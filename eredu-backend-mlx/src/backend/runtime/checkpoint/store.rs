@@ -370,7 +370,7 @@ impl WeightLease {
         let source = match lease {
             CheckpointLease::Safetensors(lease) => WeightLeaseSource::Safetensors(lease),
             CheckpointLease::Gguf(lease) => WeightLeaseSource::Gguf(Box::new(GgufLeaseSource {
-                lease,
+                lease: *lease,
                 converted_groups,
             })),
             CheckpointLease::Memory(lease) => WeightLeaseSource::Memory(lease),

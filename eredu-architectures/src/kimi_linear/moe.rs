@@ -2,8 +2,8 @@
 
 use eredu_nn::{
     Error, GatedProductGroupLayout, GroupScoring, GroupSelectionOperator, GroupedGatedProductSpec,
-    GroupedNeuralBackend, LinearOperator, LinearSpec, ParameterSpec, Parameterized, Tensor,
-    TopKGroupSelectionSpec, TopKGroupSelectorSpec,
+    GroupedNeuralBackend, LinearOperator, LinearSpec, NeuralBackend, ParameterSpec, Parameterized,
+    Tensor, TopKGroupSelectionSpec, TopKGroupSelectorSpec,
 };
 use eredu_runtime::{
     ResidentExpertProvider, RoutedExpertProvider, RoutedExpertRequest,
@@ -20,7 +20,7 @@ use super::{FeedForwardPolicy, ModelArgs};
 /// Checkpoint-compatible dense SwiGLU used by dense and shared paths.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct DenseSwiGlu<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
+pub struct DenseSwiGlu<B: NeuralBackend> {
     /// Gate projection.
     pub gate: B::Linear,
     /// Down projection.
@@ -29,8 +29,8 @@ pub struct DenseSwiGlu<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBack
     pub up: B::Linear,
 }
 
-impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> DenseSwiGlu<B> {
-    fn new(
+impl<B: NeuralBackend> DenseSwiGlu<B> {
+    pub(crate) fn new(
         args: &ModelArgs,
         prefix: &str,
         intermediate: i32,
@@ -69,7 +69,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> DenseSwiGlu<B
         B::gated_product(gate, up, eredu_nn::GatedProductPolicy::default(), context)
     }
 
-    fn forward(
+    pub(crate) fn forward(
         &mut self,
         input: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,

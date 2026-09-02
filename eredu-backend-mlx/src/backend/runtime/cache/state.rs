@@ -897,23 +897,16 @@ impl MlxKeyValueLayerState {
 
     fn deep_clone_state(&self) -> Result<Self, Exception> {
         match self {
-            Self::Device(cache) => cache.deep_clone_state().map(Self::Device),
-            Self::Paged(cache) => cache.deep_clone_state().map(Self::Paged),
+            Self::Device(cache) => cache.checkpoint_clone_state().map(Self::Device),
+            Self::Paged(cache) => Ok(Self::Paged(cache.checkpoint_clone_state())),
         }
     }
 
     fn restore_checkpoint(&mut self, checkpoint: &Self, stream: &Stream) -> Result<(), Exception> {
         match (self, checkpoint) {
             (Self::Device(current), Self::Device(previous)) => {
-                match previous.snapshot_arrays(stream)? {
-                    Some((keys, values)) => {
-                        current.restore_resident(keys, values, KeyValueCache::offset(previous))
-                    }
-                    None => {
-                        current.clear();
-                        Ok(())
-                    }
-                }
+                *current = previous.checkpoint_clone_state()?;
+                Ok(())
             }
             (Self::Paged(current), Self::Paged(previous)) => {
                 current.restore_checkpoint(previous, stream)
@@ -1349,13 +1342,12 @@ impl MlxHybridAttentionState {
     fn deep_clone_state(&self) -> Result<Self, Exception> {
         match self {
             Self::KeyValue(MlxKeyValueLayerState::Device(cache)) => cache
-                .deep_clone_state()
+                .checkpoint_clone_state()
                 .map(MlxKeyValueLayerState::Device)
                 .map(Self::KeyValue),
-            Self::KeyValue(MlxKeyValueLayerState::Paged(cache)) => cache
-                .deep_clone_state()
-                .map(MlxKeyValueLayerState::Paged)
-                .map(Self::KeyValue),
+            Self::KeyValue(MlxKeyValueLayerState::Paged(cache)) => Ok(Self::KeyValue(
+                MlxKeyValueLayerState::Paged(cache.checkpoint_clone_state()),
+            )),
             Self::Compressed(cache) => cache.deep_clone_state().map(Self::Compressed),
         }
     }
@@ -1409,15 +1401,10 @@ impl MlxHybridAttentionState {
             (
                 Self::KeyValue(MlxKeyValueLayerState::Device(current)),
                 Self::KeyValue(MlxKeyValueLayerState::Device(previous)),
-            ) => match previous.snapshot_arrays(stream)? {
-                Some((keys, values)) => {
-                    current.restore_resident(keys, values, KeyValueCache::offset(previous))
-                }
-                None => {
-                    current.clear();
-                    Ok(())
-                }
-            },
+            ) => {
+                *current = previous.checkpoint_clone_state()?;
+                Ok(())
+            }
             (
                 Self::KeyValue(MlxKeyValueLayerState::Paged(current)),
                 Self::KeyValue(MlxKeyValueLayerState::Paged(previous)),
@@ -1447,20 +1434,9 @@ impl MlxHybridLayerState {
             .as_ref()
             .map(MlxHybridAttentionState::deep_clone_state)
             .transpose()?;
-        let fixed = self
-            .fixed
-            .iter()
-            .map(|(role, value)| {
-                value
-                    .as_ref()
-                    .map(|array| array.as_array().clone().deep_clone())
-                    .transpose()
-                    .map(|value| (*role, value.map(MlxTensor::from_array)))
-            })
-            .collect::<Result<_, Exception>>()?;
         Ok(Self {
             attention,
-            fixed,
+            fixed: self.fixed.clone(),
             fixed_offset: self.fixed_offset,
         })
     }
@@ -1834,6 +1810,56 @@ impl MlxHybridState {
             .map_or(0, RuntimeStateComponents::position)
     }
 
+    #[cfg(test)]
+    pub(crate) fn semantic_snapshot(&self) -> Vec<(i32, Vec<(StateTensorRole, bool)>)> {
+        self.layers
+            .iter()
+            .map(|layer| {
+                (
+                    layer.position(),
+                    layer
+                        .fixed
+                        .iter()
+                        .map(|(role, value)| (*role, value.is_some()))
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fixed_numeric_snapshot(
+        &self,
+    ) -> Result<Vec<(usize, StateTensorRole, Vec<i32>, Vec<f32>)>, Exception> {
+        let mut snapshot = Vec::new();
+        for (layer, state) in self.layers.iter().enumerate() {
+            for (role, value) in &state.fixed {
+                let Some(value) = value else {
+                    continue;
+                };
+                let evaluated = value.as_array().evaluated()?;
+                snapshot.push((
+                    layer,
+                    *role,
+                    value.as_array().shape().to_vec(),
+                    evaluated.as_slice::<f32>().to_vec(),
+                ));
+            }
+        }
+        Ok(snapshot)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_numeric_snapshot(&self) -> Result<Vec<(Vec<i32>, Vec<f32>)>, Exception> {
+        self.retained_arrays()
+            .into_iter()
+            .map(|array| {
+                let evaluated = array.evaluated()?;
+                Ok((array.shape().to_vec(), evaluated.as_slice::<f32>().to_vec()))
+            })
+            .collect()
+    }
+
     /// Clears every heterogeneous component.
     pub fn clear(&mut self) -> Result<(), Exception> {
         for layer in &mut self.layers {
@@ -1984,7 +2010,7 @@ impl MlxHybridState {
                 }
                 *slot = restored.map(MlxTensor::from_array);
             }
-            if state.attention.is_none() {
+            if state.attention.is_none() && !state.fixed.is_empty() {
                 state.fixed_offset = frontier;
             }
         }
@@ -2042,7 +2068,7 @@ impl MlxHybridState {
                 }
                 *slot = restored.map(MlxTensor::from_array);
             }
-            if state.attention.is_none() {
+            if state.attention.is_none() && !state.fixed.is_empty() {
                 state.fixed_offset = frontier;
             }
         }
@@ -2063,6 +2089,9 @@ impl MlxHybridState {
         }
         for (relative, layer) in range.clone().enumerate() {
             let state = &mut self.layers[layer];
+            if state.attention.is_none() && state.fixed.is_empty() {
+                continue;
+            }
             let frontier = processed_tokens
                 .checked_add(layer_prefix_offsets[relative])
                 .ok_or_else(|| Exception::custom("prompt-cache layer frontier overflowed"))?;
@@ -2122,6 +2151,9 @@ impl MlxHybridState {
             .zip(descriptor.layer_prefix_offsets())
             .enumerate()
         {
+            if state.attention.is_none() && state.fixed.is_empty() {
+                continue;
+            }
             let layer_expected = expected.checked_add(*delta).ok_or_else(|| {
                 Exception::custom(format!(
                     "prompt-cache frontier overflowed at hybrid state layer {layer}"

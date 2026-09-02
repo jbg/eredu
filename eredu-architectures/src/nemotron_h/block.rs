@@ -1,7 +1,7 @@
 //! Exact Nemotron-H physical-unit normalization and residual order.
 
 use eredu_nn::{
-    AttentionCache, Error, GroupedNeuralBackend, NormalizationConstructionSpec,
+    AttentionCache, Error, GroupedNeuralBackend, NeuralBackend, NormalizationConstructionSpec,
     NormalizationOperator, ParameterSpec, Parameterized, Tensor,
 };
 use eredu_runtime::{ResidentExpertProvider, RoutedExpertProvider, RuntimeStateComponents};
@@ -37,6 +37,101 @@ pub struct Block<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
     pub norm: B::Normalization,
     #[parameter(skip)]
     residual_in_fp32: bool,
+}
+
+/// Non-routed Nemotron-H physical operator admitted by replicated text composition.
+#[derive(Debug, Clone, Parameterized)]
+#[parameterized(tensor = "B::Tensor")]
+pub(crate) enum ReplicatedOperator<B: NeuralBackend> {
+    Mamba(Mamba2<B>),
+    Attention(Attention<B>),
+    Dense(DenseMlp<B>),
+}
+
+/// Dense-only Nemotron-H unit used by replicated text composition.
+#[derive(Debug, Clone, Parameterized)]
+#[parameterized(tensor = "B::Tensor")]
+pub(crate) struct ReplicatedBlock<B: NeuralBackend> {
+    operator: ReplicatedOperator<B>,
+    norm: B::Normalization,
+    #[parameter(skip)]
+    residual_in_fp32: bool,
+}
+
+impl<B: NeuralBackend> ReplicatedBlock<B> {
+    pub(crate) fn new(
+        args: &ModelArgs,
+        layer: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        let policy = args
+            .layer_schedule
+            .get(layer)
+            .copied()
+            .ok_or_else(|| Error::backend(format!("Nemotron-H has no layer {layer}")))?;
+        let operator = match policy {
+            LayerPolicy::Mamba => ReplicatedOperator::Mamba(Mamba2::new(args, layer, context)?),
+            LayerPolicy::SelfAttention(_) => ReplicatedOperator::Attention(new_attention(
+                args,
+                layer,
+                args.num_attention_heads,
+                args.num_key_value_heads,
+                context,
+            )?),
+            LayerPolicy::DenseMlp => ReplicatedOperator::Dense(DenseMlp::new(
+                args,
+                &format!("model.layers.{layer}.mlp"),
+                args.intermediate_size,
+                context,
+            )?),
+            LayerPolicy::SparseMoe => {
+                return Err(Error::backend(
+                    "replicated Nemotron-H unit rejects routed computation",
+                ))
+            }
+        };
+        Ok(Self {
+            operator,
+            norm: B::normalization(
+                NormalizationConstructionSpec::learned(
+                    args.hidden_size,
+                    args.layer_norm_epsilon,
+                    ParameterSpec::trainable(format!("model.layers.{layer}.norm.weight"))
+                        .map_err(Error::backend)?,
+                ),
+                context,
+            )?,
+            residual_in_fp32: args.residual_in_fp32,
+        })
+    }
+
+    pub(crate) fn forward<S>(
+        &mut self,
+        hidden: &B::Tensor,
+        mask: Option<&B::Tensor>,
+        state: &mut S,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error>
+    where
+        S: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+    {
+        let normalized = self.norm.forward(hidden, context)?;
+        let output = match &mut self.operator {
+            ReplicatedOperator::Mamba(mamba) => mamba.forward(&normalized, state, context)?,
+            ReplicatedOperator::Attention(attention) => attention.forward(
+                AttentionInput {
+                    hidden: &normalized,
+                    mask,
+                    cache: Some(state),
+                    allow_sliding_prefill: true,
+                    rotary_position: None,
+                },
+                context,
+            )?,
+            ReplicatedOperator::Dense(mlp) => mlp.forward(&normalized, context)?,
+        };
+        B::add_residual(hidden, &output, self.residual_in_fp32, context)
+    }
 }
 
 impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Block<B> {

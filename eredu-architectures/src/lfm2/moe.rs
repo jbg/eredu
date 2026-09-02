@@ -2,8 +2,8 @@
 
 use eredu_nn::{
     Error, GatedProductGroupLayout, GroupScoring, GroupSelectionOperator, GroupedGatedProductSpec,
-    GroupedNeuralBackend, LinearOperator, LinearSpec, ParameterSpec, Parameterized, Tensor,
-    TopKGroupSelectionSpec, TopKGroupSelectorSpec,
+    GroupedNeuralBackend, LinearOperator, LinearSpec, NeuralBackend, ParameterSpec, Parameterized,
+    Tensor, TopKGroupSelectionSpec, TopKGroupSelectorSpec,
 };
 use eredu_runtime::{
     ResidentExpertProvider, RoutedExpertProvider, RoutedExpertRequest,
@@ -20,7 +20,7 @@ use super::{FeedForwardPolicy, ModelArgs};
 /// Dense LFM2 SwiGLU with checkpoint-compatible projection identities.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct DenseSwiGlu<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
+pub struct DenseSwiGlu<B: NeuralBackend> {
     /// Gate projection (`w1`).
     pub gate: B::Linear,
     /// Down projection (`w2`).
@@ -29,8 +29,8 @@ pub struct DenseSwiGlu<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBack
     pub up: B::Linear,
 }
 
-impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> DenseSwiGlu<B> {
-    fn new(
+impl<B: NeuralBackend> DenseSwiGlu<B> {
+    pub(crate) fn new(
         args: &ModelArgs,
         layer: usize,
         intermediate: i32,
@@ -68,6 +68,15 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> DenseSwiGlu<B
         let gate = self.gate.forward(input, context)?;
         let up = self.up.forward(input, context)?;
         B::gated_product(gate, up, eredu_nn::GatedProductPolicy::default(), context)
+    }
+
+    pub(crate) fn forward(
+        &mut self,
+        input: &B::Tensor,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        let hidden = self.hidden(input, context)?;
+        self.down.forward(&hidden, context)
     }
 }
 

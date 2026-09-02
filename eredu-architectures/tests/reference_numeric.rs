@@ -9,6 +9,15 @@ use std::{
 use eredu_architectures::{
     decoder, deepseek, execute_routed_gated_product, gemma4, gpt_oss, inkling, kimi_linear, lfm2,
     llama, moshi, muse_glimmer, nemotron_h, qwen,
+    replicated_text::{
+        visit_replicated_attention_state_text_architecture,
+        visit_replicated_component_state_text_architecture,
+        visit_replicated_compressed_only_text_architecture,
+        visit_replicated_compressed_state_text_architecture,
+        visit_replicated_fixed_state_text_architecture,
+        visit_replicated_stateless_text_architecture, PreparedReplicatedTextArchitecture,
+        ReplicatedTextArchitectureVisitor,
+    },
 };
 use eredu_core::cache::{LayerCachePolicy, PromptCacheTopology, StateTensorRole};
 use eredu_core::{
@@ -11625,6 +11634,343 @@ fn assert_state_exact(
         assert_eq!(
             actual.resets, expected.resets,
             "{label} layer {layer} reset count"
+        );
+    }
+}
+
+struct NumericReplicatedVisitor<'a> {
+    context: &'a NumericContext,
+    tokens: &'a NumericTensor,
+    construction_started: bool,
+}
+
+impl<'a>
+    ReplicatedTextArchitectureVisitor<
+        NumericBackend,
+        DeviceState<NumericBackend, NumericHybridLayerState>,
+    > for NumericReplicatedVisitor<'a>
+{
+    type Output = (
+        NumericTensor,
+        DeviceState<NumericBackend, NumericHybridLayerState>,
+    );
+    type Error = String;
+
+    fn construction_started(&mut self) {
+        self.construction_started = true;
+    }
+
+    fn visit<A>(
+        self,
+        prepared: PreparedReplicatedTextArchitecture<A>,
+        _: eredu_checkpoint::store::SharedCheckpointSource,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        A: eredu_runtime::ReplicatedTextArchitecture<
+                NumericBackend,
+                DeviceState<NumericBackend, NumericHybridLayerState>,
+                Error = Error,
+            > + 'static,
+        A::StaticModules: Clone,
+        A::Error: std::fmt::Display,
+    {
+        assert!(self.construction_started);
+        let layout = prepared.requirements().state_layout().clone();
+        let unit_count = prepared.requirements().execution_units().len();
+        let architecture = prepared.into_modules().take_architecture();
+        let units = (0..unit_count)
+            .map(|unit| A::build_unit(&architecture, 0, unit, self.context))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        let mut runtime = LayerwiseRuntime::new(architecture, ResidentUnitWindow::new(units));
+        let mut state = DeviceState::<NumericBackend, _>::create(layout, |_, policy| {
+            Ok::<_, Error>(NumericHybridLayerState::new(policy))
+        })
+        .map_err(|error| error.to_string())?;
+        let logits = runtime
+            .forward(A::text_input(self.tokens, None), &mut state, self.context)
+            .map_err(|error| error.to_string())?;
+        Ok((logits, state))
+    }
+}
+
+fn execute_numeric_replicated_visitor(
+    config: &serde_json::Value,
+    parameters: Vec<(String, Vec<usize>)>,
+    context: &NumericContext,
+    tokens: &NumericTensor,
+) -> (
+    NumericTensor,
+    DeviceState<NumericBackend, NumericHybridLayerState>,
+) {
+    use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
+
+    let artifact = tempfile::tempdir().unwrap();
+    std::fs::write(
+        artifact.path().join("config.json"),
+        serde_json::to_vec(config).unwrap(),
+    )
+    .unwrap();
+    let tensors = parameters
+        .into_iter()
+        .map(|(name, shape)| {
+            let bytes = vec![0_u8; shape.iter().product::<usize>() * 4];
+            (name, shape, bytes)
+        })
+        .collect::<Vec<_>>();
+    let views = tensors
+        .iter()
+        .map(|(name, shape, bytes)| {
+            (
+                name.as_str(),
+                TensorView::new(Dtype::F32, shape.clone(), bytes.as_slice()).unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    serialize_to_file(views, None, &artifact.path().join("model.safetensors")).unwrap();
+    let inspection = eredu_architectures::configuration::inspect_artifact(artifact.path()).unwrap();
+    let requirements =
+        eredu_architectures::replicated_text::replicated_text_requirements(&inspection).unwrap();
+    let lowerings = requirements
+        .parameters()
+        .iter()
+        .filter(|parameter| parameter.has_lowering_source())
+        .map(|parameter| {
+            eredu_runtime::WeightLoweringCapability::new(
+                parameter
+                    .lowering_descriptor(parameter.native_executable())
+                    .unwrap(),
+                eredu_runtime::WeightLoweringKind::Direct,
+            )
+        })
+        .collect();
+    let state = eredu_runtime::StateMechanismCapabilities::new(
+        (0..requirements.state_layout().len()).flat_map(|layer| {
+            requirements
+                .state_layout()
+                .components(layer)
+                .unwrap()
+                .iter()
+                .cloned()
+                .map(move |component| {
+                    eredu_runtime::StateComponentMechanism::new(
+                        layer,
+                        component,
+                        Some(eredu_runtime::StateComponentPlacement::Device),
+                        None,
+                    )
+                })
+        }),
+    )
+    .with_transactions(true, true)
+    .with_reset(true);
+    let capabilities = eredu_runtime::BackendMechanismCapabilities::new(
+        eredu_nn::NeuralOperatorCapabilities::ALL,
+        lowerings,
+        vec![eredu_runtime::WeightResidencyMechanism::Resident],
+        state,
+    );
+    let request = eredu_runtime::ReplicatedTextSelectionRequest::new(
+        eredu_runtime::LayerWeightResidency::FullyResident,
+        eredu_runtime::CacheResidencyPolicy::Device,
+    );
+    let selected =
+        eredu_runtime::select_replicated_text_realization(&requirements, &request, &capabilities)
+            .unwrap();
+    let store: eredu_checkpoint::store::SharedCheckpointSource = std::sync::Arc::new(
+        eredu_checkpoint::store::SafetensorsWeightStore::open(artifact.path()).unwrap(),
+    );
+    let visitor = NumericReplicatedVisitor {
+        context,
+        tokens,
+        construction_started: false,
+    };
+    match requirements.state_access() {
+        eredu_runtime::ReplicatedTextStateAccess::Stateless => {
+            visit_replicated_stateless_text_architecture(
+                inspection.architecture_plan(),
+                selected,
+                store,
+                context,
+                visitor,
+            )
+        }
+        eredu_runtime::ReplicatedTextStateAccess::KeyValue => {
+            visit_replicated_attention_state_text_architecture(
+                inspection.architecture_plan(),
+                selected,
+                store,
+                context,
+                visitor,
+            )
+        }
+        eredu_runtime::ReplicatedTextStateAccess::Fixed => {
+            visit_replicated_component_state_text_architecture(
+                inspection.architecture_plan(),
+                selected,
+                store,
+                context,
+                visitor,
+            )
+        }
+        eredu_runtime::ReplicatedTextStateAccess::AttentionWithFixed => {
+            visit_replicated_fixed_state_text_architecture(
+                inspection.architecture_plan(),
+                selected,
+                store,
+                context,
+                visitor,
+            )
+        }
+        eredu_runtime::ReplicatedTextStateAccess::CompressedAttentionWithFixed => {
+            visit_replicated_compressed_state_text_architecture(
+                inspection.architecture_plan(),
+                selected,
+                store,
+                context,
+                visitor,
+            )
+        }
+        eredu_runtime::ReplicatedTextStateAccess::CompressedAttention => {
+            visit_replicated_compressed_only_text_architecture(
+                inspection.architecture_plan(),
+                selected,
+                store,
+                context,
+                visitor,
+            )
+        }
+        access => panic!("unsupported numeric replicated state profile {access:?}"),
+    }
+    .unwrap()
+}
+
+#[test]
+fn heterogeneous_replicated_visitors_match_established_numeric_family_models() {
+    let cases = [
+        serde_json::json!({
+            "model_type":"lfm2", "vocab_size":16, "hidden_size":8,
+            "intermediate_size":10, "num_hidden_layers":2,
+            "num_attention_heads":4, "num_key_value_heads":2,
+            "max_position_embeddings":32, "layer_types":["conv","full_attention"],
+            "conv_L_cache":3, "block_multiple_of":2,
+            "block_ffn_dim_multiplier":1.0, "block_auto_adjust_ff_dim":true,
+            "tie_word_embeddings":false
+        }),
+        serde_json::json!({
+            "model_type":"kimi_linear", "vocab_size":16, "hidden_size":8,
+            "num_hidden_layers":2, "num_attention_heads":2, "num_key_value_heads":2,
+            "intermediate_size":10, "head_dim":4, "model_max_length":64,
+            "linear_attn_config":{"kda_layers":[1],"full_attn_layers":[2],"num_heads":2,"head_dim":4,"short_conv_kernel_size":3},
+            "num_experts":2,"moe_intermediate_size":6,"kv_lora_rank":4,
+            "qk_nope_head_dim":4,"qk_rope_head_dim":2,"v_head_dim":4,
+            "mla_use_nope":true,"num_experts_per_token":1,"num_shared_experts":1,
+            "routed_scaling_factor":1.0,"first_k_dense_replace":2,
+            "num_expert_group":1,"topk_group":1,"tie_word_embeddings":false
+        }),
+        serde_json::json!({
+            "model_type":"nemotron_h", "vocab_size":16, "hidden_size":8,
+            "intermediate_size":12, "num_hidden_layers":2,
+            "hybrid_override_pattern":"M-", "num_attention_heads":2,
+            "num_key_value_heads":1,"head_dim":4,"mamba_num_heads":2,
+            "n_groups":1,"mamba_head_dim":4,"ssm_state_size":3,"conv_kernel":3,
+            "n_routed_experts":4,"n_shared_experts":1,"moe_intermediate_size":6,
+            "moe_shared_expert_intermediate_size":6,"num_experts_per_tok":2,
+            "n_group":2,"topk_group":1,"num_nextn_predict_layers":0
+        }),
+        serde_json::json!({
+            "model_type":"qwen3_5_text", "vocab_size":16, "hidden_size":8,
+            "num_hidden_layers":2,"mtp_num_hidden_layers":0,"intermediate_size":12,
+            "num_attention_heads":4,"num_key_value_heads":2,"head_dim":2,
+            "max_position_embeddings":64,"full_attention_interval":2,
+            "linear_conv_kernel_dim":3,"linear_key_head_dim":2,"linear_value_head_dim":2,
+            "linear_num_key_heads":2,"linear_num_value_heads":2,"num_experts":0,
+            "layer_types":["linear_attention","full_attention"],"tie_word_embeddings":false
+        }),
+        serde_json::json!({
+            "model_type":"qwen3_next", "vocab_size":16, "hidden_size":8,
+            "num_hidden_layers":2,"mtp_num_hidden_layers":0,"intermediate_size":12,
+            "num_attention_heads":4,"num_key_value_heads":2,"head_dim":2,
+            "max_position_embeddings":64,"full_attention_interval":2,
+            "linear_conv_kernel_dim":3,"linear_key_head_dim":2,"linear_value_head_dim":2,
+            "linear_num_key_heads":2,"linear_num_value_heads":2,"num_experts":0,
+            "layer_types":["linear_attention","full_attention"],"tie_word_embeddings":false
+        }),
+    ];
+    for config in cases {
+        let context = NumericContext::default();
+        let tokens = NumericTensor::token_ids(&[1, 3, 2]);
+        macro_rules! reference_case {
+            ($architecture:expr, $input:expr) => {{
+                let architecture = $architecture;
+                let description = architecture.parameter_description(&context).unwrap();
+                let parameters = description
+                    .groups()
+                    .iter()
+                    .flat_map(|owned| owned.group().members())
+                    .map(|member| (member.target().to_owned(), member.global_shape().to_vec()))
+                    .collect::<BTreeMap<_, _>>()
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                let layout = architecture.state_layout().unwrap();
+                let layers = layout.len();
+                let mut state = DeviceState::<NumericBackend, _>::create(layout, |_, policy| {
+                    Ok::<_, Error>(NumericHybridLayerState::new(policy))
+                })
+                .unwrap();
+                let mut runtime = ResidentRuntime::new(architecture, &context).unwrap();
+                let logits = runtime.forward($input, &mut state, &context).unwrap();
+                (logits, state, parameters, layers)
+            }};
+        }
+        let (expected, expected_state, parameters, layers) = match config["model_type"].as_str() {
+            Some("lfm2") => {
+                let args = lfm2::model_args_from_config_value(&config).unwrap();
+                reference_case!(
+                    lfm2::LayeredModel::<NumericBackend>::new(args, &context).unwrap(),
+                    decoder::LayeredInput {
+                        tokens: &tokens,
+                        mask: None
+                    }
+                )
+            }
+            Some("kimi_linear") => {
+                let args = kimi_linear::model_args_from_config_value(&config).unwrap();
+                reference_case!(
+                    kimi_linear::LayeredModel::<NumericBackend>::new(args, &context).unwrap(),
+                    decoder::LayeredInput {
+                        tokens: &tokens,
+                        mask: None
+                    }
+                )
+            }
+            Some("nemotron_h") => {
+                let args = nemotron_h::model_args_from_config_value(&config).unwrap();
+                reference_case!(
+                    nemotron_h::LayeredModel::<NumericBackend>::new(args, &context).unwrap(),
+                    nemotron_h::EmbeddedInput::target(&tokens, None)
+                )
+            }
+            Some("qwen3_5_text") | Some("qwen3_next") => {
+                let args = qwen::hybrid::model_args_from_config_value(&config)
+                    .unwrap()
+                    .text;
+                reference_case!(
+                    qwen::hybrid::LayeredModel::<NumericBackend>::new(args, &context).unwrap(),
+                    qwen::hybrid::EmbeddedInput::target(&tokens, None)
+                )
+            }
+            kind => panic!("unexpected numeric visitor fixture {kind:?}"),
+        };
+        let (actual, actual_state) =
+            execute_numeric_replicated_visitor(&config, parameters, &context, &tokens);
+        let label = config["model_type"].as_str().unwrap();
+        assert_tensor_close(&actual, &expected, &format!("{label} replicated logits"));
+        assert_state_exact(
+            &actual_state,
+            &expected_state,
+            layers,
+            &format!("{label} replicated state"),
         );
     }
 }

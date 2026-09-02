@@ -144,9 +144,10 @@ pub use replicated_text::{
     ReplicatedTextContractError, ReplicatedTextParameterOwner, ReplicatedTextParameterPresence,
     ReplicatedTextParameterRequirement, ReplicatedTextParameterRole, ReplicatedTextPhysicalSource,
     ReplicatedTextRequirements, ReplicatedTextSelectionError, ReplicatedTextSelectionRequest,
-    SelectedParameterRealization, SelectedReplicatedTextRealization, StateResidencyMechanism,
-    WeightLoweringCapability, WeightLoweringDescriptor, WeightLoweringKind,
-    WeightResidencyMechanism,
+    ReplicatedTextStateAccess, SelectedParameterRealization, SelectedReplicatedTextRealization,
+    SelectedStateComponentRealization, SelectedStateRealization, StateComponentMechanism,
+    StateComponentPlacement, StateMechanismCapabilities, WeightLoweringCapability,
+    WeightLoweringDescriptor, WeightLoweringKind, WeightResidencyMechanism,
 };
 pub use residency::{
     DeviceLayerWindow, OffloadUnit, ResidencyAcquisition, ResidencyController,

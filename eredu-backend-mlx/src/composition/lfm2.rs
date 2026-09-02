@@ -618,6 +618,12 @@ pub struct Lfm2Model {
 }
 
 impl Lfm2Model {
+    pub(crate) fn requires_family_executable(&self) -> bool {
+        self.args.has_sparse_moe_layers()
+            || self.parameter_bank.is_some()
+            || self.parallel_info.is_some()
+    }
+
     /// Returns validated family policy.
     pub const fn args(&self) -> &ModelArgs {
         &self.args
@@ -1084,6 +1090,7 @@ impl CausalModel<MlxHybridState> for Lfm2Model {
 /// Loads SafeTensors LFM2 through one neutral model object.
 pub fn load_lfm2_model(
     artifact: &crate::composition::mlx::artifact::PreparedSafetensorsArtifact,
+    _route: &crate::composition::mlx::loading::ExcludedFamilyRoute,
     residency: WeightResidency,
     quantization: Option<WeightQuantization>,
     stream: &Stream,
@@ -1205,6 +1212,7 @@ pub(crate) fn prepare_gguf(
 /// Loads a GGUF checkpoint through the same neutral LFM2 model object.
 pub(crate) fn load_lfm2_gguf_model(
     source: &crate::composition::mlx::structural::AdmittedGguf,
+    _route: &crate::composition::mlx::loading::ExcludedFamilyRoute,
     residency: WeightResidency,
     quantization: Option<WeightQuantization>,
     stream: &Stream,

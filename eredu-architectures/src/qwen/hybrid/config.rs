@@ -776,7 +776,11 @@ pub fn model_args_from_gguf_catalog(
     )
     .map_err(|error| invalid(format!("hybrid {error}")))?;
     let vocab_size = gguf_i32(metadata, &key("vocab_size"))?;
-    let is_moe = variant != HybridVariant::Qwen35Dense;
+    let declared_experts = gguf_optional_i64(metadata, &key("expert_count"))?
+        .map(i32::try_from)
+        .transpose()
+        .map_err(|_| invalid("GGUF expert count exceeds i32"))?;
+    let is_moe = variant == HybridVariant::Qwen35Moe || declared_experts.is_some_and(|n| n > 0);
     let rope_theta = gguf_optional_f32(metadata, &key("rope.freq_base"))?.unwrap_or(10_000_000.0);
     let mut rope_parameters = HashMap::new();
     rope_parameters.insert("rope_theta".into(), serde_json::json!(rope_theta));
@@ -835,7 +839,7 @@ pub fn model_args_from_gguf_catalog(
             0
         },
         num_experts: if is_moe {
-            gguf_i32(metadata, &key("expert_count"))?
+            declared_experts.ok_or_else(|| invalid("GGUF routed model is missing expert_count"))?
         } else {
             0
         },

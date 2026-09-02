@@ -7,6 +7,17 @@ use eredu_core::SpeculativeCapability;
 use safemlx::{error::Exception, Stream};
 
 use crate::backend::error::Error;
+
+#[derive(Clone, Copy)]
+pub(super) struct CompositeInputProof(());
+
+impl CompositeInputProof {
+    pub(super) fn from_plan(
+        plan: &eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+    ) -> Option<Self> {
+        plan.has_processor().then_some(Self(()))
+    }
+}
 use crate::composition::gpt_oss;
 use eredu_architectures::ModelKind;
 use eredu_runtime::CacheResidencyReport;
@@ -182,6 +193,11 @@ impl Executable {
         kind: ModelKind,
         model: crate::composition::kimi_linear::KimiLinearModel,
     ) -> Result<Self, Error> {
+        if !model.requires_family_executable() {
+            return Err(Error::ArchitectureModel(
+                "replicated Kimi Linear text requires generic composition".into(),
+            ));
+        }
         let identity = AdmittedModelKind::new(kind, &[ModelKind::KimiLinear])?;
         let cache = model.new_cache();
         Ok(Self::KimiLinear(identity, model, cache))
@@ -211,7 +227,16 @@ impl Executable {
     ) -> Result<Self, Error> {
         let identity = AdmittedModelKind::new(
             kind,
-            &[ModelKind::Llama, ModelKind::Qwen2, ModelKind::Qwen3],
+            &[
+                ModelKind::Llama,
+                ModelKind::Qwen2,
+                ModelKind::Qwen3,
+                ModelKind::Lfm2,
+                ModelKind::KimiLinear,
+                ModelKind::NemotronH,
+                ModelKind::Qwen3Next,
+                ModelKind::Qwen35,
+            ],
         )?;
         Ok(Self::ReplicatedText(identity, model))
     }
@@ -229,6 +254,11 @@ impl Executable {
         kind: ModelKind,
         model: crate::composition::lfm2::Lfm2Model,
     ) -> Result<Self, Error> {
+        if !model.requires_family_executable() {
+            return Err(Error::ArchitectureModel(
+                "replicated LFM2 text requires generic composition".into(),
+            ));
+        }
         let identity = AdmittedModelKind::new(kind, &[ModelKind::Lfm2])?;
         let cache = model.new_cache();
         Ok(Self::Lfm2(identity, model, cache))
@@ -238,6 +268,11 @@ impl Executable {
         kind: ModelKind,
         model: crate::composition::nemotron_h::NemotronHModel,
     ) -> Result<Self, Error> {
+        if !model.requires_family_executable() {
+            return Err(Error::ArchitectureModel(
+                "replicated Nemotron-H text requires generic composition".into(),
+            ));
+        }
         let identity = AdmittedModelKind::new(kind, &[ModelKind::NemotronH])?;
         let cache = model.new_cache();
         Ok(Self::NemotronH(identity, model, cache))
@@ -256,6 +291,11 @@ impl Executable {
         kind: ModelKind,
         model: crate::composition::qwen::hybrid::QwenHybridModel,
     ) -> Result<Self, Error> {
+        if !model.requires_family_executable() {
+            return Err(Error::ArchitectureModel(
+                "replicated Qwen3-Next text requires generic composition".into(),
+            ));
+        }
         let identity = AdmittedModelKind::new(kind, &[ModelKind::Qwen3Next])?;
         let cache = model.new_cache();
         Ok(Self::Qwen3Next(identity, model, cache))
@@ -282,6 +322,21 @@ impl Executable {
     pub(super) fn qwen35(
         kind: ModelKind,
         model: crate::composition::qwen::hybrid::QwenHybridModel,
+    ) -> Result<Self, Error> {
+        if !model.requires_family_executable() {
+            return Err(Error::ArchitectureModel(
+                "replicated Qwen3.5 text requires generic composition".into(),
+            ));
+        }
+        let identity = AdmittedModelKind::new(kind, &[ModelKind::Qwen35])?;
+        let cache = model.new_cache();
+        Ok(Self::Qwen35(identity, model, cache))
+    }
+
+    pub(super) fn qwen35_composite(
+        kind: ModelKind,
+        model: crate::composition::qwen::hybrid::QwenHybridModel,
+        _proof: CompositeInputProof,
     ) -> Result<Self, Error> {
         let identity = AdmittedModelKind::new(kind, &[ModelKind::Qwen35])?;
         let cache = model.new_cache();

@@ -4,8 +4,8 @@ use eredu_core::cache::StateTensorRole;
 use eredu_nn::{
     AttentionCache, CausalDepthwiseConvolutionSpec, ConvolutionActivation, Error,
     GatedShortConvolution, GatedShortConvolutionSpec, GroupedNeuralBackend, LinearSpec,
-    NormalizationConstructionSpec, NormalizationOperator, ParameterSpec, Parameterized, RotarySpec,
-    Tensor,
+    NeuralBackend, NormalizationConstructionSpec, NormalizationOperator, ParameterSpec,
+    Parameterized, RotarySpec, Tensor,
 };
 use eredu_runtime::RuntimeStateComponents;
 
@@ -18,7 +18,7 @@ use super::{FeedForward, ModelArgs, OperatorPolicy};
 /// Scheduled LFM2 token mixer.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub enum TokenMixer<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
+pub enum TokenMixer<B: NeuralBackend> {
     /// Grouped-query self attention.
     Attention(Attention<B>),
     /// Gated causal short convolution.
@@ -37,6 +37,163 @@ pub struct Block<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
     pub operator_norm: B::Normalization,
     /// Feed-forward pre-normalization.
     pub feed_forward_norm: B::Normalization,
+}
+
+/// Dense-only LFM2 unit used by replicated text composition.
+#[derive(Debug, Clone, Parameterized)]
+#[parameterized(tensor = "B::Tensor")]
+pub(crate) struct ReplicatedBlock<B: NeuralBackend> {
+    mixer: TokenMixer<B>,
+    feed_forward: super::moe::DenseSwiGlu<B>,
+    operator_norm: B::Normalization,
+    feed_forward_norm: B::Normalization,
+}
+
+impl<B: NeuralBackend> ReplicatedBlock<B> {
+    pub(crate) fn new(
+        args: &ModelArgs,
+        layer: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        let policy = args
+            .layer_policy(layer)
+            .ok_or_else(|| Error::backend(format!("LFM2 has no layer {layer}")))?;
+        if policy.feed_forward != super::FeedForwardPolicy::Dense {
+            return Err(Error::backend(
+                "replicated LFM2 unit requires a dense feed-forward policy",
+            ));
+        }
+        let root = format!("model.layers.{layer}");
+        let mixer = match policy.operator {
+            OperatorPolicy::CausalConvolution => {
+                TokenMixer::ShortConvolution(GatedShortConvolution::new(
+                    short_convolution_spec(args, &root, args.hidden_size)?,
+                    context,
+                )?)
+            }
+            OperatorPolicy::SelfAttention(attention) => {
+                let head_dim = args.hidden_size / args.num_attention_heads;
+                let prefix = format!("{root}.self_attn");
+                let linear = |field: &str, input, output| {
+                    let name = format!("{prefix}.{field}.weight");
+                    B::linear(
+                        LinearSpec {
+                            input,
+                            output,
+                            weight: ParameterSpec::trainable(&name).map_err(Error::backend)?,
+                            bias: None,
+                            format: crate::linear_format::standard_linear_format(
+                                &name,
+                                args.weight_quantization_for(&name).into(),
+                            )?,
+                        },
+                        context,
+                    )
+                };
+                let norm = |field: &str| {
+                    B::normalization(
+                        NormalizationConstructionSpec::learned(
+                            head_dim,
+                            args.norm_eps,
+                            ParameterSpec::trainable(format!("{prefix}.{field}.weight"))
+                                .map_err(Error::backend)?,
+                        ),
+                        context,
+                    )
+                };
+                TokenMixer::Attention(Attention::from_parts(
+                    args.num_attention_heads,
+                    args.num_key_value_heads,
+                    head_dim,
+                    linear("q_proj", args.hidden_size, args.hidden_size)?,
+                    linear(
+                        "k_proj",
+                        args.hidden_size,
+                        args.num_key_value_heads * head_dim,
+                    )?,
+                    linear(
+                        "v_proj",
+                        args.hidden_size,
+                        args.num_key_value_heads * head_dim,
+                    )?,
+                    linear("out_proj", args.hidden_size, args.hidden_size)?,
+                    Some(norm("q_layernorm")?),
+                    Some(norm("k_layernorm")?),
+                    Some(B::rotary(
+                        RotarySpec {
+                            dimensions: head_dim,
+                            base: args.rope.theta,
+                            traditional: false,
+                            algorithm: eredu_nn::RotaryAlgorithm::Default,
+                        },
+                        context,
+                    )?),
+                    attention.sliding_window_i32().map_err(Error::backend)?,
+                )?)
+            }
+        };
+        let normalization = |field: &str| {
+            B::normalization(
+                NormalizationConstructionSpec::learned(
+                    args.hidden_size,
+                    args.norm_eps,
+                    ParameterSpec::trainable(format!("{root}.{field}.weight"))
+                        .map_err(Error::backend)?,
+                ),
+                context,
+            )
+        };
+        Ok(Self {
+            mixer,
+            feed_forward: super::moe::DenseSwiGlu::new(
+                args,
+                layer,
+                args.dense_intermediate_size,
+                context,
+            )?,
+            operator_norm: normalization("operator_norm")?,
+            feed_forward_norm: normalization("ffn_norm")?,
+        })
+    }
+
+    pub(crate) fn forward<C>(
+        &mut self,
+        hidden: &B::Tensor,
+        mask: Option<&B::Tensor>,
+        state: &mut C,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error>
+    where
+        C: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+    {
+        let normalized = self.operator_norm.forward(hidden, context)?;
+        let mixed = match &mut self.mixer {
+            TokenMixer::Attention(attention) => attention.forward(
+                AttentionInput {
+                    hidden: &normalized,
+                    mask,
+                    cache: Some(&mut *state),
+                    allow_sliding_prefill: true,
+                    rotary_position: None,
+                },
+                context,
+            )?,
+            TokenMixer::ShortConvolution(convolution) => {
+                let role = StateTensorRole::Convolution { slot: 0 };
+                let result = {
+                    let history = state.fixed_component(role).map_err(Error::backend)?;
+                    convolution.forward(&normalized, history.as_ref(), context)?
+                };
+                *state.fixed_component(role).map_err(Error::backend)? = result.history;
+                state.advance_fixed(hidden.dim(1)).map_err(Error::backend)?;
+                result.output
+            }
+        };
+        let hidden = hidden.add(&mixed, context)?;
+        let normalized = self.feed_forward_norm.forward(&hidden, context)?;
+        let feed_forward = self.feed_forward.forward(&normalized, context)?;
+        hidden.add(&feed_forward, context)
+    }
 }
 
 /// Rank-local operator widths resolved by semantic placement.

@@ -34,6 +34,21 @@ pub struct TensorMetadata {
     pub backing_shard: Option<PathBuf>,
 }
 
+/// Container-native provenance behind one logical checkpoint catalog key.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct TensorSourceProvenance {
+    /// Logical key accepted by [`CheckpointSource`].
+    pub catalog_key: String,
+    /// Physical tensor identity in the admitted container.
+    pub physical_tensor: String,
+    /// Exact logical output selected from the physical tensor.
+    pub output: String,
+    /// Payload shard backing the physical tensor, when file-backed.
+    pub backing_shard: Option<PathBuf>,
+    /// Exact physical container encoding.
+    pub source_encoding: crate::SourceTensorEncoding,
+}
+
 /// A requested logical subset of a checkpoint tensor.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum TensorSelection {
@@ -117,7 +132,7 @@ pub enum CheckpointLease {
     /// Buffered SafeTensors bytes.
     Safetensors(SafetensorsLease),
     /// Lazily read portable GGUF payload.
-    Gguf(crate::gguf_store::GgufLease),
+    Gguf(Box<crate::gguf_store::GgufLease>),
     /// Immutable in-memory encoded bytes.
     Memory(MemoryLease),
 }
@@ -354,6 +369,18 @@ pub trait CheckpointSource: Send + Sync {
     /// Returns deterministic storage diagnostics.
     fn source_diagnostics(&self) -> Result<WeightStoreDiagnostics, StoreError>;
 
+    /// Returns exact container provenance without opening tensor payloads.
+    fn source_provenance(&self, key: &str) -> Result<TensorSourceProvenance, StoreError> {
+        let metadata = self.source_metadata(key)?;
+        Ok(TensorSourceProvenance {
+            catalog_key: key.to_owned(),
+            physical_tensor: key.to_owned(),
+            output: key.to_owned(),
+            backing_shard: metadata.backing_shard,
+            source_encoding: crate::SourceTensorEncoding::Safetensors(metadata.stored_dtype),
+        })
+    }
+
     /// Returns physical source keys consumed to synthesize overlay bindings.
     fn materialized_source_keys(&self) -> Vec<String> {
         Vec::new()
@@ -492,6 +519,10 @@ impl CheckpointSource for CompositeCheckpointSource {
         })
     }
 
+    fn source_provenance(&self, key: &str) -> Result<TensorSourceProvenance, StoreError> {
+        self.source_for(key)?.source_provenance(key)
+    }
+
     fn materialized_source_keys(&self) -> Vec<String> {
         self.sources
             .iter()
@@ -599,6 +630,13 @@ impl CheckpointSource for ResolvedCheckpointSource {
 
     fn source_diagnostics(&self) -> Result<WeightStoreDiagnostics, StoreError> {
         self.source.source_diagnostics()
+    }
+
+    fn source_provenance(&self, key: &str) -> Result<TensorSourceProvenance, StoreError> {
+        if !self.source.is_authoritative_materialized_key(key) {
+            self.authorize(key)?;
+        }
+        self.source.source_provenance(key)
     }
 
     fn materialized_source_keys(&self) -> Vec<String> {

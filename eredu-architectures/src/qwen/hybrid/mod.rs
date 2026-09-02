@@ -1,6 +1,6 @@
 //! One backend-neutral hybrid decoder shared by Qwen3-Next and Qwen3.5.
 
-mod block;
+pub(crate) mod block;
 mod checkpoint;
 mod conditional;
 mod config;

@@ -2,7 +2,7 @@
 
 use eredu_nn::{
     AttentionCache, Error, GatedProductGroupLayout, GroupScoring, GroupSelectionOperator,
-    GroupedGatedProductSpec, GroupedNeuralBackend, LinearOperator, LinearSpec,
+    GroupedGatedProductSpec, GroupedNeuralBackend, LinearOperator, LinearSpec, NeuralBackend,
     NormalizationConstructionSpec, NormalizationOperator, NormalizationScale, ParameterSpec,
     Parameterized, RotarySpec, Tensor, TopKGroupSelectionSpec, TopKGroupSelectorSpec,
 };
@@ -23,7 +23,7 @@ use super::{HybridConfig, HybridLayerPolicy, LinearAttention};
 /// Scheduled hybrid token mixer.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub enum TokenMixer<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
+pub enum TokenMixer<B: NeuralBackend> {
     /// Gated-delta recurrent attention.
     Linear(LinearAttention<B>),
     /// Gated grouped-query self attention.
@@ -283,6 +283,100 @@ pub struct Block<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
     pub post_attention_norm: B::Normalization,
 }
 
+/// Dense-only Qwen hybrid unit used by replicated text composition.
+#[derive(Debug, Clone, Parameterized)]
+#[parameterized(tensor = "B::Tensor")]
+pub(crate) struct ReplicatedBlock<B: NeuralBackend> {
+    mixer: TokenMixer<B>,
+    feed_forward: Mlp<B>,
+    input_norm: B::Normalization,
+    post_attention_norm: B::Normalization,
+}
+
+impl<B: NeuralBackend> ReplicatedBlock<B> {
+    pub(crate) fn new(
+        config: &HybridConfig,
+        layer: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        if config.is_moe() {
+            return Err(Error::backend(
+                "replicated Qwen hybrid unit rejects routed computation",
+            ));
+        }
+        let policy = config
+            .layer_schedule
+            .get(layer)
+            .copied()
+            .ok_or_else(|| Error::backend(format!("Qwen hybrid has no layer {layer}")))?;
+        let root = format!("model.layers.{layer}");
+        let mixer = match policy {
+            HybridLayerPolicy::LinearAttention => {
+                TokenMixer::Linear(LinearAttention::new(config, layer, context)?)
+            }
+            HybridLayerPolicy::SelfAttention(_) => {
+                TokenMixer::Attention(new_attention(config, &root, context)?)
+            }
+        };
+        let norm = |field: &str| {
+            B::normalization(
+                NormalizationConstructionSpec {
+                    dimensions: config.hidden_size,
+                    epsilon: config.rms_norm_eps,
+                    scale: NormalizationScale::LearnedOffset {
+                        weight: parameter(format!("{root}.{field}.weight"))?,
+                        offset: 1.0,
+                    },
+                },
+                context,
+            )
+        };
+        Ok(Self {
+            mixer,
+            feed_forward: new_mlp(
+                config,
+                &format!("{root}.mlp"),
+                config.intermediate_size,
+                context,
+            )?,
+            input_norm: norm("input_layernorm")?,
+            post_attention_norm: norm("post_attention_layernorm")?,
+        })
+    }
+
+    pub(crate) fn forward<S>(
+        &mut self,
+        hidden: &B::Tensor,
+        mask: Option<&B::Tensor>,
+        state: &mut S,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error>
+    where
+        S: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+    {
+        let normalized = self.input_norm.forward(hidden, context)?;
+        let mixed = match &mut self.mixer {
+            TokenMixer::Linear(linear) => linear.forward(&normalized, state, context)?,
+            TokenMixer::Attention(attention) => attention.forward(
+                AttentionInput {
+                    hidden: &normalized,
+                    mask,
+                    cache: Some(&mut *state),
+                    allow_sliding_prefill: true,
+                    rotary_position: None,
+                },
+                context,
+            )?,
+        };
+        let hidden = hidden.add(&mixed, context)?;
+        let normalized = self.post_attention_norm.forward(&hidden, context)?;
+        let feed_forward = self
+            .feed_forward
+            .forward_feed_forward(&normalized, context)?;
+        hidden.add(&feed_forward, context)
+    }
+}
+
 impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Block<B> {
     /// Builds one global-geometry physical decoder layer.
     pub fn new(
@@ -463,7 +557,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Block<B> {
     }
 }
 
-fn new_attention<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>(
+fn new_attention<B: NeuralBackend>(
     config: &HybridConfig,
     root: &str,
     context: &<B::Tensor as Tensor>::Context,
@@ -533,7 +627,7 @@ fn new_attention<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>(
     )
 }
 
-fn new_mlp<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>(
+fn new_mlp<B: NeuralBackend>(
     config: &HybridConfig,
     prefix: &str,
     intermediate: i32,
@@ -568,7 +662,7 @@ fn new_mlp<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>(
     ))
 }
 
-fn new_linear<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>(
+fn new_linear<B: NeuralBackend>(
     config: &HybridConfig,
     prefix: &str,
     input: i32,

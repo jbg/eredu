@@ -34,6 +34,7 @@ struct CatalogEntry {
     metadata: TensorMetadata,
     physical_descriptor: TensorDescriptor,
     logical_last_units_per_block: Option<usize>,
+    source_encoding: crate::SourceTensorEncoding,
 }
 
 #[derive(Debug, Default)]
@@ -211,6 +212,10 @@ impl GgufWeightStoreBuilder {
                             metadata,
                             physical_descriptor: descriptor.clone(),
                             logical_last_units_per_block,
+                            source_encoding: crate::SourceTensorEncoding::Gguf {
+                                ggml_type: descriptor.ggml_type,
+                                endian: shard.endian(),
+                            },
                         },
                     );
                 }
@@ -468,11 +473,29 @@ impl CheckpointSource for GgufWeightStore {
     }
 
     fn acquire_lease(&self, request: TensorReadRequest) -> Result<CheckpointLease, StoreError> {
-        WeightStore::acquire(self, request).map(CheckpointLease::Gguf)
+        WeightStore::acquire(self, request).map(|lease| CheckpointLease::Gguf(Box::new(lease)))
     }
 
     fn source_diagnostics(&self) -> Result<WeightStoreDiagnostics, StoreError> {
         WeightStore::diagnostics(self)
+    }
+
+    fn source_provenance(
+        &self,
+        key: &str,
+    ) -> Result<crate::store::TensorSourceProvenance, StoreError> {
+        let entry = self
+            .inner
+            .catalog
+            .get(key)
+            .ok_or_else(|| StoreError::UnknownTensor { key: key.into() })?;
+        Ok(crate::store::TensorSourceProvenance {
+            catalog_key: key.to_owned(),
+            physical_tensor: entry.physical_name.clone(),
+            output: entry.original_name.clone(),
+            backing_shard: entry.metadata.backing_shard.clone(),
+            source_encoding: entry.source_encoding.clone(),
+        })
     }
 
     fn unclaimed_checkpoint_keys(&self) -> Vec<String> {

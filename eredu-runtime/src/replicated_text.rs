@@ -1,12 +1,14 @@
 //! Selection contracts for replicated text architectures.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
 };
 
 use eredu_checkpoint::{LinearFormat, SourceTensorEncoding};
-use eredu_core::{ParallelTopology, QuantizationRequest, SessionCapabilities};
+use eredu_core::{
+    cache::StateComponentPolicy, ParallelTopology, QuantizationRequest, SessionCapabilities,
+};
 use eredu_nn::{NeuralBackend, NeuralOperatorCapabilities};
 
 use crate::{
@@ -14,10 +16,10 @@ use crate::{
     LayerWeightResidency, LayeredArchitecture, RuntimeState, StateLayout,
 };
 
-/// Statically dispatched text-input seam for an ordinary layered decoder.
+/// Statically dispatched text-input seam for a layered decoder.
 ///
-/// Hybrid, routed, composite, partitioned, prediction, and realtime execution
-/// use separate extension contracts rather than adding requirements here.
+/// Routed, composite, partitioned, prediction, and realtime execution use
+/// separate extension contracts rather than adding requirements here.
 pub trait ReplicatedTextArchitecture<B, S>: LayeredArchitecture<B, S>
 where
     B: NeuralBackend,
@@ -33,8 +35,12 @@ where
 pub enum WeightLoweringKind {
     /// The admitted source encoding is retained by the executable operator.
     Direct,
+    /// An architecture-owned recipe derives the executable tensor from the admitted source.
+    Derived,
     /// Payload materialization performs an admitted transformation.
     Transform,
+    /// An architecture recipe derives a tensor that payload materialization then transforms.
+    DerivedTransform,
 }
 
 /// One exact weight lowering implemented by a backend.
@@ -159,14 +165,141 @@ pub enum WeightResidencyMechanism {
     DiskStreamed,
 }
 
-/// Mutable-state residency mechanism implemented by a backend.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+/// Physical placement selected for one semantic mutable-state component.
+#[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[non_exhaustive]
-pub enum StateResidencyMechanism {
-    /// State tensors remain on the execution device.
+pub enum StateComponentPlacement {
+    /// The mutable component remains on the execution device.
     Device,
-    /// State blocks use bounded paged storage.
+    /// The append-only component is managed by bounded paged storage.
     Paged,
+}
+
+/// Exact state component and placements implemented by a backend mechanism.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct StateComponentMechanism {
+    layer: usize,
+    component: StateComponentPolicy,
+    device_placement: Option<StateComponentPlacement>,
+    paged_placement: Option<StateComponentPlacement>,
+}
+
+impl StateComponentMechanism {
+    /// Describes support for one exact architecture-declared component.
+    pub fn new(
+        layer: usize,
+        component: StateComponentPolicy,
+        device_placement: Option<StateComponentPlacement>,
+        paged_placement: Option<StateComponentPlacement>,
+    ) -> Self {
+        Self {
+            layer,
+            component,
+            device_placement,
+            paged_placement,
+        }
+    }
+
+    /// Returns the architecture-global state layer.
+    pub const fn layer(&self) -> usize {
+        self.layer
+    }
+
+    /// Returns the exact semantic component contract.
+    pub const fn component(&self) -> &StateComponentPolicy {
+        &self.component
+    }
+
+    /// Returns the placement used for a requested state policy.
+    pub const fn placement(
+        &self,
+        policy: &CacheResidencyPolicy,
+    ) -> Option<StateComponentPlacement> {
+        match policy {
+            CacheResidencyPolicy::Device => self.device_placement,
+            CacheResidencyPolicy::Paged(_) => self.paged_placement,
+        }
+    }
+}
+
+/// Exact, family-neutral mutable-state mechanisms reported by a backend.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct StateMechanismCapabilities {
+    components: Vec<StateComponentMechanism>,
+    checkpoint: bool,
+    rollback: bool,
+    reset: bool,
+    prompt_cache: bool,
+    observation_retention: bool,
+}
+
+impl StateMechanismCapabilities {
+    /// Creates a fail-closed report for exact architecture-declared components.
+    pub fn new(components: impl IntoIterator<Item = StateComponentMechanism>) -> Self {
+        Self {
+            components: components.into_iter().collect(),
+            checkpoint: false,
+            rollback: false,
+            reset: false,
+            prompt_cache: false,
+            observation_retention: false,
+        }
+    }
+
+    /// Declares transactional checkpoint and rollback facilities.
+    pub const fn with_transactions(mut self, checkpoint: bool, rollback: bool) -> Self {
+        self.checkpoint = checkpoint;
+        self.rollback = rollback;
+        self
+    }
+
+    /// Declares complete state reset support.
+    pub const fn with_reset(mut self, supported: bool) -> Self {
+        self.reset = supported;
+        self
+    }
+
+    /// Declares prompt-cache persistence and restoration support.
+    pub const fn with_prompt_cache(mut self, supported: bool) -> Self {
+        self.prompt_cache = supported;
+        self
+    }
+
+    /// Declares that observed submissions retain every live component.
+    pub const fn with_observation_retention(mut self, supported: bool) -> Self {
+        self.observation_retention = supported;
+        self
+    }
+
+    /// Returns exact supported component mechanisms.
+    pub fn components(&self) -> &[StateComponentMechanism] {
+        &self.components
+    }
+
+    /// Returns whether state checkpoints are implemented.
+    pub const fn checkpoint(&self) -> bool {
+        self.checkpoint
+    }
+
+    /// Returns whether checkpoint rollback is implemented.
+    pub const fn rollback(&self) -> bool {
+        self.rollback
+    }
+
+    /// Returns whether complete reset is implemented.
+    pub const fn reset(&self) -> bool {
+        self.reset
+    }
+
+    /// Returns whether prompt-cache persistence is implemented.
+    pub const fn prompt_cache(&self) -> bool {
+        self.prompt_cache
+    }
+
+    /// Returns whether observation retains every live component.
+    pub const fn observation_retention(&self) -> bool {
+        self.observation_retention
+    }
 }
 
 /// Architecture-valid transform target for one linear parameter.
@@ -391,13 +524,33 @@ impl ReplicatedTextParameterRequirement {
                 "logical parameter {name:?} has an empty physical identity"
             )));
         }
-        let has_source = presence.has_physical_source();
-        if has_source
-            != (!sources.is_empty() && source_encoding.is_some() && physical_shape.is_some())
+        let has_source = !sources.is_empty();
+        let has_physical_facts = source_encoding.is_some() && physical_shape.is_some();
+        if source_encoding.is_some() != physical_shape.is_some()
+            || (has_source && !has_physical_facts)
         {
             return Err(ReplicatedTextContractError::invalid(format!(
                 "logical parameter {name:?} has inconsistent source presence"
             )));
+        }
+        match presence {
+            ReplicatedTextParameterPresence::Required
+            | ReplicatedTextParameterPresence::OptionalPresent
+                if !has_source =>
+            {
+                return Err(ReplicatedTextContractError::invalid(format!(
+                    "physical logical parameter {name:?} has no lowering source"
+                )));
+            }
+            ReplicatedTextParameterPresence::OptionalAbsent
+            | ReplicatedTextParameterPresence::Tied { .. }
+                if has_source =>
+            {
+                return Err(ReplicatedTextContractError::invalid(format!(
+                    "source-free logical parameter {name:?} has a lowering source"
+                )));
+            }
+            _ => {}
         }
         let provenance_required =
             has_source || matches!(presence, ReplicatedTextParameterPresence::Derived { .. });
@@ -413,6 +566,11 @@ impl ReplicatedTextParameterRequirement {
         {
             return Err(ReplicatedTextContractError::invalid(format!(
                 "logical parameter {name:?} has provenance outside its selected sources"
+            )));
+        }
+        if physical_sources.is_empty() && has_physical_facts {
+            return Err(ReplicatedTextContractError::invalid(format!(
+                "logical parameter {name:?} has physical facts without provenance"
             )));
         }
         if physical_shape
@@ -501,6 +659,14 @@ impl ReplicatedTextParameterRequirement {
         &self.presence
     }
 
+    /// Returns whether this logical value selects a physical source lowering.
+    ///
+    /// Architecture-derived values may retain a physical lowering source when
+    /// a recipe splits one encoded tensor into several logical parameters.
+    pub fn has_lowering_source(&self) -> bool {
+        !self.sources.is_empty()
+    }
+
     /// Returns exact transform eligibility and packing geometry.
     pub const fn transform_constraint(&self) -> ParameterTransformConstraint {
         self.transform
@@ -568,11 +734,33 @@ impl ReplicatedTextParameterRequirement {
             ParameterTransformConstraint::None => None,
             ParameterTransformConstraint::Linear { packed_axis } => Some(packed_axis),
         };
-        let packed_axis = packed_axis.or_else(|| {
-            (self.role == ReplicatedTextParameterRole::Embedding
-                && executable != LinearFormat::Dense)
-                .then(|| self.logical_shape.len() - 1)
-        });
+        let packed_axis = packed_axis
+            .or_else(|| {
+                (self.role == ReplicatedTextParameterRole::Embedding
+                    && executable != LinearFormat::Dense)
+                    .then(|| self.logical_shape.len() - 1)
+            })
+            .or_else(|| {
+                (matches!(
+                    self.presence,
+                    ReplicatedTextParameterPresence::Derived { .. }
+                ) && executable != LinearFormat::Dense)
+                    .then(|| {
+                        self.physical_shape
+                            .as_ref()
+                            .expect("derived lowering source has shape")
+                            .len()
+                            - 1
+                    })
+            });
+        let lowering_shape = if matches!(
+            self.presence,
+            ReplicatedTextParameterPresence::Derived { .. }
+        ) {
+            self.physical_shape.as_ref().unwrap_or(&self.logical_shape)
+        } else {
+            &self.logical_shape
+        };
         WeightLoweringDescriptor::new(
             self.source_encoding.clone().ok_or_else(|| {
                 ReplicatedTextContractError::invalid(format!(
@@ -587,7 +775,7 @@ impl ReplicatedTextParameterRequirement {
                     self.name
                 ))
             })?,
-            self.logical_shape.clone(),
+            lowering_shape.clone(),
             packed_axis,
         )
     }
@@ -598,6 +786,24 @@ impl ReplicatedTextParameterRequirement {
 #[error("invalid replicated text contract: {message}")]
 pub struct ReplicatedTextContractError {
     message: String,
+}
+
+/// Static state-access semantics required by an admitted replicated text graph.
+#[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[non_exhaustive]
+pub enum ReplicatedTextStateAccess {
+    /// No mutable token state.
+    Stateless,
+    /// Ordinary key/value attention state.
+    KeyValue,
+    /// Architecture-declared recurrent or convolutional components only.
+    Fixed,
+    /// Key/value attention plus architecture-declared fixed components.
+    AttentionWithFixed,
+    /// Compressed-latent attention state without fixed components.
+    CompressedAttention,
+    /// Compressed-latent attention plus architecture-declared fixed components.
+    CompressedAttentionWithFixed,
 }
 
 impl ReplicatedTextContractError {
@@ -616,6 +822,7 @@ impl ReplicatedTextContractError {
 /// Exact architecture and artifact requirements for replicated text execution.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ReplicatedTextRequirements {
+    architecture_identity: String,
     /// Optional neural operations required by the architecture equations.
     operators: NeuralOperatorCapabilities,
     /// Stable architecture-owned execution graph.
@@ -626,21 +833,37 @@ pub struct ReplicatedTextRequirements {
     group_transports: Vec<ArchitectureGroupTransport>,
     /// Complete architecture-owned mutable-state geometry.
     state_layout: StateLayout,
+    /// Static state-access semantics used by architecture traversal.
+    state_access: ReplicatedTextStateAccess,
     /// Canonical logical parameter requirements.
     parameters: Vec<ReplicatedTextParameterRequirement>,
+    derived_recipes: BTreeMap<String, eredu_checkpoint::recipe::DerivedWeightRecipe>,
+    derived_recipe_outputs: BTreeMap<String, eredu_checkpoint::recipe::RecipeMetadata>,
     grouped_operations: Vec<GroupedOperationRequirement>,
 }
 
 impl ReplicatedTextRequirements {
     /// Creates exact requirements from architecture and admitted-artifact facts only.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the constructor validates one complete immutable architecture contract"
+    )]
     pub fn new(
+        architecture_identity: impl Into<String>,
         operators: NeuralOperatorCapabilities,
         execution_graph: ExecutionGraph,
         execution_units: ExecutionUnitLayout,
         group_transports: Vec<ArchitectureGroupTransport>,
         state_layout: StateLayout,
+        state_access: ReplicatedTextStateAccess,
         parameters: Vec<ReplicatedTextParameterRequirement>,
     ) -> Result<Self, ReplicatedTextContractError> {
+        let architecture_identity = architecture_identity.into();
+        if architecture_identity.trim().is_empty() {
+            return Err(ReplicatedTextContractError::invalid(
+                "architecture identity is empty",
+            ));
+        }
         if group_transports.len() != execution_graph.groups().len() {
             return Err(ReplicatedTextContractError::invalid(format!(
                 "{} group transports do not match {} execution groups",
@@ -648,6 +871,7 @@ impl ReplicatedTextRequirements {
                 execution_graph.groups().len()
             )));
         }
+        validate_state_access_profile(&state_layout, state_access)?;
         let mut names = BTreeSet::new();
         if parameters
             .iter()
@@ -658,14 +882,62 @@ impl ReplicatedTextRequirements {
             ));
         }
         Ok(Self {
+            architecture_identity,
             operators,
             execution_graph,
             execution_units,
             group_transports,
             state_layout,
+            state_access,
             parameters,
+            derived_recipes: BTreeMap::new(),
+            derived_recipe_outputs: BTreeMap::new(),
             grouped_operations: Vec::new(),
         })
+    }
+
+    /// Attaches the exact architecture-owned derivations selected for this artifact.
+    pub fn with_derived_recipes(
+        mut self,
+        recipes: BTreeMap<String, eredu_checkpoint::recipe::DerivedWeightRecipe>,
+        outputs: BTreeMap<String, eredu_checkpoint::recipe::RecipeMetadata>,
+    ) -> Result<Self, ReplicatedTextContractError> {
+        if recipes.keys().ne(outputs.keys()) {
+            return Err(ReplicatedTextContractError::invalid(
+                "derived recipe targets and inferred outputs differ",
+            ));
+        }
+        for target in recipes.keys() {
+            let parameter = self
+                .parameters
+                .iter_mut()
+                .find(|parameter| parameter.name == *target)
+                .ok_or_else(|| {
+                    ReplicatedTextContractError::invalid(format!(
+                        "derived recipe target {target:?} is not a declared parameter"
+                    ))
+                })?;
+            if matches!(
+                parameter.presence,
+                ReplicatedTextParameterPresence::OptionalAbsent
+                    | ReplicatedTextParameterPresence::Tied { .. }
+            ) {
+                return Err(ReplicatedTextContractError::invalid(format!(
+                    "derived recipe target {target:?} has no independent artifact value"
+                )));
+            }
+            parameter.presence = ReplicatedTextParameterPresence::Derived {
+                recipe: "architecture.recipe".into(),
+            };
+        }
+        self.derived_recipes = recipes;
+        self.derived_recipe_outputs = outputs;
+        Ok(self)
+    }
+
+    /// Returns the normalized architecture identity bound during admission.
+    pub fn architecture_identity(&self) -> &str {
+        &self.architecture_identity
     }
 
     /// Declares exact grouped operations required by this architecture path.
@@ -697,14 +969,92 @@ impl ReplicatedTextRequirements {
     pub const fn state_layout(&self) -> &StateLayout {
         &self.state_layout
     }
+    /// Returns the state-access semantics used by typed traversal.
+    pub const fn state_access(&self) -> ReplicatedTextStateAccess {
+        self.state_access
+    }
     /// Returns canonical logical parameter requirements.
     pub fn parameters(&self) -> &[ReplicatedTextParameterRequirement] {
         &self.parameters
+    }
+    /// Returns exact derivations that are part of the selected artifact contract.
+    pub fn derived_recipes(
+        &self,
+    ) -> &BTreeMap<String, eredu_checkpoint::recipe::DerivedWeightRecipe> {
+        &self.derived_recipes
+    }
+    /// Returns admission-time output metadata for every exact derivation.
+    pub fn derived_recipe_outputs(
+        &self,
+    ) -> &BTreeMap<String, eredu_checkpoint::recipe::RecipeMetadata> {
+        &self.derived_recipe_outputs
     }
     /// Returns exact grouped operations required before construction.
     pub fn grouped_operations(&self) -> &[GroupedOperationRequirement] {
         &self.grouped_operations
     }
+}
+
+fn validate_state_access_profile(
+    layout: &StateLayout,
+    access: ReplicatedTextStateAccess,
+) -> Result<(), ReplicatedTextContractError> {
+    use eredu_core::cache::StateComponentRole;
+
+    let roles = (0..layout.len())
+        .flat_map(|layer| {
+            layout
+                .components(layer)
+                .expect("validated state layout exposes every layer")
+        })
+        .map(StateComponentPolicy::role)
+        .collect::<Vec<_>>();
+    let ordinary = |role| {
+        matches!(
+            role,
+            StateComponentRole::AttentionKeys | StateComponentRole::AttentionValues
+        )
+    };
+    let compressed = |role| {
+        matches!(
+            role,
+            StateComponentRole::CompressedLatent | StateComponentRole::RotaryKeys
+        )
+    };
+    let fixed = |role| matches!(role, StateComponentRole::Fixed(_));
+    let has_ordinary = roles.iter().copied().any(ordinary);
+    let has_compressed = roles.iter().copied().any(compressed);
+    let has_fixed = roles.iter().copied().any(fixed);
+    let coherent = match access {
+        ReplicatedTextStateAccess::Stateless => roles.is_empty(),
+        ReplicatedTextStateAccess::KeyValue => roles.iter().copied().all(ordinary) && has_ordinary,
+        ReplicatedTextStateAccess::Fixed => roles.iter().copied().all(fixed) && has_fixed,
+        ReplicatedTextStateAccess::AttentionWithFixed => {
+            roles
+                .iter()
+                .copied()
+                .all(|role| ordinary(role) || fixed(role))
+                && has_ordinary
+                && has_fixed
+        }
+        ReplicatedTextStateAccess::CompressedAttention => {
+            roles.iter().copied().all(compressed) && has_compressed
+        }
+        ReplicatedTextStateAccess::CompressedAttentionWithFixed => {
+            roles
+                .iter()
+                .copied()
+                .all(|role| compressed(role) || fixed(role))
+                && has_compressed
+                && has_fixed
+        }
+    };
+    if !coherent {
+        return Err(ReplicatedTextContractError::invalid(format!(
+            "state access profile {access:?} does not match component roles {roles:?}"
+        )));
+    }
+    Ok(())
 }
 
 /// One required grouped-compute mechanism.
@@ -730,8 +1080,8 @@ pub struct BackendMechanismCapabilities {
     weight_lowerings: Vec<WeightLoweringCapability>,
     /// Ordinary parameter residency mechanisms.
     weight_residencies: Vec<WeightResidencyMechanism>,
-    /// Mutable-state residency mechanisms.
-    state_residencies: Vec<StateResidencyMechanism>,
+    /// Exact mutable-state component and lifecycle mechanisms.
+    state: StateMechanismCapabilities,
     /// Exact session facilities implemented by the constructed session.
     session: SessionCapabilities,
     /// Prompt-cache persistence mechanism is available.
@@ -747,13 +1097,13 @@ impl BackendMechanismCapabilities {
         operators: NeuralOperatorCapabilities,
         weight_lowerings: Vec<WeightLoweringCapability>,
         weight_residencies: Vec<WeightResidencyMechanism>,
-        state_residencies: Vec<StateResidencyMechanism>,
+        state: StateMechanismCapabilities,
     ) -> Self {
         Self {
             operators,
             weight_lowerings,
             weight_residencies,
-            state_residencies,
+            state,
             session: SessionCapabilities::default(),
             prompt_cache: false,
             exact_completion: false,
@@ -796,9 +1146,9 @@ impl BackendMechanismCapabilities {
     pub fn weight_residencies(&self) -> &[WeightResidencyMechanism] {
         &self.weight_residencies
     }
-    /// Returns mutable-state residency mechanisms.
-    pub fn state_residencies(&self) -> &[StateResidencyMechanism] {
-        &self.state_residencies
+    /// Returns exact mutable-state component and lifecycle mechanisms.
+    pub const fn state(&self) -> &StateMechanismCapabilities {
+        &self.state
     }
     /// Returns session-observation and persistence mechanisms.
     pub const fn session(&self) -> SessionCapabilities {
@@ -948,15 +1298,102 @@ impl SelectedParameterRealization {
     }
 }
 
+/// Selected physical realization of one exact semantic state component.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct SelectedStateComponentRealization {
+    layer: usize,
+    component: StateComponentPolicy,
+    placement: StateComponentPlacement,
+}
+
+impl SelectedStateComponentRealization {
+    /// Returns the architecture-global state layer.
+    pub const fn layer(&self) -> usize {
+        self.layer
+    }
+
+    /// Returns the exact architecture-declared component contract.
+    pub const fn component(&self) -> &StateComponentPolicy {
+        &self.component
+    }
+
+    /// Returns the selected physical placement.
+    pub const fn placement(&self) -> StateComponentPlacement {
+        self.placement
+    }
+}
+
+/// Authoritative mutable-state realization selected before allocation.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct SelectedStateRealization {
+    layout: StateLayout,
+    access: ReplicatedTextStateAccess,
+    policy: CacheResidencyPolicy,
+    components: Vec<SelectedStateComponentRealization>,
+    checkpoint: bool,
+    rollback: bool,
+    reset: bool,
+    prompt_cache: bool,
+    observation_retention: bool,
+}
+
+impl SelectedStateRealization {
+    /// Returns the exact architecture-owned state layout.
+    pub const fn layout(&self) -> &StateLayout {
+        &self.layout
+    }
+
+    /// Returns the state-access semantics selected for typed traversal.
+    pub const fn access(&self) -> ReplicatedTextStateAccess {
+        self.access
+    }
+
+    /// Returns the selected residency policy.
+    pub const fn policy(&self) -> &CacheResidencyPolicy {
+        &self.policy
+    }
+
+    /// Returns exact selected component realizations in layer/component order.
+    pub fn components(&self) -> &[SelectedStateComponentRealization] {
+        &self.components
+    }
+
+    /// Returns whether state checkpoints are selected.
+    pub const fn checkpoint(&self) -> bool {
+        self.checkpoint
+    }
+
+    /// Returns whether checkpoint rollback is selected.
+    pub const fn rollback(&self) -> bool {
+        self.rollback
+    }
+
+    /// Returns whether complete reset is selected.
+    pub const fn reset(&self) -> bool {
+        self.reset
+    }
+
+    /// Returns whether prompt-cache persistence is selected.
+    pub const fn prompt_cache(&self) -> bool {
+        self.prompt_cache
+    }
+
+    /// Returns whether observation retains every live component.
+    pub const fn observation_retention(&self) -> bool {
+        self.observation_retention
+    }
+}
+
 /// Authoritative realization selected before architecture or payload construction.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct SelectedReplicatedTextRealization {
+    requirements: ReplicatedTextRequirements,
     /// Exact selected execution topology.
     topology: ParallelTopology,
     /// Selected ordinary parameter residency.
     residency: LayerWeightResidency,
-    /// Selected mutable-state implementation and its exact residency policy.
-    state: CacheResidencyPolicy,
+    /// Selected exact mutable-state implementation.
+    state: SelectedStateRealization,
     /// Exact per-parameter source, executable format, and lowering.
     parameters: Vec<SelectedParameterRealization>,
     /// Required observation facilities admitted by the backend.
@@ -969,6 +1406,10 @@ pub struct SelectedReplicatedTextRealization {
 }
 
 impl SelectedReplicatedTextRealization {
+    /// Returns the exact architecture/artifact requirements selected together.
+    pub const fn requirements(&self) -> &ReplicatedTextRequirements {
+        &self.requirements
+    }
     /// Returns the exact selected topology.
     pub const fn topology(&self) -> ParallelTopology {
         self.topology
@@ -977,8 +1418,8 @@ impl SelectedReplicatedTextRealization {
     pub const fn residency(&self) -> LayerWeightResidency {
         self.residency
     }
-    /// Returns selected mutable-state policy.
-    pub const fn state(&self) -> &CacheResidencyPolicy {
+    /// Returns the authoritative selected mutable-state realization.
+    pub const fn state(&self) -> &SelectedStateRealization {
         &self.state
     }
     /// Returns exact per-parameter realizations.
@@ -1055,12 +1496,66 @@ pub fn select_replicated_text_realization(
     {
         issues.push(format!("weight residency {residency_mechanism:?}"));
     }
-    let state_residency = match &request.state {
-        CacheResidencyPolicy::Device => StateResidencyMechanism::Device,
-        CacheResidencyPolicy::Paged(_) => StateResidencyMechanism::Paged,
-    };
-    if !capabilities.state_residencies.contains(&state_residency) {
-        issues.push(format!("state residency {state_residency:?}"));
+    let mut state_components = Vec::new();
+    for layer in 0..requirements.state_layout.len() {
+        for component in requirements
+            .state_layout
+            .components(layer)
+            .expect("state layout exposes every validated layer")
+        {
+            let matches = capabilities
+                .state
+                .components
+                .iter()
+                .filter(|mechanism| mechanism.layer == layer && mechanism.component == *component)
+                .collect::<Vec<_>>();
+            let role = component.role().stable_name();
+            match matches.as_slice() {
+                [mechanism] => match mechanism.placement(&request.state) {
+                    Some(placement) if placement_is_compatible(component, &request.state, placement) => {
+                        state_components.push(SelectedStateComponentRealization {
+                            layer,
+                            component: component.clone(),
+                            placement,
+                        });
+                    }
+                    Some(placement) => issues.push(format!(
+                        "state component {role} at layer {layer} has incompatible {placement:?} placement for {:?} and {:?} residency",
+                        request.state,
+                        component.residency()
+                    )),
+                    None => issues.push(format!(
+                        "state component {role} at layer {layer} for {:?}",
+                        request.state
+                    )),
+                },
+                [] => issues.push(format!(
+                    "state component {role} at layer {layer} with shape {:?} and dtype {:?}",
+                    component.shape(),
+                    component.dtype()
+                )),
+                _ => issues.push(format!(
+                    "unique state component mechanism {role} at layer {layer}"
+                )),
+            }
+        }
+    }
+    for (supported, name) in [
+        (capabilities.state.checkpoint, "state checkpoint"),
+        (capabilities.state.rollback, "state rollback"),
+        (capabilities.state.reset, "state reset"),
+    ] {
+        if !supported {
+            issues.push(name.into());
+        }
+    }
+    if request.prompt_cache && !capabilities.state.prompt_cache {
+        issues.push("state prompt-cache persistence".into());
+    }
+    if (request.session.output_observation() || request.session.activation_inspection())
+        && !capabilities.state.observation_retention
+    {
+        issues.push("state observation retention".into());
     }
     for (required, supported, name) in [
         (
@@ -1100,7 +1595,7 @@ pub fn select_replicated_text_realization(
             ));
             continue;
         }
-        if !parameter.presence.has_physical_source() {
+        if !parameter.has_lowering_source() {
             continue;
         }
         let candidate = match request.quantization {
@@ -1151,24 +1646,63 @@ pub fn select_replicated_text_realization(
                 .clone()
                 .expect("physical parameter has a source encoding"),
             executable,
-            lowering: lowering.kind,
+            lowering: match (&parameter.presence, lowering.kind) {
+                (
+                    ReplicatedTextParameterPresence::Derived { .. },
+                    WeightLoweringKind::Transform,
+                ) => WeightLoweringKind::DerivedTransform,
+                (ReplicatedTextParameterPresence::Derived { .. }, _) => WeightLoweringKind::Derived,
+                (_, kind) => kind,
+            },
         });
     }
     if !issues.is_empty() {
         return Err(ReplicatedTextSelectionError { issues });
     }
     Ok(SelectedReplicatedTextRealization {
+        requirements: requirements.clone(),
         topology: request
             .topology
             .unwrap_or_else(|| ParallelTopology::new(1, 1, 1, 1).expect("replicated topology")),
         residency: request.residency,
-        state: request.state.clone(),
+        state: SelectedStateRealization {
+            layout: requirements.state_layout.clone(),
+            access: requirements.state_access,
+            policy: request.state.clone(),
+            components: state_components,
+            checkpoint: true,
+            rollback: true,
+            reset: true,
+            prompt_cache: request.prompt_cache,
+            observation_retention: request.session.output_observation()
+                || request.session.activation_inspection(),
+        },
         parameters,
         session: request.session,
         prompt_cache: request.prompt_cache,
         exact_completion: request.exact_completion,
         grouped_operations: requirements.grouped_operations.clone(),
     })
+}
+
+fn placement_is_compatible(
+    component: &StateComponentPolicy,
+    policy: &CacheResidencyPolicy,
+    placement: StateComponentPlacement,
+) -> bool {
+    use eredu_core::cache::StateResidencyClass;
+
+    let expected = match (policy, component.residency()) {
+        (CacheResidencyPolicy::Device, _) => StateComponentPlacement::Device,
+        (CacheResidencyPolicy::Paged(_), StateResidencyClass::SealablePaged) => {
+            StateComponentPlacement::Paged
+        }
+        (
+            CacheResidencyPolicy::Paged(_),
+            StateResidencyClass::AlwaysDeviceMutable | StateResidencyClass::LayerScopedOffloadable,
+        ) => StateComponentPlacement::Device,
+    };
+    placement == expected
 }
 
 #[cfg(test)]
@@ -1180,7 +1714,13 @@ mod tests {
         ExecutionUnitLayout, LayerwiseLoadOptions, StateLayout,
     };
     use eredu_checkpoint::{AffineQuantization, StoredDtype};
-    use eredu_core::{cache::LayerCachePolicy, AttentionPolicy, LayerSchedule};
+    use eredu_core::{
+        cache::{
+            LayerCachePolicy, MutableStateResidency, StateTensorDimension, StateTensorDtype,
+            StateTensorPolicy, StateTensorRole,
+        },
+        AttentionPolicy, LayerSchedule,
+    };
 
     fn paged_state() -> CacheResidencyPolicy {
         CacheResidencyPolicy::Paged(
@@ -1199,6 +1739,7 @@ mod tests {
             ExecutionGraph::new(vec![ExecutionGroupSpec::root("decoder")], "decoder").unwrap();
         let execution_units = ExecutionUnitLayout::new(&graph, [1]).unwrap();
         ReplicatedTextRequirements::new(
+            "test.replicated-text",
             NeuralOperatorCapabilities::EXP,
             graph,
             execution_units,
@@ -1219,6 +1760,7 @@ mod tests {
                 .unwrap(),
             )
             .unwrap(),
+            ReplicatedTextStateAccess::KeyValue,
             vec![
                 ReplicatedTextParameterRequirement::new(
                     "model.layers.0.mlp.weight",
@@ -1360,6 +1902,40 @@ mod tests {
 
     fn capabilities() -> BackendMechanismCapabilities {
         let source = SourceTensorEncoding::Safetensors(StoredDtype::F16);
+        let requirements = requirements();
+        let state = StateMechanismCapabilities::new(
+            (0..requirements.state_layout().len()).flat_map(|layer| {
+                requirements
+                    .state_layout()
+                    .components(layer)
+                    .unwrap()
+                    .iter()
+                    .cloned()
+                    .map(move |component| {
+                        let paged = match component.role() {
+                            eredu_core::cache::StateComponentRole::AttentionKeys
+                            | eredu_core::cache::StateComponentRole::AttentionValues
+                            | eredu_core::cache::StateComponentRole::CompressedLatent
+                            | eredu_core::cache::StateComponentRole::RotaryKeys => {
+                                StateComponentPlacement::Paged
+                            }
+                            eredu_core::cache::StateComponentRole::Fixed(_) => {
+                                StateComponentPlacement::Device
+                            }
+                        };
+                        StateComponentMechanism::new(
+                            layer,
+                            component,
+                            Some(StateComponentPlacement::Device),
+                            Some(paged),
+                        )
+                    })
+            }),
+        )
+        .with_transactions(true, true)
+        .with_reset(true)
+        .with_prompt_cache(true)
+        .with_observation_retention(true);
         BackendMechanismCapabilities::new(
             NeuralOperatorCapabilities::EXP,
             vec![
@@ -1402,10 +1978,7 @@ mod tests {
                 WeightResidencyMechanism::Windowed,
                 WeightResidencyMechanism::DiskStreamed,
             ],
-            vec![
-                StateResidencyMechanism::Device,
-                StateResidencyMechanism::Paged,
-            ],
+            state,
         )
         .with_session(SessionCapabilities::new(true, true, true))
         .with_prompt_cache(true)
@@ -1491,7 +2064,8 @@ mod tests {
             left.residency(),
             LayerWeightResidency::DenseDiskStream(disk)
         );
-        assert_eq!(left.state(), &paged_state());
+        assert_eq!(left.state().policy(), &paged_state());
+        assert_eq!(left.state().layout(), requirements().state_layout());
         assert_eq!(left.parameters().len(), 2);
         assert_eq!(requirements().parameters().len(), 3);
         assert!(matches!(
@@ -1523,7 +2097,7 @@ mod tests {
             NeuralOperatorCapabilities::NONE,
             Vec::new(),
             Vec::new(),
-            Vec::new(),
+            StateMechanismCapabilities::new(Vec::new()),
         );
         let error = select_replicated_text_realization(
             &requirements(),
@@ -1539,6 +2113,107 @@ mod tests {
             .issues()
             .iter()
             .any(|issue| issue.contains("weight lowering")));
+    }
+
+    #[test]
+    fn selection_rejects_paged_fixed_component_placement_even_when_reported() {
+        let fixed = StateTensorPolicy::new(
+            StateTensorRole::Recurrent,
+            vec![
+                StateTensorDimension::Batch,
+                StateTensorDimension::fixed(8).unwrap(),
+            ],
+            StateTensorDtype::Float32,
+            MutableStateResidency::LayerScopedOffloadable,
+        )
+        .unwrap();
+        let mut requirements = requirements();
+        requirements.state_layout = StateLayout::new(
+            LayerSchedule::new(
+                1,
+                vec![LayerCachePolicy::key_value_with_fixed_state(
+                    AttentionPolicy::Full,
+                    1,
+                    8,
+                    vec![fixed],
+                )
+                .unwrap()],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        requirements.state_access = ReplicatedTextStateAccess::AttentionWithFixed;
+        let mut capabilities = capabilities();
+        capabilities.state.components = (0..requirements.state_layout.len())
+            .flat_map(|layer| {
+                requirements
+                    .state_layout
+                    .components(layer)
+                    .unwrap()
+                    .iter()
+                    .cloned()
+                    .map(move |component| {
+                        StateComponentMechanism::new(
+                            layer,
+                            component,
+                            Some(StateComponentPlacement::Device),
+                            Some(StateComponentPlacement::Paged),
+                        )
+                    })
+            })
+            .collect();
+
+        let error = select_replicated_text_realization(
+            &requirements,
+            &request(LayerWeightResidency::FullyResident),
+            &capabilities,
+        )
+        .unwrap_err();
+        assert!(error
+            .issues()
+            .iter()
+            .any(|issue| issue.contains("incompatible Paged placement")));
+    }
+
+    #[test]
+    fn requirements_reject_state_layout_and_access_profile_mismatch() {
+        let fixed = StateTensorPolicy::new(
+            StateTensorRole::Recurrent,
+            vec![
+                StateTensorDimension::Batch,
+                StateTensorDimension::fixed(8).unwrap(),
+            ],
+            StateTensorDtype::Float32,
+            MutableStateResidency::LayerScopedOffloadable,
+        )
+        .unwrap();
+        let layout = StateLayout::new(
+            LayerSchedule::new(
+                1,
+                vec![LayerCachePolicy::key_value_with_fixed_state(
+                    AttentionPolicy::Full,
+                    1,
+                    8,
+                    vec![fixed],
+                )
+                .unwrap()],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let base = requirements();
+        let error = ReplicatedTextRequirements::new(
+            base.architecture_identity,
+            base.operators,
+            base.execution_graph,
+            base.execution_units,
+            base.group_transports,
+            layout,
+            ReplicatedTextStateAccess::KeyValue,
+            base.parameters,
+        )
+        .unwrap_err();
+        assert!(error.message().contains("does not match component roles"));
     }
 
     #[test]

@@ -595,7 +595,7 @@ impl CompressedLatentCache {
                 ));
             }
         }
-        self.clone_from(checkpoint);
+        *self = checkpoint.deep_clone_state()?;
         Ok(())
     }
 
@@ -1427,7 +1427,7 @@ impl LiveKeyValueCache {
     ) -> Result<(), Exception> {
         match (self, checkpoint) {
             (Self::Resident(cache), Self::Resident(previous)) => {
-                cache.clone_from(previous);
+                *cache = previous.deep_clone_state()?;
                 Ok(())
             }
             (Self::Paged(cache), Self::Paged(previous)) => {
@@ -1558,6 +1558,13 @@ impl PagedKeyValueCache {
         clone.tail_keys = clone_array(&self.tail_keys)?;
         clone.tail_values = clone_array(&self.tail_values)?;
         Ok(clone)
+    }
+
+    /// Snapshots append-only local state while retaining its exact array views.
+    /// Appends replace tails rather than mutating them, so the shared views are
+    /// immutable for the lifetime of the checkpoint.
+    pub fn checkpoint_clone_state(&self) -> Self {
+        self.clone()
     }
 
     /// Captures the shared-manager frontier required to discard one
@@ -2768,6 +2775,17 @@ impl ConcatKeyValueCache {
             .map(|array| array.clone().deep_clone())
             .transpose()?;
         Ok(cache)
+    }
+
+    /// Snapshots the ordinary append-only cache without changing array layout.
+    /// Capacity-backed caches can update storage in place and therefore still
+    /// require an independent data copy.
+    pub fn checkpoint_clone_state(&self) -> Result<Self, Exception> {
+        if self.step <= 1 {
+            Ok(self.clone())
+        } else {
+            self.deep_clone_state()
+        }
     }
 
     /// Creates a cache for exact causal sliding-window attention.

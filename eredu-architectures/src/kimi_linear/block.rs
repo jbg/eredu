@@ -2,7 +2,8 @@
 
 use eredu_nn::{
     BlockwiseAttentionBackend, CompressedAttentionCache, Error, GroupedNeuralBackend,
-    NormalizationConstructionSpec, NormalizationOperator, ParameterSpec, Parameterized, Tensor,
+    NeuralBackend, NormalizationConstructionSpec, NormalizationOperator, ParameterSpec,
+    Parameterized, Tensor,
 };
 use eredu_runtime::{RoutedExpertProvider, RuntimeStateComponents};
 
@@ -13,7 +14,7 @@ use super::{AttentionKind, FeedForward, KimiDeltaAttention, KimiLatentAttention,
 #[parameterized(tensor = "B::Tensor")]
 pub enum TokenMixer<B>
 where
-    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAttentionBackend,
+    B: NeuralBackend + BlockwiseAttentionBackend,
 {
     /// Kimi Delta Attention.
     Kda(KimiDeltaAttention<B>),
@@ -36,6 +37,144 @@ where
     pub input_norm: B::Normalization,
     /// Feed-forward pre-normalization.
     pub post_attention_norm: B::Normalization,
+}
+
+/// Dense-only Kimi Linear unit used by replicated text composition.
+#[derive(Debug, Clone, Parameterized)]
+#[parameterized(tensor = "B::Tensor")]
+pub(crate) struct ReplicatedBlock<B: NeuralBackend + BlockwiseAttentionBackend> {
+    mixer: TokenMixer<B>,
+    feed_forward: super::moe::DenseSwiGlu<B>,
+    input_norm: B::Normalization,
+    post_attention_norm: B::Normalization,
+}
+
+#[derive(Debug, Clone, Parameterized)]
+#[parameterized(tensor = "B::Tensor")]
+pub(crate) struct KdaReplicatedBlock<B: NeuralBackend> {
+    mixer: KimiDeltaAttention<B>,
+    feed_forward: super::moe::DenseSwiGlu<B>,
+    input_norm: B::Normalization,
+    post_attention_norm: B::Normalization,
+}
+
+impl<B: NeuralBackend> KdaReplicatedBlock<B> {
+    pub(crate) fn new(
+        args: &ModelArgs,
+        layer: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        let policy = args
+            .layer_policy(layer)
+            .ok_or_else(|| Error::backend(format!("Kimi Linear has no layer {layer}")))?;
+        if policy.feed_forward != super::FeedForwardPolicy::Dense
+            || policy.attention != AttentionKind::Kda
+        {
+            return Err(Error::backend(
+                "fixed-state Kimi unit requires dense KDA policy",
+            ));
+        }
+        let norm = |field: &str| {
+            B::normalization(
+                NormalizationConstructionSpec::learned(
+                    args.hidden_size,
+                    args.rms_norm_eps,
+                    ParameterSpec::trainable(format!("model.layers.{layer}.{field}.weight"))
+                        .map_err(Error::backend)?,
+                ),
+                context,
+            )
+        };
+        Ok(Self {
+            mixer: KimiDeltaAttention::new(args, layer, context)?,
+            feed_forward: super::moe::DenseSwiGlu::new(
+                args,
+                &format!("model.layers.{layer}.mlp"),
+                args.intermediate_size,
+                context,
+            )?,
+            input_norm: norm("input_layernorm")?,
+            post_attention_norm: norm("post_attention_layernorm")?,
+        })
+    }
+
+    pub(crate) fn forward<C: RuntimeStateComponents<B>>(
+        &mut self,
+        hidden: &B::Tensor,
+        state: &mut C,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        let normalized = self.input_norm.forward(hidden, context)?;
+        let mixed = self.mixer.forward(&normalized, state, context)?;
+        let hidden = hidden.add(&mixed, context)?;
+        let normalized = self.post_attention_norm.forward(&hidden, context)?;
+        let feed_forward = self.feed_forward.forward(&normalized, context)?;
+        hidden.add(&feed_forward, context)
+    }
+}
+
+impl<B: NeuralBackend + BlockwiseAttentionBackend> ReplicatedBlock<B> {
+    pub(crate) fn new(
+        args: &ModelArgs,
+        layer: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        let policy = args
+            .layer_policy(layer)
+            .ok_or_else(|| Error::backend(format!("Kimi Linear has no layer {layer}")))?;
+        if policy.feed_forward != super::FeedForwardPolicy::Dense {
+            return Err(Error::backend(
+                "replicated Kimi Linear unit requires a dense feed-forward policy",
+            ));
+        }
+        let mixer = match policy.attention {
+            AttentionKind::Kda => TokenMixer::Kda(KimiDeltaAttention::new(args, layer, context)?),
+            AttentionKind::Mla => TokenMixer::Mla(KimiLatentAttention::new(args, layer, context)?),
+        };
+        let norm = |field: &str| {
+            B::normalization(
+                NormalizationConstructionSpec::learned(
+                    args.hidden_size,
+                    args.rms_norm_eps,
+                    ParameterSpec::trainable(format!("model.layers.{layer}.{field}.weight"))
+                        .map_err(Error::backend)?,
+                ),
+                context,
+            )
+        };
+        Ok(Self {
+            mixer,
+            feed_forward: super::moe::DenseSwiGlu::new(
+                args,
+                &format!("model.layers.{layer}.mlp"),
+                args.intermediate_size,
+                context,
+            )?,
+            input_norm: norm("input_layernorm")?,
+            post_attention_norm: norm("post_attention_layernorm")?,
+        })
+    }
+
+    pub(crate) fn forward<C>(
+        &mut self,
+        hidden: &B::Tensor,
+        mask: Option<&B::Tensor>,
+        state: &mut C,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error>
+    where
+        C: RuntimeStateComponents<B> + CompressedAttentionCache<B::Tensor>,
+    {
+        let normalized = self.input_norm.forward(hidden, context)?;
+        let mixed = match &mut self.mixer {
+            TokenMixer::Kda(mixer) => mixer.forward(&normalized, state, context)?,
+            TokenMixer::Mla(mixer) => mixer.forward(&normalized, mask, Some(state), context)?,
+        };
+        let hidden = hidden.add(&mixed, context)?;
+        let normalized = self.post_attention_norm.forward(&hidden, context)?;
+        let feed_forward = self.feed_forward.forward(&normalized, context)?;
+        hidden.add(&feed_forward, context)
+    }
 }
 
 /// Placement-resolved local widths for one Kimi block.

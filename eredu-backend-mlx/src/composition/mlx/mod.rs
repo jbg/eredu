@@ -39,6 +39,7 @@ pub(crate) mod path_instrumentation {
     #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
     pub(crate) struct Counts {
         pub(crate) architecture_constructions: usize,
+        pub(crate) state_allocations: usize,
         pub(crate) payload_opens: usize,
         pub(crate) forwards: usize,
     }
@@ -67,6 +68,14 @@ pub(crate) mod path_instrumentation {
         COUNTS.with(|cell| {
             let mut counts = cell.get();
             counts.payload_opens += 1;
+            cell.set(counts);
+        });
+    }
+
+    pub(crate) fn state_allocation() {
+        COUNTS.with(|cell| {
+            let mut counts = cell.get();
+            counts.state_allocations += 1;
             cell.set(counts);
         });
     }

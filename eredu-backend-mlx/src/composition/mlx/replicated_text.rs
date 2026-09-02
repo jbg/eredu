@@ -5,15 +5,17 @@ use std::{marker::PhantomData, path::Path, sync::Arc};
 use eredu_checkpoint::{store::CheckpointSource, LinearFormat, SourceTensorEncoding, StoredDtype};
 use eredu_core::cache::{
     PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
+    StateComponentRole,
 };
 use eredu_nn::NeuralBackend;
 use eredu_runtime::{
-    BackendMechanismCapabilities, CacheResidencyPolicy, CacheResidencyReport,
-    DenseDiskStreamReport, GroupedOperationRequirement, LayerwiseRuntime,
-    ReplicatedTextArchitecture, ReplicatedTextRequirements, ReplicatedTextSelectionRequest,
-    ResidencyReport, RuntimeState, SelectedReplicatedTextRealization, StateResidencyMechanism,
-    WeightLoweringCapability, WeightLoweringDescriptor, WeightLoweringKind,
-    WeightResidencyMechanism,
+    ArchitectureStateFactory, BackendMechanismCapabilities, CacheResidencyPolicy,
+    CacheResidencyReport, DenseDiskStreamReport, GroupedOperationRequirement, LayerRuntimeState,
+    LayerwiseRuntime, ReplicatedTextArchitecture, ReplicatedTextRequirements,
+    ReplicatedTextSelectionRequest, ResidencyReport, SelectedReplicatedTextRealization,
+    SelectedStateRealization, StateComponentMechanism, StateComponentPlacement,
+    StateMechanismCapabilities, WeightLoweringCapability, WeightLoweringDescriptor,
+    WeightLoweringKind, WeightResidencyMechanism,
 };
 use safemlx::{error::Exception, ops::indexing::TryIndexOp, Array, Stream};
 
@@ -26,10 +28,12 @@ use crate::{
         nn::shared::MlxNeuralBackend,
         runtime::{
             cache::{
-                residency::{open_prompt_cache, CacheResidencyManager},
-                state::MlxKeyValueState,
+                residency::{
+                    load_prompt_cache_state_tensors, open_prompt_cache, CacheResidencyManager,
+                },
+                state::{MlxHybridState, MlxKeyValueState},
             },
-            execution::generic::{prepare_layerwise_policy, MlxLayerwisePolicy, MlxResidentPolicy},
+            execution::generic::{MlxLayerwisePolicy, MlxResidentPolicy},
             media::input,
         },
     },
@@ -37,9 +41,17 @@ use crate::{
     MlxTensor,
 };
 
+use crate::backend::nn::shared::MlxModule;
+use crate::backend::runtime::checkpoint::binding::{
+    build_module_bindings_with_recipes_excluding,
+    build_neutral_module_bindings_with_recipes_excluding,
+};
 use crate::backend::runtime::execution::{
-    generic::{architecture_execution_layout, construct_architecture_unit},
-    layerwise::quantize_parameterized_store,
+    generic::{
+        architecture_execution_layout, construct_architecture_unit,
+        prepare_layerwise_policy_with_bindings,
+    },
+    layerwise::quantize_module_store_with_bindings,
 };
 
 use eredu_architectures::replicated_text::{
@@ -63,7 +75,7 @@ pub(crate) fn capabilities(
 ) -> BackendMechanismCapabilities {
     let mut weight_lowerings = Vec::new();
     for parameter in requirements.parameters() {
-        if !parameter.presence().has_physical_source() {
+        if !parameter.has_lowering_source() {
             continue;
         }
         let requested = request
@@ -90,6 +102,35 @@ pub(crate) fn capabilities(
             }
         }
     }
+    let state =
+        StateMechanismCapabilities::new((0..requirements.state_layout().len()).flat_map(|layer| {
+            requirements
+                .state_layout()
+                .components(layer)
+                .expect("validated state layout exposes every layer")
+                .iter()
+                .filter_map(move |component| {
+                    let paged = match component.role() {
+                        StateComponentRole::AttentionKeys
+                        | StateComponentRole::AttentionValues
+                        | StateComponentRole::CompressedLatent
+                        | StateComponentRole::RotaryKeys => StateComponentPlacement::Paged,
+                        StateComponentRole::Fixed(_) => StateComponentPlacement::Device,
+                    };
+                    mlx_supports_state_component(component).then(|| {
+                        StateComponentMechanism::new(
+                            layer,
+                            component.clone(),
+                            Some(StateComponentPlacement::Device),
+                            Some(paged),
+                        )
+                    })
+                })
+        }))
+        .with_transactions(true, true)
+        .with_reset(true)
+        .with_prompt_cache(matches!(request.state(), CacheResidencyPolicy::Paged(_)))
+        .with_observation_retention(true);
     BackendMechanismCapabilities::new(
         MlxNeuralBackend::OPERATOR_CAPABILITIES,
         weight_lowerings,
@@ -98,16 +139,58 @@ pub(crate) fn capabilities(
             WeightResidencyMechanism::Windowed,
             WeightResidencyMechanism::DiskStreamed,
         ],
-        vec![
-            StateResidencyMechanism::Device,
-            StateResidencyMechanism::Paged,
-        ],
+        state,
     )
     .with_session(eredu_core::SessionCapabilities::new(true, true, true))
     .with_grouped_operations(GROUPED_OPERATION_CAPABILITIES)
     .with_prompt_cache(true)
     .with_exact_completion(true)
 }
+
+fn mlx_supports_state_component(component: &eredu_core::cache::StateComponentPolicy) -> bool {
+    use eredu_core::cache::{StateTensorDimension, StateTensorDtype};
+
+    !component.shape().is_empty()
+        && component.shape().iter().all(|dimension| match dimension {
+            StateTensorDimension::Fixed(value)
+            | StateTensorDimension::PrefixTokensDiv(value)
+            | StateTensorDimension::PrefixTokensRem(value) => value.get() > 0,
+            StateTensorDimension::Batch | StateTensorDimension::PrefixTokens => true,
+            StateTensorDimension::Scalar => component.shape().len() == 1,
+        })
+        && matches!(
+            component.dtype(),
+            StateTensorDtype::Floating
+                | StateTensorDtype::Float32
+                | StateTensorDtype::Int32
+                | StateTensorDtype::Uint32
+        )
+}
+
+#[cfg(test)]
+type StatePresenceSnapshot = Vec<(i32, Vec<(eredu_core::cache::StateTensorRole, bool)>)>;
+
+#[cfg(test)]
+type FixedNumericStateSnapshot = Vec<(
+    usize,
+    eredu_core::cache::StateTensorRole,
+    Vec<i32>,
+    Vec<f32>,
+)>;
+
+#[cfg(test)]
+type RetainedNumericStateSnapshot = Vec<(Vec<i32>, Vec<f32>)>;
+
+#[cfg(test)]
+type CheckpointRestoreProbe = (
+    StatePresenceSnapshot,
+    StatePresenceSnapshot,
+    StatePresenceSnapshot,
+    FixedNumericStateSnapshot,
+    FixedNumericStateSnapshot,
+    FixedNumericStateSnapshot,
+    Vec<f32>,
+);
 
 /// Backend-private erased operations for a paired architecture and mutable state.
 pub trait ErasedReplicatedTextExecutable {
@@ -116,6 +199,16 @@ pub trait ErasedReplicatedTextExecutable {
     fn selected_session_binding(&self) -> &SelectedSessionBinding;
     #[cfg(test)]
     fn selected_residency(&self) -> eredu_runtime::LayerWeightResidency;
+    #[cfg(test)]
+    fn state_snapshot(&self) -> StatePresenceSnapshot;
+    #[cfg(test)]
+    fn fixed_numeric_state_snapshot(&self) -> Result<FixedNumericStateSnapshot, Exception>;
+    #[cfg(test)]
+    fn checkpoint_restore_probe(
+        &mut self,
+        tokens: &Array,
+        stream: &Stream,
+    ) -> Result<CheckpointRestoreProbe, Error>;
     fn residency_report(&self) -> Result<Option<ResidencyReport>, Error>;
     fn dense_stream_report(&self) -> Result<Option<DenseDiskStreamReport>, Error>;
     fn materialization_report(&self) -> Option<&eredu_runtime::WeightMaterializationReport>;
@@ -179,44 +272,375 @@ impl SelectedSessionBinding {
         }
         Ok(())
     }
+
+    fn prompt_cache(&self) -> bool {
+        self.prompt_cache
+    }
 }
 
-type ResidentRuntime<A> = LayerwiseRuntime<
+struct MlxKeyValueStateFactory<'a> {
+    selected: &'a SelectedStateRealization,
+}
+
+impl ArchitectureStateFactory<MlxNeuralBackend> for MlxKeyValueStateFactory<'_> {
+    type State = MlxKeyValueState;
+    type Error = Error;
+
+    fn realize(&mut self, layout: &eredu_runtime::StateLayout) -> Result<Self::State, Self::Error> {
+        validate_selected_state(self.selected, layout)?;
+        #[cfg(test)]
+        super::path_instrumentation::state_allocation();
+        match self.selected.policy() {
+            CacheResidencyPolicy::Device => {
+                MlxKeyValueState::device(layout.clone()).map_err(Into::into)
+            }
+            CacheResidencyPolicy::Paged(options) => MlxKeyValueState::paged(
+                layout.clone(),
+                CacheResidencyManager::new(options.clone())
+                    .map_err(|error| Error::Parallel(error.to_string()))?,
+                None,
+            )
+            .map_err(Into::into),
+        }
+    }
+}
+
+struct MlxHybridStateFactory<'a> {
+    selected: &'a SelectedStateRealization,
+}
+
+impl ArchitectureStateFactory<MlxNeuralBackend> for MlxHybridStateFactory<'_> {
+    type State = MlxHybridState;
+    type Error = Error;
+
+    fn realize(&mut self, layout: &eredu_runtime::StateLayout) -> Result<Self::State, Self::Error> {
+        validate_selected_state(self.selected, layout)?;
+        #[cfg(test)]
+        super::path_instrumentation::state_allocation();
+        match self.selected.policy() {
+            CacheResidencyPolicy::Device => {
+                MlxHybridState::device(layout.clone()).map_err(Into::into)
+            }
+            CacheResidencyPolicy::Paged(options) => MlxHybridState::paged(
+                layout.clone(),
+                CacheResidencyManager::new(options.clone())
+                    .map_err(|error| Error::Parallel(error.to_string()))?,
+                None,
+            )
+            .map_err(Into::into),
+        }
+    }
+}
+
+fn validate_selected_state(
+    selected: &SelectedStateRealization,
+    layout: &eredu_runtime::StateLayout,
+) -> Result<(), Error> {
+    if selected.layout() != layout {
+        return Err(Error::ArchitectureModel(
+            "selected state layout differs from constructed architecture".into(),
+        ));
+    }
+    let expected = (0..layout.len())
+        .flat_map(|layer| {
+            layout
+                .components(layer)
+                .expect("validated state layout exposes every layer")
+                .iter()
+                .map(move |component| {
+                    let placement = match (selected.policy(), component.role()) {
+                        (CacheResidencyPolicy::Device, _) => StateComponentPlacement::Device,
+                        (
+                            CacheResidencyPolicy::Paged(_),
+                            StateComponentRole::AttentionKeys
+                            | StateComponentRole::AttentionValues
+                            | StateComponentRole::CompressedLatent
+                            | StateComponentRole::RotaryKeys,
+                        ) => StateComponentPlacement::Paged,
+                        (CacheResidencyPolicy::Paged(_), StateComponentRole::Fixed(_)) => {
+                            StateComponentPlacement::Device
+                        }
+                    };
+                    (layer, component, placement)
+                })
+        })
+        .collect::<Vec<_>>();
+    let exact = selected.components().len() == expected.len()
+        && selected
+            .components()
+            .iter()
+            .zip(expected)
+            .all(|(actual, expected)| {
+                actual.layer() == expected.0
+                    && actual.component() == expected.1
+                    && actual.placement() == expected.2
+            });
+    if !exact {
+        return Err(Error::ArchitectureModel(
+            "selected state component realization differs from MLX mechanisms".into(),
+        ));
+    }
+    if !selected.checkpoint() || !selected.rollback() || !selected.reset() {
+        return Err(Error::ArchitectureModel(
+            "selected state lifecycle omits required replicated facilities".into(),
+        ));
+    }
+    Ok(())
+}
+
+trait MlxReplicatedState: LayerRuntimeState<MlxNeuralBackend> + Sized {
+    fn realize(selected: &SelectedStateRealization) -> Result<Self, Error>;
+    fn load_prompt_cache(
+        selected: &SelectedStateRealization,
+        directory: &Path,
+        expected: &PromptCacheDescriptor,
+        identity: &PromptCacheModelIdentity,
+        prefix_token_ids: &[u32],
+        stream: &Stream,
+    ) -> Result<(Self, PromptCacheManifest), Error>;
+    fn save_prompt_cache(
+        &mut self,
+        destination: &Path,
+        descriptor: PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: &PromptCacheOptions,
+    ) -> Result<PromptCacheManifest, Error>;
+    fn residency_report(&self) -> Result<Option<CacheResidencyReport>, Exception>;
+    #[cfg(test)]
+    fn deep_checkpoint(&self) -> Result<Self, Exception>;
+    #[cfg(test)]
+    fn restore_checkpoint(&mut self, checkpoint: &Self, stream: &Stream) -> Result<(), Exception>;
+    #[cfg(test)]
+    fn state_snapshot(&self) -> Vec<(i32, Vec<(eredu_core::cache::StateTensorRole, bool)>)>;
+    #[cfg(test)]
+    fn fixed_numeric_snapshot(
+        &self,
+    ) -> Result<
+        Vec<(
+            usize,
+            eredu_core::cache::StateTensorRole,
+            Vec<i32>,
+            Vec<f32>,
+        )>,
+        Exception,
+    >;
+    #[cfg(test)]
+    fn retained_numeric_snapshot(&self) -> Result<RetainedNumericStateSnapshot, Exception>;
+}
+
+impl MlxReplicatedState for MlxKeyValueState {
+    fn realize(selected: &SelectedStateRealization) -> Result<Self, Error> {
+        MlxKeyValueStateFactory { selected }.realize(selected.layout())
+    }
+
+    fn load_prompt_cache(
+        selected: &SelectedStateRealization,
+        directory: &Path,
+        expected: &PromptCacheDescriptor,
+        identity: &PromptCacheModelIdentity,
+        prefix_token_ids: &[u32],
+        _stream: &Stream,
+    ) -> Result<(Self, PromptCacheManifest), Error> {
+        let CacheResidencyPolicy::Paged(options) = selected.policy() else {
+            return Err(Error::Parallel(
+                "prompt-cache loading requires selected paged state".into(),
+            ));
+        };
+        let (manager, manifest) = open_prompt_cache(
+            directory,
+            expected,
+            identity,
+            prefix_token_ids,
+            options.clone(),
+        )
+        .map_err(|error| Error::Parallel(error.to_string()))?;
+        let state = MlxKeyValueState::paged(selected.layout().clone(), manager, None)?;
+        Ok((state, manifest))
+    }
+
+    fn save_prompt_cache(
+        &mut self,
+        destination: &Path,
+        descriptor: PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: &PromptCacheOptions,
+    ) -> Result<PromptCacheManifest, Error> {
+        MlxKeyValueState::save_prompt_cache(
+            self,
+            destination,
+            descriptor,
+            prefix_token_ids,
+            options,
+        )
+        .map_err(Into::into)
+    }
+
+    fn residency_report(&self) -> Result<Option<CacheResidencyReport>, Exception> {
+        MlxKeyValueState::residency_report(self)
+    }
+
+    #[cfg(test)]
+    fn deep_checkpoint(&self) -> Result<Self, Exception> {
+        self.deep_clone_state()
+    }
+
+    #[cfg(test)]
+    fn restore_checkpoint(&mut self, checkpoint: &Self, stream: &Stream) -> Result<(), Exception> {
+        MlxKeyValueState::restore_checkpoint(self, checkpoint, stream)
+    }
+
+    #[cfg(test)]
+    fn state_snapshot(&self) -> Vec<(i32, Vec<(eredu_core::cache::StateTensorRole, bool)>)> {
+        self.as_ref()
+            .iter()
+            .map(|layer| (eredu_nn::AttentionCache::offset(layer), Vec::new()))
+            .collect()
+    }
+
+    #[cfg(test)]
+    fn fixed_numeric_snapshot(
+        &self,
+    ) -> Result<
+        Vec<(
+            usize,
+            eredu_core::cache::StateTensorRole,
+            Vec<i32>,
+            Vec<f32>,
+        )>,
+        Exception,
+    > {
+        Ok(Vec::new())
+    }
+
+    #[cfg(test)]
+    fn retained_numeric_snapshot(&self) -> Result<RetainedNumericStateSnapshot, Exception> {
+        Ok(Vec::new())
+    }
+}
+
+impl MlxReplicatedState for MlxHybridState {
+    fn realize(selected: &SelectedStateRealization) -> Result<Self, Error> {
+        MlxHybridStateFactory { selected }.realize(selected.layout())
+    }
+
+    fn load_prompt_cache(
+        selected: &SelectedStateRealization,
+        directory: &Path,
+        expected: &PromptCacheDescriptor,
+        identity: &PromptCacheModelIdentity,
+        prefix_token_ids: &[u32],
+        stream: &Stream,
+    ) -> Result<(Self, PromptCacheManifest), Error> {
+        let CacheResidencyPolicy::Paged(options) = selected.policy() else {
+            return Err(Error::Parallel(
+                "prompt-cache loading requires selected paged state".into(),
+            ));
+        };
+        let (manager, manifest) = open_prompt_cache(
+            directory,
+            expected,
+            identity,
+            prefix_token_ids,
+            options.clone(),
+        )
+        .map_err(|error| Error::Parallel(error.to_string()))?;
+        let tensors = load_prompt_cache_state_tensors(directory, &manifest, stream)
+            .map_err(|error| Error::Parallel(error.to_string()))?;
+        let mut state = MlxHybridState::paged(selected.layout().clone(), manager, None)?;
+        state.restore_prompt_cache_state(
+            tensors,
+            i32::try_from(prefix_token_ids.len())
+                .map_err(|_| Error::Parallel("prompt-cache prefix exceeds i32".into()))?,
+            identity.layer_prefix_offsets(),
+        )?;
+        Ok((state, manifest))
+    }
+
+    fn save_prompt_cache(
+        &mut self,
+        destination: &Path,
+        descriptor: PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: &PromptCacheOptions,
+    ) -> Result<PromptCacheManifest, Error> {
+        MlxHybridState::save_prompt_cache(self, destination, descriptor, prefix_token_ids, options)
+            .map_err(Into::into)
+    }
+
+    fn residency_report(&self) -> Result<Option<CacheResidencyReport>, Exception> {
+        MlxHybridState::residency_report(self)
+    }
+
+    #[cfg(test)]
+    fn deep_checkpoint(&self) -> Result<Self, Exception> {
+        self.deep_clone_state()
+    }
+
+    #[cfg(test)]
+    fn restore_checkpoint(&mut self, checkpoint: &Self, stream: &Stream) -> Result<(), Exception> {
+        MlxHybridState::restore_checkpoint(self, checkpoint, stream)
+    }
+
+    #[cfg(test)]
+    fn state_snapshot(&self) -> Vec<(i32, Vec<(eredu_core::cache::StateTensorRole, bool)>)> {
+        self.semantic_snapshot()
+    }
+
+    #[cfg(test)]
+    fn fixed_numeric_snapshot(
+        &self,
+    ) -> Result<
+        Vec<(
+            usize,
+            eredu_core::cache::StateTensorRole,
+            Vec<i32>,
+            Vec<f32>,
+        )>,
+        Exception,
+    > {
+        self.fixed_numeric_snapshot()
+    }
+
+    #[cfg(test)]
+    fn retained_numeric_snapshot(&self) -> Result<RetainedNumericStateSnapshot, Exception> {
+        self.retained_numeric_snapshot()
+    }
+}
+
+type ResidentRuntime<A, S> = LayerwiseRuntime<
     A,
     MlxNeuralBackend,
-    MlxKeyValueState,
-    MlxResidentPolicy<
-        <A as eredu_runtime::LayeredArchitecture<MlxNeuralBackend, MlxKeyValueState>>::Unit,
-    >,
+    S,
+    MlxResidentPolicy<<A as eredu_runtime::LayeredArchitecture<MlxNeuralBackend, S>>::Unit>,
 >;
-type BoundedRuntime<A> = LayerwiseRuntime<
+type BoundedRuntime<A, S> = LayerwiseRuntime<
     A,
     MlxNeuralBackend,
-    MlxKeyValueState,
-    MlxLayerwisePolicy<
-        <A as eredu_runtime::LayeredArchitecture<MlxNeuralBackend, MlxKeyValueState>>::Unit,
-    >,
+    S,
+    MlxLayerwisePolicy<<A as eredu_runtime::LayeredArchitecture<MlxNeuralBackend, S>>::Unit>,
 >;
 
-enum Execution<A>
+enum Execution<A, S>
 where
-    A: ReplicatedTextArchitecture<MlxNeuralBackend, MlxKeyValueState, Error = eredu_nn::Error>,
+    S: MlxReplicatedState,
+    A: ReplicatedTextArchitecture<MlxNeuralBackend, S, Error = eredu_nn::Error>,
     A::StaticModules: Clone,
     A::Error: std::fmt::Display,
 {
-    Resident(ResidentRuntime<A>),
-    Bounded(BoundedRuntime<A>),
+    Resident(ResidentRuntime<A, S>),
+    Bounded(BoundedRuntime<A, S>),
 }
 
-struct BoundReplicatedText<A>
+struct BoundReplicatedText<A, S>
 where
-    A: ReplicatedTextArchitecture<MlxNeuralBackend, MlxKeyValueState, Error = eredu_nn::Error>,
+    S: MlxReplicatedState,
+    A: ReplicatedTextArchitecture<MlxNeuralBackend, S, Error = eredu_nn::Error>,
     A::StaticModules: Clone,
     A::Error: std::fmt::Display,
 {
-    execution: Execution<A>,
+    execution: Execution<A, S>,
     state_layout: eredu_runtime::StateLayout,
-    state: MlxKeyValueState,
+    state: S,
     prompt_cache_identity: PromptCacheModelIdentity,
     capability_estimate: eredu_architectures::capability::CapabilityEstimate,
     effective_model_type: String,
@@ -224,12 +648,14 @@ where
     #[cfg(test)]
     selected_residency: eredu_runtime::LayerWeightResidency,
     selected_session: SelectedSessionBinding,
-    state_residency: CacheResidencyPolicy,
+    selected_state: SelectedStateRealization,
+    stream: Stream,
 }
 
-impl<A> BoundReplicatedText<A>
+impl<A, S> BoundReplicatedText<A, S>
 where
-    A: ReplicatedTextArchitecture<MlxNeuralBackend, MlxKeyValueState, Error = eredu_nn::Error>,
+    S: MlxReplicatedState,
+    A: ReplicatedTextArchitecture<MlxNeuralBackend, S, Error = eredu_nn::Error>,
     A::StaticModules: Clone,
     A::Error: std::fmt::Display,
 {
@@ -242,20 +668,26 @@ where
         let requirements = prepared.requirements().clone();
         let selected = prepared.selected().clone();
         let selected_session = SelectedSessionBinding::from_selected(&selected);
-        let state_residency = selected.state().clone();
+        let selected_state = selected.state().clone();
         let capability_estimate = prepared.capability_estimate().clone();
         let effective_model_type = prepared.effective_model_type().to_owned();
         let residency = selected.residency();
         let mut modules = prepared.into_modules();
         let mut architecture = modules.take_architecture();
         let source_architecture = modules.take_source_architecture();
+        let static_recipes = modules.take_static_recipes();
+        let unit_recipes = modules.take_unit_recipes();
         validate_architecture_contract(&architecture, &requirements)?;
+        validate_parameter_contract(
+            source_architecture.as_ref().unwrap_or(&architecture),
+            &requirements,
+            stream,
+        )?;
         let (store, materialization) = match source_architecture {
             Some(source) => {
                 let quantization = selected_transform_quantization(&selected)?;
-                let source_layout = architecture_execution_layout::<_, MlxKeyValueState>(&source)?;
-                let target_layout =
-                    architecture_execution_layout::<_, MlxKeyValueState>(&architecture)?;
+                let source_layout = architecture_execution_layout::<_, S>(&source)?;
+                let target_layout = architecture_execution_layout::<_, S>(&architecture)?;
                 if source_layout != target_layout {
                     return Err(Error::Quantization(
                         "selected weight transform changed the execution-unit layout".into(),
@@ -264,7 +696,9 @@ where
                 let unit_count = source_layout.len();
                 let source_static = source.static_modules().clone();
                 let target_static = architecture.static_modules().clone();
-                let (store, report) = quantize_parameterized_store(
+                let quantization_static_recipes = static_recipes.clone();
+                let quantization_unit_recipes = unit_recipes.clone();
+                let (store, report) = quantize_module_store_with_bindings(
                     store,
                     &source_static,
                     &target_static,
@@ -274,7 +708,7 @@ where
                             &source_layout,
                             ordinal,
                             context,
-                            PhantomData::<MlxKeyValueState>,
+                            PhantomData::<S>,
                         )
                     },
                     |ordinal, context| {
@@ -283,12 +717,35 @@ where
                             &target_layout,
                             ordinal,
                             context,
-                            PhantomData::<MlxKeyValueState>,
+                            PhantomData::<S>,
                         )
                     },
                     unit_count,
                     quantization,
                     stream,
+                    move |modules, store| {
+                        let mut recipes = quantization_static_recipes;
+                        build_neutral_module_bindings_with_recipes_excluding(
+                            modules,
+                            store,
+                            &mut recipes,
+                            |_| false,
+                        )
+                        .map_err(Into::into)
+                    },
+                    move |ordinal, unit, store| {
+                        let mut recipes = quantization_unit_recipes
+                            .get(ordinal)
+                            .cloned()
+                            .unwrap_or_default();
+                        build_neutral_module_bindings_with_recipes_excluding(
+                            unit,
+                            store,
+                            &mut recipes,
+                            |_| false,
+                        )
+                        .map_err(Into::into)
+                    },
                 )?;
                 (store, Some(report))
             }
@@ -301,33 +758,46 @@ where
             &architecture,
             eredu_core::cache::PromptCacheTopology::default(),
         )?;
-        let (policy, _) = prepare_layerwise_policy(
+        let (policy, _) = prepare_layerwise_policy_with_bindings(
             store,
             &mut architecture,
             (),
-            PhantomData::<MlxKeyValueState>,
+            PhantomData::<S>,
             residency,
             stream,
             weights_stream,
             |_| false,
+            move |modules, store| {
+                build_module_bindings_with_recipes_excluding(
+                    &MlxModule::new(modules.clone()),
+                    "",
+                    store,
+                    static_recipes,
+                    |_| false,
+                )
+                .map_err(Into::into)
+            },
+            move |ordinal, _address, _path, unit, store, _stream| {
+                let recipes = unit_recipes.get(ordinal).cloned().unwrap_or_default();
+                build_module_bindings_with_recipes_excluding(
+                    &MlxModule::new(unit),
+                    "",
+                    store,
+                    recipes,
+                    |_| false,
+                )
+                .map_err(Into::into)
+            },
         )?;
         let execution = if residency.is_fully_resident() {
             Execution::Resident(LayerwiseRuntime::new_policy_first(
-                policy.into_resident(&architecture, stream, PhantomData::<MlxKeyValueState>)?,
+                policy.into_resident(&architecture, stream, PhantomData::<S>)?,
                 architecture,
             ))
         } else {
             Execution::Bounded(LayerwiseRuntime::new(architecture, policy))
         };
-        let state = match selected.state() {
-            CacheResidencyPolicy::Device => MlxKeyValueState::device(state_layout.clone())?,
-            CacheResidencyPolicy::Paged(options) => MlxKeyValueState::paged(
-                state_layout.clone(),
-                CacheResidencyManager::new(options.clone())
-                    .map_err(|error| Error::Parallel(error.to_string()))?,
-                None,
-            )?,
-        };
+        let state = S::realize(&selected_state)?;
         Ok(Self {
             execution,
             state_layout,
@@ -339,7 +809,8 @@ where
             #[cfg(test)]
             selected_residency: residency,
             selected_session,
-            state_residency,
+            selected_state,
+            stream: stream.clone(),
         })
     }
 
@@ -349,6 +820,8 @@ where
         mask: Option<&Array>,
         stream: &Stream,
     ) -> Result<Array, Error> {
+        #[cfg(test)]
+        super::path_instrumentation::forward();
         self.validate_state()?;
         let tokens = MlxTensor::from_array(tokens.clone());
         let mask = mask.cloned().map(MlxTensor::from_array);
@@ -370,28 +843,18 @@ where
         Ok(())
     }
 
-    fn new_state(&self, policy: CacheResidencyPolicy) -> Result<MlxKeyValueState, Error> {
-        match policy {
-            CacheResidencyPolicy::Device => {
-                MlxKeyValueState::device(self.state_layout.clone()).map_err(Into::into)
-            }
-            CacheResidencyPolicy::Paged(options) => MlxKeyValueState::paged(
-                self.state_layout.clone(),
-                CacheResidencyManager::new(options)
-                    .map_err(|error| Error::Parallel(error.to_string()))?,
-                None,
-            )
-            .map_err(Into::into),
-        }
+    fn new_state(&self) -> Result<S, Error> {
+        S::realize(&self.selected_state)
     }
 }
 
-fn validate_architecture_contract<A>(
+fn validate_architecture_contract<A, S>(
     architecture: &A,
     requirements: &ReplicatedTextRequirements,
 ) -> Result<(), Error>
 where
-    A: ReplicatedTextArchitecture<MlxNeuralBackend, MlxKeyValueState, Error = eredu_nn::Error>,
+    S: MlxReplicatedState,
+    A: ReplicatedTextArchitecture<MlxNeuralBackend, S, Error = eredu_nn::Error>,
     A::StaticModules: Clone,
     A::Error: std::fmt::Display,
 {
@@ -403,7 +866,7 @@ where
             "constructed execution graph differs from selected replicated requirements".into(),
         ));
     }
-    let units = architecture_execution_layout::<_, MlxKeyValueState>(architecture)?;
+    let units = architecture_execution_layout::<_, S>(architecture)?;
     if &units != requirements.execution_units() {
         return Err(Error::ArchitectureModel(
             "constructed execution-unit geometry differs from selected replicated requirements"
@@ -429,10 +892,117 @@ where
     Ok(())
 }
 
-impl<A> ErasedReplicatedTextExecutable for BoundReplicatedText<A>
+fn validate_parameter_contract<A, S>(
+    architecture: &A,
+    requirements: &ReplicatedTextRequirements,
+    context: &Stream,
+) -> Result<(), Error>
 where
-    A: ReplicatedTextArchitecture<MlxNeuralBackend, MlxKeyValueState, Error = eredu_nn::Error>
-        + 'static,
+    S: MlxReplicatedState,
+    A: ReplicatedTextArchitecture<MlxNeuralBackend, S, Error = eredu_nn::Error>,
+    A::StaticModules: Clone,
+    A::Error: std::fmt::Display,
+{
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use eredu_runtime::{ParameterGroupOwner, ReplicatedTextParameterOwner};
+
+    let description = architecture
+        .parameter_description(context)
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let mut actual = BTreeMap::new();
+    for group in description.groups() {
+        for member in group.group().members() {
+            actual.insert(member.target(), (member.global_shape(), group.owner()));
+        }
+    }
+    let expected = requirements
+        .parameters()
+        .iter()
+        .filter(|parameter| {
+            !matches!(
+                parameter.presence(),
+                eredu_runtime::ReplicatedTextParameterPresence::OptionalAbsent
+                    | eredu_runtime::ReplicatedTextParameterPresence::Tied { .. }
+            )
+        })
+        .map(|parameter| parameter.name())
+        .collect::<BTreeSet<_>>();
+    let actual_names = actual.keys().copied().collect::<BTreeSet<_>>();
+    if expected != actual_names {
+        return Err(Error::ArchitectureModel(format!(
+            "replicated parameter requirements differ from architecture topology: missing {:?}, unexpected {:?}",
+            expected.difference(&actual_names).collect::<Vec<_>>(),
+            actual_names.difference(&expected).collect::<Vec<_>>()
+        )));
+    }
+    for parameter in requirements.parameters().iter().filter(|parameter| {
+        !matches!(
+            parameter.presence(),
+            eredu_runtime::ReplicatedTextParameterPresence::OptionalAbsent
+                | eredu_runtime::ReplicatedTextParameterPresence::Tied { .. }
+        )
+    }) {
+        let (shape, owner) = actual
+            .get(parameter.name())
+            .expect("equal parameter-name sets contain every requirement");
+        let owner_matches = match (owner, parameter.owner()) {
+            (
+                ParameterGroupOwner::StaticRole(actual),
+                ReplicatedTextParameterOwner::StaticRole(expected),
+            ) => actual == expected,
+            (
+                ParameterGroupOwner::StaticAnyOf(actual),
+                ReplicatedTextParameterOwner::StaticRole(expected),
+            ) => actual.iter().any(|role| role == expected),
+            (
+                ParameterGroupOwner::ExecutionUnit {
+                    group, global_unit, ..
+                },
+                ReplicatedTextParameterOwner::ExecutionUnit {
+                    group: expected_group,
+                    unit: expected_unit,
+                },
+            ) => group.as_str() == expected_group && global_unit == expected_unit,
+            _ => false,
+        };
+        let mut expected_shape = parameter.logical_shape().to_vec();
+        if let Some(last) = expected_shape.last_mut() {
+            match parameter.native_executable() {
+                LinearFormat::Affine(config) => {
+                    *last = last.saturating_mul(config.bits as usize) / 32;
+                }
+                LinearFormat::MxFp4 => *last = last.saturating_mul(4) / 32,
+                LinearFormat::GgufIQuant { ggml_type, .. } => {
+                    if let Ok((block, bytes)) = ggml_type.block_and_bytes() {
+                        if let (Ok(block), Ok(bytes)) =
+                            (usize::try_from(block), usize::try_from(bytes))
+                        {
+                            *last = last.saturating_mul(bytes) / block;
+                        }
+                    }
+                }
+                LinearFormat::Dense | LinearFormat::E4M3BlockFp8(_) => {}
+            }
+        }
+        if *shape != expected_shape || !owner_matches {
+            return Err(Error::ArchitectureModel(format!(
+                "replicated parameter requirement {:?} differs from architecture shape/owner: requirement {:?} {:?}, architecture {:?} {:?}",
+                parameter.name(),
+                expected_shape,
+                parameter.owner(),
+                shape,
+                owner,
+            )));
+        }
+    }
+    Ok(())
+}
+
+impl<A, S> ErasedReplicatedTextExecutable for BoundReplicatedText<A, S>
+where
+    S: MlxReplicatedState + 'static,
+    A: ReplicatedTextArchitecture<MlxNeuralBackend, S, Error = eredu_nn::Error> + 'static,
     A::StaticModules: Clone,
     A::Error: std::fmt::Display,
 {
@@ -451,6 +1021,49 @@ where
     #[cfg(test)]
     fn selected_residency(&self) -> eredu_runtime::LayerWeightResidency {
         self.selected_residency
+    }
+
+    #[cfg(test)]
+    fn state_snapshot(&self) -> StatePresenceSnapshot {
+        MlxReplicatedState::state_snapshot(&self.state)
+    }
+
+    #[cfg(test)]
+    fn fixed_numeric_state_snapshot(&self) -> Result<FixedNumericStateSnapshot, Exception> {
+        MlxReplicatedState::fixed_numeric_snapshot(&self.state)
+    }
+
+    #[cfg(test)]
+    fn checkpoint_restore_probe(
+        &mut self,
+        tokens: &Array,
+        stream: &Stream,
+    ) -> Result<CheckpointRestoreProbe, Error> {
+        let before = MlxReplicatedState::state_snapshot(&self.state);
+        let before_numeric = MlxReplicatedState::fixed_numeric_snapshot(&self.state)?;
+        let before_retained = MlxReplicatedState::retained_numeric_snapshot(&self.state)?;
+        let checkpoint = self.state.deep_checkpoint()?;
+        let continuation = self
+            .forward(tokens, None, stream)?
+            .evaluated()?
+            .as_slice::<f32>()
+            .to_vec();
+        let advanced = MlxReplicatedState::state_snapshot(&self.state);
+        let advanced_numeric = MlxReplicatedState::fixed_numeric_snapshot(&self.state)?;
+        self.state.restore_checkpoint(&checkpoint, stream)?;
+        let restored = MlxReplicatedState::state_snapshot(&self.state);
+        let restored_numeric = MlxReplicatedState::fixed_numeric_snapshot(&self.state)?;
+        let restored_retained = MlxReplicatedState::retained_numeric_snapshot(&self.state)?;
+        assert_eq!(restored_retained, before_retained);
+        Ok((
+            before,
+            advanced,
+            restored,
+            before_numeric,
+            advanced_numeric,
+            restored_numeric,
+            continuation,
+        ))
     }
 
     fn residency_report(&self) -> Result<Option<ResidencyReport>, Error> {
@@ -478,7 +1091,7 @@ where
 
     fn reset_cache(&mut self) -> Result<(), Exception> {
         self.state = self
-            .new_state(self.state_residency.clone())
+            .new_state()
             .map_err(|error| Exception::custom(error.to_string()))?;
         Ok(())
     }
@@ -489,25 +1102,25 @@ where
         expected: &PromptCacheDescriptor,
         prefix_token_ids: &[u32],
     ) -> Result<PromptCacheManifest, Error> {
-        let CacheResidencyPolicy::Paged(options) = &self.state_residency else {
-            return Err(Error::Parallel(
-                "prompt-cache loading requires paged state selected during preparation".into(),
+        if !self.selected_session.prompt_cache() {
+            return Err(Error::ArchitectureModel(
+                "prompt-cache persistence was not selected for this state realization".into(),
             ));
-        };
+        }
         eredu_core::cache::validate_prompt_cache_model_identity(
             expected,
             &self.prompt_cache_identity,
         )
         .map_err(|error| Error::Parallel(error.to_string()))?;
-        let (manager, manifest) = open_prompt_cache(
+        let (state, manifest) = S::load_prompt_cache(
+            &self.selected_state,
             directory,
             expected,
             &self.prompt_cache_identity,
             prefix_token_ids,
-            options.clone(),
-        )
-        .map_err(|error| Error::Parallel(error.to_string()))?;
-        self.state = MlxKeyValueState::paged(self.state_layout.clone(), manager, None)?;
+            &self.stream,
+        )?;
+        self.state = state;
         Ok(manifest)
     }
 
@@ -518,18 +1131,27 @@ where
         prefix_token_ids: &[u32],
         options: &PromptCacheOptions,
     ) -> Result<PromptCacheManifest, Error> {
+        if !self.selected_session.prompt_cache() {
+            return Err(Error::ArchitectureModel(
+                "prompt-cache persistence was not selected for this state realization".into(),
+            ));
+        }
         eredu_core::cache::validate_prompt_cache_model_identity(
             &descriptor,
             &self.prompt_cache_identity,
         )
         .map_err(|error| Error::Parallel(error.to_string()))?;
-        self.state
-            .save_prompt_cache(destination, descriptor, prefix_token_ids, options)
-            .map_err(Into::into)
+        MlxReplicatedState::save_prompt_cache(
+            &mut self.state,
+            destination,
+            descriptor,
+            prefix_token_ids,
+            options,
+        )
     }
 
     fn cache_residency_report(&self) -> Result<Option<CacheResidencyReport>, Exception> {
-        self.state.residency_report()
+        MlxReplicatedState::residency_report(&self.state)
     }
 
     fn prefill(&mut self, input: input::ModelInput<'_>, stream: &Stream) -> Result<Array, Error> {
@@ -540,8 +1162,6 @@ where
     }
 
     fn decode(&mut self, tokens: &Array, stream: &Stream) -> Result<Array, Error> {
-        #[cfg(test)]
-        super::path_instrumentation::forward();
         self.forward(tokens, None, stream)?
             .try_index_device((.., -1, ..), stream)
             .map_err(Into::into)
@@ -554,6 +1174,8 @@ where
         stream: &Stream,
         observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
     ) -> Result<Array, Error> {
+        #[cfg(test)]
+        super::path_instrumentation::forward();
         self.validate_state()?;
         let tokens = MlxTensor::from_array(tokens.clone());
         let mask = mask.cloned().map(MlxTensor::from_array);
@@ -579,7 +1201,10 @@ fn selected_transform_quantization(
 ) -> Result<eredu_checkpoint::WeightQuantization, Error> {
     let mut quantization = None;
     for parameter in selected.parameters() {
-        if parameter.lowering() != WeightLoweringKind::Transform {
+        if !matches!(
+            parameter.lowering(),
+            WeightLoweringKind::Transform | WeightLoweringKind::DerivedTransform
+        ) {
             continue;
         }
         let current = parameter
@@ -607,7 +1232,6 @@ fn selected_transform_quantization(
 
 /// Family-agnostic MLX visitor that binds neutral parameter topology.
 pub(crate) struct BindingVisitor<'a> {
-    pub store: Arc<dyn CheckpointSource>,
     pub stream: &'a Stream,
     pub weights_stream: &'a Stream,
 }
@@ -624,6 +1248,7 @@ impl ReplicatedTextArchitectureVisitor<MlxNeuralBackend, MlxKeyValueState> for B
     fn visit<A>(
         self,
         prepared: PreparedReplicatedTextArchitecture<A>,
+        store: Arc<dyn CheckpointSource>,
     ) -> Result<Self::Output, Self::Error>
     where
         A: ReplicatedTextArchitecture<MlxNeuralBackend, MlxKeyValueState, Error = eredu_nn::Error>
@@ -631,7 +1256,32 @@ impl ReplicatedTextArchitectureVisitor<MlxNeuralBackend, MlxKeyValueState> for B
         A::StaticModules: Clone,
         A::Error: std::fmt::Display,
     {
-        BoundReplicatedText::new(prepared, self.store, self.stream, self.weights_stream)
+        BoundReplicatedText::new(prepared, store, self.stream, self.weights_stream)
+            .map(|model| Box::new(model) as Box<dyn ErasedReplicatedTextExecutable>)
+    }
+}
+
+impl ReplicatedTextArchitectureVisitor<MlxNeuralBackend, MlxHybridState> for BindingVisitor<'_> {
+    type Output = Box<dyn ErasedReplicatedTextExecutable>;
+    type Error = Error;
+
+    fn construction_started(&mut self) {
+        #[cfg(test)]
+        super::path_instrumentation::architecture_construction();
+    }
+
+    fn visit<A>(
+        self,
+        prepared: PreparedReplicatedTextArchitecture<A>,
+        store: Arc<dyn CheckpointSource>,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        A: ReplicatedTextArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error>
+            + 'static,
+        A::StaticModules: Clone,
+        A::Error: std::fmt::Display,
+    {
+        BoundReplicatedText::new(prepared, store, self.stream, self.weights_stream)
             .map(|model| Box::new(model) as Box<dyn ErasedReplicatedTextExecutable>)
     }
 }
@@ -699,7 +1349,8 @@ fn valid_direct_source_geometry(descriptor: &WeightLoweringDescriptor) -> bool {
         }
         _ => {
             descriptor.physical_shape() == descriptor.logical_shape()
-                && valid_packed_geometry(descriptor)
+                && (descriptor.executable() == LinearFormat::Dense
+                    || valid_packed_geometry(descriptor))
         }
     }
 }
@@ -745,7 +1396,7 @@ fn supports_direct(descriptor: &WeightLoweringDescriptor) -> bool {
         }
         _ => false,
     };
-    supported && (executable == LinearFormat::Dense || valid_direct_source_geometry(descriptor))
+    supported && valid_direct_source_geometry(descriptor)
 }
 
 fn supports_transform(descriptor: &WeightLoweringDescriptor) -> bool {
@@ -799,9 +1450,59 @@ mod tests {
         cache::LayerCachePolicy, AttentionPolicy, LayerSchedule, ModelConfigurationResolver,
     };
     use eredu_runtime::{
-        ParameterTransformConstraint, ReplicatedTextParameterRequirement, StateLayout,
-        WeightLoweringDescriptor,
+        ParameterTransformConstraint, ReplicatedTextParameterRequirement,
+        ReplicatedTextStateAccess, StateLayout, WeightLoweringDescriptor,
     };
+
+    struct ForgedShapeSource {
+        inner: eredu_checkpoint::store::SharedCheckpointSource,
+        key: String,
+    }
+
+    impl eredu_checkpoint::store::CheckpointSource for ForgedShapeSource {
+        fn source_keys(&self) -> Vec<String> {
+            self.inner.source_keys()
+        }
+
+        fn source_metadata(
+            &self,
+            key: &str,
+        ) -> Result<eredu_checkpoint::store::TensorMetadata, eredu_checkpoint::store::StoreError>
+        {
+            let mut metadata = self.inner.source_metadata(key)?;
+            if key == self.key {
+                metadata.physical_shape.push(2);
+            }
+            Ok(metadata)
+        }
+
+        fn acquire_lease(
+            &self,
+            request: eredu_checkpoint::store::TensorReadRequest,
+        ) -> Result<eredu_checkpoint::store::CheckpointLease, eredu_checkpoint::store::StoreError>
+        {
+            self.inner.acquire_lease(request)
+        }
+
+        fn source_diagnostics(
+            &self,
+        ) -> Result<
+            eredu_checkpoint::store::WeightStoreDiagnostics,
+            eredu_checkpoint::store::StoreError,
+        > {
+            self.inner.source_diagnostics()
+        }
+
+        fn source_provenance(
+            &self,
+            key: &str,
+        ) -> Result<
+            eredu_checkpoint::store::TensorSourceProvenance,
+            eredu_checkpoint::store::StoreError,
+        > {
+            self.inner.source_provenance(key)
+        }
+    }
 
     fn materialize_model_plan(
         plan: eredu_core::ModelPreparationPlan<
@@ -863,6 +1564,53 @@ mod tests {
     }
 
     #[test]
+    fn selected_store_geometry_mismatch_rejects_before_construction_or_payload_open() {
+        super::super::path_instrumentation::reset();
+        let artifact = tiny_heterogeneous_artifact(lfm2_config());
+        let inspection =
+            eredu_architectures::configuration::inspect_artifact(artifact.path()).unwrap();
+        let requirements =
+            eredu_architectures::replicated_text::replicated_text_requirements(&inspection)
+                .unwrap();
+        let request = eredu_runtime::ReplicatedTextSelectionRequest::new(
+            eredu_runtime::LayerWeightResidency::FullyResident,
+            eredu_runtime::CacheResidencyPolicy::Device,
+        );
+        let selected = eredu_runtime::select_replicated_text_realization(
+            &requirements,
+            &request,
+            &capabilities(&requirements, &request),
+        )
+        .unwrap();
+        let source: eredu_checkpoint::store::SharedCheckpointSource = Arc::new(
+            eredu_checkpoint::store::SafetensorsWeightStore::open(artifact.path()).unwrap(),
+        );
+        let key = requirements
+            .parameters()
+            .iter()
+            .find_map(|parameter| parameter.sources().first())
+            .unwrap()
+            .clone();
+        let forged: eredu_checkpoint::store::SharedCheckpointSource =
+            Arc::new(ForgedShapeSource { inner: source, key });
+        let (stream, weights_stream) = execution_streams();
+        let error = super::super::loading::bind_replicated_text(
+            inspection.architecture_plan(),
+            selected,
+            forged,
+            &stream,
+            &weights_stream,
+        )
+        .err()
+        .expect("forged source geometry must fail");
+        assert!(error.to_string().contains("physical geometry"));
+        assert_eq!(
+            super::super::path_instrumentation::snapshot(),
+            super::super::path_instrumentation::Counts::default()
+        );
+    }
+
+    #[test]
     fn report_distinguishes_native_and_transforming_lowerings() {
         let parameter = ReplicatedTextParameterRequirement::new(
             "projection.weight",
@@ -889,6 +1637,7 @@ mod tests {
         .unwrap();
         let graph = eredu_runtime::ExecutionGraph::chain(["decoder"]).unwrap();
         let requirements = ReplicatedTextRequirements::new(
+            "test.generic-binding",
             eredu_nn::NeuralOperatorCapabilities::NONE,
             graph.clone(),
             eredu_runtime::ExecutionUnitLayout::new(&graph, [1]).unwrap(),
@@ -909,6 +1658,7 @@ mod tests {
                 .unwrap(),
             )
             .unwrap(),
+            eredu_runtime::ReplicatedTextStateAccess::KeyValue,
             vec![parameter],
         )
         .unwrap();
@@ -999,11 +1749,27 @@ mod tests {
             })
             .map(|constraint| {
                 let elements = constraint.shape.iter().product::<usize>();
-                (
-                    constraint.key.clone(),
-                    constraint.shape.clone(),
-                    vec![0_u8; elements * 4],
-                )
+                let bytes: Vec<u8> = if constraint.key.ends_with(".A_log") {
+                    (-1.0_f32)
+                        .to_le_bytes()
+                        .into_iter()
+                        .cycle()
+                        .take(elements * 4)
+                        .collect()
+                } else if constraint.key.contains("norm") && constraint.key.ends_with(".weight") {
+                    (0..elements).flat_map(|_| 1.0_f32.to_le_bytes()).collect()
+                } else {
+                    let seed = constraint.key.bytes().fold(1_u32, |value, byte| {
+                        value.wrapping_mul(31) ^ u32::from(byte)
+                    });
+                    (0..elements)
+                        .flat_map(|index| {
+                            let signed = i32::try_from((seed as usize + index) % 29).unwrap() - 14;
+                            (signed as f32 * 0.001).to_le_bytes()
+                        })
+                        .collect()
+                };
+                (constraint.key.clone(), constraint.shape.clone(), bytes)
             })
             .collect::<Vec<_>>();
         let write = |path: &Path, tensors: &[(String, Vec<usize>, Vec<u8>)]| {
@@ -1042,6 +1808,365 @@ mod tests {
         root
     }
 
+    fn tiny_heterogeneous_artifact(config: serde_json::Value) -> tempfile::TempDir {
+        tiny_heterogeneous_artifact_with_layout(config, false)
+    }
+
+    fn tiny_heterogeneous_artifact_with_layout(
+        config: serde_json::Value,
+        fused_qwen_next: bool,
+    ) -> tempfile::TempDir {
+        use safetensors::{tensor::serialize_to_file, tensor::TensorView, Dtype};
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("config.json"),
+            serde_json::to_vec(&config).unwrap(),
+        )
+        .unwrap();
+        let resolved = eredu_architectures::configuration::MODEL_CONFIGURATIONS
+            .resolve_safetensors(&config)
+            .unwrap();
+        let plan = resolved
+            .architecture_plan()
+            .safetensors_architecture()
+            .unwrap()
+            .checkpoint();
+        let mut constraints = plan.common_tensors.iter().collect::<Vec<_>>();
+        constraints.extend(
+            plan.layout_groups
+                .iter()
+                .filter(|group| group.required)
+                .filter_map(|group| {
+                    if fused_qwen_next && group.variants.iter().any(|variant| variant.id == "fused")
+                    {
+                        group.variants.iter().find(|variant| variant.id == "fused")
+                    } else {
+                        group.variants.first()
+                    }
+                })
+                .flat_map(|variant| variant.tensors.iter()),
+        );
+        let tensors = constraints
+            .into_iter()
+            .filter(|constraint| {
+                constraint.requirement == eredu_checkpoint::schema::TensorRequirement::Required
+            })
+            .map(|constraint| {
+                let elements = constraint.shape.iter().product::<usize>();
+                let bytes: Vec<u8> = if constraint.key.ends_with(".A_log") {
+                    (-1.0_f32)
+                        .to_le_bytes()
+                        .into_iter()
+                        .cycle()
+                        .take(elements * 4)
+                        .collect()
+                } else if constraint.key.contains("norm") && constraint.key.ends_with(".weight") {
+                    (0..elements).flat_map(|_| 1.0_f32.to_le_bytes()).collect()
+                } else {
+                    let seed = constraint.key.bytes().fold(1_u32, |value, byte| {
+                        value.wrapping_mul(31) ^ u32::from(byte)
+                    });
+                    (0..elements)
+                        .flat_map(|index| {
+                            let signed = i32::try_from((seed as usize + index) % 29).unwrap() - 14;
+                            (signed as f32 * 0.001).to_le_bytes()
+                        })
+                        .collect()
+                };
+                (constraint.key.clone(), constraint.shape.clone(), bytes)
+            })
+            .collect::<Vec<_>>();
+        let views = tensors
+            .iter()
+            .map(|(name, shape, bytes)| {
+                (
+                    name.as_str(),
+                    TensorView::new(Dtype::F32, shape.clone(), bytes.as_slice()).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        serialize_to_file(views, None, &root.path().join("model.safetensors")).unwrap();
+        root
+    }
+
+    fn tiny_heterogeneous_gguf(family: &str, stream: &Stream) -> crate::test_utils::SyntheticGguf {
+        tiny_heterogeneous_gguf_with_packed_qwen_next(family, None, stream)
+    }
+
+    fn tiny_heterogeneous_gguf_with_packed_qwen_next(
+        family: &str,
+        packed_qkvz: Option<eredu_gguf::GgmlType>,
+        stream: &Stream,
+    ) -> crate::test_utils::SyntheticGguf {
+        use std::collections::HashMap;
+
+        use eredu_gguf::{MetadataArray, MetadataValue};
+
+        let (plan, metadata) = match family {
+            "lfm2" => {
+                let args = eredu_architectures::lfm2::model_args_from_config_value(&lfm2_config())
+                    .unwrap();
+                let key = |suffix: &str| format!("lfm2.{suffix}");
+                (
+                    eredu_architectures::lfm2::gguf_plan(&args).unwrap(),
+                    HashMap::from([
+                        (
+                            "general.architecture".into(),
+                            MetadataValue::String("lfm2".into()),
+                        ),
+                        ("general.file_type".into(), MetadataValue::Uint32(0)),
+                        (key("block_count"), MetadataValue::Uint32(2)),
+                        (key("embedding_length"), MetadataValue::Uint32(16)),
+                        (
+                            key("feed_forward_length"),
+                            MetadataValue::Uint32(args.dense_intermediate_size as u32),
+                        ),
+                        (key("attention.head_count"), MetadataValue::Uint32(4)),
+                        (
+                            key("attention.head_count_kv"),
+                            MetadataValue::Array(MetadataArray::Uint32(vec![0, 2])),
+                        ),
+                        (
+                            key("attention.layer_norm_rms_epsilon"),
+                            MetadataValue::Float32(args.norm_eps),
+                        ),
+                        (key("context_length"), MetadataValue::Uint32(64)),
+                        (key("shortconv.l_cache"), MetadataValue::Uint32(3)),
+                        (
+                            key("rope.freq_base"),
+                            MetadataValue::Float32(args.rope.theta),
+                        ),
+                        (key("vocab_size"), MetadataValue::Uint32(64)),
+                    ]),
+                )
+            }
+            "kimi_linear" => {
+                let args = eredu_architectures::kimi_linear::model_args_from_config_value(
+                    &kimi_linear_config(),
+                )
+                .unwrap();
+                let key = |suffix: &str| format!("kimi-linear.{suffix}");
+                (
+                    eredu_architectures::kimi_linear::gguf_plan(&args).unwrap(),
+                    HashMap::from([
+                        (
+                            "general.architecture".into(),
+                            MetadataValue::String("kimi-linear".into()),
+                        ),
+                        ("general.file_type".into(), MetadataValue::Uint32(0)),
+                        (key("block_count"), MetadataValue::Uint32(2)),
+                        (key("embedding_length"), MetadataValue::Uint32(12)),
+                        (key("attention.head_count"), MetadataValue::Uint32(3)),
+                        (
+                            key("attention.head_count_kv"),
+                            MetadataValue::Array(MetadataArray::Uint32(vec![0, 1])),
+                        ),
+                        (key("rope.dimension_count"), MetadataValue::Uint32(2)),
+                        (key("attention.key_length_mla"), MetadataValue::Uint32(6)),
+                        (key("vocab_size"), MetadataValue::Uint32(64)),
+                        (key("feed_forward_length"), MetadataValue::Uint32(16)),
+                        (key("context_length"), MetadataValue::Uint32(64)),
+                        (
+                            key("attention.layer_norm_rms_epsilon"),
+                            MetadataValue::Float32(args.rms_norm_eps),
+                        ),
+                        (key("kda.head_dim"), MetadataValue::Uint32(4)),
+                        (key("ssm.conv_kernel"), MetadataValue::Uint32(3)),
+                        (key("expert_count"), MetadataValue::Uint32(2)),
+                        (key("expert_feed_forward_length"), MetadataValue::Uint32(8)),
+                        (key("attention.kv_lora_rank"), MetadataValue::Uint32(6)),
+                        (key("attention.value_length_mla"), MetadataValue::Uint32(4)),
+                        (key("leading_dense_block_count"), MetadataValue::Uint32(2)),
+                        (key("expert_used_count"), MetadataValue::Uint32(1)),
+                        (key("expert_shared_count"), MetadataValue::Uint32(1)),
+                    ]),
+                )
+            }
+            "nemotron_h" => {
+                let args = eredu_architectures::nemotron_h::model_args_from_config_value(
+                    &nemotron_h_config(),
+                )
+                .unwrap();
+                let key = |suffix: &str| format!("nemotron_h.{suffix}");
+                (
+                    eredu_architectures::nemotron_h::gguf_plan(&args).unwrap(),
+                    HashMap::from([
+                        (
+                            "general.architecture".into(),
+                            MetadataValue::String("nemotron_h".into()),
+                        ),
+                        ("general.file_type".into(), MetadataValue::Uint32(0)),
+                        (key("block_count"), MetadataValue::Uint32(4)),
+                        (key("embedding_length"), MetadataValue::Uint32(16)),
+                        (
+                            key("feed_forward_length"),
+                            MetadataValue::Array(MetadataArray::Uint32(vec![0, 0, 24, 0])),
+                        ),
+                        (
+                            key("attention.head_count_kv"),
+                            MetadataValue::Array(MetadataArray::Uint32(vec![0, 2, 0, 0])),
+                        ),
+                        (key("attention.head_count"), MetadataValue::Uint32(4)),
+                        (key("attention.key_length"), MetadataValue::Uint32(4)),
+                        (
+                            key("attention.layer_norm_rms_epsilon"),
+                            MetadataValue::Float32(args.norm_eps),
+                        ),
+                        (key("context_length"), MetadataValue::Uint32(64)),
+                        (key("ssm.inner_size"), MetadataValue::Uint32(16)),
+                        (key("ssm.time_step_rank"), MetadataValue::Uint32(4)),
+                        (key("ssm.state_size"), MetadataValue::Uint32(3)),
+                        (key("ssm.group_count"), MetadataValue::Uint32(2)),
+                        (key("ssm.conv_kernel"), MetadataValue::Uint32(3)),
+                        (key("vocab_size"), MetadataValue::Uint32(64)),
+                    ]),
+                )
+            }
+            "qwen35" | "qwen3next" => {
+                let (config, architecture) = if family == "qwen35" {
+                    (qwen_hybrid_config(), "qwen35")
+                } else {
+                    (qwen_next_config(), "qwen3next")
+                };
+                let args = eredu_architectures::qwen::hybrid::model_args_from_config_value(&config)
+                    .unwrap()
+                    .text;
+                let key = |suffix: &str| format!("{architecture}.{suffix}");
+                let plan = eredu_architectures::qwen::hybrid::gguf_plan(&args).unwrap();
+                let metadata = HashMap::from([
+                    (
+                        "general.architecture".into(),
+                        MetadataValue::String(architecture.into()),
+                    ),
+                    ("general.file_type".into(), MetadataValue::Uint32(0)),
+                    (key("block_count"), MetadataValue::Uint32(2)),
+                    (key("embedding_length"), MetadataValue::Uint32(32)),
+                    (key("attention.head_count"), MetadataValue::Uint32(4)),
+                    (key("attention.head_count_kv"), MetadataValue::Uint32(2)),
+                    (key("attention.key_length"), MetadataValue::Uint32(8)),
+                    (key("rope.dimension_count"), MetadataValue::Uint32(2)),
+                    (key("full_attention_interval"), MetadataValue::Uint32(2)),
+                    (key("vocab_size"), MetadataValue::Uint32(64)),
+                    (key("context_length"), MetadataValue::Uint32(128)),
+                    (
+                        key("attention.layer_norm_rms_epsilon"),
+                        MetadataValue::Float32(args.rms_norm_eps),
+                    ),
+                    (key("feed_forward_length"), MetadataValue::Uint32(48)),
+                    (key("ssm.conv_kernel"), MetadataValue::Uint32(4)),
+                    (key("ssm.state_size"), MetadataValue::Uint32(8)),
+                    (key("ssm.group_count"), MetadataValue::Uint32(2)),
+                    (key("ssm.time_step_rank"), MetadataValue::Uint32(4)),
+                ]);
+                (plan, metadata)
+            }
+            _ => unreachable!("heterogeneous GGUF fixture family"),
+        };
+        let mut constraints = plan.common_tensors.iter().collect::<Vec<_>>();
+        constraints.extend(
+            plan.layout_groups
+                .iter()
+                .filter(|group| group.required)
+                .filter_map(|group| {
+                    if family == "qwen3next"
+                        && group.variants.iter().any(|variant| variant.id == "fused")
+                    {
+                        group.variants.iter().find(|variant| variant.id == "fused")
+                    } else {
+                        group.variants.first()
+                    }
+                })
+                .flat_map(|variant| variant.tensors.iter()),
+        );
+        let arrays = constraints
+            .into_iter()
+            .filter(|constraint| {
+                constraint.requirement == eredu_checkpoint::schema::TensorRequirement::Required
+            })
+            .map(|constraint| {
+                let shape = constraint
+                    .shape
+                    .iter()
+                    .map(|dimension| i32::try_from(*dimension).unwrap())
+                    .collect::<Vec<_>>();
+                let array = if constraint.key.ends_with("ssm_a") {
+                    Array::full::<f32>(&shape, Array::from_f32(-1.0), stream).unwrap()
+                } else {
+                    let seed = constraint
+                        .key
+                        .bytes()
+                        .fold(0_usize, |sum, byte| sum.wrapping_add(usize::from(byte)));
+                    let values = (0..shape.iter().map(|dimension| *dimension as usize).product())
+                        .map(|index| ((index + seed) % 29 + 1) as f32 / 100.0)
+                        .collect::<Vec<_>>();
+                    Array::from_slice(&values, &shape)
+                };
+                (constraint.key.clone(), array)
+            })
+            .collect::<HashMap<_, _>>();
+        crate::test_utils::SyntheticGguf::with_packed_tensors(&arrays, &metadata, |name, _| {
+            packed_qkvz.filter(|_| name.contains("attn_qkvz.weight"))
+        })
+    }
+
+    fn lfm2_config() -> serde_json::Value {
+        serde_json::json!({
+            "model_type": "lfm2", "vocab_size": 64, "hidden_size": 16,
+            "intermediate_size": 32, "num_hidden_layers": 2,
+            "num_attention_heads": 4, "num_key_value_heads": 2,
+            "max_position_embeddings": 64,
+            "layer_types": ["conv", "full_attention"], "conv_L_cache": 3,
+            "block_multiple_of": 8, "block_ffn_dim_multiplier": 1.0,
+            "block_auto_adjust_ff_dim": true, "tie_word_embeddings": false
+        })
+    }
+
+    fn kimi_linear_config() -> serde_json::Value {
+        serde_json::json!({
+            "model_type":"kimi_linear","vocab_size":64,"hidden_size":12,"num_hidden_layers":2,
+            "num_attention_heads":3,"num_key_value_heads":3,"intermediate_size":16,"head_dim":4,
+            "model_max_length":64,"linear_attn_config":{"kda_layers":[1],"full_attn_layers":[2],"num_heads":3,"head_dim":4,"short_conv_kernel_size":3},
+            "num_experts":2,"moe_intermediate_size":8,"kv_lora_rank":6,"qk_nope_head_dim":4,"qk_rope_head_dim":2,"v_head_dim":4,
+            "mla_use_nope":true,"num_experts_per_token":1,"num_shared_experts":1,"routed_scaling_factor":1.0,
+            "first_k_dense_replace":2,"num_expert_group":1,"topk_group":1
+        })
+    }
+
+    fn nemotron_h_config() -> serde_json::Value {
+        serde_json::json!({
+            "model_type":"nemotron_h", "vocab_size":64, "hidden_size":16,
+            "intermediate_size":24, "num_hidden_layers":4,
+            "hybrid_override_pattern":"M*-M", "num_attention_heads":4,
+            "num_key_value_heads":2, "head_dim":4, "mamba_num_heads":4,
+            "n_groups":2, "mamba_head_dim":4, "ssm_state_size":3,
+            "conv_kernel":3, "n_routed_experts":4, "n_shared_experts":1,
+            "moe_intermediate_size":8, "moe_shared_expert_intermediate_size":8,
+            "num_experts_per_tok":2, "n_group":2, "topk_group":1,
+            "num_nextn_predict_layers":0
+        })
+    }
+
+    fn qwen_hybrid_config() -> serde_json::Value {
+        serde_json::json!({
+            "model_type": "qwen3_5_text", "vocab_size": 64, "hidden_size": 32,
+            "num_hidden_layers": 2, "mtp_num_hidden_layers": 0,
+            "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 8,
+            "max_position_embeddings": 128, "linear_conv_kernel_dim": 4,
+            "linear_key_head_dim": 8, "linear_value_head_dim": 8,
+            "linear_num_key_heads": 2, "linear_num_value_heads": 4,
+            "intermediate_size": 48, "moe_intermediate_size": 16,
+            "shared_expert_intermediate_size": 24, "num_experts_per_tok": 0,
+            "num_experts": 0, "layer_types": ["linear_attention", "full_attention"]
+        })
+    }
+
+    fn qwen_next_config() -> serde_json::Value {
+        let mut config = qwen_hybrid_config();
+        config["model_type"] = "qwen3_next".into();
+        config
+    }
+
     fn execution_streams() -> (Stream, Stream) {
         let execution_device = if cfg!(feature = "metal") {
             safemlx::Device::new(safemlx::DeviceType::Gpu, 0)
@@ -1053,6 +2178,33 @@ mod tests {
             Stream::new_with_device(&execution_device),
             Stream::new_with_device(&weights_device),
         )
+    }
+
+    fn complete_state_capabilities(
+        components: impl IntoIterator<Item = StateComponentMechanism>,
+    ) -> StateMechanismCapabilities {
+        StateMechanismCapabilities::new(components)
+            .with_transactions(true, true)
+            .with_reset(true)
+            .with_prompt_cache(true)
+            .with_observation_retention(true)
+    }
+
+    fn capabilities_with(
+        full: &BackendMechanismCapabilities,
+        operators: eredu_nn::NeuralOperatorCapabilities,
+        state: StateMechanismCapabilities,
+    ) -> BackendMechanismCapabilities {
+        BackendMechanismCapabilities::new(
+            operators,
+            full.weight_lowerings().to_vec(),
+            full.weight_residencies().to_vec(),
+            state,
+        )
+        .with_session(full.session())
+        .with_prompt_cache(full.prompt_cache())
+        .with_exact_completion(full.exact_completion())
+        .with_grouped_operations(full.grouped_operations().iter().copied())
     }
 
     fn tiny_llama_gguf(
@@ -1189,6 +2341,16 @@ mod tests {
         let requirements =
             eredu_architectures::replicated_text::replicated_text_requirements(&inspection)
                 .unwrap();
+        let output = requirements
+            .parameters()
+            .iter()
+            .find(|parameter| parameter.name() == "lm_head.weight")
+            .expect("tied GGUF output remains explicit in the logical topology");
+        assert!(matches!(
+            output.presence(),
+            eredu_runtime::ReplicatedTextParameterPresence::Tied { target }
+                if target == "model.embed_tokens.weight"
+        ));
         let derived = requirements
             .parameters()
             .iter()
@@ -1264,10 +2426,564 @@ mod tests {
             super::super::path_instrumentation::snapshot(),
             super::super::path_instrumentation::Counts {
                 architecture_constructions: 4,
+                state_allocations: 4,
                 payload_opens: 4,
                 forwards: 8,
             }
         );
+    }
+
+    #[test]
+    fn generic_handoff_executes_every_replicated_state_profile() {
+        super::super::path_instrumentation::reset();
+        let (stream, weights_stream) = execution_streams();
+        for (name, config) in [
+            ("lfm2", lfm2_config()),
+            ("kimi_linear", kimi_linear_config()),
+            ("nemotron_h", nemotron_h_config()),
+            ("qwen3_next", qwen_next_config()),
+            ("qwen3_5_text", qwen_hybrid_config()),
+        ] {
+            let root = tiny_heterogeneous_artifact(config);
+            let inspection =
+                eredu_architectures::configuration::inspect_artifact(root.path()).unwrap();
+            let requirements =
+                eredu_architectures::replicated_text::replicated_text_requirements(&inspection)
+                    .unwrap_or_else(|error| panic!("{name} requirements: {error}"));
+            assert!(requirements
+                .state_layout()
+                .layers()
+                .iter()
+                .any(|layer| !layer.fixed_state().is_empty()));
+            let stateful_layers = requirements
+                .state_layout()
+                .layers()
+                .iter()
+                .map(|layer| layer.attention().is_some() || !layer.fixed_state().is_empty())
+                .collect::<Vec<_>>();
+            let policy = eredu_core::PreparationPolicy::default();
+            let plan = eredu_core::plan_model_preparation(
+                inspection,
+                policy,
+                eredu_core::SessionCapabilities::default(),
+            )
+            .unwrap();
+            let model = materialize_model_plan(
+                plan,
+                crate::MlxLoadRequest::default(),
+                &stream,
+                &weights_stream,
+            )
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+            let mut executable = model.into_complete().unwrap();
+            let super::super::Executable::ReplicatedText(_, executable) = &mut executable else {
+                panic!("{name} did not use generic replicated composition")
+            };
+            let prompt = Array::from_slice(&[1_u32, 2], &[1, 2]);
+            let parts = [input::token_ids_part(&prompt).unwrap()];
+            let logits = executable
+                .prefill(input::ModelInput::new(&parts), &stream)
+                .unwrap_or_else(|error| panic!("{name} prefill: {error}"));
+            assert_eq!(logits.shape(), &[1, 64], "{name}");
+            logits.evaluated().unwrap();
+            let snapshot = executable.state_snapshot();
+            assert!(
+                snapshot
+                    .iter()
+                    .zip(&stateful_layers)
+                    .all(|((position, _), stateful)| *position == if *stateful { 2 } else { 0 }),
+                "{name} prefill: {snapshot:?}"
+            );
+            for (step, token) in [3_u32, 4].into_iter().enumerate() {
+                let logits = executable
+                    .decode(&Array::from_slice(&[token], &[1, 1]), &stream)
+                    .unwrap_or_else(|error| panic!("{name} decode {step}: {error}"));
+                assert_eq!(logits.shape(), &[1, 64], "{name}");
+                logits.evaluated().unwrap();
+                let snapshot = executable.state_snapshot();
+                assert!(
+                    snapshot
+                        .iter()
+                        .zip(&stateful_layers)
+                        .all(|((position, _), stateful)| *position
+                            == if *stateful { step as i32 + 3 } else { 0 }),
+                    "{name} step {step}: {snapshot:?}"
+                );
+                assert!(snapshot
+                    .iter()
+                    .flat_map(|(_, fixed)| fixed)
+                    .all(|(_, present)| *present));
+            }
+        }
+        assert_eq!(
+            super::super::path_instrumentation::snapshot(),
+            super::super::path_instrumentation::Counts {
+                architecture_constructions: 5,
+                state_allocations: 5,
+                payload_opens: 5,
+                forwards: 15,
+            }
+        );
+    }
+
+    #[test]
+    fn homogeneous_state_schedules_execute_with_only_their_exact_mechanisms() {
+        let (stream, weights_stream) = execution_streams();
+        let mut cases = Vec::new();
+        let mut lfm = lfm2_config();
+        lfm["layer_types"] = serde_json::json!(["full_attention", "full_attention"]);
+        cases.push((
+            "lfm_attention",
+            lfm,
+            ReplicatedTextStateAccess::KeyValue,
+            None,
+        ));
+        let mut lfm = lfm2_config();
+        lfm["layer_types"] = serde_json::json!(["conv", "conv"]);
+        cases.push(("lfm_fixed", lfm, ReplicatedTextStateAccess::Fixed, None));
+
+        let mut kimi = kimi_linear_config();
+        kimi["linear_attn_config"]["kda_layers"] = serde_json::json!([1, 2]);
+        kimi["linear_attn_config"]["full_attn_layers"] = serde_json::json!([]);
+        cases.push((
+            "kimi_kda",
+            kimi,
+            ReplicatedTextStateAccess::Fixed,
+            Some(eredu_nn::NeuralOperatorCapabilities::GATED_DELTA_SCAN),
+        ));
+        let mut kimi = kimi_linear_config();
+        kimi["linear_attn_config"]["kda_layers"] = serde_json::json!([]);
+        kimi["linear_attn_config"]["full_attn_layers"] = serde_json::json!([1, 2]);
+        cases.push((
+            "kimi_mla",
+            kimi,
+            ReplicatedTextStateAccess::CompressedAttention,
+            None,
+        ));
+
+        for (name, pattern, access, operator) in [
+            (
+                "nemotron_attention",
+                "****",
+                ReplicatedTextStateAccess::KeyValue,
+                None,
+            ),
+            (
+                "nemotron_mamba",
+                "MMMM",
+                ReplicatedTextStateAccess::Fixed,
+                Some(eredu_nn::NeuralOperatorCapabilities::SELECTIVE_STATE_SPACE_SCAN),
+            ),
+            (
+                "nemotron_stateless",
+                "----",
+                ReplicatedTextStateAccess::Stateless,
+                None,
+            ),
+        ] {
+            let mut nemo = nemotron_h_config();
+            nemo["hybrid_override_pattern"] = pattern.into();
+            cases.push((name, nemo, access, operator));
+        }
+        let mut qwen = qwen_hybrid_config();
+        qwen["layer_types"] = serde_json::json!(["full_attention", "full_attention"]);
+        cases.push((
+            "qwen_attention",
+            qwen,
+            ReplicatedTextStateAccess::KeyValue,
+            None,
+        ));
+        let mut qwen = qwen_hybrid_config();
+        qwen["layer_types"] = serde_json::json!(["linear_attention", "linear_attention"]);
+        cases.push((
+            "qwen_fixed",
+            qwen,
+            ReplicatedTextStateAccess::Fixed,
+            Some(eredu_nn::NeuralOperatorCapabilities::GATED_DELTA_SCAN),
+        ));
+
+        for (name, config, access, operator) in cases {
+            let root = tiny_heterogeneous_artifact(config);
+            let inspection =
+                eredu_architectures::configuration::inspect_artifact(root.path()).unwrap();
+            let requirements =
+                eredu_architectures::replicated_text::replicated_text_requirements(&inspection)
+                    .unwrap_or_else(|error| panic!("{name} requirements: {error}"));
+            assert_eq!(requirements.state_access(), access, "{name}");
+            if let Some(operator) = operator {
+                assert!(requirements.operators().contains(operator), "{name}");
+            } else {
+                assert_eq!(
+                    requirements.operators(),
+                    eredu_nn::NeuralOperatorCapabilities::NONE,
+                    "{name}"
+                );
+            }
+            let stateful = requirements
+                .state_layout()
+                .layers()
+                .iter()
+                .map(|layer| layer.attention().is_some() || !layer.fixed_state().is_empty())
+                .collect::<Vec<_>>();
+            let plan = eredu_core::plan_model_preparation(
+                inspection,
+                eredu_core::PreparationPolicy::default(),
+                eredu_core::SessionCapabilities::default(),
+            )
+            .unwrap();
+            let model = materialize_model_plan(
+                plan,
+                crate::MlxLoadRequest::default(),
+                &stream,
+                &weights_stream,
+            )
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+            let mut executable = model.into_complete().unwrap();
+            let super::super::Executable::ReplicatedText(_, generic) = &mut executable else {
+                panic!("{name} did not use replicated composition")
+            };
+            let prompt = Array::from_slice(&[1_u32, 2], &[1, 2]);
+            let parts = [input::token_ids_part(&prompt).unwrap()];
+            generic
+                .prefill(input::ModelInput::new(&parts), &stream)
+                .unwrap()
+                .evaluated()
+                .unwrap();
+            let logits = generic
+                .decode(&Array::from_slice(&[3_u32], &[1, 1]), &stream)
+                .unwrap()
+                .evaluated()
+                .unwrap()
+                .as_slice::<f32>()
+                .to_vec();
+            assert!(
+                logits.iter().all(|value| value.is_finite())
+                    && logits.iter().any(|value| value.abs() > 1e-12),
+                "{name}: {logits:?}"
+            );
+            assert!(generic
+                .state_snapshot()
+                .iter()
+                .zip(&stateful)
+                .all(|((position, _), stateful)| *position == if *stateful { 3 } else { 0 }));
+        }
+    }
+
+    #[test]
+    fn heterogeneous_gguf_artifacts_use_the_same_generic_state_contract() {
+        super::super::path_instrumentation::reset();
+        let (stream, weights_stream) = execution_streams();
+        for (name, gguf_name, config) in [
+            ("lfm2", "lfm2", lfm2_config()),
+            ("kimi_linear", "kimi_linear", kimi_linear_config()),
+            ("nemotron_h", "nemotron_h", nemotron_h_config()),
+            ("qwen3_next", "qwen3next", qwen_next_config()),
+            ("qwen3_5_text", "qwen35", qwen_hybrid_config()),
+        ] {
+            let gguf = tiny_heterogeneous_gguf(gguf_name, &stream);
+            let inspection =
+                eredu_architectures::configuration::inspect_artifact(gguf.path()).unwrap();
+            let requirements =
+                eredu_architectures::replicated_text::replicated_text_requirements(&inspection)
+                    .unwrap_or_else(|error| panic!("{name} GGUF requirements: {error}"));
+            let stateful = (0..requirements.state_layout().len())
+                .map(|layer| {
+                    !requirements
+                        .state_layout()
+                        .components(layer)
+                        .unwrap()
+                        .is_empty()
+                })
+                .collect::<Vec<_>>();
+            let safe = tiny_heterogeneous_artifact(config);
+            let safe_inspection =
+                eredu_architectures::configuration::inspect_artifact(safe.path()).unwrap();
+            let safe_requirements =
+                eredu_architectures::replicated_text::replicated_text_requirements(
+                    &safe_inspection,
+                )
+                .unwrap();
+            assert_eq!(
+                requirements.state_access(),
+                safe_requirements.state_access()
+            );
+            assert_eq!(
+                requirements.state_layout(),
+                safe_requirements.state_layout()
+            );
+            assert_eq!(requirements.operators(), safe_requirements.operators());
+            assert_eq!(
+                requirements.execution_graph(),
+                safe_requirements.execution_graph()
+            );
+
+            let execute = |token| {
+                let fresh =
+                    eredu_architectures::configuration::inspect_artifact(gguf.path()).unwrap();
+                let plan = eredu_core::plan_model_preparation(
+                    fresh,
+                    eredu_core::PreparationPolicy::default(),
+                    eredu_core::SessionCapabilities::default(),
+                )
+                .unwrap();
+                let model = materialize_model_plan(
+                    plan,
+                    crate::MlxLoadRequest::default(),
+                    &stream,
+                    &weights_stream,
+                )
+                .unwrap_or_else(|error| panic!("{name} GGUF: {error}"));
+                let mut executable = model.into_complete().unwrap();
+                let super::super::Executable::ReplicatedText(_, generic) = &mut executable else {
+                    panic!("{name} GGUF did not use generic replicated composition")
+                };
+                let prompt = Array::from_slice(&[1_u32, 2], &[1, 2]);
+                let parts = [input::token_ids_part(&prompt).unwrap()];
+                generic
+                    .prefill(input::ModelInput::new(&parts), &stream)
+                    .unwrap()
+                    .evaluated()
+                    .unwrap();
+                let fixed_before = generic.fixed_numeric_state_snapshot().unwrap();
+                let logits = generic
+                    .decode(&Array::from_slice(&[token], &[1, 1]), &stream)
+                    .unwrap()
+                    .evaluated()
+                    .unwrap()
+                    .as_slice::<f32>()
+                    .to_vec();
+                let fixed_after = generic.fixed_numeric_state_snapshot().unwrap();
+                (logits, generic.state_snapshot(), fixed_before, fixed_after)
+            };
+            let token_three = execute(3_u32);
+            let token_four = execute(4_u32);
+            for (logits, snapshot, fixed_before, fixed_after) in [&token_three, &token_four] {
+                assert!(
+                    logits.iter().all(|value| value.is_finite())
+                        && logits.iter().any(|value| value.abs() > 1e-12),
+                    "{name} GGUF produced invalid logits: {logits:?}"
+                );
+                assert!(snapshot
+                    .iter()
+                    .zip(&stateful)
+                    .all(|((position, fixed), stateful)| {
+                        *position == if *stateful { 3 } else { 0 }
+                            && fixed.iter().all(|(_, present)| *present)
+                    }));
+                assert_ne!(
+                    fixed_before, fixed_after,
+                    "{name} fixed state did not consume decode input"
+                );
+            }
+            assert_ne!(
+                token_three.0, token_four.0,
+                "{name} ignored token identity at an identical state frontier"
+            );
+        }
+        assert_eq!(
+            super::super::path_instrumentation::snapshot(),
+            super::super::path_instrumentation::Counts {
+                architecture_constructions: 10,
+                state_allocations: 10,
+                payload_opens: 10,
+                forwards: 20,
+            }
+        );
+    }
+
+    #[test]
+    fn packed_fused_qwen_next_gguf_format_reaches_split_projection_execution() {
+        let (stream, weights_stream) = execution_streams();
+        let gguf = tiny_heterogeneous_gguf_with_packed_qwen_next(
+            "qwen3next",
+            Some(eredu_gguf::GgmlType::MxFp4),
+            &stream,
+        );
+        let inspection = eredu_architectures::configuration::inspect_artifact(gguf.path()).unwrap();
+        let requirements =
+            eredu_architectures::replicated_text::replicated_text_requirements(&inspection)
+                .unwrap();
+        let fused_targets = requirements
+            .parameters()
+            .iter()
+            .filter(|parameter| {
+                parameter.name().contains("linear_attn.in_proj_qkv.weight")
+                    || parameter.name().contains("linear_attn.in_proj_z.weight")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(fused_targets.len(), 2);
+        assert!(fused_targets.iter().all(|parameter| {
+            matches!(
+                parameter.presence(),
+                eredu_runtime::ReplicatedTextParameterPresence::Derived { .. }
+            ) && parameter.has_lowering_source()
+                && parameter.native_executable() == eredu_checkpoint::LinearFormat::MxFp4
+        }));
+        let selection_request = eredu_runtime::ReplicatedTextSelectionRequest::new(
+            eredu_runtime::LayerWeightResidency::FullyResident,
+            eredu_runtime::CacheResidencyPolicy::Device,
+        );
+        let selected = eredu_runtime::select_replicated_text_realization(
+            &requirements,
+            &selection_request,
+            &capabilities(&requirements, &selection_request),
+        )
+        .unwrap();
+        assert!(selected
+            .parameters()
+            .iter()
+            .filter(|parameter| {
+                parameter.name().contains("linear_attn.in_proj_qkv.weight")
+                    || parameter.name().contains("linear_attn.in_proj_z.weight")
+            })
+            .all(|parameter| parameter.lowering() == eredu_runtime::WeightLoweringKind::Derived));
+
+        let plan = eredu_core::plan_model_preparation(
+            inspection,
+            eredu_core::PreparationPolicy::default(),
+            eredu_core::SessionCapabilities::default(),
+        )
+        .unwrap();
+        let model = materialize_model_plan(
+            plan,
+            crate::MlxLoadRequest::default(),
+            &stream,
+            &weights_stream,
+        )
+        .unwrap();
+        let mut executable = model.into_complete().unwrap();
+        let super::super::Executable::ReplicatedText(_, generic) = &mut executable else {
+            panic!("packed Qwen3-Next did not use generic replicated composition")
+        };
+        let prompt = Array::from_slice(&[1_u32, 2], &[1, 2]);
+        let parts = [input::token_ids_part(&prompt).unwrap()];
+        generic
+            .prefill(input::ModelInput::new(&parts), &stream)
+            .unwrap()
+            .evaluated()
+            .unwrap();
+        let logits = generic
+            .decode(&Array::from_slice(&[3_u32], &[1, 1]), &stream)
+            .unwrap()
+            .evaluated()
+            .unwrap()
+            .as_slice::<f32>()
+            .to_vec();
+        assert!(
+            logits.iter().all(|value| value.is_finite())
+                && logits.iter().any(|value| value.abs() > 1e-12)
+        );
+        assert!(generic
+            .state_snapshot()
+            .iter()
+            .all(|(position, _)| *position == 3));
+    }
+
+    #[test]
+    fn fused_qwen_next_safetensors_preserves_both_source_families_into_execution() {
+        let (stream, weights_stream) = execution_streams();
+        let root = tiny_heterogeneous_artifact_with_layout(qwen_next_config(), true);
+        let inspection = eredu_architectures::configuration::inspect_artifact(root.path()).unwrap();
+        let requirements =
+            eredu_architectures::replicated_text::replicated_text_requirements(&inspection)
+                .unwrap();
+        let fused = requirements
+            .parameters()
+            .iter()
+            .filter(|parameter| {
+                parameter.name().contains("linear_attn.in_proj_")
+                    && matches!(
+                        parameter.presence(),
+                        eredu_runtime::ReplicatedTextParameterPresence::Derived { .. }
+                    )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(fused.len(), 4);
+        assert!(fused.iter().all(|parameter| {
+            parameter.has_lowering_source()
+                && matches!(
+                    parameter.source_encoding(),
+                    Some(eredu_checkpoint::SourceTensorEncoding::Safetensors(
+                        eredu_checkpoint::StoredDtype::F32
+                    ))
+                )
+                && parameter.physical_shape().is_some()
+                && parameter.physical_sources().len() == 1
+        }));
+        assert_eq!(
+            fused
+                .iter()
+                .filter(|parameter| parameter.physical_sources()[0].tensor().contains("qkvz"))
+                .count(),
+            2
+        );
+        assert_eq!(
+            fused
+                .iter()
+                .filter(|parameter| parameter.physical_sources()[0].tensor().contains("ba"))
+                .count(),
+            2
+        );
+        assert!(fused
+            .iter()
+            .filter(|parameter| parameter.physical_sources()[0].tensor().contains("ba"))
+            .all(
+                |parameter| parameter.native_executable() == eredu_checkpoint::LinearFormat::Dense
+            ));
+
+        let plan = eredu_core::plan_model_preparation(
+            inspection,
+            eredu_core::PreparationPolicy::default(),
+            eredu_core::SessionCapabilities::default(),
+        )
+        .unwrap();
+        let model = materialize_model_plan(
+            plan,
+            crate::MlxLoadRequest::default(),
+            &stream,
+            &weights_stream,
+        )
+        .unwrap();
+        let mut executable = model.into_complete().unwrap();
+        let super::super::Executable::ReplicatedText(_, generic) = &mut executable else {
+            panic!("fused SafeTensors Qwen3-Next did not use replicated composition")
+        };
+        let prompt = Array::from_slice(&[1_u32, 2], &[1, 2]);
+        let parts = [input::token_ids_part(&prompt).unwrap()];
+        generic
+            .prefill(input::ModelInput::new(&parts), &stream)
+            .unwrap()
+            .evaluated()
+            .unwrap();
+        let logits = generic
+            .decode(&Array::from_slice(&[3_u32], &[1, 1]), &stream)
+            .unwrap()
+            .evaluated()
+            .unwrap()
+            .as_slice::<f32>()
+            .to_vec();
+        assert!(
+            logits.iter().all(|value| value.is_finite())
+                && logits.iter().any(|value| value.abs() > 1e-12)
+        );
+        assert!(generic
+            .state_snapshot()
+            .iter()
+            .all(|(position, _)| *position == 3));
+    }
+
+    #[test]
+    fn admitted_gguf_media_projector_keeps_qwen_hybrid_out_of_text_binding() {
+        let (stream, _) = execution_streams();
+        let gguf = tiny_heterogeneous_gguf("qwen35", &stream);
+        let inspection = eredu_architectures::configuration::inspect_artifact(gguf.path()).unwrap();
+        let plan = inspection.architecture_plan().gguf_plan().unwrap();
+        assert!(super::super::loading::gguf_uses_replicated_text_binding(
+            plan, false
+        ));
+        assert!(!super::super::loading::gguf_uses_replicated_text_binding(
+            plan, true
+        ));
     }
 
     #[test]
@@ -1353,6 +3069,359 @@ mod tests {
     }
 
     #[test]
+    fn heterogeneous_state_and_operator_gaps_reject_before_any_production_path() {
+        use eredu_core::cache::{
+            LayerCachePolicy, StateComponentRole, StateTensorDtype, StateTensorPolicy,
+        };
+
+        super::super::path_instrumentation::reset();
+        let paged = CacheResidencyPolicy::Paged(
+            PagedCacheOptions::new(4, 4096, 4096, 1)
+                .unwrap()
+                .with_full_attention(true),
+        );
+        for (name, config) in [
+            ("lfm2", lfm2_config()),
+            ("kimi_linear", kimi_linear_config()),
+            ("nemotron_h", nemotron_h_config()),
+            ("qwen3_next", qwen_next_config()),
+            ("qwen3_5_text", qwen_hybrid_config()),
+        ] {
+            let root = tiny_heterogeneous_artifact(config);
+            let inspection =
+                eredu_architectures::configuration::inspect_artifact(root.path()).unwrap();
+            let requirements =
+                eredu_architectures::replicated_text::replicated_text_requirements(&inspection)
+                    .unwrap();
+            let request = eredu_runtime::ReplicatedTextSelectionRequest::new(
+                eredu_runtime::LayerWeightResidency::FullyResident,
+                CacheResidencyPolicy::Device,
+            );
+            let full = capabilities(&requirements, &request);
+
+            let fixed_components = full
+                .state()
+                .components()
+                .iter()
+                .filter(|mechanism| {
+                    matches!(mechanism.component().role(), StateComponentRole::Fixed(_))
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            assert!(
+                !fixed_components.is_empty(),
+                "{name} fixture has no fixed state"
+            );
+            for fixed in &fixed_components {
+                let missing_fixed = complete_state_capabilities(
+                    full.state()
+                        .components()
+                        .iter()
+                        .filter(|mechanism| *mechanism != fixed)
+                        .cloned(),
+                );
+                let error = eredu_runtime::select_replicated_text_realization(
+                    &requirements,
+                    &request,
+                    &capabilities_with(&full, full.operators(), missing_fixed),
+                )
+                .expect_err("missing fixed state was admitted");
+                assert!(
+                    error.issues().iter().any(|issue| {
+                        issue.contains(&fixed.component().role().stable_name())
+                            && issue.contains("state component")
+                    }),
+                    "{name}: {error}"
+                );
+            }
+            if name == "kimi_linear" {
+                let without_compressed = complete_state_capabilities(
+                    full.state()
+                        .components()
+                        .iter()
+                        .filter(|mechanism| {
+                            mechanism.component().role() != StateComponentRole::CompressedLatent
+                        })
+                        .cloned(),
+                );
+                let error = eredu_runtime::select_replicated_text_realization(
+                    &requirements,
+                    &request,
+                    &capabilities_with(&full, full.operators(), without_compressed),
+                )
+                .expect_err("missing compressed attention was admitted");
+                assert!(error
+                    .issues()
+                    .iter()
+                    .any(|issue| issue.contains("attention.compressed_latent")));
+            }
+
+            for fixed in &fixed_components {
+                let StateComponentRole::Fixed(role) = fixed.component().role() else {
+                    unreachable!("fixed component filter changed")
+                };
+                let wrong_shape =
+                    LayerCachePolicy::fixed_only(vec![StateTensorPolicy::new_with_residency(
+                        role,
+                        vec![eredu_core::cache::StateTensorDimension::fixed(999).unwrap()],
+                        fixed.component().dtype(),
+                        fixed.component().residency(),
+                    )
+                    .unwrap()])
+                    .unwrap()
+                    .components()
+                    .pop()
+                    .unwrap();
+                let components = full.state().components().iter().map(|mechanism| {
+                    if mechanism == fixed {
+                        StateComponentMechanism::new(
+                            mechanism.layer(),
+                            wrong_shape.clone(),
+                            Some(StateComponentPlacement::Device),
+                            Some(StateComponentPlacement::Device),
+                        )
+                    } else {
+                        mechanism.clone()
+                    }
+                });
+                let error = eredu_runtime::select_replicated_text_realization(
+                    &requirements,
+                    &request,
+                    &capabilities_with(
+                        &full,
+                        full.operators(),
+                        complete_state_capabilities(components),
+                    ),
+                )
+                .expect_err("wrong fixed-state shape was admitted");
+                assert!(error
+                    .issues()
+                    .iter()
+                    .any(|issue| issue.contains("shape") && issue.contains("dtype")));
+
+                let alternate_dtype = match fixed.component().dtype() {
+                    StateTensorDtype::Float32 => StateTensorDtype::Floating,
+                    _ => StateTensorDtype::Float32,
+                };
+                let wrong_dtype =
+                    LayerCachePolicy::fixed_only(vec![StateTensorPolicy::new_with_residency(
+                        role,
+                        fixed.component().shape().to_vec(),
+                        alternate_dtype,
+                        fixed.component().residency(),
+                    )
+                    .unwrap()])
+                    .unwrap()
+                    .components()
+                    .pop()
+                    .unwrap();
+                let components = full.state().components().iter().map(|mechanism| {
+                    if mechanism == fixed {
+                        StateComponentMechanism::new(
+                            mechanism.layer(),
+                            wrong_dtype.clone(),
+                            Some(StateComponentPlacement::Device),
+                            Some(StateComponentPlacement::Device),
+                        )
+                    } else {
+                        mechanism.clone()
+                    }
+                });
+                assert!(
+                    eredu_runtime::select_replicated_text_realization(
+                        &requirements,
+                        &request,
+                        &capabilities_with(
+                            &full,
+                            full.operators(),
+                            complete_state_capabilities(components),
+                        ),
+                    )
+                    .is_err(),
+                    "{name} admitted an incompatible fixed-state dtype"
+                );
+            }
+
+            let paged_components = full.state().components().iter().map(|mechanism| {
+                StateComponentMechanism::new(
+                    mechanism.layer(),
+                    mechanism.component().clone(),
+                    Some(StateComponentPlacement::Device),
+                    Some(StateComponentPlacement::Paged),
+                )
+            });
+            let paged_request = eredu_runtime::ReplicatedTextSelectionRequest::new(
+                eredu_runtime::LayerWeightResidency::FullyResident,
+                paged.clone(),
+            )
+            .with_prompt_cache(true);
+            assert!(
+                eredu_runtime::select_replicated_text_realization(
+                    &requirements,
+                    &paged_request,
+                    &capabilities_with(
+                        &full,
+                        full.operators(),
+                        complete_state_capabilities(paged_components),
+                    ),
+                )
+                .is_err(),
+                "{name} admitted incompatible paged fixed-component placement"
+            );
+
+            if requirements.operators() != eredu_nn::NeuralOperatorCapabilities::NONE {
+                let error = eredu_runtime::select_replicated_text_realization(
+                    &requirements,
+                    &request,
+                    &capabilities_with(
+                        &full,
+                        eredu_nn::NeuralOperatorCapabilities::NONE,
+                        full.state().clone(),
+                    ),
+                )
+                .expect_err("missing semantic neural operations were admitted");
+                let operation = match name {
+                    "nemotron_h" => "selective_state_space_scan",
+                    "kimi_linear" | "qwen3_next" | "qwen3_5_text" => "gated_delta_scan",
+                    _ => unreachable!(),
+                };
+                assert!(
+                    error.issues().iter().any(|issue| issue.contains(operation)),
+                    "{name}: {error}"
+                );
+            }
+
+            let paged_full = capabilities(&requirements, &paged_request);
+            for (facility, state) in [
+                (
+                    "checkpoint",
+                    StateMechanismCapabilities::new(
+                        paged_full.state().components().iter().cloned(),
+                    )
+                    .with_transactions(false, true)
+                    .with_reset(true)
+                    .with_prompt_cache(true)
+                    .with_observation_retention(true),
+                ),
+                (
+                    "rollback",
+                    StateMechanismCapabilities::new(
+                        paged_full.state().components().iter().cloned(),
+                    )
+                    .with_transactions(true, false)
+                    .with_reset(true)
+                    .with_prompt_cache(true)
+                    .with_observation_retention(true),
+                ),
+                (
+                    "reset",
+                    StateMechanismCapabilities::new(
+                        paged_full.state().components().iter().cloned(),
+                    )
+                    .with_transactions(true, true)
+                    .with_reset(false)
+                    .with_prompt_cache(true)
+                    .with_observation_retention(true),
+                ),
+                (
+                    "prompt-cache",
+                    StateMechanismCapabilities::new(
+                        paged_full.state().components().iter().cloned(),
+                    )
+                    .with_transactions(true, true)
+                    .with_reset(true)
+                    .with_prompt_cache(false)
+                    .with_observation_retention(true),
+                ),
+            ] {
+                let error = eredu_runtime::select_replicated_text_realization(
+                    &requirements,
+                    &paged_request,
+                    &capabilities_with(&paged_full, paged_full.operators(), state),
+                )
+                .unwrap_err();
+                assert!(
+                    error.issues().iter().any(|issue| issue.contains(facility)),
+                    "{name}: missing {facility} diagnostic: {error}"
+                );
+            }
+
+            std::fs::remove_file(root.path().join("model.safetensors")).unwrap();
+        }
+        assert_eq!(
+            super::super::path_instrumentation::snapshot(),
+            super::super::path_instrumentation::Counts::default()
+        );
+    }
+
+    #[test]
+    fn routed_prediction_and_media_graphs_are_ineligible_without_production_work() {
+        use eredu_architectures::replicated_text::ReplicatedTextIneligibility;
+
+        super::super::path_instrumentation::reset();
+        let mut routed = qwen_hybrid_config();
+        routed["model_type"] = "qwen3_next".into();
+        routed["num_experts"] = 2.into();
+        routed["num_experts_per_tok"] = 1.into();
+
+        let mut nemotron_prediction = nemotron_h_config();
+        nemotron_prediction["num_nextn_predict_layers"] = 1.into();
+        nemotron_prediction["mtp_hybrid_override_pattern"] = "*E".into();
+
+        let mut qwen_prediction = qwen_hybrid_config();
+        qwen_prediction["mtp_num_hidden_layers"] = 1.into();
+
+        let text = qwen_hybrid_config();
+        let media = serde_json::json!({
+            "model_type": "qwen3_5",
+            "image_token_id": 60,
+            "video_token_id": 61,
+            "text_config": text,
+            "vision_config": {
+                "depth": 1, "hidden_size": 8, "intermediate_size": 16,
+                "num_heads": 2, "num_position_embeddings": 16,
+                "in_channels": 3, "patch_size": 2, "spatial_merge_size": 2,
+                "temporal_patch_size": 2, "out_hidden_size": 32
+            }
+        });
+
+        for (name, config, expected) in [
+            ("routed", routed, ReplicatedTextIneligibility::Routed),
+            (
+                "nemotron prediction",
+                nemotron_prediction,
+                ReplicatedTextIneligibility::EmbeddedPrediction,
+            ),
+            (
+                "qwen prediction",
+                qwen_prediction,
+                ReplicatedTextIneligibility::EmbeddedPrediction,
+            ),
+            ("media", media, ReplicatedTextIneligibility::CompositeInput),
+        ] {
+            let root = tiny_heterogeneous_artifact(config);
+            let inspection =
+                eredu_architectures::configuration::inspect_artifact(root.path()).unwrap();
+            std::fs::remove_file(root.path().join("model.safetensors")).unwrap();
+            let error =
+                eredu_architectures::replicated_text::replicated_text_requirements(&inspection)
+                    .expect_err("excluded graph entered replicated text admission");
+            assert!(
+                matches!(
+                    error,
+                    eredu_architectures::replicated_text::ReplicatedTextRequirementsError::Ineligible(actual)
+                        if actual == expected
+                ),
+                "{name}: {error}"
+            );
+        }
+        assert_eq!(
+            super::super::path_instrumentation::snapshot(),
+            super::super::path_instrumentation::Counts::default()
+        );
+    }
+
+    #[test]
     fn invalid_source_and_missing_grouped_mechanism_never_reach_production_paths() {
         super::super::path_instrumentation::reset();
         let root = tiny_artifact("llama", false);
@@ -1384,11 +3453,13 @@ mod tests {
         let mut parameters = requirements.parameters().to_vec();
         parameters[0] = invalid;
         let invalid_requirements = ReplicatedTextRequirements::new(
+            requirements.architecture_identity().to_owned(),
             requirements.operators(),
             requirements.execution_graph().clone(),
             requirements.execution_units().clone(),
             requirements.group_transports().to_vec(),
             requirements.state_layout().clone(),
+            requirements.state_access(),
             parameters,
         )
         .unwrap();
@@ -1483,11 +3554,13 @@ mod tests {
         let mut parameters = requirements.parameters().to_vec();
         parameters[linear_index] = invalid_mxfp4;
         let invalid_mxfp4_requirements = ReplicatedTextRequirements::new(
+            requirements.architecture_identity().to_owned(),
             requirements.operators(),
             requirements.execution_graph().clone(),
             requirements.execution_units().clone(),
             requirements.group_transports().to_vec(),
             requirements.state_layout().clone(),
+            requirements.state_access(),
             parameters,
         )
         .unwrap();
@@ -1510,7 +3583,14 @@ mod tests {
             full.operators(),
             full.weight_lowerings().to_vec(),
             vec![WeightResidencyMechanism::Resident],
-            vec![StateResidencyMechanism::Device],
+            StateMechanismCapabilities::new(full.state().components().iter().map(|mechanism| {
+                StateComponentMechanism::new(
+                    mechanism.layer(),
+                    mechanism.component().clone(),
+                    Some(StateComponentPlacement::Device),
+                    None,
+                )
+            })),
         );
         let paged = CacheResidencyPolicy::Paged(PagedCacheOptions::new(4, 4096, 4096, 1).unwrap());
         let state_error = eredu_runtime::select_replicated_text_realization(
@@ -1525,7 +3605,7 @@ mod tests {
         assert!(state_error
             .issues()
             .iter()
-            .any(|issue| issue.contains("state residency")));
+            .any(|issue| issue.contains("state component")));
         let session_error = eredu_runtime::select_replicated_text_realization(
             &requirements,
             &request
@@ -1585,7 +3665,7 @@ mod tests {
                 &capabilities(&requirements, &request),
             )
             .unwrap();
-            assert_eq!(selected.state(), &state);
+            assert_eq!(selected.state().policy(), &state);
             let plan = eredu_core::plan_model_preparation(
                 inspection,
                 policy,
@@ -1614,19 +3694,148 @@ mod tests {
             )
             .unwrap();
             let executable =
-                eredu_architectures::replicated_text::visit_replicated_text_architecture(
+                eredu_architectures::replicated_text::visit_replicated_text_architecture::<
+                    MlxNeuralBackend,
+                    MlxKeyValueState,
+                    _,
+                >(
                     &architecture_plan,
-                    requirements,
                     selected,
+                    prepared.store(),
                     &stream,
                     BindingVisitor {
-                        store: prepared.store(),
                         stream: &stream,
                         weights_stream: &weights_stream,
                     },
                 )
                 .unwrap();
             assert!(executable.cache_residency_report().unwrap().is_some());
+        }
+    }
+
+    #[test]
+    fn heterogeneous_requirements_are_invariant_across_caller_policies() {
+        for config in [
+            lfm2_config(),
+            kimi_linear_config(),
+            nemotron_h_config(),
+            qwen_next_config(),
+            qwen_hybrid_config(),
+        ] {
+            let root = tiny_heterogeneous_artifact(config);
+            let inspection =
+                eredu_architectures::configuration::inspect_artifact(root.path()).unwrap();
+            let expected =
+                eredu_architectures::replicated_text::replicated_text_requirements(&inspection)
+                    .unwrap();
+            let requests = [
+                eredu_runtime::ReplicatedTextSelectionRequest::new(
+                    eredu_runtime::LayerWeightResidency::FullyResident,
+                    CacheResidencyPolicy::Device,
+                ),
+                eredu_runtime::ReplicatedTextSelectionRequest::new(
+                    eredu_runtime::LayerWeightResidency::LayerwiseHost(
+                        eredu_runtime::LayerwiseLoadOptions::default(),
+                    ),
+                    CacheResidencyPolicy::Paged(
+                        PagedCacheOptions::new(4, 1 << 20, 1 << 20, 1)
+                            .unwrap()
+                            .with_full_attention(true),
+                    ),
+                )
+                .with_quantization(eredu_core::QuantizationRequest::Affine {
+                    group_size: 16,
+                    bits: 4,
+                })
+                .with_session(eredu_core::SessionCapabilities::new(true, true, true))
+                .with_prompt_cache(true)
+                .with_exact_completion(true),
+                eredu_runtime::ReplicatedTextSelectionRequest::new(
+                    eredu_runtime::LayerWeightResidency::DenseDiskStream(
+                        eredu_runtime::DenseDiskStreamLoadOptions::default(),
+                    ),
+                    CacheResidencyPolicy::Device,
+                )
+                .with_quantization(eredu_core::QuantizationRequest::MxFp4),
+            ];
+            for request in requests {
+                assert!(matches!(
+                    request.residency(),
+                    eredu_runtime::LayerWeightResidency::FullyResident
+                        | eredu_runtime::LayerWeightResidency::LayerwiseHost(_)
+                        | eredu_runtime::LayerWeightResidency::DenseDiskStream(_)
+                ));
+                assert_eq!(
+                    expected,
+                    eredu_architectures::replicated_text::replicated_text_requirements(&inspection)
+                        .unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn included_safetensors_configs_cannot_enter_family_materialization() {
+        let (stream, weights_stream) = execution_streams();
+        for config in [
+            lfm2_config(),
+            kimi_linear_config(),
+            nemotron_h_config(),
+            qwen_next_config(),
+            qwen_hybrid_config(),
+        ] {
+            let root = tiny_heterogeneous_artifact(config);
+            let inspection =
+                eredu_architectures::configuration::inspect_artifact(root.path()).unwrap();
+            let plan = eredu_core::plan_model_preparation(
+                inspection,
+                eredu_core::PreparationPolicy::default(),
+                eredu_core::SessionCapabilities::default(),
+            )
+            .unwrap();
+            let architecture_plan = plan.inspection().architecture_plan().clone();
+            let eredu_core::ModelArtifact::SafeTensors {
+                configuration,
+                tensors,
+                shards,
+                ..
+            } = plan.into_artifact()
+            else {
+                panic!("expected SafeTensors fixture")
+            };
+            let prepared = super::super::artifact::PreparedSafetensorsArtifact::open(
+                configuration,
+                super::super::loading::prepared_safetensors_architecture(&architecture_plan)
+                    .unwrap()
+                    .clone(),
+                tensors,
+                shards,
+                1,
+            )
+            .unwrap();
+            let options = super::super::loading::SelectedMlxConstruction::from_request(
+                crate::MlxLoadRequest::default(),
+                eredu_core::SessionCapabilities::default(),
+            )
+            .unwrap();
+            super::super::path_instrumentation::reset();
+            let error = match super::super::loading::materialize_safetensors(
+                &prepared,
+                None,
+                options,
+                &stream,
+                &weights_stream,
+            ) {
+                Ok(_) => panic!("included configuration entered a family materializer"),
+                Err(error) => error,
+            };
+            assert!(error
+                .to_string()
+                .contains("architecture-owned eligibility requires replicated text composition"));
+            assert_eq!(
+                super::super::path_instrumentation::snapshot(),
+                super::super::path_instrumentation::Counts::default()
+            );
         }
     }
 
@@ -1670,6 +3879,104 @@ mod tests {
             executable
                 .decode(&Array::from_slice(&[1_u32], &[1, 1]), &stream)
                 .unwrap()
+                .evaluated()
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn heterogeneous_generic_handoff_executes_selected_load_time_transforms() {
+        let (stream, weights_stream) = execution_streams();
+        let mut lfm_affine = lfm2_config();
+        lfm_affine["hidden_size"] = 32.into();
+        lfm_affine["intermediate_size"] = 32.into();
+        lfm_affine["num_key_value_heads"] = 1.into();
+        lfm_affine["block_auto_adjust_ff_dim"] = false.into();
+        let mut kimi_affine = kimi_linear_config();
+        kimi_affine["hidden_size"] = 32.into();
+        kimi_affine["intermediate_size"] = 32.into();
+        kimi_affine["kv_lora_rank"] = 32.into();
+        kimi_affine["moe_intermediate_size"] = 32.into();
+        kimi_affine["linear_attn_config"]["num_heads"] = 4.into();
+        kimi_affine["linear_attn_config"]["head_dim"] = 32.into();
+        kimi_affine["num_attention_heads"] = 4.into();
+        kimi_affine["qk_nope_head_dim"] = 24.into();
+        kimi_affine["qk_rope_head_dim"] = 8.into();
+        kimi_affine["v_head_dim"] = 8.into();
+        let mut nemotron_affine = nemotron_h_config();
+        nemotron_affine["hidden_size"] = 32.into();
+        nemotron_affine["intermediate_size"] = 32.into();
+        nemotron_affine["num_attention_heads"] = 8.into();
+        nemotron_affine["num_key_value_heads"] = 4.into();
+        nemotron_affine["mamba_num_heads"] = 8.into();
+        nemotron_affine["moe_intermediate_size"] = 32.into();
+        nemotron_affine["moe_shared_expert_intermediate_size"] = 32.into();
+        let mut lfm_mxfp4 = lfm2_config();
+        lfm_mxfp4["hidden_size"] = 32.into();
+        lfm_mxfp4["intermediate_size"] = 64.into();
+        lfm_mxfp4["num_key_value_heads"] = 1.into();
+        lfm_mxfp4["block_auto_adjust_ff_dim"] = false.into();
+        let mut qwen_mxfp4 = qwen_hybrid_config();
+        qwen_mxfp4["intermediate_size"] = 64.into();
+        for (name, config, request) in [
+            (
+                "lfm2-affine",
+                lfm_affine,
+                eredu_core::QuantizationRequest::Affine {
+                    group_size: 32,
+                    bits: 4,
+                },
+            ),
+            (
+                "kimi-affine",
+                kimi_affine,
+                eredu_core::QuantizationRequest::Affine {
+                    group_size: 32,
+                    bits: 4,
+                },
+            ),
+            (
+                "nemotron-affine",
+                nemotron_affine,
+                eredu_core::QuantizationRequest::Affine {
+                    group_size: 32,
+                    bits: 4,
+                },
+            ),
+            (
+                "lfm2-mxfp4",
+                lfm_mxfp4,
+                eredu_core::QuantizationRequest::MxFp4,
+            ),
+            (
+                "qwen-mxfp4",
+                qwen_mxfp4,
+                eredu_core::QuantizationRequest::MxFp4,
+            ),
+        ] {
+            let root = tiny_heterogeneous_artifact(config);
+            let options = crate::MlxLoadRequest::with_quantization(request);
+            let inspection =
+                eredu_architectures::configuration::inspect_artifact(root.path()).unwrap();
+            let plan = eredu_core::plan_model_preparation(
+                inspection,
+                options.preparation_policy().unwrap(),
+                eredu_core::SessionCapabilities::default(),
+            )
+            .unwrap();
+            let model = materialize_model_plan(plan, options, &stream, &weights_stream)
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+            let report = model
+                .materialization_report()
+                .unwrap_or_else(|| panic!("{name}: no materialization report"));
+            assert!(report.transformed_weights > 0, "{name}");
+            let mut executable = model.into_complete().unwrap();
+            let super::super::Executable::ReplicatedText(_, generic) = &mut executable else {
+                panic!("{name} did not use generic replicated composition")
+            };
+            generic
+                .decode(&Array::from_slice(&[1_u32], &[1, 1]), &stream)
+                .unwrap_or_else(|error| panic!("{name}: {error}"))
                 .evaluated()
                 .unwrap();
         }
@@ -1799,6 +4106,8 @@ mod tests {
         struct Observer {
             activation: bool,
             logits: bool,
+            intervened: bool,
+            stream: Stream,
         }
         impl eredu_runtime::ActivationObserver<Array, Exception> for Observer {
             fn observe(&mut self, path: &str, _value: &Array) -> Result<(), Exception> {
@@ -1808,7 +4117,12 @@ mod tests {
             }
 
             fn intervene(&mut self, path: &str, value: &Array) -> Result<Option<Array>, Exception> {
-                Ok((path == eredu_core::MODEL_LOGITS_OBSERVATION_PATH).then(|| value.clone()))
+                if path == eredu_core::MODEL_LOGITS_OBSERVATION_PATH {
+                    self.intervened = true;
+                    Ok(Some(safemlx::ops::zeros_like(value, &self.stream)?))
+                } else {
+                    Ok(None)
+                }
             }
         }
 
@@ -1867,19 +4181,25 @@ mod tests {
             let mut observer = Observer {
                 activation: false,
                 logits: false,
+                intervened: false,
+                stream: stream.clone(),
             };
-            generic
+            let replacement = generic
                 .forward_with_observer(
                     &Array::from_slice(&[3_u32], &[1, 1]),
                     None,
                     &stream,
                     &mut observer,
                 )
-                .unwrap()
-                .evaluated()
                 .unwrap();
+            let replacement = replacement.evaluated().unwrap();
             assert!(observer.logits);
             assert!(observer.activation);
+            assert!(observer.intervened);
+            assert!(replacement
+                .as_slice::<f32>()
+                .iter()
+                .all(|value| *value == 0.0));
 
             let identity = generic.prompt_cache_model_identity().clone();
             let descriptor = PromptCacheDescriptor::from_model_identity(
@@ -1926,6 +4246,379 @@ mod tests {
                 .unwrap()
                 .evaluated()
                 .unwrap();
+        }
+    }
+
+    #[test]
+    fn heterogeneous_generic_sessions_preserve_every_state_component_across_controls() {
+        struct Observer {
+            activation: bool,
+            logits: bool,
+            intervened: bool,
+            stream: Stream,
+        }
+        impl eredu_runtime::ActivationObserver<Array, Exception> for Observer {
+            fn observe(&mut self, path: &str, _value: &Array) -> Result<(), Exception> {
+                self.logits |= path == eredu_core::MODEL_LOGITS_OBSERVATION_PATH;
+                self.activation |= path != eredu_core::MODEL_LOGITS_OBSERVATION_PATH;
+                Ok(())
+            }
+
+            fn intervene(&mut self, path: &str, value: &Array) -> Result<Option<Array>, Exception> {
+                if path == eredu_core::MODEL_LOGITS_OBSERVATION_PATH {
+                    self.intervened = true;
+                    Ok(Some(safemlx::ops::zeros_like(value, &self.stream)?))
+                } else {
+                    Ok(None)
+                }
+            }
+        }
+
+        let (stream, weights_stream) = execution_streams();
+        let host = eredu_runtime::LayerwiseLoadOptions::new(
+            eredu_core::residency::OffloadConfig::new(Some(u64::MAX), Some(u64::MAX), 3).unwrap(),
+        )
+        .with_max_cached_shards(2);
+        let disk = eredu_runtime::DenseDiskStreamLoadOptions::new(1 << 30, 2 << 30, 5, 2).unwrap();
+        let paged = PagedCacheOptions::new(4, 1 << 20, 1 << 20, 1)
+            .unwrap()
+            .with_full_attention(true);
+        let cases = vec![
+            (
+                "lfm2",
+                lfm2_config(),
+                eredu_runtime::WeightResidency::fully_resident(),
+                CacheResidencyPolicy::Device,
+            ),
+            (
+                "lfm2-paged",
+                lfm2_config(),
+                eredu_runtime::WeightResidency::layerwise_host(host),
+                CacheResidencyPolicy::Paged(paged.clone()),
+            ),
+            (
+                "kimi_linear",
+                kimi_linear_config(),
+                eredu_runtime::WeightResidency::layerwise_host(host),
+                CacheResidencyPolicy::Device,
+            ),
+            (
+                "kimi_linear-paged",
+                kimi_linear_config(),
+                eredu_runtime::WeightResidency::dense_disk_stream(disk),
+                CacheResidencyPolicy::Paged(paged.clone()),
+            ),
+            (
+                "nemotron_h",
+                nemotron_h_config(),
+                eredu_runtime::WeightResidency::dense_disk_stream(disk),
+                CacheResidencyPolicy::Device,
+            ),
+            (
+                "nemotron_h-paged",
+                nemotron_h_config(),
+                eredu_runtime::WeightResidency::fully_resident(),
+                CacheResidencyPolicy::Paged(paged.clone()),
+            ),
+            (
+                "qwen3_next",
+                qwen_next_config(),
+                eredu_runtime::WeightResidency::fully_resident(),
+                CacheResidencyPolicy::Device,
+            ),
+            (
+                "qwen3_next-paged",
+                qwen_next_config(),
+                eredu_runtime::WeightResidency::layerwise_host(host),
+                CacheResidencyPolicy::Paged(paged.clone()),
+            ),
+            (
+                "qwen3_5_text",
+                qwen_hybrid_config(),
+                eredu_runtime::WeightResidency::layerwise_host(host),
+                CacheResidencyPolicy::Device,
+            ),
+            (
+                "qwen3_5_text-paged",
+                qwen_hybrid_config(),
+                eredu_runtime::WeightResidency::dense_disk_stream(disk),
+                CacheResidencyPolicy::Paged(paged),
+            ),
+        ];
+
+        for (name, config, residency, state_policy) in cases {
+            let root = tiny_heterogeneous_artifact(config);
+            let options = crate::MlxLoadRequest::default()
+                .with_weight_residency(residency)
+                .with_state_residency(state_policy.clone());
+            let inspection =
+                eredu_architectures::configuration::inspect_artifact(root.path()).unwrap();
+            let plan = eredu_core::plan_model_preparation(
+                inspection,
+                options.preparation_policy().unwrap(),
+                eredu_core::SessionCapabilities::default(),
+            )
+            .unwrap();
+            let model = materialize_model_plan(plan, options, &stream, &weights_stream)
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+            assert!(model.residency_report().unwrap().is_some());
+            assert_eq!(
+                model.dense_stream_report().unwrap().is_some(),
+                matches!(
+                    residency,
+                    eredu_runtime::WeightResidency::Layers(
+                        eredu_runtime::LayerWeightResidency::DenseDiskStream(_)
+                    )
+                ),
+                "{name}"
+            );
+            let mut executable = model.into_complete().unwrap();
+            let super::super::Executable::ReplicatedText(_, generic) = &mut executable else {
+                panic!("{name} did not use generic replicated composition")
+            };
+            assert_eq!(generic.selected_residency(), residency.layers(), "{name}");
+            assert_eq!(
+                generic.cache_residency_report().unwrap().is_some(),
+                matches!(state_policy, CacheResidencyPolicy::Paged(_)),
+                "{name}"
+            );
+
+            let prefix = [1_u32, 2, 3];
+            let prompt = Array::from_slice(&prefix, &[1, 3]);
+            let parts = [input::token_ids_part(&prompt).unwrap()];
+            generic
+                .prefill(input::ModelInput::new(&parts), &stream)
+                .unwrap()
+                .evaluated()
+                .unwrap();
+            let saved_snapshot = generic.state_snapshot();
+            let saved_numeric = generic
+                .fixed_numeric_state_snapshot()
+                .unwrap_or_else(|error| panic!("{name} numeric snapshot: {error}"));
+            assert!(!saved_numeric.is_empty(), "{name}");
+            assert!(saved_snapshot
+                .iter()
+                .flat_map(|(_, fixed)| fixed)
+                .all(|(_, present)| *present));
+
+            let persisted = matches!(state_policy, CacheResidencyPolicy::Paged(_)).then(|| {
+                let identity = generic.prompt_cache_model_identity().clone();
+                let descriptor = PromptCacheDescriptor::from_model_identity(
+                    identity,
+                    format!("{name}-checkpoint"),
+                    "tokens:1,2,3",
+                    1,
+                )
+                .unwrap();
+                let cache_root = tempfile::tempdir().unwrap();
+                let destination = cache_root.path().join("cache");
+                generic
+                    .save_prompt_cache(
+                        &destination,
+                        descriptor.clone(),
+                        &prefix,
+                        &PromptCacheOptions::default(),
+                    )
+                    .unwrap();
+                (cache_root, destination, descriptor)
+            });
+            let continuation_token = Array::from_slice(&[4_u32], &[1, 1]);
+            let persistence_baseline = persisted
+                .as_ref()
+                .map(|_| generic.checkpoint_restore_probe(&continuation_token, &stream))
+                .transpose()
+                .unwrap_or_else(|error| panic!("{name} persistence baseline: {error}"));
+            generic.reset_cache().unwrap();
+            assert!(generic.state_snapshot().iter().all(|(position, fixed)| {
+                *position == 0 && fixed.iter().all(|(_, present)| !present)
+            }));
+            if let Some((_cache_root, destination, descriptor)) = persisted {
+                let incompatible = descriptor
+                    .clone()
+                    .with_architecture_fingerprint(format!(
+                        "{}-different",
+                        descriptor.architecture_fingerprint()
+                    ))
+                    .unwrap();
+                assert!(generic
+                    .load_prompt_cache(&destination, &incompatible, &prefix)
+                    .is_err());
+                generic
+                    .load_prompt_cache(&destination, &descriptor, &prefix)
+                    .unwrap();
+            } else {
+                assert!(generic
+                    .save_prompt_cache(
+                        tempfile::tempdir().unwrap().path(),
+                        PromptCacheDescriptor::from_model_identity(
+                            generic.prompt_cache_model_identity().clone(),
+                            format!("{name}-checkpoint"),
+                            "tokens:1,2,3",
+                            1,
+                        )
+                        .unwrap(),
+                        &prefix,
+                        &PromptCacheOptions::default(),
+                    )
+                    .is_err());
+                generic
+                    .prefill(input::ModelInput::new(&parts), &stream)
+                    .unwrap()
+                    .evaluated()
+                    .unwrap();
+            }
+            assert_eq!(generic.state_snapshot(), saved_snapshot, "{name}");
+            assert_eq!(
+                generic.fixed_numeric_state_snapshot().unwrap(),
+                saved_numeric,
+                "{name} fixed tensors changed across prompt-cache restoration"
+            );
+            let probe = generic
+                .checkpoint_restore_probe(&continuation_token, &stream)
+                .unwrap_or_else(|error| panic!("{name} checkpoint/restore: {error}"));
+            if let Some(baseline) = persistence_baseline {
+                assert_eq!(
+                    probe, baseline,
+                    "{name} continuation changed after prompt-cache restoration"
+                );
+            }
+            let (
+                before,
+                advanced,
+                restored,
+                before_numeric,
+                advanced_numeric,
+                restored_numeric,
+                continuation,
+            ) = probe;
+            assert_eq!(before, saved_snapshot, "{name}");
+            assert_ne!(advanced, before, "{name}");
+            assert_eq!(restored, before, "{name}");
+            assert_eq!(before_numeric, saved_numeric, "{name}");
+            assert_ne!(advanced_numeric, before_numeric, "{name}");
+            assert_eq!(restored_numeric, before_numeric, "{name}");
+            let replayed = generic.decode(&continuation_token, &stream).unwrap();
+            let replayed = replayed.evaluated().unwrap();
+            assert_eq!(
+                replayed.as_slice::<f32>(),
+                continuation.as_slice(),
+                "{name}"
+            );
+            assert_eq!(generic.state_snapshot(), advanced, "{name}");
+            assert_eq!(
+                generic.fixed_numeric_state_snapshot().unwrap(),
+                advanced_numeric,
+                "{name}"
+            );
+
+            let mut observer = Observer {
+                activation: false,
+                logits: false,
+                intervened: false,
+                stream: stream.clone(),
+            };
+            let replacement = generic
+                .forward_with_observer(
+                    &Array::from_slice(&[5_u32], &[1, 1]),
+                    None,
+                    &stream,
+                    &mut observer,
+                )
+                .unwrap();
+            let replacement = replacement.evaluated().unwrap();
+            assert!(observer.activation && observer.logits, "{name}");
+            assert!(observer.intervened, "{name}");
+            assert!(
+                replacement
+                    .as_slice::<f32>()
+                    .iter()
+                    .all(|value| *value == 0.0),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn heterogeneous_logits_and_fixed_state_match_across_weight_and_state_residency() {
+        let (stream, weights_stream) = execution_streams();
+        let disk = eredu_runtime::DenseDiskStreamLoadOptions::new(1 << 30, 2 << 30, 5, 2).unwrap();
+        let paged = PagedCacheOptions::new(4, 1 << 20, 1 << 20, 1)
+            .unwrap()
+            .with_full_attention(true);
+        for (name, config) in [
+            ("lfm2", lfm2_config()),
+            ("kimi_linear", kimi_linear_config()),
+            ("nemotron_h", nemotron_h_config()),
+            ("qwen3_next", qwen_next_config()),
+            ("qwen3_5_text", qwen_hybrid_config()),
+        ] {
+            let root = tiny_heterogeneous_artifact(config);
+            let mut results = Vec::new();
+            for (residency, state) in [
+                (
+                    eredu_runtime::WeightResidency::fully_resident(),
+                    CacheResidencyPolicy::Device,
+                ),
+                (
+                    eredu_runtime::WeightResidency::dense_disk_stream(disk),
+                    CacheResidencyPolicy::Paged(paged.clone()),
+                ),
+            ] {
+                let options = crate::MlxLoadRequest::default()
+                    .with_weight_residency(residency)
+                    .with_state_residency(state);
+                let inspection =
+                    eredu_architectures::configuration::inspect_artifact(root.path()).unwrap();
+                let plan = eredu_core::plan_model_preparation(
+                    inspection,
+                    options.preparation_policy().unwrap(),
+                    eredu_core::SessionCapabilities::default(),
+                )
+                .unwrap();
+                let model = materialize_model_plan(plan, options, &stream, &weights_stream)
+                    .unwrap_or_else(|error| panic!("{name}: {error}"));
+                let mut executable = model.into_complete().unwrap();
+                let super::super::Executable::ReplicatedText(_, generic) = &mut executable else {
+                    panic!("{name} did not use generic replicated composition")
+                };
+                let prompt = Array::from_slice(&[1_u32, 2], &[1, 2]);
+                let parts = [input::token_ids_part(&prompt).unwrap()];
+                generic
+                    .prefill(input::ModelInput::new(&parts), &stream)
+                    .unwrap()
+                    .evaluated()
+                    .unwrap();
+                let logits = generic
+                    .decode(&Array::from_slice(&[3_u32], &[1, 1]), &stream)
+                    .unwrap()
+                    .evaluated()
+                    .unwrap()
+                    .as_slice::<f32>()
+                    .to_vec();
+                assert!(
+                    logits.iter().all(|value| value.is_finite())
+                        && logits.iter().any(|value| value.abs() > 1e-12),
+                    "{name}: {logits:?}"
+                );
+                results.push((
+                    logits,
+                    generic.state_snapshot(),
+                    generic.fixed_numeric_state_snapshot().unwrap(),
+                ));
+            }
+            let (resident_logits, resident_semantics, resident_fixed) = &results[0];
+            let (bounded_logits, bounded_semantics, bounded_fixed) = &results[1];
+            assert_eq!(resident_semantics, bounded_semantics, "{name}");
+            assert_eq!(resident_fixed.len(), bounded_fixed.len(), "{name}");
+            for (left, right) in resident_logits.iter().zip(bounded_logits) {
+                assert!((left - right).abs() <= 1e-5, "{name}: {left} != {right}");
+            }
+            for (left, right) in resident_fixed.iter().zip(bounded_fixed) {
+                assert_eq!((&left.0, &left.1, &left.2), (&right.0, &right.1, &right.2));
+                for (left, right) in left.3.iter().zip(&right.3) {
+                    assert!((left - right).abs() <= 1e-5, "{name}: {left} != {right}");
+                }
+            }
         }
     }
 }

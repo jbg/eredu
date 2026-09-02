@@ -54,7 +54,6 @@ pub struct MlxSelectedPreparation {
 #[derive(Debug, Clone)]
 enum MlxSelectedPreparationRoute {
     ReplicatedText {
-        requirements: eredu_runtime::ReplicatedTextRequirements,
         realization: eredu_runtime::SelectedReplicatedTextRealization,
     },
     Other(SelectedMlxConstruction),
@@ -136,6 +135,34 @@ struct MaterializedGgufModel {
     processor: Option<ModelProcessor>,
 }
 
+/// Proof that a family-specific complete-model loader serves an execution
+/// responsibility outside replicated text composition.
+pub(crate) struct ExcludedFamilyRoute(());
+
+impl ExcludedFamilyRoute {
+    fn safetensors(
+        architecture: &eredu_architectures::configuration::SafetensorsArchitecturePlan,
+        composite: Option<super::model::CompositeInputProof>,
+    ) -> Option<Self> {
+        (composite.is_some()
+            || eredu_architectures::replicated_text::safetensors_replicated_text_eligibility(
+                architecture,
+            )
+            .is_err())
+        .then_some(Self(()))
+    }
+
+    fn gguf(
+        architecture: &eredu_architectures::configuration::GgufArchitecturePlan,
+        has_projector: bool,
+    ) -> Option<Self> {
+        (has_projector
+            || eredu_architectures::replicated_text::gguf_replicated_text_eligibility(architecture)
+                .is_err())
+        .then_some(Self(()))
+    }
+}
+
 pub(crate) fn validate_gguf_projector_requirement(
     architecture: eredu_architectures::GgufArchitecture,
     has_projector: bool,
@@ -161,6 +188,13 @@ fn materialize_gguf_model(
     weights_stream: &Stream,
 ) -> Result<Executable, Error> {
     let kind = source.architecture().model_kind();
+    if gguf_uses_replicated_text_binding(source.plan(), projector.is_some()) {
+        return Err(Error::ArchitectureModel(
+            "architecture-owned eligibility requires replicated text composition".into(),
+        ));
+    }
+    let family_route = ExcludedFamilyRoute::gguf(source.plan(), projector.is_some())
+        .expect("replicated GGUF eligibility was rejected above");
     let quantization = options.weight_quantization();
     let binding = GgufBinding::for_kind(kind).ok_or_else(|| {
         Error::ArchitectureModel(format!(
@@ -174,6 +208,7 @@ fn materialize_gguf_model(
         GgufBinding::Quantized(QuantizedGgufBinding::KimiLinear) => {
             let loaded = crate::composition::kimi_linear::load_kimi_linear_gguf_model(
                 source,
+                &family_route,
                 options.weight_residency,
                 quantization,
                 stream,
@@ -229,11 +264,9 @@ fn materialize_gguf_model(
             )?;
             Executable::gemma4(kind, loaded)?
         }
-        GgufBinding::Quantized(QuantizedGgufBinding::Llama) => {
-            return Err(Error::ArchitectureModel(
-                "replicated Llama must use replicated text composition".into(),
-            ));
-        }
+        GgufBinding::Quantized(QuantizedGgufBinding::Llama) => unreachable!(
+            "architecture-owned eligibility rejects replicated GGUF before family binding"
+        ),
         GgufBinding::Fixed(FixedGgufBinding::MuseGlimmer) => {
             let loaded = crate::composition::muse_glimmer::load_gguf(
                 source,
@@ -247,6 +280,7 @@ fn materialize_gguf_model(
         GgufBinding::Quantized(QuantizedGgufBinding::Lfm2) => {
             let loaded = crate::composition::lfm2::load_lfm2_gguf_model(
                 source,
+                &family_route,
                 options.weight_residency,
                 quantization,
                 stream,
@@ -257,6 +291,7 @@ fn materialize_gguf_model(
         GgufBinding::Quantized(QuantizedGgufBinding::NemotronH) => {
             let loaded = crate::composition::nemotron_h::load_nemotron_h_gguf_model(
                 source,
+                &family_route,
                 options.weight_residency,
                 quantization,
                 stream,
@@ -265,14 +300,6 @@ fn materialize_gguf_model(
             Executable::nemotron_h(kind, loaded)?
         }
         GgufBinding::Quantized(QuantizedGgufBinding::Qwen) => {
-            if !matches!(
-                source.plan().model(),
-                eredu_architectures::configuration::GgufModelConfig::Qwen(args) if args.is_moe()
-            ) {
-                return Err(Error::ArchitectureModel(
-                    "ordinary replicated Qwen must use replicated text composition".into(),
-                ));
-            }
             let loaded = crate::composition::qwen::load_qwen_gguf_model(
                 source,
                 options.weight_residency,
@@ -306,6 +333,7 @@ fn materialize_gguf_model(
             let loaded = crate::composition::qwen::hybrid::load_gguf(
                 source,
                 projector,
+                &family_route,
                 options.weight_residency,
                 quantization,
                 stream,
@@ -319,6 +347,14 @@ fn materialize_gguf_model(
         }
     };
     Ok(model)
+}
+
+pub(crate) fn gguf_uses_replicated_text_binding(
+    plan: &eredu_architectures::configuration::GgufArchitecturePlan,
+    has_media_projector: bool,
+) -> bool {
+    !has_media_projector
+        && eredu_architectures::replicated_text::gguf_replicated_text_eligibility(plan).is_ok()
 }
 
 pub(crate) fn select_preparation(
@@ -385,7 +421,10 @@ pub(crate) fn select_preparation_with_grouped_capabilities(
                 options.state_residency().clone(),
             )
             .with_session(admitted_session)
-            .with_prompt_cache(true)
+            .with_prompt_cache(matches!(
+                options.state_residency(),
+                CacheResidencyPolicy::Paged(_)
+            ))
             .with_exact_completion(true);
             if let Some(topology) = policy.topology() {
                 request = request.with_topology(topology);
@@ -400,10 +439,7 @@ pub(crate) fn select_preparation_with_grouped_capabilities(
             )
             .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
             Ok(MlxSelectedPreparation::new(
-                MlxSelectedPreparationRoute::ReplicatedText {
-                    requirements,
-                    realization,
-                },
+                MlxSelectedPreparationRoute::ReplicatedText { realization },
             ))
         }
         Err(eredu_architectures::replicated_text::ReplicatedTextRequirementsError::Ineligible(
@@ -426,12 +462,9 @@ pub fn materialize_model_plan(
 ) -> Result<MlxModel, Error> {
     let floating_state_dtype_bytes = inspected_floating_state_dtype_bytes(plan.inspection())?;
     let options = match selected.into_route() {
-        MlxSelectedPreparationRoute::ReplicatedText {
-            requirements,
-            realization,
-        } => {
+        MlxSelectedPreparationRoute::ReplicatedText { realization } => {
             let max_cached_shards = realization.residency().max_cached_shards();
-            let state_residency = realization.state().clone();
+            let state_residency = realization.state().policy().clone();
             let architecture_plan = plan.inspection().architecture_plan().clone();
             let artifact = plan.into_artifact();
             let kind = prepared_model_kind(&architecture_plan);
@@ -451,7 +484,6 @@ pub fn materialize_model_plan(
                     )?;
                     bind_replicated_text(
                         &architecture_plan,
-                        requirements,
                         realization,
                         prepared.store(),
                         stream,
@@ -470,6 +502,8 @@ pub fn materialize_model_plan(
                             "replicated text composition cannot bind a media projector".into(),
                         ));
                     }
+                    #[cfg(test)]
+                    super::path_instrumentation::payload_open();
                     let store = Arc::new(
                         crate::backend::runtime::checkpoint::store::open_gguf_checkpoint_source(
                             source.checkpoint().clone(),
@@ -480,7 +514,6 @@ pub fn materialize_model_plan(
                     );
                     bind_replicated_text(
                         &architecture_plan,
-                        requirements,
                         realization,
                         store,
                         stream,
@@ -588,11 +621,16 @@ pub fn materialize_model_plan(
                 shards,
                 options.weight_residency.max_cached_shards(),
             )?;
-            let model = materialize_safetensors(&prepared, options, stream, weights_stream).map(
-                |model| {
-                    MlxModel::complete(model, floating_state_dtype_bytes, state_residency.clone())
-                },
-            )?;
+            let composite = super::model::CompositeInputProof::from_plan(&architecture_plan);
+            let model =
+                materialize_safetensors(&prepared, composite, options, stream, weights_stream)
+                    .map(|model| {
+                        MlxModel::complete(
+                            model,
+                            floating_state_dtype_bytes,
+                            state_residency.clone(),
+                        )
+                    })?;
             attach_processor(model, &architecture_plan)
         }
         _ => Err(Error::ArchitectureModel(
@@ -601,25 +639,118 @@ pub fn materialize_model_plan(
     }
 }
 
-fn bind_replicated_text(
+pub(super) fn bind_replicated_text(
     architecture_plan: &ArtifactArchitecturePlan,
-    requirements: eredu_runtime::ReplicatedTextRequirements,
     selected: eredu_runtime::SelectedReplicatedTextRealization,
     store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Box<dyn super::replicated_text::ErasedReplicatedTextExecutable>, Error> {
-    eredu_architectures::replicated_text::visit_replicated_text_architecture(
-        architecture_plan,
-        requirements,
-        selected,
+    use crate::backend::{
+        nn::shared::MlxNeuralBackend,
+        runtime::cache::state::{MlxHybridState, MlxKeyValueState},
+    };
+    use eredu_runtime::ReplicatedTextStateAccess;
+
+    let profile = selected.state().access();
+    let visitor = super::replicated_text::BindingVisitor {
         stream,
-        super::replicated_text::BindingVisitor {
-            store,
-            stream,
-            weights_stream,
-        },
-    )
+        weights_stream,
+    };
+    match profile {
+        ReplicatedTextStateAccess::Stateless => {
+            eredu_architectures::replicated_text::visit_replicated_stateless_text_architecture::<
+                MlxNeuralBackend,
+                MlxHybridState,
+                _,
+            >(architecture_plan, selected, store, stream, visitor)
+        }
+        ReplicatedTextStateAccess::KeyValue => {
+            let ordinary = eredu_architectures::replicated_text::visit_replicated_text_architecture::<
+                MlxNeuralBackend,
+                MlxKeyValueState,
+                _,
+            >(
+                architecture_plan,
+                selected.clone(),
+                store.clone(),
+                stream,
+                visitor,
+            );
+            if matches!(
+                ordinary,
+                Err(eredu_architectures::replicated_text::ReplicatedTextDispatchError::Ineligible(
+                    eredu_architectures::replicated_text::ReplicatedTextIneligibility::Unrelated
+                        | eredu_architectures::replicated_text::ReplicatedTextIneligibility::HybridState
+                ))
+            ) {
+                eredu_architectures::replicated_text::visit_replicated_attention_state_text_architecture::<
+                    MlxNeuralBackend,
+                    MlxKeyValueState,
+                    _,
+                >(
+                    architecture_plan,
+                    selected,
+                    store,
+                    stream,
+                    super::replicated_text::BindingVisitor { stream, weights_stream },
+                )
+            } else {
+                ordinary
+            }
+        }
+        ReplicatedTextStateAccess::AttentionWithFixed => {
+            eredu_architectures::replicated_text::visit_replicated_fixed_state_text_architecture::<
+                MlxNeuralBackend,
+                MlxHybridState,
+                _,
+            >(
+                architecture_plan,
+                selected,
+                store,
+                stream,
+                visitor,
+            )
+        }
+        ReplicatedTextStateAccess::Fixed => {
+            eredu_architectures::replicated_text::visit_replicated_component_state_text_architecture::<
+                MlxNeuralBackend,
+                MlxHybridState,
+                _,
+            >(
+                architecture_plan,
+                selected,
+                store,
+                stream,
+                visitor,
+            )
+        }
+        ReplicatedTextStateAccess::CompressedAttention => {
+            eredu_architectures::replicated_text::visit_replicated_compressed_only_text_architecture::<
+                MlxNeuralBackend,
+                MlxHybridState,
+                _,
+            >(architecture_plan, selected, store, stream, visitor)
+        }
+        ReplicatedTextStateAccess::CompressedAttentionWithFixed => {
+            eredu_architectures::replicated_text::visit_replicated_compressed_state_text_architecture::<
+                MlxNeuralBackend,
+                MlxHybridState,
+                _,
+            >(
+                architecture_plan,
+                selected,
+                store,
+                stream,
+                visitor,
+            )
+        }
+        _ => {
+            return Err(Error::ArchitectureModel(
+                "MLX has no mechanism binding for the selected replicated state profile".into(),
+            ));
+        }
+    }
     .map_err(|error| Error::ArchitectureModel(error.to_string()))
 }
 
@@ -1341,11 +1472,24 @@ pub fn validate_gguf_quantization_source(
 
 pub(super) fn materialize_safetensors(
     artifact: &super::artifact::PreparedSafetensorsArtifact,
+    composite: Option<super::model::CompositeInputProof>,
     options: SelectedMlxConstruction,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Executable, Error> {
     let kind = artifact.architecture().model_kind();
+    if composite.is_none()
+        && eredu_architectures::replicated_text::safetensors_replicated_text_eligibility(
+            artifact.architecture(),
+        )
+        .is_ok()
+    {
+        return Err(Error::ArchitectureModel(
+            "architecture-owned eligibility requires replicated text composition".into(),
+        ));
+    }
+    let family_route = ExcludedFamilyRoute::safetensors(artifact.architecture(), composite)
+        .expect("replicated SafeTensors eligibility was rejected above");
     let quantization = options.weight_quantization();
     if let (Some(parameter_bank), Some(non_expert)) = (
         options.weight_residency.parameter_bank_cache(),
@@ -1361,6 +1505,7 @@ pub(super) fn materialize_safetensors(
                 kind,
                 crate::composition::kimi_linear::load_kimi_linear_model(
                     artifact,
+                    &family_route,
                     eredu_runtime::WeightResidency::with_independent_parameter_banks(
                         non_expert,
                         parameter_bank,
@@ -1423,6 +1568,7 @@ pub(super) fn materialize_safetensors(
                 kind,
                 crate::composition::lfm2::load_lfm2_model(
                     artifact,
+                    &family_route,
                     eredu_runtime::WeightResidency::with_independent_parameter_banks(
                         non_expert,
                         parameter_bank,
@@ -1449,6 +1595,7 @@ pub(super) fn materialize_safetensors(
                 kind,
                 crate::composition::nemotron_h::load_nemotron_h_model(
                     artifact,
+                    &family_route,
                     eredu_runtime::WeightResidency::with_independent_parameter_banks(
                         non_expert,
                         parameter_bank,
@@ -1475,6 +1622,7 @@ pub(super) fn materialize_safetensors(
                 kind,
                 crate::composition::qwen::hybrid::load_safetensors_with_residency(
                     artifact,
+                    &family_route,
                     eredu_runtime::WeightResidency::with_independent_parameter_banks(
                         non_expert,
                         parameter_bank,
@@ -1501,6 +1649,7 @@ pub(super) fn materialize_safetensors(
                 kind,
                 crate::composition::qwen::hybrid::load_safetensors_with_residency(
                     artifact,
+                    &family_route,
                     eredu_runtime::WeightResidency::with_independent_parameter_banks(
                         non_expert,
                         parameter_bank,
@@ -1553,19 +1702,19 @@ pub(super) fn materialize_safetensors(
                 weights_stream,
             )?,
         )?),
-        FamilyBinding::KimiLinear => Ok(Executable::kimi_linear(
-            kind,
+        FamilyBinding::KimiLinear => Ok(Executable::kimi_linear(kind, {
             crate::composition::kimi_linear::load_kimi_linear_model(
                 artifact,
+                &family_route,
                 eredu_runtime::WeightResidency::with_layers(execution),
                 quantization,
                 stream,
                 weights_stream,
-            )?,
-        )?),
-        FamilyBinding::Llama => Err(Error::ArchitectureModel(
-            "replicated Llama must use replicated text composition".into(),
-        )),
+            )?
+        })?),
+        FamilyBinding::Llama => unreachable!(
+            "architecture-owned eligibility rejects replicated SafeTensors before family binding"
+        ),
         FamilyBinding::MuseGlimmer => Ok(Executable::muse_glimmer(
             kind,
             crate::composition::muse_glimmer::load_safetensors(
@@ -1576,27 +1725,16 @@ pub(super) fn materialize_safetensors(
                 weights_stream,
             )?,
         )?),
-        FamilyBinding::Qwen => {
-            if !matches!(
-                artifact.model(),
-                eredu_architectures::configuration::SafetensorsModelConfig::Qwen(args)
-                    if args.is_moe()
-            ) {
-                return Err(Error::ArchitectureModel(
-                    "ordinary replicated Qwen must use replicated text composition".into(),
-                ));
-            }
-            Ok(Executable::qwen(
-                kind,
-                crate::composition::qwen::load_safetensors(
-                    artifact,
-                    eredu_runtime::WeightResidency::with_layers(execution),
-                    quantization,
-                    stream,
-                    weights_stream,
-                )?,
-            )?)
-        }
+        FamilyBinding::Qwen => Ok(Executable::qwen(
+            kind,
+            crate::composition::qwen::load_safetensors(
+                artifact,
+                eredu_runtime::WeightResidency::with_layers(execution),
+                quantization,
+                stream,
+                weights_stream,
+            )?,
+        )?),
         FamilyBinding::GptOss => Ok(Executable::gpt_oss(
             kind,
             crate::composition::gpt_oss::load_safetensors(
@@ -1607,36 +1745,36 @@ pub(super) fn materialize_safetensors(
                 weights_stream,
             )?,
         )?),
-        FamilyBinding::Lfm2 => Ok(Executable::lfm2(
-            kind,
+        FamilyBinding::Lfm2 => Ok(Executable::lfm2(kind, {
             crate::composition::lfm2::load_lfm2_model(
                 artifact,
+                &family_route,
                 eredu_runtime::WeightResidency::with_layers(execution),
                 quantization,
                 stream,
                 weights_stream,
-            )?,
-        )?),
-        FamilyBinding::NemotronH => Ok(Executable::nemotron_h(
-            kind,
+            )?
+        })?),
+        FamilyBinding::NemotronH => Ok(Executable::nemotron_h(kind, {
             crate::composition::nemotron_h::load_nemotron_h_model(
                 artifact,
+                &family_route,
                 eredu_runtime::WeightResidency::with_layers(execution),
                 quantization,
                 stream,
                 weights_stream,
-            )?,
-        )?),
-        FamilyBinding::Qwen3Next => Ok(Executable::qwen3_next(
-            kind,
+            )?
+        })?),
+        FamilyBinding::Qwen3Next => Ok(Executable::qwen3_next(kind, {
             crate::composition::qwen::hybrid::load_safetensors(
                 artifact,
+                &family_route,
                 execution,
                 quantization,
                 stream,
                 weights_stream,
-            )?,
-        )?),
+            )?
+        })?),
         FamilyBinding::Qwen3Vl => Ok(Executable::qwen3_vl(
             kind,
             crate::composition::qwen::vl::load_safetensors(
@@ -1657,15 +1795,20 @@ pub(super) fn materialize_safetensors(
                 weights_stream,
             )?,
         )?),
-        FamilyBinding::Qwen35 => Ok(Executable::qwen35(
-            kind,
-            crate::composition::qwen::hybrid::load_safetensors(
+        FamilyBinding::Qwen35 => {
+            let model = crate::composition::qwen::hybrid::load_safetensors(
                 artifact,
+                &family_route,
                 execution,
                 quantization,
                 stream,
                 weights_stream,
-            )?,
-        )?),
+            )?;
+            if let Some(proof) = composite {
+                Executable::qwen35_composite(kind, model, proof)
+            } else {
+                Executable::qwen35(kind, model)
+            }
+        }
     }
 }

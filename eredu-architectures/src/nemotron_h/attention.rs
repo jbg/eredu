@@ -7,7 +7,7 @@ use crate::decoder::Attention;
 use super::{LayerPolicy, ModelArgs};
 
 /// Builds the exact no-RoPE attention operator used by a scheduled unit.
-pub fn new_attention<B: NeuralBackend + eredu_nn::DistributedNeuralBackend>(
+pub fn new_attention<B: NeuralBackend>(
     args: &ModelArgs,
     layer: usize,
     query_heads: i32,
@@ -33,7 +33,7 @@ pub fn new_attention<B: NeuralBackend + eredu_nn::DistributedNeuralBackend>(
 }
 
 /// Builds an attention operator at an explicit target or MTP parameter path.
-pub fn new_attention_at<B: NeuralBackend + eredu_nn::DistributedNeuralBackend>(
+pub fn new_attention_at<B: NeuralBackend>(
     args: &ModelArgs,
     attention: eredu_core::AttentionPolicy,
     prefix: &str,

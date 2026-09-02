@@ -673,6 +673,7 @@ pub fn prepare_gguf_pipeline(
 pub(crate) fn load_gguf(
     source: &crate::composition::mlx::structural::AdmittedGguf,
     projector: Option<&crate::composition::mlx::structural::AdmittedGgufProjector>,
+    _route: &crate::composition::mlx::loading::ExcludedFamilyRoute,
     residency: eredu_runtime::WeightResidency,
     quantization: Option<WeightQuantization>,
     stream: &Stream,
@@ -800,6 +801,13 @@ pub struct QwenHybridModel {
 }
 
 impl QwenHybridModel {
+    pub(crate) fn requires_family_executable(&self) -> bool {
+        self.parsed.text.is_moe()
+            || self.parsed.text.mtp_num_hidden_layers > 0
+            || self.parsed.vision.is_some()
+            || self.parameter_bank.is_some()
+    }
+
     /// Complete validated text and optional vision architecture policy.
     pub fn parsed_args(&self) -> &ParsedHybridConfig {
         &self.parsed
@@ -1880,6 +1888,7 @@ fn quantize_conditional_store(
 /// Loads SafeTensors through the generic component residency engine.
 pub fn load_safetensors(
     artifact: &crate::composition::mlx::artifact::PreparedSafetensorsArtifact,
+    route: &crate::composition::mlx::loading::ExcludedFamilyRoute,
     options: impl Into<LayerWeightResidency>,
     quantization: Option<WeightQuantization>,
     stream: &Stream,
@@ -1887,6 +1896,7 @@ pub fn load_safetensors(
 ) -> Result<QwenHybridModel, Error> {
     load_safetensors_with_residency(
         artifact,
+        route,
         eredu_runtime::WeightResidency::with_layers(options.into()),
         quantization,
         stream,
@@ -1896,6 +1906,7 @@ pub fn load_safetensors(
 
 pub fn load_safetensors_with_residency(
     artifact: &crate::composition::mlx::artifact::PreparedSafetensorsArtifact,
+    _route: &crate::composition::mlx::loading::ExcludedFamilyRoute,
     residency: eredu_runtime::WeightResidency,
     quantization: Option<WeightQuantization>,
     stream: &Stream,

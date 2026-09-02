@@ -234,7 +234,8 @@ unchanged.
 Replicated text composition has one checked cross-crate construction flow.
 `eredu-architectures` derives `ReplicatedTextRequirements` from the normalized
 architecture and the exact admitted artifact. The requirements contain the
-execution graph and unit layout, group transport, complete state layout,
+execution graph and unit layout, group transport, complete state layout and
+typed access profile,
 complete canonical parameter topology, admitted physical sources and
 encodings, aliases and derivations, logical and physical shapes, ownership,
 presence, architecture-native executable formats, and exact transform
@@ -244,11 +245,15 @@ by the requested format. Caller-selected topology,
 weight residency, mutable-state residency, load-time transformation, cache,
 observation, persistence, and completion facilities live in a separate
 `ReplicatedTextSelectionRequest`. A concrete backend reports only reusable
-neural, lowering, residency, state-storage, session, and completion mechanisms
-through `BackendMechanismCapabilities`. The neutral selector resolves those
-three values into one
-`SelectedReplicatedTextRealization` before architecture modules or weight
-payloads are constructed.
+neural, lowering, residency, session, and completion mechanisms through
+`BackendMechanismCapabilities`. Mutable-state capabilities enumerate exact
+layer components with their semantic role, shape, dtype, and device or paged
+placement, plus checkpoint, rollback, reset, persistence, and observation
+facilities. They contain no architecture-family identity. The neutral selector
+resolves those three values into one `SelectedReplicatedTextRealization` before
+architecture modules or weight payloads are constructed. Its opaque
+`SelectedStateRealization` records the accepted layout, access profile,
+per-component placement, residency policy, and lifecycle facilities.
 
 Each architecture-derived parameter requirement also retains exact physical
 provenance: the canonical admitted shard, physical tensor identity, and the
@@ -283,15 +288,28 @@ requirements even when no transform applies. The resulting per-parameter
 realizations are the only source and format choices consumed by module
 construction and materialization.
 
-Architecture-owned typed dispatch constructs Llama/Mistral and ordinary dense
-Qwen2/Qwen3 modules with the selected executable formats and hands the selected
-value, exact requirements, and concrete architecture to a generic backend
-visitor. MLX binds that opaque architecture through `ArchitectureParameters`
-and `Parameterized`, uses the existing resident or layerwise runtime traversal,
-constructs state from the architecture-owned layout, and erases the paired
-runtime and state only at the session boundary. The erased interface performs
-one dispatch per session operation; tensor operations and execution-unit
-traversal remain statically dispatched.
+Architecture-owned typed dispatch admits replicated Llama/Mistral, dense
+Qwen2/Qwen3, dense LFM2, dense Kimi Linear, target-only dense Nemotron-H, and
+target-only text Qwen3-Next/Qwen3.5 configurations. It rejects routed,
+partitioned, prediction-bearing, and conditional-media graphs from this
+construction class. Dispatch constructs modules with the selected executable
+formats and hands the selected value, exact requirements, and concrete
+architecture to a generic backend visitor. Separate typed visitors express
+the exact stateless, ordinary key/value, fixed-only, attention-with-fixed,
+compressed-only, or compressed-with-fixed state-access profile without
+imposing broader mechanisms on ordinary backends.
+
+MLX binds each opaque architecture through `ArchitectureParameters` and
+`Parameterized`, verifies the requirement catalog against the constructed
+parameter description, and uses one resident or layerwise runtime traversal.
+Its state factory consumes only `SelectedStateRealization`, producing
+`MlxKeyValueState` or `MlxHybridState` with the selected component layout and
+placements. SafeTensors aliases, derived recipes, GGUF translated outputs, and
+selected transformations feed the same generic binding. The complete paired
+architecture and state are erased only at the session boundary. The erased
+interface performs one dispatch per session operation; tensor operations,
+state-component access, and execution-unit traversal remain statically
+dispatched.
 
 The selected realization is also the sole construction authority for exact
 weight-residency limits, mutable-state paging, topology realization, session
@@ -325,8 +343,10 @@ from ordinary grouped execution; selection rejects the missing extension
 before construction. Routed architecture plans derive those requirements from
 their normalized expert configuration and selected topology, including the
 tensor-parallel partial, before any payload is opened or module constructor is
-called. Architectures requiring mixed mutable-state components
-opt into the separate `ArchitectureStateFactory` realization contract.
+called. Architectures requiring mixed mutable-state components use the same
+selected state authority through `ArchitectureStateFactory`; fixed recurrent
+and convolutional components remain device-resident when append-only attention
+components use paged storage.
 Partitioning adds `PartitionedLayeredArchitecture`, boundary schemas, and
 driver-owned boundary exchange through opaque collective contexts;
 composite models use `PreparedModelInput` and architecture-owned execution

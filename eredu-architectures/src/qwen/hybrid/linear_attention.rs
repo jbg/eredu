@@ -13,7 +13,7 @@ use super::{HybridConfig, HybridVariant};
 /// One recurrent gated-delta attention operator.
 #[derive(Debug, Clone, eredu_nn::Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct LinearAttention<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
+pub struct LinearAttention<B: NeuralBackend> {
     #[parameter(skip)]
     key_heads: i32,
     #[parameter(skip)]
@@ -40,7 +40,7 @@ pub struct LinearAttention<B: NeuralBackend + eredu_nn::DistributedNeuralBackend
     output: B::Linear,
 }
 
-impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> LinearAttention<B> {
+impl<B: NeuralBackend> LinearAttention<B> {
     /// Creates unloaded parameters for one physical decoder layer.
     pub fn new(
         config: &HybridConfig,
@@ -147,32 +147,25 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> LinearAttention<B> {
     where
         S: RuntimeStateComponents<B>,
     {
-        self.forward_inner(input, state, None, context)
+        self.forward_inner(input, state, context, |projection, value, context| {
+            projection.forward(value, context)
+        })
     }
 
-    /// Executes the same recurrence with one row-parallel output reduction.
-    pub fn forward_parallel<S>(
+    fn forward_inner<S, F>(
         &mut self,
         input: &B::Tensor,
         state: &mut S,
-        parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
+        project: F,
     ) -> Result<B::Tensor, Error>
     where
         S: RuntimeStateComponents<B>,
-    {
-        self.forward_inner(input, state, Some(parallel), context)
-    }
-
-    fn forward_inner<S>(
-        &mut self,
-        input: &B::Tensor,
-        state: &mut S,
-        parallel: Option<&B::ParallelContext>,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error>
-    where
-        S: RuntimeStateComponents<B>,
+        F: FnOnce(
+            &mut B::Linear,
+            &B::Tensor,
+            &<B::Tensor as Tensor>::Context,
+        ) -> Result<B::Tensor, Error>,
     {
         let shape = input.shape();
         if shape.len() != 3 || shape[0] <= 0 || shape[1] <= 0 {
@@ -291,11 +284,24 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> LinearAttention<B> {
             context,
         )?
         .reshape(&[batch, sequence, self.value_width], context)?;
-        match parallel {
-            Some(parallel) => {
-                B::row_parallel_linear(&mut self.output, &normalized, parallel, context)
-            }
-            None => self.output.forward(&normalized, context),
-        }
+        project(&mut self.output, &normalized, context)
+    }
+}
+
+impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> LinearAttention<B> {
+    /// Executes the same recurrence with one row-parallel output reduction.
+    pub fn forward_parallel<S>(
+        &mut self,
+        input: &B::Tensor,
+        state: &mut S,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error>
+    where
+        S: RuntimeStateComponents<B>,
+    {
+        self.forward_inner(input, state, context, |projection, value, context| {
+            B::row_parallel_linear(projection, value, parallel, context)
+        })
     }
 }

@@ -13,7 +13,7 @@ use super::ModelArgs;
 /// One unloaded Mamba2 mixer with architecture-authored parameter identity.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct Mamba2<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
+pub struct Mamba2<B: NeuralBackend> {
     /// Joint gate, convolution-input, and timestep projection.
     pub in_proj: B::Linear,
     /// Shared neutral causal depthwise convolution.
@@ -48,7 +48,7 @@ pub struct Mamba2<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     epsilon: f32,
 }
 
-impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> Mamba2<B> {
+impl<B: NeuralBackend> Mamba2<B> {
     /// Builds one global-geometry mixer.
     pub fn new(
         args: &ModelArgs,
@@ -141,32 +141,25 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> Mamba2<B> {
     where
         S: RuntimeStateComponents<B>,
     {
-        self.forward_inner(input, state, None, context)
+        self.forward_inner(input, state, context, |projection, value, context| {
+            projection.forward(value, context)
+        })
     }
 
-    /// Executes the same recurrence with a row-parallel output projection.
-    pub fn forward_parallel<S>(
+    fn forward_inner<S, F>(
         &mut self,
         input: &B::Tensor,
         state: &mut S,
-        parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
+        project: F,
     ) -> Result<B::Tensor, Error>
     where
         S: RuntimeStateComponents<B>,
-    {
-        self.forward_inner(input, state, Some(parallel), context)
-    }
-
-    fn forward_inner<S>(
-        &mut self,
-        input: &B::Tensor,
-        state: &mut S,
-        parallel: Option<&B::ParallelContext>,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error>
-    where
-        S: RuntimeStateComponents<B>,
+        F: FnOnce(
+            &mut B::Linear,
+            &B::Tensor,
+            &<B::Tensor as Tensor>::Context,
+        ) -> Result<B::Tensor, Error>,
     {
         let shape = input.shape();
         if shape.len() != 3 {
@@ -283,11 +276,24 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> Mamba2<B> {
             self.epsilon,
             context,
         )?;
-        match parallel {
-            Some(parallel) => {
-                B::row_parallel_linear(&mut self.out_proj, &normalized, parallel, context)
-            }
-            None => self.out_proj.forward(&normalized, context),
-        }
+        project(&mut self.out_proj, &normalized, context)
+    }
+}
+
+impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> Mamba2<B> {
+    /// Executes the same recurrence with a row-parallel output projection.
+    pub fn forward_parallel<S>(
+        &mut self,
+        input: &B::Tensor,
+        state: &mut S,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error>
+    where
+        S: RuntimeStateComponents<B>,
+    {
+        self.forward_inner(input, state, context, |projection, value, context| {
+            B::row_parallel_linear(projection, value, parallel, context)
+        })
     }
 }

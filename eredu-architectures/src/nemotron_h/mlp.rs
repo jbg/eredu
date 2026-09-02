@@ -2,8 +2,8 @@
 
 use eredu_nn::{
     Error, GroupScoring, GroupSelectionOperator, GroupedNeuralBackend, GroupedRelu2Spec,
-    LinearOperator, LinearSpec, ParameterSpec, Parameterized, Tensor, TopKGroupSelectionSpec,
-    TopKGroupSelectorSpec,
+    LinearOperator, LinearSpec, NeuralBackend, ParameterSpec, Parameterized, Tensor,
+    TopKGroupSelectionSpec, TopKGroupSelectorSpec,
 };
 use eredu_runtime::{
     ResidentExpertProvider, RoutedExpertProvider, RoutedExpertRequest,
@@ -17,14 +17,14 @@ use super::ModelArgs;
 /// Dense up/ReLU²/down projection pair.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct DenseMlp<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
+pub struct DenseMlp<B: NeuralBackend> {
     /// Up projection.
     pub up_proj: B::Linear,
     /// Down projection.
     pub down_proj: B::Linear,
 }
 
-impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> DenseMlp<B> {
+impl<B: NeuralBackend> DenseMlp<B> {
     /// Builds one unloaded dense MLP.
     pub fn new(
         args: &ModelArgs,
@@ -78,7 +78,9 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> DenseMlp<B> {
         let hidden = self.hidden(input, context)?;
         self.down_proj.forward(&hidden, context)
     }
+}
 
+impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> DenseMlp<B> {
     /// Executes a row-parallel down projection.
     pub fn forward_parallel(
         &mut self,

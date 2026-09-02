@@ -8,7 +8,10 @@ use eredu_architectures::{
     gemma4, gpt_oss,
     llama::{self, LayeredInput, ModelArgs},
     moshi, muse_glimmer, qwen,
-    replicated_text::replicated_text_requirements,
+    replicated_text::{
+        replicated_text_requirements, visit_replicated_text_architecture,
+        PreparedReplicatedTextArchitecture, ReplicatedTextArchitectureVisitor,
+    },
 };
 use eredu_core::{AttentionPolicy, Completion, LayerSchedule, TokenFilter};
 use eredu_nn::{
@@ -32,6 +35,63 @@ use eredu_runtime::{
     SequentialDecisionSource, SequentialDecisionTraversal, StateError, StaticParameterVisitor,
     SubmissionBackend, TensorPlacement, TokenDomain, WeightBinding,
 };
+
+struct ReferenceReplicatedVisitor {
+    construction_started: bool,
+}
+
+impl
+    ReplicatedTextArchitectureVisitor<
+        ReferenceBackend,
+        DeviceState<ReferenceBackend, ReferenceCache>,
+    > for ReferenceReplicatedVisitor
+{
+    type Output = ReferenceTensor;
+    type Error = Error;
+
+    fn construction_started(&mut self) {
+        self.construction_started = true;
+    }
+
+    fn visit<A>(
+        self,
+        prepared: PreparedReplicatedTextArchitecture<A>,
+        _: eredu_checkpoint::store::SharedCheckpointSource,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        A: eredu_runtime::ReplicatedTextArchitecture<
+                ReferenceBackend,
+                DeviceState<ReferenceBackend, ReferenceCache>,
+                Error = Error,
+            > + 'static,
+        A::StaticModules: Clone,
+        A::Error: std::fmt::Display,
+    {
+        assert!(self.construction_started);
+        let layout = prepared.requirements().state_layout().clone();
+        let unit_count = prepared.requirements().execution_units().len();
+        let architecture = prepared.into_modules().take_architecture();
+        let units = (0..unit_count)
+            .map(|index| A::build_unit(&architecture, 0, index, &()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut runtime = LayerwiseRuntime::new(architecture, ResidentUnitWindow::new(units));
+        let mut state = DeviceState::create(layout, |_, policy| {
+            Ok::<_, std::convert::Infallible>(ReferenceCache {
+                offset: 0,
+                window: policy
+                    .attention()
+                    .and_then(|attention| attention.window())
+                    .map(|window| window.get() as i32),
+                resets: 0,
+            })
+        })
+        .expect("reference state layout is valid");
+        let tokens = ReferenceTensor(vec![1, 3]);
+        runtime
+            .forward(A::text_input(&tokens, None), &mut state, &())
+            .map_err(|error| Error::backend(error.to_string()))
+    }
+}
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 struct ReferenceTensor(Vec<i32>);
@@ -1417,6 +1477,71 @@ fn replicated_requirement_catalog_matches_authoritative_architecture_parameters(
         parameter.role() == ReplicatedTextParameterRole::Normalization
             && parameter.logical_shape().len() == 1
     }));
+
+    let weight_lowerings = requirements
+        .parameters()
+        .iter()
+        .filter(|parameter| parameter.has_lowering_source())
+        .map(|parameter| {
+            eredu_runtime::WeightLoweringCapability::new(
+                parameter
+                    .lowering_descriptor(parameter.native_executable())
+                    .unwrap(),
+                eredu_runtime::WeightLoweringKind::Direct,
+            )
+        })
+        .collect();
+    let state = eredu_runtime::StateMechanismCapabilities::new(
+        (0..requirements.state_layout().len()).flat_map(|layer| {
+            requirements
+                .state_layout()
+                .components(layer)
+                .unwrap()
+                .iter()
+                .cloned()
+                .map(move |component| {
+                    eredu_runtime::StateComponentMechanism::new(
+                        layer,
+                        component,
+                        Some(eredu_runtime::StateComponentPlacement::Device),
+                        None,
+                    )
+                })
+        }),
+    )
+    .with_transactions(true, true)
+    .with_reset(true);
+    let capabilities = eredu_runtime::BackendMechanismCapabilities::new(
+        eredu_nn::NeuralOperatorCapabilities::ALL,
+        weight_lowerings,
+        vec![eredu_runtime::WeightResidencyMechanism::Resident],
+        state,
+    );
+    let request = eredu_runtime::ReplicatedTextSelectionRequest::new(
+        eredu_runtime::LayerWeightResidency::FullyResident,
+        eredu_runtime::CacheResidencyPolicy::Device,
+    );
+    let selected =
+        eredu_runtime::select_replicated_text_realization(&requirements, &request, &capabilities)
+            .unwrap();
+    let store: eredu_checkpoint::store::SharedCheckpointSource = std::sync::Arc::new(
+        eredu_checkpoint::store::SafetensorsWeightStore::open(artifact.path()).unwrap(),
+    );
+    let logits = visit_replicated_text_architecture::<
+        ReferenceBackend,
+        DeviceState<ReferenceBackend, ReferenceCache>,
+        _,
+    >(
+        inspection.architecture_plan(),
+        selected,
+        store,
+        &(),
+        ReferenceReplicatedVisitor {
+            construction_started: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(logits, ReferenceTensor(vec![1, 3, 32]));
 }
 
 #[test]

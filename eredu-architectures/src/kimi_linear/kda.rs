@@ -13,7 +13,7 @@ use super::ModelArgs;
 /// Backend-neutral Kimi Delta Attention operator.
 #[derive(Debug, Clone, eredu_nn::Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct KimiDeltaAttention<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
+pub struct KimiDeltaAttention<B: NeuralBackend> {
     #[parameter(skip)]
     num_heads: i32,
     #[parameter(skip)]
@@ -37,7 +37,7 @@ pub struct KimiDeltaAttention<B: NeuralBackend + eredu_nn::DistributedNeuralBack
     o_proj: B::Linear,
 }
 
-impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> KimiDeltaAttention<B> {
+impl<B: NeuralBackend> KimiDeltaAttention<B> {
     /// Creates unloaded KDA parameters for one physical layer.
     pub fn new(
         args: &ModelArgs,
@@ -134,32 +134,25 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> KimiDeltaAttention<B
     where
         S: RuntimeStateComponents<B>,
     {
-        self.forward_inner(input, state, None, context)
+        self.forward_inner(input, state, context, |projection, value, context| {
+            projection.forward(value, context)
+        })
     }
 
-    /// Executes the same KDA recurrence with a row-parallel output projection.
-    pub fn forward_parallel<S>(
+    fn forward_inner<S, F>(
         &mut self,
         input: &B::Tensor,
         state: &mut S,
-        parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
+        project: F,
     ) -> Result<B::Tensor, Error>
     where
         S: RuntimeStateComponents<B>,
-    {
-        self.forward_inner(input, state, Some(parallel), context)
-    }
-
-    fn forward_inner<S>(
-        &mut self,
-        input: &B::Tensor,
-        state: &mut S,
-        parallel: Option<&B::ParallelContext>,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error>
-    where
-        S: RuntimeStateComponents<B>,
+        F: FnOnce(
+            &mut B::Linear,
+            &B::Tensor,
+            &<B::Tensor as Tensor>::Context,
+        ) -> Result<B::Tensor, Error>,
     {
         let shape = input.shape();
         if shape.len() != 3 {
@@ -253,11 +246,24 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> KimiDeltaAttention<B
             .forward(&scan.output, context)?
             .multiply(&gate, context)?;
         let normalized = normalized.reshape(&[batch, sequence, projection], context)?;
-        match parallel {
-            Some(parallel) => {
-                B::row_parallel_linear(&mut self.o_proj, &normalized, parallel, context)
-            }
-            None => self.o_proj.forward(&normalized, context),
-        }
+        project(&mut self.o_proj, &normalized, context)
+    }
+}
+
+impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> KimiDeltaAttention<B> {
+    /// Executes the same KDA recurrence with a row-parallel output projection.
+    pub fn forward_parallel<S>(
+        &mut self,
+        input: &B::Tensor,
+        state: &mut S,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error>
+    where
+        S: RuntimeStateComponents<B>,
+    {
+        self.forward_inner(input, state, context, |projection, value, context| {
+            B::row_parallel_linear(projection, value, parallel, context)
+        })
     }
 }
