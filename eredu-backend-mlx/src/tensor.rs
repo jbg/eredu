@@ -170,6 +170,14 @@ impl Tensor for MlxTensor {
         ))
     }
 
+    fn maximum_i32(&self, rhs: i32, context: &Self::Context) -> Result<Self, Error> {
+        tensor(safemlx::ops::maximum(
+            self.as_array(),
+            Array::from_int(rhs),
+            context,
+        ))
+    }
+
     fn clip(&self, minimum: &Self, maximum: &Self, context: &Self::Context) -> Result<Self, Error> {
         tensor(safemlx::ops::clip(
             self.as_array(),

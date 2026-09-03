@@ -74,10 +74,6 @@ impl Executable {
                 media_plan::muse_glimmer_input_part(model.args(), input, &input::MlxInputInspector)
                     .map(Into::into)
             }
-            Self::Qwen3Vl(_, model, _) | Self::Qwen3VlMoe(_, model, _) => {
-                media_plan::qwen_vl_input_part(model.args(), input, &input::MlxInputInspector)
-                    .map(Into::into)
-            }
             Self::Qwen3Next(_, model, _) | Self::Qwen35(_, model, _) => {
                 if model.vision_config().is_some() {
                     media_plan::qwen_hybrid_input_part(
@@ -127,9 +123,6 @@ impl Executable {
             Self::ReplicatedText(_, model) => Ok(model.capability_estimate().clone()),
             Self::Qwen(_, model, _) => capability::qwen(model.args()),
             Self::MuseGlimmer(_, model, _) => capability::muse_glimmer(model.args()),
-            Self::Qwen3Vl(_, model, _) | Self::Qwen3VlMoe(_, model, _) => {
-                capability::qwen_vl(model.args())
-            }
             Self::GptOss(_, model, _) => capability::gpt_oss(model.args()),
             Self::Gemma4(_, model, _) => capability::gemma4(model.args()),
             Self::Inkling(_, model, _) => capability::inkling(model.args()),

@@ -240,6 +240,18 @@ mod tests {
     }
 
     #[test]
+    fn text_gguf_translation_uses_the_composite_language_namespace() {
+        assert_eq!(
+            translate_text_gguf_weight_name("token_embd.weight", false),
+            "model.language_model.embed_tokens.weight"
+        );
+        assert_eq!(
+            translate_text_gguf_weight_name("blk.0.attn_q.weight", false),
+            "model.language_model.layers.0.self_attn.q_proj.weight"
+        );
+    }
+
+    #[test]
     fn projector_plan_owns_family_mode_and_width_compatibility() {
         let admitted = model_args();
         assert!(projector_gguf_plan(&admitted).is_ok());

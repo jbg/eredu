@@ -25,7 +25,7 @@ use eredu_nn::{
 };
 use eredu_runtime::{
     bind_materialized_unit, construct_replicated_text_session, materialize_bindings,
-    prepare_replicated_text_contract, realize_architecture_state,
+    prepare_layered_text_contract, prepare_replicated_text_contract, realize_architecture_state,
     select_replicated_text_realization, ArchitectureGroupKind, ArchitectureGroupPlacement,
     ArchitectureGroupTransport, ArchitectureMergeDestination, ArchitectureParameterDescription,
     ArchitectureParameters, ArchitecturePartition, ArchitectureStateFactory,
@@ -37,7 +37,7 @@ use eredu_runtime::{
     LayerwiseRuntime, NoAuxiliaryBoundary, NoAuxiliaryBoundarySchema, ParallelLayeredArchitecture,
     ParameterBackend, PartitionOwnership, PartitionedLayeredArchitecture, PenaltyConfig,
     PredictionDirective, PreparedInputPart, PreparedInputPayload, PreparedModelInput,
-    ReplicatedTextMaterializationTask, ReplicatedTextParameterOwner,
+    ReplicatedTextArchitecture, ReplicatedTextMaterializationTask, ReplicatedTextParameterOwner,
     ReplicatedTextParameterPresence, ReplicatedTextParameterRequirement,
     ReplicatedTextParameterRole, ReplicatedTextPhysicalSource, ReplicatedTextRequirements,
     ReplicatedTextSelectionRequest, ReplicatedTextSessionMechanisms, ReplicatedTextStateAccess,
@@ -1694,14 +1694,33 @@ impl LayerwisePolicy<FakeBackend, FakeUnit> for RecordingPolicy {
     }
 }
 
+type ReferencePromptCache = Rc<
+    RefCell<
+        Option<(
+            DeviceState<FakeBackend, FakeLayerState>,
+            eredu_core::cache::PromptCacheManifest,
+        )>,
+    >,
+>;
+
 struct ReferenceTextMechanisms {
     tasks: Rc<RefCell<Vec<ReplicatedTextMaterializationTask>>>,
     completions: Rc<RefCell<Vec<FakeTensor>>>,
     counters: ReplicatedSessionCounters,
     fail_completion: Rc<Cell<bool>>,
+    prompt_cache: Option<ReferencePromptCache>,
 }
 
-impl ReplicatedTextSessionMechanisms<OrdinaryTextFixture, FakeBackend> for ReferenceTextMechanisms {
+impl<A> ReplicatedTextSessionMechanisms<A, FakeBackend> for ReferenceTextMechanisms
+where
+    A: LayeredArchitecture<
+        FakeBackend,
+        DeviceState<FakeBackend, FakeLayerState>,
+        StaticModules = FakeOperator,
+        Unit = FakeUnit,
+        Error = Error,
+    >,
+{
     type State = DeviceState<FakeBackend, FakeLayerState>;
     type PolicyError = &'static str;
     type ResidentPolicy = RecordingPolicy;
@@ -1713,10 +1732,10 @@ impl ReplicatedTextSessionMechanisms<OrdinaryTextFixture, FakeBackend> for Refer
 
     fn prepare_materialization(
         &mut self,
-        _: &mut OrdinaryTextFixture,
+        _: &mut A,
         _: &eredu_runtime::ExecutionUnitLayout,
         _: &mut [FakeUnit],
-        _: Option<&mut OrdinaryTextFixture>,
+        _: Option<&mut A>,
         _: Option<&mut [FakeUnit]>,
         tasks: &[ReplicatedTextMaterializationTask],
         _: &[String],
@@ -1740,7 +1759,7 @@ impl ReplicatedTextSessionMechanisms<OrdinaryTextFixture, FakeBackend> for Refer
 
     fn resident_policy(
         &mut self,
-        _: &mut OrdinaryTextFixture,
+        _: &mut A,
         units: Vec<FakeUnit>,
         _: &eredu_runtime::SelectedReplicatedTextRealization,
         _: &(),
@@ -1751,7 +1770,7 @@ impl ReplicatedTextSessionMechanisms<OrdinaryTextFixture, FakeBackend> for Refer
 
     fn bounded_policy(
         &mut self,
-        _: &mut OrdinaryTextFixture,
+        _: &mut A,
         selected: &eredu_runtime::SelectedReplicatedTextRealization,
         _: &(),
     ) -> Result<Self::BoundedPolicy, Self::Error> {
@@ -1803,19 +1822,72 @@ impl ReplicatedTextSessionMechanisms<OrdinaryTextFixture, FakeBackend> for Refer
         _: &eredu_runtime::SelectedStateRealization,
         _: &(),
     ) -> Result<(Self::State, eredu_core::cache::PromptCacheManifest), Self::Error> {
-        Err("prompt cache is not selected by this fixture")
+        self.prompt_cache
+            .as_ref()
+            .and_then(|cache| cache.borrow().clone())
+            .ok_or("prompt cache is not selected by this fixture")
     }
 
     fn save_prompt_cache(
         &mut self,
-        _: &mut Self::State,
+        state: &mut Self::State,
         _: &std::path::Path,
-        _: eredu_core::cache::PromptCacheDescriptor,
-        _: &[u32],
+        descriptor: eredu_core::cache::PromptCacheDescriptor,
+        prefix: &[u32],
         _: &eredu_core::cache::PromptCacheOptions,
         _: &(),
     ) -> Result<eredu_core::cache::PromptCacheManifest, Self::Error> {
-        Err("prompt cache is not selected by this fixture")
+        let cache = self
+            .prompt_cache
+            .as_ref()
+            .ok_or("prompt cache is not selected by this fixture")?;
+        let batch = i32::try_from(descriptor.batch_size()).map_err(|_| "invalid cache batch")?;
+        let tokens = i32::try_from(prefix.len()).map_err(|_| "invalid cache prefix")?;
+        let logical_bytes = u64::try_from(i64::from(batch) * i64::from(tokens) * 8)
+            .map_err(|_| "invalid cache bytes")?;
+        let blocks = (descriptor.global_layer_start()..descriptor.global_layer_end())
+            .map(|layer| eredu_core::cache::PromptCacheBlock {
+                global_layer: layer,
+                representation: eredu_core::cache::CacheRepresentation::KeyValue,
+                start: 0,
+                end: i64::from(tokens),
+                rank: None,
+                shard: format!("blocks/layer-{layer}.safetensors"),
+                first_array: "keys".into(),
+                second_array: "values".into(),
+                first_shape: vec![batch, 1, tokens, 1],
+                second_shape: vec![batch, 1, tokens, 1],
+                first_dtype: "Float32".into(),
+                second_dtype: "Float32".into(),
+                logical_bytes,
+                payload_sha256: "0".repeat(64),
+            })
+            .collect();
+        let manifest = eredu_core::cache::PromptCacheManifest {
+            schema_version: eredu_core::cache::PROMPT_CACHE_SCHEMA_VERSION,
+            model_family: descriptor.model_family().into(),
+            effective_model_type: descriptor.effective_model_type().into(),
+            checkpoint_fingerprint: descriptor.checkpoint_fingerprint().into(),
+            prefix_content_fingerprint: descriptor.prefix_content_fingerprint().into(),
+            architecture_fingerprint: descriptor.architecture_fingerprint().into(),
+            layer_count: descriptor.layer_count(),
+            global_layer_start: descriptor.global_layer_start(),
+            global_layer_end: descriptor.global_layer_end(),
+            block_size_tokens: tokens,
+            batch_size: descriptor.batch_size(),
+            total_prefix_tokens: prefix.len(),
+            prefix_sha256: eredu_core::cache::prompt_cache_token_fingerprint(prefix),
+            layer_layout: descriptor.layer_layout().clone(),
+            layer_prefix_offsets: descriptor.layer_prefix_offsets().to_vec(),
+            state_segments: descriptor.state_segments().to_vec(),
+            sink_tokens: descriptor.sink_tokens(),
+            topology: descriptor.topology().clone(),
+            application_namespace: None,
+            blocks,
+            state_tensors: Vec::new(),
+        };
+        *cache.borrow_mut() = Some((state.clone(), manifest.clone()));
+        Ok(manifest)
     }
 
     fn state_report(&self, state: &Self::State) -> Result<Self::StateReport, Self::Error> {
@@ -1836,6 +1908,14 @@ impl ReplicatedTextSessionMechanisms<OrdinaryTextFixture, FakeBackend> for Refer
         _: &Self::State,
         _: &(),
     ) -> Result<(), Self::Error> {
+        COMPOSITE_FORWARD_RESOURCE.with(|resource| {
+            if let Some(dropped) = resource.borrow().as_ref() {
+                assert!(
+                    !dropped.get(),
+                    "architecture forward resources were dropped before exact completion"
+                );
+            }
+        });
         self.counters
             .update(|counts| counts.completion_attempts += 1);
         if self.fail_completion.get() {
@@ -2017,6 +2097,7 @@ fn production_replicated_text_constructor_executes_reference_mechanisms() {
             completions: Rc::clone(&completions),
             counters: counters.clone(),
             fail_completion: Rc::clone(&fail_completion),
+            prompt_cache: None,
         };
         let mut session = construct_replicated_text_session::<_, FakeBackend, _>(
             architecture,
@@ -2053,8 +2134,13 @@ fn production_replicated_text_constructor_executes_reference_mechanisms() {
         assert_eq!(task.physical_shape(), [1, 1]);
         assert_eq!(task.lowering(), WeightLoweringKind::Direct);
 
+        let prompt = FakeTensor(vec![1, 2]);
+        let input = <OrdinaryTextFixture as ReplicatedTextArchitecture<
+            FakeBackend,
+            DeviceState<FakeBackend, FakeLayerState>,
+        >>::text_input(&prompt, None);
         assert_eq!(
-            session.prefill(&FakeTensor(vec![1, 2]), None, &()).unwrap(),
+            session.prefill_input(input, &()).unwrap(),
             FakeTensor(vec![5])
         );
         assert_eq!(
@@ -2238,6 +2324,52 @@ struct GroupedFixture {
     trace: Vec<(usize, usize)>,
 }
 
+thread_local! {
+    static COMPOSITE_FORWARD_RESOURCE: RefCell<Option<Rc<Cell<bool>>>> = const { RefCell::new(None) };
+}
+
+#[derive(Debug, Default)]
+struct GroupedForwardContext {
+    trace: Vec<(usize, usize)>,
+    dropped: Option<Rc<Cell<bool>>>,
+}
+
+impl PartialEq for GroupedForwardContext {
+    fn eq(&self, other: &Self) -> bool {
+        self.trace == other.trace
+    }
+}
+
+impl Eq for GroupedForwardContext {}
+
+impl GroupedForwardContext {
+    fn new(trace: Vec<(usize, usize)>) -> Self {
+        let dropped = COMPOSITE_FORWARD_RESOURCE.with(|resource| resource.borrow().clone());
+        if let Some(dropped) = &dropped {
+            dropped.set(false);
+        }
+        Self { trace, dropped }
+    }
+
+    fn push(&mut self, value: (usize, usize)) {
+        self.trace.push(value);
+    }
+}
+
+impl PartialEq<Vec<(usize, usize)>> for GroupedForwardContext {
+    fn eq(&self, other: &Vec<(usize, usize)>) -> bool {
+        &self.trace == other
+    }
+}
+
+impl Drop for GroupedForwardContext {
+    fn drop(&mut self) {
+        if let Some(dropped) = &self.dropped {
+            dropped.set(true);
+        }
+    }
+}
+
 impl ArchitectureParameters<FakeBackend> for GroupedFixture {
     type DefinitionError = Error;
 
@@ -2301,7 +2433,7 @@ impl LayeredArchitecture<FakeBackend, DeviceState<FakeBackend, FakeLayerState>> 
     type Input<'a> = Option<&'a PreparedModelInput<FakeTensor>>;
     type StaticModules = FakeOperator;
     type Unit = FakeUnit;
-    type ForwardContext = Vec<(usize, usize)>;
+    type ForwardContext = GroupedForwardContext;
     type RetainedContextValues<'a> = std::iter::Empty<&'a FakeTensor>;
     type Error = Error;
 
@@ -2374,6 +2506,18 @@ impl LayeredArchitecture<FakeBackend, DeviceState<FakeBackend, FakeLayerState>> 
         Ok(format!("group.{group}.unit.{index}"))
     }
 
+    fn group_input_observation_path(&self, group: usize) -> Result<Option<String>, Self::Error> {
+        Ok((group == 2).then(|| eredu_core::MODALITY_MERGE_OUTPUT_OBSERVATION_PATH.to_owned()))
+    }
+
+    fn group_output_observation_path(&self, group: usize) -> Result<Option<String>, Self::Error> {
+        Ok(match group {
+            0 => Some(eredu_core::VISION_PROJECTOR_OUTPUT_OBSERVATION_PATH.to_owned()),
+            1 => Some(eredu_core::AUDIO_PROJECTOR_OUTPUT_OBSERVATION_PATH.to_owned()),
+            _ => None,
+        })
+    }
+
     fn static_modules(&self) -> &Self::StaticModules {
         &self.static_modules
     }
@@ -2431,7 +2575,7 @@ impl LayeredArchitecture<FakeBackend, DeviceState<FakeBackend, FakeLayerState>> 
         };
         Ok(LayeredForwardState {
             hidden,
-            context: Vec::new(),
+            context: GroupedForwardContext::new(Vec::new()),
         })
     }
 
@@ -2470,11 +2614,14 @@ impl LayeredArchitecture<FakeBackend, DeviceState<FakeBackend, FakeLayerState>> 
         index: usize,
         unit: &mut Self::Unit,
         hidden: &FakeTensor,
-        _: &mut DeviceState<FakeBackend, FakeLayerState>,
+        state: &mut DeviceState<FakeBackend, FakeLayerState>,
         _: &mut Self::ForwardContext,
         _: &(),
     ) -> Result<FakeTensor, Self::Error> {
         self.trace.push((group, index));
+        if group == 2 && state.as_ref().len() >= 4 {
+            state.as_mut()[2 + index].0 += 1;
+        }
         let mut output = hidden.clone();
         output.0.push(unit.marker);
         Ok(output)
@@ -2564,7 +2711,7 @@ impl PartitionedLayeredArchitecture<FakeBackend, DeviceState<FakeBackend, FakeLa
         };
         Ok(LayeredForwardState {
             hidden,
-            context: vec![(usize::MAX, first_state_ordinal)],
+            context: GroupedForwardContext::new(vec![(usize::MAX, first_state_ordinal)]),
         })
     }
 
@@ -2902,6 +3049,306 @@ fn prepared_composite_input(image: i32) -> PreparedModelInput<FakeTensor> {
     .unwrap()
 }
 
+fn composite_content_fingerprint(image: u8) -> String {
+    eredu_core::MultimodalRequest::new(vec![
+        eredu_core::MultimodalSegment::TokenIds(vec![7]),
+        eredu_core::MultimodalSegment::Media(eredu_core::Media::Image(
+            eredu_core::RgbImage::new(vec![image; 3], 1, 1).unwrap(),
+        )),
+        eredu_core::MultimodalSegment::Media(eredu_core::Media::Audio(
+            eredu_core::Audio::new(vec![0.5], 16_000).unwrap(),
+        )),
+    ])
+    .unwrap()
+    .tokenize::<std::convert::Infallible>(|_| unreachable!())
+    .unwrap()
+    .semantic_content_fingerprint()
+}
+
+fn selected_reference_composite(
+    architecture: &GroupedFixture,
+    residency: LayerWeightResidency,
+) -> eredu_runtime::SelectedReplicatedTextRealization {
+    let graph = architecture.execution_graph().unwrap();
+    let units = ExecutionUnitLayout::new(&graph, [1, 1, 2]).unwrap();
+    let state_layout = architecture.state_layout().unwrap();
+    let requirements = ReplicatedTextRequirements::new(
+        "composite-fixture",
+        NeuralOperatorCapabilities::NONE,
+        graph,
+        units,
+        (0..3)
+            .map(|group| architecture.group_transport(group))
+            .collect::<Vec<_>>(),
+        state_layout.clone(),
+        ReplicatedTextStateAccess::KeyValue,
+        Vec::new(),
+    )
+    .unwrap();
+    let state = StateMechanismCapabilities::new(
+        state_layout
+            .layers()
+            .iter()
+            .enumerate()
+            .flat_map(|(layer, policy)| {
+                policy.components().into_iter().map(move |component| {
+                    StateComponentMechanism::new(
+                        layer,
+                        component,
+                        Some(StateComponentPlacement::Device),
+                        None,
+                    )
+                })
+            })
+            .collect::<Vec<_>>(),
+    )
+    .with_transactions(true, true)
+    .with_reset(true)
+    .with_prompt_cache(true);
+    let capabilities = BackendMechanismCapabilities::new(
+        NeuralOperatorCapabilities::NONE,
+        Vec::new(),
+        vec![
+            WeightResidencyMechanism::Resident,
+            WeightResidencyMechanism::Windowed,
+        ],
+        state,
+    )
+    .with_prompt_cache(true)
+    .with_exact_completion(true);
+    let request = ReplicatedTextSelectionRequest::new(residency, CacheResidencyPolicy::Device)
+        .with_prompt_cache(true)
+        .with_exact_completion(true);
+    select_replicated_text_realization(&requirements, &request, &capabilities).unwrap()
+}
+
+struct CompositeCausalObserver {
+    values: Vec<(String, FakeTensor)>,
+    replace_vision: bool,
+    fail_path: Option<&'static str>,
+}
+
+impl eredu_runtime::ActivationObserver<FakeTensor, Error> for CompositeCausalObserver {
+    fn observe(&mut self, path: &str, value: &FakeTensor) -> Result<(), Error> {
+        self.values.push((path.to_owned(), value.clone()));
+        if self.fail_path == Some(path) {
+            return Err(Error::backend("composite observer failure"));
+        }
+        Ok(())
+    }
+
+    fn intervene(&mut self, path: &str, _: &FakeTensor) -> Result<Option<FakeTensor>, Error> {
+        Ok(
+            (self.replace_vision && path == eredu_core::VISION_PROJECTOR_OUTPUT_OBSERVATION_PATH)
+                .then(|| FakeTensor(vec![30, 0])),
+        )
+    }
+}
+
+impl CompositeCausalObserver {
+    fn value(&self, path: &str) -> &FakeTensor {
+        &self
+            .values
+            .iter()
+            .find(|(candidate, _)| candidate == path)
+            .unwrap_or_else(|| panic!("missing composite observation {path}"))
+            .1
+    }
+}
+
+#[test]
+fn production_composite_input_reuses_the_shared_session_lifecycle() {
+    for residency in [
+        LayerWeightResidency::FullyResident,
+        LayerWeightResidency::LayerwiseHost(Default::default()),
+    ] {
+        let architecture = GroupedFixture {
+            static_modules: FakeOperator,
+            trace: Vec::new(),
+        };
+        let selected = selected_reference_composite(&architecture, residency);
+        let contract = prepare_layered_text_contract::<
+            _,
+            FakeBackend,
+            DeviceState<FakeBackend, FakeLayerState>,
+        >(
+            &architecture,
+            None,
+            selected,
+            "fixture",
+            eredu_runtime::ReplicatedTextOutputSelection::LastSequencePosition,
+            &(),
+        )
+        .unwrap();
+        let prompt_model_identity = contract.prompt_cache_identity().clone();
+        let counters = ReplicatedSessionCounters::default();
+        let completions = Rc::new(RefCell::new(Vec::new()));
+        let fail_completion = Rc::new(Cell::new(false));
+        let prompt_cache = Rc::new(RefCell::new(None));
+        let mechanisms = ReferenceTextMechanisms {
+            tasks: Rc::new(RefCell::new(Vec::new())),
+            completions: Rc::clone(&completions),
+            counters: counters.clone(),
+            fail_completion: Rc::clone(&fail_completion),
+            prompt_cache: Some(Rc::clone(&prompt_cache)),
+        };
+        let mut session = construct_replicated_text_session::<_, FakeBackend, _>(
+            architecture,
+            None,
+            contract,
+            mechanisms,
+            &(),
+        )
+        .unwrap();
+
+        let resource_dropped = Rc::new(Cell::new(true));
+        COMPOSITE_FORWARD_RESOURCE
+            .with(|resource| *resource.borrow_mut() = Some(Rc::clone(&resource_dropped)));
+        let prepared = prepared_composite_input(3);
+        let input_identity = prepared
+            .cache_identity(composite_content_fingerprint(3))
+            .unwrap();
+        assert_eq!(
+            session
+                .prefill_input_with_cache_identity(Some(&prepared), input_identity.clone(), &(),)
+                .unwrap(),
+            FakeTensor(vec![21])
+        );
+        assert!(resource_dropped.get());
+        assert_eq!(session.report().unwrap().state_report(), &[0, 0, 1, 1]);
+        assert_eq!(
+            session.committed_prompt_input_identity(),
+            Some(&input_identity)
+        );
+
+        let checkpoint = session.checkpoint_complete(&()).unwrap();
+        let decode = prepared_composite_input(4);
+        let mut baseline_observer = CompositeCausalObserver {
+            values: Vec::new(),
+            replace_vision: false,
+            fail_path: None,
+        };
+        session
+            .decode_input_with_observer(Some(&decode), &(), &mut baseline_observer)
+            .unwrap();
+        assert_eq!(session.report().unwrap().state_report(), &[0, 0, 2, 2]);
+        session.rollback_complete(checkpoint, &()).unwrap();
+        assert_eq!(session.report().unwrap().state_report(), &[0, 0, 1, 1]);
+        assert_eq!(
+            session.committed_prompt_input_identity(),
+            Some(&input_identity)
+        );
+
+        let checkpoint = session.checkpoint_complete(&()).unwrap();
+        let mut causal_observer = CompositeCausalObserver {
+            values: Vec::new(),
+            replace_vision: true,
+            fail_path: None,
+        };
+        session
+            .decode_input_with_observer(Some(&decode), &(), &mut causal_observer)
+            .unwrap();
+        assert_eq!(
+            baseline_observer.value(eredu_core::MODALITY_MERGE_OUTPUT_OBSERVATION_PATH),
+            &FakeTensor(vec![16])
+        );
+        assert_eq!(
+            causal_observer.value(eredu_core::MODALITY_MERGE_OUTPUT_OBSERVATION_PATH),
+            &FakeTensor(vec![42])
+        );
+        assert_eq!(
+            causal_observer.value("group.2.unit.0.input"),
+            &FakeTensor(vec![42])
+        );
+        session.rollback_complete(checkpoint, &()).unwrap();
+
+        let descriptor = eredu_core::cache::PromptCacheDescriptor::from_model_identity(
+            prompt_model_identity,
+            "fixture-checkpoint",
+            input_identity.prefix_content_fingerprint(),
+            1,
+        )
+        .unwrap();
+        let different_media = prepared_composite_input(99)
+            .cache_identity(composite_content_fingerprint(99))
+            .unwrap();
+        let before_identity_mismatch = session.report().unwrap().state_report().clone();
+        let mismatch = session
+            .save_prompt_cache_for_input(
+                std::path::Path::new("unused"),
+                descriptor.clone(),
+                &[7],
+                &eredu_core::cache::PromptCacheOptions::default(),
+                &different_media,
+                &(),
+            )
+            .unwrap_err();
+        assert!(mismatch
+            .to_string()
+            .contains("content identity differs from the prepared input"));
+        assert_eq!(
+            session.report().unwrap().state_report(),
+            &before_identity_mismatch
+        );
+
+        session
+            .save_prompt_cache_for_input(
+                std::path::Path::new("unused"),
+                descriptor.clone(),
+                &[7],
+                &eredu_core::cache::PromptCacheOptions::default(),
+                &input_identity,
+                &(),
+            )
+            .unwrap();
+        session.reset(&()).unwrap();
+        assert_eq!(session.report().unwrap().state_report(), &[0, 0, 0, 0]);
+        session
+            .load_prompt_cache_for_input(
+                std::path::Path::new("unused"),
+                &descriptor,
+                &[7],
+                input_identity.clone(),
+                &(),
+            )
+            .unwrap();
+        assert_eq!(session.report().unwrap().state_report(), &[0, 0, 1, 1]);
+        assert_eq!(
+            session.committed_prompt_input_identity(),
+            Some(&input_identity)
+        );
+
+        let mut failing_observer = CompositeCausalObserver {
+            values: Vec::new(),
+            replace_vision: false,
+            fail_path: Some("group.2.unit.0.output"),
+        };
+        assert!(session
+            .decode_input_with_observer(Some(&decode), &(), &mut failing_observer)
+            .is_err());
+        assert_eq!(session.report().unwrap().state_report(), &[0, 0, 1, 1]);
+
+        fail_completion.set(true);
+        assert!(session.decode_input(Some(&decode), &()).is_err());
+        fail_completion.set(false);
+        assert_eq!(session.report().unwrap().state_report(), &[0, 0, 1, 1]);
+        assert_eq!(
+            session.committed_prompt_input_identity(),
+            Some(&input_identity)
+        );
+
+        session.reset(&()).unwrap();
+        assert_eq!(session.report().unwrap().state_report(), &[0, 0, 0, 0]);
+        assert!(session.committed_prompt_input_identity().is_none());
+        assert_eq!(completions.borrow().len(), counters.snapshot().publications);
+        assert_eq!(
+            counters.snapshot().completion_attempts,
+            counters.snapshot().publications + 1
+        );
+        COMPOSITE_FORWARD_RESOURCE.with(|resource| resource.borrow_mut().take());
+    }
+}
+
 #[test]
 fn composite_prepared_parts_drive_dependency_group_output() {
     let architecture = GroupedFixture {
@@ -3033,13 +3480,13 @@ struct FixtureDecisionBoundary {
     accepted: Vec<(usize, LayeredTraversalPoint, FakeTensor)>,
 }
 
-impl SequentialDecisionBoundary<FakeBackend, Vec<(usize, usize)>, Error>
+impl SequentialDecisionBoundary<FakeBackend, GroupedForwardContext, Error>
     for FixtureDecisionBoundary
 {
     fn prediction_at(
         &self,
         point: LayeredTraversalPoint,
-        _: &Vec<(usize, usize)>,
+        _: &GroupedForwardContext,
     ) -> Option<usize> {
         match point {
             LayeredTraversalPoint::Group { group: 0 } => Some(0),
@@ -3053,7 +3500,7 @@ impl SequentialDecisionBoundary<FakeBackend, Vec<(usize, usize)>, Error>
         _: usize,
         _: LayeredTraversalPoint,
         value: &FakeTensor,
-        _: &mut Vec<(usize, usize)>,
+        _: &mut GroupedForwardContext,
         _: &(),
     ) -> Result<FakeTensor, Error> {
         Ok(value.clone())
@@ -3063,7 +3510,7 @@ impl SequentialDecisionBoundary<FakeBackend, Vec<(usize, usize)>, Error>
         &mut self,
         _: usize,
         _: LayeredTraversalPoint,
-        _: &Vec<(usize, usize)>,
+        _: &GroupedForwardContext,
     ) -> Result<TokenDomain, Error> {
         Ok(TokenDomain::new(10_000))
     }
@@ -3073,7 +3520,7 @@ impl SequentialDecisionBoundary<FakeBackend, Vec<(usize, usize)>, Error>
         prediction: usize,
         point: LayeredTraversalPoint,
         token: &FakeTensor,
-        forward: &mut Vec<(usize, usize)>,
+        forward: &mut GroupedForwardContext,
         _: &(),
     ) -> Result<(), Error> {
         let token_marker = token
@@ -3218,7 +3665,7 @@ impl LayeredTraversalHook<FakeBackend, (), Error> for RecordingTraversalHook {
         group: usize,
         index: usize,
         _: usize,
-        _: &FakeTensor,
+        _: &mut FakeTensor,
         _: &mut (),
         _: &(),
     ) -> Result<LayeredUnitAction, Error> {
@@ -3236,7 +3683,7 @@ impl LayeredTraversalHook<FakeBackend, (), Error> for RecordingTraversalHook {
         &mut self,
         group: usize,
         index: usize,
-        _: &FakeTensor,
+        _: &mut FakeTensor,
         _: &mut (),
         _: &(),
     ) -> Result<(), Error> {
@@ -3249,7 +3696,7 @@ impl LayeredTraversalHook<FakeBackend, (), Error> for RecordingTraversalHook {
     fn after_group(
         &mut self,
         group: usize,
-        _: &FakeTensor,
+        _: &mut FakeTensor,
         _: &mut (),
         _: &(),
     ) -> Result<(), Error> {
@@ -3274,13 +3721,13 @@ fn composite_traversal_hook_preserves_order_and_combines_tail_skip() {
         events: Rc::clone(&events),
     };
     let mut hook = CompositeLayeredTraversalHook::new(left, right);
-    let value = FakeTensor(vec![1]);
+    let mut value = FakeTensor(vec![1]);
     assert_eq!(
-        hook.before_unit(1, 2, 3, &value, &mut (), &()).unwrap(),
+        hook.before_unit(1, 2, 3, &mut value, &mut (), &()).unwrap(),
         LayeredUnitAction::SkipRemainingGroup
     );
-    hook.after_unit(1, 2, &value, &mut (), &()).unwrap();
-    hook.after_group(1, &value, &mut (), &()).unwrap();
+    hook.after_unit(1, 2, &mut value, &mut (), &()).unwrap();
+    hook.after_group(1, &mut value, &mut (), &()).unwrap();
     assert_eq!(
         events.borrow().as_slice(),
         [

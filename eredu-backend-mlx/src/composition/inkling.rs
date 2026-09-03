@@ -2,17 +2,13 @@
 
 use std::{collections::BTreeMap, path::Path, sync::Arc};
 
-use eredu_architectures::{
-    inkling::{
-        AudioInput, DecoderInputPart, LayeredModel as Architecture, ModelArgs, ModelInput, Unit,
-    },
-    media_plan,
+use eredu_architectures::inkling::{
+    DecoderInputPart, LayeredModel as Architecture, ModelArgs, ModelInput, Unit,
 };
 use eredu_checkpoint::{
     store::{CheckpointSource, SharedCheckpointSource},
     WeightQuantization,
 };
-use eredu_core::InputModality;
 use eredu_nn::Tensor;
 use eredu_runtime::{
     ArchitectureParameters, CacheResidencyPolicy, CausalModel, LayerWeightResidency,
@@ -20,10 +16,7 @@ use eredu_runtime::{
     RuntimeState, WeightBinding, WeightResidency,
 };
 use safemlx::{
-    error::Exception,
-    ops::{concatenate_axis, indexing::TryIndexOp},
-    transforms::async_eval_with_event,
-    Array, Stream,
+    error::Exception, ops::indexing::TryIndexOp, transforms::async_eval_with_event, Array, Stream,
 };
 
 use crate::backend::{
@@ -911,40 +904,8 @@ impl InklingModel {
         stream: &Stream,
         observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
     ) -> Result<crate::MlxTensor, Error> {
-        let prepared = PreparedInklingInput::new(&self.args, typed, stream)?;
-        let parts = prepared
-            .tokens
-            .iter()
-            .zip(prepared.kinds.iter().copied())
-            .zip(&prepared.projected)
-            .map(|((value, kind), projected)| match projected {
-                Some(embeddings) => DecoderInputPart::Projected {
-                    tokens: value,
-                    embeddings,
-                },
-                None => match kind {
-                    InputModality::Text => DecoderInputPart::Text(value),
-                    InputModality::Image => DecoderInputPart::Image(value),
-                    InputModality::Audio => DecoderInputPart::Audio(value),
-                    InputModality::Video => unreachable!(),
-                    _ => unreachable!("validated Inkling input modality"),
-                },
-            })
-            .collect::<Vec<_>>();
-        let audio = prepared.audio.as_ref().map(|code_ids| AudioInput {
-            code_ids,
-            valid_frames: code_ids.dim(1),
-        });
-        self.forward_with_observer(
-            ModelInput {
-                parts: &parts,
-                vision_patches: prepared.images.as_ref(),
-                audio,
-            },
-            state,
-            stream,
-            observer,
-        )
+        prepare_input(&self.args, typed, stream)?
+            .with_model_input(|input| self.forward_with_observer(input, state, stream, observer))
     }
 
     pub fn forward_tokens(
@@ -1012,49 +973,19 @@ impl InklingModel {
                 "Inkling tensor-parallel cache layout mismatch".into(),
             ));
         }
-        let prepared = PreparedInklingInput::new(&self.args, typed, stream)?;
-        let parts = prepared
-            .tokens
-            .iter()
-            .zip(prepared.kinds.iter().copied())
-            .zip(&prepared.projected)
-            .map(|((value, kind), projected)| match projected {
-                Some(embeddings) => DecoderInputPart::Projected {
-                    tokens: value,
-                    embeddings,
-                },
-                None => match kind {
-                    InputModality::Text => DecoderInputPart::Text(value),
-                    InputModality::Image => DecoderInputPart::Image(value),
-                    InputModality::Audio => DecoderInputPart::Audio(value),
-                    InputModality::Video => unreachable!(),
-                    _ => unreachable!("validated Inkling input modality"),
-                },
-            })
-            .collect::<Vec<_>>();
-        let audio = prepared.audio.as_ref().map(|code_ids| AudioInput {
-            code_ids,
-            valid_frames: code_ids.dim(1),
-        });
-        let input = ModelInput {
-            parts: &parts,
-            vision_patches: prepared.images.as_ref(),
-            audio,
-        };
-        let logits = match &mut self.execution {
-            Execution::ParallelResident(runtime) => runtime
-                .forward_parallel(input, &mut state.target, group, stream)
-                .map_err(|error| Error::Parallel(error.to_string()))?,
-            Execution::ParallelBounded(runtime) => runtime
-                .forward_parallel(input, &mut state.target, group, stream)
-                .map_err(|error| Error::Parallel(error.to_string()))?,
-            Execution::Resident(_) | Execution::Bounded(_) => {
-                return Err(Error::Parallel(
+        prepare_input(&self.args, typed, stream)?.with_model_input(|input| {
+            match &mut self.execution {
+                Execution::ParallelResident(runtime) => runtime
+                    .forward_parallel(input, &mut state.target, group, stream)
+                    .map_err(|error| Error::Parallel(error.to_string())),
+                Execution::ParallelBounded(runtime) => runtime
+                    .forward_parallel(input, &mut state.target, group, stream)
+                    .map_err(|error| Error::Parallel(error.to_string())),
+                Execution::Resident(_) | Execution::Bounded(_) => Err(Error::Parallel(
                     "Inkling model was not loaded for tensor parallelism".into(),
-                ))
+                )),
             }
-        };
-        Ok(logits)
+        })
     }
 
     pub fn forward_tensor_parallel_with_observer(
@@ -1087,41 +1018,9 @@ impl InklingModel {
         stream: &Stream,
         observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
     ) -> Result<crate::MlxTensor, Error> {
-        let prepared = PreparedInklingInput::new(&self.args, typed, stream)?;
-        let parts = prepared
-            .tokens
-            .iter()
-            .zip(prepared.kinds.iter().copied())
-            .zip(&prepared.projected)
-            .map(|((value, kind), projected)| match projected {
-                Some(embeddings) => DecoderInputPart::Projected {
-                    tokens: value,
-                    embeddings,
-                },
-                None => match kind {
-                    InputModality::Text => DecoderInputPart::Text(value),
-                    InputModality::Image => DecoderInputPart::Image(value),
-                    InputModality::Audio => DecoderInputPart::Audio(value),
-                    InputModality::Video => unreachable!(),
-                    _ => unreachable!("validated Inkling input modality"),
-                },
-            })
-            .collect::<Vec<_>>();
-        let audio = prepared.audio.as_ref().map(|code_ids| AudioInput {
-            code_ids,
-            valid_frames: code_ids.dim(1),
-        });
-        self.forward_parallel_input_with_observer(
-            ModelInput {
-                parts: &parts,
-                vision_patches: prepared.images.as_ref(),
-                audio,
-            },
-            state,
-            group,
-            stream,
-            observer,
-        )
+        prepare_input(&self.args, typed, stream)?.with_model_input(|input| {
+            self.forward_parallel_input_with_observer(input, state, group, stream, observer)
+        })
     }
 
     fn forward_parallel_input_with_observer(
@@ -1223,39 +1122,8 @@ impl InklingModel {
         state: &mut InklingState,
         stream: &Stream,
     ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Error> {
-        let prepared = PreparedInklingInput::new(&self.args, typed, stream)?;
-        let parts = prepared
-            .tokens
-            .iter()
-            .zip(prepared.kinds.iter().copied())
-            .zip(&prepared.projected)
-            .map(|((value, kind), projected)| match projected {
-                Some(embeddings) => DecoderInputPart::Projected {
-                    tokens: value,
-                    embeddings,
-                },
-                None => match kind {
-                    InputModality::Text => DecoderInputPart::Text(value),
-                    InputModality::Image => DecoderInputPart::Image(value),
-                    InputModality::Audio => DecoderInputPart::Audio(value),
-                    InputModality::Video => unreachable!(),
-                    _ => unreachable!("validated Inkling input modality"),
-                },
-            })
-            .collect::<Vec<_>>();
-        let audio_input = prepared.audio.as_ref().map(|code_ids| AudioInput {
-            code_ids,
-            valid_frames: code_ids.dim(1),
-        });
-        self.forward_with_capture(
-            ModelInput {
-                parts: &parts,
-                vision_patches: prepared.images.as_ref(),
-                audio: audio_input,
-            },
-            state,
-            stream,
-        )
+        prepare_input(&self.args, typed, stream)?
+            .with_model_input(|input| self.forward_with_capture(input, state, stream))
     }
 
     pub fn forward_input(
@@ -1332,40 +1200,9 @@ impl InklingModel {
         group: &crate::backend::runtime::distributed::Group,
         stream: &Stream,
     ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Error> {
-        let prepared = PreparedInklingInput::new(&self.args, typed, stream)?;
-        let parts = prepared
-            .tokens
-            .iter()
-            .zip(prepared.kinds.iter().copied())
-            .zip(&prepared.projected)
-            .map(|((value, kind), projected)| match projected {
-                Some(embeddings) => DecoderInputPart::Projected {
-                    tokens: value,
-                    embeddings,
-                },
-                None => match kind {
-                    InputModality::Text => DecoderInputPart::Text(value),
-                    InputModality::Image => DecoderInputPart::Image(value),
-                    InputModality::Audio => DecoderInputPart::Audio(value),
-                    InputModality::Video => unreachable!(),
-                    _ => unreachable!("validated Inkling input modality"),
-                },
-            })
-            .collect::<Vec<_>>();
-        let audio = prepared.audio.as_ref().map(|code_ids| AudioInput {
-            code_ids,
-            valid_frames: code_ids.dim(1),
-        });
-        self.forward_parallel_with_capture(
-            ModelInput {
-                parts: &parts,
-                vision_patches: prepared.images.as_ref(),
-                audio,
-            },
-            state,
-            group,
-            stream,
-        )
+        prepare_input(&self.args, typed, stream)?.with_model_input(|input| {
+            self.forward_parallel_with_capture(input, state, group, stream)
+        })
     }
 
     fn forward_mtp_draft_parallel(
@@ -1446,139 +1283,23 @@ impl InklingModel {
     }
 }
 
-pub struct PreparedInklingInput {
-    pub tokens: Vec<crate::MlxTensor>,
-    pub kinds: Vec<InputModality>,
-    pub projected: Vec<Option<crate::MlxTensor>>,
-    pub images: Option<crate::MlxTensor>,
-    pub audio: Option<crate::MlxTensor>,
-}
-
-impl PreparedInklingInput {
-    pub fn new(
-        args: &ModelArgs,
-        typed: input::ModelInput<'_>,
-        stream: &Stream,
-    ) -> Result<PreparedInklingInput, Error> {
-        input::validate(typed)?;
-        let mut tokens = Vec::new();
-        let mut kinds = Vec::new();
-        let mut projected = Vec::new();
-        let mut images = Vec::new();
-        let mut audio = Vec::new();
-        for part in typed.parts {
-            let plan = media_plan::inkling_input_part(args, part, &input::MlxInputInspector)
-                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-            match (plan, part.payload()) {
-                (
-                    media_plan::InklingInputPartPlan::TextTokens { .. },
-                    input::InputPayload::TokenIds(value),
-                ) => {
-                    tokens.push(crate::MlxTensor::from_array(value.clone()));
-                    kinds.push(InputModality::Text);
-                    projected.push(None);
-                }
-                (
-                    media_plan::InklingInputPartPlan::Media {
-                        modality: InputModality::Image,
-                        ingress,
-                        ..
-                    },
-                    input::InputPayload::Tensor(value),
-                ) => {
-                    let count = usize::try_from(ingress.placeholder_count).map_err(|_| {
-                        Error::ArchitectureModel(
-                            "Inkling image placeholder span exceeds host capacity".into(),
-                        )
-                    })?;
-                    tokens.push(crate::MlxTensor::from_array(input::token_ids_array(
-                        &vec![ingress.placeholder_token_id; count],
-                        stream,
-                    )?));
-                    kinds.push(InputModality::Image);
-                    projected.push(None);
-                    images.push(value.clone());
-                }
-                (
-                    media_plan::InklingInputPartPlan::Media {
-                        modality: InputModality::Audio,
-                        ingress,
-                        ..
-                    },
-                    input::InputPayload::Tensor(value),
-                ) => {
-                    let count = usize::try_from(ingress.placeholder_count).map_err(|_| {
-                        Error::ArchitectureModel(
-                            "Inkling audio placeholder span exceeds host capacity".into(),
-                        )
-                    })?;
-                    let retained_frames =
-                        i32::try_from(ingress.placeholder_count).map_err(|_| {
-                            Error::ArchitectureModel(
-                                "Inkling audio placeholder span exceeds tensor capacity".into(),
-                            )
-                        })?;
-                    tokens.push(crate::MlxTensor::from_array(input::token_ids_array(
-                        &vec![ingress.placeholder_token_id; count],
-                        stream,
-                    )?));
-                    kinds.push(InputModality::Audio);
-                    projected.push(None);
-                    audio.push(value.try_index_device((.., ..retained_frames, ..), stream)?);
-                }
-                (
-                    media_plan::InklingInputPartPlan::Projected {
-                        modality,
-                        placeholder_token_id,
-                        positions,
-                    },
-                    input::InputPayload::Embeddings(value),
-                ) => {
-                    let count = usize::try_from(positions).map_err(|_| {
-                        Error::ArchitectureModel(
-                            "Inkling projected placeholder span exceeds host capacity".into(),
-                        )
-                    })?;
-                    tokens.push(crate::MlxTensor::from_array(input::token_ids_array(
-                        &vec![placeholder_token_id; count],
-                        stream,
-                    )?));
-                    kinds.push(match modality {
-                        InputModality::Image => InputModality::Image,
-                        InputModality::Audio => InputModality::Audio,
-                        InputModality::Text | InputModality::Video => unreachable!(),
-                        _ => unreachable!("validated Inkling input modality"),
-                    });
-                    projected.push(Some(crate::MlxTensor::from_array(value.clone())));
-                }
-                _ => {
-                    return Err(Error::ArchitectureModel(format!(
-                        "Inkling input plan disagrees with the prepared {} payload",
-                        part.modality().as_str()
-                    )))
-                }
-            }
-        }
-        Ok(PreparedInklingInput {
-            tokens,
-            kinds,
-            projected,
-            images: concatenate(&images, 0, stream)?.map(crate::MlxTensor::from_array),
-            audio: concatenate(&audio, 1, stream)?.map(crate::MlxTensor::from_array),
-        })
-    }
-}
-
-fn concatenate(values: &[Array], axis: i32, stream: &Stream) -> Result<Option<Array>, Error> {
-    match values {
-        [] => Ok(None),
-        [value] => Ok(Some(value.clone())),
-        _ => Ok(Some(concatenate_axis(
-            &values.iter().collect::<Vec<_>>(),
-            axis,
-            stream,
-        )?)),
-    }
+pub(crate) fn prepare_input(
+    args: &ModelArgs,
+    input: input::ModelInput<'_>,
+    stream: &Stream,
+) -> Result<eredu_architectures::inkling::PreparedInput<crate::MlxTensor>, Error> {
+    let prepared = crate::composition::mlx::replicated_text::prepared_composite_input(input)?;
+    let admitted = eredu_architectures::media_plan::admit_inkling_input(
+        args,
+        &prepared,
+        &input::MlxTensorInputInspector,
+    )
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let input =
+        eredu_architectures::composite_execution::PreparedCompositeInput::new(&prepared, &admitted)
+            .map_err(Error::ArchitectureModel)?;
+    eredu_architectures::inkling::prepare_input(input, stream)
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))
 }
 
 impl CausalModel<InklingState> for InklingModel {

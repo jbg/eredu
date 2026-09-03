@@ -27,9 +27,9 @@ pub use graph::{
     PREDICTION_STATE_SEGMENT, TARGET_STATE_SEGMENT,
 };
 pub use model::{
-    state_identity, DecoderInputPart, ForwardContext, InklingStateLayouts, LayeredModel,
-    ModelInput, PartitionMtpOutput, StaticModules, TextPartitionInput, Unit, MTP_STATIC_ROLE,
-    TEXT_EXECUTION_GROUP, VISION_EXECUTION_GROUP,
+    prepare_input, state_identity, DecoderInputPart, ForwardContext, InklingStateLayouts,
+    LayeredModel, ModelInput, PartitionMtpOutput, PreparedInput, StaticModules, TextPartitionInput,
+    Unit, AUDIO_EXECUTION_GROUP, MTP_STATIC_ROLE, TEXT_EXECUTION_GROUP, VISION_EXECUTION_GROUP,
 };
 pub use mtp::{MtpDepth, MtpModel, MtpOutput};
 pub use parallel::{

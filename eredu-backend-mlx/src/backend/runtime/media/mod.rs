@@ -10,7 +10,7 @@ use eredu_core::VideoSampling;
 use eredu_core::{checkpoint::TensorDtype, InputTensorIdentity, PreparedInputIdentity};
 #[cfg(any(feature = "image", feature = "audio"))]
 use eredu_core::{InputExtent, InputMetadataKey, InputModality};
-use eredu_runtime::PreparedModelInput as RuntimePreparedModelInput;
+use eredu_runtime::{PreparedInputCacheIdentity, PreparedModelInput as RuntimePreparedModelInput};
 use safemlx::{Array, Dtype};
 
 #[cfg(any(test, feature = "image", feature = "audio"))]
@@ -148,6 +148,7 @@ pub fn media_input_part(
 #[derive(Debug, Clone)]
 pub struct PreparedModelInput {
     inner: RuntimePreparedModelInput<Array>,
+    cache_identity: Option<PreparedInputCacheIdentity>,
 }
 
 impl PreparedModelInput {
@@ -158,7 +159,34 @@ impl PreparedModelInput {
             })
         })
         .map_err(prepared_input_error)?;
-        Ok(Self { inner })
+        Ok(Self {
+            inner,
+            cache_identity: None,
+        })
+    }
+
+    /// Couples processor output to the exact semantic request that produced it.
+    #[cfg(any(feature = "image", feature = "audio"))]
+    pub(crate) fn from_runtime_with_semantic_content(
+        inner: RuntimePreparedModelInput<Array>,
+        semantic_content_fingerprint: impl Into<String>,
+    ) -> Result<Self, Error> {
+        let cache_identity = inner
+            .cache_identity(semantic_content_fingerprint)
+            .map_err(|error| Error::Processor(error.to_string()))?;
+        Ok(Self {
+            inner,
+            cache_identity: Some(cache_identity),
+        })
+    }
+
+    /// Retains an observed prepared result without asserting an unchanged semantic identity.
+    #[cfg(any(feature = "image", feature = "audio"))]
+    pub(crate) fn from_observed_runtime(inner: RuntimePreparedModelInput<Array>) -> Self {
+        Self {
+            inner,
+            cache_identity: None,
+        }
     }
 
     /// Copies borrowed typed input into scheduler-safe owned storage.
@@ -170,6 +198,11 @@ impl PreparedModelInput {
     /// Returns the payload-free collective identity of this prepared input.
     pub const fn identity(&self) -> &PreparedInputIdentity {
         self.inner.identity()
+    }
+
+    /// Exact prepared-description and semantic-content cache identity, when supplied.
+    pub const fn cache_identity(&self) -> Option<&PreparedInputCacheIdentity> {
+        self.cache_identity.as_ref()
     }
 
     /// Returns the number of ordered runtime parts.
@@ -227,7 +260,10 @@ impl PreparedModelInput {
             },
         )
         .map_err(prepared_input_error)?;
-        Ok(Self { inner })
+        Ok(Self {
+            inner,
+            cache_identity: None,
+        })
     }
 }
 

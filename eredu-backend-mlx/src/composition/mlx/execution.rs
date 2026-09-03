@@ -63,9 +63,6 @@ pub(super) fn prefill_model(
         Executable::Qwen3Next(_, model, cache) | Executable::Qwen35(_, model, cache) => {
             prefill_pair(model, cache, input, stream)
         }
-        Executable::Qwen3Vl(_, model, cache) | Executable::Qwen3VlMoe(_, model, cache) => {
-            prefill_pair(model, cache, input, stream)
-        }
     }
 }
 
@@ -87,9 +84,6 @@ pub(super) fn decode_model(
         Executable::NemotronH(_, model, cache) => decode_pair(model, cache, input, stream),
         Executable::Qwen(_, model, cache) => decode_pair(model, cache, input, stream),
         Executable::Qwen3Next(_, model, cache) | Executable::Qwen35(_, model, cache) => {
-            decode_pair(model, cache, input, stream)
-        }
-        Executable::Qwen3Vl(_, model, cache) | Executable::Qwen3VlMoe(_, model, cache) => {
             decode_pair(model, cache, input, stream)
         }
     }
@@ -131,8 +125,6 @@ pub(super) fn prefill_model_tensor_parallel(
         | Executable::NemotronH(_, _, _)
         | Executable::Qwen(_, _, _)
         | Executable::Qwen3Next(_, _, _)
-        | Executable::Qwen3Vl(_, _, _)
-        | Executable::Qwen3VlMoe(_, _, _)
         | Executable::Qwen35(_, _, _)) => {
             let tokens = input::text_token_ids(input, stream)?;
             forward_model_tensor_parallel(executable, &tokens, group, stream)?
@@ -196,8 +188,6 @@ fn forward_model_tensor_parallel(
         Executable::DeepSeek(_, _, _)
         | Executable::ReplicatedText(_, _)
         | Executable::Qwen3Next(_, _, _)
-        | Executable::Qwen3Vl(_, _, _)
-        | Executable::Qwen3VlMoe(_, _, _)
         | Executable::Qwen35(_, _, _) => Err(Error::Parallel(
             "this architecture is materialized as a pipeline model for distributed execution"
                 .into(),
@@ -254,8 +244,6 @@ pub(super) fn prefill_model_tensor_parallel_with_observer(
         | Executable::NemotronH(_, _, _)
         | Executable::Qwen(_, _, _)
         | Executable::Qwen3Next(_, _, _)
-        | Executable::Qwen3Vl(_, _, _)
-        | Executable::Qwen3VlMoe(_, _, _)
         | Executable::Qwen35(_, _, _)) => {
             let tokens = input::text_token_ids(input, stream)?;
             forward_model_tensor_parallel_with_observer(
@@ -323,8 +311,6 @@ pub(super) fn forward_model_tensor_parallel_with_observer(
         Executable::DeepSeek(_, _, _)
         | Executable::ReplicatedText(_, _)
         | Executable::Qwen3Next(_, _, _)
-        | Executable::Qwen3Vl(_, _, _)
-        | Executable::Qwen3VlMoe(_, _, _)
         | Executable::Qwen35(_, _, _) => Err(Error::Parallel(
             "this architecture is materialized as a pipeline model for distributed execution"
                 .into(),

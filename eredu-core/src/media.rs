@@ -1,14 +1,13 @@
 //! Portable decoded-media requests and chat-placeholder composition.
 
+use sha2::{Digest, Sha256};
+
 /// Failure while validating portable media or composing a chat request.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum MediaRequestError {
     /// An input request must contain at least one segment.
     #[error("multimodal input request is empty")]
     EmptyRequest,
-    /// Multimodal preparation is meaningful only when media is present.
-    #[error("multimodal input request contains no media")]
-    MissingMedia,
     /// RGB dimensions or payload length are invalid.
     #[error("RGB8 image shape {width}x{height} requires {expected} bytes, got {actual}")]
     InvalidRgbImage {
@@ -256,12 +255,6 @@ impl MultimodalRequest {
         if segments.is_empty() {
             return Err(MediaRequestError::EmptyRequest);
         }
-        if !segments
-            .iter()
-            .any(|segment| matches!(segment, MultimodalSegment::Media(_)))
-        {
-            return Err(MediaRequestError::MissingMedia);
-        }
         Ok(Self { segments })
     }
 
@@ -369,6 +362,83 @@ impl TokenizedMultimodalRequest {
     pub fn segments(&self) -> &[TokenizedMultimodalSegment] {
         &self.segments
     }
+
+    /// Derives a stable digest of the exact ordered tokens and decoded media.
+    pub fn semantic_content_fingerprint(&self) -> String {
+        let mut digest = Sha256::new();
+        digest.update(b"eredu-tokenized-multimodal-input-v1\0");
+        digest.update((self.segments.len() as u64).to_le_bytes());
+        for segment in &self.segments {
+            match segment {
+                TokenizedMultimodalSegment::TokenIds(tokens) => {
+                    digest.update([0]);
+                    digest.update((tokens.len() as u64).to_le_bytes());
+                    for token in tokens {
+                        digest.update(token.to_le_bytes());
+                    }
+                }
+                TokenizedMultimodalSegment::Media(media) => hash_media(&mut digest, media),
+            }
+        }
+        let bytes = digest.finalize();
+        let mut encoded = String::with_capacity(71);
+        encoded.push_str("sha256:");
+        for byte in bytes {
+            use std::fmt::Write as _;
+            write!(&mut encoded, "{byte:02x}").expect("writing to a string cannot fail");
+        }
+        encoded
+    }
+}
+
+fn hash_image(digest: &mut Sha256, image: &RgbImage) {
+    digest.update(image.width.to_le_bytes());
+    digest.update(image.height.to_le_bytes());
+    digest.update((image.pixels.len() as u64).to_le_bytes());
+    digest.update(&image.pixels);
+}
+
+fn hash_media(digest: &mut Sha256, media: &Media) {
+    match media {
+        Media::Image(image) => {
+            digest.update([1]);
+            hash_image(digest, image);
+        }
+        Media::Video(video) => {
+            digest.update([2]);
+            digest.update((video.frames.len() as u64).to_le_bytes());
+            match video.source_fps {
+                Some(fps) => {
+                    digest.update([1]);
+                    digest.update(fps.to_bits().to_le_bytes());
+                }
+                None => digest.update([0]),
+            }
+            match video.sampling {
+                VideoSampling::ProcessorDefault => digest.update([0]),
+                VideoSampling::Fps(fps) => {
+                    digest.update([1]);
+                    digest.update(fps.to_bits().to_le_bytes());
+                }
+                VideoSampling::FrameCount(count) => {
+                    digest.update([2]);
+                    digest.update((count as u64).to_le_bytes());
+                }
+                VideoSampling::All => digest.update([3]),
+            }
+            for frame in &video.frames {
+                hash_image(digest, frame);
+            }
+        }
+        Media::Audio(audio) => {
+            digest.update([3]);
+            digest.update(audio.sample_rate.to_le_bytes());
+            digest.update((audio.samples.len() as u64).to_le_bytes());
+            for sample in &audio.samples {
+                digest.update(sample.to_bits().to_le_bytes());
+            }
+        }
+    }
 }
 
 fn validate_bindings(
@@ -462,5 +532,51 @@ mod tests {
             ),
             Err(MediaRequestError::PlaceholderCount { .. })
         ));
+    }
+
+    #[test]
+    fn request_preserves_text_only_segments() {
+        let request = MultimodalRequest::new(vec![
+            MultimodalSegment::TokenIds(vec![1, 2]),
+            MultimodalSegment::Text("tail".into()),
+        ])
+        .unwrap();
+
+        assert_eq!(request.segments().len(), 2);
+        assert!(matches!(
+            &request.segments()[0],
+            MultimodalSegment::TokenIds(ids) if ids == &[1, 2]
+        ));
+    }
+
+    #[test]
+    fn semantic_fingerprint_is_stable_and_distinguishes_equal_geometry_payloads() {
+        fn request(image_value: u8, audio_value: f32) -> TokenizedMultimodalRequest {
+            MultimodalRequest::new(vec![
+                MultimodalSegment::TokenIds(vec![7, 11]),
+                MultimodalSegment::Media(Media::Image(
+                    RgbImage::new(vec![image_value; 12], 2, 2).unwrap(),
+                )),
+                MultimodalSegment::Media(Media::Audio(
+                    Audio::new(vec![audio_value; 4], 16_000).unwrap(),
+                )),
+            ])
+            .unwrap()
+            .tokenize::<std::convert::Infallible>(|_| unreachable!())
+            .unwrap()
+        }
+
+        let first = request(3, 0.25);
+        let same = request(3, 0.25);
+        let changed_image = request(4, 0.25);
+        let changed_audio = request(3, 0.5);
+
+        let fingerprint = first.semantic_content_fingerprint();
+        assert_eq!(fingerprint, same.semantic_content_fingerprint());
+        assert_eq!(fingerprint, first.semantic_content_fingerprint());
+        assert_ne!(fingerprint, changed_image.semantic_content_fingerprint());
+        assert_ne!(fingerprint, changed_audio.semantic_content_fingerprint());
+        assert_eq!(fingerprint.len(), 71);
+        assert!(fingerprint.starts_with("sha256:"));
     }
 }

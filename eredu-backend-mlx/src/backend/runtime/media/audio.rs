@@ -82,6 +82,27 @@ pub struct LogMelFeatures {
     pub mel_bins: usize,
 }
 
+/// Model-independent leading-zero Slaney log-mel extraction parameters.
+#[derive(Debug, Clone)]
+pub struct LeadingSlaneyLogMelConfig {
+    /// Required input sampling rate.
+    pub sample_rate: u32,
+    /// FFT and periodic-Hann window length.
+    pub fft_length: usize,
+    /// Frame step in samples.
+    pub hop_length: usize,
+    /// Zero-valued samples prepended before the waveform.
+    pub leading_zeros: usize,
+    /// Number of area-normalized Slaney mel filters.
+    pub mel_bins: usize,
+    /// Lowest filter frequency.
+    pub min_frequency: f32,
+    /// Highest filter frequency.
+    pub max_frequency: f32,
+    /// Energy floor before taking the base-ten logarithm.
+    pub energy_floor: f32,
+}
+
 /// Extracts semicausal periodic-Hann HTK log-mel features.
 pub fn extract_log_mel(
     waveform: AudioWaveform<'_>,
@@ -158,6 +179,87 @@ pub fn extract_log_mel(
     })
 }
 
+/// Extracts leading-zero periodic-Hann, magnitude, Slaney log-mel features.
+pub fn extract_leading_slaney_log_mel(
+    waveform: AudioWaveform<'_>,
+    config: &LeadingSlaneyLogMelConfig,
+) -> Result<LogMelFeatures, Error> {
+    if waveform.sample_rate != config.sample_rate {
+        return Err(Error::Processor(format!(
+            "audio processor requires {} Hz PCM, got {} Hz",
+            config.sample_rate, waveform.sample_rate
+        )));
+    }
+    if config.fft_length == 0
+        || config.hop_length == 0
+        || config.mel_bins == 0
+        || !config.min_frequency.is_finite()
+        || !config.max_frequency.is_finite()
+        || config.min_frequency < 0.0
+        || config.max_frequency <= config.min_frequency
+        || config.max_frequency > config.sample_rate as f32 / 2.0
+        || !config.energy_floor.is_finite()
+        || config.energy_floor <= 0.0
+    {
+        return Err(Error::Processor(
+            "invalid leading Slaney log-mel configuration".into(),
+        ));
+    }
+
+    let frames = waveform.samples.len().div_ceil(config.hop_length);
+    let padded_len = frames
+        .checked_sub(1)
+        .map_or(config.leading_zeros, |last_frame| {
+            config.leading_zeros.max(
+                last_frame
+                    .saturating_mul(config.hop_length)
+                    .saturating_add(config.fft_length),
+            )
+        });
+    let mut padded = vec![0.0f32; padded_len];
+    let waveform_end = config
+        .leading_zeros
+        .checked_add(waveform.samples.len())
+        .ok_or_else(|| Error::Processor("audio framing geometry overflowed".into()))?;
+    if waveform_end > padded.len() {
+        return Err(Error::Processor(
+            "audio framing does not contain the waveform".into(),
+        ));
+    }
+    padded[config.leading_zeros..waveform_end].copy_from_slice(waveform.samples);
+
+    let filters = slaney_mel_filters(config);
+    let frequency_bins = config.fft_length / 2 + 1;
+    let mut planner = FftPlanner::<f32>::new();
+    let fft = planner.plan_fft_forward(config.fft_length);
+    let mut spectrum = vec![Complex32::default(); config.fft_length];
+    let mut values = vec![0.0f32; frames * config.mel_bins];
+    for frame in 0..frames {
+        spectrum.fill(Complex32::default());
+        let start = frame * config.hop_length;
+        for index in 0..config.fft_length {
+            let window = 0.5
+                - 0.5
+                    * (2.0 * std::f32::consts::PI * index as f32 / config.fft_length as f32).cos();
+            spectrum[index].re = padded[start + index] * window;
+        }
+        fft.process(&mut spectrum);
+        for mel in 0..config.mel_bins {
+            let mut energy = 0.0f32;
+            for frequency in 0..frequency_bins {
+                energy += spectrum[frequency].norm() * filters[mel * frequency_bins + frequency];
+            }
+            values[frame * config.mel_bins + mel] = energy.max(config.energy_floor).log10();
+        }
+    }
+    Ok(LogMelFeatures {
+        values,
+        mask: vec![true; frames],
+        frames,
+        mel_bins: config.mel_bins,
+    })
+}
+
 fn htk_mel_filters(config: &LogMelConfig) -> Vec<f32> {
     let frequency_bins = config.fft_length / 2 + 1;
     let hertz_to_mel = |frequency: f32| 2595.0 * (1.0 + frequency / 700.0).log10();
@@ -183,9 +285,49 @@ fn htk_mel_filters(config: &LogMelConfig) -> Vec<f32> {
     filters
 }
 
+fn slaney_mel_filters(config: &LeadingSlaneyLogMelConfig) -> Vec<f32> {
+    let hz_to_mel = |hz: f64| {
+        if hz < 1_000.0 {
+            hz / (200.0 / 3.0)
+        } else {
+            15.0 + (hz / 1_000.0).ln() / (6.4f64.ln() / 27.0)
+        }
+    };
+    let mel_to_hz = |mel: f64| {
+        if mel < 15.0 {
+            mel * (200.0 / 3.0)
+        } else {
+            1_000.0 * ((mel - 15.0) * (6.4f64.ln() / 27.0)).exp()
+        }
+    };
+    let mel_min = hz_to_mel(config.min_frequency as f64);
+    let mel_max = hz_to_mel(config.max_frequency as f64);
+    let edges = (0..config.mel_bins + 2)
+        .map(|index| {
+            mel_to_hz(mel_min + (mel_max - mel_min) * index as f64 / (config.mel_bins + 1) as f64)
+        })
+        .collect::<Vec<_>>();
+    let frequency_bins = config.fft_length / 2 + 1;
+    let mut filters = vec![0.0f32; config.mel_bins * frequency_bins];
+    for mel in 0..config.mel_bins {
+        let normalization = 2.0 / (edges[mel + 2] - edges[mel]);
+        for frequency in 0..frequency_bins {
+            let hz = config.sample_rate as f64 * frequency as f64 / config.fft_length as f64;
+            let lower = (hz - edges[mel]) / (edges[mel + 1] - edges[mel]);
+            let upper = (edges[mel + 2] - hz) / (edges[mel + 2] - edges[mel + 1]);
+            filters[mel * frequency_bins + frequency] =
+                (lower.min(upper).max(0.0) * normalization) as f32;
+        }
+    }
+    filters
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{extract_log_mel, AudioWaveform, LogMelConfig};
+    use super::{
+        extract_leading_slaney_log_mel, extract_log_mel, AudioWaveform, LeadingSlaneyLogMelConfig,
+        LogMelConfig,
+    };
 
     #[test]
     fn validates_waveform_and_extracts_masked_features() {
@@ -211,5 +353,31 @@ mod tests {
         assert_eq!(features.values.len(), 99 * 128);
         assert!(features.mask.iter().all(|valid| *valid));
         assert!(features.values.iter().all(|value| value.is_finite()));
+    }
+
+    #[test]
+    fn leading_slaney_frontend_uses_input_divided_by_hop_frames() {
+        let samples = vec![0.0f32; 801];
+        let features = extract_leading_slaney_log_mel(
+            AudioWaveform::new(&samples, 16_000).unwrap(),
+            &LeadingSlaneyLogMelConfig {
+                sample_rate: 16_000,
+                fft_length: 1_600,
+                hop_length: 800,
+                leading_zeros: 800,
+                mel_bins: 80,
+                min_frequency: 0.0,
+                max_frequency: 8_000.0,
+                energy_floor: 1e-10,
+            },
+        )
+        .unwrap();
+        assert_eq!(features.frames, 2);
+        assert_eq!(features.values.len(), 2 * 80);
+        assert!(features
+            .values
+            .iter()
+            .all(|value| (*value + 10.0).abs() < 1e-6));
+        assert!(features.mask.iter().all(|valid| *valid));
     }
 }

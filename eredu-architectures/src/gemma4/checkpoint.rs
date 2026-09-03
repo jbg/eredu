@@ -58,7 +58,37 @@ pub fn with_checkpoint_formats(
     formats: HashMap<String, WeightQuantization>,
 ) -> Result<FamilyConfig, String> {
     let mut target = config.clone();
-    target.text.quantized_weight_configs = Some(formats);
+    let mut text = HashMap::new();
+    let mut vision = HashMap::new();
+    let mut audio = HashMap::new();
+    for (name, format) in formats {
+        if name.starts_with("model.vision_tower.") || name.starts_with("model.embed_vision.") {
+            vision.insert(name.clone(), format);
+            if name.starts_with("model.embed_vision.") {
+                text.insert(name, format);
+            }
+        } else if name.starts_with("model.audio_tower.") || name.starts_with("model.embed_audio.") {
+            audio.insert(name.clone(), format);
+            if name.starts_with("model.embed_audio.") {
+                text.insert(name, format);
+            }
+        } else {
+            text.insert(name, format);
+        }
+    }
+    target.text.weight_quantization = None;
+    target.text.quantized_weights = None;
+    target.text.quantized_weight_configs = (!text.is_empty()).then_some(text);
+    if let Some(config) = target.vision.as_mut() {
+        config.weight_quantization = None;
+        config.quantized_weights = None;
+        config.quantized_weight_configs = (!vision.is_empty()).then_some(vision);
+    }
+    if let Some(config) = target.audio.as_mut() {
+        config.weight_quantization = None;
+        config.quantized_weights = None;
+        config.quantized_weight_configs = (!audio.is_empty()).then_some(audio);
+    }
     target.validate().map_err(|error| error.to_string())?;
     Ok(target)
 }
@@ -1277,7 +1307,9 @@ pub fn expert_residency_catalog<C: RecipeCatalog + ?Sized>(
             );
         }
     }
-    crate::ExpertResidencyCatalog::new(units).map_err(|error| error.to_string())
+    crate::ExpertResidencyCatalog::new(units)
+        .and_then(|residency| residency.with_inferred_byte_geometry(catalog))
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
@@ -1422,6 +1454,43 @@ mod tests {
             .unwrap()
             .quantized_weight_configs
             .is_some());
+    }
+
+    #[test]
+    fn selected_formats_are_partitioned_across_every_family_component() {
+        let source = sparse_family();
+        let format = WeightQuantization::MxFp4;
+        let text = "model.language_model.layers.0.self_attn.q_proj.weight";
+        let vision = "model.vision_tower.encoder.layers.0.self_attn.q_proj.linear.weight";
+        let audio = "model.audio_tower.layers.0.self_attn.q_proj.linear.weight";
+        let vision_projection = "model.embed_vision.embedding_projection.weight";
+        let target = with_checkpoint_formats(
+            &source,
+            HashMap::from([
+                (text.into(), format),
+                (vision.into(), format),
+                (audio.into(), format),
+                (vision_projection.into(), format),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(target.text.linear_format_for(text), format.into());
+        assert_eq!(
+            target
+                .vision
+                .as_ref()
+                .unwrap()
+                .linear_format_for(vision, 32),
+            format.into()
+        );
+        assert_eq!(
+            target.audio.as_ref().unwrap().linear_format_for(audio, 32),
+            format.into()
+        );
+        assert_eq!(
+            target.text.linear_format_for(vision_projection),
+            format.into()
+        );
     }
 
     #[test]

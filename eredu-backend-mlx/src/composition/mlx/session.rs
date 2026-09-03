@@ -399,12 +399,14 @@ impl Completion for MlxSessionCompletion {
 #[derive(Debug, Clone)]
 pub struct MlxModelInput {
     parts: Vec<input::InputPart>,
+    cache_identity: Option<eredu_runtime::PreparedInputCacheIdentity>,
 }
 
 impl From<input::ModelInput<'_>> for MlxModelInput {
     fn from(input: input::ModelInput<'_>) -> Self {
         Self {
             parts: input.parts.to_vec(),
+            cache_identity: input.cache_identity().cloned(),
         }
     }
 }
@@ -413,12 +415,40 @@ impl MlxModelInput {
     /// Converts processor-owned MLX values into an opaque backend prompt.
     #[cfg(any(feature = "image", feature = "audio"))]
     pub fn from_prepared(input: &PreparedModelInput) -> Self {
-        input.with_model_input(|input| Self::from(input))
+        let mut owned = input.with_model_input(|borrowed| Self::from(borrowed));
+        owned.cache_identity = input.cache_identity().cloned();
+        owned
+    }
+
+    /// Returns the exact semantic identity carried by processor-produced input.
+    pub const fn cache_identity(&self) -> Option<&eredu_runtime::PreparedInputCacheIdentity> {
+        self.cache_identity.as_ref()
+    }
+
+    /// Couples manually prepared tensors to caller-owned semantic content.
+    pub fn with_semantic_content_fingerprint(
+        mut self,
+        fingerprint: impl Into<String>,
+    ) -> Result<Self, Error> {
+        let prepared = eredu_runtime::PreparedModelInput::new(self.parts.clone(), |array| {
+            eredu_runtime::PreparedInputInspector::identity(&input::MlxInputInspector, array)
+        })
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        self.cache_identity = Some(
+            prepared
+                .cache_identity(fingerprint)
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?,
+        );
+        Ok(self)
     }
 
     /// Borrows the owned input parts as a model-input view for one operation.
     pub fn with_borrowed<T>(&self, execute: impl FnOnce(input::ModelInput<'_>) -> T) -> T {
-        execute(input::ModelInput::new(&self.parts))
+        let input = match self.cache_identity.as_ref() {
+            Some(identity) => input::ModelInput::with_cache_identity(&self.parts, identity),
+            None => input::ModelInput::new(&self.parts),
+        };
+        execute(input)
     }
 }
 
@@ -623,8 +653,6 @@ impl<'a> MlxModelSession<'a> {
                 | Executable::NemotronH(_, _, _)
                 | Executable::Qwen(_, _, _)
                 | Executable::Qwen3Next(_, _, _)
-                | Executable::Qwen3Vl(_, _, _)
-                | Executable::Qwen3VlMoe(_, _, _)
                 | Executable::Qwen35(_, _, _)) => {
                     return Err(Error::ArchitectureModel(format!(
                         "drafter {:?} is incompatible with target {} ({:?})",
@@ -788,6 +816,42 @@ impl<'a> MlxModelSession<'a> {
         Ok(manifest)
     }
 
+    /// Opens a persisted prefix only when it matches an exact prepared input.
+    pub fn load_prompt_cache_for_input(
+        &mut self,
+        backend: &MlxBackend<'a>,
+        root: impl AsRef<Path>,
+        expected: &PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        input: &MlxModelInput,
+    ) -> Result<PromptCacheManifest, Error> {
+        let identity = input.cache_identity.clone().ok_or_else(|| {
+            Error::ArchitectureModel(
+                "prompt-cache loading requires prepared-input semantic identity".into(),
+            )
+        })?;
+        let CacheResidencyPolicy::Paged(options) = &self.state_residency else {
+            return Err(Error::ArchitectureModel(
+                "prompt-cache loading requires paged state selected during preparation".into(),
+            ));
+        };
+        match &mut self.inner {
+            MlxSessionKind::Complete(model) => model
+                .load_prompt_cache_for_input(
+                    root,
+                    expected,
+                    prefix_token_ids,
+                    identity,
+                    options.clone(),
+                    backend.stream(),
+                )
+                .map_err(Into::into),
+            MlxSessionKind::Pipeline(_, _) => Err(Error::ArchitectureModel(
+                "prepared-input cache loading is unavailable for pipeline sessions".into(),
+            )),
+        }
+    }
+
     /// Returns communication when this is a distributed session.
     pub const fn distributed(&self) -> Option<&MlxDistributedSession<'a>> {
         self.distributed.as_ref()
@@ -939,22 +1003,6 @@ impl<'a> MlxModelSession<'a> {
                 }
                 model.forward_with_observer(input_tokens, cache, stream, &mut observer)
             }
-            Executable::Qwen3Vl(_, model, cache) => {
-                if mask.is_some() {
-                    return Err(Error::ArchitectureModel(
-                        "explicit Qwen3-VL observer masks are unsupported".into(),
-                    ));
-                }
-                model.forward_tokens_with_observer(input_tokens, cache, stream, &mut observer)
-            }
-            Executable::Qwen3VlMoe(_, model, cache) => {
-                if mask.is_some() {
-                    return Err(Error::ArchitectureModel(
-                        "explicit Qwen3-VL-MoE observer masks are unsupported".into(),
-                    ));
-                }
-                model.forward_tokens_with_observer(input_tokens, cache, stream, &mut observer)
-            }
             Executable::Qwen35(_, model, cache) => {
                 if mask.is_some() {
                     return Err(Error::ArchitectureModel(
@@ -1010,9 +1058,8 @@ impl<'a> MlxModelSession<'a> {
     ) -> Result<Submission<Array, MlxCompletion>, Error> {
         let output = input.with_borrowed(|input| {
             if let Executable::ReplicatedText(_, family) = model {
-                let tokens = input::text_token_ids(input, stream)?;
                 return family.prefill_with_observer(
-                    &tokens,
+                    input,
                     None,
                     stream,
                     &mut ArrayObserverAdapter { inner: observer },
@@ -1117,18 +1164,6 @@ impl<'a> MlxModelSession<'a> {
                     )?
                 }
                 Executable::Qwen3Next(_, family, cache) => family.prefill_input_with_observer(
-                    input,
-                    cache,
-                    stream,
-                    &mut ArrayObserverAdapter { inner: observer },
-                )?,
-                Executable::Qwen3Vl(_, family, cache) => family.prefill_with_observer(
-                    input,
-                    cache,
-                    stream,
-                    &mut ArrayObserverAdapter { inner: observer },
-                )?,
-                Executable::Qwen3VlMoe(_, family, cache) => family.prefill_with_observer(
                     input,
                     cache,
                     stream,
@@ -1488,7 +1523,9 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
             [],
             [],
         )?];
-        Ok(MlxModelInput::from(input::ModelInput::new(&parts)))
+        MlxModelInput::from(input::ModelInput::new(&parts)).with_semantic_content_fingerprint(
+            eredu_core::cache::prompt_cache_token_fingerprint(&prompt_token_ids),
+        )
     }
 
     fn submit_text_prefill(

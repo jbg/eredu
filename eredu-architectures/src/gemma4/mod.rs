@@ -34,8 +34,9 @@ pub use ingress::{
 };
 pub use media::ModalityProjector;
 pub use model::{
-    DecoderInputPart, ForwardContext, LayeredModel, ModelInput, StaticModules, TextBoundary,
-    TextBoundarySchema, Unit, AUDIO_EXECUTION_GROUP, TEXT_EXECUTION_GROUP, VISION_EXECUTION_GROUP,
+    prepare_composite_ingress, DecoderInputPart, ForwardContext, LayeredModel, ModelInput,
+    PreparedCompositeIngress, StaticModules, TextBoundary, TextBoundarySchema, Unit,
+    AUDIO_EXECUTION_GROUP, TEXT_EXECUTION_GROUP, VISION_EXECUTION_GROUP,
 };
 pub use parallel::{
     audio_layer_parameter_groups, audio_static_parameter_groups, layer_parameter_groups,

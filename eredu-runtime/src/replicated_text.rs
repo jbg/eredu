@@ -120,14 +120,12 @@ impl WeightLoweringDescriptor {
         logical_shape: Vec<usize>,
         packed_axis: Option<usize>,
     ) -> Result<Self, ReplicatedTextContractError> {
-        if physical_shape.is_empty()
-            || physical_shape.contains(&0)
-            || logical_shape.is_empty()
+        if physical_shape.contains(&0)
             || logical_shape.contains(&0)
             || physical_shape.len() != logical_shape.len()
         {
             return Err(ReplicatedTextContractError::invalid(
-                "weight lowering requires positive physical and logical shapes of equal rank",
+                "weight lowering requires positive extents and equal physical and logical ranks",
             ));
         }
         if packed_axis.is_some_and(|axis| axis >= logical_shape.len()) {
@@ -588,13 +586,13 @@ impl ReplicatedTextParameterRequirement {
         }
         if physical_shape
             .as_ref()
-            .is_some_and(|shape| shape.is_empty() || shape.contains(&0))
+            .is_some_and(|shape| shape.contains(&0))
         {
             return Err(ReplicatedTextContractError::invalid(format!(
                 "logical parameter {name:?} has an invalid physical shape"
             )));
         }
-        if logical_shape.is_empty() || logical_shape.contains(&0) {
+        if logical_shape.contains(&0) {
             return Err(ReplicatedTextContractError::invalid(format!(
                 "logical parameter {name:?} has an invalid shape {logical_shape:?}"
             )));
@@ -2448,6 +2446,32 @@ mod tests {
             absent_bias.transform_constraint(),
             ParameterTransformConstraint::None
         );
+    }
+
+    #[test]
+    fn scalar_parameter_requirement_preserves_rank_zero_geometry() {
+        let requirement = ReplicatedTextParameterRequirement::new(
+            "model.audio_tower.input_max",
+            vec!["model.audio_tower.input_max".into()],
+            vec![physical_source("model.audio_tower.input_max")],
+            Vec::new(),
+            Some(SourceTensorEncoding::Safetensors(StoredDtype::F32)),
+            Some(Vec::new()),
+            Vec::new(),
+            LinearFormat::Dense,
+            ReplicatedTextParameterRole::Other,
+            ReplicatedTextParameterOwner::StaticRole("audio".into()),
+            ReplicatedTextParameterPresence::Required,
+            ParameterTransformConstraint::None,
+        )
+        .unwrap();
+
+        let descriptor = requirement
+            .lowering_descriptor(LinearFormat::Dense)
+            .unwrap();
+        assert!(descriptor.physical_shape().is_empty());
+        assert!(descriptor.logical_shape().is_empty());
+        assert_eq!(descriptor.packed_axis(), None);
     }
 
     #[test]

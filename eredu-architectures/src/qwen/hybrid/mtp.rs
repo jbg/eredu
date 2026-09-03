@@ -9,6 +9,16 @@ use eredu_runtime::{ResidentExpertProvider, RoutedExpertProvider, RuntimeStateCo
 
 use super::{Block, HybridConfig};
 
+/// Concatenates decoder token identity for embedded prediction in request order.
+pub fn prompt_token_identity<T: Tensor>(tokens: &[T], context: &T::Context) -> Result<T, Error> {
+    if tokens.is_empty() {
+        return Err(Error::backend(
+            "Qwen hybrid embedded prediction requires token identity",
+        ));
+    }
+    T::concatenate(tokens, 1, context)
+}
+
 /// Borrowed input selecting target execution or one prediction depth.
 pub enum EmbeddedInput<'a, T> {
     /// Execute the target decoder.

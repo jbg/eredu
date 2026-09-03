@@ -317,7 +317,10 @@ pub fn prompt_cache_architecture_fingerprint(args: &ModelArgs) -> String {
                 "text",
                 qwen::prompt_cache_architecture_fingerprint(&args.text),
             ),
-            ("vision", args.vision.layer_schedule_fingerprint()),
+            (
+                "vision",
+                crate::qwen::vision::prompt_cache_architecture_fingerprint(&args.vision),
+            ),
             ("image_token", args.image_token_id.to_string()),
             ("video_token", args.video_token_id.to_string()),
             ("mrope_section", format!("{:?}", args.mrope_section)),
@@ -507,5 +510,22 @@ mod tests {
         value["video_token_id"] = Value::from(62);
         value["vision_config"]["out_hidden_size"] = Value::from(16);
         assert!(model_args_from_config_value(&value).is_err());
+    }
+
+    #[test]
+    fn cache_fingerprint_includes_vision_parameter_formats() {
+        let dense = model_args_from_config_value(&config("qwen3_vl", "qwen3_vl_text")).unwrap();
+        let mut quantized = dense.clone();
+        quantized.vision.linear_formats.insert(
+            "blocks.0.attn.qkv.weight".into(),
+            eredu_checkpoint::WeightQuantization::Affine(
+                eredu_checkpoint::AffineQuantization::new(16, 4).unwrap(),
+            )
+            .into(),
+        );
+        assert_ne!(
+            prompt_cache_architecture_fingerprint(&dense),
+            prompt_cache_architecture_fingerprint(&quantized)
+        );
     }
 }

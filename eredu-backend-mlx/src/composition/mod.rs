@@ -312,13 +312,9 @@ pub mod deepseek;
 pub mod deepseek_expert;
 pub mod gemma4;
 pub mod gemma4_expert;
-#[cfg(any(feature = "image", feature = "audio"))]
-pub mod gemma4_processor;
 pub mod gpt_oss;
 pub mod inkling;
 pub mod inkling_expert;
-#[cfg(any(feature = "image", feature = "audio"))]
-pub mod inkling_processor;
 pub mod kimi_linear;
 // MLX adapter only; the neutral family is always available from
 // `eredu_architectures::lfm2`.
@@ -328,8 +324,6 @@ pub mod mlx;
 pub mod moshi;
 pub mod muse_glimmer;
 pub mod muse_glimmer_expert;
-#[cfg(feature = "image")]
-pub mod muse_glimmer_processor;
 pub mod nemotron_h;
 pub mod qwen;
 

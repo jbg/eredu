@@ -2334,6 +2334,9 @@ struct InklingIngressState {
         eredu_architectures::inkling::ForwardContext<crate::MlxTensor>,
     >,
     state: MlxHybridState,
+    vision_complete: bool,
+    audio_complete: bool,
+    assembled: bool,
 }
 
 impl InklingIngressState {
@@ -2444,6 +2447,10 @@ trait MlxPlacedGroupExecutor {
 
     fn placed_ingress_arrays(&self, _group: &str) -> Result<Vec<Array>, Error>;
 
+    fn placed_group_input_observation_path(&self, group: &str) -> Result<Option<String>, Error>;
+
+    fn placed_group_output_observation_path(&self, group: &str) -> Result<Option<String>, Error>;
+
     fn replace_placed_ingress_arrays(
         &mut self,
         _group: &str,
@@ -2465,6 +2472,15 @@ trait MlxPlacedGroupExecutor {
         _execution: Option<&ParallelExecutionContext<'_>>,
         _stream: &Stream,
     ) -> Result<PipelinePayload, Error>;
+
+    fn finish_placed_ingress_observed(
+        &mut self,
+        execution: Option<&ParallelExecutionContext<'_>>,
+        stream: &Stream,
+        _observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
+    ) -> Result<PipelinePayload, Error> {
+        self.finish_placed_ingress(execution, stream)
+    }
 
     fn prefill(
         &mut self,
@@ -2678,6 +2694,18 @@ impl dyn PipelineArchitecture {
             .placed_ingress_arrays(group)
     }
 
+    fn placed_group_input_observation_path(&self, group: &str) -> Result<Option<String>, Error> {
+        self.placed_ingress()
+            .ok_or_else(|| Error::Parallel("stage has no placed-ingress capability".into()))?
+            .placed_group_input_observation_path(group)
+    }
+
+    fn placed_group_output_observation_path(&self, group: &str) -> Result<Option<String>, Error> {
+        self.placed_ingress()
+            .ok_or_else(|| Error::Parallel("stage has no placed-ingress capability".into()))?
+            .placed_group_output_observation_path(group)
+    }
+
     fn replace_placed_ingress_arrays(
         &mut self,
         group: &str,
@@ -2714,6 +2742,17 @@ impl dyn PipelineArchitecture {
         self.placed_ingress_mut()
             .ok_or_else(|| Error::Parallel("stage has no placed-ingress capability".into()))?
             .finish_placed_ingress(execution, stream)
+    }
+
+    fn finish_placed_ingress_observed(
+        &mut self,
+        execution: Option<&ParallelExecutionContext<'_>>,
+        stream: &Stream,
+        observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
+    ) -> Result<PipelinePayload, Error> {
+        self.placed_ingress_mut()
+            .ok_or_else(|| Error::Parallel("stage has no placed-ingress capability".into()))?
+            .finish_placed_ingress_observed(execution, stream, observer)
     }
 
     fn prefill(
@@ -5966,6 +6005,7 @@ impl PipelineModel {
         tensor: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
         retained: &mut Vec<Array>,
+        observer: &mut Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
     ) -> Result<Option<PipelinePayload>, Error> {
         let placement = Arc::clone(&self.info.placement);
         let boundary_schema = self.stage.boundary_wire_schema()?;
@@ -6092,7 +6132,7 @@ impl PipelineModel {
                     } else {
                         stream
                     };
-                    let arrays = match placed.kind {
+                    let mut arrays = match placed.kind {
                         ArchitectureGroupKind::VisionEncoder
                         | ArchitectureGroupKind::AudioEncoder => {
                             if active[index] {
@@ -6110,9 +6150,17 @@ impl PipelineModel {
                         ArchitectureGroupKind::ModalityFinalization => {
                             let arrays = working.remove(&index).unwrap_or_default();
                             self.stage.merge_placed_ingress_arrays(arrays)?;
-                            self.stage
-                                .finish_placed_ingress(tensor, execution_stream)?
-                                .into_arrays()
+                            match observer.as_mut() {
+                                Some(observer) => self.stage.finish_placed_ingress_observed(
+                                    tensor,
+                                    execution_stream,
+                                    &mut **observer,
+                                )?,
+                                None => {
+                                    self.stage.finish_placed_ingress(tensor, execution_stream)?
+                                }
+                            }
+                            .into_arrays()
                         }
                         ArchitectureGroupKind::Decoder
                             if placed.id == self.info.primary_execution_group =>
@@ -6125,8 +6173,28 @@ impl PipelineModel {
                                 )));
                             }
                             self.stage.merge_placed_ingress_arrays(arrays)?;
+                            let mut payload = match observer.as_mut() {
+                                Some(observer) => self.stage.finish_placed_ingress_observed(
+                                    tensor,
+                                    execution_stream,
+                                    &mut **observer,
+                                )?,
+                                None => {
+                                    self.stage.finish_placed_ingress(tensor, execution_stream)?
+                                }
+                            };
+                            if let (Some(path), Some(observer)) = (
+                                self.stage.placed_group_input_observation_path(&placed.id)?,
+                                observer.as_deref_mut(),
+                            ) {
+                                payload.hidden = eredu_runtime::observe_and_intervene(
+                                    observer,
+                                    &path,
+                                    &payload.hidden,
+                                )?;
+                            }
                             let payload = normalize_pipeline_payload_for_wire(
-                                self.stage.finish_placed_ingress(tensor, execution_stream)?,
+                                payload,
                                 self.info.activation_dtype(),
                                 &resolved_boundary,
                                 execution_stream,
@@ -6157,6 +6225,25 @@ impl PipelineModel {
                         }
                         ArchitectureGroupKind::Prediction => Vec::new(),
                     };
+                    let terminal_owner = placed.owners.get(wave + 1).is_none();
+                    if active[index] && terminal_owner {
+                        if let (Some(path), Some(observer)) = (
+                            self.stage
+                                .placed_group_output_observation_path(&placed.id)?,
+                            observer.as_deref_mut(),
+                        ) {
+                            let output = arrays.first().cloned().ok_or_else(|| {
+                                Error::Parallel(format!(
+                                    "observed placed group {:?} produced no activation",
+                                    placed.id
+                                ))
+                            })?;
+                            arrays[0] =
+                                eredu_runtime::observe_and_intervene(observer, &path, &output)?;
+                            self.stage
+                                .replace_placed_ingress_arrays(&placed.id, arrays.clone())?;
+                        }
+                    }
                     let completion = DistributedCompletion::submit((), arrays.iter())?;
                     submissions.insert(index, (arrays.clone(), completion));
                     working.insert(index, arrays);
@@ -6503,10 +6590,27 @@ impl PipelineModel {
                         tensor,
                         stream,
                         &mut placed_retained,
+                        &mut observer,
                     )?;
                 } else if self.info.owns_input {
                     self.stage.begin_placed_ingress(input, tensor, stream)?;
-                    placed_payload = Some(self.stage.finish_placed_ingress(tensor, stream)?);
+                    let mut payload = match observer.as_mut() {
+                        Some(observer) => self.stage.finish_placed_ingress_observed(
+                            tensor,
+                            stream,
+                            &mut **observer,
+                        )?,
+                        None => self.stage.finish_placed_ingress(tensor, stream)?,
+                    };
+                    let primary = self.info.primary_execution_group.clone();
+                    if let (Some(path), Some(observer)) = (
+                        self.stage.placed_group_input_observation_path(&primary)?,
+                        observer.as_deref_mut(),
+                    ) {
+                        payload.hidden =
+                            eredu_runtime::observe_and_intervene(observer, &path, &payload.hidden)?;
+                    }
+                    placed_payload = Some(payload);
                 }
             }
         }

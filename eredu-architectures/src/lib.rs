@@ -18,6 +18,8 @@ mod cache_identity;
 pub mod capability;
 /// Exact architecture-owned plans for dense checkpoint conversion.
 pub mod checkpoint_conversion;
+/// Shared typed prepared-input ingress for replicated composite graphs.
+pub mod composite_execution;
 /// Authoritative model-family identity and Hugging Face/GGUF configuration parsing.
 pub mod configuration;
 pub use configuration::{GgufArchitecture, ModelKind};
@@ -41,6 +43,8 @@ pub mod media_plan;
 pub mod operator_requirements;
 /// Architecture-derived capabilities used before backend materialization.
 pub mod preparation;
+/// Architecture-owned execution of retained media processor plans.
+pub mod processor_execution;
 /// Backend-neutral family preprocessing and framing plans.
 pub mod processor_plan;
 mod replicated_model;

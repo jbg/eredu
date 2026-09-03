@@ -12,6 +12,11 @@ use eredu_runtime::{
     RoutedExpertProvider, RoutedLayeredArchitecture, StateLayout,
 };
 
+use crate::{
+    composite_execution::{CompositeArchitecture, PreparedCompositeInput},
+    media_plan::MuseGlimmerInputPartPlan,
+};
+
 use super::{
     layer_parameter_groups, state_layout, static_parameter_groups, vision_layer_parameter_groups,
     vision_static_parameter_groups, DecoderConfig, LocalGeometry,
@@ -40,6 +45,145 @@ pub struct ModelInput<'a, T> {
     pub vision: Option<VisionInput<'a, T>>,
     /// Optional explicit decoder attention mask.
     pub mask: Option<&'a T>,
+}
+
+/// Architecture-prepared Muse-Glimmer decoder and vision ingress.
+pub struct PreparedCompositeIngress<T> {
+    tokens: Vec<T>,
+    media: Vec<bool>,
+    pixels: Option<T>,
+    grid: Vec<(i32, i32, i32)>,
+}
+
+impl<T> PreparedCompositeIngress<T> {
+    /// Borrows ordered decoder segments with architecture-created placeholders.
+    pub fn decoder_parts(&self) -> Vec<DecoderInputPart<'_, T>> {
+        self.tokens
+            .iter()
+            .zip(&self.media)
+            .map(|(tokens, media)| {
+                if *media {
+                    DecoderInputPart::Media(tokens)
+                } else {
+                    DecoderInputPart::Text(tokens)
+                }
+            })
+            .collect()
+    }
+
+    /// Borrows the packed vision input when media is present.
+    pub fn vision_input(&self) -> Option<VisionInput<'_, T>> {
+        self.pixels.as_ref().map(|pixels| VisionInput {
+            pixels,
+            grid: &self.grid,
+        })
+    }
+}
+
+/// Interprets one admitted Muse-Glimmer input using neutral tensor operations.
+pub fn prepare_composite_ingress<B>(
+    input: PreparedCompositeInput<'_, B::Tensor, MuseGlimmerInputPartPlan>,
+    context: &<B::Tensor as Tensor>::Context,
+) -> Result<PreparedCompositeIngress<B::Tensor>, Error>
+where
+    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
+{
+    let prepared = input.prepared();
+    let admitted = input.admitted();
+    if prepared.identity() != admitted.identity() || prepared.len() != admitted.parts().len() {
+        return Err(Error::backend(
+            "Muse-Glimmer prepared input no longer matches its admission",
+        ));
+    }
+
+    let mut tokens = Vec::with_capacity(prepared.len());
+    let mut media = Vec::with_capacity(prepared.len());
+    let mut pixels = Vec::new();
+    let mut grid = Vec::new();
+    for (part, plan) in prepared.parts().iter().zip(admitted.parts()) {
+        match plan {
+            MuseGlimmerInputPartPlan::TextTokens { .. } => {
+                let eredu_runtime::PreparedInputPayload::TokenIds(value) = part.payload() else {
+                    return Err(Error::backend(
+                        "Muse-Glimmer admitted text part lost its token payload",
+                    ));
+                };
+                tokens.push(value.clone());
+                media.push(false);
+            }
+            MuseGlimmerInputPartPlan::Vision { ingress, .. } => {
+                let eredu_runtime::PreparedInputPayload::Tensor(value) = part.payload() else {
+                    return Err(Error::backend(
+                        "Muse-Glimmer admitted media part lost its tensor payload",
+                    ));
+                };
+                let count = i32::try_from(ingress.placeholder_count)
+                    .map_err(|_| Error::backend("Muse-Glimmer media span exceeds I32"))?;
+                let token = i32::try_from(ingress.placeholder_token_id)
+                    .map_err(|_| Error::backend("Muse-Glimmer placeholder ID exceeds I32"))?;
+                tokens.push(B::Tensor::full_i32(token, &[1, count], context)?);
+                media.push(true);
+                pixels.push(value.clone());
+                grid.extend_from_slice(&ingress.patch_grid);
+            }
+        }
+    }
+    let pixels = match pixels.len() {
+        0 => None,
+        1 => pixels.pop(),
+        _ => Some(B::Tensor::concatenate(&pixels, 0, context)?),
+    };
+    Ok(PreparedCompositeIngress {
+        tokens,
+        media,
+        pixels,
+        grid,
+    })
+}
+
+impl<B, S> CompositeArchitecture<B, S> for LayeredModel<B>
+where
+    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
+    S: LayerRuntimeState<B>,
+    S::LayerState: AttentionCache<B::Tensor>,
+{
+    type InputPartPlan = MuseGlimmerInputPartPlan;
+    type AdmissionConfig = DecoderConfig;
+
+    fn admission_config(&self) -> Self::AdmissionConfig {
+        self.args.clone()
+    }
+
+    fn admit_prepared_input(
+        config: &Self::AdmissionConfig,
+        input: &eredu_runtime::PreparedModelInput<B::Tensor>,
+        inspector: &impl eredu_runtime::PreparedInputInspector<B::Tensor>,
+    ) -> Result<
+        crate::media_plan::AdmittedCompositeInput<Self::InputPartPlan>,
+        eredu_core::CapabilityError,
+    > {
+        crate::media_plan::admit_muse_glimmer_input(config, input, inspector)
+    }
+
+    fn begin_composite_forward<'a>(
+        &mut self,
+        input: PreparedCompositeInput<'a, B::Tensor, Self::InputPartPlan>,
+        state: &mut S,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
+        let prepared = prepare_composite_ingress::<B>(input, context)?;
+        let decoder_parts = prepared.decoder_parts();
+        <Self as LayeredArchitecture<B, S>>::begin_forward(
+            self,
+            ModelInput {
+                parts: &decoder_parts,
+                vision: prepared.vision_input(),
+                mask: None,
+            },
+            state,
+            context,
+        )
+    }
 }
 
 /// Typed decoder input for one pipeline partition.
@@ -976,6 +1120,14 @@ where
         }
     }
 
+    fn group_output_observation_path(&self, group: usize) -> Result<Option<String>, Self::Error> {
+        Ok((group == 0).then(|| eredu_core::VISION_PROJECTOR_OUTPUT_OBSERVATION_PATH.to_owned()))
+    }
+
+    fn group_input_observation_path(&self, group: usize) -> Result<Option<String>, Self::Error> {
+        Ok((group == 1).then(|| eredu_core::MODALITY_MERGE_OUTPUT_OBSERVATION_PATH.to_owned()))
+    }
+
     fn static_modules(&self) -> &Self::StaticModules {
         &self.static_modules
     }
@@ -1077,12 +1229,15 @@ where
         initial: &B::Tensor,
         dependencies: &[&B::Tensor],
         _state: &mut S,
-        _forward: &mut Self::ForwardContext,
-        _context: &<B::Tensor as Tensor>::Context,
+        forward: &mut Self::ForwardContext,
+        context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
         match (group, dependencies) {
             (0, []) => Ok(initial.clone()),
-            (1, [vision_or_assembled]) => Ok((*vision_or_assembled).clone()),
+            (1, [vision_or_assembled]) if forward.vision.is_some() => {
+                self.assemble(&forward.parts, Some(vision_or_assembled), context)
+            }
+            (1, [assembled]) => Ok((*assembled).clone()),
             _ => Err(Error::backend(
                 "invalid Muse-Glimmer execution dependencies",
             )),
@@ -1143,7 +1298,7 @@ where
                     .as_mut()
                     .ok_or_else(|| Error::backend("Muse-Glimmer model has no vision projector"))?
                     .finish(hidden, vision, context)?;
-                self.assemble(&forward.parts, Some(&media), context)
+                Ok(media)
             }
             (0, None) | (1, _) => Ok(hidden.clone()),
             _ => Err(Error::backend("invalid Muse-Glimmer execution group")),

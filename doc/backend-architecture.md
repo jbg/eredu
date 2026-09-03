@@ -283,8 +283,9 @@ configuration or caller options.
 The MLX adapter consumes its load request before neutral selection completes.
 Replicated routed text has its own architecture-owned requirements
 and selected realization layered over the shared replicated-text contract.
-Partitioned, composite, prediction, drafting, and realtime paths retain their
-distinct selected construction values. Reusable MLX loading, residency, cache,
+Replicated composite text adds selected processor and ingress requirements to
+that same contract. Partitioned, prediction, drafting, and realtime paths
+retain their distinct selected construction values. Reusable MLX loading, residency, cache,
 stream, transfer, and completion mechanisms receive only exact tasks, generic
 limits, rank-local placement, or opaque group handles. The mechanism-only `MlxRankContext`
 contains a world rank and local device assignment. Semantic tensor, pipeline,
@@ -318,6 +319,9 @@ configuration omits media modules, so it does not enter this class. The
 architecture registry selects both the replicated
 execution class and the exact stateless, ordinary key/value, fixed-only,
 attention-with-fixed, compressed-only, or compressed-with-fixed access profile.
+Its replicated composite class admits Gemma 4, Inkling without an active
+prediction group, Muse-Glimmer, Qwen3-VL and its sparse variant, and
+conditional Qwen3.5 without an active prediction group.
 It constructs modules with the selected executable formats, validates the
 proof-bearing architecture value, and invokes the corresponding typed neutral
 constructor adapter. Optional profiles are additive, so an ordinary backend
@@ -433,8 +437,10 @@ groups; embedded prediction uses separately identified prediction groups and
 `DraftStateTransaction`; and realtime models opt into `RealtimeFrameTransition`,
 which consumes `RealtimeInputFrame` on an unpublished branch and attaches the
 exact completion before atomic publication.
-None of these execution classes adds routing, media, partition, prediction, or
-frame requirements to replicated text selection or to `NeuralBackend`.
+Composite and routed requirements are additive selections over explicit media
+and grouped-computation capabilities; they do not broaden `NeuralBackend`.
+Partition, prediction, and frame requirements remain confined to their own
+execution classes.
 
 Grouped execution is exposed through the required `GroupedNeuralBackend`
 extension rather than a permissive base-trait fallback. Distributed vocabulary
@@ -863,6 +869,12 @@ or claim that a provider-only output is the family result.
 Activation observers likewise derive unit input, output, and nested operator
 names from the architecture's canonical `unit_path`; concrete composition must
 not reconstruct a family path from a group or layer index.
+The layered architecture also names group-ingress and group-output seams. The
+shared resident and bounded drivers apply intervention at those seams, which
+exposes projected vision, projected audio, and decoder-width multimodal merge
+values at their real consumption points. `PreparedProcessor` exposes its final
+ordered payload and metadata tensors under the processor output path before it
+rebuilds their coupled identity.
 
 Architecture capability estimates likewise own native and effective context,
 accepted modalities, cache ownership and sharing, attention windows,
@@ -1129,9 +1141,66 @@ grouping, and derives resize, normalization, patch, and signal-feature policy.
 Audio feature plans specify the analysis window, exact padding and frame-count
 convention, frequency bounds, mel scale and normalization, spectrum value, and
 logarithm as well as their dimensions and floors.
-Concrete backends execute those declarations: they resize pixels, extract
-features, pack patches, and construct native tensors. A new backend therefore
-consumes the same family protocol instead of reimplementing it.
+`PreparedProcessor` interprets that plan over `ProcessorMechanisms`. The
+mechanisms normalize pixels, extract requested audio features, inspect small
+metadata values, and construct native tensors; architecture code owns frame
+selection, patch packing, framing order, metadata, and the ordered
+`PreparedModelInput`. A new backend therefore supplies media and tensor
+mechanisms without implementing a family processor.
+
+Replicated composite selection combines the exact replicated-text realization
+with one `SelectedProcessorExecution`. It admits raw media, prepared tensors,
+and projected embeddings per modality and carries that decision into the typed
+architecture handoff. Other execution classes select the same processor value
+before construction; partitioned workers select prepared tensors without raw
+media and therefore cannot attach a raw processor from the artifact plan. The
+backend lowers only the selected mechanisms and cannot choose a second input
+route. Gemma 4, Inkling, Muse-Glimmer, Qwen3-VL and its sparse
+variant, and conditional Qwen3.5 use this handoff whenever their replicated
+configuration has no separately placed prediction group. Partitioned,
+prediction, assistant, and realtime responsibilities remain distinct execution
+classes.
+
+`PreparedModelInput` retains the ordered payload and metadata tensors together
+with its exact descriptor identity. Architecture admission derives one ordered
+part plan from that value, and `PreparedCompositeInput` couples the native
+tensors to that admission before the graph can execute. Architecture-owned
+composite adapters build embeddings, placeholders, masks, positions, optional
+encoder roots, projectors, merge inputs, and per-layer visual contributions,
+then enter the ordinary layered driver. Direct and routed composite execution
+therefore use the same replicated session for prefill, decode, transactions,
+state reset, cache persistence, observation, reports, and exact completion.
+Complete, tensor-parallel, and pipeline composition use the same family ingress:
+the MLX layer converts handles and pairs admitted tensors, while architecture
+code assembles placeholders, batching, positions, masks, and ordered parts.
+Qwen pipeline prefill and embedded prediction token identity both consume the
+same architecture-prepared value; neither path recreates placeholder spans,
+patch grids, or packed pixels in MLX.
+Prompt-cache use additionally couples that descriptor identity to a nonempty
+semantic-content fingerprint. Qwen composite architecture identity includes
+both decoder and vision parameter formats as well as media-token policy. Full
+session checkpoints retain the committed
+pair; state-only rollback, reset, and an unbound cache load clear it. The
+input-aware save and open operations reject a descriptor or prepared input
+that differs from the successfully published prompt without changing state.
+Processor output and composite execution also share the neutral activation
+observer. Observation paths cover processor output, vision and audio projector
+outputs, the modality merge, layer outputs, and final logits; interventions are
+applied before the next declared consumer executes. Layered and placed pipeline
+drivers both obtain group paths from the architecture, observe projector values
+after architecture completion, install intervened values into transported
+ingress, and expose the resulting merge value.
+An observed processor result is intentionally unbound from exact prompt-cache
+identity because an intervention may have changed native tensor content.
+
+Composite GGUF requirements enumerate the admitted primary and media-projector
+checkpoints as one physical source set. Their exact translated outputs,
+provenance, recipes, source encodings, and independently selected executable
+formats flow into materialization tasks. Module construction receives the
+matching per-parameter format maps, so packed decoder weights and dense media
+weights may coexist without a model-wide format decision. The final MLX layer
+opens those already admitted sources, binds generic native modules and media
+mechanisms, and erases the completed typed session.
 
 Realtime prompt protocols follow the same ownership rule. The neutral Moshi
 architecture declares PersonaPlex's released silence, sine-conditioning, and

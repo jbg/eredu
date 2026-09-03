@@ -18,9 +18,9 @@ pub use config::{
     VlConfigError,
 };
 pub use model::{
-    ForwardContext, InputPart, LayeredModel, ModelInput, PipelineBoundary, PipelineBoundarySchema,
-    PipelinePartitionInput, PipelinePrepared, PipelineVisionState, StaticModules, Unit,
-    TEXT_EXECUTION_GROUP, VISION_EXECUTION_GROUP,
+    prepare_input, ForwardContext, InputPart, LayeredModel, ModelInput, PipelineBoundary,
+    PipelineBoundarySchema, PipelinePartitionInput, PipelinePrepared, PipelineVisionState,
+    PreparedInput, StaticModules, Unit, TEXT_EXECUTION_GROUP, VISION_EXECUTION_GROUP,
 };
 pub use parallel::{local_geometry, LocalGeometry};
 pub use positions::{

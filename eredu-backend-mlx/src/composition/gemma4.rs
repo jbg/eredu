@@ -2,32 +2,21 @@
 
 use std::{collections::BTreeMap, path::Path, sync::Arc};
 
-use eredu_architectures::gemma4::{
-    AudioIngressBatchPlan, AudioIngressPartPlan, AudioInput, DecoderInputPart, FamilyConfig,
-    LayeredModel as Architecture, ModelInput, Unit, VisionIngressBatchPlan, VisionIngressPartPlan,
-    VisionInput,
+use eredu_architectures::{
+    composite_execution::{CompositeArchitecture, PreparedCompositeInput},
+    gemma4::{DecoderInputPart, FamilyConfig, LayeredModel as Architecture, ModelInput, Unit},
 };
-use eredu_architectures::media_plan::Gemma4InputPartPlan;
 use eredu_checkpoint::{
     store::{CheckpointSource, SharedCheckpointSource},
     WeightQuantization,
 };
-use eredu_core::{InputMetadataKey, InputModality};
 use eredu_nn::Tensor;
 use eredu_runtime::{
     ArchitectureParameters, CacheResidencyPolicy, CausalModel, ExecutionUnitLayout,
     LayerWeightResidency, LayeredArchitecture, LayerwiseRuntime, PagedCacheOptions,
     ParallelModelInfo, ParameterRole, RuntimeState, WeightBinding, WeightResidency,
 };
-use safemlx::{
-    error::Exception,
-    ops::{
-        concatenate_axis,
-        indexing::{NewAxis, TryIndexOp},
-        maximum, pad, PadWidth,
-    },
-    Array, Stream,
-};
+use safemlx::{error::Exception, ops::indexing::TryIndexOp, Array, Stream};
 
 use crate::backend::runtime::checkpoint::gguf::GgufCheckpoint;
 use crate::backend::{
@@ -842,7 +831,7 @@ impl Gemma4Model {
         observer: &mut dyn eredu_runtime::ActivationObserver<Array, safemlx::error::Exception>,
     ) -> Result<crate::MlxTensor, Error> {
         input::validate(typed)?;
-        let prepared = PreparedParts::new(&self.args, typed, stream)?;
+        let prepared = prepare_parts(&self.args, typed, stream)?;
         let parts = prepared.decoder_parts();
         self.forward_with_observer(
             ModelInput {
@@ -905,7 +894,7 @@ impl Gemma4Model {
         stream: &Stream,
     ) -> Result<Gemma4SpeculativeOutput, Error> {
         input::validate(typed)?;
-        let prepared = PreparedParts::new(&self.args, typed, stream)?;
+        let prepared = prepare_parts(&self.args, typed, stream)?;
         let parts = prepared.decoder_parts();
         self.speculative_output(
             ModelInput {
@@ -996,7 +985,7 @@ impl Gemma4Model {
             ));
         }
         input::validate(typed)?;
-        let prepared = PreparedParts::new(&self.args, typed, stream)?;
+        let prepared = prepare_parts(&self.args, typed, stream)?;
         let parts = prepared.decoder_parts();
         let input = ModelInput {
             parts: &parts,
@@ -1041,7 +1030,7 @@ impl Gemma4Model {
         observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
     ) -> Result<crate::MlxTensor, Error> {
         input::validate(typed)?;
-        let prepared = PreparedParts::new(&self.args, typed, stream)?;
+        let prepared = prepare_parts(&self.args, typed, stream)?;
         let parts = prepared.decoder_parts();
         self.forward_parallel_input_with_observer(
             ModelInput {
@@ -1269,7 +1258,7 @@ impl Gemma4Model {
         stream: &Stream,
     ) -> Result<crate::MlxTensor, Error> {
         input::validate(typed)?;
-        let prepared = PreparedParts::new(&self.args, typed, stream)?;
+        let prepared = prepare_parts(&self.args, typed, stream)?;
         let parts = prepared.decoder_parts();
         self.forward(
             ModelInput {
@@ -1285,343 +1274,26 @@ impl Gemma4Model {
     }
 }
 
-struct PreparedVision {
-    patches: crate::MlxTensor,
-    positions: crate::MlxTensor,
-    valid: crate::MlxTensor,
-    key_mask: crate::MlxTensor,
-    grid_extents: Vec<(i32, i32)>,
-}
+pub type PreparedParts =
+    eredu_architectures::gemma4::model::PreparedCompositeIngress<crate::MlxTensor>;
 
-struct PreparedVisionPart {
-    patches: crate::MlxTensor,
-    positions: crate::MlxTensor,
-    plan: VisionIngressPartPlan,
-}
-
-struct PreparedAudio {
-    features: crate::MlxTensor,
-    input_mask: crate::MlxTensor,
-    first_stage_mask: crate::MlxTensor,
-    valid: Vec<i32>,
-}
-
-struct PreparedAudioPart {
-    features: crate::MlxTensor,
-    mask: crate::MlxTensor,
-    plan: AudioIngressPartPlan,
-}
-
-pub struct PreparedParts {
-    tokens: Vec<crate::MlxTensor>,
-    modalities: Vec<InputModality>,
-    projected: Vec<Option<crate::MlxTensor>>,
-    vision_parts: Vec<PreparedVisionPart>,
-    vision: Option<PreparedVision>,
-    audio_parts: Vec<PreparedAudioPart>,
-    audio: Option<PreparedAudio>,
-}
-
-impl PreparedParts {
-    pub fn new(
-        args: &FamilyConfig,
-        typed: input::ModelInput<'_>,
-        stream: &Stream,
-    ) -> Result<Self, Error> {
-        let mut prepared = Self {
-            tokens: Vec::with_capacity(typed.parts.len()),
-            modalities: Vec::with_capacity(typed.parts.len()),
-            projected: Vec::with_capacity(typed.parts.len()),
-            vision_parts: Vec::new(),
-            vision: None,
-            audio_parts: Vec::new(),
-            audio: None,
-        };
-        for part in typed.parts {
-            let plan = eredu_architectures::media_plan::gemma4_input_part(
-                args,
-                part,
-                &input::MlxInputInspector,
-            )
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-            match plan {
-                Gemma4InputPartPlan::TextTokens { .. } => {
-                    let input::InputPayload::TokenIds(tokens) = part.payload() else {
-                        unreachable!("architecture-admitted Gemma text payload")
-                    };
-                    prepared
-                        .tokens
-                        .push(crate::MlxTensor::from_array(tokens.clone()));
-                    prepared.modalities.push(InputModality::Text);
-                    prepared.projected.push(None);
-                }
-                Gemma4InputPartPlan::Projected {
-                    placeholder_token_id,
-                    positions,
-                    ..
-                } => {
-                    let input::InputPayload::Embeddings(embeddings) = part.payload() else {
-                        unreachable!("architecture-admitted Gemma projected payload")
-                    };
-                    let positions = usize::try_from(positions).map_err(|_| {
-                        Error::ArchitectureModel(
-                            "Gemma projected sequence exceeds host capacity".into(),
-                        )
-                    })?;
-                    prepared
-                        .tokens
-                        .push(crate::MlxTensor::from_array(Array::from_slice(
-                            &vec![placeholder_token_id; positions],
-                            &[1, embeddings.dim(1)],
-                        )));
-                    prepared.modalities.push(part.modality());
-                    prepared
-                        .projected
-                        .push(Some(crate::MlxTensor::from_array(embeddings.clone())));
-                }
-                Gemma4InputPartPlan::Vision {
-                    placeholder_token_id,
-                    ingress,
-                    ..
-                } => {
-                    let input::InputPayload::Tensor(patches) = part.payload() else {
-                        unreachable!("architecture-admitted Gemma vision payload")
-                    };
-                    let positions = part
-                        .metadata_value(InputMetadataKey::PatchPositions)
-                        .expect("architecture-admitted Gemma patch positions");
-                    prepared.push_vision(
-                        part.modality(),
-                        patches,
-                        positions,
-                        ingress,
-                        placeholder_token_id,
-                    )?;
-                }
-                Gemma4InputPartPlan::Audio {
-                    placeholder_token_id,
-                    ingress,
-                    ..
-                } => {
-                    let input::InputPayload::Tensor(features) = part.payload() else {
-                        unreachable!("architecture-admitted Gemma audio payload")
-                    };
-                    let mask = part
-                        .metadata_value(InputMetadataKey::AudioMask)
-                        .expect("architecture-admitted Gemma audio mask");
-                    prepared.push_audio(features, mask, ingress, placeholder_token_id)?;
-                }
-            }
-        }
-        prepared.finish_vision(stream)?;
-        prepared.finish_audio(stream)?;
-        Ok(prepared)
-    }
-
-    fn push_vision(
-        &mut self,
-        modality: InputModality,
-        patches: &Array,
-        positions: &Array,
-        plan: VisionIngressPartPlan,
-        placeholder_token_id: u32,
-    ) -> Result<(), Error> {
-        self.tokens
-            .push(crate::MlxTensor::from_array(Array::from_slice(
-                &vec![placeholder_token_id; plan.decoder_positions as usize],
-                &[1, plan.decoder_positions],
-            )));
-        self.modalities.push(modality);
-        self.projected.push(None);
-
-        self.vision_parts.push(PreparedVisionPart {
-            patches: crate::MlxTensor::from_array(patches.clone()),
-            positions: crate::MlxTensor::from_array(positions.clone()),
-            plan,
-        });
-        Ok(())
-    }
-
-    fn finish_vision(&mut self, stream: &Stream) -> Result<(), Error> {
-        if self.vision_parts.is_empty() {
-            return Ok(());
-        }
-        let plan = VisionIngressBatchPlan::new(
-            &self
-                .vision_parts
-                .iter()
-                .map(|part| part.plan.clone())
-                .collect::<Vec<_>>(),
-        )
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        let max_patches = plan.padded_patches;
-        let patches = self
-            .vision_parts
-            .iter()
-            .map(|part| pad_sequence(part.patches.as_array(), max_patches, 0, stream))
-            .collect::<Result<Vec<_>, _>>()?;
-        let positions = self
-            .vision_parts
-            .iter()
-            .map(|part| pad_sequence(part.positions.as_array(), max_patches, -1, stream))
-            .collect::<Result<Vec<_>, _>>()?;
-        let patch_refs = patches.iter().collect::<Vec<_>>();
-        let position_refs = positions.iter().collect::<Vec<_>>();
-        let patches = concatenate_axis(&patch_refs, 0, stream)?;
-        let positions = concatenate_axis(&position_refs, 0, stream)?;
-        let sanitized = maximum(positions.clone(), Array::from_int(0), stream)?;
-        self.vision = Some(PreparedVision {
-            patches: crate::MlxTensor::from_array(patches),
-            positions: crate::MlxTensor::from_array(sanitized),
-            valid: crate::MlxTensor::from_array(Array::from_slice(
-                &plan.position_valid_values,
-                &plan.position_valid_shape(),
-            )),
-            key_mask: crate::MlxTensor::from_array(Array::from_slice(
-                &plan.key_mask_values,
-                &plan.key_mask_shape(),
-            )),
-            grid_extents: plan.grid_extents,
-        });
-        Ok(())
-    }
-
-    fn push_audio(
-        &mut self,
-        features: &Array,
-        mask: &Array,
-        plan: AudioIngressPartPlan,
-        placeholder_token_id: u32,
-    ) -> Result<(), Error> {
-        self.tokens
-            .push(crate::MlxTensor::from_array(Array::from_slice(
-                &vec![placeholder_token_id; plan.decoder_positions as usize],
-                &[1, plan.decoder_positions],
-            )));
-        self.modalities.push(InputModality::Audio);
-        self.projected.push(None);
-
-        self.audio_parts.push(PreparedAudioPart {
-            features: crate::MlxTensor::from_array(features.clone()),
-            mask: crate::MlxTensor::from_array(mask.clone()),
-            plan,
-        });
-        Ok(())
-    }
-
-    fn finish_audio(&mut self, stream: &Stream) -> Result<(), Error> {
-        if self.audio_parts.is_empty() {
-            return Ok(());
-        }
-        let plan = AudioIngressBatchPlan::new(
-            &self
-                .audio_parts
-                .iter()
-                .map(|part| part.plan.clone())
-                .collect::<Vec<_>>(),
-        )
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        let max_frames = plan.padded_frames;
-        let features = self
-            .audio_parts
-            .iter()
-            .map(|part| pad_sequence(part.features.as_array(), max_frames, 0, stream))
-            .collect::<Result<Vec<_>, _>>()?;
-        let masks = self
-            .audio_parts
-            .iter()
-            .map(|part| {
-                let extra = max_frames - part.mask.dim(1);
-                if extra == 0 {
-                    Ok(part.mask.as_array().clone())
-                } else {
-                    Ok(pad(
-                        part.mask.as_array(),
-                        PadWidth::from(&[(0, 0), (0, extra)][..]),
-                        Array::from_bool(false),
-                        None,
-                        stream,
-                    )?)
-                }
-            })
-            .collect::<Result<Vec<_>, Error>>()?;
-        let feature_refs = features.iter().collect::<Vec<_>>();
-        let mask_refs = masks.iter().collect::<Vec<_>>();
-        let features = concatenate_axis(&feature_refs, 0, stream)?;
-        let mask = concatenate_axis(&mask_refs, 0, stream)?;
-        let input_mask = mask
-            .as_dtype(features.dtype(), stream)?
-            .try_index_device((.., .., NewAxis), stream)?;
-        self.audio = Some(PreparedAudio {
-            features: crate::MlxTensor::from_array(features),
-            input_mask: crate::MlxTensor::from_array(input_mask),
-            first_stage_mask: crate::MlxTensor::from_array(Array::from_slice(
-                &plan.first_stage_mask_values,
-                &plan.first_stage_mask_shape(),
-            )),
-            valid: plan.valid_subsampled_frames,
-        });
-        Ok(())
-    }
-
-    pub fn decoder_parts(&self) -> Vec<DecoderInputPart<'_, crate::MlxTensor>> {
-        self.tokens
-            .iter()
-            .zip(&self.modalities)
-            .zip(&self.projected)
-            .map(|((tokens, modality), embeddings)| {
-                if let Some(embeddings) = embeddings {
-                    DecoderInputPart::Projected { tokens, embeddings }
-                } else {
-                    match modality {
-                        InputModality::Text => DecoderInputPart::Text(tokens),
-                        InputModality::Image => DecoderInputPart::Image(tokens),
-                        InputModality::Video => DecoderInputPart::Video(tokens),
-                        InputModality::Audio => DecoderInputPart::Audio(tokens),
-                        _ => unreachable!("validated Gemma input modality"),
-                    }
-                }
-            })
-            .collect()
-    }
-
-    pub fn vision_input(&self) -> Option<VisionInput<'_, crate::MlxTensor>> {
-        self.vision.as_ref().map(|vision| VisionInput {
-            patches: &vision.patches,
-            position_ids: &vision.positions,
-            position_valid: &vision.valid,
-            key_mask: &vision.key_mask,
-            grid_extents: &vision.grid_extents,
-        })
-    }
-
-    pub fn audio_input(&self) -> Option<AudioInput<'_, crate::MlxTensor>> {
-        self.audio.as_ref().map(|audio| AudioInput {
-            features: &audio.features,
-            input_mask: &audio.input_mask,
-            first_stage_mask: &audio.first_stage_mask,
-            valid_subsampled_frames: &audio.valid,
-        })
-    }
-}
-
-fn pad_sequence(value: &Array, sequence: i32, fill: i32, stream: &Stream) -> Result<Array, Error> {
-    let extra = sequence - value.dim(1);
-    if extra < 0 {
-        return Err(Error::ArchitectureModel(
-            "prepared media sequence exceeds its batch padding extent".into(),
-        ));
-    }
-    if extra == 0 {
-        return Ok(value.clone());
-    }
-    Ok(pad(
-        value,
-        PadWidth::from(&[(0, 0), (0, extra), (0, 0)][..]),
-        Array::from_int(fill).as_dtype(value.dtype(), stream)?,
-        None,
-        stream,
-    )?)
+pub fn prepare_parts(
+    args: &FamilyConfig,
+    typed: input::ModelInput<'_>,
+    stream: &Stream,
+) -> Result<PreparedParts, Error> {
+    let prepared = crate::composition::mlx::replicated_text::prepared_composite_input(typed)?;
+    let admitted = <NeutralArchitecture as CompositeArchitecture<
+        MlxNeuralBackend,
+        MlxHybridState,
+    >>::admit_prepared_input(args, &prepared, &input::MlxTensorInputInspector)
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let paired =
+        PreparedCompositeInput::new(&prepared, &admitted).map_err(Error::ArchitectureModel)?;
+    eredu_architectures::gemma4::model::prepare_composite_ingress::<MlxNeuralBackend>(
+        paired, stream,
+    )
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))
 }
 
 impl CausalModel<MlxHybridState> for Gemma4Model {

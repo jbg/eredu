@@ -359,11 +359,22 @@ where
         _group: usize,
         _index: usize,
         _remaining_units: usize,
-        _value: &B::Tensor,
+        _value: &mut B::Tensor,
         _forward: &mut C,
         _context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<LayeredUnitAction, E> {
         Ok(LayeredUnitAction::Execute)
+    }
+
+    /// Observes and may replace the activation selected for one ready group.
+    fn after_group_begin(
+        &mut self,
+        _group: usize,
+        _value: &mut B::Tensor,
+        _forward: &mut C,
+        _context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<(), E> {
+        Ok(())
     }
 
     /// Observes one executed unit output.
@@ -371,7 +382,7 @@ where
         &mut self,
         _group: usize,
         _index: usize,
-        _value: &B::Tensor,
+        _value: &mut B::Tensor,
         _forward: &mut C,
         _context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<(), E> {
@@ -382,7 +393,7 @@ where
     fn after_group(
         &mut self,
         _group: usize,
-        _value: &B::Tensor,
+        _value: &mut B::Tensor,
         _forward: &mut C,
         _context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<(), E> {
@@ -423,7 +434,7 @@ where
         group: usize,
         index: usize,
         remaining_units: usize,
-        value: &B::Tensor,
+        value: &mut B::Tensor,
         forward: &mut C,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<LayeredUnitAction, E> {
@@ -448,7 +459,7 @@ where
         &mut self,
         group: usize,
         index: usize,
-        value: &B::Tensor,
+        value: &mut B::Tensor,
         forward: &mut C,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<(), E> {
@@ -457,10 +468,22 @@ where
         self.right.after_unit(group, index, value, forward, context)
     }
 
+    fn after_group_begin(
+        &mut self,
+        group: usize,
+        value: &mut B::Tensor,
+        forward: &mut C,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<(), E> {
+        self.left
+            .after_group_begin(group, value, forward, context)?;
+        self.right.after_group_begin(group, value, forward, context)
+    }
+
     fn after_group(
         &mut self,
         group: usize,
-        value: &B::Tensor,
+        value: &mut B::Tensor,
         forward: &mut C,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<(), E> {
@@ -472,6 +495,76 @@ where
 struct NoopLayeredTraversalHook;
 
 impl<B, C, E> LayeredTraversalHook<B, C, E> for NoopLayeredTraversalHook where B: NeuralBackend {}
+
+struct ActivationObserverTraversalHook<'a, O: ?Sized> {
+    observer: std::rc::Rc<std::cell::RefCell<&'a mut O>>,
+    units: Vec<Vec<String>>,
+    group_inputs: Vec<Option<String>>,
+    group_outputs: Vec<Option<String>>,
+}
+
+impl<B, C, E, O> LayeredTraversalHook<B, C, E> for ActivationObserverTraversalHook<'_, O>
+where
+    B: NeuralBackend,
+    O: ActivationObserver<B::Tensor, E> + ?Sized,
+{
+    fn before_unit(
+        &mut self,
+        group: usize,
+        index: usize,
+        _remaining_units: usize,
+        value: &mut B::Tensor,
+        _forward: &mut C,
+        _context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<LayeredUnitAction, E> {
+        let path = format!("{}.input", self.units[group][index]);
+        let mut observer = self.observer.borrow_mut();
+        *value = observe_and_intervene(&mut **observer, &path, value)?;
+        Ok(LayeredUnitAction::Execute)
+    }
+
+    fn after_unit(
+        &mut self,
+        group: usize,
+        index: usize,
+        value: &mut B::Tensor,
+        _forward: &mut C,
+        _context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<(), E> {
+        let path = format!("{}.output", self.units[group][index]);
+        let mut observer = self.observer.borrow_mut();
+        *value = observe_and_intervene(&mut **observer, &path, value)?;
+        Ok(())
+    }
+
+    fn after_group_begin(
+        &mut self,
+        group: usize,
+        value: &mut B::Tensor,
+        _forward: &mut C,
+        _context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<(), E> {
+        if let Some(path) = self.group_inputs.get(group).and_then(Option::as_deref) {
+            let mut observer = self.observer.borrow_mut();
+            *value = observe_and_intervene(&mut **observer, path, value)?;
+        }
+        Ok(())
+    }
+
+    fn after_group(
+        &mut self,
+        group: usize,
+        value: &mut B::Tensor,
+        _forward: &mut C,
+        _context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<(), E> {
+        if let Some(path) = self.group_outputs.get(group).and_then(Option::as_deref) {
+            let mut observer = self.observer.borrow_mut();
+            *value = observe_and_intervene(&mut **observer, path, value)?;
+        }
+        Ok(())
+    }
+}
 
 struct AfterUnitTraversalHook<F> {
     after_unit: F,
@@ -490,7 +583,7 @@ where
         &mut self,
         group: usize,
         index: usize,
-        value: &B::Tensor,
+        value: &mut B::Tensor,
         forward: &mut C,
         _context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<(), E> {
@@ -507,7 +600,7 @@ where
         &mut self,
         group: usize,
         index: usize,
-        _value: &B::Tensor,
+        _value: &mut B::Tensor,
         forward: &mut C,
         _context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<(), E> {
@@ -574,6 +667,16 @@ where
 
     /// Returns the stable architecture-owned path of one group-local execution unit.
     fn unit_path(&self, group: usize, index: usize) -> Result<String, Self::Error>;
+
+    /// Architecture-owned name for the activation selected at group ingress.
+    fn group_input_observation_path(&self, _group: usize) -> Result<Option<String>, Self::Error> {
+        Ok(None)
+    }
+
+    /// Architecture-owned name for the activation emitted after group completion.
+    fn group_output_observation_path(&self, _group: usize) -> Result<Option<String>, Self::Error> {
+        Ok(None)
+    }
 
     /// Borrows pinned modules for parameter discovery and binding.
     fn static_modules(&self) -> &Self::StaticModules;
@@ -1119,6 +1222,7 @@ where
                 &mut forward_context,
                 context,
             )?;
+            hook.after_group_begin(group, &mut hidden, &mut forward_context, context)?;
             for dependency in schedule
                 .started(group)
                 .expect("topological execution starts only ready groups")
@@ -1135,7 +1239,7 @@ where
                         group,
                         index,
                         unit_count - index,
-                        &hidden,
+                        &mut hidden,
                         &mut forward_context,
                         context,
                     )? == LayeredUnitAction::SkipRemainingGroup
@@ -1151,7 +1255,7 @@ where
                         &mut forward_context,
                         context,
                     )?;
-                    hook.after_unit(group, index, &hidden, &mut forward_context, context)?;
+                    hook.after_unit(group, index, &mut hidden, &mut forward_context, context)?;
                 }
             }
             hidden = self.architecture.complete_execution_group(
@@ -1161,7 +1265,7 @@ where
                 &mut forward_context,
                 context,
             )?;
-            hook.after_group(group, &hidden, &mut forward_context, context)?;
+            hook.after_group(group, &mut hidden, &mut forward_context, context)?;
             outputs[group] = Some(hidden);
             schedule
                 .ordered(group)
@@ -1544,7 +1648,23 @@ where
     where
         Observer: ActivationObserver<B::Tensor, A::Error> + ?Sized,
     {
-        self.forward_with_unit_executor_and_observer(
+        self.forward_with_observer_and_context(input, state, context, observer)
+            .map(|(output, _)| output)
+    }
+
+    /// Runs observed sequential traversal and retains architecture forward resources for the
+    /// caller's completion boundary.
+    pub fn forward_with_observer_and_context<'a, Observer>(
+        &mut self,
+        input: A::Input<'a>,
+        state: &mut S,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        observer: &mut Observer,
+    ) -> Result<(B::Tensor, A::ForwardContext), LayerwiseRuntimeError<A::Error, P::Error>>
+    where
+        Observer: ActivationObserver<B::Tensor, A::Error> + ?Sized,
+    {
+        self.forward_with_unit_executor_and_observer_and_context(
             input,
             state,
             context,
@@ -1561,7 +1681,7 @@ where
         input: A::Input<'a>,
         state: &mut S,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
-        mut execute: E,
+        execute: E,
         observer: &mut Observer,
     ) -> Result<B::Tensor, LayerwiseRuntimeError<A::Error, P::Error>>
     where
@@ -1577,25 +1697,72 @@ where
         ) -> Result<B::Tensor, A::Error>,
         Observer: ActivationObserver<B::Tensor, A::Error> + ?Sized,
     {
-        self.forward_with_unit_executor(
-            input,
-            state,
-            context,
-            |architecture, group, index, unit, hidden, state, forward, context| {
-                let path = architecture.unit_path(group, index)?;
-                let input = observe_and_intervene(observer, &format!("{path}.input"), hidden)?;
-                let output = execute(
-                    architecture,
-                    group,
-                    index,
-                    unit,
-                    &input,
-                    state,
-                    forward,
-                    context,
-                )?;
-                observe_and_intervene(observer, &format!("{path}.output"), &output)
-            },
+        self.forward_with_unit_executor_and_observer_and_context(
+            input, state, context, execute, observer,
+        )
+        .map(|(output, _)| output)
+    }
+
+    /// Runs a custom observed executor while returning its retained forward resources.
+    pub fn forward_with_unit_executor_and_observer_and_context<'a, E, Observer>(
+        &mut self,
+        input: A::Input<'a>,
+        state: &mut S,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        execute: E,
+        observer: &mut Observer,
+    ) -> Result<(B::Tensor, A::ForwardContext), LayerwiseRuntimeError<A::Error, P::Error>>
+    where
+        E: FnMut(
+            &mut A,
+            usize,
+            usize,
+            &mut A::Unit,
+            &B::Tensor,
+            &mut S,
+            &mut A::ForwardContext,
+            &<B::Tensor as eredu_nn::Tensor>::Context,
+        ) -> Result<B::Tensor, A::Error>,
+        Observer: ActivationObserver<B::Tensor, A::Error> + ?Sized,
+    {
+        let graph = self
+            .architecture
+            .execution_graph()
+            .map_err(LayerwiseRuntimeError::Architecture)?;
+        let mut units = Vec::with_capacity(graph.groups().len());
+        let mut group_inputs = Vec::with_capacity(graph.groups().len());
+        let mut group_outputs = Vec::with_capacity(graph.groups().len());
+        for group in 0..graph.groups().len() {
+            let count = self
+                .architecture
+                .group_unit_count(group)
+                .map_err(LayerwiseRuntimeError::Architecture)?;
+            units.push(
+                (0..count)
+                    .map(|index| self.architecture.unit_path(group, index))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(LayerwiseRuntimeError::Architecture)?,
+            );
+            group_inputs.push(
+                self.architecture
+                    .group_input_observation_path(group)
+                    .map_err(LayerwiseRuntimeError::Architecture)?,
+            );
+            group_outputs.push(
+                self.architecture
+                    .group_output_observation_path(group)
+                    .map_err(LayerwiseRuntimeError::Architecture)?,
+            );
+        }
+        let observer = std::rc::Rc::new(std::cell::RefCell::new(observer));
+        let mut hook = ActivationObserverTraversalHook {
+            observer,
+            units,
+            group_inputs,
+            group_outputs,
+        };
+        self.forward_with_unit_executor_and_traversal_hook(
+            input, state, context, execute, &mut hook,
         )
     }
 
@@ -1624,18 +1791,87 @@ where
         Provider::Error: std::fmt::Display,
         Observer: ActivationObserver<B::Tensor, A::Error> + ?Sized,
     {
-        self.forward_with_unit_executor(
+        self.forward_with_provider_and_observer_and_context(
+            input, state, pass, provider, context, observer,
+        )
+        .map(|(output, _)| output)
+    }
+
+    /// Runs provider-backed observed execution while retaining architecture forward resources.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_with_provider_and_observer_and_context<'a, Provider, Observer>(
+        &mut self,
+        input: A::Input<'a>,
+        state: &mut S,
+        pass: ExpertPass,
+        provider: &mut Provider,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        observer: &mut Observer,
+    ) -> Result<(B::Tensor, A::ForwardContext), LayerwiseRuntimeError<A::Error, P::Error>>
+    where
+        B: eredu_nn::GroupedNeuralBackend,
+        A: RoutedLayeredArchitecture<B, S>,
+        A::Error: std::fmt::Display,
+        Provider: RoutedExpertProvider<B>,
+        Provider::Error: std::fmt::Display,
+        Observer: ActivationObserver<B::Tensor, A::Error> + ?Sized,
+    {
+        let graph = self
+            .architecture
+            .execution_graph()
+            .map_err(LayerwiseRuntimeError::Architecture)?;
+        let mut units = Vec::with_capacity(graph.groups().len());
+        let mut group_inputs = Vec::with_capacity(graph.groups().len());
+        let mut group_outputs = Vec::with_capacity(graph.groups().len());
+        for group in 0..graph.groups().len() {
+            let count = self
+                .architecture
+                .group_unit_count(group)
+                .map_err(LayerwiseRuntimeError::Architecture)?;
+            units.push(
+                (0..count)
+                    .map(|index| self.architecture.unit_path(group, index))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(LayerwiseRuntimeError::Architecture)?,
+            );
+            group_inputs.push(
+                self.architecture
+                    .group_input_observation_path(group)
+                    .map_err(LayerwiseRuntimeError::Architecture)?,
+            );
+            group_outputs.push(
+                self.architecture
+                    .group_output_observation_path(group)
+                    .map_err(LayerwiseRuntimeError::Architecture)?,
+            );
+        }
+        let observer = std::rc::Rc::new(std::cell::RefCell::new(observer));
+        let routed_observer = observer.clone();
+        let mut hook = ActivationObserverTraversalHook {
+            observer,
+            units,
+            group_inputs,
+            group_outputs,
+        };
+        self.forward_with_unit_executor_and_traversal_hook(
             input,
             state,
             context,
             |architecture, group, index, unit, hidden, state, forward, context| {
-                let path = architecture.unit_path(group, index)?;
-                let input = observe_and_intervene(observer, &format!("{path}.input"), hidden)?;
-                let output = architecture.forward_unit_observed_with_provider(
-                    group, index, unit, &input, state, forward, pass, provider, context, observer,
-                )?;
-                observe_and_intervene(observer, &format!("{path}.output"), &output)
+                architecture.forward_unit_observed_with_provider(
+                    group,
+                    index,
+                    unit,
+                    hidden,
+                    state,
+                    forward,
+                    pass,
+                    provider,
+                    context,
+                    &mut **routed_observer.borrow_mut(),
+                )
             },
+            &mut hook,
         )
     }
 
@@ -1831,6 +2067,8 @@ where
                     executor,
                 )
                 .map_err(LayerwiseRuntimeError::Architecture)?;
+            hook.after_group_begin(group, &mut hidden, &mut forward_context, executor)
+                .map_err(LayerwiseRuntimeError::Architecture)?;
             for dependency in schedule
                 .started(group)
                 .expect("topological execution starts only ready groups")
@@ -1851,7 +2089,7 @@ where
                             group,
                             index,
                             unit_count - index,
-                            &hidden,
+                            &mut hidden,
                             &mut forward_context,
                             executor,
                         )
@@ -1889,7 +2127,7 @@ where
                         executor,
                     )
                     .map_err(LayerwiseRuntimeError::Architecture)?;
-                    hook.after_unit(group, index, &hidden, &mut forward_context, executor)
+                    hook.after_unit(group, index, &mut hidden, &mut forward_context, executor)
                         .map_err(LayerwiseRuntimeError::Architecture)?;
                     let mut state_values = Vec::new();
                     for state_ordinal in self
@@ -1914,7 +2152,7 @@ where
                 .architecture
                 .complete_execution_group(group, &hidden, state, &mut forward_context, executor)
                 .map_err(LayerwiseRuntimeError::Architecture)?;
-            hook.after_group(group, &hidden, &mut forward_context, executor)
+            hook.after_group(group, &mut hidden, &mut forward_context, executor)
                 .map_err(LayerwiseRuntimeError::Architecture)?;
             outputs[group] = Some(hidden);
             if graph.groups().len() > 1 {
@@ -2323,6 +2561,8 @@ where
                     executor,
                 )
                 .map_err(LayerwiseRuntimeError::Architecture)?;
+            hook.after_group_begin(group, &mut hidden, &mut forward_context, executor)
+                .map_err(LayerwiseRuntimeError::Architecture)?;
             for dependency in schedule
                 .started(group)
                 .expect("topological execution starts only ready groups")
@@ -2343,7 +2583,7 @@ where
                             group,
                             index,
                             unit_count - index,
-                            &hidden,
+                            &mut hidden,
                             &mut forward_context,
                             executor,
                         )
@@ -2382,7 +2622,7 @@ where
                         executor,
                     )
                     .map_err(LayerwiseRuntimeError::Architecture)?;
-                    hook.after_unit(group, index, &hidden, &mut forward_context, executor)
+                    hook.after_unit(group, index, &mut hidden, &mut forward_context, executor)
                         .map_err(LayerwiseRuntimeError::Architecture)?;
                     let mut state_values = Vec::new();
                     for state_ordinal in self
@@ -2414,7 +2654,7 @@ where
                     executor,
                 )
                 .map_err(LayerwiseRuntimeError::Architecture)?;
-            hook.after_group(group, &hidden, &mut forward_context, executor)
+            hook.after_group(group, &mut hidden, &mut forward_context, executor)
                 .map_err(LayerwiseRuntimeError::Architecture)?;
             outputs[group] = Some(hidden);
             if graph.groups().len() > 1 {

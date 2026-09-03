@@ -18,22 +18,23 @@ pub use checkpoint::{
     translate_vision_gguf_weight_name, unit_recipes,
 };
 pub use conditional::{
-    ConditionalForwardContext, ConditionalInput, ConditionalLayeredModel,
-    ConditionalPartitionInput, ConditionalPipelineBoundary, ConditionalPipelineBoundarySchema,
-    ConditionalPipelinePrepared, ConditionalPipelineVisionState, ConditionalStaticModules,
-    ConditionalUnit, VISION_EXECUTION_GROUP,
+    prepare_input as prepare_conditional_input, ConditionalForwardContext, ConditionalInput,
+    ConditionalLayeredModel, ConditionalPartitionInput, ConditionalPipelineBoundary,
+    ConditionalPipelineBoundarySchema, ConditionalPipelinePrepared, ConditionalPipelineVisionState,
+    ConditionalStaticModules, ConditionalUnit, PreparedInput as PreparedConditionalInput,
+    VISION_EXECUTION_GROUP,
 };
 pub use config::{
-    fp8_block_row_widths, fused_projection_widths, model_args_from_config_value,
-    model_args_from_gguf_catalog, prompt_cache_architecture_fingerprint, state_layout,
-    state_layout_with_geometry, vision_config_from_gguf_catalog, with_gguf_vision_projector,
-    with_media_token_ids, HybridConfig, HybridConfigError, HybridLayerPolicy, HybridStateGeometry,
-    HybridVariant, ParsedHybridConfig, QwenFp8QuantizationConfig, PREDICTION_STATE_SEGMENT,
-    TARGET_STATE_SEGMENT,
+    conditional_prompt_cache_architecture_fingerprint, fp8_block_row_widths,
+    fused_projection_widths, model_args_from_config_value, model_args_from_gguf_catalog,
+    prompt_cache_architecture_fingerprint, state_layout, state_layout_with_geometry,
+    vision_config_from_gguf_catalog, with_gguf_vision_projector, with_media_token_ids,
+    HybridConfig, HybridConfigError, HybridLayerPolicy, HybridStateGeometry, HybridVariant,
+    ParsedHybridConfig, QwenFp8QuantizationConfig, PREDICTION_STATE_SEGMENT, TARGET_STATE_SEGMENT,
 };
 pub use linear_attention::LinearAttention;
 pub use model::{state_identity, ForwardContext, LayeredModel, TargetPartitionInput, Unit};
-pub use mtp::{EmbeddedInput, ForwardMode, PredictionUnit};
+pub use mtp::{prompt_token_identity, EmbeddedInput, ForwardMode, PredictionUnit};
 pub use parallel::{
     conditional_local_geometry, local_block_config, local_geometry, local_unit_config,
     unit_parallel_parameter_groups, ConditionalLocalGeometry, LocalGeometry,

@@ -51,6 +51,9 @@ pub struct AudioConfig {
     pub rms_norm_eps: f32,
     /// Exactly two convolution channel counts.
     pub subsampling_conv_channels: Vec<i32>,
+    /// Whether the checkpoint supplies the audio output-projection bias.
+    #[serde(default = "default_true")]
+    pub output_projection_bias: bool,
     /// Preferred model-wide media weight encoding.
     #[serde(default)]
     pub weight_quantization: Option<WeightQuantization>,
@@ -60,6 +63,10 @@ pub struct AudioConfig {
     /// Per-weight mixed encodings.
     #[serde(default)]
     pub quantized_weight_configs: Option<HashMap<String, WeightQuantization>>,
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 impl AudioConfig {
@@ -766,10 +773,13 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> AudioStatic<B> {
                 input: config.hidden_size,
                 output: config.output_proj_dims,
                 weight: ParameterSpec::trainable(weight).map_err(Error::backend)?,
-                bias: Some(
-                    ParameterSpec::trainable("model.audio_tower.output_proj.bias")
-                        .map_err(Error::backend)?,
-                ),
+                bias: config
+                    .output_projection_bias
+                    .then(|| {
+                        ParameterSpec::trainable("model.audio_tower.output_proj.bias")
+                            .map_err(Error::backend)
+                    })
+                    .transpose()?,
                 format: crate::linear_format::standard_linear_format(
                     weight,
                     config.linear_format_for(weight, config.hidden_size),
@@ -975,6 +985,7 @@ mod tests {
             residual_weight: 0.5,
             rms_norm_eps: 1.0e-6,
             subsampling_conv_channels: vec![4, 8],
+            output_projection_bias: true,
             weight_quantization: None,
             quantized_weights: None,
             quantized_weight_configs: None,

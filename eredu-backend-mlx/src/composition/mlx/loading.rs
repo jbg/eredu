@@ -51,6 +51,7 @@ pub struct MlxSelectedPreparation {
     execution: eredu_architectures::replicated_text::SelectedReplicatedTextExecution<
         eredu_runtime::SelectedReplicatedTextRealization,
         eredu_architectures::SelectedRoutedTextRealization,
+        eredu_architectures::replicated_text::SelectedCompositeTextRealization,
         SelectedMlxConstruction,
     >,
     session: eredu_core::SessionCapabilities,
@@ -61,6 +62,7 @@ impl MlxSelectedPreparation {
         execution: eredu_architectures::replicated_text::SelectedReplicatedTextExecution<
             eredu_runtime::SelectedReplicatedTextRealization,
             eredu_architectures::SelectedRoutedTextRealization,
+            eredu_architectures::replicated_text::SelectedCompositeTextRealization,
             SelectedMlxConstruction,
         >,
         session: eredu_core::SessionCapabilities,
@@ -84,6 +86,7 @@ pub(crate) struct SelectedMlxConstruction {
     pub(crate) weight_residency: eredu_runtime::WeightResidency,
     pub(crate) state_residency: CacheResidencyPolicy,
     session: eredu_core::SessionCapabilities,
+    processor: Option<eredu_runtime::SelectedProcessorExecution>,
 }
 
 impl SelectedMlxConstruction {
@@ -97,7 +100,16 @@ impl SelectedMlxConstruction {
             weight_residency: request.weight_residency(),
             state_residency: request.state_residency().clone(),
             session,
+            processor: None,
         })
+    }
+
+    fn with_processor(
+        mut self,
+        processor: Option<eredu_runtime::SelectedProcessorExecution>,
+    ) -> Self {
+        self.processor = processor;
+        self
     }
 
     pub(crate) const fn parallel_topology(
@@ -275,23 +287,11 @@ fn materialize_gguf_model(
             Executable::qwen(kind, loaded)?
         }
         GgufBinding::Quantized(
-            binding @ (QuantizedGgufBinding::Qwen3Vl | QuantizedGgufBinding::Qwen3VlMoe),
-        ) => {
-            let projector = projector.expect("required GGUF projector was validated above");
-            let loaded = crate::composition::qwen::vl::load_gguf(
-                source,
-                projector,
-                options.weight_residency,
-                quantization,
-                stream,
-                weights_stream,
-            )?;
-            match binding {
-                QuantizedGgufBinding::Qwen3Vl => Executable::qwen3_vl(kind, loaded)?,
-                QuantizedGgufBinding::Qwen3VlMoe => Executable::qwen3_vl_moe(kind, loaded)?,
-                _ => unreachable!(),
-            }
-        }
+            QuantizedGgufBinding::Qwen3Vl | QuantizedGgufBinding::Qwen3VlMoe,
+        ) => return Err(Error::ArchitectureModel(
+            "replicated Qwen3-VL GGUF requires the architecture-selected composite materializer"
+                .into(),
+        )),
         GgufBinding::Quantized(
             binding @ (QuantizedGgufBinding::Qwen35 | QuantizedGgufBinding::Qwen3Next),
         ) => {
@@ -331,6 +331,7 @@ struct MlxExecutionClassSelection {
     options: MlxLoadRequest,
     policy: eredu_core::PreparationPolicy,
     admitted_session: eredu_core::SessionCapabilities,
+    processor: Option<eredu_runtime::SelectedProcessorExecution>,
 }
 
 impl eredu_architectures::replicated_text::ReplicatedTextExecutionClassDispatcher
@@ -338,6 +339,7 @@ impl eredu_architectures::replicated_text::ReplicatedTextExecutionClassDispatche
 {
     type Replicated = eredu_runtime::SelectedReplicatedTextRealization;
     type Routed = eredu_architectures::SelectedRoutedTextRealization;
+    type Composite = eredu_architectures::replicated_text::SelectedCompositeTextRealization;
     type Other = SelectedMlxConstruction;
     type Error = Error;
 
@@ -402,8 +404,44 @@ impl eredu_architectures::replicated_text::ReplicatedTextExecutionClassDispatche
         .map_err(|error| Error::ArchitectureModel(error.to_string()))
     }
 
+    fn composite(
+        self,
+        requirements: eredu_architectures::replicated_text::CompositeTextRequirements,
+    ) -> Result<Self::Composite, Self::Error> {
+        let mut execution_request = ReplicatedTextSelectionRequest::new(
+            self.options.weight_residency.layers(),
+            self.options.state_residency().clone(),
+        )
+        .with_session(self.admitted_session)
+        .with_prompt_cache(matches!(
+            self.options.state_residency(),
+            CacheResidencyPolicy::Paged(_)
+        ))
+        .with_exact_completion(true);
+        if let Some(topology) = self.policy.topology() {
+            execution_request = execution_request.with_topology(topology);
+        }
+        if let Some(quantization) = self.policy.quantization() {
+            execution_request = execution_request.with_quantization(quantization);
+        }
+        let processor = self.processor.ok_or_else(|| {
+            Error::ArchitectureModel(
+                "composite execution has no selected processor realization".into(),
+            )
+        })?;
+        eredu_architectures::replicated_text::select_composite_text_realization_with_processor(
+            &requirements,
+            &execution_request,
+            self.options.weight_residency,
+            &super::replicated_text::capabilities(requirements.execution(), &execution_request),
+            processor,
+        )
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))
+    }
+
     fn other(self) -> Result<Self::Other, Self::Error> {
         SelectedMlxConstruction::from_request(self.options, self.admitted_session)
+            .map(|selected| selected.with_processor(self.processor))
     }
 }
 
@@ -440,6 +478,40 @@ pub(crate) fn select_preparation_with_grouped_capabilities(
             "backend is missing architecture-required grouped mechanisms: {missing_grouped:?}"
         )));
     }
+    let processor =
+        eredu_architectures::replicated_text::composite_processor_execution_requirements(
+            inspection.architecture_plan(),
+        )
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?
+        .map(|requirements| {
+            let request = eredu_runtime::ProcessorSelectionRequest::new(
+                requirements
+                    .modalities()
+                    .iter()
+                    .map(eredu_runtime::ModalityProcessorRequirements::modality),
+            )
+            .with_prepared_tensors(true)
+            .with_projected_modalities(
+                requirements
+                    .modalities()
+                    .iter()
+                    .filter(|requirement| requirement.projected_embeddings())
+                    .map(eredu_runtime::ModalityProcessorRequirements::modality),
+            )
+            .with_available_raw_media(
+                policy
+                    .topology()
+                    .is_none_or(eredu_core::ParallelTopology::is_replicated)
+                    && inspection.architecture_plan().has_processor(),
+            );
+            eredu_runtime::select_processor_execution(
+                &requirements,
+                &request,
+                &super::processor::capabilities(),
+            )
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))
+        })
+        .transpose()?;
     let execution = eredu_architectures::replicated_text::dispatch_replicated_text_execution_class(
         inspection,
         policy.topology(),
@@ -447,6 +519,7 @@ pub(crate) fn select_preparation_with_grouped_capabilities(
             options,
             policy,
             admitted_session,
+            processor,
         },
     )
     .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
@@ -480,6 +553,7 @@ impl
     eredu_architectures::replicated_text::SelectedReplicatedTextExecutionDispatcher<
         eredu_runtime::SelectedReplicatedTextRealization,
         eredu_architectures::SelectedRoutedTextRealization,
+        eredu_architectures::replicated_text::SelectedCompositeTextRealization,
         SelectedMlxConstruction,
     > for MlxSelectedExecutionMaterializer<'_>
 {
@@ -498,6 +572,13 @@ impl
         selected: eredu_architectures::SelectedRoutedTextRealization,
     ) -> Result<Self::Output, Self::Error> {
         materialize_routed_text_plan(self.plan, selected, self.stream, self.weights_stream)
+    }
+
+    fn composite(
+        self,
+        selected: eredu_architectures::replicated_text::SelectedCompositeTextRealization,
+    ) -> Result<Self::Output, Self::Error> {
+        materialize_composite_text_plan(self.plan, selected, self.stream, self.weights_stream)
     }
 
     fn other(self, selected: SelectedMlxConstruction) -> Result<Self::Output, Self::Error> {
@@ -587,7 +668,7 @@ fn materialize_replicated_text_plan(
         floating_state_dtype_bytes,
         state_residency,
     );
-    attach_processor(model, &architecture_plan)
+    Ok(model)
 }
 
 fn materialize_routed_text_plan(
@@ -666,7 +747,108 @@ fn materialize_routed_text_plan(
         floating_state_dtype_bytes,
         state_residency,
     );
-    attach_processor(model, &architecture_plan)
+    Ok(model)
+}
+
+fn materialize_composite_text_plan(
+    plan: ModelPreparationPlan<ArtifactArchitecturePlan>,
+    realization: eredu_architectures::replicated_text::SelectedCompositeTextRealization,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<MlxModel, Error> {
+    let floating_state_dtype_bytes = inspected_floating_state_dtype_bytes(plan.inspection())?;
+    let max_cached_shards = realization.execution().residency().max_cached_shards();
+    let state_residency = realization.execution().state().policy().clone();
+    let inspection = plan.inspection().clone();
+    let architecture_plan = inspection.architecture_plan().clone();
+    let requirements =
+        eredu_architectures::replicated_text::composite_text_requirements(&inspection)
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let selected_processor = realization.processor().clone();
+    let artifact = plan.into_artifact();
+    let kind = prepared_model_kind(&architecture_plan);
+    let store: Arc<dyn eredu_checkpoint::store::CheckpointSource> = match artifact {
+        ModelArtifact::SafeTensors {
+            path: _,
+            configuration,
+            tensors,
+            shards,
+        } => {
+            let prepared = super::artifact::PreparedSafetensorsArtifact::open(
+                configuration,
+                prepared_safetensors_architecture(&architecture_plan)?.clone(),
+                tensors,
+                shards,
+                max_cached_shards,
+            )?;
+            Arc::clone(&prepared.store())
+        }
+        ModelArtifact::Gguf { validated, .. } => {
+            let architecture = prepared_gguf_plan(&architecture_plan)?.clone();
+            let (source, projector) = structural::AdmittedGguf::from_admission(
+                architecture,
+                architecture_plan.gguf_media_projector().cloned(),
+                validated,
+            )?;
+            #[cfg(test)]
+            super::path_instrumentation::payload_open();
+            let primary_mapping = projector
+                .as_ref()
+                .map_or(source.plan().tensor_mapping(), |projector| {
+                    projector.plan().primary_tensor_mapping()
+                });
+            let primary: Arc<dyn eredu_checkpoint::store::CheckpointSource> = Arc::new(
+                crate::backend::runtime::checkpoint::store::open_gguf_checkpoint_source(
+                    source.checkpoint().clone(),
+                    source.plan().checkpoint(),
+                    primary_mapping,
+                    max_cached_shards,
+                )?,
+            );
+            match projector {
+                None => primary,
+                Some(projector) => {
+                    let companion: Arc<dyn eredu_checkpoint::store::CheckpointSource> = Arc::new(
+                        crate::backend::runtime::checkpoint::store::open_gguf_checkpoint_source(
+                            projector.checkpoint().clone(),
+                            projector.plan().checkpoint(),
+                            projector.plan().tensor_mapping(),
+                            max_cached_shards,
+                        )?,
+                    );
+                    Arc::new(eredu_checkpoint::store::CompositeCheckpointSource::new([
+                        primary, companion,
+                    ])?)
+                }
+            }
+        }
+        _ => {
+            return Err(Error::ArchitectureModel(
+                "unsupported artifact route for replicated composite composition".into(),
+            ));
+        }
+    };
+    let executable = eredu_architectures::replicated_text::visit_composite_text_architecture::<
+        crate::backend::nn::shared::MlxNeuralBackend,
+        crate::backend::runtime::cache::state::MlxHybridState,
+        _,
+    >(
+        requirements,
+        realization,
+        store,
+        stream,
+        super::replicated_text::CompositeBindingVisitor {
+            stream,
+            weights_stream,
+        },
+    )
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let model = MlxModel::complete(
+        Executable::replicated_text(kind, executable)?,
+        floating_state_dtype_bytes,
+        state_residency,
+    );
+    attach_selected_processor(model, &architecture_plan, &selected_processor)
 }
 
 fn materialize_excluded_model_plan(
@@ -676,6 +858,23 @@ fn materialize_excluded_model_plan(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<MlxModel, Error> {
+    let selected_processor = options.processor.clone();
+    if options
+        .parallel_topology()
+        .is_none_or(|topology| topology.is_replicated())
+        && matches!(
+            eredu_architectures::replicated_text::replicated_text_execution_class(
+                plan.inspection(),
+            )
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?,
+            eredu_architectures::replicated_text::ReplicatedTextExecutionClass::Composite(_)
+        )
+    {
+        return Err(Error::ArchitectureModel(
+            "replicated composite execution requires the architecture-selected composite materializer"
+                .into(),
+        ));
+    }
     let floating_state_dtype_bytes = inspected_floating_state_dtype_bytes(plan.inspection())?;
     let state_residency = options.state_residency.clone();
     if let Some(topology) = options
@@ -684,8 +883,7 @@ fn materialize_excluded_model_plan(
     {
         let kind = prepared_model_kind(plan.inspection().architecture_plan());
         if requires_distributed_stage(kind, topology.topology()) {
-            #[cfg(any(feature = "image", feature = "audio"))]
-            let processor = ModelProcessor::from_plan(plan.inspection().architecture_plan());
+            let architecture_plan = plan.inspection().architecture_plan().clone();
             let model =
                 crate::composition::mlx::distributed::pipeline::load_pipeline_model_with_options(
                     plan,
@@ -696,9 +894,11 @@ fn materialize_excluded_model_plan(
                 .map(|model| {
                     MlxModel::pipeline(model, floating_state_dtype_bytes, state_residency.clone())
                 })?;
-            #[cfg(any(feature = "image", feature = "audio"))]
-            let model = model.with_processor(processor);
-            return Ok(model);
+            return attach_optional_selected_processor(
+                model,
+                &architecture_plan,
+                selected_processor.as_ref(),
+            );
         }
         let architecture_plan = plan.inspection().architecture_plan().clone();
         let artifact = plan.into_artifact();
@@ -735,7 +935,11 @@ fn materialize_excluded_model_plan(
                             state_residency.clone(),
                         )
                     })?;
-                attach_processor(model, &architecture_plan)
+                attach_optional_selected_processor(
+                    model,
+                    &architecture_plan,
+                    selected_processor.as_ref(),
+                )
             }
             _ => Err(Error::ArchitectureModel(
                 "unsupported artifact route for tensor-parallel composition".into(),
@@ -769,19 +973,16 @@ fn materialize_excluded_model_plan(
                 shards,
                 options.weight_residency.max_cached_shards(),
             )?;
-            let composite = super::model::CompositeInputProof::from_plan(&architecture_plan);
-            let model = materialize_safetensors(
-                &prepared,
-                composite,
-                family_route,
-                options,
-                stream,
-                weights_stream,
+            let model =
+                materialize_safetensors(&prepared, family_route, options, stream, weights_stream)
+                    .map(|model| {
+                    MlxModel::complete(model, floating_state_dtype_bytes, state_residency.clone())
+                })?;
+            attach_optional_selected_processor(
+                model,
+                &architecture_plan,
+                selected_processor.as_ref(),
             )
-            .map(|model| {
-                MlxModel::complete(model, floating_state_dtype_bytes, state_residency.clone())
-            })?;
-            attach_processor(model, &architecture_plan)
         }
         _ => Err(Error::ArchitectureModel(
             "unsupported artifact route for model composition".into(),
@@ -1018,12 +1219,39 @@ mod floating_state_dtype_tests {
                 .resolve_safetensors(&config)
                 .unwrap()
                 .into_parts();
+        let checkpoint = resolved_plan
+            .safetensors_architecture()
+            .unwrap()
+            .checkpoint();
+        let catalog = eredu_core::checkpoint::TensorCatalog::new(
+            checkpoint
+                .common_tensors
+                .iter()
+                .chain(
+                    checkpoint
+                        .layout_groups
+                        .iter()
+                        .filter(|group| group.required)
+                        .filter_map(|group| group.variants.first())
+                        .flat_map(|variant| variant.tensors.iter()),
+                )
+                .filter(|tensor| {
+                    tensor.requirement == eredu_checkpoint::schema::TensorRequirement::Required
+                })
+                .map(|tensor| eredu_core::checkpoint::TensorDescriptor {
+                    name: tensor.key.clone(),
+                    shape: tensor.shape.clone(),
+                    dtype: eredu_core::checkpoint::TensorDtype::F32,
+                    storage: None,
+                }),
+        )
+        .unwrap();
         let architecture_plan = eredu_architectures::configuration::MODEL_CONFIGURATIONS
             .artifact_plan(
                 root.path(),
                 ArtifactFormat::SafeTensors,
                 &configuration,
-                &eredu_core::checkpoint::TensorCatalog::new([]).unwrap(),
+                &catalog,
                 None,
                 resolved_plan,
             )
@@ -1114,16 +1342,33 @@ fn prepared_gguf_plan(
     })
 }
 
-fn attach_processor(
+fn attach_optional_selected_processor(
     model: MlxModel,
     architecture_plan: &ArtifactArchitecturePlan,
+    selected: Option<&eredu_runtime::SelectedProcessorExecution>,
+) -> Result<MlxModel, Error> {
+    match selected {
+        Some(selected) => attach_selected_processor(model, architecture_plan, selected),
+        None => Ok(model),
+    }
+}
+
+fn attach_selected_processor(
+    model: MlxModel,
+    architecture_plan: &ArtifactArchitecturePlan,
+    selected: &eredu_runtime::SelectedProcessorExecution,
 ) -> Result<MlxModel, Error> {
     #[cfg(any(feature = "image", feature = "audio"))]
     {
-        Ok(model.with_processor(ModelProcessor::from_plan(architecture_plan)))
+        Ok(model.with_processor(ModelProcessor::from_selected(architecture_plan, selected)?))
     }
     #[cfg(not(any(feature = "image", feature = "audio")))]
     {
+        if selected.raw_media() {
+            return Err(Error::ArchitectureModel(
+                "selected raw-media execution has no compiled MLX mechanisms".into(),
+            ));
+        }
         let _ = architecture_plan;
         Ok(model)
     }
@@ -1311,7 +1556,12 @@ fn materialize_gguf_artifact(
     let metadata = source.metadata();
     validate_gguf_quantization_source(checkpoint, metadata, options.weight_quantization())?;
     #[cfg(any(feature = "image", feature = "audio"))]
-    let processor = ModelProcessor::from_plan(&architecture_plan);
+    let processor = options
+        .processor
+        .as_ref()
+        .map(|selected| ModelProcessor::from_selected(&architecture_plan, selected))
+        .transpose()?
+        .flatten();
     if options
         .parallel_topology()
         .is_some_and(|topology| !topology.is_replicated())
@@ -1532,7 +1782,6 @@ pub fn validate_gguf_quantization_source(
 
 pub(super) fn materialize_safetensors(
     artifact: &super::artifact::PreparedSafetensorsArtifact,
-    composite: Option<super::model::CompositeInputProof>,
     family_route: &ExcludedFamilyRoute,
     options: SelectedMlxConstruction,
     stream: &Stream,
@@ -1681,19 +1930,10 @@ pub(super) fn materialize_safetensors(
                     weights_stream,
                 )?,
             )?),
-            AddressableParameterBankBinding::Qwen3VlMoe => Ok(Executable::qwen3_vl_moe(
-                kind,
-                crate::composition::qwen::vl::load_safetensors_with_residency(
-                    artifact,
-                    eredu_runtime::WeightResidency::with_independent_parameter_banks(
-                        non_expert,
-                        parameter_bank,
-                    ),
-                    quantization,
-                    stream,
-                    weights_stream,
-                )?,
-            )?),
+            AddressableParameterBankBinding::Qwen3VlMoe => Err(Error::ArchitectureModel(
+                "replicated Qwen3-VL-MoE SafeTensors requires the architecture-selected composite materializer"
+                    .into(),
+            )),
             AddressableParameterBankBinding::Qwen35 => Ok(Executable::qwen35(
                 kind,
                 crate::composition::qwen::hybrid::load_safetensors_with_residency(
@@ -1824,40 +2064,22 @@ pub(super) fn materialize_safetensors(
                 weights_stream,
             )?
         })?),
-        FamilyBinding::Qwen3Vl => Ok(Executable::qwen3_vl(
+        FamilyBinding::Qwen3Vl | FamilyBinding::Qwen3VlMoe => {
+            Err(Error::ArchitectureModel(
+                "replicated Qwen3-VL SafeTensors requires the architecture-selected composite materializer"
+                    .into(),
+            ))
+        }
+        FamilyBinding::Qwen35 => Ok(Executable::qwen35(
             kind,
-            crate::composition::qwen::vl::load_safetensors(
-                artifact,
-                execution,
-                quantization,
-                stream,
-                weights_stream,
-            )?,
-        )?),
-        FamilyBinding::Qwen3VlMoe => Ok(Executable::qwen3_vl_moe(
-            kind,
-            crate::composition::qwen::vl::load_safetensors(
-                artifact,
-                execution,
-                quantization,
-                stream,
-                weights_stream,
-            )?,
-        )?),
-        FamilyBinding::Qwen35 => {
-            let model = crate::composition::qwen::hybrid::load_safetensors(
+            crate::composition::qwen::hybrid::load_safetensors(
                 artifact,
                 family_route,
                 execution,
                 quantization,
                 stream,
                 weights_stream,
-            )?;
-            if let Some(proof) = composite {
-                Executable::qwen35_composite(kind, model, proof)
-            } else {
-                Executable::qwen35(kind, model)
-            }
-        }
+            )?,
+        )?),
     }
 }

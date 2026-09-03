@@ -12,7 +12,7 @@ use std::{
     sync::Arc,
 };
 
-use eredu_architectures::{media_plan::QwenVisionIngressPlan, qwen::ModelArgs};
+use eredu_architectures::qwen::ModelArgs;
 use eredu_nn::GroupedNeuralBackend;
 use safemlx::{error::Exception, ops::indexing::TryIndexOp, Array, Stream};
 
@@ -49,25 +49,6 @@ use crate::{
     },
 };
 
-struct MaterializedQwenIngress {
-    tokens: Array,
-    patch_grid: Vec<(i32, i32, i32)>,
-}
-
-fn materialize_qwen_media_ingress(
-    plan: QwenVisionIngressPlan,
-    stream: &Stream,
-) -> Result<MaterializedQwenIngress, Exception> {
-    let placeholder_count = usize::try_from(plan.placeholder_count)
-        .map_err(|_| Exception::custom("Qwen media placeholder span exceeds host capacity"))?;
-    let tokens =
-        input::token_ids_array(&vec![plan.placeholder_token_id; placeholder_count], stream)?;
-    Ok(MaterializedQwenIngress {
-        tokens,
-        patch_grid: plan.patch_grid,
-    })
-}
-
 pub mod expert {
     include!("qwen_expert.rs");
 }
@@ -76,11 +57,10 @@ pub mod hybrid {
     include!("qwen_hybrid.rs");
 }
 
-#[cfg(feature = "image")]
-pub mod processor {
-    include!("qwen_processor.rs");
-}
-
+#[allow(
+    dead_code,
+    reason = "Qwen-VL keeps complete-model helpers beside the selected distributed checkpoint/store binder until those shared helpers are split"
+)]
 pub mod vl {
     include!("qwen_vl.rs");
 }

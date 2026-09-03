@@ -1355,7 +1355,7 @@ mod tests {
             group: usize,
             index: usize,
             _remaining_units: usize,
-            value: &MlxTensor,
+            value: &mut MlxTensor,
             _forward: &mut eredu_architectures::moshi::ForwardContext<crate::MlxTensor>,
             _context: &Stream,
         ) -> Result<LayeredUnitAction, eredu_nn::Error> {
@@ -1372,7 +1372,7 @@ mod tests {
             &mut self,
             group: usize,
             index: usize,
-            value: &MlxTensor,
+            value: &mut MlxTensor,
             _forward: &mut eredu_architectures::moshi::ForwardContext<crate::MlxTensor>,
             _context: &Stream,
         ) -> Result<(), eredu_nn::Error> {
@@ -1390,7 +1390,7 @@ mod tests {
         fn after_group(
             &mut self,
             group: usize,
-            _value: &MlxTensor,
+            _value: &mut MlxTensor,
             forward: &mut eredu_architectures::moshi::ForwardContext<crate::MlxTensor>,
             _context: &Stream,
         ) -> Result<(), eredu_nn::Error> {

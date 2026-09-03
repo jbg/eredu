@@ -514,7 +514,7 @@ where
         group: usize,
         index: usize,
         remaining_units: usize,
-        _value: &NB::Tensor,
+        _value: &mut NB::Tensor,
         forward: &mut C,
         context: &<NB::Tensor as Tensor>::Context,
     ) -> Result<LayeredUnitAction, E> {
@@ -571,7 +571,7 @@ where
         &mut self,
         group: usize,
         index: usize,
-        value: &NB::Tensor,
+        value: &mut NB::Tensor,
         forward: &mut C,
         context: &<NB::Tensor as Tensor>::Context,
     ) -> Result<(), E> {
@@ -586,7 +586,7 @@ where
     fn after_group(
         &mut self,
         group: usize,
-        value: &NB::Tensor,
+        value: &mut NB::Tensor,
         forward: &mut C,
         context: &<NB::Tensor as Tensor>::Context,
     ) -> Result<(), E> {

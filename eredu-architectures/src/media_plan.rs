@@ -5,32 +5,16 @@
 //! decoder positions and scalar workspace implied by the family equations.
 
 use eredu_core::{
-    CapabilityError, InputExtent, InputMetadataKey, InputModality, InputPartDescriptor,
-    InputPayloadKind, InputTensorIdentity, PreparedInputError,
+    CapabilityError, InputExtent, InputMetadataKey, InputModalities, InputModality,
+    InputPartDescriptor, InputPayloadKind, InputTensorIdentity, PreparedInputIdentity,
 };
-use eredu_runtime::PreparedInputPart;
+use eredu_runtime::{PreparedInputInspector, PreparedInputPart, PreparedModelInput};
 
 use crate::qwen::{
     hybrid::{HybridConfig, ParsedHybridConfig},
     vision::{VisionAttentionPolicy, VisionConfig},
     vl::ModelArgs as QwenVlModelArgs,
 };
-
-/// Backend adapter used only to describe native tensors and read the small
-/// metadata arrays required by architecture admission.
-///
-/// Modality, payload role, tensor identity, and host-known extents remain
-/// owned by `eredu-core` and `eredu-runtime`.
-pub trait PreparedInputInspector<Tensor> {
-    /// Returns the portable identity of a native tensor.
-    fn identity(&self, tensor: &Tensor) -> Result<InputTensorIdentity, PreparedInputError>;
-
-    /// Reads an evaluated signed-integer metadata tensor in row-major order.
-    fn i32_values(&self, tensor: &Tensor) -> Result<Vec<i32>, CapabilityError>;
-
-    /// Reads an evaluated Boolean metadata tensor in row-major order.
-    fn bool_values(&self, tensor: &Tensor) -> Result<Vec<bool>, CapabilityError>;
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MetadataValues<T> {
@@ -407,6 +391,200 @@ pub struct MuseGlimmerIngressPlan {
     pub placeholder_count: u64,
     /// Validated `(time, height, width)` rows consumed by vision execution.
     pub patch_grid: Vec<(i32, i32, i32)>,
+}
+
+/// Whole-request architecture admission coupled to exact prepared tensor identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmittedCompositeInput<P> {
+    identity: PreparedInputIdentity,
+    parts: Vec<P>,
+    decoder_positions: u64,
+    active_modalities: InputModalities,
+}
+
+impl<P> AdmittedCompositeInput<P> {
+    /// Identity recomputed from the exact tensor handles admitted by the architecture.
+    pub const fn identity(&self) -> &PreparedInputIdentity {
+        &self.identity
+    }
+
+    /// Ordered architecture-owned plan for every prepared input part.
+    pub fn parts(&self) -> &[P] {
+        &self.parts
+    }
+
+    /// Total decoder positions occupied by all ordered parts.
+    pub const fn decoder_positions(&self) -> u64 {
+        self.decoder_positions
+    }
+
+    /// Modalities that activate request-optional roots for this exact input.
+    pub const fn active_modalities(&self) -> InputModalities {
+        self.active_modalities
+    }
+}
+
+trait CompositePartPlan {
+    fn decoder_positions(&self) -> u64;
+}
+
+impl CompositePartPlan for QwenVlInputPartPlan {
+    fn decoder_positions(&self) -> u64 {
+        match self {
+            Self::TextTokens { positions } | Self::ProjectedText { positions } => *positions,
+            Self::Media { shape, .. } => shape.decoder_positions,
+        }
+    }
+}
+
+impl CompositePartPlan for QwenHybridInputPartPlan {
+    fn decoder_positions(&self) -> u64 {
+        match self {
+            Self::TextTokens { positions } | Self::Projected { positions, .. } => *positions,
+            Self::Media { shape, .. } => shape.decoder_positions,
+        }
+    }
+}
+
+impl CompositePartPlan for Gemma4InputPartPlan {
+    fn decoder_positions(&self) -> u64 {
+        match self {
+            Self::TextTokens { positions } | Self::Projected { positions, .. } => *positions,
+            Self::Vision { shape, .. } | Self::Audio { shape, .. } => shape.decoder_positions,
+        }
+    }
+}
+
+impl CompositePartPlan for InklingInputPartPlan {
+    fn decoder_positions(&self) -> u64 {
+        match self {
+            Self::TextTokens { positions } | Self::Projected { positions, .. } => *positions,
+            Self::Media { shape, .. } => shape.decoder_positions,
+        }
+    }
+}
+
+impl CompositePartPlan for MuseGlimmerInputPartPlan {
+    fn decoder_positions(&self) -> u64 {
+        match self {
+            Self::TextTokens { positions } => *positions,
+            Self::Vision { shape, .. } => shape.decoder_positions,
+        }
+    }
+}
+
+fn admit_composite_input<Tensor, P>(
+    input: &PreparedModelInput<Tensor>,
+    inspector: &impl PreparedInputInspector<Tensor>,
+    mut admit_part: impl FnMut(&PreparedInputPart<Tensor>) -> Result<P, CapabilityError>,
+) -> Result<AdmittedCompositeInput<P>, CapabilityError>
+where
+    P: CompositePartPlan,
+{
+    let descriptors = input
+        .parts()
+        .iter()
+        .map(|part| part.descriptor(&|tensor| inspector.identity(tensor)))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| CapabilityError::Observation(error.to_string()))?;
+    let identity = PreparedInputIdentity::new(descriptors)
+        .map_err(|error| CapabilityError::Observation(error.to_string()))?;
+    if &identity != input.identity() {
+        return Err(CapabilityError::Observation(
+            "prepared-input tensor identity changed before architecture admission".into(),
+        ));
+    }
+    let mut active_modalities = InputModalities {
+        text: false,
+        image: false,
+        audio: false,
+        video: false,
+    };
+    let mut decoder_positions = 0u64;
+    let mut parts = Vec::with_capacity(input.len());
+    for part in input.parts() {
+        let plan = admit_part(part)?;
+        decoder_positions = decoder_positions
+            .checked_add(plan.decoder_positions())
+            .ok_or(CapabilityError::ArithmeticOverflow {
+                operation: "composite decoder-position total",
+            })?;
+        match part.modality() {
+            InputModality::Text => active_modalities.text = true,
+            InputModality::Image => active_modalities.image = true,
+            InputModality::Audio => active_modalities.audio = true,
+            InputModality::Video => active_modalities.video = true,
+            _ => {}
+        }
+        parts.push(plan);
+    }
+    if decoder_positions == 0 {
+        return Err(CapabilityError::UnsupportedInput {
+            architecture: "replicated composite".into(),
+            reason: "prepared input occupies no decoder positions".into(),
+        });
+    }
+    Ok(AdmittedCompositeInput {
+        identity,
+        parts,
+        decoder_positions,
+        active_modalities,
+    })
+}
+
+/// Admits a complete Qwen3-VL request before composite graph execution.
+pub fn admit_qwen_vl_input<Tensor>(
+    args: &QwenVlModelArgs,
+    input: &PreparedModelInput<Tensor>,
+    inspector: &impl PreparedInputInspector<Tensor>,
+) -> Result<AdmittedCompositeInput<QwenVlInputPartPlan>, CapabilityError> {
+    admit_composite_input(input, inspector, |part| {
+        qwen_vl_input_part(args, part, inspector)
+    })
+}
+
+/// Admits a complete conditional Qwen request before composite graph execution.
+pub fn admit_qwen_hybrid_input<Tensor>(
+    args: &ParsedHybridConfig,
+    input: &PreparedModelInput<Tensor>,
+    inspector: &impl PreparedInputInspector<Tensor>,
+) -> Result<AdmittedCompositeInput<QwenHybridInputPartPlan>, CapabilityError> {
+    admit_composite_input(input, inspector, |part| {
+        qwen_hybrid_input_part(args, part, inspector)
+    })
+}
+
+/// Admits a complete Gemma 4 request before composite graph execution.
+pub fn admit_gemma4_input<Tensor>(
+    args: &crate::gemma4::FamilyConfig,
+    input: &PreparedModelInput<Tensor>,
+    inspector: &impl PreparedInputInspector<Tensor>,
+) -> Result<AdmittedCompositeInput<Gemma4InputPartPlan>, CapabilityError> {
+    admit_composite_input(input, inspector, |part| {
+        gemma4_input_part(args, part, inspector)
+    })
+}
+
+/// Admits a complete Inkling request before composite graph execution.
+pub fn admit_inkling_input<Tensor>(
+    args: &crate::inkling::ModelArgs,
+    input: &PreparedModelInput<Tensor>,
+    inspector: &impl PreparedInputInspector<Tensor>,
+) -> Result<AdmittedCompositeInput<InklingInputPartPlan>, CapabilityError> {
+    admit_composite_input(input, inspector, |part| {
+        inkling_input_part(args, part, inspector)
+    })
+}
+
+/// Admits a complete Muse-Glimmer request before composite graph execution.
+pub fn admit_muse_glimmer_input<Tensor>(
+    args: &crate::muse_glimmer::DecoderConfig,
+    input: &PreparedModelInput<Tensor>,
+    inspector: &impl PreparedInputInspector<Tensor>,
+) -> Result<AdmittedCompositeInput<MuseGlimmerInputPartPlan>, CapabilityError> {
+    admit_composite_input(input, inspector, |part| {
+        muse_glimmer_input_part(args, part, inspector)
+    })
 }
 
 fn positive(value: i32, field: &'static str) -> Result<u64, CapabilityError> {
@@ -1900,7 +2078,7 @@ pub fn text_only_input_part<Tensor>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eredu_core::checkpoint::TensorDtype;
+    use eredu_core::{checkpoint::TensorDtype, PreparedInputError};
     use eredu_runtime::PreparedInputPayload as RuntimePayload;
     use serde_json::json;
 
@@ -1959,6 +2137,26 @@ mod tests {
                     "test tensor does not contain bool values".into(),
                 )),
             }
+        }
+    }
+
+    struct ShapeChangingInspector;
+
+    impl PreparedInputInspector<TestTensor> for ShapeChangingInspector {
+        fn identity(&self, tensor: &TestTensor) -> Result<InputTensorIdentity, PreparedInputError> {
+            let mut shape = tensor.shape.clone();
+            *shape
+                .last_mut()
+                .expect("test tensors have non-empty shapes") += 1;
+            InputTensorIdentity::new(tensor.dtype.clone(), shape)
+        }
+
+        fn i32_values(&self, tensor: &TestTensor) -> Result<Vec<i32>, CapabilityError> {
+            TestInspector.i32_values(tensor)
+        }
+
+        fn bool_values(&self, tensor: &TestTensor) -> Result<Vec<bool>, CapabilityError> {
+            TestInspector.bool_values(tensor)
         }
     }
 
@@ -2040,6 +2238,16 @@ mod tests {
             payload,
             metadata,
             extents,
+        )
+        .unwrap()
+    }
+
+    fn prepared_input(
+        parts: impl IntoIterator<Item = TestInputPart>,
+    ) -> PreparedModelInput<TestTensor> {
+        PreparedModelInput::new(
+            parts.into_iter().map(|part| runtime_part(&part)).collect(),
+            |tensor| TestInspector.identity(tensor),
         )
         .unwrap()
     }
@@ -2270,6 +2478,87 @@ mod tests {
         };
         assert!(matches!(
             qwen_hybrid_text_input_part(&args.text, &projected_text),
+            Err(CapabilityError::UnsupportedInput { .. })
+        ));
+    }
+
+    #[test]
+    fn whole_input_admission_preserves_identity_order_and_total_geometry() {
+        let args = qwen_hybrid_args();
+        let input = prepared_input([
+            TestInputPart {
+                modality: InputModality::Text,
+                payload: TestPayload::TokenIds(vec![1, 3]),
+            },
+            TestInputPart {
+                modality: InputModality::Image,
+                payload: TestPayload::Embeddings(vec![1, 4, 16]),
+            },
+            TestInputPart {
+                modality: InputModality::Video,
+                payload: TestPayload::Embeddings(vec![1, 2, 16]),
+            },
+        ]);
+
+        let admitted = admit_qwen_hybrid_input(&args, &input, &TestInspector).unwrap();
+
+        assert_eq!(admitted.identity(), input.identity());
+        assert_eq!(admitted.decoder_positions(), 9);
+        assert_eq!(
+            admitted.active_modalities(),
+            InputModalities {
+                text: true,
+                image: true,
+                audio: false,
+                video: true,
+            }
+        );
+        assert_eq!(
+            admitted.parts(),
+            [
+                QwenHybridInputPartPlan::TextTokens { positions: 3 },
+                QwenHybridInputPartPlan::Projected {
+                    modality: InputModality::Image,
+                    positions: 4,
+                },
+                QwenHybridInputPartPlan::Projected {
+                    modality: InputModality::Video,
+                    positions: 2,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn whole_input_admission_rejects_changed_tensor_identity() {
+        let args = qwen_hybrid_args();
+        let input = prepared_input([TestInputPart {
+            modality: InputModality::Text,
+            payload: TestPayload::TokenIds(vec![1, 3]),
+        }]);
+
+        assert!(matches!(
+            admit_qwen_hybrid_input(&args, &input, &ShapeChangingInspector),
+            Err(CapabilityError::Observation(_))
+        ));
+    }
+
+    #[test]
+    fn whole_input_admission_rejects_an_invalid_later_part() {
+        let args = qwen_hybrid_args();
+        let input = prepared_input([
+            TestInputPart {
+                modality: InputModality::Text,
+                payload: TestPayload::TokenIds(vec![1, 3]),
+            },
+            TestInputPart {
+                modality: InputModality::Audio,
+                payload: TestPayload::Embeddings(vec![1, 2, 16]),
+            },
+        ]);
+
+        assert!(matches!(
+            admit_qwen_hybrid_input(&args, &input, &TestInspector),
             Err(CapabilityError::UnsupportedInput { .. })
         ));
     }
@@ -2563,6 +2852,7 @@ mod tests {
             residual_weight: 1.0,
             rms_norm_eps: 1e-5,
             subsampling_conv_channels: vec![4, 8],
+            output_projection_bias: true,
             weight_quantization: None,
             quantized_weights: None,
             quantized_weight_configs: None,

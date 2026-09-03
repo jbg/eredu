@@ -34,6 +34,7 @@ pub enum GgufMediaProjectorConfig {
 pub struct GgufMediaProjectorPlan {
     model: GgufMediaProjectorConfig,
     checkpoint: GgufCheckpointPlan,
+    primary_tensor_mapping: Vec<eredu_gguf::TranslatedTensorLayout>,
     tensor_mapping: Vec<eredu_gguf::TranslatedTensorLayout>,
 }
 
@@ -46,6 +47,11 @@ impl GgufMediaProjectorPlan {
     /// Exact companion checkpoint schema proven by portable inspection.
     pub const fn checkpoint(&self) -> &GgufCheckpointPlan {
         &self.checkpoint
+    }
+
+    /// Canonical primary-model mapping in the complete composite namespace.
+    pub fn primary_tensor_mapping(&self) -> &[eredu_gguf::TranslatedTensorLayout] {
+        &self.primary_tensor_mapping
     }
 
     /// Canonical physical-to-logical tensor mapping resolved during admission.
@@ -173,10 +179,24 @@ pub(crate) fn resolve_media_projector(
     validate_gguf_plan(projector, &checkpoint)
         .into_loader_result()
         .map_err(|failure| strict_failure("media-projector GGUF", failure))?;
+    let primary_tensor_mapping = match &model {
+        GgufMediaProjectorConfig::Qwen3Vl(model) => primary
+            .translated_outputs(|name| {
+                crate::qwen::vl::translate_text_gguf_weight_name(name, model.text.is_moe())
+            })
+            .map_err(|error| error.to_string())?,
+        GgufMediaProjectorConfig::Qwen3VlPending(model) => primary
+            .translated_outputs(|name| {
+                crate::qwen::vl::translate_text_gguf_weight_name(name, model.text.is_moe())
+            })
+            .map_err(|error| error.to_string())?,
+        _ => primary_plan.tensor_mapping().to_vec(),
+    };
     let tensor_mapping = canonical_projector_mapping(projector, &model)?;
     Ok(GgufMediaProjectorPlan {
         model,
         checkpoint,
+        primary_tensor_mapping,
         tensor_mapping,
     })
 }

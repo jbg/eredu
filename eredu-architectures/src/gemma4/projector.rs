@@ -157,6 +157,7 @@ fn audio_config(
         residual_weight: required_f32(metadata, "clip.audio.residual_weight")?,
         rms_norm_eps: required_f32(metadata, "clip.audio.attention.layer_norm_rms_epsilon")?,
         subsampling_conv_channels: channels,
+        output_projection_bias: true,
         weight_quantization: None,
         quantized_weights: None,
         quantized_weight_configs: None,

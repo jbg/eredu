@@ -10,7 +10,8 @@ use eredu_architectures::{
     decoder, deepseek, execute_routed_gated_product, gemma4, gpt_oss, inkling, kimi_linear, lfm2,
     llama, moshi, muse_glimmer, nemotron_h, qwen,
     replicated_text::{
-        dispatch_replicated_text_architecture, PreparedReplicatedTextArchitecture,
+        dispatch_replicated_text_architecture, CompositeTextArchitectureVisitor,
+        PreparedCompositeTextArchitecture, PreparedReplicatedTextArchitecture,
         ReplicatedTextArchitectureVisitor, ReplicatedTextProfileDispatcher,
     },
     ExpertParameterRecipe, ExpertParameterRole, ExpertRealizationPlan, ExpertResidencyCatalog,
@@ -5879,7 +5880,7 @@ impl LayeredTraversalHook<NumericBackend, moshi::ForwardContext<NumericTensor>, 
         group: usize,
         index: usize,
         _: usize,
-        value: &NumericTensor,
+        value: &mut NumericTensor,
         _: &mut moshi::ForwardContext<NumericTensor>,
         _: &NumericContext,
     ) -> Result<eredu_runtime::LayeredUnitAction, Error> {
@@ -5893,7 +5894,7 @@ impl LayeredTraversalHook<NumericBackend, moshi::ForwardContext<NumericTensor>, 
         &mut self,
         group: usize,
         index: usize,
-        value: &NumericTensor,
+        value: &mut NumericTensor,
         _: &mut moshi::ForwardContext<NumericTensor>,
         _: &NumericContext,
     ) -> Result<(), Error> {
@@ -5915,7 +5916,7 @@ impl LayeredTraversalHook<NumericBackend, moshi::ForwardContext<NumericTensor>, 
     fn after_group(
         &mut self,
         group: usize,
-        _: &NumericTensor,
+        _: &mut NumericTensor,
         forward: &mut moshi::ForwardContext<NumericTensor>,
         _: &NumericContext,
     ) -> Result<(), Error> {
@@ -10421,7 +10422,7 @@ fn inkling_tensor_parallel_size_one_matches_replicated_multimodal_graph() {
             <inkling::LayeredModel<NumericBackend> as LayeredArchitecture<
                 NumericBackend,
                 DeviceState<NumericBackend, NumericHybridLayerState>,
-            >>::build_unit(&parallel_architecture, 1, index, &context)
+            >>::build_unit(&parallel_architecture, 2, index, &context)
             .unwrap()
         })
         .collect::<Vec<_>>();
@@ -10530,7 +10531,7 @@ fn inkling_tp1_tp2_trim_padded_vocab_and_match_replicated_multimodal_graph() {
         &tp1_context,
     )
     .unwrap();
-    let tp1_units = [(0, 0), (0, 1), (0, 2), (0, 3), (1, 0), (1, 1)]
+    let tp1_units = [(0, 0), (0, 1), (0, 2), (0, 3), (2, 0), (2, 1)]
         .into_iter()
         .map(|(group, index)| {
             <inkling::LayeredModel<NumericBackend> as LayeredArchitecture<
@@ -10594,7 +10595,7 @@ fn inkling_tp1_tp2_trim_padded_vocab_and_match_replicated_multimodal_graph() {
                         args, geometry, &context,
                     )
                     .unwrap();
-                    let addresses = [(0, 0), (0, 1), (0, 2), (0, 3), (1, 0), (1, 1)];
+                    let addresses = [(0, 0), (0, 1), (0, 2), (0, 3), (2, 0), (2, 1)];
                     let units = addresses
                         .into_iter()
                         .map(|(group, index)| {
@@ -10817,7 +10818,7 @@ fn real_multimodal_model_matches_resident_and_dense_streamed_traversal() {
     );
     assert_eq!(
         streamed.policy().events,
-        expected_stream_events(&[(0, 0), (0, 1), (0, 2), (0, 3), (1, 0)])
+        expected_stream_events(&[(0, 0), (0, 1), (0, 2), (0, 3), (2, 0)])
     );
     assert_eq!(streamed_state.layer(0).unwrap().position(), 3);
     assert_eq!(resident_state.layer(0).unwrap().position(), 3);
@@ -12346,7 +12347,7 @@ fn numeric_text_output(output: NumericTensor) -> Result<NumericTensor, Error> {
 
 impl<A> ReplicatedTextSessionMechanisms<A, NumericBackend> for NumericReplicatedMechanisms
 where
-    A: eredu_runtime::ReplicatedTextArchitecture<
+    A: eredu_runtime::LayeredArchitecture<
         NumericBackend,
         DeviceState<NumericBackend, NumericHybridLayerState>,
         Error = Error,
@@ -12491,6 +12492,377 @@ where
         _: &NumericContext,
     ) -> Result<(), Self::Error> {
         Ok(())
+    }
+}
+
+struct NumericInputInspector;
+
+impl eredu_runtime::PreparedInputInspector<NumericTensor> for NumericInputInspector {
+    fn identity(
+        &self,
+        tensor: &NumericTensor,
+    ) -> Result<eredu_core::InputTensorIdentity, eredu_core::PreparedInputError> {
+        eredu_core::InputTensorIdentity::new(
+            eredu_core::checkpoint::TensorDtype::F32,
+            tensor
+                .shape()
+                .iter()
+                .map(|dimension| usize::try_from(*dimension).unwrap())
+                .collect(),
+        )
+    }
+
+    fn i32_values(&self, tensor: &NumericTensor) -> Result<Vec<i32>, eredu_core::CapabilityError> {
+        Ok(tensor.data.iter().map(|value| *value as i32).collect())
+    }
+
+    fn bool_values(
+        &self,
+        tensor: &NumericTensor,
+    ) -> Result<Vec<bool>, eredu_core::CapabilityError> {
+        Ok(tensor.data.iter().map(|value| *value != 0.0).collect())
+    }
+}
+
+#[derive(Default)]
+struct NumericProcessorMechanisms {
+    normalizations: usize,
+    tensors: usize,
+}
+
+impl eredu_runtime::PreparedInputInspector<NumericTensor> for NumericProcessorMechanisms {
+    fn identity(
+        &self,
+        tensor: &NumericTensor,
+    ) -> Result<eredu_core::InputTensorIdentity, eredu_core::PreparedInputError> {
+        eredu_runtime::PreparedInputInspector::identity(&NumericInputInspector, tensor)
+    }
+
+    fn i32_values(&self, tensor: &NumericTensor) -> Result<Vec<i32>, eredu_core::CapabilityError> {
+        Ok(tensor.data.iter().map(|value| *value as i32).collect())
+    }
+
+    fn bool_values(
+        &self,
+        tensor: &NumericTensor,
+    ) -> Result<Vec<bool>, eredu_core::CapabilityError> {
+        Ok(tensor.data.iter().map(|value| *value != 0.0).collect())
+    }
+}
+
+impl eredu_architectures::processor_execution::ProcessorMechanisms for NumericProcessorMechanisms {
+    type Tensor = NumericTensor;
+    type Error = String;
+
+    fn normalize_rgb(
+        &mut self,
+        image: &eredu_core::RgbImage,
+        plan: eredu_architectures::processor_plan::RgbTransformPlan,
+    ) -> Result<eredu_architectures::processor_execution::NormalizedRgb, Self::Error> {
+        self.normalizations += 1;
+        let mut values = vec![0.0; plan.width * plan.height * 3];
+        for y in 0..plan.height {
+            for x in 0..plan.width {
+                let source_y = y * image.height() as usize / plan.height;
+                let source_x = x * image.width() as usize / plan.width;
+                for channel in 0..3 {
+                    let raw = image.pixels()
+                        [(source_y * image.width() as usize + source_x) * 3 + channel]
+                        as f32;
+                    values[(channel * plan.height + y) * plan.width + x] =
+                        (raw * plan.rescale_factor - plan.mean[channel]) / plan.std[channel];
+                }
+            }
+        }
+        eredu_architectures::processor_execution::NormalizedRgb::new(
+            values,
+            plan.width,
+            plan.height,
+        )
+    }
+
+    fn tensor_u32(&mut self, values: &[u32], shape: &[usize]) -> Result<Self::Tensor, Self::Error> {
+        self.tensors += 1;
+        Ok(NumericTensor::new(
+            shape.iter().map(|value| *value as i32).collect::<Vec<_>>(),
+            values.iter().map(|value| *value as f32).collect(),
+        ))
+    }
+
+    fn tensor_f32(&mut self, values: &[f32], shape: &[usize]) -> Result<Self::Tensor, Self::Error> {
+        self.tensors += 1;
+        Ok(NumericTensor::new(
+            shape.iter().map(|value| *value as i32).collect::<Vec<_>>(),
+            values.to_vec(),
+        ))
+    }
+
+    fn tensor_i32(&mut self, values: &[i32], shape: &[usize]) -> Result<Self::Tensor, Self::Error> {
+        self.tensors += 1;
+        Ok(NumericTensor::new(
+            shape.iter().map(|value| *value as i32).collect::<Vec<_>>(),
+            values.iter().map(|value| *value as f32).collect(),
+        ))
+    }
+}
+
+struct NumericCompositeVisitor<'a> {
+    context: &'a NumericContext,
+    input: &'a eredu_runtime::PreparedModelInput<NumericTensor>,
+    construction_started: bool,
+    addressable: bool,
+    observer: Option<std::rc::Rc<std::cell::RefCell<CompositeObservation>>>,
+}
+
+#[derive(Default)]
+struct CompositeObservation {
+    paths: Vec<String>,
+    replace_vision_projector: bool,
+    merged_values: Vec<f32>,
+    replacement_applied: bool,
+    merge_after_replacement: bool,
+}
+
+impl eredu_runtime::ActivationObserver<NumericTensor, Error> for CompositeObservation {
+    fn observe(&mut self, path: &str, value: &NumericTensor) -> Result<(), Error> {
+        self.paths.push(path.to_owned());
+        if path == eredu_core::MODALITY_MERGE_OUTPUT_OBSERVATION_PATH {
+            self.merged_values = value.data.clone();
+            self.merge_after_replacement = self.replacement_applied;
+        }
+        Ok(())
+    }
+
+    fn intervene(
+        &mut self,
+        path: &str,
+        value: &NumericTensor,
+    ) -> Result<Option<NumericTensor>, Error> {
+        if self.replace_vision_projector
+            && path == eredu_core::VISION_PROJECTOR_OUTPUT_OBSERVATION_PATH
+        {
+            self.replacement_applied = true;
+            Ok(Some(NumericTensor::new(
+                value.shape.clone(),
+                vec![0.75; value.data.len()],
+            )))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+impl<'a>
+    CompositeTextArchitectureVisitor<
+        NumericBackend,
+        DeviceState<NumericBackend, NumericHybridLayerState>,
+    > for NumericCompositeVisitor<'a>
+{
+    type Output = NumericReplicatedRun;
+    type Error = String;
+
+    fn construction_started(&mut self) {
+        self.construction_started = true;
+    }
+
+    fn visit<A>(
+        self,
+        prepared: PreparedCompositeTextArchitecture<A, A::AdmissionConfig>,
+        _: eredu_checkpoint::store::SharedCheckpointSource,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        A: eredu_architectures::composite_execution::CompositeArchitecture<
+                NumericBackend,
+                DeviceState<NumericBackend, NumericHybridLayerState>,
+                Error = Error,
+            > + eredu_runtime::RoutedLayeredArchitecture<
+                NumericBackend,
+                DeviceState<NumericBackend, NumericHybridLayerState>,
+            > + 'static,
+        A::InputPartPlan: 'static,
+        A::StaticModules: Clone,
+        A::Error: std::fmt::Display,
+    {
+        assert!(self.construction_started);
+        let layout = prepared.requirements().state_layout().clone();
+        let (architecture, source_architecture, contract, _, admission) = prepared.into_parts();
+        let mut session = construct_replicated_text_session::<_, NumericBackend, _>(
+            architecture,
+            source_architecture,
+            contract,
+            NumericReplicatedMechanisms,
+            self.context,
+        )
+        .map_err(|error| error.to_string())?;
+        let admitted = A::admit_prepared_input(&admission, self.input, &NumericInputInspector)
+            .map_err(|error| error.to_string())?;
+        let paired = eredu_architectures::composite_execution::PreparedCompositeInput::new(
+            self.input, &admitted,
+        )?;
+        let first = match &self.observer {
+            Some(observer) => session
+                .prefill_input_with_observer(paired, self.context, &mut *observer.borrow_mut())
+                .map_err(|error| error.to_string())?,
+            None => session
+                .prefill_input(paired, self.context)
+                .map_err(|error| error.to_string())?,
+        };
+        let mut outputs = vec![first];
+        for token in [4, 5] {
+            let part = eredu_runtime::PreparedInputPart::new(
+                eredu_core::InputModality::Text,
+                eredu_runtime::PreparedInputPayload::TokenIds(NumericTensor::token_ids(&[token])),
+                [],
+            )
+            .map_err(|error| error.to_string())?;
+            let input = eredu_runtime::PreparedModelInput::new(vec![part], |tensor| {
+                eredu_runtime::PreparedInputInspector::identity(&NumericInputInspector, tensor)
+            })
+            .map_err(|error| error.to_string())?;
+            let admitted = A::admit_prepared_input(&admission, &input, &NumericInputInspector)
+                .map_err(|error| error.to_string())?;
+            let paired = eredu_architectures::composite_execution::PreparedCompositeInput::new(
+                &input, &admitted,
+            )?;
+            outputs.push(
+                session
+                    .decode_input(paired, self.context)
+                    .map_err(|error| error.to_string())?,
+            );
+        }
+        let state = session
+            .report()
+            .map_err(|error| error.to_string())?
+            .state_report()
+            .clone();
+        assert_eq!(state.layout(), &layout);
+        Ok(NumericReplicatedRun {
+            outputs,
+            state,
+            bank_report: None,
+        })
+    }
+
+    fn visit_routed<A>(
+        self,
+        prepared: eredu_architectures::replicated_text::PreparedRoutedCompositeTextArchitecture<
+            A,
+            A::AdmissionConfig,
+        >,
+        _: eredu_checkpoint::store::SharedCheckpointSource,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        A: eredu_architectures::composite_execution::CompositeArchitecture<
+                NumericBackend,
+                DeviceState<NumericBackend, NumericHybridLayerState>,
+                Error = Error,
+            > + eredu_runtime::RoutedLayeredArchitecture<
+                NumericBackend,
+                DeviceState<NumericBackend, NumericHybridLayerState>,
+            > + 'static,
+        A::InputPartPlan: 'static,
+        A::StaticModules: Clone,
+        A::Error: std::fmt::Display,
+    {
+        assert!(self.construction_started);
+        let layout = prepared.requirements().state_layout().clone();
+        let (routed, _, admission) = prepared.into_parts();
+        macro_rules! run_session {
+            ($session:expr) => {{
+                let mut session = $session;
+                let admitted =
+                    A::admit_prepared_input(&admission, self.input, &NumericInputInspector)
+                        .map_err(|error| error.to_string())?;
+                let paired = eredu_architectures::composite_execution::PreparedCompositeInput::new(
+                    self.input, &admitted,
+                )?;
+                let first = match &self.observer {
+                    Some(observer) => session
+                        .prefill_input_with_observer(
+                            paired,
+                            self.context,
+                            &mut *observer.borrow_mut(),
+                        )
+                        .map_err(|error| error.to_string())?,
+                    None => session
+                        .prefill_input(paired, self.context)
+                        .map_err(|error| error.to_string())?,
+                };
+                let mut outputs = vec![first];
+                for token in [4, 5] {
+                    let part = eredu_runtime::PreparedInputPart::new(
+                        eredu_core::InputModality::Text,
+                        eredu_runtime::PreparedInputPayload::TokenIds(NumericTensor::token_ids(&[
+                            token,
+                        ])),
+                        [],
+                    )
+                    .map_err(|error| error.to_string())?;
+                    let input = eredu_runtime::PreparedModelInput::new(vec![part], |tensor| {
+                        eredu_runtime::PreparedInputInspector::identity(
+                            &NumericInputInspector,
+                            tensor,
+                        )
+                    })
+                    .map_err(|error| error.to_string())?;
+                    let admitted =
+                        A::admit_prepared_input(&admission, &input, &NumericInputInspector)
+                            .map_err(|error| error.to_string())?;
+                    let paired =
+                        eredu_architectures::composite_execution::PreparedCompositeInput::new(
+                            &input, &admitted,
+                        )?;
+                    outputs.push(
+                        session
+                            .decode_input(paired, self.context)
+                            .map_err(|error| error.to_string())?,
+                    );
+                }
+                let state = session
+                    .report()
+                    .map_err(|error| error.to_string())?
+                    .state_report()
+                    .clone();
+                assert_eq!(state.layout(), &layout);
+                (outputs, state, session)
+            }};
+        }
+        if self.addressable {
+            let bank = numeric_addressable_gated_bank(
+                routed.plan(),
+                routed.catalog(),
+                routed.routes_per_token(),
+                self.context,
+            )?;
+            let session = routed.construct_addressable_session::<NumericBackend, _, _, _>(
+                NumericReplicatedMechanisms,
+                bank,
+                NumericIndexedMovement,
+                self.context,
+            )?;
+            let (outputs, state, session) = run_session!(session);
+            let report = session
+                .execution_strategy()
+                .provider()
+                .bank_report()
+                .map_err(|error| error.to_string())?;
+            Ok(NumericReplicatedRun {
+                outputs,
+                state,
+                bank_report: Some(report),
+            })
+        } else {
+            let session = routed.construct_resident_session::<NumericBackend, _>(
+                NumericReplicatedMechanisms,
+                self.context,
+            )?;
+            let (outputs, state, _) = run_session!(session);
+            Ok(NumericReplicatedRun {
+                outputs,
+                state,
+                bank_report: None,
+            })
+        }
     }
 }
 
@@ -12644,8 +13016,12 @@ impl<'a>
         }
 
         if self.addressable {
-            let bank =
-                numeric_addressable_gated_bank(prepared.plan(), prepared.catalog(), self.context)?;
+            let bank = numeric_addressable_gated_bank(
+                prepared.plan(),
+                prepared.catalog(),
+                prepared.routes_per_token(),
+                self.context,
+            )?;
             let session = prepared.construct_addressable_session::<NumericBackend, _, _, _>(
                 NumericReplicatedMechanisms,
                 bank,
@@ -12681,16 +13057,20 @@ impl<'a>
 fn numeric_addressable_gated_bank(
     plan: &ExpertRealizationPlan<GroupedGatedProductSpec>,
     catalog: &ExpertResidencyCatalog,
+    capacity: usize,
     context: &NumericContext,
 ) -> Result<NumericGroupedBankMechanism, String> {
     let mut full_banks = BTreeMap::<(String, usize), NumericExpertBank>::new();
     let mut banks = BTreeMap::new();
     let mut bytes = BTreeMap::new();
     for unit in catalog.units() {
-        let address = (unit.owner_group().as_str().to_owned(), unit.owner_unit());
+        let address = (
+            unit.owner_group().as_str().to_owned(),
+            unit.identity().unit(),
+        );
         if !full_banks.contains_key(&address) {
             let spec = plan
-                .unit_spec(unit.owner_group().as_str(), unit.owner_unit())
+                .unit_spec(unit.owner_group().as_str(), unit.identity().unit())
                 .ok_or_else(|| format!("numeric addressable unit {address:?} has no plan"))?;
             full_banks.insert(
                 address.clone(),
@@ -12726,7 +13106,7 @@ fn numeric_addressable_gated_bank(
         bytes,
         report: NumericBankReport::default(),
         resident: Vec::new(),
-        capacity: 1,
+        capacity,
     })
 }
 
@@ -13135,7 +13515,7 @@ fn execute_numeric_routed_visitor(
             .max()
             .expect("routed catalog has exact member geometry");
         let options = eredu_runtime::ParameterBankLoadOptions::new(
-            eredu_core::residency::OffloadConfig::new(Some(member_bytes), Some(member_bytes), 1)
+            eredu_core::residency::OffloadConfig::new(Some(member_bytes), Some(member_bytes), 2)
                 .unwrap(),
             member_bytes.checked_mul(2).unwrap(),
             member_bytes,
@@ -13191,6 +13571,1299 @@ fn execute_numeric_routed_visitor(
         )
         .unwrap()
     }
+}
+
+fn execute_numeric_composite_visitor(
+    config: &serde_json::Value,
+    input: &eredu_runtime::PreparedModelInput<NumericTensor>,
+    context: &NumericContext,
+    addressable: bool,
+) -> NumericReplicatedRun {
+    execute_numeric_composite_visitor_with_observer(config, input, context, addressable, None)
+}
+
+fn execute_numeric_composite_visitor_with_observer(
+    config: &serde_json::Value,
+    input: &eredu_runtime::PreparedModelInput<NumericTensor>,
+    context: &NumericContext,
+    addressable: bool,
+    observer: Option<std::rc::Rc<std::cell::RefCell<CompositeObservation>>>,
+) -> NumericReplicatedRun {
+    use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
+
+    let artifact = tempfile::tempdir().unwrap();
+    std::fs::write(
+        artifact.path().join("config.json"),
+        serde_json::to_vec(config).unwrap(),
+    )
+    .unwrap();
+    let resolved = eredu_architectures::configuration::MODEL_CONFIGURATIONS
+        .resolve_safetensors(config)
+        .unwrap();
+    let checkpoint = resolved
+        .architecture_plan()
+        .safetensors_architecture()
+        .unwrap()
+        .checkpoint();
+    let mut constraints = checkpoint.common_tensors.iter().collect::<Vec<_>>();
+    constraints.extend(
+        checkpoint
+            .layout_groups
+            .iter()
+            .filter(|group| group.required)
+            .filter_map(|group| group.variants.first())
+            .flat_map(|variant| variant.tensors.iter()),
+    );
+    let mut tensors = BTreeMap::<String, (Vec<usize>, Vec<u8>)>::new();
+    for constraint in constraints.into_iter().filter(|constraint| {
+        constraint.requirement == eredu_checkpoint::schema::TensorRequirement::Required
+    }) {
+        tensors.entry(constraint.key.clone()).or_insert_with(|| {
+            (
+                constraint.shape.clone(),
+                vec![0_u8; constraint.shape.iter().product::<usize>() * 4],
+            )
+        });
+    }
+    let views = tensors
+        .iter()
+        .map(|(name, (shape, bytes))| {
+            (
+                name.as_str(),
+                TensorView::new(Dtype::F32, shape.clone(), bytes.as_slice()).unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    serialize_to_file(views, None, &artifact.path().join("model.safetensors")).unwrap();
+
+    let inspection = eredu_architectures::configuration::inspect_artifact(artifact.path()).unwrap();
+    let requirements =
+        eredu_architectures::replicated_text::composite_text_requirements(&inspection).unwrap();
+    let lowerings = requirements
+        .execution()
+        .parameters()
+        .iter()
+        .filter(|parameter| parameter.has_lowering_source())
+        .map(|parameter| {
+            let kind = if matches!(
+                parameter.presence(),
+                eredu_runtime::ReplicatedTextParameterPresence::Derived { .. }
+            ) {
+                eredu_runtime::WeightLoweringKind::Derived
+            } else {
+                eredu_runtime::WeightLoweringKind::Direct
+            };
+            eredu_runtime::WeightLoweringCapability::new(
+                parameter
+                    .lowering_descriptor(parameter.native_executable())
+                    .unwrap(),
+                kind,
+            )
+        })
+        .collect();
+    let state = eredu_runtime::StateMechanismCapabilities::new(
+        (0..requirements.state_layout().len()).flat_map(|layer| {
+            requirements
+                .state_layout()
+                .components(layer)
+                .unwrap()
+                .iter()
+                .cloned()
+                .map(move |component| {
+                    eredu_runtime::StateComponentMechanism::new(
+                        layer,
+                        component,
+                        Some(eredu_runtime::StateComponentPlacement::Device),
+                        None,
+                    )
+                })
+        }),
+    )
+    .with_transactions(true, true)
+    .with_reset(true);
+    let mut capabilities = eredu_runtime::BackendMechanismCapabilities::new(
+        eredu_nn::NeuralOperatorCapabilities::ALL,
+        lowerings,
+        vec![eredu_runtime::WeightResidencyMechanism::Resident],
+        state,
+    )
+    .with_grouped_operations([
+        eredu_runtime::GroupedOperationRequirement::GatedProduct,
+        eredu_runtime::GroupedOperationRequirement::GatedProductTensorParallelPartial,
+        eredu_runtime::GroupedOperationRequirement::Relu2,
+        eredu_runtime::GroupedOperationRequirement::Relu2TensorParallelPartial,
+    ]);
+    if addressable {
+        capabilities = capabilities
+            .with_indexed_movement(true)
+            .with_addressable_storage(eredu_runtime::AddressableStorageCapabilities::new(
+                true,
+                true,
+                true,
+                u64::MAX,
+            ));
+    }
+    let execution_request = eredu_runtime::ReplicatedTextSelectionRequest::new(
+        eredu_runtime::LayerWeightResidency::FullyResident,
+        eredu_runtime::CacheResidencyPolicy::Device,
+    );
+    let processor_request = eredu_runtime::ProcessorSelectionRequest::new(
+        input.parts().iter().map(|part| part.modality()),
+    )
+    .with_prepared_tensors(true)
+    .with_projected_modalities(input.parts().iter().filter_map(|part| {
+        matches!(
+            part.payload(),
+            eredu_runtime::PreparedInputPayload::Embeddings(_)
+        )
+        .then_some(part.modality())
+    }));
+    let processor_capabilities = eredu_runtime::MediaPrimitiveCapabilities::new(
+        [],
+        [
+            eredu_core::InputModality::Text,
+            eredu_core::InputModality::Image,
+            eredu_core::InputModality::Video,
+            eredu_core::InputModality::Audio,
+        ],
+        [
+            eredu_core::InputModality::Text,
+            eredu_core::InputModality::Image,
+            eredu_core::InputModality::Video,
+            eredu_core::InputModality::Audio,
+        ],
+        [],
+        i32::MAX as u64,
+    );
+    let weights = if addressable {
+        let routed = requirements
+            .routed_execution()
+            .expect("addressable composite test requires routed requirements");
+        let member_bytes = routed
+            .catalog()
+            .units()
+            .iter()
+            .filter_map(ExpertResidencyUnit::byte_len)
+            .max()
+            .unwrap();
+        let options = eredu_runtime::ParameterBankLoadOptions::new(
+            eredu_core::residency::OffloadConfig::new(Some(member_bytes), Some(member_bytes), 2)
+                .unwrap(),
+            member_bytes.checked_mul(2).unwrap(),
+            member_bytes,
+        )
+        .unwrap();
+        eredu_runtime::WeightResidency::with_independent_parameter_banks(
+            eredu_runtime::OrdinaryWeightResidency::FullyResident,
+            options,
+        )
+    } else {
+        eredu_runtime::WeightResidency::fully_resident()
+    };
+    let selected = eredu_architectures::replicated_text::select_composite_text_realization(
+        &requirements,
+        &execution_request,
+        weights,
+        &processor_request,
+        &capabilities,
+        &processor_capabilities,
+    )
+    .unwrap();
+    let store: eredu_checkpoint::store::SharedCheckpointSource = std::sync::Arc::new(
+        eredu_checkpoint::store::SafetensorsWeightStore::open(artifact.path()).unwrap(),
+    );
+    eredu_architectures::replicated_text::visit_composite_text_architecture::<
+        NumericBackend,
+        DeviceState<NumericBackend, NumericHybridLayerState>,
+        _,
+    >(
+        requirements,
+        selected,
+        store,
+        context,
+        NumericCompositeVisitor {
+            context,
+            input,
+            construction_started: false,
+            addressable,
+            observer,
+        },
+    )
+    .unwrap()
+}
+
+fn prepare_numeric_qwen_image_request(
+    config: &serde_json::Value,
+) -> (
+    eredu_runtime::PreparedModelInput<NumericTensor>,
+    NumericProcessorMechanisms,
+) {
+    use std::convert::Infallible;
+
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path()
+            .join(eredu_architectures::processor_plan::PROCESSOR_CONFIG_FILENAME),
+        br#"{
+            "size":{"shortest_edge":4,"longest_edge":4},
+            "patch_size":2,"temporal_patch_size":2,"merge_size":2,
+            "image_mean":[0.0,0.0,0.0],"image_std":[1.0,1.0,1.0]
+        }"#,
+    )
+    .unwrap();
+    let (configuration, resolved) = eredu_architectures::configuration::MODEL_CONFIGURATIONS
+        .resolve_safetensors(config)
+        .unwrap()
+        .into_parts();
+    let checkpoint = resolved.safetensors_architecture().unwrap().checkpoint();
+    let constraints = checkpoint
+        .common_tensors
+        .iter()
+        .chain(
+            checkpoint
+                .layout_groups
+                .iter()
+                .filter(|group| group.required)
+                .filter_map(|group| group.variants.first())
+                .flat_map(|variant| variant.tensors.iter()),
+        )
+        .filter(|tensor| {
+            tensor.requirement == eredu_checkpoint::schema::TensorRequirement::Required
+        })
+        .map(|tensor| {
+            (
+                tensor.key.clone(),
+                eredu_core::checkpoint::TensorDescriptor {
+                    name: tensor.key.clone(),
+                    shape: tensor.shape.clone(),
+                    dtype: eredu_core::checkpoint::TensorDtype::F32,
+                    storage: None,
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let catalog = eredu_core::checkpoint::TensorCatalog::new(constraints.into_values()).unwrap();
+    let architecture_plan = eredu_architectures::configuration::MODEL_CONFIGURATIONS
+        .artifact_plan(
+            root.path(),
+            eredu_core::ArtifactFormat::SafeTensors,
+            &configuration,
+            &catalog,
+            None,
+            resolved,
+        )
+        .unwrap();
+    let processor = eredu_architectures::processor_execution::PreparedProcessor::from_artifact(
+        &architecture_plan,
+    )
+    .unwrap();
+    let request = eredu_core::MultimodalRequest::new(vec![
+        eredu_core::MultimodalSegment::TokenIds(vec![1, 2]),
+        eredu_core::MultimodalSegment::Media(eredu_core::Media::Image(
+            eredu_core::RgbImage::new((0..48).map(|value| value as u8).collect(), 4, 4).unwrap(),
+        )),
+    ])
+    .unwrap()
+    .tokenize::<Infallible>(|_| unreachable!())
+    .unwrap();
+    let mut mechanisms = NumericProcessorMechanisms::default();
+    let prepared = processor
+        .prepare(&request, &mut mechanisms, &mut |_| {
+            Ok::<_, Infallible>(Vec::new())
+        })
+        .unwrap();
+    (prepared, mechanisms)
+}
+
+#[test]
+fn non_mlx_composite_session_runs_image_prefill_and_repeated_text_decode() {
+    let config = serde_json::json!({
+        "model_type": "qwen3_vl", "image_token_id": 5, "video_token_id": 6,
+        "vision_start_token_id": 3, "vision_end_token_id": 4,
+        "tie_word_embeddings": false,
+        "text_config": {
+            "model_type": "qwen3_vl_text", "hidden_size": 16,
+            "num_hidden_layers": 1, "intermediate_size": 10,
+            "num_attention_heads": 2, "num_key_value_heads": 2, "head_dim": 8,
+            "rms_norm_eps": 0.000001, "vocab_size": 7,
+            "max_position_embeddings": 64, "rope_theta": 1000000.0,
+            "rope_scaling": {"mrope_section": [1, 1, 2], "mrope_interleaved": true}
+        },
+        "vision_config": {
+            "depth": 1, "hidden_size": 8, "intermediate_size": 10,
+            "num_heads": 2, "num_position_embeddings": 16,
+            "in_channels": 3, "patch_size": 2, "spatial_merge_size": 2,
+            "temporal_patch_size": 2, "out_hidden_size": 16,
+            "deepstack_visual_indexes": []
+        }
+    });
+    let (input, processor_counts) = prepare_numeric_qwen_image_request(&config);
+    assert_eq!(processor_counts.normalizations, 1);
+    assert_eq!(processor_counts.tensors, 5);
+    let text = NumericTensor::token_ids(&[1, 2]);
+    let vision_start = NumericTensor::token_ids(&[3]);
+    let vision_end = NumericTensor::token_ids(&[4]);
+    let pixels = input.parts()[2].payload().value().clone();
+    let context = NumericContext::default();
+    let actual = execute_numeric_composite_visitor(&config, &input, &context, false);
+    let observation = std::rc::Rc::new(std::cell::RefCell::new(CompositeObservation {
+        replace_vision_projector: true,
+        ..Default::default()
+    }));
+    let _ = execute_numeric_composite_visitor_with_observer(
+        &config,
+        &input,
+        &context,
+        false,
+        Some(std::rc::Rc::clone(&observation)),
+    );
+    let observation = observation.borrow();
+    assert!(observation
+        .paths
+        .iter()
+        .any(|path| path == eredu_core::VISION_PROJECTOR_OUTPUT_OBSERVATION_PATH));
+    assert!(observation
+        .paths
+        .iter()
+        .any(|path| path == eredu_core::MODALITY_MERGE_OUTPUT_OBSERVATION_PATH));
+    assert!(observation.replacement_applied);
+    assert!(observation.merge_after_replacement);
+    assert!(observation
+        .merged_values
+        .iter()
+        .any(|value| (*value - 0.75).abs() < f32::EPSILON));
+
+    let args = qwen::vl::model_args_from_config_value(&config).unwrap();
+    let architecture = qwen::vl::LayeredModel::<NumericBackend>::new(args, &context).unwrap();
+    let units = [
+        <qwen::vl::LayeredModel<NumericBackend> as LayeredArchitecture<
+            NumericBackend,
+            DeviceState<NumericBackend, NumericHybridLayerState>,
+        >>::build_unit(&architecture, 0, 0, &context)
+        .unwrap(),
+        <qwen::vl::LayeredModel<NumericBackend> as LayeredArchitecture<
+            NumericBackend,
+            DeviceState<NumericBackend, NumericHybridLayerState>,
+        >>::build_unit(&architecture, 1, 0, &context)
+        .unwrap(),
+    ];
+    let mut state = DeviceState::create(architecture.state_layout().unwrap(), |_, policy| {
+        Ok::<_, Error>(NumericHybridLayerState::new(policy))
+    })
+    .unwrap();
+    let mut runtime = LayerwiseRuntime::new(
+        architecture,
+        ResidentUnitWindow::new(units.into_iter().collect()),
+    );
+    let image_tokens = NumericTensor::token_ids(&[5]);
+    let grids = [(1, 2, 2)];
+    let parts = [
+        qwen::vl::InputPart::Text(&text),
+        qwen::vl::InputPart::Text(&vision_start),
+        qwen::vl::InputPart::Image {
+            tokens: &image_tokens,
+            grid: &grids,
+        },
+        qwen::vl::InputPart::Text(&vision_end),
+    ];
+    let mut expected = vec![numeric_text_output(
+        runtime
+            .forward(
+                qwen::vl::ModelInput {
+                    parts: &parts,
+                    pixels: Some(&pixels),
+                    mask: None,
+                },
+                &mut state,
+                &context,
+            )
+            .unwrap(),
+    )
+    .unwrap()];
+    for token in [4, 5] {
+        let tokens = NumericTensor::token_ids(&[token]);
+        let parts = [qwen::vl::InputPart::Text(&tokens)];
+        expected.push(
+            numeric_text_output(
+                runtime
+                    .forward(
+                        qwen::vl::ModelInput {
+                            parts: &parts,
+                            pixels: None,
+                            mask: None,
+                        },
+                        &mut state,
+                        &context,
+                    )
+                    .unwrap(),
+            )
+            .unwrap(),
+        );
+    }
+    assert_eq!(actual.outputs.len(), 3);
+    for (step, (actual, expected)) in actual.outputs.iter().zip(&expected).enumerate() {
+        assert_tensor_exact(actual, expected, &format!("composite Qwen step {step}"));
+    }
+    assert_state_exact(
+        &actual.state,
+        &state,
+        1,
+        "composite Qwen repeated-decode state",
+    );
+}
+
+#[test]
+fn non_mlx_composite_preserves_video_and_projected_part_order() {
+    let config = serde_json::json!({
+        "model_type": "qwen3_vl", "image_token_id": 5, "video_token_id": 6,
+        "tie_word_embeddings": false,
+        "text_config": {
+            "model_type": "qwen3_vl_text", "hidden_size": 16,
+            "num_hidden_layers": 1, "intermediate_size": 10,
+            "num_attention_heads": 2, "num_key_value_heads": 2, "head_dim": 8,
+            "rms_norm_eps": 0.000001, "vocab_size": 7,
+            "max_position_embeddings": 64, "rope_theta": 1000000.0,
+            "rope_scaling": {"mrope_section": [1, 1, 2], "mrope_interleaved": true}
+        },
+        "vision_config": {
+            "depth": 1, "hidden_size": 8, "intermediate_size": 10,
+            "num_heads": 2, "num_position_embeddings": 16,
+            "in_channels": 3, "patch_size": 2, "spatial_merge_size": 2,
+            "temporal_patch_size": 2, "out_hidden_size": 16,
+            "deepstack_visual_indexes": []
+        }
+    });
+    let text = NumericTensor::token_ids(&[1, 2]);
+    let pixels = NumericTensor::new(
+        [4, 24],
+        (0..96).map(|index| (index as f32 - 48.0) / 100.0).collect(),
+    );
+    let projected = NumericTensor::new(
+        [1, 1, 16],
+        (0..16).map(|index| (index as f32 - 8.0) / 16.0).collect(),
+    );
+    let input = eredu_runtime::PreparedModelInput::new(
+        vec![
+            eredu_runtime::PreparedInputPart::new(
+                eredu_core::InputModality::Text,
+                eredu_runtime::PreparedInputPayload::TokenIds(text.clone()),
+                [],
+            )
+            .unwrap(),
+            eredu_runtime::PreparedInputPart::new_with_extents(
+                eredu_core::InputModality::Video,
+                eredu_runtime::PreparedInputPayload::Tensor(pixels.clone()),
+                [(
+                    eredu_core::InputMetadataKey::PatchGrid,
+                    NumericTensor::new([1, 3], vec![1.0, 2.0, 2.0]),
+                )],
+                [eredu_core::InputExtent::PatchGrid {
+                    time: 1,
+                    height: 2,
+                    width: 2,
+                }],
+            )
+            .unwrap(),
+            eredu_runtime::PreparedInputPart::new(
+                eredu_core::InputModality::Text,
+                eredu_runtime::PreparedInputPayload::Embeddings(projected.clone()),
+                [],
+            )
+            .unwrap(),
+        ],
+        |tensor| eredu_runtime::PreparedInputInspector::identity(&NumericInputInspector, tensor),
+    )
+    .unwrap();
+    let context = NumericContext::default();
+    let actual = execute_numeric_composite_visitor(&config, &input, &context, false);
+
+    let args = qwen::vl::model_args_from_config_value(&config).unwrap();
+    let architecture = qwen::vl::LayeredModel::<NumericBackend>::new(args, &context).unwrap();
+    let mut state = DeviceState::create(architecture.state_layout().unwrap(), |_, policy| {
+        Ok::<_, Error>(NumericHybridLayerState::new(policy))
+    })
+    .unwrap();
+    let mut runtime = ResidentRuntime::new(architecture, &context).unwrap();
+    let video_tokens = NumericTensor::token_ids(&[6]);
+    let projected_tokens = NumericTensor::token_ids(&[0]);
+    let grids = [(1, 2, 2)];
+    let parts = [
+        qwen::vl::InputPart::Text(&text),
+        qwen::vl::InputPart::Video {
+            tokens: &video_tokens,
+            grid: &grids,
+        },
+        qwen::vl::InputPart::Projected {
+            tokens: &projected_tokens,
+            embeddings: &projected,
+        },
+    ];
+    let mut expected = vec![numeric_text_output(
+        runtime
+            .forward(
+                qwen::vl::ModelInput {
+                    parts: &parts,
+                    pixels: Some(&pixels),
+                    mask: None,
+                },
+                &mut state,
+                &context,
+            )
+            .unwrap(),
+    )
+    .unwrap()];
+    for token in [4, 5] {
+        let tokens = NumericTensor::token_ids(&[token]);
+        let parts = [qwen::vl::InputPart::Text(&tokens)];
+        expected.push(
+            numeric_text_output(
+                runtime
+                    .forward(
+                        qwen::vl::ModelInput {
+                            parts: &parts,
+                            pixels: None,
+                            mask: None,
+                        },
+                        &mut state,
+                        &context,
+                    )
+                    .unwrap(),
+            )
+            .unwrap(),
+        );
+    }
+    for (step, expected) in expected.iter().enumerate() {
+        assert_tensor_exact(
+            &actual.outputs[step],
+            expected,
+            &format!("Qwen video/projected composite step {step}"),
+        );
+    }
+    assert_state_exact(
+        &actual.state,
+        &state,
+        1,
+        "Qwen video/projected composite state",
+    );
+}
+
+#[test]
+fn non_mlx_routed_composite_reuses_the_planned_provider() {
+    let config = serde_json::json!({
+        "model_type": "qwen3_vl_moe", "image_token_id": 5, "video_token_id": 6,
+        "tie_word_embeddings": false,
+        "text_config": {
+            "model_type": "qwen3_vl_moe_text", "hidden_size": 16,
+            "num_hidden_layers": 1, "intermediate_size": 0,
+            "moe_intermediate_size": 8, "num_experts": 2, "num_experts_per_tok": 1,
+            "num_attention_heads": 2, "num_key_value_heads": 2, "head_dim": 8,
+            "rms_norm_eps": 0.000001, "vocab_size": 7,
+            "max_position_embeddings": 64, "rope_theta": 1000000.0,
+            "rope_scaling": {"mrope_section": [1, 1, 2], "mrope_interleaved": true}
+        },
+        "vision_config": {
+            "depth": 1, "hidden_size": 8, "intermediate_size": 10,
+            "num_heads": 2, "num_position_embeddings": 16,
+            "in_channels": 3, "patch_size": 2, "spatial_merge_size": 2,
+            "temporal_patch_size": 2, "out_hidden_size": 16,
+            "deepstack_visual_indexes": []
+        }
+    });
+    let text = NumericTensor::token_ids(&[1, 2]);
+    let pixels = NumericTensor::new(
+        [4, 24],
+        (0..96).map(|index| (index as f32 - 48.0) / 100.0).collect(),
+    );
+    let grid = NumericTensor::new([1, 3], vec![1.0, 2.0, 2.0]);
+    let input = eredu_runtime::PreparedModelInput::new(
+        vec![
+            eredu_runtime::PreparedInputPart::new(
+                eredu_core::InputModality::Text,
+                eredu_runtime::PreparedInputPayload::TokenIds(text.clone()),
+                [],
+            )
+            .unwrap(),
+            eredu_runtime::PreparedInputPart::new_with_extents(
+                eredu_core::InputModality::Image,
+                eredu_runtime::PreparedInputPayload::Tensor(pixels.clone()),
+                [(eredu_core::InputMetadataKey::PatchGrid, grid)],
+                [eredu_core::InputExtent::PatchGrid {
+                    time: 1,
+                    height: 2,
+                    width: 2,
+                }],
+            )
+            .unwrap(),
+        ],
+        |tensor| eredu_runtime::PreparedInputInspector::identity(&NumericInputInspector, tensor),
+    )
+    .unwrap();
+    let context = NumericContext::default();
+    let resident = execute_numeric_composite_visitor(&config, &input, &context, false);
+    let addressable = execute_numeric_composite_visitor(&config, &input, &context, true);
+
+    let args = qwen::vl::model_args_from_config_value(&config).unwrap();
+    let architecture = qwen::vl::LayeredModel::<NumericBackend>::new(args, &context).unwrap();
+    let mut state = DeviceState::create(architecture.state_layout().unwrap(), |_, policy| {
+        Ok::<_, Error>(NumericHybridLayerState::new(policy))
+    })
+    .unwrap();
+    let mut runtime = ResidentRuntime::new(architecture, &context).unwrap();
+    let image_tokens = NumericTensor::token_ids(&[5]);
+    let grids = [(1, 2, 2)];
+    let parts = [
+        qwen::vl::InputPart::Text(&text),
+        qwen::vl::InputPart::Image {
+            tokens: &image_tokens,
+            grid: &grids,
+        },
+    ];
+    let mut expected = vec![numeric_text_output(
+        runtime
+            .forward(
+                qwen::vl::ModelInput {
+                    parts: &parts,
+                    pixels: Some(&pixels),
+                    mask: None,
+                },
+                &mut state,
+                &context,
+            )
+            .unwrap(),
+    )
+    .unwrap()];
+    for token in [4, 5] {
+        let tokens = NumericTensor::token_ids(&[token]);
+        let parts = [qwen::vl::InputPart::Text(&tokens)];
+        expected.push(
+            numeric_text_output(
+                runtime
+                    .forward(
+                        qwen::vl::ModelInput {
+                            parts: &parts,
+                            pixels: None,
+                            mask: None,
+                        },
+                        &mut state,
+                        &context,
+                    )
+                    .unwrap(),
+            )
+            .unwrap(),
+        );
+    }
+    for (step, expected) in expected.iter().enumerate() {
+        assert_tensor_exact(
+            &resident.outputs[step],
+            expected,
+            &format!("resident routed composite Qwen step {step}"),
+        );
+        assert_tensor_exact(
+            &addressable.outputs[step],
+            expected,
+            &format!("addressable routed composite Qwen step {step}"),
+        );
+    }
+    assert_state_exact(
+        &resident.state,
+        &state,
+        1,
+        "resident routed composite Qwen repeated-decode state",
+    );
+    assert_state_exact(
+        &addressable.state,
+        &state,
+        1,
+        "addressable routed composite Qwen repeated-decode state",
+    );
+    let report = addressable.bank_report.unwrap();
+    assert!(report.acquisitions > 0);
+    assert_eq!(report.acquisitions, report.completions);
+    assert!(report.evictions > 0);
+}
+
+#[test]
+fn non_mlx_inkling_composite_executes_routed_and_shared_banks() {
+    let config = serde_json::json!({
+        "model_type":"inkling_mm_model","image_token_id":5,
+        "text_config":{
+            "hidden_size":8,"num_hidden_layers":1,"vocab_size":19,
+            "num_attention_heads":2,"num_key_value_heads":1,"head_dim":4,
+            "sliding_window_size":4,"layer_types":["full_attention"],
+            "mlp_layer_types":["moe"],"sconv_kernel_size":3,
+            "d_rel":2,"rel_extent":8,"intermediate_size":12,
+            "dense_intermediate_size":12,"moe_intermediate_size":6,
+            "n_routed_experts":3,"num_experts_per_tok":2,"n_shared_experts":1,
+            "unpadded_vocab_size":19
+        },
+        "vision_config":{"text_hidden_size":8,"patch_size":40,"temporal_patch_size":2,
+            "num_channels":3,"num_hidden_layers":4}
+    });
+    let tokens = NumericTensor::token_ids(&[1, 2]);
+    let projected = NumericTensor::new(
+        [1, 1, 8],
+        (0..8).map(|index| (index as f32 - 4.0) / 8.0).collect(),
+    );
+    let input = eredu_runtime::PreparedModelInput::new(
+        vec![
+            eredu_runtime::PreparedInputPart::new(
+                eredu_core::InputModality::Text,
+                eredu_runtime::PreparedInputPayload::TokenIds(tokens.clone()),
+                [],
+            )
+            .unwrap(),
+            eredu_runtime::PreparedInputPart::new(
+                eredu_core::InputModality::Image,
+                eredu_runtime::PreparedInputPayload::Embeddings(projected.clone()),
+                [],
+            )
+            .unwrap(),
+        ],
+        |tensor| eredu_runtime::PreparedInputInspector::identity(&NumericInputInspector, tensor),
+    )
+    .unwrap();
+    let context = NumericContext::default();
+    let resident = execute_numeric_composite_visitor(&config, &input, &context, false);
+    let addressable = execute_numeric_composite_visitor(&config, &input, &context, true);
+
+    let args = inkling::ModelArgs::from_hf_json(&serde_json::to_vec(&config).unwrap()).unwrap();
+    let architecture = inkling::LayeredModel::<NumericBackend>::new(args, &context).unwrap();
+    let mut state = DeviceState::create(architecture.state_layout().unwrap(), |_, policy| {
+        Ok::<_, Error>(NumericHybridLayerState::new(policy))
+    })
+    .unwrap();
+    let mut runtime = ResidentRuntime::new(architecture, &context).unwrap();
+    let projected_tokens = NumericTensor::token_ids(&[5]);
+    let parts = [
+        inkling::DecoderInputPart::Text(&tokens),
+        inkling::DecoderInputPart::Projected {
+            tokens: &projected_tokens,
+            embeddings: &projected,
+        },
+    ];
+    let mut expected = vec![numeric_text_output(
+        runtime
+            .forward(
+                inkling::ModelInput {
+                    parts: &parts,
+                    vision_patches: None,
+                    audio: None,
+                },
+                &mut state,
+                &context,
+            )
+            .unwrap(),
+    )
+    .unwrap()];
+    for token in [4, 5] {
+        let tokens = NumericTensor::token_ids(&[token]);
+        let parts = [inkling::DecoderInputPart::Text(&tokens)];
+        expected.push(
+            numeric_text_output(
+                runtime
+                    .forward(
+                        inkling::ModelInput {
+                            parts: &parts,
+                            vision_patches: None,
+                            audio: None,
+                        },
+                        &mut state,
+                        &context,
+                    )
+                    .unwrap(),
+            )
+            .unwrap(),
+        );
+    }
+    for (step, expected) in expected.iter().enumerate() {
+        assert_tensor_exact(
+            &resident.outputs[step],
+            expected,
+            &format!("resident Inkling composite step {step}"),
+        );
+        assert_tensor_exact(
+            &addressable.outputs[step],
+            expected,
+            &format!("addressable Inkling composite step {step}"),
+        );
+    }
+    assert_state_exact(
+        &resident.state,
+        &state,
+        1,
+        "resident Inkling composite state",
+    );
+    assert_state_exact(
+        &addressable.state,
+        &state,
+        1,
+        "addressable Inkling composite state",
+    );
+    let report = addressable.bank_report.unwrap();
+    assert!(report.acquisitions >= 6);
+    assert_eq!(report.acquisitions, report.completions);
+    assert!(report.evictions > 0);
+}
+
+#[test]
+fn non_mlx_muse_glimmer_composite_matches_established_image_video_text_graph() {
+    let config = serde_json::json!({
+        "architectures":["MuseGlimmerForConditionalGeneration"],"model_type":"muse_glimmer",
+        "image_token_id":5,"video_token_id":6,"out_hidden_size":32,"projector_hidden_size":8,
+        "text_config":{"model_type":"muse_glimmer_text","hidden_size":8,"num_hidden_layers":2,
+          "intermediate_size":10,"num_attention_heads":2,"num_key_value_heads":2,"head_dim":4,
+          "rms_norm_eps":0.00001,"post_norm_eps":0.00001,"vocab_size":7,
+          "max_position_embeddings":64,"rope_theta":10000.0,
+          "layer_types":["sliding_attention","full_attention"],
+          "layer_rope_theta":[10000.0,0.0],"sliding_window":4,"tie_word_embeddings":false,
+          "hidden_act":"silu","attention_dropout":0.0,"qk_scale_factor":1.0,
+          "output_multiplier":1.0,"final_logit_softcapping":7.0},
+        "vision_config":{"model_type":"muse_glimmer_vision","hidden_size":8,
+          "intermediate_size":10,"num_attention_heads":2,"num_hidden_layers":1,
+          "patch_size":2,"patch_temporal":1,"merge_size":2,"pos_emb_height":2,
+          "pos_emb_width":2,"max_position_embeddings":4,"layer_norm_eps":0.00001,
+          "hidden_act":"gelu","layer_types":["full_attention"],
+          "rope_parameters":{"rope_theta":10000.0,"rope_type":"default"}}
+    });
+    let text_before = NumericTensor::token_ids(&[0]);
+    let text_between = NumericTensor::token_ids(&[4]);
+    let text_after = NumericTensor::token_ids(&[3]);
+    let image_pixels = NumericTensor::new(
+        [4, 12],
+        (0..48).map(|index| (index as f32 - 24.0) / 100.0).collect(),
+    );
+    let video_pixels = NumericTensor::new(
+        [4, 12],
+        (0..48).map(|index| (24.0 - index as f32) / 120.0).collect(),
+    );
+    let media_part = |modality, pixels: NumericTensor| {
+        eredu_runtime::PreparedInputPart::new_with_extents(
+            modality,
+            eredu_runtime::PreparedInputPayload::Tensor(pixels),
+            [(
+                eredu_core::InputMetadataKey::PatchGrid,
+                NumericTensor::new([1, 3], vec![1.0, 2.0, 2.0]),
+            )],
+            [eredu_core::InputExtent::PatchGrid {
+                time: 1,
+                height: 2,
+                width: 2,
+            }],
+        )
+        .unwrap()
+    };
+    let text_part = |tokens: NumericTensor| {
+        eredu_runtime::PreparedInputPart::new(
+            eredu_core::InputModality::Text,
+            eredu_runtime::PreparedInputPayload::TokenIds(tokens),
+            [],
+        )
+        .unwrap()
+    };
+    let input = eredu_runtime::PreparedModelInput::new(
+        vec![
+            text_part(text_before.clone()),
+            media_part(eredu_core::InputModality::Image, image_pixels.clone()),
+            text_part(text_between.clone()),
+            media_part(eredu_core::InputModality::Video, video_pixels.clone()),
+            text_part(text_after.clone()),
+        ],
+        |tensor| eredu_runtime::PreparedInputInspector::identity(&NumericInputInspector, tensor),
+    )
+    .unwrap();
+    let context = NumericContext::default();
+    let actual = execute_numeric_composite_visitor(&config, &input, &context, false);
+    let observation = std::rc::Rc::new(std::cell::RefCell::new(CompositeObservation {
+        replace_vision_projector: true,
+        ..Default::default()
+    }));
+    let _ = execute_numeric_composite_visitor_with_observer(
+        &config,
+        &input,
+        &context,
+        false,
+        Some(std::rc::Rc::clone(&observation)),
+    );
+    let observation = observation.borrow();
+    assert!(observation
+        .paths
+        .iter()
+        .any(|path| path == eredu_core::VISION_PROJECTOR_OUTPUT_OBSERVATION_PATH));
+    assert!(observation
+        .paths
+        .iter()
+        .any(|path| path == eredu_core::MODALITY_MERGE_OUTPUT_OBSERVATION_PATH));
+    assert!(observation.replacement_applied);
+    assert!(observation.merge_after_replacement);
+    assert!(observation
+        .merged_values
+        .iter()
+        .any(|value| (*value - 0.75).abs() < f32::EPSILON));
+
+    let args = muse_glimmer::DecoderConfig::from_hf_value(&config).unwrap();
+    let architecture = muse_glimmer::LayeredModel::<NumericBackend>::new(args, &context).unwrap();
+    let mut state = DeviceState::create(architecture.state_layout().unwrap(), |_, policy| {
+        Ok::<_, Error>(NumericHybridLayerState::new(policy))
+    })
+    .unwrap();
+    let mut runtime = ResidentRuntime::new(architecture, &context).unwrap();
+    let image_tokens = NumericTensor::token_ids(&[5]);
+    let video_tokens = NumericTensor::token_ids(&[6]);
+    let pixels =
+        NumericTensor::concatenate(&[image_pixels.clone(), video_pixels.clone()], 0, &context)
+            .unwrap();
+    let grids = [(1, 2, 2), (1, 2, 2)];
+    let parts = [
+        muse_glimmer::DecoderInputPart::Text(&text_before),
+        muse_glimmer::DecoderInputPart::Media(&image_tokens),
+        muse_glimmer::DecoderInputPart::Text(&text_between),
+        muse_glimmer::DecoderInputPart::Media(&video_tokens),
+        muse_glimmer::DecoderInputPart::Text(&text_after),
+    ];
+    let mut expected = vec![numeric_text_output(
+        runtime
+            .forward(
+                muse_glimmer::ModelInput {
+                    parts: &parts,
+                    vision: Some(muse_glimmer::VisionInput {
+                        pixels: &pixels,
+                        grid: &grids,
+                    }),
+                    mask: None,
+                },
+                &mut state,
+                &context,
+            )
+            .unwrap(),
+    )
+    .unwrap()];
+    for token in [4, 5] {
+        let tokens = NumericTensor::token_ids(&[token]);
+        let parts = [muse_glimmer::DecoderInputPart::Text(&tokens)];
+        expected.push(
+            numeric_text_output(
+                runtime
+                    .forward(
+                        muse_glimmer::ModelInput {
+                            parts: &parts,
+                            vision: None,
+                            mask: None,
+                        },
+                        &mut state,
+                        &context,
+                    )
+                    .unwrap(),
+            )
+            .unwrap(),
+        );
+    }
+    assert_eq!(actual.outputs.len(), expected.len());
+    for (step, (actual, expected)) in actual.outputs.iter().zip(&expected).enumerate() {
+        assert_tensor_exact(
+            actual,
+            expected,
+            &format!("Muse-Glimmer composite step {step}"),
+        );
+    }
+    assert_state_exact(
+        &actual.state,
+        &state,
+        2,
+        "Muse-Glimmer composite repeated-decode state",
+    );
+}
+
+#[test]
+fn non_mlx_conditional_qwen_composite_runs_without_prediction_depth() {
+    let config = serde_json::json!({
+        "model_type": "qwen3_5", "image_token_id": 5, "video_token_id": 6,
+        "text_config": {
+            "model_type": "qwen3_5_text", "vocab_size": 7, "hidden_size": 8,
+            "num_hidden_layers": 1, "mtp_num_hidden_layers": 0,
+            "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 2,
+            "max_position_embeddings": 64, "linear_conv_kernel_dim": 2,
+            "linear_key_head_dim": 2, "linear_value_head_dim": 2,
+            "linear_num_key_heads": 2, "linear_num_value_heads": 2,
+            "intermediate_size": 10, "moe_intermediate_size": 4,
+            "shared_expert_intermediate_size": 4, "num_experts_per_tok": 1,
+            "num_experts": 2, "layer_types": ["full_attention"],
+            "tie_word_embeddings": false
+        },
+        "vision_config": {
+            "depth": 1, "hidden_size": 8, "intermediate_size": 10,
+            "num_heads": 2, "num_position_embeddings": 16,
+            "in_channels": 3, "patch_size": 2, "spatial_merge_size": 2,
+            "temporal_patch_size": 2, "out_hidden_size": 8
+        }
+    });
+    let text = NumericTensor::token_ids(&[1, 2]);
+    let pixels = NumericTensor::new(
+        [4, 24],
+        (0..96).map(|index| (index as f32 - 48.0) / 100.0).collect(),
+    );
+    let grid = NumericTensor::new([1, 3], vec![1.0, 2.0, 2.0]);
+    let input = eredu_runtime::PreparedModelInput::new(
+        vec![
+            eredu_runtime::PreparedInputPart::new(
+                eredu_core::InputModality::Text,
+                eredu_runtime::PreparedInputPayload::TokenIds(text.clone()),
+                [],
+            )
+            .unwrap(),
+            eredu_runtime::PreparedInputPart::new_with_extents(
+                eredu_core::InputModality::Image,
+                eredu_runtime::PreparedInputPayload::Tensor(pixels.clone()),
+                [(eredu_core::InputMetadataKey::PatchGrid, grid)],
+                [eredu_core::InputExtent::PatchGrid {
+                    time: 1,
+                    height: 2,
+                    width: 2,
+                }],
+            )
+            .unwrap(),
+        ],
+        |tensor| eredu_runtime::PreparedInputInspector::identity(&NumericInputInspector, tensor),
+    )
+    .unwrap();
+    let context = NumericContext::default();
+    let actual = execute_numeric_composite_visitor(&config, &input, &context, false);
+
+    let parsed = qwen::hybrid::model_args_from_config_value(&config).unwrap();
+    let architecture =
+        qwen::hybrid::ConditionalLayeredModel::<NumericBackend>::new(parsed, &context).unwrap();
+    let mut state = DeviceState::create(architecture.state_layout().unwrap(), |_, policy| {
+        Ok::<_, Error>(NumericHybridLayerState::new(policy))
+    })
+    .unwrap();
+    let mut runtime = ResidentRuntime::new(architecture, &context).unwrap();
+    let image_tokens = NumericTensor::token_ids(&[5]);
+    let grids = [(1, 2, 2)];
+    let parts = [
+        qwen::vl::InputPart::Text(&text),
+        qwen::vl::InputPart::Image {
+            tokens: &image_tokens,
+            grid: &grids,
+        },
+    ];
+    let mut expected = vec![numeric_text_output(
+        runtime
+            .forward(
+                qwen::hybrid::ConditionalInput::Target {
+                    parts: &parts,
+                    pixels: Some(&pixels),
+                    mask: None,
+                },
+                &mut state,
+                &context,
+            )
+            .unwrap(),
+    )
+    .unwrap()];
+    for token in [4, 5] {
+        let tokens = NumericTensor::token_ids(&[token]);
+        let parts = [qwen::vl::InputPart::Text(&tokens)];
+        expected.push(
+            numeric_text_output(
+                runtime
+                    .forward(
+                        qwen::hybrid::ConditionalInput::Target {
+                            parts: &parts,
+                            pixels: None,
+                            mask: None,
+                        },
+                        &mut state,
+                        &context,
+                    )
+                    .unwrap(),
+            )
+            .unwrap(),
+        );
+    }
+    for (step, (actual, expected)) in actual.outputs.iter().zip(&expected).enumerate() {
+        assert_tensor_exact(actual, expected, &format!("conditional Qwen step {step}"));
+    }
+    assert_state_exact(
+        &actual.state,
+        &state,
+        1,
+        "conditional Qwen repeated-decode state",
+    );
+}
+
+#[test]
+fn non_mlx_composite_session_runs_mixed_audio_prefill_and_repeated_decode() {
+    let config = serde_json::json!({
+        "model_type":"gemma4_unified", "tie_word_embeddings":false,
+        "image_token_id":5, "audio_token_id":6,
+        "text_config":{
+            "model_type":"gemma4_text", "hidden_size":8,
+            "num_hidden_layers":2, "intermediate_size":10,
+            "num_attention_heads":2, "num_key_value_heads":2, "head_dim":4,
+            "rms_norm_eps":0.00001, "vocab_size":7,
+            "max_position_embeddings":64, "attention_k_eq_v":false,
+            "num_kv_shared_layers":0,
+            "layer_types":["sliding_attention","full_attention"],
+            "sliding_window":4, "enable_moe_block":false,
+            "final_logit_softcapping":7.0
+        },
+        "vision_config":{
+            "hidden_size":8, "intermediate_size":10,
+            "num_hidden_layers":1, "num_attention_heads":2,
+            "num_key_value_heads":2, "head_dim":4, "patch_size":2,
+            "pooling_kernel_size":2, "position_embedding_size":2,
+            "rms_norm_eps":0.00001
+        },
+        "audio_config":{
+            "hidden_size":8, "num_hidden_layers":1,
+            "num_attention_heads":2, "output_proj_dims":8,
+            "conv_kernel_size":3, "attention_chunk_size":4,
+            "attention_context_left":5, "attention_context_right":0,
+            "attention_invalid_logits_value":-1000000000.0,
+            "attention_logit_cap":50.0, "residual_weight":0.5,
+            "rms_norm_eps":0.00001, "subsampling_conv_channels":[4,8]
+        }
+    });
+    let text_before = NumericTensor::token_ids(&[0]);
+    let text_after = NumericTensor::token_ids(&[4]);
+    let patches = NumericTensor::new(
+        [1, 4, 12],
+        (0..48).map(|index| (index as f32 - 24.0) / 100.0).collect(),
+    );
+    let position_ids = NumericTensor::new([1, 4, 2], vec![0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0]);
+    let grid = NumericTensor::new([1, 3], vec![1.0, 2.0, 2.0]);
+    let audio_features = NumericTensor::new(
+        [1, 4, 128],
+        (0..512)
+            .map(|index| (index as f32 % 17.0 - 8.0) / 100.0)
+            .collect(),
+    );
+    let audio_mask = NumericTensor::new([1, 4], vec![1.0; 4]);
+    let parts = vec![
+        eredu_runtime::PreparedInputPart::new(
+            eredu_core::InputModality::Text,
+            eredu_runtime::PreparedInputPayload::TokenIds(text_before.clone()),
+            [],
+        )
+        .unwrap(),
+        eredu_runtime::PreparedInputPart::new_with_extents(
+            eredu_core::InputModality::Image,
+            eredu_runtime::PreparedInputPayload::Tensor(patches.clone()),
+            [
+                (eredu_core::InputMetadataKey::PatchGrid, grid),
+                (
+                    eredu_core::InputMetadataKey::PatchPositions,
+                    position_ids.clone(),
+                ),
+            ],
+            [eredu_core::InputExtent::PatchGrid {
+                time: 1,
+                height: 2,
+                width: 2,
+            }],
+        )
+        .unwrap(),
+        eredu_runtime::PreparedInputPart::new_with_extents(
+            eredu_core::InputModality::Audio,
+            eredu_runtime::PreparedInputPayload::Tensor(audio_features.clone()),
+            [(eredu_core::InputMetadataKey::AudioMask, audio_mask)],
+            [eredu_core::InputExtent::AudioValidFrames(4)],
+        )
+        .unwrap(),
+        eredu_runtime::PreparedInputPart::new(
+            eredu_core::InputModality::Text,
+            eredu_runtime::PreparedInputPayload::TokenIds(text_after.clone()),
+            [],
+        )
+        .unwrap(),
+    ];
+    let input = eredu_runtime::PreparedModelInput::new(parts, |tensor| {
+        eredu_runtime::PreparedInputInspector::identity(&NumericInputInspector, tensor)
+    })
+    .unwrap();
+    let context = NumericContext::default();
+    let actual = execute_numeric_composite_visitor(&config, &input, &context, false);
+
+    let mut family =
+        gemma4::FamilyConfig::from_hf_json(&serde_json::to_vec(&config).unwrap()).unwrap();
+    family.audio.as_mut().unwrap().output_projection_bias = false;
+    let architecture = gemma4::LayeredModel::<NumericBackend>::new(family, &context).unwrap();
+    let mut state = DeviceState::create(architecture.state_layout().unwrap(), |_, policy| {
+        Ok::<_, Error>(NumericHybridLayerState::new(policy))
+    })
+    .unwrap();
+    let mut runtime = ResidentRuntime::new(architecture, &context).unwrap();
+    let image_tokens = NumericTensor::token_ids(&[5]);
+    let audio_tokens = NumericTensor::token_ids(&[6]);
+    let decoder_parts = [
+        gemma4::DecoderInputPart::Text(&text_before),
+        gemma4::DecoderInputPart::Image(&image_tokens),
+        gemma4::DecoderInputPart::Audio(&audio_tokens),
+        gemma4::DecoderInputPart::Text(&text_after),
+    ];
+    let position_valid = NumericTensor::new([1, 4, 1], vec![1.0; 4]);
+    let key_mask = NumericTensor::zeros([1, 1, 1, 4]);
+    let input_mask = NumericTensor::new([1, 4, 1], vec![1.0; 4]);
+    let first_mask = NumericTensor::new([1, 2, 1, 1], vec![1.0; 2]);
+    let grid_extents = [(2, 2)];
+    let valid_audio = [1];
+    let mut expected = vec![numeric_text_output(
+        runtime
+            .forward(
+                gemma4::ModelInput {
+                    parts: &decoder_parts,
+                    vision: Some(gemma4::VisionInput {
+                        patches: &patches,
+                        position_ids: &position_ids,
+                        position_valid: &position_valid,
+                        key_mask: &key_mask,
+                        grid_extents: &grid_extents,
+                    }),
+                    audio: Some(gemma4::AudioInput {
+                        features: &audio_features,
+                        input_mask: &input_mask,
+                        first_stage_mask: &first_mask,
+                        valid_subsampled_frames: &valid_audio,
+                    }),
+                    per_layer_tokens: None,
+                    mask: None,
+                },
+                &mut state,
+                &context,
+            )
+            .unwrap(),
+    )
+    .unwrap()];
+    for token in [4, 5] {
+        let tokens = NumericTensor::token_ids(&[token]);
+        let parts = [gemma4::DecoderInputPart::Text(&tokens)];
+        expected.push(
+            numeric_text_output(
+                runtime
+                    .forward(
+                        gemma4::ModelInput {
+                            parts: &parts,
+                            vision: None,
+                            audio: None,
+                            per_layer_tokens: None,
+                            mask: None,
+                        },
+                        &mut state,
+                        &context,
+                    )
+                    .unwrap(),
+            )
+            .unwrap(),
+        );
+    }
+    for (step, (actual, expected)) in actual.outputs.iter().zip(&expected).enumerate() {
+        assert_tensor_exact(actual, expected, &format!("composite Gemma step {step}"));
+    }
+    assert_state_exact(
+        &actual.state,
+        &state,
+        2,
+        "composite Gemma repeated-decode state",
+    );
 }
 
 #[test]

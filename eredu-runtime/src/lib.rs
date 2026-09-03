@@ -11,6 +11,8 @@ pub mod backend;
 pub mod cache;
 /// Typed multimodal component graphs and residency accounting.
 pub mod component;
+/// Mechanism-only selection contracts for composite model input.
+pub mod composite;
 /// Backend-neutral sequential prediction decisions and layered handoff.
 pub mod decision;
 /// Backend-neutral dense-stream residency telemetry.
@@ -71,6 +73,12 @@ pub use component::{
     ComponentDomain, ComponentGraph, ComponentGraphError, ComponentKind, ComponentResidencyClass,
     ComponentSpec,
 };
+pub use composite::{
+    select_composite_realization, select_processor_execution, CompositeSelectionError,
+    MediaPrimitiveCapabilities, ModalityProcessorRequirements, ProcessorExecutionRequirements,
+    ProcessorPrimitive, ProcessorSelectionError, ProcessorSelectionRequest,
+    SelectedCompositeRealization, SelectedProcessorExecution,
+};
 pub use decision::{
     FullyForcedTailDecision, PredictionDirective, SequentialDecision, SequentialDecisionBoundary,
     SequentialDecisionDiagnostic, SequentialDecisionDriver, SequentialDecisionError,
@@ -100,7 +108,10 @@ pub use generation::{
     PenaltyConfig, Sampler, SamplingBackend, SamplingConfigurationError, SpeculativeSampler,
     TokenDomain,
 };
-pub use input::{PreparedInputPart, PreparedInputPayload, PreparedModelInput};
+pub use input::{
+    PreparedInputCacheIdentity, PreparedInputCacheIdentityError, PreparedInputInspector,
+    PreparedInputPart, PreparedInputPayload, PreparedModelInput,
+};
 pub use inspection::{
     observe_and_intervene, observe_model_logits, ActivationObserver, NoopObserver,
     RoutingObservation, TargetStateCapture, TargetStateCaptureError, TargetStateTap,
@@ -143,10 +154,12 @@ pub use realtime::{
 };
 pub use replicated_session::{
     construct_replicated_text_session, construct_replicated_text_session_with_execution,
+    prepare_layered_text_contract, prepare_layered_text_contract_with_addressable_parameters,
     prepare_replicated_text_contract, prepare_replicated_text_contract_with_addressable_parameters,
     DirectReplicatedTextExecution, PreparedReplicatedTextContract, ReplicatedTextExecutionStrategy,
-    ReplicatedTextRuntime, ReplicatedTextSession, ReplicatedTextSessionError,
-    ReplicatedTextSessionMechanisms, ReplicatedTextSessionReport, RoutedReplicatedTextExecution,
+    ReplicatedTextRuntime, ReplicatedTextSession, ReplicatedTextSessionCheckpoint,
+    ReplicatedTextSessionError, ReplicatedTextSessionMechanisms, ReplicatedTextSessionReport,
+    RoutedReplicatedTextExecution,
 };
 pub use replicated_text::{
     replicated_text_materialization_tasks, select_replicated_text_realization,

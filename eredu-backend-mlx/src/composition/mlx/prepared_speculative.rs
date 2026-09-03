@@ -301,8 +301,6 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
                 | Executable::NemotronH(_, _, _)
                 | Executable::Qwen(_, _, _)
                 | Executable::Qwen3Next(_, _, _)
-                | Executable::Qwen3Vl(_, _, _)
-                | Executable::Qwen3VlMoe(_, _, _)
                 | Executable::Qwen35(_, _, _)),
                 kind,
             ) => Err(Error::Speculative(format!(
@@ -444,9 +442,7 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
                         | Executable::PartitionedLlama(_, _, _)
                         | Executable::ReplicatedText(_, _)
                         | Executable::MuseGlimmer(_, _, _)
-                        | Executable::Qwen(_, _, _)
-                        | Executable::Qwen3Vl(_, _, _)
-                        | Executable::Qwen3VlMoe(_, _, _)) => Err(Error::Speculative(format!(
+                        | Executable::Qwen(_, _, _)) => Err(Error::Speculative(format!(
                             "distributed prepared-chat embedded MTP is unavailable for model type {} ({:?})",
                             model.effective_model_type(),
                             model.speculative_capability()
@@ -551,9 +547,7 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
             | Executable::PartitionedLlama(_, _, _)
             | Executable::ReplicatedText(_, _)
             | Executable::MuseGlimmer(_, _, _)
-            | Executable::Qwen(_, _, _)
-            | Executable::Qwen3Vl(_, _, _)
-            | Executable::Qwen3VlMoe(_, _, _)) => Err(Error::Speculative(format!(
+            | Executable::Qwen(_, _, _)) => Err(Error::Speculative(format!(
                 "scheduled prepared-chat embedded MTP batch is unavailable for model type {} ({:?})",
                 model.effective_model_type(),
                 model.speculative_capability()

@@ -322,26 +322,7 @@ pub fn static_parameter_groups(
             [("audio.final_norm.weight", vec![hidden])],
         )?);
     }
-    if let Some(vision) = &args.vision_config {
-        for (layer, (input, output, _, _)) in vision.layer_specs().into_iter().enumerate() {
-            let output = dim(output)?;
-            groups.push(replicated(
-                format!("visual.layers.{layer}.channels"),
-                [(
-                    format!("visual.layers.{layer}.projection.weight"),
-                    vec![output, dim(input)?],
-                )],
-            )?);
-            if layer + 1 != vision.layer_specs().len() {
-                groups.push(replicated(
-                    format!("visual.layers.{layer}.norm"),
-                    [(
-                        format!("visual.layers.{layer}.layer_norm.weight"),
-                        vec![output],
-                    )],
-                )?);
-            }
-        }
+    if args.vision_config.is_some() {
         groups.push(replicated(
             "visual.final_norm",
             [("visual.final_norm.weight", vec![hidden])],

@@ -56,9 +56,13 @@ use crate::backend::runtime::execution::{
     layerwise::quantize_exact_replicated_text_tasks,
 };
 
+use eredu_architectures::composite_execution::{
+    CompositeArchitecture, PreparedCompositeArchitecture, PreparedCompositeInput,
+};
 use eredu_architectures::replicated_text::{
-    PreparedReplicatedTextArchitecture, ReplicatedTextArchitectureVisitor,
-    ReplicatedTextProfileDispatcher,
+    CompositeTextArchitectureVisitor, PreparedCompositeTextArchitecture,
+    PreparedReplicatedTextArchitecture, PreparedRoutedCompositeTextArchitecture,
+    ReplicatedTextArchitectureVisitor, ReplicatedTextProfileDispatcher,
 };
 
 /// Reports the exact MLX mechanisms applicable to one neutral requirement set.
@@ -325,6 +329,16 @@ pub trait ErasedReplicatedTextExecutable {
         expected: &PromptCacheDescriptor,
         prefix_token_ids: &[u32],
     ) -> Result<PromptCacheManifest, Error>;
+    fn load_prompt_cache_for_input(
+        &mut self,
+        directory: &Path,
+        expected: &PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        input_identity: eredu_runtime::PreparedInputCacheIdentity,
+    ) -> Result<PromptCacheManifest, Error> {
+        let _ = input_identity;
+        self.load_prompt_cache(directory, expected, prefix_token_ids)
+    }
     fn save_prompt_cache(
         &mut self,
         destination: &Path,
@@ -344,7 +358,7 @@ pub trait ErasedReplicatedTextExecutable {
     ) -> Result<Array, Error>;
     fn prefill_with_observer(
         &mut self,
-        tokens: &Array,
+        input: input::ModelInput<'_>,
         mask: Option<&Array>,
         stream: &Stream,
         observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
@@ -355,6 +369,48 @@ pub trait ErasedReplicatedTextExecutable {
         stream: &Stream,
         observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
     ) -> Result<Array, Error>;
+}
+
+pub(crate) fn prepared_composite_input(
+    input: input::ModelInput<'_>,
+) -> Result<eredu_runtime::PreparedModelInput<MlxTensor>, Error> {
+    use eredu_runtime::{PreparedInputInspector, PreparedInputPart, PreparedInputPayload};
+
+    input::validate(input)?;
+    let parts = input
+        .parts
+        .iter()
+        .map(|part| {
+            let payload = match part.payload() {
+                input::InputPayload::TokenIds(value) => {
+                    PreparedInputPayload::TokenIds(MlxTensor::from_array(value.clone()))
+                }
+                input::InputPayload::Tensor(value) => {
+                    PreparedInputPayload::Tensor(MlxTensor::from_array(value.clone()))
+                }
+                input::InputPayload::Embeddings(value) => {
+                    PreparedInputPayload::Embeddings(MlxTensor::from_array(value.clone()))
+                }
+                _ => {
+                    return Err(eredu_core::PreparedInputError::BackendTensorIdentity(
+                        "MLX prepared input contains an unknown payload kind".into(),
+                    ))
+                }
+            };
+            PreparedInputPart::new_with_extents(
+                part.modality(),
+                payload,
+                part.metadata()
+                    .iter()
+                    .map(|(key, value)| (*key, MlxTensor::from_array(value.clone()))),
+                part.extents().iter().copied(),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let inspector = input::MlxTensorInputInspector;
+    eredu_runtime::PreparedModelInput::new(parts, |tensor| inspector.identity(tensor))
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))
 }
 
 trait MlxStateMechanisms: LayerRuntimeState<MlxNeuralBackend> + Sized {
@@ -815,7 +871,7 @@ struct MlxStateReport {
 struct MlxReplicatedTextMechanisms<A, S>
 where
     S: MlxStateMechanisms,
-    A: ReplicatedTextArchitecture<MlxNeuralBackend, S, Error = eredu_nn::Error>,
+    A: eredu_runtime::LayeredArchitecture<MlxNeuralBackend, S, Error = eredu_nn::Error>,
 {
     store: Arc<dyn CheckpointSource>,
     prepared_bindings: Option<PreparedExactBindings>,
@@ -890,7 +946,7 @@ fn partition_materialization_tasks<'a>(
 impl<A, S> MlxReplicatedTextMechanisms<A, S>
 where
     S: MlxStateMechanisms,
-    A: ReplicatedTextArchitecture<MlxNeuralBackend, S, Error = eredu_nn::Error>,
+    A: eredu_runtime::LayeredArchitecture<MlxNeuralBackend, S, Error = eredu_nn::Error>,
 {
     fn new(
         store: Arc<dyn CheckpointSource>,
@@ -954,7 +1010,7 @@ impl<A, S> ReplicatedTextSessionMechanisms<A, MlxNeuralBackend>
     for MlxReplicatedTextMechanisms<A, S>
 where
     S: MlxStateMechanisms,
-    A: ReplicatedTextArchitecture<MlxNeuralBackend, S, Error = eredu_nn::Error>,
+    A: eredu_runtime::LayeredArchitecture<MlxNeuralBackend, S, Error = eredu_nn::Error>,
     A::StaticModules: Clone,
     A::Error: std::fmt::Display,
 {
@@ -1585,13 +1641,14 @@ where
 
     fn prefill_with_observer(
         &mut self,
-        tokens: &Array,
+        input: input::ModelInput<'_>,
         mask: Option<&Array>,
         stream: &Stream,
         observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
     ) -> Result<Array, Error> {
         #[cfg(test)]
         super::path_instrumentation::forward();
+        let tokens = input::text_token_ids(input, stream)?;
         let tokens = MlxTensor::from_array(tokens.clone());
         let mask = mask.cloned().map(MlxTensor::from_array);
         let mut observer = crate::composition::NeutralActivationObserver::new(observer);
@@ -1619,6 +1676,729 @@ where
             .map(MlxTensor::into_array)
             .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         Ok(self.published(output))
+    }
+}
+
+struct CompletedComposite<A, D = eredu_runtime::DirectReplicatedTextExecution>
+where
+    A: CompositeArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error>
+        + eredu_runtime::RoutedLayeredArchitecture<MlxNeuralBackend, MlxHybridState>
+        + 'static,
+    A::InputPartPlan: 'static,
+    A::StaticModules: Clone,
+    D: eredu_runtime::ReplicatedTextExecutionStrategy<
+        PreparedCompositeArchitecture<A>,
+        MlxNeuralBackend,
+        MlxHybridState,
+        MlxResidentPolicy<
+            <PreparedCompositeArchitecture<A> as eredu_runtime::LayeredArchitecture<
+                MlxNeuralBackend,
+                MlxHybridState,
+            >>::Unit,
+        >,
+        MlxLayerwisePolicy<
+            <PreparedCompositeArchitecture<A> as eredu_runtime::LayeredArchitecture<
+                MlxNeuralBackend,
+                MlxHybridState,
+            >>::Unit,
+            MlxSelectiveUnitPopulator,
+        >,
+    >,
+{
+    session: ReplicatedTextSession<
+        PreparedCompositeArchitecture<A>,
+        MlxNeuralBackend,
+        MlxReplicatedTextMechanisms<PreparedCompositeArchitecture<A>, MlxHybridState>,
+        D,
+    >,
+    admission: A::AdmissionConfig,
+    processor: eredu_runtime::SelectedProcessorExecution,
+    prompt_cache_identity: PromptCacheModelIdentity,
+    capability_estimate: eredu_architectures::capability::CapabilityEstimate,
+    effective_model_type: String,
+    materialization: Option<eredu_runtime::WeightMaterializationReport>,
+    #[cfg(test)]
+    selected_residency: eredu_runtime::LayerWeightResidency,
+    stream: Stream,
+}
+
+impl<A> CompletedComposite<A>
+where
+    A: CompositeArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error>
+        + eredu_runtime::RoutedLayeredArchitecture<MlxNeuralBackend, MlxHybridState>
+        + 'static,
+    A::InputPartPlan: 'static,
+    A::StaticModules: Clone,
+    A::Error: std::fmt::Display,
+{
+    fn new(
+        prepared: PreparedCompositeTextArchitecture<A, A::AdmissionConfig>,
+        store: Arc<dyn CheckpointSource>,
+        stream: &Stream,
+        weights_stream: &Stream,
+    ) -> Result<Self, Error> {
+        #[cfg(test)]
+        let selected_residency = prepared.selected().residency();
+        let prompt_cache_identity = prepared.prompt_cache_identity().clone();
+        let capability_estimate = prepared.capability_estimate().clone();
+        let effective_model_type = prepared.effective_model_type().to_owned();
+        let (architecture, source_architecture, contract, processor, admission) =
+            prepared.into_parts();
+        let materialization = Arc::new(std::sync::Mutex::new(None));
+        let mechanisms = MlxReplicatedTextMechanisms::new(
+            store,
+            Arc::clone(&materialization),
+            stream,
+            weights_stream,
+        );
+        #[cfg(test)]
+        super::path_instrumentation::constructor();
+        let session = eredu_runtime::construct_replicated_text_session(
+            architecture,
+            source_architecture,
+            contract,
+            mechanisms,
+            stream,
+        )
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        let materialization = materialization
+            .lock()
+            .map_err(|_| {
+                Error::ArchitectureModel("materialization report lock was poisoned".into())
+            })?
+            .clone();
+        Ok(Self {
+            session,
+            admission,
+            processor,
+            prompt_cache_identity,
+            capability_estimate,
+            effective_model_type,
+            materialization,
+            #[cfg(test)]
+            selected_residency,
+            stream: stream.clone(),
+        })
+    }
+}
+
+impl<A, D> CompletedComposite<A, D>
+where
+    A: CompositeArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error>
+        + eredu_runtime::RoutedLayeredArchitecture<MlxNeuralBackend, MlxHybridState>
+        + 'static,
+    A::InputPartPlan: 'static,
+    A::StaticModules: Clone,
+    D: eredu_runtime::ReplicatedTextExecutionStrategy<
+        PreparedCompositeArchitecture<A>,
+        MlxNeuralBackend,
+        MlxHybridState,
+        MlxResidentPolicy<
+            <PreparedCompositeArchitecture<A> as eredu_runtime::LayeredArchitecture<
+                MlxNeuralBackend,
+                MlxHybridState,
+            >>::Unit,
+        >,
+        MlxLayerwisePolicy<
+            <PreparedCompositeArchitecture<A> as eredu_runtime::LayeredArchitecture<
+                MlxNeuralBackend,
+                MlxHybridState,
+            >>::Unit,
+            MlxSelectiveUnitPopulator,
+        >,
+    >,
+{
+    #[allow(clippy::too_many_arguments)]
+    fn from_session(
+        session: ReplicatedTextSession<
+            PreparedCompositeArchitecture<A>,
+            MlxNeuralBackend,
+            MlxReplicatedTextMechanisms<PreparedCompositeArchitecture<A>, MlxHybridState>,
+            D,
+        >,
+        admission: A::AdmissionConfig,
+        processor: eredu_runtime::SelectedProcessorExecution,
+        prompt_cache_identity: PromptCacheModelIdentity,
+        capability_estimate: eredu_architectures::capability::CapabilityEstimate,
+        effective_model_type: String,
+        materialization: Option<eredu_runtime::WeightMaterializationReport>,
+        selected_residency: eredu_runtime::LayerWeightResidency,
+        stream: &Stream,
+    ) -> Self {
+        #[cfg(not(test))]
+        let _ = selected_residency;
+        Self {
+            session,
+            admission,
+            processor,
+            prompt_cache_identity,
+            capability_estimate,
+            effective_model_type,
+            materialization,
+            #[cfg(test)]
+            selected_residency,
+            stream: stream.clone(),
+        }
+    }
+
+    fn prepare(
+        &self,
+        input: input::ModelInput<'_>,
+    ) -> Result<
+        (
+            eredu_runtime::PreparedModelInput<MlxTensor>,
+            eredu_architectures::media_plan::AdmittedCompositeInput<A::InputPartPlan>,
+            Option<eredu_runtime::PreparedInputCacheIdentity>,
+        ),
+        Error,
+    > {
+        if let Some(modality) = input
+            .parts
+            .iter()
+            .map(|part| part.modality())
+            .find(|modality| !self.processor.modalities().contains(modality))
+        {
+            return Err(Error::ArchitectureModel(format!(
+                "prepared input modality {} is outside the selected composite modalities {:?}",
+                modality.as_str(),
+                self.processor.modalities()
+            )));
+        }
+        if !self.processor.prepared_tensors()
+            && input
+                .parts
+                .iter()
+                .any(|part| part.modality() != eredu_core::InputModality::Text)
+        {
+            return Err(Error::ArchitectureModel(
+                "prepared media tensors were not admitted by processor selection".into(),
+            ));
+        }
+        if let Some(modality) = input.parts.iter().find_map(|part| {
+            matches!(part.payload(), input::InputPayload::Embeddings(_))
+                .then_some(part.modality())
+                .filter(|modality| !self.processor.projected_modalities().contains(modality))
+        }) {
+            return Err(Error::ArchitectureModel(format!(
+                "projected {} embeddings were not admitted by processor selection",
+                modality.as_str()
+            )));
+        }
+        let supplied_cache_identity = input.cache_identity().cloned();
+        let text_fingerprint = if supplied_cache_identity.is_none()
+            && input.parts.iter().all(|part| {
+                part.modality() == eredu_core::InputModality::Text
+                    && matches!(part.payload(), input::InputPayload::TokenIds(_))
+            }) {
+            let mut tokens = Vec::new();
+            for part in input.parts {
+                let input::InputPayload::TokenIds(value) = part.payload() else {
+                    unreachable!("text-only token payload checked above")
+                };
+                let value = value.evaluated()?;
+                tokens.extend_from_slice(
+                    value
+                        .try_as_slice::<u32>()
+                        .map_err(|error| Error::ArchitectureModel(error.to_string()))?,
+                );
+            }
+            Some(eredu_core::cache::prompt_cache_token_fingerprint(&tokens))
+        } else {
+            None
+        };
+        let prepared = prepared_composite_input(input)?;
+        if supplied_cache_identity
+            .as_ref()
+            .is_some_and(|identity| identity.prepared() != prepared.identity())
+        {
+            return Err(Error::ArchitectureModel(
+                "prepared-input cache identity differs from the submitted tensors".into(),
+            ));
+        }
+        let admitted =
+            A::admit_prepared_input(&self.admission, &prepared, &input::MlxTensorInputInspector)
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        let cache_identity = match (supplied_cache_identity, text_fingerprint) {
+            (Some(identity), _) => Some(identity),
+            (None, Some(fingerprint)) => Some(
+                prepared
+                    .cache_identity(fingerprint)
+                    .map_err(|error| Error::ArchitectureModel(error.to_string()))?,
+            ),
+            (None, None) => None,
+        };
+        Ok((prepared, admitted, cache_identity))
+    }
+
+    fn text_input(
+        &self,
+        tokens: &Array,
+    ) -> Result<
+        (
+            eredu_runtime::PreparedModelInput<MlxTensor>,
+            eredu_architectures::media_plan::AdmittedCompositeInput<A::InputPartPlan>,
+            Option<eredu_runtime::PreparedInputCacheIdentity>,
+        ),
+        Error,
+    > {
+        let part = input::token_ids_part(tokens)?;
+        self.prepare(input::ModelInput::new(std::slice::from_ref(&part)))
+    }
+
+    fn published<T>(&self, value: T) -> T {
+        #[cfg(test)]
+        super::path_instrumentation::state_publication();
+        value
+    }
+}
+
+impl<A, D> ErasedReplicatedTextExecutable for CompletedComposite<A, D>
+where
+    A: CompositeArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error>
+        + eredu_runtime::RoutedLayeredArchitecture<MlxNeuralBackend, MlxHybridState>
+        + 'static,
+    A::InputPartPlan: 'static,
+    A::StaticModules: Clone,
+    A::Error: std::fmt::Display,
+    D: eredu_runtime::ReplicatedTextExecutionStrategy<
+            PreparedCompositeArchitecture<A>,
+            MlxNeuralBackend,
+            MlxHybridState,
+            MlxResidentPolicy<
+                <PreparedCompositeArchitecture<A> as eredu_runtime::LayeredArchitecture<
+                    MlxNeuralBackend,
+                    MlxHybridState,
+                >>::Unit,
+            >,
+            MlxLayerwisePolicy<
+                <PreparedCompositeArchitecture<A> as eredu_runtime::LayeredArchitecture<
+                    MlxNeuralBackend,
+                    MlxHybridState,
+                >>::Unit,
+                MlxSelectiveUnitPopulator,
+            >,
+        > + MlxParameterBankTelemetry
+        + 'static,
+{
+    fn effective_model_type(&self) -> &str {
+        &self.effective_model_type
+    }
+
+    fn capability_estimate(&self) -> &eredu_architectures::capability::CapabilityEstimate {
+        &self.capability_estimate
+    }
+
+    #[cfg(test)]
+    fn selected_residency(&self) -> eredu_runtime::LayerWeightResidency {
+        self.selected_residency
+    }
+
+    #[cfg(test)]
+    fn state_snapshot(&self) -> StatePresenceSnapshot {
+        self.session
+            .report()
+            .expect("MLX composite state report")
+            .state_report()
+            .presence
+            .clone()
+    }
+
+    #[cfg(test)]
+    fn fixed_numeric_state_snapshot(&self) -> Result<FixedNumericStateSnapshot, Exception> {
+        self.session
+            .report()
+            .map(|report| report.state_report().fixed_numeric.clone())
+            .map_err(|error| Exception::custom(error.to_string()))
+    }
+
+    #[cfg(test)]
+    fn checkpoint_restore_probe(
+        &mut self,
+        tokens: &Array,
+        stream: &Stream,
+    ) -> Result<CheckpointRestoreProbe, Error> {
+        let before_report = self
+            .session
+            .report()
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        let before = before_report.state_report().presence.clone();
+        let before_numeric = before_report.state_report().fixed_numeric.clone();
+        let before_retained = before_report.state_report().retained_numeric.clone();
+        let checkpoint = self
+            .session
+            .checkpoint(stream)
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        let (prepared, admitted, _) = self.text_input(tokens)?;
+        let paired =
+            PreparedCompositeInput::new(&prepared, &admitted).map_err(Error::ArchitectureModel)?;
+        let continuation = self
+            .session
+            .decode_input(paired, stream)
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?
+            .into_array()
+            .evaluated()?
+            .as_slice::<f32>()
+            .to_vec();
+        let advanced_report = self
+            .session
+            .report()
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        let advanced = advanced_report.state_report().presence.clone();
+        let advanced_numeric = advanced_report.state_report().fixed_numeric.clone();
+        self.session
+            .rollback(checkpoint, stream)
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        let restored_report = self
+            .session
+            .report()
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        let restored = restored_report.state_report().presence.clone();
+        let restored_numeric = restored_report.state_report().fixed_numeric.clone();
+        let restored_retained = restored_report.state_report().retained_numeric.clone();
+        assert_eq!(restored_retained, before_retained);
+        Ok((
+            before,
+            advanced,
+            restored,
+            before_numeric,
+            advanced_numeric,
+            restored_numeric,
+            continuation,
+        ))
+    }
+
+    fn residency_report(&self) -> Result<Option<ResidencyReport>, Error> {
+        self.session
+            .report()
+            .map(|report| Some(report.execution_report().residency.clone()))
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))
+    }
+
+    fn dense_stream_report(&self) -> Result<Option<DenseDiskStreamReport>, Error> {
+        self.session
+            .report()
+            .map(|report| report.execution_report().dense.clone())
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))
+    }
+
+    fn materialization_report(&self) -> Option<&eredu_runtime::WeightMaterializationReport> {
+        self.materialization.as_ref()
+    }
+
+    fn parameter_bank_report(
+        &self,
+    ) -> Result<
+        Option<crate::backend::runtime::residency::parameter_bank::ParameterBankResidencyReport>,
+        Error,
+    > {
+        self.session.execution_strategy().parameter_bank_report()
+    }
+
+    fn prompt_cache_model_identity(&self) -> &PromptCacheModelIdentity {
+        &self.prompt_cache_identity
+    }
+
+    fn reset_cache(&mut self) -> Result<(), Exception> {
+        self.session
+            .reset(&self.stream)
+            .map_err(|error| Exception::custom(error.to_string()))
+    }
+
+    fn load_prompt_cache(
+        &mut self,
+        directory: &Path,
+        expected: &PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+    ) -> Result<PromptCacheManifest, Error> {
+        let _ = (directory, expected, prefix_token_ids);
+        Err(Error::ArchitectureModel(
+            "composite prompt-cache loading requires the prepared-input identity".into(),
+        ))
+    }
+
+    fn load_prompt_cache_for_input(
+        &mut self,
+        directory: &Path,
+        expected: &PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        input_identity: eredu_runtime::PreparedInputCacheIdentity,
+    ) -> Result<PromptCacheManifest, Error> {
+        self.session
+            .load_prompt_cache_for_input(
+                directory,
+                expected,
+                prefix_token_ids,
+                input_identity,
+                &self.stream,
+            )
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))
+    }
+
+    fn save_prompt_cache(
+        &mut self,
+        destination: &Path,
+        descriptor: PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: &PromptCacheOptions,
+    ) -> Result<PromptCacheManifest, Error> {
+        let identity = self
+            .session
+            .committed_prompt_input_identity()
+            .cloned()
+            .ok_or_else(|| {
+                Error::ArchitectureModel(
+                    "composite prompt cache requires a committed prepared-input identity".into(),
+                )
+            })?;
+        self.session
+            .save_prompt_cache_for_input(
+                destination,
+                descriptor,
+                prefix_token_ids,
+                options,
+                &identity,
+                &self.stream,
+            )
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))
+    }
+
+    fn cache_residency_report(&self) -> Result<Option<CacheResidencyReport>, Exception> {
+        self.session
+            .report()
+            .map(|report| report.state_report().residency.clone())
+            .map_err(|error| Exception::custom(error.to_string()))
+    }
+
+    fn prefill(&mut self, input: input::ModelInput<'_>, stream: &Stream) -> Result<Array, Error> {
+        #[cfg(test)]
+        super::path_instrumentation::forward();
+        let (prepared, admitted, cache_identity) = self.prepare(input)?;
+        let paired =
+            PreparedCompositeInput::new(&prepared, &admitted).map_err(Error::ArchitectureModel)?;
+        let output = match cache_identity {
+            Some(identity) => self
+                .session
+                .prefill_input_with_cache_identity(paired, identity, stream),
+            None => self.session.prefill_input(paired, stream),
+        }
+        .map(MlxTensor::into_array)
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        Ok(self.published(output))
+    }
+
+    fn decode(&mut self, tokens: &Array, stream: &Stream) -> Result<Array, Error> {
+        #[cfg(test)]
+        super::path_instrumentation::forward();
+        let (prepared, admitted, _) = self.text_input(tokens)?;
+        let paired =
+            PreparedCompositeInput::new(&prepared, &admitted).map_err(Error::ArchitectureModel)?;
+        let output = self
+            .session
+            .decode_input(paired, stream)
+            .map(MlxTensor::into_array)
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        Ok(self.published(output))
+    }
+
+    fn forward_with_observer(
+        &mut self,
+        tokens: &Array,
+        mask: Option<&Array>,
+        stream: &Stream,
+        observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
+    ) -> Result<Array, Error> {
+        if mask.is_some() {
+            return Err(Error::ArchitectureModel(
+                "explicit composite decoder masks require prepared-input metadata".into(),
+            ));
+        }
+        let parts = [input::token_ids_part(tokens)?];
+        self.prefill_with_observer(input::ModelInput::new(&parts), None, stream, observer)
+    }
+
+    fn prefill_with_observer(
+        &mut self,
+        input: input::ModelInput<'_>,
+        mask: Option<&Array>,
+        stream: &Stream,
+        observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
+    ) -> Result<Array, Error> {
+        if mask.is_some() {
+            return Err(Error::ArchitectureModel(
+                "explicit composite decoder masks require prepared-input metadata".into(),
+            ));
+        }
+        #[cfg(test)]
+        super::path_instrumentation::forward();
+        let (prepared, admitted, cache_identity) = self.prepare(input)?;
+        let paired =
+            PreparedCompositeInput::new(&prepared, &admitted).map_err(Error::ArchitectureModel)?;
+        let mut observer = crate::composition::NeutralActivationObserver::new(observer);
+        let output = match cache_identity {
+            Some(identity) => self.session.prefill_input_with_observer_and_cache_identity(
+                paired,
+                identity,
+                stream,
+                &mut observer,
+            ),
+            None => self
+                .session
+                .prefill_input_with_observer(paired, stream, &mut observer),
+        }
+        .map(MlxTensor::into_array)
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        Ok(self.published(output))
+    }
+
+    fn decode_with_observer(
+        &mut self,
+        tokens: &Array,
+        stream: &Stream,
+        observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
+    ) -> Result<Array, Error> {
+        #[cfg(test)]
+        super::path_instrumentation::forward();
+        let (prepared, admitted, _) = self.text_input(tokens)?;
+        let paired =
+            PreparedCompositeInput::new(&prepared, &admitted).map_err(Error::ArchitectureModel)?;
+        let mut observer = crate::composition::NeutralActivationObserver::new(observer);
+        let output = self
+            .session
+            .decode_input_with_observer(paired, stream, &mut observer)
+            .map(MlxTensor::into_array)
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        Ok(self.published(output))
+    }
+}
+
+/// Family-agnostic MLX binder for architecture-owned composite ingress.
+#[derive(Clone, Copy)]
+pub(crate) struct CompositeBindingVisitor<'a> {
+    pub stream: &'a Stream,
+    pub weights_stream: &'a Stream,
+}
+
+impl CompositeTextArchitectureVisitor<MlxNeuralBackend, MlxHybridState>
+    for CompositeBindingVisitor<'_>
+{
+    type Output = Box<dyn ErasedReplicatedTextExecutable>;
+    type Error = Error;
+
+    fn construction_started(&mut self) {
+        #[cfg(test)]
+        super::path_instrumentation::architecture_construction();
+    }
+
+    fn visit<A>(
+        self,
+        prepared: PreparedCompositeTextArchitecture<A, A::AdmissionConfig>,
+        store: Arc<dyn CheckpointSource>,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        A: CompositeArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error>
+            + eredu_runtime::RoutedLayeredArchitecture<MlxNeuralBackend, MlxHybridState>
+            + 'static,
+        A::InputPartPlan: 'static,
+        A::StaticModules: Clone,
+        A::Error: std::fmt::Display,
+    {
+        CompletedComposite::new(prepared, store, self.stream, self.weights_stream)
+            .map(|model| Box::new(model) as Box<dyn ErasedReplicatedTextExecutable>)
+    }
+
+    fn visit_routed<A>(
+        self,
+        prepared: PreparedRoutedCompositeTextArchitecture<A, A::AdmissionConfig>,
+        store: Arc<dyn CheckpointSource>,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        A: CompositeArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error>
+            + eredu_runtime::RoutedLayeredArchitecture<MlxNeuralBackend, MlxHybridState>
+            + 'static,
+        A::InputPartPlan: 'static,
+        A::StaticModules: Clone,
+        A::Error: std::fmt::Display,
+    {
+        let prompt_cache_identity = prepared.routed().text().prompt_cache_identity().clone();
+        let capability_estimate = prepared.capability_estimate().clone();
+        let effective_model_type = prepared.effective_model_type().to_owned();
+        let selected_residency = prepared.routed().text().selected().residency();
+        let bank_residency = prepared.routed().bank_residency();
+        let (routed, processor, admission) = prepared.into_parts();
+        let materialization_slot: Arc<
+            std::sync::Mutex<Option<eredu_runtime::WeightMaterializationReport>>,
+        > = Arc::new(std::sync::Mutex::new(None));
+        let mechanisms: MlxReplicatedTextMechanisms<
+            PreparedCompositeArchitecture<A>,
+            MlxHybridState,
+        > = MlxReplicatedTextMechanisms::new(
+            Arc::clone(&store),
+            Arc::clone(&materialization_slot),
+            self.stream,
+            self.weights_stream,
+        );
+        #[cfg(test)]
+        super::path_instrumentation::constructor();
+        let materialization =
+            |slot: &Arc<std::sync::Mutex<Option<eredu_runtime::WeightMaterializationReport>>>| {
+                slot.lock()
+                    .map_err(|_| {
+                        Error::ArchitectureModel("materialization report lock was poisoned".into())
+                    })
+                    .map(|report| report.clone())
+            };
+        match bank_residency {
+            eredu_runtime::ParameterBankResidency::WithLayer => {
+                let session = routed
+                    .construct_resident_session::<MlxNeuralBackend, _>(mechanisms, self.stream)
+                    .map_err(Error::ArchitectureModel)?;
+                let materialization = materialization(&materialization_slot)?;
+                Ok(Box::new(CompletedComposite::from_session(
+                    session,
+                    admission,
+                    processor,
+                    prompt_cache_identity,
+                    capability_estimate,
+                    effective_model_type,
+                    materialization,
+                    selected_residency,
+                    self.stream,
+                )))
+            }
+            eredu_runtime::ParameterBankResidency::IndependentCache(options) => {
+                let bank = selected_addressable_bank(
+                    routed.addressable_members(),
+                    routed.addressable_quantization(),
+                    store,
+                    options,
+                    self.weights_stream,
+                    self.stream,
+                )?;
+                let session = routed
+                    .construct_addressable_session::<MlxNeuralBackend, _, _, _>(
+                        mechanisms,
+                        bank,
+                        crate::backend::runtime::residency::parameter_bank::MlxIndexedMovement,
+                        self.stream,
+                    )
+                    .map_err(Error::ArchitectureModel)?;
+                let materialization = materialization(&materialization_slot)?;
+                Ok(Box::new(CompletedComposite::from_session(
+                    session,
+                    admission,
+                    processor,
+                    prompt_cache_identity,
+                    capability_estimate,
+                    effective_model_type,
+                    materialization,
+                    selected_residency,
+                    self.stream,
+                )))
+            }
+            _ => Err(Error::ArchitectureModel(
+                "unsupported selected composite bank residency".into(),
+            )),
+        }
     }
 }
 

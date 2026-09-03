@@ -512,10 +512,11 @@ pub struct ModelArgs {
 impl ModelArgs {
     /// Returns the input modalities admitted by this exact family variant.
     pub const fn input_modalities(&self) -> InputModalities {
+        let admits_media = self.vision_config.is_some() || self.audio_config.is_some();
         InputModalities {
             text: true,
-            image: self.vision_config.is_some(),
-            audio: self.audio_config.is_some(),
+            image: admits_media,
+            audio: admits_media,
             video: false,
         }
     }
@@ -1350,6 +1351,22 @@ mod tests {
         object.remove("audio_config");
         let args = ModelArgs::from_hf_json(&serde_json::to_vec(&value).unwrap()).unwrap();
         assert_eq!(args.input_modalities(), InputModalities::TEXT);
+    }
+
+    #[test]
+    fn projected_media_bypasses_an_absent_tower() {
+        let mut value = config();
+        value.as_object_mut().unwrap().remove("vision_config");
+        let args = ModelArgs::from_hf_json(&serde_json::to_vec(&value).unwrap()).unwrap();
+        assert_eq!(
+            args.input_modalities(),
+            InputModalities {
+                text: true,
+                image: true,
+                audio: true,
+                video: false,
+            }
+        );
     }
 
     #[test]

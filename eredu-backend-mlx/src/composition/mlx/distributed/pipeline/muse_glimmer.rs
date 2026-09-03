@@ -85,6 +85,20 @@ impl PipelinePartitionMetadata for MuseGlimmerPipelinePartition {
 }
 
 impl MlxPlacedGroupExecutor for MuseGlimmerPipelinePartition {
+    fn placed_group_input_observation_path(&self, group: &str) -> Result<Option<String>, Error> {
+        let group = architecture_group_by_id::<_, MlxKeyValueState>(&self.architecture, group)?;
+        <muse_glimmer_arch::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
+            MlxNeuralBackend,
+            MlxKeyValueState,
+        >>::group_input_observation_path(&self.architecture, group)
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))
+    }
+
+    fn placed_group_output_observation_path(&self, group: &str) -> Result<Option<String>, Error> {
+        let _ = group;
+        Ok(None)
+    }
+
     fn begin_placed_ingress(
         &mut self,
         input: crate::backend::runtime::media::input::ModelInput<'_>,
@@ -179,40 +193,25 @@ impl MlxPlacedGroupExecutor for MuseGlimmerPipelinePartition {
 
     fn finish_placed_ingress(
         &mut self,
-        _execution: Option<&ParallelExecutionContext<'_>>,
+        execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
     ) -> Result<PipelinePayload, Error> {
-        let mut state = self.ingress_state.take().ok_or_else(|| {
+        let state = self.ingress_state.take().ok_or_else(|| {
             Error::Parallel("Muse-Glimmer placed ingress state is unavailable".into())
         })?;
-        let vision_group = architecture_group_by_id::<_, MlxKeyValueState>(
-            &self.architecture,
-            eredu_architectures::muse_glimmer::VISION_EXECUTION_GROUP,
-        )?;
-        if <muse_glimmer_arch::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
-            MlxNeuralBackend,
-            MlxKeyValueState,
-        >>::should_execute_group(&self.architecture, vision_group, &state.forward.context)
-        {
-            state.forward.hidden =
-                <muse_glimmer_arch::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
-                    MlxNeuralBackend,
-                    MlxKeyValueState,
-                >>::complete_execution_group(
-                    &mut self.architecture,
-                    vision_group,
-                    &state.forward.hidden,
-                    &mut state.state,
-                    &mut state.forward.context,
-                    stream,
-                )
-                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        }
-        let hidden = state.forward.hidden;
-        Ok(PipelinePayload {
-            hidden: hidden.into_array(),
-            auxiliary: PipelineAuxiliaryState::default(),
-        })
+        self.finish_placed_state(state, execution, stream, None)
+    }
+
+    fn finish_placed_ingress_observed(
+        &mut self,
+        execution: Option<&ParallelExecutionContext<'_>>,
+        stream: &Stream,
+        observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
+    ) -> Result<PipelinePayload, Error> {
+        let state = self.ingress_state.take().ok_or_else(|| {
+            Error::Parallel("Muse-Glimmer placed ingress state is unavailable".into())
+        })?;
+        self.finish_placed_state(state, execution, stream, Some(observer))
     }
 
     fn prefill(
@@ -224,38 +223,19 @@ impl MlxPlacedGroupExecutor for MuseGlimmerPipelinePartition {
         execution: Option<&ParallelExecutionContext<'_>>,
         expert_group: Option<&Group>,
         stream: &Stream,
-        observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
+        mut observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
     ) -> Result<PipelineStageOutput, Error> {
         let mut ingress = self.begin_placed_input(input, execution, stream)?;
         self.execute_placed_vision(&mut ingress, execution, stream)?;
-        let vision_group = architecture_group_by_id::<_, MlxKeyValueState>(
-            &self.architecture,
-            eredu_architectures::muse_glimmer::VISION_EXECUTION_GROUP,
-        )?;
-        if <muse_glimmer_arch::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
-            MlxNeuralBackend,
-            MlxKeyValueState,
-        >>::should_execute_group(
-            &self.architecture, vision_group, &ingress.forward.context
-        ) {
-            ingress.forward.hidden =
-                <muse_glimmer_arch::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
-                    MlxNeuralBackend,
-                    MlxKeyValueState,
-                >>::complete_execution_group(
-                    &mut self.architecture,
-                    vision_group,
-                    &ingress.forward.hidden,
-                    &mut ingress.state,
-                    &mut ingress.forward.context,
-                    stream,
-                )
-                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        }
-        let payload = PipelinePayload {
-            hidden: ingress.forward.hidden.into_array(),
-            auxiliary: PipelineAuxiliaryState::default(),
+        let mut payload = match observer.as_mut() {
+            Some(observer) => {
+                self.finish_placed_state(ingress, execution, stream, Some(&mut **observer))?
+            }
+            None => self.finish_placed_state(ingress, execution, stream, None)?,
         };
+        if let Some(observer) = observer.as_deref_mut() {
+            self.observe_merge_payload(&mut payload, observer)?;
+        }
         self.forward_decoder(
             PipelineStageInput::Hidden(&payload),
             step,
@@ -723,6 +703,125 @@ pub(super) fn load_muse_glimmer_pipeline(
 }
 
 impl MuseGlimmerPipelinePartition {
+    fn finish_placed_state(
+        &mut self,
+        mut state: MuseGlimmerPlacedState,
+        execution: Option<&ParallelExecutionContext<'_>>,
+        stream: &Stream,
+        observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
+    ) -> Result<PipelinePayload, Error> {
+        let vision_group = architecture_group_by_id::<_, MlxKeyValueState>(
+            &self.architecture,
+            eredu_architectures::muse_glimmer::VISION_EXECUTION_GROUP,
+        )?;
+        let active = <muse_glimmer_arch::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
+            MlxNeuralBackend,
+            MlxKeyValueState,
+        >>::should_execute_group(
+            &self.architecture, vision_group, &state.forward.context
+        );
+        if active {
+            state.forward.hidden =
+                <muse_glimmer_arch::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
+                    MlxNeuralBackend,
+                    MlxKeyValueState,
+                >>::complete_execution_group(
+                    &mut self.architecture,
+                    vision_group,
+                    &state.forward.hidden,
+                    &mut state.state,
+                    &mut state.forward.context,
+                    stream,
+                )
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+            if let Some(observer) = observer {
+                let path =
+                    <muse_glimmer_arch::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
+                        MlxNeuralBackend,
+                        MlxKeyValueState,
+                    >>::group_output_observation_path(
+                        &self.architecture, vision_group
+                    )
+                    .map_err(|error| Error::ArchitectureModel(error.to_string()))?
+                    .ok_or_else(|| {
+                        Error::ArchitectureModel(
+                            "Muse-Glimmer vision group has no output observation path".into(),
+                        )
+                    })?;
+                state.forward.hidden =
+                    crate::MlxTensor::from_array(eredu_runtime::observe_and_intervene(
+                        observer,
+                        &path,
+                        state.forward.hidden.as_array(),
+                    )?);
+            }
+        }
+        let text_group = architecture_group_by_id::<_, MlxKeyValueState>(
+            &self.architecture,
+            eredu_architectures::muse_glimmer::TEXT_EXECUTION_GROUP,
+        )?;
+        let dependency = state.forward.hidden.clone();
+        state.forward.hidden = match execution.filter(|value| value.is_tensor_parallel()) {
+            Some(execution) => {
+                <muse_glimmer_arch::LayeredModel<MlxNeuralBackend> as ParallelLayeredArchitecture<
+                    MlxNeuralBackend,
+                    MlxKeyValueState,
+                >>::begin_execution_group_parallel(
+                    &mut self.architecture,
+                    text_group,
+                    &dependency,
+                    &[&dependency],
+                    &mut state.state,
+                    &mut state.forward.context,
+                    execution.group().ok_or_else(|| {
+                        Error::Parallel("Muse-Glimmer TP group is missing".into())
+                    })?,
+                    stream,
+                )
+            }
+            None => <muse_glimmer_arch::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
+                MlxNeuralBackend,
+                MlxKeyValueState,
+            >>::begin_execution_group(
+                &mut self.architecture,
+                text_group,
+                &dependency,
+                &[&dependency],
+                &mut state.state,
+                &mut state.forward.context,
+                stream,
+            ),
+        }
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        Ok(PipelinePayload {
+            hidden: state.forward.hidden.into_array(),
+            auxiliary: PipelineAuxiliaryState::default(),
+        })
+    }
+
+    fn observe_merge_payload(
+        &self,
+        payload: &mut PipelinePayload,
+        observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
+    ) -> Result<(), Error> {
+        let text_group = architecture_group_by_id::<_, MlxKeyValueState>(
+            &self.architecture,
+            eredu_architectures::muse_glimmer::TEXT_EXECUTION_GROUP,
+        )?;
+        let path = <muse_glimmer_arch::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
+            MlxNeuralBackend,
+            MlxKeyValueState,
+        >>::group_input_observation_path(&self.architecture, text_group)
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?
+        .ok_or_else(|| {
+            Error::ArchitectureModel(
+                "Muse-Glimmer decoder group has no input observation path".into(),
+            )
+        })?;
+        payload.hidden = eredu_runtime::observe_and_intervene(observer, &path, &payload.hidden)?;
+        Ok(())
+    }
+
     fn range(&self) -> Range<usize> {
         self.media_range::<MlxKeyValueState>(
             eredu_architectures::muse_glimmer::TEXT_EXECUTION_GROUP,
@@ -746,28 +845,11 @@ impl MuseGlimmerPipelinePartition {
             input,
             stream,
         )?;
-        let parts = prepared
-            .tokens
-            .iter()
-            .zip(&prepared.media)
-            .map(|(tokens, media)| {
-                if *media {
-                    muse_glimmer_arch::DecoderInputPart::Media(tokens)
-                } else {
-                    muse_glimmer_arch::DecoderInputPart::Text(tokens)
-                }
-            })
-            .collect::<Vec<_>>();
+        let parts = prepared.decoder_parts();
         let mut state = MlxKeyValueState::device(self.architecture.state_layout()?)?;
         let model_input = muse_glimmer_arch::ModelInput {
             parts: &parts,
-            vision: prepared
-                .pixels
-                .as_ref()
-                .map(|pixels| muse_glimmer_arch::VisionInput {
-                    pixels,
-                    grid: &prepared.grid,
-                }),
+            vision: prepared.vision_input(),
             mask: None,
         };
         let forward = if let Some(execution) = execution.filter(|value| value.is_tensor_parallel())

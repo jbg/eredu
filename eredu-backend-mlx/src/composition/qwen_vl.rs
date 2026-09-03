@@ -11,19 +11,12 @@ use eredu_checkpoint::{
     store::{CheckpointSource, CompositeCheckpointSource},
     WeightQuantization,
 };
-use eredu_core::InputModality;
 use eredu_runtime::{
-    ArchitectureParameters,
-    CacheResidencyPolicy, CausalModel, ExecutionUnitLayout, LayerWeightResidency,
-    LayeredArchitecture, LayerwiseRuntime,
-    PagedCacheOptions, ParameterRole, ResidencyReport, WeightBinding,
-    WeightResidency,
+    ArchitectureParameters, CacheResidencyPolicy, CausalModel, ExecutionUnitLayout,
+    LayerWeightResidency, LayeredArchitecture, LayerwiseRuntime, PagedCacheOptions, ParameterRole,
+    ResidencyReport, WeightBinding, WeightResidency,
 };
-use safemlx::{
-    error::Exception,
-    ops::{concatenate_axis, indexing::TryIndexOp},
-    Array, Stream,
-};
+use safemlx::{error::Exception, ops::indexing::TryIndexOp, Array, Stream};
 
 fn neutral_input_parts<'a>(
     parts: &'a [vl::InputPart<'a, Array>],
@@ -50,17 +43,52 @@ fn neutral_input_parts<'a>(
         .collect()
 }
 
-fn qwen_vl_input_plan(
+fn native_input_parts<'a>(
+    parts: &'a [vl::InputPart<'a, crate::MlxTensor>],
+) -> Vec<vl::InputPart<'a, Array>> {
+    parts
+        .iter()
+        .map(|part| match part {
+            vl::InputPart::Text(tokens) => vl::InputPart::Text(tokens.as_array()),
+            vl::InputPart::Image { tokens, grid } => vl::InputPart::Image {
+                tokens: tokens.as_array(),
+                grid,
+            },
+            vl::InputPart::Video { tokens, grid } => vl::InputPart::Video {
+                tokens: tokens.as_array(),
+                grid,
+            },
+            vl::InputPart::Projected { tokens, embeddings } => vl::InputPart::Projected {
+                tokens: tokens.as_array(),
+                embeddings: embeddings.as_array(),
+            },
+        })
+        .collect()
+}
+
+fn prepare_model_input(
     args: &vl::ModelArgs,
-    part: &input::InputPart,
-) -> Result<eredu_architectures::media_plan::QwenVlInputPartPlan, safemlx::error::Exception> {
-    eredu_architectures::media_plan::qwen_vl_input_part(args, part, &input::MlxInputInspector)
+    input: input::ModelInput<'_>,
+    stream: &Stream,
+) -> Result<vl::PreparedInput<crate::MlxTensor>, safemlx::error::Exception> {
+    let prepared = crate::composition::mlx::replicated_text::prepared_composite_input(input)
+        .map_err(|error| safemlx::error::Exception::custom(error.to_string()))?;
+    let admitted = eredu_architectures::media_plan::admit_qwen_vl_input(
+        args,
+        &prepared,
+        &input::MlxTensorInputInspector,
+    )
+    .map_err(|error| safemlx::error::Exception::custom(error.to_string()))?;
+    let input =
+        eredu_architectures::composite_execution::PreparedCompositeInput::new(&prepared, &admitted)
+            .map_err(safemlx::error::Exception::custom)?;
+    vl::prepare_input(input, stream)
         .map_err(|error| safemlx::error::Exception::custom(error.to_string()))
 }
 
 use crate::backend::{
     error::Error,
-    nn::shared::{MlxNeuralBackend, MlxModule},
+    nn::shared::{MlxModule, MlxNeuralBackend},
     runtime::{
         cache::{
             residency::{
@@ -74,8 +102,7 @@ use crate::backend::{
             parameter_role_targets, populate_module_from_lease_excluding,
         },
         checkpoint::{
-            load::gguf_quantization_configs,
-            quantization::should_quantize_on_load,
+            load::gguf_quantization_configs, quantization::should_quantize_on_load,
             store::open_gguf_checkpoint_source,
         },
         execution::{
@@ -115,11 +142,11 @@ impl QwenVlCheckpointTemplate {
     pub fn new(args: vl::ModelArgs, stream: &Stream) -> Result<Self, Error> {
         let architecture = Architecture::new(args.clone(), stream)
             .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        let static_modules =
-            <Architecture as LayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::static_modules(
-                &architecture,
-            )
-            .clone();
+        let static_modules = <Architecture as LayeredArchitecture<
+            MlxNeuralBackend,
+            MlxHybridState,
+        >>::static_modules(&architecture)
+        .clone();
         let layout = unit_layout(&architecture)?;
         let units = (0..layout.len())
             .map(|index| {
@@ -192,101 +219,17 @@ impl QwenVlPipelineBindings {
         parallel: Option<&crate::backend::runtime::distributed::Group>,
         stream: &Stream,
     ) -> Result<vl::PipelineVisionState<crate::MlxTensor>, Error> {
-        let args = architecture.args().clone();
-        input::validate(typed)?;
-        let mut token_storage = Vec::new();
-        let mut grids = Vec::new();
-        let mut pixels = Vec::new();
-        enum Kind {
-            Text(usize),
-            Projected(usize, usize),
-            Image(usize, usize),
-            Video(usize, usize),
-        }
-        let mut kinds = Vec::new();
-        for (original, part) in typed.parts.iter().enumerate() {
-            match qwen_vl_input_plan(&args, part)? {
-                eredu_architectures::media_plan::QwenVlInputPartPlan::TextTokens { .. } => {
-                    let input::InputPayload::TokenIds(tokens) = part.payload() else {
-                        unreachable!()
-                    };
-                    token_storage.push(tokens.clone());
-                    kinds.push(Kind::Text(token_storage.len() - 1));
-                }
-                eredu_architectures::media_plan::QwenVlInputPartPlan::ProjectedText { .. } => {
-                    let input::InputPayload::Embeddings(embeddings) = part.payload() else {
-                        unreachable!()
-                    };
-                    token_storage.push(input::token_ids_array(
-                        &vec![0; usize::try_from(embeddings.dim(1)).unwrap_or_default()],
-                        stream,
-                    )?);
-                    kinds.push(Kind::Projected(token_storage.len() - 1, original));
-                }
-                eredu_architectures::media_plan::QwenVlInputPartPlan::Media {
-                    ingress, ..
-                } => {
-                    let input::InputPayload::Tensor(tensor) = part.payload() else {
-                        unreachable!()
-                    };
-                    let ingress = super::materialize_qwen_media_ingress(ingress, stream)?;
-                    token_storage.push(ingress.tokens);
-                    grids.push(ingress.patch_grid);
-                    pixels.push(tensor.clone());
-                    let token = token_storage.len() - 1;
-                    let grid = grids.len() - 1;
-                    kinds.push(if part.modality() == InputModality::Image {
-                        Kind::Image(token, grid)
-                    } else {
-                        Kind::Video(token, grid)
-                    });
-                }
-            }
-        }
-        let mut parts = Vec::with_capacity(kinds.len());
-        for kind in kinds {
-            parts.push(match kind {
-                Kind::Text(token) => vl::InputPart::Text(&token_storage[token]),
-                Kind::Projected(token, original) => {
-                    let input::InputPayload::Embeddings(embeddings) = typed.parts[original].payload()
-                    else {
-                        unreachable!()
-                    };
-                    vl::InputPart::Projected {
-                        tokens: &token_storage[token],
-                        embeddings,
-                    }
-                }
-                Kind::Image(token, grid) => vl::InputPart::Image {
-                    tokens: &token_storage[token],
-                    grid: &grids[grid],
-                },
-                Kind::Video(token, grid) => vl::InputPart::Video {
-                    tokens: &token_storage[token],
-                    grid: &grids[grid],
-                },
-            });
-        }
-        let pixel_refs = pixels.iter().collect::<Vec<_>>();
-        let pixels = if pixel_refs.is_empty() {
-            None
-        } else {
-            Some(concatenate_axis(&pixel_refs, 0, stream)?)
-        };
-        let neutral_parts = neutral_input_parts(&parts);
-        let input = vl::ModelInput {
-            parts: &neutral_parts,
-            pixels: crate::composition::tensor_opt(pixels.as_ref()),
-            mask: None,
-        };
+        let prepared = prepare_model_input(architecture.args(), typed, stream)?;
         let delta = crate::composition::tensor_opt(delta);
-        match parallel {
-            Some(parallel) => {
-                architecture.begin_pipeline_parallel(input, offset, delta, parallel, stream)
+        prepared.with_model_input(|input| {
+            match parallel {
+                Some(parallel) => {
+                    architecture.begin_pipeline_parallel(input, offset, delta, parallel, stream)
+                }
+                None => architecture.begin_pipeline(input, offset, delta, stream),
             }
-            None => architecture.begin_pipeline(input, offset, delta, stream),
-        }
-        .map_err(|error| Error::Parallel(error.to_string()))
+            .map_err(|error| Error::Parallel(error.to_string()))
+        })
     }
 
     pub fn quantizes_static_binding(&self, _binding: &WeightBinding) -> bool {
@@ -319,8 +262,7 @@ impl QwenVlPipelineBindings {
         realization: Option<
             &eredu_architectures::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>,
         >,
-    ) -> Result<Option<crate::composition::expert_dispatch::ExpertAssignment>, Error>
-    {
+    ) -> Result<Option<crate::composition::expert_dispatch::ExpertAssignment>, Error> {
         match realization {
             None if self.external_experts => Err(Error::Parallel(
                 "Qwen3-VL has no architecture expert realization".into(),
@@ -328,10 +270,8 @@ impl QwenVlPipelineBindings {
             None => Ok(None),
             Some(plan) if plan.expert_parallel_size() == 1 && !self.external_experts => Ok(None),
             Some(plan) => {
-                crate::composition::expert_dispatch::ExpertAssignment::from_realization(
-                    plan,
-                )
-                .map(Some)
+                crate::composition::expert_dispatch::ExpertAssignment::from_realization(plan)
+                    .map(Some)
             }
         }
     }
@@ -369,7 +309,7 @@ impl QwenVlPipelineBindings {
                         architecture.args(),
                         unit_ordinal(architecture, group, index)?,
                     )
-                        .map_err(Error::ArchitectureModel)?
+                    .map_err(Error::ArchitectureModel)?
                 };
                 let bindings = build_module_bindings_with_recipes_excluding(
                     global_layer,
@@ -423,7 +363,8 @@ impl MlxUnitPopulator<Unit> for UnitPopulator {
     }
 }
 
-type Resident = LayerwiseRuntime<Architecture, MlxNeuralBackend, MlxHybridState, MlxResidentPolicy<Unit>>;
+type Resident =
+    LayerwiseRuntime<Architecture, MlxNeuralBackend, MlxHybridState, MlxResidentPolicy<Unit>>;
 type Bounded = LayerwiseRuntime<
     Architecture,
     MlxNeuralBackend,
@@ -464,7 +405,11 @@ impl QwenVlModel {
 
     pub fn parallel_info(
         &self,
-    ) -> Option<&eredu_runtime::ParallelModelInfo<crate::composition::mlx::distributed::topology::MlxParallelPlan>> {
+    ) -> Option<
+        &eredu_runtime::ParallelModelInfo<
+            crate::composition::mlx::distributed::topology::MlxParallelPlan,
+        >,
+    > {
         None
     }
 
@@ -565,7 +510,8 @@ impl QwenVlModel {
         Option<crate::backend::runtime::residency::parameter_bank::ParameterBankResidencyReport>,
         Error,
     > {
-        Ok(self.parameter_bank
+        Ok(self
+            .parameter_bank
             .as_ref()
             .map(AddressableParameterBank::report)
             .transpose()?)
@@ -680,10 +626,20 @@ impl QwenVlModel {
                         crate::composition::qwen::expert::cached_provider(parameter_bank, &args);
                     match &mut self.execution {
                         Execution::Resident(runtime) => runtime.forward_with_provider_and_observer(
-                            input, cache, pass, &mut provider, stream, &mut neutral,
+                            input,
+                            cache,
+                            pass,
+                            &mut provider,
+                            stream,
+                            &mut neutral,
                         ),
                         Execution::Bounded(runtime) => runtime.forward_with_provider_and_observer(
-                            input, cache, pass, &mut provider, stream, &mut neutral,
+                            input,
+                            cache,
+                            pass,
+                            &mut provider,
+                            stream,
+                            &mut neutral,
                         ),
                     }
                 }
@@ -706,102 +662,24 @@ impl QwenVlModel {
 
     fn prepared_forward(
         &mut self,
-        typed: input::ModelInput<'_>,
+        input: input::ModelInput<'_>,
         cache: &mut MlxHybridState,
         stream: &Stream,
         observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
     ) -> Result<Array, Exception> {
-        input::validate(typed)?;
-        let mut token_storage = Vec::new();
-        let mut grids = Vec::new();
-        let mut pixels = Vec::new();
-        enum Kind {
-            Text(usize),
-            Projected(usize, usize),
-            Image(usize, usize),
-            Video(usize, usize),
-        }
-        let mut kinds = Vec::new();
-        for (original, part) in typed.parts.iter().enumerate() {
-            match qwen_vl_input_plan(&self.args, part)? {
-                eredu_architectures::media_plan::QwenVlInputPartPlan::TextTokens { .. } => {
-                    let input::InputPayload::TokenIds(tokens) = part.payload() else {
-                        unreachable!()
-                    };
-                    token_storage.push(tokens.clone());
-                    kinds.push(Kind::Text(token_storage.len() - 1));
-                }
-                eredu_architectures::media_plan::QwenVlInputPartPlan::ProjectedText { .. } => {
-                    let input::InputPayload::Embeddings(embeddings) = part.payload() else {
-                        unreachable!()
-                    };
-                    let token = input::token_ids_array(
-                        &vec![0; usize::try_from(embeddings.dim(1)).unwrap_or_default()],
-                        stream,
-                    )?;
-                    token_storage.push(token);
-                    kinds.push(Kind::Projected(token_storage.len() - 1, original));
-                }
-                eredu_architectures::media_plan::QwenVlInputPartPlan::Media {
-                    ingress, ..
-                } => {
-                    let input::InputPayload::Tensor(tensor) = part.payload() else {
-                        unreachable!()
-                    };
-                    let ingress = super::materialize_qwen_media_ingress(ingress, stream)?;
-                    token_storage.push(ingress.tokens);
-                    grids.push(ingress.patch_grid);
-                    pixels.push(tensor.clone());
-                    let token_index = token_storage.len() - 1;
-                    let grid_index = grids.len() - 1;
-                    kinds.push(if part.modality() == InputModality::Image {
-                        Kind::Image(token_index, grid_index)
-                    } else {
-                        Kind::Video(token_index, grid_index)
-                    });
-                }
+        prepare_model_input(&self.args, input, stream)?.with_model_input(|input| {
+            let parts = native_input_parts(input.parts);
+            let input = vl::ModelInput {
+                parts: &parts,
+                pixels: input.pixels.map(crate::MlxTensor::as_array),
+                mask: input.mask.map(crate::MlxTensor::as_array),
+            };
+            match observer {
+                Some(observer) => self.forward_with_observer(input, cache, stream, observer),
+                None => self.forward(input, cache, stream),
             }
-        }
-        let mut parts = Vec::with_capacity(kinds.len());
-        for kind in kinds {
-            parts.push(match kind {
-                Kind::Text(token) => vl::InputPart::Text(&token_storage[token]),
-                Kind::Projected(token, original) => {
-                    let input::InputPayload::Embeddings(embeddings) = typed.parts[original].payload()
-                    else {
-                        unreachable!()
-                    };
-                    vl::InputPart::Projected {
-                        tokens: &token_storage[token],
-                        embeddings,
-                    }
-                }
-                Kind::Image(token, grid) => vl::InputPart::Image {
-                    tokens: &token_storage[token],
-                    grid: &grids[grid],
-                },
-                Kind::Video(token, grid) => vl::InputPart::Video {
-                    tokens: &token_storage[token],
-                    grid: &grids[grid],
-                },
-            });
-        }
-        let pixel_refs = pixels.iter().collect::<Vec<_>>();
-        let pixels = if pixel_refs.is_empty() {
-            None
-        } else {
-            Some(concatenate_axis(&pixel_refs, 0, stream)?)
-        };
-        let input = vl::ModelInput {
-            parts: &parts,
-            pixels: pixels.as_ref(),
-            mask: None,
-        };
-        match observer {
-            Some(observer) => self.forward_with_observer(input, cache, stream, observer),
-            None => self.forward(input, cache, stream),
-        }
-        .map_err(|error| Exception::custom(error.to_string()))
+            .map_err(|error| Exception::custom(error.to_string()))
+        })
     }
 
     pub fn prefill_with_observer(
@@ -833,7 +711,6 @@ impl QwenVlModel {
             observer,
         )
     }
-
 }
 
 impl CausalModel<MlxHybridState> for QwenVlModel {
@@ -875,10 +752,11 @@ impl CausalModel<MlxHybridState> for QwenVlModel {
 }
 
 fn unit_layout(architecture: &Architecture) -> Result<ExecutionUnitLayout, Error> {
-    let graph = <Architecture as LayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::execution_graph(
-        architecture,
-    )
-    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let graph =
+        <Architecture as LayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::execution_graph(
+            architecture,
+        )
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let counts = (0..graph.groups().len())
         .map(|group| {
             <Architecture as LayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::group_unit_count(
@@ -911,8 +789,8 @@ fn quantize_store(
     ),
     Error,
 > {
-    let target = vl::load_time_quantization(source, quantization)
-        .map_err(Error::ArchitectureModel)?;
+    let target =
+        vl::load_time_quantization(source, quantization).map_err(Error::ArchitectureModel)?;
     let source_architecture = Architecture::new(source.clone(), stream)
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let target_architecture = Architecture::new(target.clone(), stream)
@@ -984,10 +862,8 @@ pub fn prepare_gguf_pipeline(
     };
     let args = args.clone();
     let text_formats = gguf_quantization_configs(checkpoint, source.plan().tensor_mapping())?;
-    let vision_formats = gguf_quantization_configs(
-        projector.checkpoint(),
-        projector.plan().tensor_mapping(),
-    )?;
+    let vision_formats =
+        gguf_quantization_configs(projector.checkpoint(), projector.plan().tensor_mapping())?;
     let args = vl::with_checkpoint_formats(&args, text_formats, vision_formats)
         .map_err(Error::ArchitectureModel)?;
     let text_source: Arc<dyn CheckpointSource> = Arc::new(open_gguf_checkpoint_source(
@@ -1023,8 +899,7 @@ pub fn load_gguf(
 ) -> Result<QwenVlModel, Error> {
     let expert_options = residency.parameter_bank_cache();
     let options = residency.layers();
-    let (mut args, store) =
-        prepare_gguf_pipeline(source, projector, options.max_cached_shards())?;
+    let (mut args, store) = prepare_gguf_pipeline(source, projector, options.max_cached_shards())?;
     let quantize_on_load = quantization
         .map(|requested| {
             should_quantize_on_load("Qwen3-VL GGUF", None, requested)
@@ -1125,10 +1000,8 @@ fn attach_parameter_bank(
         Execution::Resident(runtime) => runtime.policy().checkpoint_store_arc(),
         Execution::Bounded(runtime) => runtime.policy().checkpoint_store_arc(),
     };
-    let entries = crate::composition::qwen::expert::expert_catalog(
-        &model.args.text,
-        store.as_ref(),
-    )?;
+    let entries =
+        crate::composition::qwen::expert::expert_catalog(&model.args.text, store.as_ref())?;
     model.parameter_bank = Some(AddressableParameterBank::new_shared(
         store,
         entries,
@@ -1170,9 +1043,7 @@ fn load_store(
         options,
         stream,
         weights_stream,
-        move |key| {
-            external_experts && parameter_name_in_targets(key, &excluded_expert_targets)
-        },
+        move |key| external_experts && parameter_name_in_targets(key, &excluded_expert_targets),
         |modules, store| {
             build_module_bindings_with_recipes(
                 &MlxModule::new(modules.clone()),

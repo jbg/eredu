@@ -18,15 +18,16 @@ pub use checkpoint::{
     expert_recipes, expert_residency_catalog, gguf_plan, load_time_quantization,
     projector_gguf_plan, safetensors_parameter_names, safetensors_plan, safetensors_recipes,
     static_safetensors_recipes, translate_projector_gguf_name, translate_text_gguf_name,
-    unit_safetensors_recipes, ArtifactConfig,
+    unit_safetensors_recipes, with_checkpoint_formats, ArtifactConfig,
 };
 pub use config::{
     ConfigError, DecoderConfig, VisionAttentionPolicy, VisionConfig, WeightConvention,
 };
 pub use graph::{component_graph, state_layout};
 pub use model::{
-    DecoderInputPart, ForwardContext, LayeredModel, ModelInput, TextPartitionInput, Unit,
-    TEXT_EXECUTION_GROUP, VISION_EXECUTION_GROUP,
+    prepare_composite_ingress, DecoderInputPart, ForwardContext, LayeredModel, ModelInput,
+    PreparedCompositeIngress, TextPartitionInput, Unit, TEXT_EXECUTION_GROUP,
+    VISION_EXECUTION_GROUP,
 };
 pub use parallel::{
     layer_parameter_groups, local_decoder_config, local_geometry, static_parameter_groups,

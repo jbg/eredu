@@ -464,6 +464,90 @@ impl QwenVlPipelinePartition {
         Ok(())
     }
 
+    fn finish_ingress_state(
+        &mut self,
+        mut state: eredu_architectures::qwen::vl::PipelineVisionState<crate::MlxTensor>,
+        group: Option<&Group>,
+        stream: &Stream,
+        observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
+    ) -> Result<PipelinePayload, Error> {
+        self.architecture
+            .complete_pipeline_vision(&mut state, group, stream)
+            .map_err(|error| Error::Parallel(error.to_string()))?;
+        if let (Some(observer), Some(output)) = (
+            observer,
+            eredu_architectures::qwen::vl::LayeredModel::<MlxNeuralBackend>::pipeline_vision_output(
+                &state,
+            ),
+        ) {
+            let path = <eredu_architectures::qwen::vl::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
+                MlxNeuralBackend,
+                MlxHybridState,
+            >>::group_output_observation_path(&self.architecture, 0)
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?
+            .ok_or_else(|| {
+                Error::ArchitectureModel(
+                    "Qwen3-VL vision group has no output observation path".into(),
+                )
+            })?;
+            let output = eredu_runtime::observe_and_intervene(observer, &path, output.as_array())?;
+            eredu_architectures::qwen::vl::LayeredModel::<MlxNeuralBackend>::replace_pipeline_vision_output(
+                &mut state,
+                crate::MlxTensor::from_array(output),
+            );
+        }
+        let prepared = self
+            .architecture
+            .finish_pipeline(state, group, stream)
+            .map_err(|error| Error::Parallel(error.to_string()))?;
+        let (hidden, boundary) =
+            eredu_architectures::qwen::vl::PipelineBoundary::from_prepared(prepared);
+        Ok(PipelinePayload {
+            hidden: hidden.into_array(),
+            auxiliary: PipelineAuxiliaryState::new(
+                self.boundary_schema()?
+                    .encode(boundary)
+                    .map_err(|error| Error::Parallel(error.to_string()))?
+                    .into_iter()
+                    .map(crate::MlxTensor::into_array)
+                    .collect(),
+            ),
+        })
+    }
+
+    fn finish_ingress(
+        &mut self,
+        execution: Option<&ParallelExecutionContext<'_>>,
+        stream: &Stream,
+        observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
+    ) -> Result<PipelinePayload, Error> {
+        let state = self
+            .ingress_state
+            .take()
+            .ok_or_else(|| Error::Parallel("Qwen3-VL ingress state is unavailable".into()))?;
+        let group = execution
+            .filter(|execution| execution.is_tensor_parallel())
+            .and_then(ParallelExecutionContext::group);
+        self.finish_ingress_state(state, group, stream, observer)
+    }
+
+    fn observe_merge_payload(
+        &self,
+        payload: &mut PipelinePayload,
+        observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
+    ) -> Result<(), Error> {
+        let path = <eredu_architectures::qwen::vl::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
+            MlxNeuralBackend,
+            MlxHybridState,
+        >>::group_input_observation_path(&self.architecture, 1)
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?
+        .ok_or_else(|| {
+            Error::ArchitectureModel("Qwen3-VL decoder group has no input observation path".into())
+        })?;
+        payload.hidden = eredu_runtime::observe_and_intervene(observer, &path, &payload.hidden)?;
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn forward_decoder(
         &mut self,
@@ -600,6 +684,20 @@ impl PipelinePartitionMetadata for QwenVlPipelinePartition {
 }
 
 impl MlxPlacedGroupExecutor for QwenVlPipelinePartition {
+    fn placed_group_input_observation_path(&self, group: &str) -> Result<Option<String>, Error> {
+        let group = architecture_group_by_id::<_, MlxHybridState>(&self.architecture, group)?;
+        <eredu_architectures::qwen::vl::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
+            MlxNeuralBackend,
+            MlxHybridState,
+        >>::group_input_observation_path(&self.architecture, group)
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))
+    }
+
+    fn placed_group_output_observation_path(&self, group: &str) -> Result<Option<String>, Error> {
+        let _ = group;
+        Ok(None)
+    }
+
     fn begin_placed_ingress(
         &mut self,
         input: crate::backend::runtime::media::input::ModelInput<'_>,
@@ -702,33 +800,16 @@ impl MlxPlacedGroupExecutor for QwenVlPipelinePartition {
         execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
     ) -> Result<PipelinePayload, Error> {
-        let state = self
-            .ingress_state
-            .take()
-            .ok_or_else(|| Error::Parallel("Qwen3-VL ingress state is unavailable".into()))?;
-        let prepared = self
-            .architecture
-            .finish_pipeline(
-                state,
-                execution
-                    .filter(|execution| execution.is_tensor_parallel())
-                    .and_then(ParallelExecutionContext::group),
-                stream,
-            )
-            .map_err(|error| Error::Parallel(error.to_string()))?;
-        let (hidden, boundary) =
-            eredu_architectures::qwen::vl::PipelineBoundary::from_prepared(prepared);
-        Ok(PipelinePayload {
-            hidden: hidden.into_array(),
-            auxiliary: PipelineAuxiliaryState::new(
-                self.boundary_schema()?
-                    .encode(boundary)
-                    .map_err(|error| Error::Parallel(error.to_string()))?
-                    .into_iter()
-                    .map(crate::MlxTensor::into_array)
-                    .collect(),
-            ),
-        })
+        self.finish_ingress(execution, stream, None)
+    }
+
+    fn finish_placed_ingress_observed(
+        &mut self,
+        execution: Option<&ParallelExecutionContext<'_>>,
+        stream: &Stream,
+        observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
+    ) -> Result<PipelinePayload, Error> {
+        self.finish_ingress(execution, stream, Some(observer))
     }
 
     fn prefill(
@@ -740,7 +821,7 @@ impl MlxPlacedGroupExecutor for QwenVlPipelinePartition {
         execution: Option<&ParallelExecutionContext<'_>>,
         expert_group: Option<&Group>,
         stream: &Stream,
-        observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
+        mut observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
     ) -> Result<PipelineStageOutput, Error> {
         let mut state = self.begin_ingress(input, 0, None, execution, stream)?;
         let group = execution
@@ -751,23 +832,15 @@ impl MlxPlacedGroupExecutor for QwenVlPipelinePartition {
         ) {
             self.execute_vision_state(&mut state, group, stream)?;
         }
-        let prepared = self
-            .architecture
-            .finish_pipeline(state, group, stream)
-            .map_err(|error| Error::Parallel(error.to_string()))?;
-        let (hidden, boundary) =
-            eredu_architectures::qwen::vl::PipelineBoundary::from_prepared(prepared);
-        let payload = PipelinePayload {
-            hidden: hidden.into_array(),
-            auxiliary: PipelineAuxiliaryState::new(
-                self.boundary_schema()?
-                    .encode(boundary)
-                    .map_err(|error| Error::Parallel(error.to_string()))?
-                    .into_iter()
-                    .map(crate::MlxTensor::into_array)
-                    .collect(),
-            ),
+        let mut payload = match observer.as_mut() {
+            Some(observer) => {
+                self.finish_ingress_state(state, group, stream, Some(&mut **observer))?
+            }
+            None => self.finish_ingress_state(state, group, stream, None)?,
         };
+        if let Some(observer) = observer.as_mut() {
+            self.observe_merge_payload(&mut payload, &mut **observer)?;
+        }
         self.forward_decoder(
             PipelineStageInput::Hidden(&payload),
             step,
@@ -986,6 +1059,97 @@ impl QwenConditionalPipelinePartition {
                     .map_err(|error| Error::Parallel(error.to_string()))?;
             }
         }
+        Ok(())
+    }
+
+    fn finish_conditional_ingress_state(
+        &mut self,
+        mut state: eredu_architectures::qwen::hybrid::ConditionalPipelineVisionState<
+            crate::MlxTensor,
+        >,
+        group: Option<&Group>,
+        stream: &Stream,
+        observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
+    ) -> Result<PipelinePayload, Error> {
+        self.architecture
+            .complete_pipeline_vision(&mut state, group, stream)
+            .map_err(|error| Error::Parallel(error.to_string()))?;
+        if let (Some(observer), Some(output)) = (
+            observer,
+            eredu_architectures::qwen::hybrid::ConditionalLayeredModel::<MlxNeuralBackend>::pipeline_vision_output(&state),
+        ) {
+            let path = <eredu_architectures::qwen::hybrid::ConditionalLayeredModel<MlxNeuralBackend> as LayeredArchitecture<
+                MlxNeuralBackend,
+                MlxHybridState,
+            >>::group_output_observation_path(&self.architecture, 0)
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?
+            .ok_or_else(|| {
+                Error::ArchitectureModel(
+                    "conditional Qwen3.5 vision group has no output observation path".into(),
+                )
+            })?;
+            let output = eredu_runtime::observe_and_intervene(
+                observer,
+                &path,
+                output.as_array(),
+            )?;
+            eredu_architectures::qwen::hybrid::ConditionalLayeredModel::<MlxNeuralBackend>::replace_pipeline_vision_output(
+                &mut state,
+                crate::MlxTensor::from_array(output),
+            );
+        }
+        let prepared = self
+            .architecture
+            .finish_pipeline_target(state, group, stream)
+            .map_err(|error| Error::Parallel(error.to_string()))?;
+        let (hidden, boundary) =
+            eredu_architectures::qwen::hybrid::ConditionalPipelineBoundary::from_prepared(prepared);
+        Ok(PipelinePayload {
+            hidden: hidden.into_array(),
+            auxiliary: PipelineAuxiliaryState::new(
+                self.boundary_schema()?
+                    .encode(boundary)
+                    .map_err(|error| Error::Parallel(error.to_string()))?
+                    .into_iter()
+                    .map(crate::MlxTensor::into_array)
+                    .collect(),
+            ),
+        })
+    }
+
+    fn finish_conditional_ingress(
+        &mut self,
+        execution: Option<&ParallelExecutionContext<'_>>,
+        stream: &Stream,
+        observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
+    ) -> Result<PipelinePayload, Error> {
+        let state = self.ingress_state.take().ok_or_else(|| {
+            Error::Parallel("conditional Qwen3.5 ingress state is unavailable".into())
+        })?;
+        let group = execution
+            .filter(|execution| execution.is_tensor_parallel())
+            .and_then(ParallelExecutionContext::group);
+        self.finish_conditional_ingress_state(state, group, stream, observer)
+    }
+
+    fn observe_conditional_merge_payload(
+        &self,
+        payload: &mut PipelinePayload,
+        observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
+    ) -> Result<(), Error> {
+        let path = <eredu_architectures::qwen::hybrid::ConditionalLayeredModel<
+            MlxNeuralBackend,
+        > as LayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::group_input_observation_path(
+            &self.architecture,
+            1,
+        )
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?
+        .ok_or_else(|| {
+            Error::ArchitectureModel(
+                "conditional Qwen3.5 decoder group has no input observation path".into(),
+            )
+        })?;
+        payload.hidden = eredu_runtime::observe_and_intervene(observer, &path, &payload.hidden)?;
         Ok(())
     }
 
@@ -1211,6 +1375,20 @@ impl PipelinePartitionMetadata for QwenConditionalPipelinePartition {
 }
 
 impl MlxPlacedGroupExecutor for QwenConditionalPipelinePartition {
+    fn placed_group_input_observation_path(&self, group: &str) -> Result<Option<String>, Error> {
+        let group = architecture_group_by_id::<_, MlxHybridState>(&self.architecture, group)?;
+        <eredu_architectures::qwen::hybrid::ConditionalLayeredModel<MlxNeuralBackend> as LayeredArchitecture<
+            MlxNeuralBackend,
+            MlxHybridState,
+        >>::group_input_observation_path(&self.architecture, group)
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))
+    }
+
+    fn placed_group_output_observation_path(&self, group: &str) -> Result<Option<String>, Error> {
+        let _ = group;
+        Ok(None)
+    }
+
     fn begin_placed_ingress(
         &mut self,
         input: crate::backend::runtime::media::input::ModelInput<'_>,
@@ -1304,29 +1482,16 @@ impl MlxPlacedGroupExecutor for QwenConditionalPipelinePartition {
         execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
     ) -> Result<PipelinePayload, Error> {
-        let state = self.ingress_state.take().ok_or_else(|| {
-            Error::Parallel("conditional Qwen3.5 ingress state is unavailable".into())
-        })?;
-        let group = execution
-            .filter(|execution| execution.is_tensor_parallel())
-            .and_then(ParallelExecutionContext::group);
-        let prepared = self
-            .architecture
-            .finish_pipeline_target(state, group, stream)
-            .map_err(|error| Error::Parallel(error.to_string()))?;
-        let (hidden, boundary) =
-            eredu_architectures::qwen::hybrid::ConditionalPipelineBoundary::from_prepared(prepared);
-        Ok(PipelinePayload {
-            hidden: hidden.into_array(),
-            auxiliary: PipelineAuxiliaryState::new(
-                self.boundary_schema()?
-                    .encode(boundary)
-                    .map_err(|error| Error::Parallel(error.to_string()))?
-                    .into_iter()
-                    .map(crate::MlxTensor::into_array)
-                    .collect(),
-            ),
-        })
+        self.finish_conditional_ingress(execution, stream, None)
+    }
+
+    fn finish_placed_ingress_observed(
+        &mut self,
+        execution: Option<&ParallelExecutionContext<'_>>,
+        stream: &Stream,
+        observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
+    ) -> Result<PipelinePayload, Error> {
+        self.finish_conditional_ingress(execution, stream, Some(observer))
     }
 
     fn prefill(
@@ -1338,7 +1503,7 @@ impl MlxPlacedGroupExecutor for QwenConditionalPipelinePartition {
         execution: Option<&ParallelExecutionContext<'_>>,
         expert_group: Option<&Group>,
         stream: &Stream,
-        observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
+        mut observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
     ) -> Result<PipelineStageOutput, Error> {
         let mut state = self.begin_ingress(input, 0, execution, stream)?;
         let group = execution
@@ -1350,23 +1515,15 @@ impl MlxPlacedGroupExecutor for QwenConditionalPipelinePartition {
             {
                 self.execute_vision_state(&mut state, group, stream)?;
             }
-        let prepared = self
-            .architecture
-            .finish_pipeline_target(state, group, stream)
-            .map_err(|error| Error::Parallel(error.to_string()))?;
-        let (hidden, boundary) =
-            eredu_architectures::qwen::hybrid::ConditionalPipelineBoundary::from_prepared(prepared);
-        let payload = PipelinePayload {
-            hidden: hidden.into_array(),
-            auxiliary: PipelineAuxiliaryState::new(
-                self.boundary_schema()?
-                    .encode(boundary)
-                    .map_err(|error| Error::Parallel(error.to_string()))?
-                    .into_iter()
-                    .map(crate::MlxTensor::into_array)
-                    .collect(),
-            ),
+        let mut payload = match observer.as_mut() {
+            Some(observer) => {
+                self.finish_conditional_ingress_state(state, group, stream, Some(&mut **observer))?
+            }
+            None => self.finish_conditional_ingress_state(state, group, stream, None)?,
         };
+        if let Some(observer) = observer.as_mut() {
+            self.observe_conditional_merge_payload(&mut payload, &mut **observer)?;
+        }
         self.forward_decoder(
             PipelineStageInput::Hidden(&payload),
             step,
@@ -2809,6 +2966,14 @@ impl PipelineEmbeddedMtp for QwenHybridPipelinePartition {
 
     fn embedded_mtp_state_segment(&self) -> Option<&'static str> {
         Some(eredu_architectures::qwen::hybrid::PREDICTION_STATE_SEGMENT)
+    }
+
+    fn prefill_token_identity(
+        &self,
+        input: crate::backend::runtime::media::input::ModelInput<'_>,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        crate::composition::qwen::hybrid::text_prompt_token_ids(input, stream).map_err(Into::into)
     }
 
     fn new_embedded_mtp_cache(

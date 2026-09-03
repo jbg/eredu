@@ -23,12 +23,18 @@ use super::{
     state_layout, static_parameter_groups, vision_layer_parameter_groups, AudioInput, AudioTower,
     DecoderLayer, LocalGeometry, ModelArgs, MtpModel, MtpOutput, VisionLayer, VisionStatic,
 };
+use crate::{
+    composite_execution::{CompositeArchitecture, PreparedCompositeInput},
+    media_plan::InklingInputPartPlan,
+};
 
 /// Canonical static-role identity for the embedded prediction modules and
 /// their persistent state owner.
 pub const MTP_STATIC_ROLE: &str = "mtp";
 /// Stable execution-group identity for Inkling vision ingress.
 pub const VISION_EXECUTION_GROUP: &str = "vision";
+/// Stable execution-group identity for Inkling audio ingress.
+pub const AUDIO_EXECUTION_GROUP: &str = "audio";
 /// Stable execution-group identity for Inkling text decoding.
 pub const TEXT_EXECUTION_GROUP: &str = "text_decoder";
 
@@ -197,6 +203,187 @@ pub struct ModelInput<'a, T> {
     pub audio: Option<AudioInput<'a, T>>,
 }
 
+/// Architecture-owned tensor assembly for one admitted Inkling request.
+pub struct PreparedInput<T> {
+    tokens: Vec<T>,
+    modalities: Vec<eredu_core::InputModality>,
+    projected: Vec<Option<T>>,
+    images: Option<T>,
+    audio: Option<T>,
+    audio_frames: i32,
+}
+
+impl<T> PreparedInput<T> {
+    /// Borrows the assembled request through the canonical model input vocabulary.
+    pub fn with_model_input<R>(&self, apply: impl FnOnce(ModelInput<'_, T>) -> R) -> R {
+        let parts = self
+            .tokens
+            .iter()
+            .zip(&self.modalities)
+            .zip(&self.projected)
+            .map(|((tokens, modality), projected)| match projected {
+                Some(embeddings) => DecoderInputPart::Projected { tokens, embeddings },
+                None => match modality {
+                    eredu_core::InputModality::Text => DecoderInputPart::Text(tokens),
+                    eredu_core::InputModality::Image => DecoderInputPart::Image(tokens),
+                    eredu_core::InputModality::Audio => DecoderInputPart::Audio(tokens),
+                    _ => unreachable!("Inkling admission rejects other modalities"),
+                },
+            })
+            .collect::<Vec<_>>();
+        let audio = self.audio.as_ref().map(|code_ids| AudioInput {
+            code_ids,
+            valid_frames: self.audio_frames,
+        });
+        apply(ModelInput {
+            parts: &parts,
+            vision_patches: self.images.as_ref(),
+            audio,
+        })
+    }
+}
+
+/// Materializes placeholders, retained media extents, and ordered segments from
+/// an architecture admission.
+pub fn prepare_input<T: Tensor>(
+    input: PreparedCompositeInput<'_, T, InklingInputPartPlan>,
+    context: &T::Context,
+) -> Result<PreparedInput<T>, Error> {
+    let prepared = input.prepared();
+    let admitted = input.admitted();
+    if prepared.identity() != admitted.identity() || prepared.len() != admitted.parts().len() {
+        return Err(Error::backend(
+            "Inkling prepared input no longer matches its admission",
+        ));
+    }
+
+    let mut tokens = Vec::with_capacity(prepared.len());
+    let mut modalities = Vec::with_capacity(prepared.len());
+    let mut projected = Vec::with_capacity(prepared.len());
+    let mut images = Vec::new();
+    let mut audio = Vec::new();
+    let mut audio_frames = 0i32;
+    for (part, plan) in prepared.parts().iter().zip(admitted.parts()) {
+        match plan {
+            InklingInputPartPlan::TextTokens { .. } => {
+                let eredu_runtime::PreparedInputPayload::TokenIds(value) = part.payload() else {
+                    return Err(Error::backend(
+                        "Inkling admitted text part lost its token payload",
+                    ));
+                };
+                tokens.push(value.clone());
+                modalities.push(eredu_core::InputModality::Text);
+                projected.push(None);
+            }
+            InklingInputPartPlan::Projected {
+                modality,
+                placeholder_token_id,
+                positions,
+            } => {
+                let eredu_runtime::PreparedInputPayload::Embeddings(value) = part.payload() else {
+                    return Err(Error::backend(
+                        "Inkling admitted projected part lost its embedding payload",
+                    ));
+                };
+                let count = i32::try_from(*positions)
+                    .map_err(|_| Error::backend("Inkling projected span exceeds I32"))?;
+                let token = i32::try_from(*placeholder_token_id)
+                    .map_err(|_| Error::backend("Inkling placeholder ID exceeds I32"))?;
+                tokens.push(T::full_i32(token, &[1, count], context)?);
+                modalities.push(*modality);
+                projected.push(Some(value.clone()));
+            }
+            InklingInputPartPlan::Media {
+                modality, ingress, ..
+            } => {
+                let eredu_runtime::PreparedInputPayload::Tensor(value) = part.payload() else {
+                    return Err(Error::backend(
+                        "Inkling admitted media part lost its tensor payload",
+                    ));
+                };
+                let count = i32::try_from(ingress.placeholder_count)
+                    .map_err(|_| Error::backend("Inkling media span exceeds I32"))?;
+                let token = i32::try_from(ingress.placeholder_token_id)
+                    .map_err(|_| Error::backend("Inkling placeholder ID exceeds I32"))?;
+                tokens.push(T::full_i32(token, &[1, count], context)?);
+                modalities.push(*modality);
+                projected.push(None);
+                match modality {
+                    eredu_core::InputModality::Image => images.push(value.clone()),
+                    eredu_core::InputModality::Audio => {
+                        audio.push(
+                            value.index(
+                                &[Index::Full, Index::Range(0, count), Index::Full],
+                                context,
+                            )?,
+                        );
+                        audio_frames += count;
+                    }
+                    _ => {
+                        return Err(Error::backend(
+                            "Inkling media admission contains an unsupported modality",
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    let images = match images.len() {
+        0 => None,
+        1 => images.pop(),
+        _ => Some(T::concatenate(&images, 0, context)?),
+    };
+    let audio = match audio.len() {
+        0 => None,
+        1 => audio.pop(),
+        _ => Some(T::concatenate(&audio, 1, context)?),
+    };
+    Ok(PreparedInput {
+        tokens,
+        modalities,
+        projected,
+        images,
+        audio,
+        audio_frames,
+    })
+}
+
+impl<B, S> CompositeArchitecture<B, S> for LayeredModel<B>
+where
+    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
+    S: LayerRuntimeState<B>,
+    S::LayerState: AuxiliaryConvolutionState<B::Tensor>,
+{
+    type InputPartPlan = InklingInputPartPlan;
+    type AdmissionConfig = ModelArgs;
+
+    fn admission_config(&self) -> Self::AdmissionConfig {
+        self.args.clone()
+    }
+
+    fn admit_prepared_input(
+        config: &Self::AdmissionConfig,
+        input: &eredu_runtime::PreparedModelInput<B::Tensor>,
+        inspector: &impl eredu_runtime::PreparedInputInspector<B::Tensor>,
+    ) -> Result<
+        crate::media_plan::AdmittedCompositeInput<Self::InputPartPlan>,
+        eredu_core::CapabilityError,
+    > {
+        crate::media_plan::admit_inkling_input(config, input, inspector)
+    }
+
+    fn begin_composite_forward<'a>(
+        &mut self,
+        input: PreparedCompositeInput<'a, B::Tensor, Self::InputPartPlan>,
+        state: &mut S,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
+        prepare_input(input, context)?.with_model_input(|input| {
+            <Self as LayeredArchitecture<B, S>>::begin_forward(self, input, state, context)
+        })
+    }
+}
+
 /// Typed text-decoder input for one pipeline partition.
 pub enum TextPartitionInput<'a, T> {
     /// Token identities owned by the first decoder partition.
@@ -255,7 +442,7 @@ where
         P::Error: std::fmt::Display,
     {
         match (group, unit) {
-            (1, Unit::Text(unit)) => self.forward_text_unit_with_provider(
+            (2, Unit::Text(unit)) => self.forward_text_unit_with_provider(
                 index, unit, hidden, state, pass, provider, context,
             ),
             (_, unit) => <Self as LayeredArchitecture<B, S>>::forward_unit(
@@ -289,7 +476,7 @@ where
         P::Error: std::fmt::Display,
     {
         match (group, unit) {
-            (1, Unit::Text(unit)) => self.forward_text_unit_parallel_with_provider(
+            (2, Unit::Text(unit)) => self.forward_text_unit_parallel_with_provider(
                 index, unit, hidden, state, pass, provider, parallel, context,
             ),
             (_, unit) => <Self as ParallelLayeredArchitecture<B, S>>::forward_unit_parallel(
@@ -303,9 +490,34 @@ where
 pub struct ForwardContext<T> {
     parts: Vec<PreparedPart<T>>,
     tokens: T,
-    audio: Option<T>,
+    audio_input: Option<T>,
+    audio_valid_frames: Option<i32>,
+    audio_output: Option<T>,
+    vision_output: Option<T>,
     has_vision: bool,
     target_hidden: Option<T>,
+}
+
+impl<T> ForwardContext<T> {
+    /// Whether this request carries raw vision input.
+    pub const fn has_vision_input(&self) -> bool {
+        self.has_vision
+    }
+
+    /// Whether this request carries raw audio input.
+    pub const fn has_audio_input(&self) -> bool {
+        self.audio_input.is_some()
+    }
+
+    /// Installs the architecture-declared vision projector output received from another owner.
+    pub fn replace_vision_output(&mut self, output: T) {
+        self.vision_output = Some(output);
+    }
+
+    /// Installs the architecture-declared audio projector output received from another owner.
+    pub fn replace_audio_output(&mut self, output: T) {
+        self.audio_output = Some(output);
+    }
 }
 
 /// Inkling architecture shared by resident, layerwise, and streamed runtimes.
@@ -496,7 +708,10 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
             context: ForwardContext {
                 tokens: hidden.clone(),
                 parts: Vec::new(),
-                audio: None,
+                audio_input: None,
+                audio_valid_frames: None,
+                audio_output: None,
+                vision_output: None,
                 has_vision: false,
                 target_hidden: None,
             },
@@ -548,13 +763,24 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         &self,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<ArchitectureParameterDescription, Error> {
-        let graph = ExecutionGraph::chain([VISION_EXECUTION_GROUP, TEXT_EXECUTION_GROUP])
-            .map_err(Error::backend)?;
+        let graph = ExecutionGraph::new(
+            vec![
+                eredu_runtime::ExecutionGroupSpec::root(VISION_EXECUTION_GROUP),
+                eredu_runtime::ExecutionGroupSpec::root(AUDIO_EXECUTION_GROUP),
+                eredu_runtime::ExecutionGroupSpec::with_dependencies(
+                    TEXT_EXECUTION_GROUP,
+                    [VISION_EXECUTION_GROUP, AUDIO_EXECUTION_GROUP],
+                ),
+            ],
+            TEXT_EXECUTION_GROUP,
+        )
+        .map_err(Error::backend)?;
         let counts = [
             self.args
                 .vision_config
                 .as_ref()
                 .map_or(0, |vision| vision.num_hidden_layers as usize),
+            0,
             self.args.text_config.num_hidden_layers as usize,
         ];
         let layout = ExecutionUnitLayout::new(&graph, counts).map_err(Error::backend)?;
@@ -652,6 +878,11 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         InklingStateLayouts::new(target, prediction)
     }
 
+    fn accepts_execution_state(&self, layout: &StateLayout) -> Result<bool, Error> {
+        let layouts = self.state_layouts()?;
+        Ok(layout == layouts.target() || layout == layouts.composite())
+    }
+
     /// Shares validated planner-derived geometry with backend residency policy.
     pub fn shared_parallel_geometry(&self) -> Option<Arc<LocalGeometry>> {
         self.parallel_geometry.clone()
@@ -683,7 +914,10 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
                     embeddings,
                 }],
                 tokens: tokens.clone(),
-                audio: None,
+                audio_input: None,
+                audio_valid_frames: None,
+                audio_output: None,
+                vision_output: None,
                 has_vision: false,
                 target_hidden: None,
             },
@@ -772,13 +1006,17 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
             None => None,
         };
         let hidden = self.assemble(&parts, vision.as_ref(), audio.as_ref(), context)?;
+        let has_vision = vision.is_some();
         Ok(LayeredForwardState {
             hidden,
             context: ForwardContext {
                 parts,
                 tokens,
-                audio,
-                has_vision: vision.is_some(),
+                audio_input: None,
+                audio_valid_frames: None,
+                audio_output: audio,
+                vision_output: vision,
+                has_vision,
                 target_hidden: None,
             },
         })
@@ -1234,8 +1472,8 @@ where
     type Error = Error;
 
     fn group_transport(&self, group: usize) -> eredu_runtime::ArchitectureGroupTransport {
-        if group == 0 {
-            eredu_runtime::ArchitectureGroupTransport {
+        match group {
+            0 => eredu_runtime::ArchitectureGroupTransport {
                 placement: eredu_runtime::ArchitectureGroupPlacement::Pipeline,
                 kind: eredu_runtime::ArchitectureGroupKind::VisionEncoder,
                 first_owner_static_roles: vec!["vision".into()],
@@ -1243,16 +1481,20 @@ where
                 merge_destination: eredu_runtime::ArchitectureMergeDestination::FirstPipelineOwner,
                 parallel_subgroup: Some(eredu_runtime::ArchitectureParallelSubgroup::TensorSharded),
                 request_optional: true,
-            }
-        } else {
-            eredu_runtime::ArchitectureGroupTransport {
+            },
+            1 => eredu_runtime::ArchitectureGroupTransport {
+                placement: eredu_runtime::ArchitectureGroupPlacement::Pipeline,
+                kind: eredu_runtime::ArchitectureGroupKind::AudioEncoder,
+                first_owner_static_roles: vec!["audio".into()],
+                last_owner_static_roles: Vec::new(),
+                merge_destination: eredu_runtime::ArchitectureMergeDestination::FirstPipelineOwner,
+                parallel_subgroup: None,
+                request_optional: true,
+            },
+            _ => eredu_runtime::ArchitectureGroupTransport {
                 placement: eredu_runtime::ArchitectureGroupPlacement::Pipeline,
                 kind: eredu_runtime::ArchitectureGroupKind::Decoder,
-                first_owner_static_roles: vec![
-                    "embedding".into(),
-                    "embedding_norm".into(),
-                    "audio".into(),
-                ],
+                first_owner_static_roles: vec!["embedding".into(), "embedding_norm".into()],
                 last_owner_static_roles: vec![
                     "norm".into(),
                     "output".into(),
@@ -1261,7 +1503,7 @@ where
                 merge_destination: eredu_runtime::ArchitectureMergeDestination::LastOwner,
                 parallel_subgroup: Some(eredu_runtime::ArchitectureParallelSubgroup::Decoder),
                 request_optional: false,
-            }
+            },
         }
     }
 
@@ -1279,12 +1521,22 @@ where
             .find(|segment| segment.id().as_str() == super::TARGET_STATE_SEGMENT)
             .map(|segment| segment.layers().end)
             .unwrap_or(layout.len());
-        crate::transport::pipeline_with_output_state(1, target_layers, layout)
+        crate::transport::pipeline_with_output_state(2, target_layers, layout)
     }
 
     fn execution_graph(&self) -> Result<ExecutionGraph, Self::Error> {
-        ExecutionGraph::chain([VISION_EXECUTION_GROUP, TEXT_EXECUTION_GROUP])
-            .map_err(Error::backend)
+        ExecutionGraph::new(
+            vec![
+                eredu_runtime::ExecutionGroupSpec::root(VISION_EXECUTION_GROUP),
+                eredu_runtime::ExecutionGroupSpec::root(AUDIO_EXECUTION_GROUP),
+                eredu_runtime::ExecutionGroupSpec::with_dependencies(
+                    TEXT_EXECUTION_GROUP,
+                    [VISION_EXECUTION_GROUP, AUDIO_EXECUTION_GROUP],
+                ),
+            ],
+            TEXT_EXECUTION_GROUP,
+        )
+        .map_err(Error::backend)
     }
 
     fn group_unit_count(&self, group: usize) -> Result<usize, Self::Error> {
@@ -1294,8 +1546,9 @@ where
                 .vision_config
                 .as_ref()
                 .map_or(0, |vision| vision.num_hidden_layers as usize)),
-            1 => Ok(self.args.text_config.num_hidden_layers as usize),
-            _ => Err(Error::backend("Inkling has two execution groups")),
+            1 => Ok(0),
+            2 => Ok(self.args.text_config.num_hidden_layers as usize),
+            _ => Err(Error::backend("Inkling has three execution groups")),
         }
     }
 
@@ -1306,17 +1559,30 @@ where
                 .vision_config
                 .as_ref()
                 .map_or(0, |vision| vision.num_hidden_layers as usize),
-            1 => self.args.text_config.num_hidden_layers as usize,
-            _ => return Err(Error::backend("Inkling has two execution groups")),
+            1 => 0,
+            2 => self.args.text_config.num_hidden_layers as usize,
+            _ => return Err(Error::backend("Inkling has three execution groups")),
         };
         if index >= count {
             return Err(Error::backend("Inkling unit is outside its group"));
         }
         match group {
             0 => Ok(format!("visual.layers.{index}")),
-            1 => Ok(format!("model.layers.{index}")),
+            2 => Ok(format!("model.layers.{index}")),
             _ => unreachable!(),
         }
+    }
+
+    fn group_input_observation_path(&self, group: usize) -> Result<Option<String>, Self::Error> {
+        Ok((group == 2).then(|| eredu_core::MODALITY_MERGE_OUTPUT_OBSERVATION_PATH.to_owned()))
+    }
+
+    fn group_output_observation_path(&self, group: usize) -> Result<Option<String>, Self::Error> {
+        Ok(match group {
+            0 => Some(eredu_core::VISION_PROJECTOR_OUTPUT_OBSERVATION_PATH.to_owned()),
+            1 => Some(eredu_core::AUDIO_PROJECTOR_OUTPUT_OBSERVATION_PATH.to_owned()),
+            _ => None,
+        })
     }
 
     fn static_modules(&self) -> &Self::StaticModules {
@@ -1347,7 +1613,7 @@ where
                     context,
                 )?))
             }
-            1 => {
+            2 => {
                 let text = match &self.parallel_geometry {
                     Some(geometry) => geometry.text_layer(index).ok_or_else(|| {
                         Error::backend("missing rank-local Inkling text geometry")
@@ -1356,14 +1622,14 @@ where
                 };
                 Ok(Unit::Text(DecoderLayer::new(text, index, context)?))
             }
-            _ => Err(Error::backend("Inkling has two execution groups")),
+            _ => Err(Error::backend("Inkling has three execution groups")),
         }
     }
 
     fn state_ordinal(&self, group: usize, index: usize, _ordinal: usize) -> usize {
         match group {
             0 => 0,
-            1 => index,
+            2 => index,
             _ => index,
         }
     }
@@ -1376,7 +1642,7 @@ where
     ) -> std::ops::Range<usize> {
         match group {
             0 => 0..0,
-            1 => index..index + 1,
+            2 => index..index + 1,
             _ => 0..0,
         }
     }
@@ -1387,21 +1653,13 @@ where
         state: &mut S,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
-        if state.layout() != &self.ingress_state_layout()? {
+        if !self.accepts_execution_state(state.layout())? {
             return Err(Error::backend("Inkling runtime state layout mismatch"));
         }
         let parts = self.prepare_parts(input.parts, context)?;
         let tokens = ordered_tokens(&parts, context)?;
-        let audio = match input.audio {
-            Some(audio) => Some(
-                self.static_modules
-                    .audio
-                    .as_mut()
-                    .ok_or_else(|| Error::backend("Inkling has no audio tower"))?
-                    .forward(audio, context)?,
-            ),
-            None => None,
-        };
+        let audio_input = input.audio.as_ref().map(|audio| audio.code_ids.clone());
+        let audio_valid_frames = input.audio.as_ref().map(|audio| audio.valid_frames);
         let has_vision = input.vision_patches.is_some();
         let hidden = match input.vision_patches {
             Some(patches) => {
@@ -1410,14 +1668,18 @@ where
                 }
                 patches.clone()
             }
-            None => self.assemble(&parts, None, audio.as_ref(), context)?,
+            None if audio_input.is_some() => audio_input.as_ref().expect("checked").clone(),
+            None => self.assemble(&parts, None, None, context)?,
         };
         Ok(LayeredForwardState {
             hidden,
             context: ForwardContext {
                 parts,
                 tokens,
-                audio,
+                audio_input,
+                audio_valid_frames,
+                audio_output: None,
+                vision_output: None,
                 has_vision,
                 target_hidden: None,
             },
@@ -1430,18 +1692,31 @@ where
         initial: &B::Tensor,
         dependencies: &[&B::Tensor],
         _state: &mut S,
-        _forward: &mut Self::ForwardContext,
-        _context: &<B::Tensor as Tensor>::Context,
+        forward: &mut Self::ForwardContext,
+        context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
         match (group, dependencies) {
             (0, []) => Ok(initial.clone()),
-            (1, [assembled]) => Ok((*assembled).clone()),
+            (1, []) if forward.audio_input.is_some() => {
+                Ok(forward.audio_input.as_ref().expect("checked").clone())
+            }
+            (1, []) => Ok(initial.clone()),
+            (2, [vision, audio]) => self.assemble(
+                &forward.parts,
+                forward.vision_output.as_ref().map(|_| *vision),
+                forward.audio_output.as_ref().map(|_| *audio),
+                context,
+            ),
             _ => Err(Error::backend("invalid Inkling execution dependencies")),
         }
     }
 
     fn should_execute_group(&self, group: usize, forward: &Self::ForwardContext) -> bool {
-        group != 0 || forward.has_vision
+        match group {
+            0 => forward.has_vision,
+            1 => forward.audio_input.is_some(),
+            _ => true,
+        }
     }
 
     fn forward_unit(
@@ -1456,7 +1731,7 @@ where
     ) -> Result<B::Tensor, Self::Error> {
         match (group, unit) {
             (0, Unit::Vision(unit)) => unit.forward(hidden, context),
-            (1, Unit::Text(unit)) => unit.forward(
+            (2, Unit::Text(unit)) => unit.forward(
                 hidden,
                 Some(state.layer(index).map_err(Error::backend)?),
                 context,
@@ -1481,15 +1756,25 @@ where
                     .as_mut()
                     .ok_or_else(|| Error::backend("Inkling vision static modules are missing"))?
                     .finish(hidden, context)?;
-                self.assemble(
-                    &forward.parts,
-                    Some(&vision),
-                    forward.audio.as_ref(),
-                    context,
-                )
+                forward.vision_output = Some(vision.clone());
+                Ok(vision)
             }
             0 => Ok(hidden.clone()),
-            1 => Ok(hidden.clone()),
+            1 if forward.audio_input.is_some() => {
+                let input = AudioInput {
+                    code_ids: forward.audio_input.as_ref().expect("checked"),
+                    valid_frames: forward.audio_valid_frames.expect("audio frame count"),
+                };
+                let audio = self
+                    .static_modules
+                    .audio
+                    .as_mut()
+                    .ok_or_else(|| Error::backend("Inkling has no audio tower"))?
+                    .forward(input, context)?;
+                forward.audio_output = Some(audio.clone());
+                Ok(audio)
+            }
+            1 | 2 => Ok(hidden.clone()),
             _ => Err(Error::backend("invalid Inkling execution group")),
         }
     }
@@ -1518,7 +1803,9 @@ where
     ) -> Self::RetainedContextValues<'a> {
         let mut values = Vec::new();
         values.push(&forward.tokens);
-        values.extend(forward.audio.iter());
+        values.extend(forward.audio_input.iter());
+        values.extend(forward.audio_output.iter());
+        values.extend(forward.vision_output.iter());
         for part in &forward.parts {
             match part {
                 PreparedPart::Text { tokens, embeddings } => values.extend([tokens, embeddings]),
@@ -1552,21 +1839,13 @@ where
                 "Inkling model was not built with local geometry",
             ));
         }
-        if state.layout() != &self.ingress_state_layout()? {
+        if !self.accepts_execution_state(state.layout())? {
             return Err(Error::backend("Inkling rank-local state layout mismatch"));
         }
         let parts = self.prepare_parts_parallel(input.parts, parallel, context)?;
         let tokens = ordered_tokens(&parts, context)?;
-        let audio = match input.audio {
-            Some(audio) => Some(
-                self.static_modules
-                    .audio
-                    .as_mut()
-                    .ok_or_else(|| Error::backend("Inkling has no audio tower"))?
-                    .forward(audio, context)?,
-            ),
-            None => None,
-        };
+        let audio_input = input.audio.as_ref().map(|audio| audio.code_ids.clone());
+        let audio_valid_frames = input.audio.as_ref().map(|audio| audio.valid_frames);
         let has_vision = input.vision_patches.is_some();
         let hidden = match input.vision_patches {
             Some(patches) => {
@@ -1575,14 +1854,18 @@ where
                 }
                 patches.clone()
             }
-            None => self.assemble(&parts, None, audio.as_ref(), context)?,
+            None if audio_input.is_some() => audio_input.as_ref().expect("checked").clone(),
+            None => self.assemble(&parts, None, None, context)?,
         };
         Ok(LayeredForwardState {
             hidden,
             context: ForwardContext {
                 parts,
                 tokens,
-                audio,
+                audio_input,
+                audio_valid_frames,
+                audio_output: None,
+                vision_output: None,
                 has_vision,
                 target_hidden: None,
             },
@@ -1602,7 +1885,7 @@ where
     ) -> Result<B::Tensor, Self::Error> {
         let output = match (group, unit) {
             (0, Unit::Vision(unit)) => unit.forward(hidden, context),
-            (1, Unit::Text(unit)) => unit.forward_parallel(
+            (2, Unit::Text(unit)) => unit.forward_parallel(
                 hidden,
                 Some(state.layer(index).map_err(Error::backend)?),
                 parallel,
@@ -1610,7 +1893,7 @@ where
             ),
             _ => Err(Error::backend("Inkling unit/group mismatch")),
         }?;
-        if group == 1 && index + 1 == self.args.text_config.num_hidden_layers as usize {
+        if group == 2 && index + 1 == self.args.text_config.num_hidden_layers as usize {
             forward.capture_target_hidden(output.clone());
         }
         Ok(output)

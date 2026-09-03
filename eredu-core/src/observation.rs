@@ -11,6 +11,18 @@ use serde::{Deserialize, Serialize};
 /// semantic observation.
 pub const MODEL_LOGITS_OBSERVATION_PATH: &str = "model.logits";
 
+/// Canonical prefix for tensors emitted by architecture processor execution.
+pub const PROCESSOR_OUTPUT_OBSERVATION_PATH: &str = "model.processor.output";
+
+/// Canonical observation path for projected visual features.
+pub const VISION_PROJECTOR_OUTPUT_OBSERVATION_PATH: &str = "model.vision.projector.output";
+
+/// Canonical observation path for projected audio features.
+pub const AUDIO_PROJECTOR_OUTPUT_OBSERVATION_PATH: &str = "model.audio.projector.output";
+
+/// Canonical observation path for the decoder-width multimodal assembly.
+pub const MODALITY_MERGE_OUTPUT_OBSERVATION_PATH: &str = "model.modality.merge.output";
+
 /// Materialized row-major tensor values.
 ///
 /// Backends may normalize native storage such as F16 or BF16 to F32 when

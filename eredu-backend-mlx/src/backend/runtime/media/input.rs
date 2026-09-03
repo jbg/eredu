@@ -10,7 +10,10 @@ use eredu_core::{
     checkpoint::TensorDtype, CapabilityError, InputExtent, InputMetadataKey, InputModality,
     InputTensorIdentity, PreparedInputError,
 };
-use eredu_runtime::{PreparedInputPart as RuntimeInputPart, PreparedInputPayload};
+use eredu_runtime::{
+    PreparedInputCacheIdentity, PreparedInputInspector, PreparedInputPart as RuntimeInputPart,
+    PreparedInputPayload,
+};
 
 /// MLX specialization of the backend-neutral runtime input part.
 pub type InputPart = RuntimeInputPart<Array>;
@@ -23,12 +26,32 @@ pub type InputPayload = PreparedInputPayload<Array>;
 pub struct ModelInput<'a> {
     /// Ordered input parts consumed by the model.
     pub parts: &'a [InputPart],
+    cache_identity: Option<&'a PreparedInputCacheIdentity>,
 }
 
 impl<'a> ModelInput<'a> {
     /// Creates a typed input from ordered parts.
     pub fn new(parts: &'a [InputPart]) -> Self {
-        Self { parts }
+        Self {
+            parts,
+            cache_identity: None,
+        }
+    }
+
+    /// Creates a typed input carrying its exact cache-relevant semantic identity.
+    pub fn with_cache_identity(
+        parts: &'a [InputPart],
+        cache_identity: &'a PreparedInputCacheIdentity,
+    ) -> Self {
+        Self {
+            parts,
+            cache_identity: Some(cache_identity),
+        }
+    }
+
+    /// Returns the identity coupled to these exact prepared values, when supplied.
+    pub const fn cache_identity(self) -> Option<&'a PreparedInputCacheIdentity> {
+        self.cache_identity
     }
 }
 
@@ -56,7 +79,7 @@ pub fn token_ids_part(token_ids: &Array) -> Result<InputPart, Exception> {
 /// Describes MLX tensors and evaluates architecture-required metadata.
 pub struct MlxInputInspector;
 
-impl eredu_architectures::media_plan::PreparedInputInspector<Array> for MlxInputInspector {
+impl PreparedInputInspector<Array> for MlxInputInspector {
     fn identity(&self, tensor: &Array) -> Result<InputTensorIdentity, PreparedInputError> {
         let shape = tensor
             .shape()
@@ -90,6 +113,26 @@ impl eredu_architectures::media_plan::PreparedInputInspector<Array> for MlxInput
             .try_as_slice::<bool>()
             .map(|values| values.to_vec())
             .map_err(|error| CapabilityError::Observation(error.to_string()))
+    }
+}
+
+/// Describes neutral MLX tensor wrappers for architecture-owned admission.
+pub struct MlxTensorInputInspector;
+
+impl PreparedInputInspector<crate::MlxTensor> for MlxTensorInputInspector {
+    fn identity(
+        &self,
+        tensor: &crate::MlxTensor,
+    ) -> Result<InputTensorIdentity, PreparedInputError> {
+        MlxInputInspector.identity(tensor.as_array())
+    }
+
+    fn i32_values(&self, tensor: &crate::MlxTensor) -> Result<Vec<i32>, CapabilityError> {
+        MlxInputInspector.i32_values(tensor.as_array())
+    }
+
+    fn bool_values(&self, tensor: &crate::MlxTensor) -> Result<Vec<bool>, CapabilityError> {
+        MlxInputInspector.bool_values(tensor.as_array())
     }
 }
 

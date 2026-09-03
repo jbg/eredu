@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use eredu_nn::{
     multimodal::{assemble_ordered_inputs, OrderedInputPart},
     AttentionCache, EmbeddingLookupPolicy, EmbeddingOperator, Error, GroupedNeuralBackend, Index,
-    LinearOperator, NormalizationOperator, Parameterized, RotaryPosition, Tensor,
+    LinearOperator, NormalizationOperator, PadMode, Parameterized, RotaryPosition, Tensor,
 };
 use eredu_runtime::{
     ArchitectureParameterDescription, ExecutionGraph, ExecutionGroupSpec, ExecutionUnitLayout,
@@ -18,9 +18,14 @@ use eredu_runtime::{
 use super::{
     audio_layer_parameter_groups, audio_static_parameter_groups, layer_parameter_groups,
     modality_projection_parameter_groups, state_layout, static_parameter_groups,
-    vision_layer_parameter_groups, vision_static_parameter_groups, AudioInput, AudioLayer,
-    AudioStatic, BlockInput, DenseBlock, FamilyConfig, LocalGeometry, ModalityProjector,
-    SharedAttentionStates, VisionInput, VisionLayer, VisionState, VisionStatic,
+    vision_layer_parameter_groups, vision_static_parameter_groups, AudioIngressBatchPlan,
+    AudioIngressPartPlan, AudioInput, AudioLayer, AudioStatic, BlockInput, DenseBlock,
+    FamilyConfig, LocalGeometry, ModalityProjector, SharedAttentionStates, VisionIngressBatchPlan,
+    VisionIngressPartPlan, VisionInput, VisionLayer, VisionState, VisionStatic,
+};
+use crate::{
+    composite_execution::{CompositeArchitecture, PreparedCompositeInput},
+    media_plan::Gemma4InputPartPlan,
 };
 
 /// Stable execution-group identity for Gemma 4 vision ingress.
@@ -305,6 +310,372 @@ pub struct ModelInput<'a, T> {
     pub per_layer_tokens: Option<&'a T>,
     /// Optional caller-supplied decoder attention mask.
     pub mask: Option<&'a T>,
+}
+
+struct PreparedVision<T> {
+    patches: T,
+    positions: T,
+    valid: T,
+    key_mask: T,
+    grid_extents: Vec<(i32, i32)>,
+}
+
+struct PreparedAudio<T> {
+    features: T,
+    input_mask: T,
+    first_stage_mask: T,
+    valid: Vec<i32>,
+}
+
+/// Architecture-prepared Gemma 4 decoder and media ingress.
+pub struct PreparedCompositeIngress<T> {
+    tokens: Vec<T>,
+    modalities: Vec<eredu_core::InputModality>,
+    projected: Vec<Option<T>>,
+    vision: Option<PreparedVision<T>>,
+    audio: Option<PreparedAudio<T>>,
+}
+
+impl<T> PreparedCompositeIngress<T> {
+    /// Borrows ordered decoder segments with architecture-created placeholders.
+    pub fn decoder_parts(&self) -> Vec<DecoderInputPart<'_, T>> {
+        self.tokens
+            .iter()
+            .zip(&self.modalities)
+            .zip(&self.projected)
+            .map(|((tokens, modality), embeddings)| {
+                if let Some(embeddings) = embeddings {
+                    DecoderInputPart::Projected { tokens, embeddings }
+                } else {
+                    match modality {
+                        eredu_core::InputModality::Text => DecoderInputPart::Text(tokens),
+                        eredu_core::InputModality::Image => DecoderInputPart::Image(tokens),
+                        eredu_core::InputModality::Video => DecoderInputPart::Video(tokens),
+                        eredu_core::InputModality::Audio => DecoderInputPart::Audio(tokens),
+                        _ => unreachable!("Gemma admission rejects other modalities"),
+                    }
+                }
+            })
+            .collect()
+    }
+
+    /// Borrows the padded vision batch when present.
+    pub fn vision_input(&self) -> Option<VisionInput<'_, T>> {
+        self.vision.as_ref().map(|vision| VisionInput {
+            patches: &vision.patches,
+            position_ids: &vision.positions,
+            position_valid: &vision.valid,
+            key_mask: &vision.key_mask,
+            grid_extents: &vision.grid_extents,
+        })
+    }
+
+    /// Borrows the padded audio batch when present.
+    pub fn audio_input(&self) -> Option<AudioInput<'_, T>> {
+        self.audio.as_ref().map(|audio| AudioInput {
+            features: &audio.features,
+            input_mask: &audio.input_mask,
+            first_stage_mask: &audio.first_stage_mask,
+            valid_subsampled_frames: &audio.valid,
+        })
+    }
+}
+
+/// Interprets one admitted Gemma 4 input using neutral tensor operations.
+pub fn prepare_composite_ingress<B>(
+    input: PreparedCompositeInput<'_, B::Tensor, Gemma4InputPartPlan>,
+    context: &<B::Tensor as Tensor>::Context,
+) -> Result<PreparedCompositeIngress<B::Tensor>, Error>
+where
+    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
+{
+    struct VisionPart<T> {
+        patches: T,
+        positions: T,
+        plan: VisionIngressPartPlan,
+    }
+    struct AudioPart<T> {
+        features: T,
+        plan: AudioIngressPartPlan,
+    }
+
+    let prepared = input.prepared();
+    let admitted = input.admitted();
+    if prepared.identity() != admitted.identity() || prepared.len() != admitted.parts().len() {
+        return Err(Error::backend(
+            "Gemma 4 prepared input no longer matches its admission",
+        ));
+    }
+
+    let mut tokens = Vec::with_capacity(prepared.len());
+    let mut modalities = Vec::with_capacity(prepared.len());
+    let mut projected = Vec::with_capacity(prepared.len());
+    let mut vision_parts = Vec::new();
+    let mut audio_parts = Vec::new();
+    for (part, plan) in prepared.parts().iter().zip(admitted.parts()) {
+        match plan {
+            Gemma4InputPartPlan::TextTokens { .. } => {
+                let eredu_runtime::PreparedInputPayload::TokenIds(value) = part.payload() else {
+                    return Err(Error::backend(
+                        "Gemma 4 admitted text part lost its token payload",
+                    ));
+                };
+                tokens.push(value.clone());
+                modalities.push(eredu_core::InputModality::Text);
+                projected.push(None);
+            }
+            Gemma4InputPartPlan::Projected {
+                modality,
+                placeholder_token_id,
+                positions,
+            } => {
+                let eredu_runtime::PreparedInputPayload::Embeddings(value) = part.payload() else {
+                    return Err(Error::backend(
+                        "Gemma 4 admitted projected part lost its embedding payload",
+                    ));
+                };
+                let count = i32::try_from(*positions)
+                    .map_err(|_| Error::backend("Gemma 4 projected span exceeds I32"))?;
+                let token = i32::try_from(*placeholder_token_id)
+                    .map_err(|_| Error::backend("Gemma 4 placeholder ID exceeds I32"))?;
+                tokens.push(B::Tensor::full_i32(token, &[1, count], context)?);
+                modalities.push(*modality);
+                projected.push(Some(value.clone()));
+            }
+            Gemma4InputPartPlan::Vision {
+                placeholder_token_id,
+                ingress,
+                ..
+            } => {
+                let eredu_runtime::PreparedInputPayload::Tensor(value) = part.payload() else {
+                    return Err(Error::backend(
+                        "Gemma 4 admitted vision part lost its tensor payload",
+                    ));
+                };
+                let positions = part
+                    .metadata_value(eredu_core::InputMetadataKey::PatchPositions)
+                    .ok_or_else(|| Error::backend("Gemma 4 vision positions disappeared"))?;
+                let token = i32::try_from(*placeholder_token_id)
+                    .map_err(|_| Error::backend("Gemma 4 placeholder ID exceeds I32"))?;
+                tokens.push(B::Tensor::full_i32(
+                    token,
+                    &[1, ingress.decoder_positions],
+                    context,
+                )?);
+                modalities.push(part.modality());
+                projected.push(None);
+                vision_parts.push(VisionPart {
+                    patches: value.clone(),
+                    positions: positions.clone(),
+                    plan: ingress.clone(),
+                });
+            }
+            Gemma4InputPartPlan::Audio {
+                placeholder_token_id,
+                ingress,
+                ..
+            } => {
+                let eredu_runtime::PreparedInputPayload::Tensor(value) = part.payload() else {
+                    return Err(Error::backend(
+                        "Gemma 4 admitted audio part lost its tensor payload",
+                    ));
+                };
+                let token = i32::try_from(*placeholder_token_id)
+                    .map_err(|_| Error::backend("Gemma 4 placeholder ID exceeds I32"))?;
+                tokens.push(B::Tensor::full_i32(
+                    token,
+                    &[1, ingress.decoder_positions],
+                    context,
+                )?);
+                modalities.push(eredu_core::InputModality::Audio);
+                projected.push(None);
+                audio_parts.push(AudioPart {
+                    features: value.clone(),
+                    plan: ingress.clone(),
+                });
+            }
+        }
+    }
+
+    let vision_plan = (!vision_parts.is_empty())
+        .then(|| {
+            VisionIngressBatchPlan::new(
+                &vision_parts
+                    .iter()
+                    .map(|part| part.plan.clone())
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .transpose()
+        .map_err(|error| Error::backend(error.to_string()))?;
+    let vision = if let Some(plan) = vision_plan {
+        let patches = vision_parts
+            .iter()
+            .map(|part| {
+                let extra = plan.padded_patches - part.patches.dim(1);
+                if extra < 0 {
+                    return Err(Error::backend(
+                        "Gemma 4 vision payload exceeds admitted batch padding",
+                    ));
+                }
+                B::Tensor::pad(
+                    &part.patches,
+                    &[(0, 0), (0, extra), (0, 0)],
+                    PadMode::Constant,
+                    context,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let positions = vision_parts
+            .iter()
+            .map(|part| {
+                let extra = plan.padded_patches - part.positions.dim(1);
+                if extra < 0 {
+                    return Err(Error::backend(
+                        "Gemma 4 vision positions exceed admitted batch padding",
+                    ));
+                }
+                B::Tensor::pad(
+                    &part.positions,
+                    &[(0, 0), (0, extra), (0, 0)],
+                    PadMode::Constant,
+                    context,
+                )?
+                .maximum_i32(0, context)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Some(PreparedVision {
+            patches: B::Tensor::concatenate(&patches, 0, context)?,
+            positions: B::Tensor::concatenate(&positions, 0, context)?,
+            valid: B::Tensor::from_f32_slice(
+                &plan.position_valid_values,
+                &plan.position_valid_shape(),
+                context,
+            )?,
+            key_mask: B::Tensor::from_f32_slice(
+                &plan.key_mask_values,
+                &plan.key_mask_shape(),
+                context,
+            )?,
+            grid_extents: plan.grid_extents,
+        })
+    } else {
+        None
+    };
+
+    let audio_plan = (!audio_parts.is_empty())
+        .then(|| {
+            AudioIngressBatchPlan::new(
+                &audio_parts
+                    .iter()
+                    .map(|part| part.plan.clone())
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .transpose()
+        .map_err(|error| Error::backend(error.to_string()))?;
+    let audio = if let Some(plan) = audio_plan {
+        let features = audio_parts
+            .iter()
+            .map(|part| {
+                let extra = plan.padded_frames - part.features.dim(1);
+                if extra < 0 {
+                    return Err(Error::backend(
+                        "Gemma 4 audio payload exceeds admitted batch padding",
+                    ));
+                }
+                B::Tensor::pad(
+                    &part.features,
+                    &[(0, 0), (0, extra), (0, 0)],
+                    PadMode::Constant,
+                    context,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let input_mask_values = audio_parts
+            .iter()
+            .flat_map(|part| {
+                (0..plan.padded_frames).map(|frame| {
+                    if frame < part.plan.valid_frames {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        Some(PreparedAudio {
+            features: B::Tensor::concatenate(&features, 0, context)?,
+            input_mask: B::Tensor::from_f32_slice(
+                &input_mask_values,
+                &[audio_parts.len() as i32, plan.padded_frames, 1],
+                context,
+            )?,
+            first_stage_mask: B::Tensor::from_f32_slice(
+                &plan.first_stage_mask_values,
+                &plan.first_stage_mask_shape(),
+                context,
+            )?,
+            valid: plan.valid_subsampled_frames,
+        })
+    } else {
+        None
+    };
+
+    Ok(PreparedCompositeIngress {
+        tokens,
+        modalities,
+        projected,
+        vision,
+        audio,
+    })
+}
+
+impl<B, S> CompositeArchitecture<B, S> for LayeredModel<B>
+where
+    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
+    S: LayerRuntimeState<B>,
+    S::LayerState: AttentionCache<B::Tensor>,
+{
+    type InputPartPlan = Gemma4InputPartPlan;
+    type AdmissionConfig = FamilyConfig;
+
+    fn admission_config(&self) -> Self::AdmissionConfig {
+        self.args.clone()
+    }
+
+    fn admit_prepared_input(
+        config: &Self::AdmissionConfig,
+        input: &eredu_runtime::PreparedModelInput<B::Tensor>,
+        inspector: &impl eredu_runtime::PreparedInputInspector<B::Tensor>,
+    ) -> Result<
+        crate::media_plan::AdmittedCompositeInput<Self::InputPartPlan>,
+        eredu_core::CapabilityError,
+    > {
+        crate::media_plan::admit_gemma4_input(config, input, inspector)
+    }
+
+    fn begin_composite_forward<'a>(
+        &mut self,
+        input: PreparedCompositeInput<'a, B::Tensor, Self::InputPartPlan>,
+        state: &mut S,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
+        let prepared = prepare_composite_ingress::<B>(input, context)?;
+        let decoder_parts = prepared.decoder_parts();
+        <Self as LayeredArchitecture<B, S>>::begin_forward(
+            self,
+            ModelInput {
+                parts: &decoder_parts,
+                vision: prepared.vision_input(),
+                audio: prepared.audio_input(),
+                per_layer_tokens: None,
+                mask: None,
+            },
+            state,
+            context,
+        )
+    }
 }
 
 enum PreparedPart<T> {
@@ -653,6 +1024,77 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         }
     }
 
+    /// Completes optional media projectors while retaining their outputs at the family boundary.
+    pub fn complete_partition_media_ingress<S>(
+        &mut self,
+        forward: &mut LayeredForwardState<B::Tensor, ForwardContext<B::Tensor>>,
+        state: &mut S,
+        vision_hidden: Option<&B::Tensor>,
+        audio_hidden: Option<&B::Tensor>,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<(), Error>
+    where
+        S: LayerRuntimeState<B>,
+        S::LayerState: AttentionCache<B::Tensor>,
+        B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
+    {
+        for (group, hidden) in [(0, vision_hidden), (1, audio_hidden)] {
+            let Some(hidden) = hidden else { continue };
+            if Self::partition_media_output(forward, group).is_some() {
+                continue;
+            }
+            match parallel {
+                Some(parallel) => {
+                    <Self as ParallelLayeredArchitecture<B, S>>::complete_execution_group_parallel(
+                        self,
+                        group,
+                        hidden,
+                        state,
+                        &mut forward.context,
+                        parallel,
+                        context,
+                    )?
+                }
+                None => <Self as LayeredArchitecture<B, S>>::complete_execution_group(
+                    self,
+                    group,
+                    hidden,
+                    state,
+                    &mut forward.context,
+                    context,
+                )?,
+            };
+        }
+        Ok(())
+    }
+
+    /// Returns a completed optional media projector output.
+    pub fn partition_media_output(
+        forward: &LayeredForwardState<B::Tensor, ForwardContext<B::Tensor>>,
+        group: usize,
+    ) -> Option<&B::Tensor> {
+        match group {
+            0 => forward.context.vision_output.as_ref(),
+            1 => forward.context.audio_output.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// Replaces a completed optional media projector output before decoder assembly.
+    pub fn replace_partition_media_output(
+        forward: &mut LayeredForwardState<B::Tensor, ForwardContext<B::Tensor>>,
+        group: usize,
+        output: B::Tensor,
+    ) -> Result<(), Error> {
+        match group {
+            0 => forward.context.vision_output = Some(output),
+            1 => forward.context.audio_output = Some(output),
+            _ => return Err(Error::backend("invalid Gemma 4 media execution group")),
+        }
+        Ok(())
+    }
+
     /// Completes optional media groups and assembles the decoder activation
     /// and per-layer conditioning at the family boundary.
     pub fn finish_partition_media_ingress<S>(
@@ -669,30 +1111,14 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         S::LayerState: AttentionCache<B::Tensor>,
         B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     {
-        for (group, hidden) in [(0, vision_hidden), (1, audio_hidden)] {
-            let Some(hidden) = hidden else { continue };
-            match parallel {
-                Some(parallel) => {
-                    <Self as ParallelLayeredArchitecture<B, S>>::complete_execution_group_parallel(
-                        self,
-                        group,
-                        &hidden,
-                        state,
-                        &mut forward.context,
-                        parallel,
-                        context,
-                    )?
-                }
-                None => <Self as LayeredArchitecture<B, S>>::complete_execution_group(
-                    self,
-                    group,
-                    &hidden,
-                    state,
-                    &mut forward.context,
-                    context,
-                )?,
-            };
-        }
+        self.complete_partition_media_ingress(
+            &mut forward,
+            state,
+            vision_hidden.as_ref(),
+            audio_hidden.as_ref(),
+            parallel,
+            context,
+        )?;
         let (hidden, tokens) = self.assemble_pipeline_text(&forward.context, context)?;
         let per_layer = self.pipeline_per_layer_inputs(&tokens, &hidden, context)?;
         Self::set_pipeline_per_layer_inputs(&mut forward.context, per_layer.clone());
@@ -1818,6 +2244,18 @@ where
         }
     }
 
+    fn group_input_observation_path(&self, group: usize) -> Result<Option<String>, Self::Error> {
+        Ok((group == 2).then(|| eredu_core::MODALITY_MERGE_OUTPUT_OBSERVATION_PATH.to_owned()))
+    }
+
+    fn group_output_observation_path(&self, group: usize) -> Result<Option<String>, Self::Error> {
+        Ok(match group {
+            0 => Some(eredu_core::VISION_PROJECTOR_OUTPUT_OBSERVATION_PATH.to_owned()),
+            1 => Some(eredu_core::AUDIO_PROJECTOR_OUTPUT_OBSERVATION_PATH.to_owned()),
+            _ => None,
+        })
+    }
+
     fn retained_state_ordinals(
         &self,
         group: usize,
@@ -1956,7 +2394,7 @@ where
         &mut self,
         group: usize,
         initial: &B::Tensor,
-        _dependencies: &[&B::Tensor],
+        dependencies: &[&B::Tensor],
         _state: &mut S,
         forward: &mut Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
@@ -1965,12 +2403,17 @@ where
             0 => Ok(forward.vision_initial.as_ref().unwrap_or(initial).clone()),
             1 => Ok(forward.audio_initial.as_ref().unwrap_or(initial).clone()),
             2 => {
-                let assembled = self.assemble(
-                    &forward.parts,
-                    forward.vision_output.as_ref(),
-                    forward.audio_output.as_ref(),
-                    context,
-                )?;
+                let vision = forward
+                    .vision_output
+                    .as_ref()
+                    .and_then(|_| dependencies.first().copied())
+                    .or(forward.vision_output.as_ref());
+                let audio = forward
+                    .audio_output
+                    .as_ref()
+                    .and_then(|_| dependencies.get(1).copied())
+                    .or(forward.audio_output.as_ref());
+                let assembled = self.assemble(&forward.parts, vision, audio, context)?;
                 let per_layer_tokens = forward
                     .per_layer_token_override
                     .as_ref()

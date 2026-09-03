@@ -368,6 +368,14 @@ mod tests {
         }
 
         let target = state_layout(&args).unwrap();
+        let target_only = composite_state_layout(&target, None).unwrap();
+        assert_eq!(target_only.len(), target.len());
+        assert_eq!(target_only.segments().len(), 1);
+        assert_eq!(
+            target_only.segments()[0].id().as_str(),
+            TARGET_STATE_SEGMENT
+        );
+        assert_eq!(target_only.segments()[0].layers(), 0..target.len());
         let composite = composite_state_layout(&target, Some(&layout)).unwrap();
         assert_eq!(composite.len(), 4);
         assert_eq!(composite.segments().len(), 2);

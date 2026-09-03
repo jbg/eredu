@@ -7,6 +7,32 @@ use eredu_core::attention::LayerSchedule;
 use eredu_gguf::{MetadataArray, MetadataValue};
 use serde::Deserialize;
 
+/// Stable cache identity for the complete shared vision policy and parameter formats.
+pub fn prompt_cache_architecture_fingerprint(config: &VisionConfig) -> String {
+    eredu_core::cache::derive_prompt_cache_architecture_fingerprint(
+        "qwen_vision",
+        [
+            ("mode", format!("{:?}", config.mode)),
+            ("schedule", config.layer_schedule_fingerprint()),
+            ("hidden", config.hidden_size.to_string()),
+            ("activation", config.hidden_act.clone()),
+            ("intermediate", config.intermediate_size.to_string()),
+            ("heads", config.num_heads.to_string()),
+            ("positions", config.num_position_embeddings.to_string()),
+            ("channels", config.in_channels.to_string()),
+            ("patch", config.patch_size.to_string()),
+            ("spatial_merge", config.spatial_merge_size.to_string()),
+            ("temporal_patch", config.temporal_patch_size.to_string()),
+            ("window", config.window_size.to_string()),
+            ("output", config.out_hidden_size.to_string()),
+            (
+                "linear_formats",
+                crate::cache_identity::debug_map(Some(&config.linear_formats)),
+            ),
+        ],
+    )
+}
+
 /// Attention topology for one vision transformer block.
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
 pub enum VisionAttentionPolicy {

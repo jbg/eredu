@@ -10,11 +10,10 @@ mod load_request;
 pub mod loading;
 mod model;
 mod prepared_speculative;
-#[cfg(any(feature = "image", feature = "audio"))]
 mod processor;
 mod realization;
 pub mod realtime;
-mod replicated_text;
+pub(crate) mod replicated_text;
 mod session;
 pub mod speculative;
 pub mod structural;

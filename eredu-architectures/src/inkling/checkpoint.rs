@@ -37,7 +37,27 @@ pub fn with_checkpoint_formats(
 ) -> Result<ModelArgs, String> {
     normalize_gguf_weight_formats(args, &mut formats)?;
     let mut target = args.clone();
+    let mut audio = HashMap::new();
+    let mut vision = HashMap::new();
+    formats.retain(|name, format| {
+        if name.starts_with("audio.") {
+            audio.insert(name.clone(), *format);
+            false
+        } else if name.starts_with("visual.") {
+            vision.insert(name.clone(), *format);
+            false
+        } else {
+            true
+        }
+    });
+    target.text_config.weight_quantization = None;
     target.text_config.quantized_weight_configs = (!formats.is_empty()).then_some(formats);
+    if let Some(config) = target.audio_config.as_mut() {
+        config.quantized_weight_configs = (!audio.is_empty()).then_some(audio);
+    }
+    if let Some(config) = target.vision_config.as_mut() {
+        config.quantized_weight_configs = (!vision.is_empty()).then_some(vision);
+    }
     target.validate().map_err(|error| error.to_string())?;
     Ok(target)
 }
@@ -1030,9 +1050,9 @@ pub fn static_safetensors_recipes<C: RecipeCatalog + ?Sized>(
 
 /// Selects the complete architecture-owned SafeTensors recipe group for one execution unit.
 ///
-/// `group` and `index` use the canonical Inkling execution layout: vision is group zero and the
-/// text decoder is group one. The returned group is deliberately complete so a backend binding
-/// mismatch fails on leftover recipes instead of being silently filtered.
+/// `group` and `index` use the canonical Inkling execution layout: vision is group zero, audio is
+/// group one, and the text decoder is group two. The returned group is deliberately complete so a
+/// backend binding mismatch fails on leftover recipes instead of being silently filtered.
 pub fn unit_safetensors_recipes<C: RecipeCatalog + ?Sized>(
     args: &ModelArgs,
     catalog: &C,
@@ -1044,10 +1064,11 @@ pub fn unit_safetensors_recipes<C: RecipeCatalog + ?Sized>(
             .vision_config
             .as_ref()
             .map_or(0, |vision| vision.num_hidden_layers as usize),
-        1 => nonnegative_count(args.text_config.num_hidden_layers, "layer count")?,
+        1 => 0,
+        2 => nonnegative_count(args.text_config.num_hidden_layers, "layer count")?,
         _ => {
             return Err(format!(
-                "Inkling recipe group {group} is outside two groups"
+                "Inkling recipe group {group} is outside three groups"
             ))
         }
     };
@@ -1084,7 +1105,7 @@ fn select_safetensors_recipe_group<C: RecipeCatalog + ?Sized>(
                     "Inkling recipe {target:?} names text unit {index}, but only {text_layers} exist"
                 ));
             }
-            Some((1, index))
+            Some((2, index))
         } else {
             None
         };
@@ -1197,10 +1218,9 @@ pub fn expert_residency_catalog<C: RecipeCatalog + ?Sized>(
                         let bank_recipe = recipes.get(target).cloned().unwrap_or_else(|| {
                             DerivedWeightRecipe::source(target, TensorSelection::Full)
                         });
-                        let recipe = DerivedWeightRecipe::Select {
-                            input: Box::new(bank_recipe),
-                            selection: selection.clone(),
-                        };
+                        let recipe = bank_recipe
+                            .select_bounded(catalog, selection.clone())
+                            .map_err(|error| error.to_string())?;
                         let role = match binding {
                             "gate_up_proj" if gate_up_quantizable => {
                                 crate::ExpertParameterRole::quantizable_projection(
@@ -1234,7 +1254,9 @@ pub fn expert_residency_catalog<C: RecipeCatalog + ?Sized>(
             }
         }
     }
-    crate::ExpertResidencyCatalog::new(units).map_err(|error| error.to_string())
+    crate::ExpertResidencyCatalog::new(units)
+        .and_then(|residency| residency.with_inferred_byte_geometry(catalog))
+        .map_err(|error| error.to_string())
 }
 
 fn add_convolution_recipes<C: RecipeCatalog + ?Sized>(
@@ -1657,7 +1679,7 @@ mod tests {
         mmproj_gguf_plan, normalize_gguf_weight_formats, partition_mmproj_weight_formats,
         safetensors_plan, safetensors_recipes, static_safetensors_recipes,
         translate_gguf_weight_name, translate_gguf_weight_name_for_model,
-        translate_mmproj_weight_name, unit_safetensors_recipes,
+        translate_mmproj_weight_name, unit_safetensors_recipes, with_checkpoint_formats,
     };
     use crate::inkling::ModelArgs;
 
@@ -1804,6 +1826,41 @@ mod tests {
             partition_mmproj_weight_formats(HashMap::from([("decoder.weight".into(), 1,)]))
                 .is_err()
         );
+        let selected_format = WeightQuantization::MxFp4;
+        let selected = with_checkpoint_formats(
+            &args,
+            HashMap::from([
+                (
+                    "model.layers.0.dense.down_proj.weight".into(),
+                    selected_format,
+                ),
+                ("audio.encoder.weight".into(), selected_format),
+                ("visual.layers.0.projection.weight".into(), selected_format),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            selected
+                .text_config
+                .linear_format_for("model.layers.0.dense.down_proj.weight"),
+            selected_format.into()
+        );
+        assert_eq!(
+            selected
+                .audio_config
+                .as_ref()
+                .unwrap()
+                .linear_format_for("audio.encoder.weight"),
+            selected_format.into()
+        );
+        assert_eq!(
+            selected
+                .vision_config
+                .as_ref()
+                .unwrap()
+                .linear_format_for("visual.layers.0.projection.weight"),
+            selected_format.into()
+        );
     }
 
     #[test]
@@ -1860,17 +1917,18 @@ mod tests {
             pinned.keys().map(String::as_str).collect::<Vec<_>>(),
             ["model.embed_tokens.weight"]
         );
-        let dense_unit = unit_safetensors_recipes(&args, &catalog, 1, 0).unwrap();
+        let dense_unit = unit_safetensors_recipes(&args, &catalog, 2, 0).unwrap();
         assert!(!dense_unit.is_empty());
         assert!(dense_unit
             .keys()
             .all(|name| name.starts_with("model.layers.0.")));
-        let sparse_unit = unit_safetensors_recipes(&args, &catalog, 1, 1).unwrap();
+        let sparse_unit = unit_safetensors_recipes(&args, &catalog, 2, 1).unwrap();
         assert!(sparse_unit
             .keys()
             .all(|name| name.starts_with("model.layers.1.")));
-        assert!(unit_safetensors_recipes(&args, &catalog, 2, 0).is_err());
-        assert!(unit_safetensors_recipes(&args, &catalog, 1, 2).is_err());
+        assert!(unit_safetensors_recipes(&args, &catalog, 3, 0).is_err());
+        assert!(unit_safetensors_recipes(&args, &catalog, 1, 0).is_err());
+        assert!(unit_safetensors_recipes(&args, &catalog, 2, 2).is_err());
     }
 
     #[test]

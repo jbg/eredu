@@ -1076,6 +1076,26 @@ pub fn prompt_cache_architecture_fingerprint(config: &HybridConfig) -> String {
     )
 }
 
+/// Stable cache identity for conditional text, vision, and media-token semantics.
+pub fn conditional_prompt_cache_architecture_fingerprint(config: &ParsedHybridConfig) -> String {
+    derive_prompt_cache_architecture_fingerprint(
+        config.text.variant.model_kind().canonical_name(),
+        [
+            ("text", prompt_cache_architecture_fingerprint(&config.text)),
+            (
+                "vision",
+                config
+                    .vision
+                    .as_ref()
+                    .map(crate::qwen::vision::prompt_cache_architecture_fingerprint)
+                    .unwrap_or_else(|| "none".into()),
+            ),
+            ("image_token", format!("{:?}", config.image_token_id)),
+            ("video_token", format!("{:?}", config.video_token_id)),
+        ],
+    )
+}
+
 /// Declares global mutable state for the exact ordered hybrid schedule.
 pub fn state_layout(config: &HybridConfig) -> Result<StateLayout, HybridConfigError> {
     let geometry = config
@@ -1428,15 +1448,46 @@ mod tests {
             .text;
         let quantized = crate::qwen::hybrid::load_time_quantization(
             &dense,
-            eredu_checkpoint::AffineQuantization::new(16, 4)
-                .unwrap()
-                .into(),
+            eredu_checkpoint::WeightQuantization::Affine(
+                eredu_checkpoint::AffineQuantization::new(16, 4).unwrap(),
+            ),
         )
         .unwrap();
 
         assert_ne!(
             prompt_cache_architecture_fingerprint(&dense),
             prompt_cache_architecture_fingerprint(&quantized)
+        );
+    }
+
+    #[test]
+    fn conditional_cache_fingerprint_includes_vision_parameter_formats() {
+        let mut value = json!({
+            "model_type": "qwen3_5",
+            "text_config": text_config("qwen3_5_text"),
+            "image_token_id": 60,
+            "video_token_id": 61,
+            "vision_config": {
+                "depth": 2, "hidden_size": 16, "intermediate_size": 24,
+                "num_heads": 4, "num_position_embeddings": 16,
+                "in_channels": 3, "patch_size": 2, "spatial_merge_size": 2,
+                "temporal_patch_size": 2, "out_hidden_size": 32
+            }
+        });
+        value["text_config"]["mtp_num_hidden_layers"] = json!(0);
+        let dense = model_args_from_config_value(&value).unwrap();
+        let mut quantized = dense.clone();
+        quantized.vision.as_mut().unwrap().linear_formats.insert(
+            "blocks.0.attn.qkv.weight".into(),
+            eredu_checkpoint::WeightQuantization::Affine(
+                eredu_checkpoint::AffineQuantization::new(16, 4).unwrap(),
+            )
+            .into(),
+        );
+
+        assert_ne!(
+            conditional_prompt_cache_architecture_fingerprint(&dense),
+            conditional_prompt_cache_architecture_fingerprint(&quantized)
         );
     }
 

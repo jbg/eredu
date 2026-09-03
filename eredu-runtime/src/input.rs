@@ -3,9 +3,26 @@
 use std::collections::BTreeMap;
 
 use eredu_core::{
-    InputExtent, InputMetadataKey, InputModality, InputPartDescriptor, InputPayloadKind,
-    InputTensorIdentity, PreparedInputError, PreparedInputIdentity,
+    CapabilityError, InputExtent, InputMetadataKey, InputModality, InputPartDescriptor,
+    InputPayloadKind, InputTensorIdentity, PreparedInputError, PreparedInputIdentity,
 };
+use sha2::{Digest, Sha256};
+
+/// Mechanism for describing native prepared tensors and reading bounded metadata.
+///
+/// Architecture admission owns which metadata values are semantically relevant.
+/// Implementations expose only tensor identity and evaluation of the small integer
+/// or Boolean arrays requested by that admission logic.
+pub trait PreparedInputInspector<Tensor> {
+    /// Returns the portable identity of a native tensor.
+    fn identity(&self, tensor: &Tensor) -> Result<InputTensorIdentity, PreparedInputError>;
+
+    /// Reads an evaluated signed-integer metadata tensor in row-major order.
+    fn i32_values(&self, tensor: &Tensor) -> Result<Vec<i32>, CapabilityError>;
+
+    /// Reads an evaluated Boolean metadata tensor in row-major order.
+    fn bool_values(&self, tensor: &Tensor) -> Result<Vec<bool>, CapabilityError>;
+}
 
 /// Primary tensor and its semantic role for one prepared input part.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -152,6 +169,78 @@ pub struct PreparedModelInput<Tensor> {
     identity: PreparedInputIdentity,
 }
 
+/// Cache identity coupling an ordered prepared-input description to caller-owned content.
+///
+/// [`PreparedInputIdentity`] deliberately excludes tensor payload bytes. Prompt caches need
+/// both that stable description and a digest of the semantic content that produced the native
+/// tensors, so equal shapes alone can never make two media requests cache-equivalent.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct PreparedInputCacheIdentity {
+    prepared: PreparedInputIdentity,
+    semantic_content_fingerprint: String,
+    prefix_content_fingerprint: String,
+}
+
+impl PreparedInputCacheIdentity {
+    /// Couples one prepared-input description to a nonempty semantic-content fingerprint.
+    pub fn new(
+        prepared: PreparedInputIdentity,
+        semantic_content_fingerprint: impl Into<String>,
+    ) -> Result<Self, PreparedInputCacheIdentityError> {
+        let semantic_content_fingerprint = semantic_content_fingerprint.into();
+        if semantic_content_fingerprint.trim().is_empty() {
+            return Err(PreparedInputCacheIdentityError::EmptySemanticContent);
+        }
+        let words = prepared
+            .encode_words()
+            .map_err(PreparedInputCacheIdentityError::Prepared)?;
+        let mut digest = Sha256::new();
+        digest.update(b"eredu-prepared-input-cache-v1\0");
+        digest.update((words.len() as u64).to_le_bytes());
+        for word in words {
+            digest.update(word.to_le_bytes());
+        }
+        digest.update((semantic_content_fingerprint.len() as u64).to_le_bytes());
+        digest.update(semantic_content_fingerprint.as_bytes());
+        let prefix_content_fingerprint = digest
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        Ok(Self {
+            prepared,
+            semantic_content_fingerprint,
+            prefix_content_fingerprint,
+        })
+    }
+
+    /// Exact ordered payload-free prepared-input description.
+    pub const fn prepared(&self) -> &PreparedInputIdentity {
+        &self.prepared
+    }
+
+    /// Caller-owned digest identifying the semantic tensor payloads.
+    pub fn semantic_content_fingerprint(&self) -> &str {
+        &self.semantic_content_fingerprint
+    }
+
+    /// Canonical fingerprint stored in [`eredu_core::cache::PromptCacheDescriptor`].
+    pub fn prefix_content_fingerprint(&self) -> &str {
+        &self.prefix_content_fingerprint
+    }
+}
+
+/// Invalid cache identity for a prepared model input.
+#[derive(Debug, thiserror::Error)]
+pub enum PreparedInputCacheIdentityError {
+    /// Semantic tensor content was not identified by the caller or processor.
+    #[error("prepared-input semantic content fingerprint must not be empty")]
+    EmptySemanticContent,
+    /// The ordered prepared-input description could not be encoded canonically.
+    #[error("prepared-input cache identity is invalid: {0}")]
+    Prepared(PreparedInputError),
+}
+
 impl<Tensor> PreparedModelInput<Tensor> {
     /// Validates and owns ordered prepared input parts.
     pub fn new(
@@ -170,6 +259,14 @@ impl<Tensor> PreparedModelInput<Tensor> {
     /// Exact payload-free identity used for rank agreement and persistence.
     pub const fn identity(&self) -> &PreparedInputIdentity {
         &self.identity
+    }
+
+    /// Derives the canonical prompt-cache content identity for these exact prepared parts.
+    pub fn cache_identity(
+        &self,
+        semantic_content_fingerprint: impl Into<String>,
+    ) -> Result<PreparedInputCacheIdentity, PreparedInputCacheIdentityError> {
+        PreparedInputCacheIdentity::new(self.identity.clone(), semantic_content_fingerprint)
     }
 
     /// Ordered owned parts.
@@ -399,5 +496,44 @@ mod tests {
                 key: InputMetadataKey::PatchGrid,
             })
         ));
+    }
+
+    #[test]
+    fn prompt_cache_identity_requires_both_prepared_description_and_semantic_content() {
+        let first = PreparedModelInput::new(
+            vec![PreparedInputPart::new(
+                InputModality::Image,
+                PreparedInputPayload::Tensor(fake(TensorDtype::F32, &[1, 3, 4, 4], 1)),
+                [],
+            )
+            .unwrap()],
+            describe,
+        )
+        .unwrap();
+        let reshaped = PreparedModelInput::new(
+            vec![PreparedInputPart::new(
+                InputModality::Image,
+                PreparedInputPayload::Tensor(fake(TensorDtype::F32, &[1, 3, 8, 8], 2)),
+                [],
+            )
+            .unwrap()],
+            describe,
+        )
+        .unwrap();
+
+        let image_a = first.cache_identity("sha256:image-a").unwrap();
+        let image_b = first.cache_identity("sha256:image-b").unwrap();
+        let reshaped_a = reshaped.cache_identity("sha256:image-a").unwrap();
+
+        assert_ne!(
+            image_a.prefix_content_fingerprint(),
+            image_b.prefix_content_fingerprint()
+        );
+        assert_ne!(
+            image_a.prefix_content_fingerprint(),
+            reshaped_a.prefix_content_fingerprint()
+        );
+        assert_eq!(image_a.prepared(), first.identity());
+        assert!(first.cache_identity(" ").is_err());
     }
 }

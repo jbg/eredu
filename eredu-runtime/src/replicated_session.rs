@@ -16,11 +16,11 @@ use eredu_nn::{NeuralBackend, Tensor};
 
 use crate::{
     observe_model_logits, replicated_text_materialization_tasks, ActivationObserver,
-    ExecutionResidency, ExpertPass, LayerWeightResidency, LayerwisePolicy, LayerwiseRuntime,
-    LayerwiseRuntimeError, ParameterGroupOwner, PartitionState, ReplicatedTextArchitecture,
-    ReplicatedTextMaterializationTask, ReplicatedTextOutputCompanion,
-    ReplicatedTextOutputSelection, ReplicatedTextParameterOwner, ReplicatedTextParameterPresence,
-    RoutedExpertProvider, RoutedLayeredArchitecture, RuntimeState,
+    ExecutionResidency, ExpertPass, LayerWeightResidency, LayeredArchitecture, LayerwisePolicy,
+    LayerwiseRuntime, LayerwiseRuntimeError, ParameterGroupOwner, PartitionState,
+    PreparedInputCacheIdentity, ReplicatedTextArchitecture, ReplicatedTextMaterializationTask,
+    ReplicatedTextOutputCompanion, ReplicatedTextOutputSelection, ReplicatedTextParameterOwner,
+    ReplicatedTextParameterPresence, RoutedExpertProvider, RoutedLayeredArchitecture, RuntimeState,
     SelectedReplicatedTextRealization, SelectedStateRealization, StateError, SubmissionBackend,
     WeightLoweringKind,
 };
@@ -35,7 +35,7 @@ use crate::{
 pub trait ReplicatedTextSessionMechanisms<A, B>
 where
     B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
-    A: ReplicatedTextArchitecture<B, Self::State>,
+    A: LayeredArchitecture<B, Self::State>,
     Self::State: RuntimeState<B>,
     Self::ResidentPolicy: LayerwisePolicy<B, A::Unit, Error = Self::PolicyError>,
     Self::BoundedPolicy: LayerwisePolicy<B, A::Unit, Error = Self::PolicyError>,
@@ -164,7 +164,7 @@ enum ReplicatedTextRuntimeKind<A, B, S, R, P>
 where
     B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
     S: RuntimeState<B>,
-    A: ReplicatedTextArchitecture<B, S>,
+    A: LayeredArchitecture<B, S>,
     R: LayerwisePolicy<B, A::Unit>,
     P: LayerwisePolicy<B, A::Unit, Error = R::Error>,
 {
@@ -183,7 +183,7 @@ pub struct ReplicatedTextRuntime<A, B, S, R, P>
 where
     B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
     S: RuntimeState<B>,
-    A: ReplicatedTextArchitecture<B, S>,
+    A: LayeredArchitecture<B, S>,
     R: LayerwisePolicy<B, A::Unit>,
     P: LayerwisePolicy<B, A::Unit, Error = R::Error>,
 {
@@ -194,7 +194,7 @@ impl<A, B, S, R, P> ReplicatedTextRuntime<A, B, S, R, P>
 where
     B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
     S: RuntimeState<B>,
-    A: ReplicatedTextArchitecture<B, S>,
+    A: LayeredArchitecture<B, S>,
     R: LayerwisePolicy<B, A::Unit>,
     P: LayerwisePolicy<B, A::Unit, Error = R::Error>,
     A::Error: std::fmt::Display,
@@ -206,16 +206,19 @@ where
         state: &mut S,
         context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
         observer: &mut O,
-    ) -> Result<B::Tensor, ReplicatedTextSessionError<A::Error, R::Error, std::convert::Infallible>>
+    ) -> Result<
+        (B::Tensor, A::ForwardContext),
+        ReplicatedTextSessionError<A::Error, R::Error, std::convert::Infallible>,
+    >
     where
         O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
     {
         match &mut self.kind {
             ReplicatedTextRuntimeKind::Resident(runtime) => runtime
-                .forward_with_observer(input, state, context, observer)
+                .forward_with_observer_and_context(input, state, context, observer)
                 .map_err(map_layerwise_error),
             ReplicatedTextRuntimeKind::Bounded(runtime) => runtime
-                .forward_with_observer(input, state, context, observer)
+                .forward_with_observer_and_context(input, state, context, observer)
                 .map_err(map_layerwise_error),
         }
     }
@@ -228,7 +231,10 @@ where
         provider: &mut Provider,
         context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
         observer: &mut Observer,
-    ) -> Result<B::Tensor, ReplicatedTextSessionError<A::Error, R::Error, std::convert::Infallible>>
+    ) -> Result<
+        (B::Tensor, A::ForwardContext),
+        ReplicatedTextSessionError<A::Error, R::Error, std::convert::Infallible>,
+    >
     where
         B: eredu_nn::GroupedNeuralBackend,
         A: RoutedLayeredArchitecture<B, S>,
@@ -238,10 +244,14 @@ where
     {
         match &mut self.kind {
             ReplicatedTextRuntimeKind::Resident(runtime) => runtime
-                .forward_with_provider_and_observer(input, state, pass, provider, context, observer)
+                .forward_with_provider_and_observer_and_context(
+                    input, state, pass, provider, context, observer,
+                )
                 .map_err(map_layerwise_error),
             ReplicatedTextRuntimeKind::Bounded(runtime) => runtime
-                .forward_with_provider_and_observer(input, state, pass, provider, context, observer)
+                .forward_with_provider_and_observer_and_context(
+                    input, state, pass, provider, context, observer,
+                )
                 .map_err(map_layerwise_error),
         }
     }
@@ -262,7 +272,7 @@ pub trait ReplicatedTextExecutionStrategy<A, B, S, R, P>
 where
     B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
     S: RuntimeState<B>,
-    A: ReplicatedTextArchitecture<B, S>,
+    A: LayeredArchitecture<B, S>,
     R: LayerwisePolicy<B, A::Unit>,
     P: LayerwisePolicy<B, A::Unit, Error = R::Error>,
     A::Error: std::fmt::Display,
@@ -278,7 +288,10 @@ where
         pass: ExpertPass,
         context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
         observer: &mut O,
-    ) -> Result<B::Tensor, ReplicatedTextSessionError<A::Error, R::Error, std::convert::Infallible>>
+    ) -> Result<
+        (B::Tensor, A::ForwardContext),
+        ReplicatedTextSessionError<A::Error, R::Error, std::convert::Infallible>,
+    >
     where
         O: ActivationObserver<B::Tensor, A::Error> + ?Sized;
 }
@@ -291,7 +304,7 @@ impl<A, B, S, R, P> ReplicatedTextExecutionStrategy<A, B, S, R, P> for DirectRep
 where
     B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
     S: RuntimeState<B>,
-    A: ReplicatedTextArchitecture<B, S>,
+    A: LayeredArchitecture<B, S>,
     R: LayerwisePolicy<B, A::Unit>,
     P: LayerwisePolicy<B, A::Unit, Error = R::Error>,
     A::Error: std::fmt::Display,
@@ -305,7 +318,10 @@ where
         _pass: ExpertPass,
         context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
         observer: &mut O,
-    ) -> Result<B::Tensor, ReplicatedTextSessionError<A::Error, R::Error, std::convert::Infallible>>
+    ) -> Result<
+        (B::Tensor, A::ForwardContext),
+        ReplicatedTextSessionError<A::Error, R::Error, std::convert::Infallible>,
+    >
     where
         O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
     {
@@ -336,7 +352,7 @@ where
     B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>
         + eredu_nn::GroupedNeuralBackend,
     S: RuntimeState<B>,
-    A: ReplicatedTextArchitecture<B, S> + RoutedLayeredArchitecture<B, S>,
+    A: LayeredArchitecture<B, S> + RoutedLayeredArchitecture<B, S>,
     R: LayerwisePolicy<B, A::Unit>,
     P: LayerwisePolicy<B, A::Unit, Error = R::Error>,
     Provider: RoutedExpertProvider<B>,
@@ -352,7 +368,10 @@ where
         pass: ExpertPass,
         context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
         observer: &mut O,
-    ) -> Result<B::Tensor, ReplicatedTextSessionError<A::Error, R::Error, std::convert::Infallible>>
+    ) -> Result<
+        (B::Tensor, A::ForwardContext),
+        ReplicatedTextSessionError<A::Error, R::Error, std::convert::Infallible>,
+    >
     where
         O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
     {
@@ -372,7 +391,7 @@ pub struct ReplicatedTextSession<A, B, M, D = DirectReplicatedTextExecution>
 where
     B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
     M: ReplicatedTextSessionMechanisms<A, B>,
-    A: ReplicatedTextArchitecture<B, M::State>,
+    A: LayeredArchitecture<B, M::State>,
     D: ReplicatedTextExecutionStrategy<A, B, M::State, M::ResidentPolicy, M::BoundedPolicy>,
     A::Error: std::fmt::Display,
     M::PolicyError: std::fmt::Display,
@@ -383,8 +402,15 @@ where
     state: M::State,
     mechanisms: M,
     prompt_cache_identity: PromptCacheModelIdentity,
+    committed_prompt_input_identity: Option<PreparedInputCacheIdentity>,
     output_selection: ReplicatedTextOutputSelection,
     backend: PhantomData<fn() -> B>,
+}
+
+/// Complete transactional checkpoint including composite prompt-input identity.
+pub struct ReplicatedTextSessionCheckpoint<C> {
+    state: C,
+    prompt_input_identity: Option<PreparedInputCacheIdentity>,
 }
 
 /// Cold-path failure from replicated-text construction or session control.
@@ -520,6 +546,63 @@ where
     A: ReplicatedTextArchitecture<B, S>,
     A::Error: std::fmt::Display,
 {
+    prepare_layered_text_contract_with_addressable_parameters::<A, B, S>(
+        architecture,
+        source_architecture,
+        selected,
+        expected_prompt_cache_architecture_identity,
+        architecture.text_output_selection(),
+        addressable_parameters,
+        context,
+    )
+}
+
+/// Validates a layered causal architecture against an authoritative text selection.
+///
+/// Composite ingress supplies its architecture-owned input directly, while this
+/// proof preserves the same parameter, state, identity, and output-selection
+/// authority as ordinary text construction.
+pub fn prepare_layered_text_contract<A, B, S>(
+    architecture: &A,
+    source_architecture: Option<&A>,
+    selected: SelectedReplicatedTextRealization,
+    expected_prompt_cache_architecture_identity: &str,
+    output_selection: ReplicatedTextOutputSelection,
+    context: &<B::Tensor as Tensor>::Context,
+) -> Result<PreparedReplicatedTextContract, String>
+where
+    B: NeuralBackend,
+    S: RuntimeState<B>,
+    A: LayeredArchitecture<B, S>,
+    A::Error: std::fmt::Display,
+{
+    prepare_layered_text_contract_with_addressable_parameters::<A, B, S>(
+        architecture,
+        source_architecture,
+        selected,
+        expected_prompt_cache_architecture_identity,
+        output_selection,
+        std::iter::empty::<&str>(),
+        context,
+    )
+}
+
+/// Validates a layered causal architecture with independently addressable parameters.
+pub fn prepare_layered_text_contract_with_addressable_parameters<'a, A, B, S>(
+    architecture: &A,
+    source_architecture: Option<&A>,
+    selected: SelectedReplicatedTextRealization,
+    expected_prompt_cache_architecture_identity: &str,
+    output_selection: ReplicatedTextOutputSelection,
+    addressable_parameters: impl IntoIterator<Item = &'a str>,
+    context: &<B::Tensor as Tensor>::Context,
+) -> Result<PreparedReplicatedTextContract, String>
+where
+    B: NeuralBackend,
+    S: RuntimeState<B>,
+    A: LayeredArchitecture<B, S>,
+    A::Error: std::fmt::Display,
+{
     let mut addressable_parameters = addressable_parameters
         .into_iter()
         .map(str::to_owned)
@@ -618,7 +701,6 @@ where
     {
         return Err("architecture prompt-cache identity differs from selection".into());
     }
-    let output_selection = architecture.text_output_selection();
     Ok(PreparedReplicatedTextContract {
         selected,
         tasks,
@@ -660,7 +742,7 @@ pub fn construct_replicated_text_session<A, B, M>(
 where
     B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
     M: ReplicatedTextSessionMechanisms<A, B>,
-    A: ReplicatedTextArchitecture<B, M::State>,
+    A: LayeredArchitecture<B, M::State>,
     A::Error: std::fmt::Display,
     M::PolicyError: std::fmt::Display,
     M::Error: std::fmt::Display,
@@ -694,7 +776,7 @@ pub fn construct_replicated_text_session_with_execution<A, B, M, D>(
 where
     B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
     M: ReplicatedTextSessionMechanisms<A, B>,
-    A: ReplicatedTextArchitecture<B, M::State>,
+    A: LayeredArchitecture<B, M::State>,
     D: ReplicatedTextExecutionStrategy<A, B, M::State, M::ResidentPolicy, M::BoundedPolicy>,
     A::Error: std::fmt::Display,
     M::PolicyError: std::fmt::Display,
@@ -766,6 +848,7 @@ where
         state,
         mechanisms,
         prompt_cache_identity,
+        committed_prompt_input_identity: None,
         output_selection,
         backend: PhantomData,
     })
@@ -779,7 +862,7 @@ fn construct_units<A, B, S>(
 where
     B: NeuralBackend,
     S: RuntimeState<B>,
-    A: ReplicatedTextArchitecture<B, S>,
+    A: LayeredArchitecture<B, S>,
 {
     (0..layout.len())
         .map(|ordinal| {
@@ -795,7 +878,7 @@ impl<A, B, M, D> ReplicatedTextSession<A, B, M, D>
 where
     B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
     M: ReplicatedTextSessionMechanisms<A, B>,
-    A: ReplicatedTextArchitecture<B, M::State>,
+    A: LayeredArchitecture<B, M::State>,
     D: ReplicatedTextExecutionStrategy<A, B, M::State, M::ResidentPolicy, M::BoundedPolicy>,
     A::Error: std::fmt::Display,
     M::PolicyError: std::fmt::Display,
@@ -812,7 +895,10 @@ where
         tokens: &B::Tensor,
         mask: Option<&B::Tensor>,
         context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>> {
+    ) -> Result<B::Tensor, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>
+    where
+        A: ReplicatedTextArchitecture<B, M::State>,
+    {
         self.forward_with_observer(tokens, mask, context, &mut crate::NoopObserver)
     }
 
@@ -825,6 +911,7 @@ where
         observer: &mut O,
     ) -> Result<B::Tensor, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>
     where
+        A: ReplicatedTextArchitecture<B, M::State>,
         O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
     {
         let pass = tokens
@@ -833,9 +920,9 @@ where
             .copied()
             .filter(|length| *length > 1)
             .map_or(ExpertPass::Decode, |_| ExpertPass::Prefill);
-        let (output, checkpoint) =
+        let (output, checkpoint, forward_context) =
             self.execute_with_observer(tokens, mask, pass, context, observer)?;
-        self.publish(output, checkpoint, context)
+        self.publish(output, checkpoint, forward_context, context)
     }
 
     /// Runs prompt processing and selects the architecture-declared text output.
@@ -844,7 +931,10 @@ where
         tokens: &B::Tensor,
         mask: Option<&B::Tensor>,
         context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>> {
+    ) -> Result<B::Tensor, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>
+    where
+        A: ReplicatedTextArchitecture<B, M::State>,
+    {
         self.prefill_with_observer(tokens, mask, context, &mut crate::NoopObserver)
     }
 
@@ -857,10 +947,71 @@ where
         observer: &mut O,
     ) -> Result<B::Tensor, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>
     where
+        A: ReplicatedTextArchitecture<B, M::State>,
         O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
     {
-        let (output, checkpoint) =
-            self.execute_with_observer(tokens, mask, ExpertPass::Prefill, context, observer)?;
+        let input = A::text_input(tokens, mask);
+        self.prefill_input_with_observer(input, context, observer)
+    }
+
+    /// Runs prompt processing from an architecture-prepared input.
+    ///
+    /// Additive ingress drivers use this entry after architecture admission has
+    /// coupled native tensors to their semantic identity. Output selection,
+    /// rollback, observation, state publication, and completion remain owned by
+    /// this session.
+    pub fn prefill_input<'a>(
+        &mut self,
+        input: A::Input<'a>,
+        context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>> {
+        self.prefill_input_with_observer(input, context, &mut crate::NoopObserver)
+    }
+
+    /// Runs composite prompt processing and commits its cache-relevant input identity only after
+    /// successful state publication and exact completion.
+    pub fn prefill_input_with_cache_identity<'a>(
+        &mut self,
+        input: A::Input<'a>,
+        identity: PreparedInputCacheIdentity,
+        context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>> {
+        self.prefill_input_with_observer_and_cache_identity(
+            input,
+            identity,
+            context,
+            &mut crate::NoopObserver,
+        )
+    }
+
+    /// Runs observed prompt processing and commits its exact prepared-input identity on success.
+    pub fn prefill_input_with_observer_and_cache_identity<'a, O>(
+        &mut self,
+        input: A::Input<'a>,
+        identity: PreparedInputCacheIdentity,
+        context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>
+    where
+        O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
+    {
+        let output = self.prefill_input_with_observer(input, context, observer)?;
+        self.committed_prompt_input_identity = Some(identity);
+        Ok(output)
+    }
+
+    /// Runs observed prompt processing from an architecture-prepared input.
+    pub fn prefill_input_with_observer<'a, O>(
+        &mut self,
+        input: A::Input<'a>,
+        context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>
+    where
+        O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
+    {
+        let (output, checkpoint, forward_context) =
+            self.execute_input_with_observer(input, ExpertPass::Prefill, context, observer)?;
         let sequence_index = self.output_selection.sequence_index();
         let output = match self
             .mechanisms
@@ -875,7 +1026,45 @@ where
                 )
             }
         };
-        self.publish(output, checkpoint, context)
+        self.publish(output, checkpoint, forward_context, context)
+    }
+
+    /// Runs one decode step from an architecture-prepared input.
+    pub fn decode_input<'a>(
+        &mut self,
+        input: A::Input<'a>,
+        context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>> {
+        self.decode_input_with_observer(input, context, &mut crate::NoopObserver)
+    }
+
+    /// Runs one observed decode step from an architecture-prepared input.
+    pub fn decode_input_with_observer<'a, O>(
+        &mut self,
+        input: A::Input<'a>,
+        context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>
+    where
+        O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
+    {
+        let (output, checkpoint, forward_context) =
+            self.execute_input_with_observer(input, ExpertPass::Decode, context, observer)?;
+        let sequence_index = self.output_selection.sequence_index();
+        let output = match self
+            .mechanisms
+            .index_text_output(output, sequence_index, context)
+        {
+            Ok(output) => output,
+            Err(error) => {
+                return self.rollback_failure(
+                    checkpoint,
+                    ReplicatedTextSessionError::Mechanism(error),
+                    context,
+                )
+            }
+        };
+        self.publish(output, checkpoint, forward_context, context)
     }
 
     /// Runs one decode step and selects the architecture-declared text output.
@@ -883,7 +1072,10 @@ where
         &mut self,
         tokens: &B::Tensor,
         context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>> {
+    ) -> Result<B::Tensor, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>
+    where
+        A: ReplicatedTextArchitecture<B, M::State>,
+    {
         self.decode_with_observer(tokens, context, &mut crate::NoopObserver)
     }
 
@@ -895,9 +1087,10 @@ where
         observer: &mut O,
     ) -> Result<B::Tensor, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>
     where
+        A: ReplicatedTextArchitecture<B, M::State>,
         O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
     {
-        let (output, checkpoint) =
+        let (output, checkpoint, forward_context) =
             self.execute_with_observer(tokens, None, ExpertPass::Decode, context, observer)?;
         let sequence_index = self.output_selection.sequence_index();
         let output = match self
@@ -913,7 +1106,7 @@ where
                 )
             }
         };
-        self.publish(output, checkpoint, context)
+        self.publish(output, checkpoint, forward_context, context)
     }
 
     /// Captures all mutable state for a later transactional rollback.
@@ -927,6 +1120,20 @@ where
             .map_err(ReplicatedTextSessionError::Mechanism)
     }
 
+    /// Captures mutable state together with the committed composite prompt identity.
+    pub fn checkpoint_complete(
+        &mut self,
+        context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
+    ) -> Result<
+        ReplicatedTextSessionCheckpoint<M::StateCheckpoint>,
+        ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>,
+    > {
+        Ok(ReplicatedTextSessionCheckpoint {
+            state: self.checkpoint(context)?,
+            prompt_input_identity: self.committed_prompt_input_identity.clone(),
+        })
+    }
+
     /// Restores every mutable component from a session checkpoint.
     pub fn rollback(
         &mut self,
@@ -935,7 +1142,23 @@ where
     ) -> Result<(), ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>> {
         self.mechanisms
             .restore_state(&mut self.state, checkpoint, context)
-            .map_err(ReplicatedTextSessionError::Mechanism)
+            .map_err(ReplicatedTextSessionError::Mechanism)?;
+        // A state-only checkpoint cannot prove which multimodal prompt produced its bytes.
+        self.committed_prompt_input_identity = None;
+        Ok(())
+    }
+
+    /// Restores every mutable component and its committed composite prompt identity atomically.
+    pub fn rollback_complete(
+        &mut self,
+        checkpoint: ReplicatedTextSessionCheckpoint<M::StateCheckpoint>,
+        context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
+    ) -> Result<(), ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>> {
+        self.mechanisms
+            .restore_state(&mut self.state, checkpoint.state, context)
+            .map_err(ReplicatedTextSessionError::Mechanism)?;
+        self.committed_prompt_input_identity = checkpoint.prompt_input_identity;
+        Ok(())
     }
 
     /// Replaces mutable state with a newly realized selected state.
@@ -949,6 +1172,7 @@ where
             .map_err(ReplicatedTextSessionError::Mechanism)?;
         validate_realized_state(&state, self.selected.state())?;
         self.state = state;
+        self.committed_prompt_input_identity = None;
         Ok(())
     }
 
@@ -977,6 +1201,23 @@ where
         manifest.validate_compatibility(expected, prefix_token_ids)?;
         validate_realized_state(&state, self.selected.state())?;
         self.state = state;
+        self.committed_prompt_input_identity = None;
+        Ok(manifest)
+    }
+
+    /// Opens a prompt cache only when its content identity matches the admitted prepared input.
+    pub fn load_prompt_cache_for_input(
+        &mut self,
+        directory: &Path,
+        expected: &PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        input_identity: PreparedInputCacheIdentity,
+        context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
+    ) -> Result<PromptCacheManifest, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>
+    {
+        self.validate_prompt_input_descriptor(expected, &input_identity)?;
+        let manifest = self.load_prompt_cache(directory, expected, prefix_token_ids, context)?;
+        self.committed_prompt_input_identity = Some(input_identity);
         Ok(manifest)
     }
 
@@ -1004,6 +1245,31 @@ where
             .map_err(ReplicatedTextSessionError::Mechanism)?;
         manifest.validate_compatibility(&descriptor, prefix_token_ids)?;
         Ok(manifest)
+    }
+
+    /// Persists state only when the descriptor names the successfully committed prepared input.
+    pub fn save_prompt_cache_for_input(
+        &mut self,
+        destination: &Path,
+        descriptor: PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: &PromptCacheOptions,
+        input_identity: &PreparedInputCacheIdentity,
+        context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
+    ) -> Result<PromptCacheManifest, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>
+    {
+        self.validate_prompt_input_descriptor(&descriptor, input_identity)?;
+        if self.committed_prompt_input_identity.as_ref() != Some(input_identity) {
+            return Err(ReplicatedTextSessionError::Contract(
+                "prompt-cache prepared-input identity differs from the committed prompt".into(),
+            ));
+        }
+        self.save_prompt_cache(destination, descriptor, prefix_token_ids, options, context)
+    }
+
+    /// Returns the prepared-input identity associated with the currently committed prompt state.
+    pub const fn committed_prompt_input_identity(&self) -> Option<&PreparedInputCacheIdentity> {
+        self.committed_prompt_input_identity.as_ref()
     }
 
     /// Returns one coherent execution and state residency report.
@@ -1036,7 +1302,25 @@ where
         context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
         observer: &mut O,
     ) -> Result<
-        (B::Tensor, M::StateCheckpoint),
+        (B::Tensor, M::StateCheckpoint, A::ForwardContext),
+        ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>,
+    >
+    where
+        A: ReplicatedTextArchitecture<B, M::State>,
+        O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
+    {
+        let input = A::text_input(tokens, mask);
+        self.execute_input_with_observer(input, pass, context, observer)
+    }
+
+    fn execute_input_with_observer<'a, O>(
+        &mut self,
+        input: A::Input<'a>,
+        pass: ExpertPass,
+        context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<
+        (B::Tensor, M::StateCheckpoint, A::ForwardContext),
         ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>,
     >
     where
@@ -1046,8 +1330,7 @@ where
             .mechanisms
             .checkpoint_state(&self.state, context)
             .map_err(ReplicatedTextSessionError::Mechanism)?;
-        let input = A::text_input(tokens, mask);
-        let output = match self
+        let (output, forward_context) = match self
             .driver
             .forward_with_observer(
                 &mut self.execution,
@@ -1072,13 +1355,14 @@ where
                 )
             }
         };
-        Ok((output, checkpoint))
+        Ok((output, checkpoint, forward_context))
     }
 
     fn publish(
         &mut self,
         output: B::Tensor,
         checkpoint: M::StateCheckpoint,
+        _forward_context: A::ForwardContext,
         context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>> {
         if self.selected.exact_completion() {
@@ -1105,6 +1389,19 @@ where
         Err(error)
     }
 
+    fn validate_prompt_input_descriptor(
+        &self,
+        descriptor: &PromptCacheDescriptor,
+        input_identity: &PreparedInputCacheIdentity,
+    ) -> Result<(), ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>> {
+        if descriptor.prefix_content_fingerprint() != input_identity.prefix_content_fingerprint() {
+            return Err(ReplicatedTextSessionError::Contract(
+                "prompt-cache content identity differs from the prepared input".into(),
+            ));
+        }
+        Ok(())
+    }
+
     fn prompt_cache_identity(
         &self,
     ) -> Result<
@@ -1127,7 +1424,7 @@ fn validate_architecture_geometry<A, B, S>(
 where
     B: NeuralBackend,
     S: RuntimeState<B>,
-    A: ReplicatedTextArchitecture<B, S>,
+    A: LayeredArchitecture<B, S>,
     A::Error: std::fmt::Display,
 {
     let requirements = selected.requirements();
@@ -1175,7 +1472,7 @@ fn validate_architecture_parameters<A, B, S>(
 where
     B: NeuralBackend,
     S: RuntimeState<B>,
-    A: ReplicatedTextArchitecture<B, S>,
+    A: LayeredArchitecture<B, S>,
     A::Error: std::fmt::Display,
 {
     let requirements = selected.requirements();

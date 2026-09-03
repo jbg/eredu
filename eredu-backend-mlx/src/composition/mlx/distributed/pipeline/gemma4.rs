@@ -35,7 +35,7 @@ use crate::{
         dispatch_local_with, dispatch_replicated_with, ExpertAssignment, RoutingStatistics,
     },
     composition::gemma4::{
-        Gemma4Bindings, Gemma4PipelineUnit, PreparedParts as Gemma4PreparedParts,
+        prepare_parts as prepare_gemma4_parts, Gemma4Bindings, Gemma4PipelineUnit,
     },
     composition::mlx::distributed::pipeline::{
         architecture_decoder_group, architecture_group_by_id, architecture_group_id,
@@ -193,7 +193,7 @@ impl Gemma4PipelinePartition {
         stream: &Stream,
     ) -> Result<Gemma4IngressState, Error> {
         crate::backend::runtime::media::input::validate(typed)?;
-        let prepared = Gemma4PreparedParts::new(self.args(), typed, stream)?;
+        let prepared = prepare_gemma4_parts(self.args(), typed, stream)?;
         let parts = prepared.decoder_parts();
         let mut state = MlxHybridState::device(
             if execution.is_some_and(ParallelExecutionContext::is_tensor_parallel) {
@@ -284,7 +284,7 @@ impl Gemma4PipelinePartition {
         stream: &Stream,
     ) -> Result<Gemma4IngressState, Error> {
         crate::backend::runtime::media::input::validate(typed)?;
-        let prepared = Gemma4PreparedParts::new(self.args(), typed, stream)?;
+        let prepared = prepare_gemma4_parts(self.args(), typed, stream)?;
         let vision_hidden = prepared.vision_input().map(|input| input.patches.clone());
         let vision_state = prepared
             .vision_input()
@@ -382,10 +382,51 @@ impl Gemma4PipelinePartition {
         mut state: Gemma4IngressState,
         execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
+        mut observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
     ) -> Result<PipelinePayload, Error> {
-        let forward = state.forward.take().ok_or_else(|| {
+        let mut forward = state.forward.take().ok_or_else(|| {
             Error::Parallel("Gemma 4 media finalization requires the primary ingress state".into())
         })?;
+        let parallel = execution.and_then(ParallelExecutionContext::group);
+        self.architecture
+            .complete_partition_media_ingress(
+                &mut forward,
+                &mut state.state,
+                state.vision_hidden.as_ref(),
+                state.audio_hidden.as_ref(),
+                parallel,
+                stream,
+            )
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        for group in 0..=1 {
+            let output =
+                eredu_architectures::gemma4::LayeredModel::<MlxNeuralBackend>::partition_media_output(
+                    &forward,
+                    group,
+                )
+                .map(|output| output.as_array().clone());
+            let Some(output) = output else { continue };
+            let Some(observer) = observer.as_deref_mut() else {
+                continue;
+            };
+            let path = <eredu_architectures::gemma4::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
+                MlxNeuralBackend,
+                MlxHybridState,
+            >>::group_output_observation_path(&self.architecture, group)
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?
+            .ok_or_else(|| {
+                Error::ArchitectureModel(format!(
+                    "Gemma 4 media group {group} has no output observation path"
+                ))
+            })?;
+            let output = eredu_runtime::observe_and_intervene(observer, &path, &output)?;
+            eredu_architectures::gemma4::LayeredModel::<MlxNeuralBackend>::replace_partition_media_output(
+                &mut forward,
+                group,
+                crate::MlxTensor::from_array(output),
+            )
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        }
         let (hidden, mut per_layer_inputs) = self
             .architecture
             .finish_partition_media_ingress(
@@ -393,7 +434,7 @@ impl Gemma4PipelinePartition {
                 &mut state.state,
                 state.vision_hidden.take(),
                 state.audio_hidden.take(),
-                execution.and_then(ParallelExecutionContext::group),
+                parallel,
                 stream,
             )
             .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
@@ -460,6 +501,20 @@ impl PipelinePartitionMetadata for Gemma4PipelinePartition {
 }
 
 impl MlxPlacedGroupExecutor for Gemma4PipelinePartition {
+    fn placed_group_input_observation_path(&self, group: &str) -> Result<Option<String>, Error> {
+        let group = architecture_group_by_id::<_, MlxHybridState>(&self.architecture, group)?;
+        <eredu_architectures::gemma4::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
+            MlxNeuralBackend,
+            MlxHybridState,
+        >>::group_input_observation_path(&self.architecture, group)
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))
+    }
+
+    fn placed_group_output_observation_path(&self, group: &str) -> Result<Option<String>, Error> {
+        let _ = group;
+        Ok(None)
+    }
+
     fn begin_placed_ingress(
         &mut self,
         input: crate::backend::runtime::media::input::ModelInput<'_>,
@@ -545,7 +600,20 @@ impl MlxPlacedGroupExecutor for Gemma4PipelinePartition {
             .ingress_state
             .take()
             .ok_or_else(|| Error::Parallel("Gemma 4 placed ingress state is unavailable".into()))?;
-        self.finish_ingress(state, execution, stream)
+        self.finish_ingress(state, execution, stream, None)
+    }
+
+    fn finish_placed_ingress_observed(
+        &mut self,
+        execution: Option<&ParallelExecutionContext<'_>>,
+        stream: &Stream,
+        observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
+    ) -> Result<PipelinePayload, Error> {
+        let state = self
+            .ingress_state
+            .take()
+            .ok_or_else(|| Error::Parallel("Gemma 4 placed ingress state is unavailable".into()))?;
+        self.finish_ingress(state, execution, stream, Some(observer))
     }
 
     fn prefill(
@@ -557,7 +625,7 @@ impl MlxPlacedGroupExecutor for Gemma4PipelinePartition {
         execution: Option<&ParallelExecutionContext<'_>>,
         expert_group: Option<&Group>,
         stream: &Stream,
-        observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
+        mut observer: Option<&mut dyn eredu_runtime::ActivationObserver<Array, Exception>>,
     ) -> Result<PipelineStageOutput, Error> {
         let mut state = self.begin_ingress(input, execution, stream)?;
         for group in [
@@ -566,7 +634,26 @@ impl MlxPlacedGroupExecutor for Gemma4PipelinePartition {
         ] {
             self.execute_placed_media(group, &mut state, execution, stream)?;
         }
-        let payload = self.finish_ingress(state, execution, stream)?;
+        let mut payload = match observer.as_mut() {
+            Some(observer) => {
+                self.finish_ingress(state, execution, stream, Some(&mut **observer))?
+            }
+            None => self.finish_ingress(state, execution, stream, None)?,
+        };
+        if let Some(observer) = observer.as_deref_mut() {
+            let path = <eredu_architectures::gemma4::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
+                MlxNeuralBackend,
+                MlxHybridState,
+            >>::group_input_observation_path(&self.architecture, 2)
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?
+            .ok_or_else(|| {
+                Error::ArchitectureModel(
+                    "Gemma 4 decoder group has no input observation path".into(),
+                )
+            })?;
+            payload.hidden =
+                eredu_runtime::observe_and_intervene(observer, &path, &payload.hidden)?;
+        }
         self.forward_decoder(
             PipelineStageInput::Hidden(&payload),
             step,

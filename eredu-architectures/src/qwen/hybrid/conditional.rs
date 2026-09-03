@@ -20,6 +20,10 @@ use crate::qwen::vision::{
     VisionBlock, VisionInput, VisionMode, VisionState, VisionStatic,
 };
 use crate::qwen::vl::InputPart;
+use crate::{
+    composite_execution::{CompositeArchitecture, PreparedCompositeInput},
+    media_plan::QwenHybridInputPartPlan,
+};
 
 use super::{
     unit_parallel_parameter_groups, Block, ConditionalLocalGeometry, ForwardMode,
@@ -145,6 +149,183 @@ pub enum ConditionalInput<'a, T> {
     },
 }
 
+enum PreparedInputKind {
+    Text(usize),
+    Projected(usize, usize),
+    Image(usize, usize),
+    Video(usize, usize),
+}
+
+/// Architecture-owned tensor assembly for one admitted conditional Qwen request.
+pub struct PreparedInput<T> {
+    tokens: Vec<T>,
+    grids: Vec<Vec<(i32, i32, i32)>>,
+    pixels: Option<T>,
+    kinds: Vec<PreparedInputKind>,
+    projected: Vec<Option<T>>,
+}
+
+impl<T: Tensor> PreparedInput<T> {
+    /// Borrows the assembled request through the canonical target vocabulary.
+    pub fn with_target_input<R>(&self, apply: impl FnOnce(ConditionalInput<'_, T>) -> R) -> R {
+        let parts = self
+            .kinds
+            .iter()
+            .map(|kind| match *kind {
+                PreparedInputKind::Text(token) => InputPart::Text(&self.tokens[token]),
+                PreparedInputKind::Projected(token, original) => InputPart::Projected {
+                    tokens: &self.tokens[token],
+                    embeddings: self.projected[original]
+                        .as_ref()
+                        .expect("projected input retains its embeddings"),
+                },
+                PreparedInputKind::Image(token, grid) => InputPart::Image {
+                    tokens: &self.tokens[token],
+                    grid: &self.grids[grid],
+                },
+                PreparedInputKind::Video(token, grid) => InputPart::Video {
+                    tokens: &self.tokens[token],
+                    grid: &self.grids[grid],
+                },
+            })
+            .collect::<Vec<_>>();
+        apply(ConditionalInput::Target {
+            parts: &parts,
+            pixels: self.pixels.as_ref(),
+            mask: None,
+        })
+    }
+
+    /// Concatenates semantic token identity in decoder order.
+    pub fn token_ids(&self, context: &T::Context) -> Result<T, Error> {
+        T::concatenate(&self.tokens, 1, context)
+    }
+}
+
+/// Materializes Qwen placeholder IDs, patch grids, and ordered target segments
+/// from an architecture admission.
+pub fn prepare_input<T: Tensor>(
+    input: PreparedCompositeInput<'_, T, QwenHybridInputPartPlan>,
+    context: &T::Context,
+) -> Result<PreparedInput<T>, Error> {
+    let prepared = input.prepared();
+    let admitted = input.admitted();
+    if prepared.identity() != admitted.identity() || prepared.len() != admitted.parts().len() {
+        return Err(Error::backend(
+            "conditional Qwen prepared input no longer matches its admission",
+        ));
+    }
+    let mut tokens = Vec::with_capacity(prepared.len());
+    let mut grids = Vec::new();
+    let mut pixels = Vec::new();
+    let mut kinds = Vec::with_capacity(prepared.len());
+    let mut projected = Vec::with_capacity(prepared.len());
+    for (original, (part, plan)) in prepared.parts().iter().zip(admitted.parts()).enumerate() {
+        match plan {
+            QwenHybridInputPartPlan::TextTokens { .. } => {
+                let eredu_runtime::PreparedInputPayload::TokenIds(value) = part.payload() else {
+                    return Err(Error::backend(
+                        "conditional Qwen admitted text lost its token payload",
+                    ));
+                };
+                tokens.push(value.clone());
+                kinds.push(PreparedInputKind::Text(tokens.len() - 1));
+                projected.push(None);
+            }
+            QwenHybridInputPartPlan::Projected { positions, .. } => {
+                let eredu_runtime::PreparedInputPayload::Embeddings(value) = part.payload() else {
+                    return Err(Error::backend(
+                        "conditional Qwen projected part lost its embeddings",
+                    ));
+                };
+                let positions = i32::try_from(*positions)
+                    .map_err(|_| Error::backend("conditional Qwen projected span exceeds I32"))?;
+                tokens.push(T::full_i32(0, &[1, positions], context)?);
+                kinds.push(PreparedInputKind::Projected(tokens.len() - 1, original));
+                projected.push(Some(value.clone()));
+            }
+            QwenHybridInputPartPlan::Media { ingress, .. } => {
+                let eredu_runtime::PreparedInputPayload::Tensor(value) = part.payload() else {
+                    return Err(Error::backend(
+                        "conditional Qwen admitted media lost its tensor payload",
+                    ));
+                };
+                let count = i32::try_from(ingress.placeholder_count)
+                    .map_err(|_| Error::backend("conditional Qwen media span exceeds I32"))?;
+                let token = i32::try_from(ingress.placeholder_token_id)
+                    .map_err(|_| Error::backend("conditional Qwen placeholder exceeds I32"))?;
+                tokens.push(T::full_i32(token, &[1, count], context)?);
+                grids.push(ingress.patch_grid.clone());
+                pixels.push(value.clone());
+                let token_index = tokens.len() - 1;
+                let grid_index = grids.len() - 1;
+                kinds.push(match part.modality() {
+                    eredu_core::InputModality::Image => {
+                        PreparedInputKind::Image(token_index, grid_index)
+                    }
+                    eredu_core::InputModality::Video => {
+                        PreparedInputKind::Video(token_index, grid_index)
+                    }
+                    _ => {
+                        return Err(Error::backend(
+                            "conditional Qwen admission contains an unsupported modality",
+                        ));
+                    }
+                });
+                projected.push(None);
+            }
+        }
+    }
+    let pixels = match pixels.len() {
+        0 => None,
+        1 => pixels.pop(),
+        _ => Some(T::concatenate(&pixels, 0, context)?),
+    };
+    Ok(PreparedInput {
+        tokens,
+        grids,
+        pixels,
+        kinds,
+        projected,
+    })
+}
+
+impl<B, S> CompositeArchitecture<B, S> for ConditionalLayeredModel<B>
+where
+    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
+    S: LayerRuntimeState<B>,
+    S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+{
+    type InputPartPlan = QwenHybridInputPartPlan;
+    type AdmissionConfig = ParsedHybridConfig;
+
+    fn admission_config(&self) -> Self::AdmissionConfig {
+        self.parsed.clone()
+    }
+
+    fn admit_prepared_input(
+        config: &Self::AdmissionConfig,
+        input: &eredu_runtime::PreparedModelInput<B::Tensor>,
+        inspector: &impl eredu_runtime::PreparedInputInspector<B::Tensor>,
+    ) -> Result<
+        crate::media_plan::AdmittedCompositeInput<Self::InputPartPlan>,
+        eredu_core::CapabilityError,
+    > {
+        crate::media_plan::admit_qwen_hybrid_input(config, input, inspector)
+    }
+
+    fn begin_composite_forward<'a>(
+        &mut self,
+        input: PreparedCompositeInput<'a, B::Tensor, Self::InputPartPlan>,
+        state: &mut S,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
+        prepare_input(input, context)?.with_target_input(|input| {
+            <Self as LayeredArchitecture<B, S>>::begin_forward(self, input, state, context)
+        })
+    }
+}
+
 /// Request-local conditional execution values.
 pub struct ConditionalForwardContext<T> {
     tokens: T,
@@ -167,6 +348,8 @@ pub struct ConditionalPipelineVisionState<T> {
     parts: Vec<PreparedPart<T>>,
     mask: Option<T>,
     vision: Option<VisionState<T>>,
+    vision_output: Option<T>,
+    deepstack: Vec<T>,
 }
 
 /// Decoder-facing conditional values after the placed vision group completes.
@@ -348,12 +531,32 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
         state: &eredu_runtime::PartitionState,
         topology: eredu_core::cache::PromptCacheTopology,
     ) -> Result<eredu_runtime::ModelStateIdentity, Self::DefinitionError> {
-        super::state_identity(
-            &self.parsed.text,
-            state.layout(),
-            state.global_layer_offset(),
+        let target_layers =
+            usize::try_from(self.parsed.text.num_hidden_layers).map_err(Error::backend)?;
+        let prediction_layers =
+            usize::try_from(self.parsed.text.mtp_num_hidden_layers).map_err(Error::backend)?;
+        let layer_count = target_layers
+            .checked_add(prediction_layers)
+            .ok_or_else(|| Error::backend("conditional Qwen state layer count overflowed"))?;
+        let global_layer_start = state.global_layer_offset();
+        let global_layer_end = global_layer_start
+            .checked_add(state.layout().len())
+            .ok_or_else(|| Error::backend("conditional Qwen owned layer range overflowed"))?;
+        if global_layer_end > layer_count {
+            return Err(Error::backend(format!(
+                "conditional Qwen owns layers {global_layer_start}..{global_layer_end}, outside {layer_count} layers"
+            )));
+        }
+        eredu_runtime::ModelStateIdentity::new(
+            self.parsed.text.variant.model_kind().canonical_name(),
+            self.parsed.text.model_type.clone(),
+            super::conditional_prompt_cache_architecture_fingerprint(&self.parsed),
+            layer_count,
+            global_layer_start,
+            0,
             topology,
         )
+        .map_err(Error::backend)
     }
 
     fn parameter_description(
@@ -1128,6 +1331,8 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalLa
             parts,
             mask,
             vision,
+            vision_output: None,
+            deepstack: Vec::new(),
         })
     }
 
@@ -1223,13 +1428,16 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalLa
         Ok(())
     }
 
-    /// Finishes the shared merger and emits a fixed-shape decoder payload.
-    pub fn finish_pipeline_target(
+    /// Finishes the placed vision projector without assembling decoder ingress.
+    pub fn complete_pipeline_vision(
         &mut self,
-        mut state: ConditionalPipelineVisionState<B::Tensor>,
+        state: &mut ConditionalPipelineVisionState<B::Tensor>,
         parallel: Option<&B::ParallelContext>,
         context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<ConditionalPipelinePrepared<B::Tensor>, Error> {
+    ) -> Result<(), Error> {
+        if state.vision_output.is_some() || state.vision.is_none() {
+            return Ok(());
+        }
         let output = match &mut state.vision {
             Some(vision) => Some(match parallel {
                 Some(parallel) => self.static_modules.vision.finish_parallel(
@@ -1245,39 +1453,64 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalLa
             }),
             None => None,
         };
-        let assembled = self.assemble(
-            &state.parts,
-            output.as_ref().map(|output| &output.embeddings),
-            context,
-        )?;
-        let deepstack = match output {
-            Some(output) => {
-                let image = self.parsed.image_token_id.expect("validated image token");
-                let video = self.parsed.video_token_id.expect("validated video token");
-                let visual = assembled
-                    .token_ids
-                    .equal_i32(image, context)?
-                    .logical_or(&assembled.token_ids.equal_i32(video, context)?, context)?;
-                output
-                    .deepstack_features
-                    .into_iter()
-                    .map(|features| {
-                        assembled.embeddings.zeros_like(context)?.masked_scatter(
-                            &visual,
-                            &features.index(&[Index::At(0), Index::Full, Index::Full], context)?,
-                            context,
-                        )
-                    })
-                    .collect::<Result<Vec<_>, Error>>()?
-            }
-            None => (0..self
+        if let Some(output) = output {
+            state.vision_output = Some(output.embeddings);
+            state.deepstack = output.deepstack_features;
+        }
+        Ok(())
+    }
+
+    /// Returns the completed placed projector output.
+    pub fn pipeline_vision_output(
+        state: &ConditionalPipelineVisionState<B::Tensor>,
+    ) -> Option<&B::Tensor> {
+        state.vision_output.as_ref()
+    }
+
+    /// Replaces the completed placed projector output before decoder assembly.
+    pub fn replace_pipeline_vision_output(
+        state: &mut ConditionalPipelineVisionState<B::Tensor>,
+        output: B::Tensor,
+    ) {
+        state.vision_output = Some(output);
+    }
+
+    /// Finishes the shared merger and emits a fixed-shape decoder payload.
+    pub fn finish_pipeline_target(
+        &mut self,
+        mut state: ConditionalPipelineVisionState<B::Tensor>,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<ConditionalPipelinePrepared<B::Tensor>, Error> {
+        self.complete_pipeline_vision(&mut state, parallel, context)?;
+        let assembled = self.assemble(&state.parts, state.vision_output.as_ref(), context)?;
+        let deepstack = if state.vision_output.is_some() {
+            let image = self.parsed.image_token_id.expect("validated image token");
+            let video = self.parsed.video_token_id.expect("validated video token");
+            let visual = assembled
+                .token_ids
+                .equal_i32(image, context)?
+                .logical_or(&assembled.token_ids.equal_i32(video, context)?, context)?;
+            state
+                .deepstack
+                .into_iter()
+                .map(|features| {
+                    assembled.embeddings.zeros_like(context)?.masked_scatter(
+                        &visual,
+                        &features.index(&[Index::At(0), Index::Full, Index::Full], context)?,
+                        context,
+                    )
+                })
+                .collect::<Result<Vec<_>, Error>>()?
+        } else {
+            (0..self
                 .parsed
                 .vision
                 .as_ref()
                 .expect("validated vision")
                 .deepstack_layer_count())
                 .map(|_| assembled.embeddings.zeros_like(context))
-                .collect::<Result<Vec<_>, Error>>()?,
+                .collect::<Result<Vec<_>, Error>>()?
         };
         Ok(ConditionalPipelinePrepared {
             hidden: assembled.embeddings,
@@ -1505,6 +1738,14 @@ where
         })
     }
 
+    fn group_input_observation_path(&self, group: usize) -> Result<Option<String>, Error> {
+        Ok((group == 1).then(|| eredu_core::MODALITY_MERGE_OUTPUT_OBSERVATION_PATH.to_owned()))
+    }
+
+    fn group_output_observation_path(&self, group: usize) -> Result<Option<String>, Error> {
+        Ok((group == 0).then(|| eredu_core::VISION_PROJECTOR_OUTPUT_OBSERVATION_PATH.to_owned()))
+    }
+
     fn static_modules(&self) -> &Self::StaticModules {
         &self.static_modules
     }
@@ -1659,8 +1900,12 @@ where
         match group {
             0 => Ok(forward.vision_initial.as_ref().unwrap_or(initial).clone()),
             1 if matches!(forward.mode, ForwardMode::Target) => {
-                let assembled =
-                    self.assemble(&forward.parts, forward.vision_output.as_ref(), context)?;
+                let vision = forward
+                    .vision_output
+                    .as_ref()
+                    .and_then(|_| dependencies.first().copied())
+                    .or(forward.vision_output.as_ref());
+                let assembled = self.assemble(&forward.parts, vision, context)?;
                 let image = self.parsed.image_token_id.expect("validated image token");
                 let video = self.parsed.video_token_id.expect("validated video token");
                 forward.visual_mask = if forward.deepstack.is_empty() {

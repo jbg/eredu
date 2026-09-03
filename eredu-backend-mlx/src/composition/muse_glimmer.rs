@@ -3,10 +3,9 @@
 use std::{path::Path, sync::Arc};
 
 use eredu_architectures::{
-    media_plan,
+    composite_execution::{CompositeArchitecture, PreparedCompositeInput},
     muse_glimmer::{
         DecoderConfig, DecoderInputPart, LayeredModel as Architecture, ModelInput, Unit,
-        VisionInput,
     },
 };
 use eredu_checkpoint::{
@@ -19,11 +18,7 @@ use eredu_runtime::{
     LayeredArchitecture, LayeredForwardState, LayerwiseRuntime, PagedCacheOptions,
     ParallelModelInfo, ParameterRole, RuntimeState, WeightBinding, WeightResidency,
 };
-use safemlx::{
-    error::Exception,
-    ops::{concatenate_axis, indexing::TryIndexOp},
-    Stream,
-};
+use safemlx::{error::Exception, ops::indexing::TryIndexOp, Stream};
 
 use crate::backend::runtime::checkpoint::gguf::GgufCheckpoint;
 
@@ -364,13 +359,6 @@ pub struct MuseGlimmerSpeculativeOutput {
     pub target_states: Vec<crate::MlxTensor>,
 }
 
-pub struct PreparedMuseInput {
-    pub tokens: Vec<crate::MlxTensor>,
-    pub media: Vec<bool>,
-    pub pixels: Option<crate::MlxTensor>,
-    pub grid: Vec<(i32, i32, i32)>,
-}
-
 /// Transportable neutral ingress state used while a pipeline placement walks
 /// the native vision group. The architecture forward context is the same one
 /// used by resident and bounded execution; only ownership of its tensors moves.
@@ -534,63 +522,17 @@ pub fn prepare_muse_input(
     args: &DecoderConfig,
     typed: input::ModelInput<'_>,
     stream: &Stream,
-) -> Result<PreparedMuseInput, Error> {
-    input::validate(typed)?;
-    let mut tokens = Vec::with_capacity(typed.parts.len());
-    let mut media = Vec::with_capacity(typed.parts.len());
-    let mut pixels = Vec::new();
-    let mut grid = Vec::new();
-    for part in typed.parts {
-        let plan = media_plan::muse_glimmer_input_part(args, part, &input::MlxInputInspector)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        match (plan, part.payload()) {
-            (
-                media_plan::MuseGlimmerInputPartPlan::TextTokens { .. },
-                input::InputPayload::TokenIds(value),
-            ) => {
-                tokens.push(crate::MlxTensor::from_array(value.clone()));
-                media.push(false);
-            }
-            (
-                media_plan::MuseGlimmerInputPartPlan::Vision { ingress, .. },
-                input::InputPayload::Tensor(value),
-            ) => {
-                let count = usize::try_from(ingress.placeholder_count).map_err(|_| {
-                    Error::ArchitectureModel(
-                        "Muse-Glimmer placeholder span exceeds host capacity".into(),
-                    )
-                })?;
-                tokens.push(crate::MlxTensor::from_array(input::token_ids_array(
-                    &vec![ingress.placeholder_token_id; count],
-                    stream,
-                )?));
-                media.push(true);
-                pixels.push(value.clone());
-                grid.extend(ingress.patch_grid);
-            }
-            _ => {
-                return Err(Error::ArchitectureModel(format!(
-                    "Muse-Glimmer input plan disagrees with the prepared {} payload",
-                    part.modality().as_str()
-                )))
-            }
-        }
-    }
-    let pixels = if pixels.is_empty() {
-        None
-    } else {
-        Some(concatenate_axis(
-            &pixels.iter().collect::<Vec<_>>(),
-            0,
-            stream,
-        )?)
-    };
-    Ok(PreparedMuseInput {
-        tokens,
-        media,
-        pixels: pixels.map(crate::MlxTensor::from_array),
-        grid,
-    })
+) -> Result<eredu_architectures::muse_glimmer::PreparedCompositeIngress<crate::MlxTensor>, Error> {
+    let prepared = crate::composition::mlx::replicated_text::prepared_composite_input(typed)?;
+    let admitted = <NeutralArchitecture as CompositeArchitecture<
+        MlxNeuralBackend,
+        MlxKeyValueState,
+    >>::admit_prepared_input(args, &prepared, &input::MlxTensorInputInspector)
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let paired =
+        PreparedCompositeInput::new(&prepared, &admitted).map_err(Error::ArchitectureModel)?;
+    eredu_architectures::muse_glimmer::prepare_composite_ingress::<MlxNeuralBackend>(paired, stream)
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))
 }
 
 impl MuseGlimmerModel {
@@ -1023,25 +965,11 @@ impl MuseGlimmerModel {
         observer: &mut dyn eredu_runtime::ActivationObserver<safemlx::Array, Exception>,
     ) -> Result<crate::MlxTensor, Error> {
         let prepared = prepare_muse_input(&self.args, typed, stream)?;
-        let parts = prepared
-            .tokens
-            .iter()
-            .zip(&prepared.media)
-            .map(|(value, media)| {
-                if *media {
-                    DecoderInputPart::Media(value)
-                } else {
-                    DecoderInputPart::Text(value)
-                }
-            })
-            .collect::<Vec<_>>();
+        let parts = prepared.decoder_parts();
         self.forward_with_observer(
             ModelInput {
                 parts: &parts,
-                vision: prepared.pixels.as_ref().map(|pixels| VisionInput {
-                    pixels,
-                    grid: &prepared.grid,
-                }),
+                vision: prepared.vision_input(),
                 mask: None,
             },
             state,
@@ -1151,24 +1079,10 @@ impl MuseGlimmerModel {
         stream: &Stream,
     ) -> Result<crate::MlxTensor, Error> {
         let prepared = prepare_muse_input(&self.args, typed, stream)?;
-        let parts = prepared
-            .tokens
-            .iter()
-            .zip(&prepared.media)
-            .map(|(value, media)| {
-                if *media {
-                    DecoderInputPart::Media(value)
-                } else {
-                    DecoderInputPart::Text(value)
-                }
-            })
-            .collect::<Vec<_>>();
+        let parts = prepared.decoder_parts();
         let input = ModelInput {
             parts: &parts,
-            vision: prepared.pixels.as_ref().map(|pixels| VisionInput {
-                pixels,
-                grid: &prepared.grid,
-            }),
+            vision: prepared.vision_input(),
             mask: None,
         };
         self.forward_parallel_input(input, state, group, stream)
@@ -1205,25 +1119,11 @@ impl MuseGlimmerModel {
         observer: &mut dyn eredu_runtime::ActivationObserver<safemlx::Array, Exception>,
     ) -> Result<crate::MlxTensor, Error> {
         let prepared = prepare_muse_input(&self.args, typed, stream)?;
-        let parts = prepared
-            .tokens
-            .iter()
-            .zip(&prepared.media)
-            .map(|(value, media)| {
-                if *media {
-                    DecoderInputPart::Media(value)
-                } else {
-                    DecoderInputPart::Text(value)
-                }
-            })
-            .collect::<Vec<_>>();
+        let parts = prepared.decoder_parts();
         self.forward_parallel_input_with_observer(
             ModelInput {
                 parts: &parts,
-                vision: prepared.pixels.as_ref().map(|pixels| VisionInput {
-                    pixels,
-                    grid: &prepared.grid,
-                }),
+                vision: prepared.vision_input(),
                 mask: None,
             },
             state,
@@ -1478,25 +1378,11 @@ impl MuseGlimmerModel {
         stream: &Stream,
     ) -> Result<MuseGlimmerSpeculativeOutput, Error> {
         let prepared = prepare_muse_input(&self.args, typed, stream)?;
-        let parts = prepared
-            .tokens
-            .iter()
-            .zip(&prepared.media)
-            .map(|(value, media)| {
-                if *media {
-                    DecoderInputPart::Media(value)
-                } else {
-                    DecoderInputPart::Text(value)
-                }
-            })
-            .collect::<Vec<_>>();
+        let parts = prepared.decoder_parts();
         self.forward_with_taps(
             ModelInput {
                 parts: &parts,
-                vision: prepared.pixels.as_ref().map(|pixels| VisionInput {
-                    pixels,
-                    grid: &prepared.grid,
-                }),
+                vision: prepared.vision_input(),
                 mask: None,
             },
             state,

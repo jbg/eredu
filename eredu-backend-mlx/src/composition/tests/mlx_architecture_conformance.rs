@@ -337,9 +337,9 @@ fn neutral_inkling_text_forward_monomorphizes_on_mlx() {
     let mut hidden =
         <Architecture as LayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::begin_execution_group(
             &mut architecture,
-            1,
+            2,
             &initial,
-            &[&initial],
+            &[&initial, &initial],
             &mut state,
             &mut context,
             stream,
@@ -348,14 +348,14 @@ fn neutral_inkling_text_forward_monomorphizes_on_mlx() {
     let mut unit =
         <Architecture as LayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::build_unit(
             &architecture,
-            1,
+            2,
             0,
             stream,
         )
         .unwrap();
     hidden = <Architecture as LayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::forward_unit(
         &mut architecture,
-        1,
+        2,
         0,
         &mut unit,
         &hidden,

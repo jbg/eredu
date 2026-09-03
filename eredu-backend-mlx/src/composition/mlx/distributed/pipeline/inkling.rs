@@ -46,7 +46,7 @@ use crate::{
     },
     composition::mlx::distributed::topology::MlxParallelPlan,
     composition::{
-        inkling::{InklingBindings, InklingPipelineUnit, PreparedInklingInput},
+        inkling::{InklingBindings, InklingPipelineUnit},
         mlx::speculative::embedded::EmbeddedMtpOutput,
     },
 };
@@ -84,44 +84,7 @@ impl InklingPipelinePartition {
         execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
     ) -> Result<InklingIngressState, Error> {
-        let prepared = PreparedInklingInput::new(self.args(), typed, stream)?;
-        let parts = prepared
-            .tokens
-            .iter()
-            .zip(prepared.kinds.iter().copied())
-            .zip(&prepared.projected)
-            .map(|((tokens, kind), projected)| match projected {
-                Some(embeddings) => {
-                    eredu_architectures::inkling::DecoderInputPart::Projected { tokens, embeddings }
-                }
-                None => match kind {
-                    eredu_core::InputModality::Text => {
-                        eredu_architectures::inkling::DecoderInputPart::Text(tokens)
-                    }
-                    eredu_core::InputModality::Image => {
-                        eredu_architectures::inkling::DecoderInputPart::Image(tokens)
-                    }
-                    eredu_core::InputModality::Audio => {
-                        eredu_architectures::inkling::DecoderInputPart::Audio(tokens)
-                    }
-                    eredu_core::InputModality::Video => unreachable!(),
-                    _ => unreachable!("validated Inkling input modality"),
-                },
-            })
-            .collect::<Vec<_>>();
-        let audio =
-            prepared
-                .audio
-                .as_ref()
-                .map(|code_ids| eredu_architectures::inkling::AudioInput {
-                    code_ids,
-                    valid_frames: code_ids.as_array().dim(1),
-                });
-        let input = eredu_architectures::inkling::ModelInput {
-            parts: &parts,
-            vision_patches: prepared.images.as_ref(),
-            audio,
-        };
+        let prepared = crate::composition::inkling::prepare_input(self.args(), typed, stream)?;
         // Media ingress executes before decoder pipeline ownership is applied.
         // The neutral architecture owns this transient geometry independently
         // of the composite target-plus-prediction persistence layout.
@@ -130,35 +93,42 @@ impl InklingPipelinePartition {
             .ingress_state_layout()
             .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         let mut state = MlxHybridState::device(ingress_layout)?;
-        let forward = match execution.and_then(ParallelExecutionContext::group) {
-            Some(parallel) => <eredu_architectures::inkling::LayeredModel<MlxNeuralBackend> as ParallelLayeredArchitecture<
-                MlxNeuralBackend,
-                MlxHybridState,
-            >>::begin_forward_parallel(&mut self.architecture, input, &mut state, parallel, stream),
-            None => <eredu_architectures::inkling::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
-                MlxNeuralBackend,
-                MlxHybridState,
-            >>::begin_forward(&mut self.architecture, input, &mut state, stream),
-        }
+        let forward = prepared.with_model_input(|input| {
+            match execution.and_then(ParallelExecutionContext::group) {
+                Some(parallel) => <eredu_architectures::inkling::LayeredModel<MlxNeuralBackend> as ParallelLayeredArchitecture<
+                    MlxNeuralBackend,
+                    MlxHybridState,
+                >>::begin_forward_parallel(&mut self.architecture, input, &mut state, parallel, stream),
+                None => <eredu_architectures::inkling::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
+                    MlxNeuralBackend,
+                    MlxHybridState,
+                >>::begin_forward(&mut self.architecture, input, &mut state, stream),
+            }
+        })
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        Ok(InklingIngressState { forward, state })
+        Ok(InklingIngressState {
+            forward,
+            state,
+            vision_complete: false,
+            audio_complete: false,
+            assembled: false,
+        })
     }
 
-    fn ingress_active(&self, state: &InklingIngressState) -> bool {
-        let vision_group = architecture_group_by_id::<_, MlxHybridState>(
-            &self.architecture,
-            eredu_architectures::inkling::VISION_EXECUTION_GROUP,
+    fn ingress_active(&self, state: &InklingIngressState, group: &str) -> Result<bool, Error> {
+        let group = architecture_group_by_id::<_, MlxHybridState>(&self.architecture, group)?;
+        Ok(
+            <eredu_architectures::inkling::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
+                MlxNeuralBackend,
+                MlxHybridState,
+            >>::should_execute_group(&self.architecture, group, &state.forward.context),
         )
-        .expect("validated Inkling vision group");
-        <eredu_architectures::inkling::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
-            MlxNeuralBackend,
-            MlxHybridState,
-        >>::should_execute_group(&self.architecture, vision_group, &state.forward.context)
     }
 
     fn replace_ingress_arrays(
         &self,
         state: &mut InklingIngressState,
+        group: &str,
         arrays: Vec<Array>,
     ) -> Result<(), Error> {
         let [hidden]: [Array; 1] = arrays.try_into().map_err(|arrays: Vec<Array>| {
@@ -167,7 +137,19 @@ impl InklingPipelinePartition {
                 arrays.len()
             ))
         })?;
-        state.replace_hidden(crate::MlxTensor::from_array(hidden));
+        let hidden = crate::MlxTensor::from_array(hidden);
+        state.replace_hidden(hidden.clone());
+        match group {
+            eredu_architectures::inkling::VISION_EXECUTION_GROUP => {
+                state.forward.context.replace_vision_output(hidden);
+                state.vision_complete = true;
+            }
+            eredu_architectures::inkling::AUDIO_EXECUTION_GROUP => {
+                state.forward.context.replace_audio_output(hidden);
+                state.audio_complete = true;
+            }
+            _ => {}
+        }
         Ok(())
     }
 
@@ -216,45 +198,35 @@ impl InklingPipelinePartition {
         Ok(())
     }
 
-    fn finish_ingress(
+    fn assemble_ingress(
         &mut self,
-        mut state: InklingIngressState,
-        execution: Option<&ParallelExecutionContext<'_>>,
+        state: &mut InklingIngressState,
         stream: &Stream,
-    ) -> Result<Array, Error> {
-        if self.ingress_active(&state) {
-            let vision_group = architecture_group_by_id::<_, MlxHybridState>(
-                &self.architecture,
-                eredu_architectures::inkling::VISION_EXECUTION_GROUP,
-            )?;
-            state.forward.hidden = match execution.and_then(ParallelExecutionContext::group) {
-                Some(parallel) => <eredu_architectures::inkling::LayeredModel<MlxNeuralBackend> as ParallelLayeredArchitecture<
-                    MlxNeuralBackend,
-                    MlxHybridState,
-                >>::complete_execution_group_parallel(
-                    &mut self.architecture,
-                    vision_group,
-                    &state.forward.hidden,
-                    &mut state.state,
-                    &mut state.forward.context,
-                    parallel,
-                    stream,
-                ),
-                None => <eredu_architectures::inkling::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
-                    MlxNeuralBackend,
-                    MlxHybridState,
-                >>::complete_execution_group(
-                    &mut self.architecture,
-                    vision_group,
-                    &state.forward.hidden,
-                    &mut state.state,
-                    &mut state.forward.context,
-                    stream,
-                ),
-            }
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    ) -> Result<(), Error> {
+        if state.assembled {
+            return Ok(());
         }
-        Ok(state.forward.hidden.into_array())
+        let text_group = architecture_group_by_id::<_, MlxHybridState>(
+            &self.architecture,
+            eredu_architectures::inkling::TEXT_EXECUTION_GROUP,
+        )?;
+        let initial = state.forward.hidden.clone();
+        state.forward.hidden =
+            <eredu_architectures::inkling::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
+                MlxNeuralBackend,
+                MlxHybridState,
+            >>::begin_execution_group(
+                &mut self.architecture,
+                text_group,
+                &initial,
+                &[&initial, &initial],
+                &mut state.state,
+                &mut state.forward.context,
+                stream,
+            )
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        state.assembled = true;
+        Ok(())
     }
 
     fn forward_pipeline_mtp(
@@ -336,6 +308,24 @@ impl PipelinePartitionMetadata for InklingPipelinePartition {
 }
 
 impl MlxPlacedGroupExecutor for InklingPipelinePartition {
+    fn placed_group_input_observation_path(&self, group: &str) -> Result<Option<String>, Error> {
+        let group = architecture_group_by_id::<_, MlxHybridState>(&self.architecture, group)?;
+        <eredu_architectures::inkling::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
+            MlxNeuralBackend,
+            MlxHybridState,
+        >>::group_input_observation_path(&self.architecture, group)
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))
+    }
+
+    fn placed_group_output_observation_path(&self, group: &str) -> Result<Option<String>, Error> {
+        let group = architecture_group_by_id::<_, MlxHybridState>(&self.architecture, group)?;
+        <eredu_architectures::inkling::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
+            MlxNeuralBackend,
+            MlxHybridState,
+        >>::group_output_observation_path(&self.architecture, group)
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))
+    }
+
     fn begin_placed_ingress(
         &mut self,
         input: crate::backend::runtime::media::input::ModelInput<'_>,
@@ -346,14 +336,12 @@ impl MlxPlacedGroupExecutor for InklingPipelinePartition {
         Ok(())
     }
 
-    fn placed_ingress_active(&self, _group: &str) -> Result<bool, Error> {
-        // Inkling's media group is also the pass-through producer for already
-        // projected image embeddings and text-only requests. Keep the placed
-        // route active even when there are no raw vision units to execute.
-        self.ingress_state
+    fn placed_ingress_active(&self, group: &str) -> Result<bool, Error> {
+        let state = self
+            .ingress_state
             .as_ref()
             .ok_or_else(|| Error::Parallel("Inkling placed ingress state is unavailable".into()))?;
-        Ok(true)
+        self.ingress_active(state, group)
     }
 
     fn placed_ingress_arrays(&self, _group: &str) -> Result<Vec<Array>, Error> {
@@ -366,24 +354,52 @@ impl MlxPlacedGroupExecutor for InklingPipelinePartition {
 
     fn replace_placed_ingress_arrays(
         &mut self,
-        _group: &str,
+        group: &str,
         arrays: Vec<Array>,
     ) -> Result<(), Error> {
         let mut state = self
             .ingress_state
             .take()
             .ok_or_else(|| Error::Parallel("Inkling placed ingress state is unavailable".into()))?;
-        let result = self.replace_ingress_arrays(&mut state, arrays);
+        let result = self.replace_ingress_arrays(&mut state, group, arrays);
         self.ingress_state = Some(state);
         result
     }
 
     fn merge_placed_ingress_arrays(&mut self, arrays: Vec<Array>) -> Result<(), Error> {
-        let group = architecture_group_id::<_, MlxHybridState>(
-            &self.architecture,
-            eredu_architectures::inkling::VISION_EXECUTION_GROUP,
-        )?;
-        self.replace_placed_ingress_arrays(&group, arrays)
+        let mut state = self
+            .ingress_state
+            .take()
+            .ok_or_else(|| Error::Parallel("Inkling placed ingress state is unavailable".into()))?;
+        let mut arrays = arrays.into_iter();
+        if state.forward.context.has_vision_input() {
+            let output = arrays.next().ok_or_else(|| {
+                Error::Parallel("Inkling placed ingress omitted the vision output".into())
+            })?;
+            state
+                .forward
+                .context
+                .replace_vision_output(crate::MlxTensor::from_array(output));
+            state.vision_complete = true;
+        }
+        if state.forward.context.has_audio_input() {
+            let output = arrays.next().ok_or_else(|| {
+                Error::Parallel("Inkling placed ingress omitted the audio output".into())
+            })?;
+            state
+                .forward
+                .context
+                .replace_audio_output(crate::MlxTensor::from_array(output));
+            state.audio_complete = true;
+        }
+        if arrays.next().is_some() {
+            self.ingress_state = Some(state);
+            return Err(Error::Parallel(
+                "Inkling placed ingress received extra dependency outputs".into(),
+            ));
+        }
+        self.ingress_state = Some(state);
+        Ok(())
     }
 
     fn execute_placed_ingress(
@@ -397,14 +413,22 @@ impl MlxPlacedGroupExecutor for InklingPipelinePartition {
             &self.architecture,
             eredu_architectures::inkling::VISION_EXECUTION_GROUP,
         )?;
-        if group != vision_group {
-            return Ok(());
-        }
         let mut state = self
             .ingress_state
             .take()
             .ok_or_else(|| Error::Parallel("Inkling placed ingress state is unavailable".into()))?;
-        let result = self.execute_placed_vision(&mut state, execution, stream);
+        let result = if group == vision_group {
+            self.execute_placed_vision(&mut state, execution, stream)
+        } else if group
+            == architecture_group_id::<_, MlxHybridState>(
+                &self.architecture,
+                eredu_architectures::inkling::AUDIO_EXECUTION_GROUP,
+            )?
+        {
+            self.execute_placed_audio(&mut state, stream)
+        } else {
+            Ok(())
+        };
         self.ingress_state = Some(state);
         result
     }
@@ -414,12 +438,14 @@ impl MlxPlacedGroupExecutor for InklingPipelinePartition {
         execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
     ) -> Result<PipelinePayload, Error> {
-        let state = self
+        let mut state = self
             .ingress_state
             .take()
             .ok_or_else(|| Error::Parallel("Inkling placed ingress state is unavailable".into()))?;
+        self.assemble_ingress(&mut state, stream)?;
+        let _ = execution;
         Ok(PipelinePayload {
-            hidden: self.finish_ingress(state, execution, stream)?,
+            hidden: state.forward.hidden.into_array(),
             auxiliary: PipelineAuxiliaryState::default(),
         })
     }
@@ -441,20 +467,11 @@ impl MlxPlacedGroupExecutor for InklingPipelinePartition {
             ));
         }
         let mut state = self.begin_ingress(input, execution, stream)?;
-        if self.ingress_active(&state) {
-            let mut layers = std::mem::take(&mut self.vision_layers);
-            let result =
-                self.vision_range()
-                    .clone()
-                    .zip(&mut layers)
-                    .try_for_each(|(index, layer)| {
-                        self.forward_vision_unit(index, layer, &mut state, execution, stream)
-                    });
-            self.vision_layers = layers;
-            result?;
-        }
+        self.execute_placed_vision(&mut state, execution, stream)?;
+        self.execute_placed_audio(&mut state, stream)?;
+        self.assemble_ingress(&mut state, stream)?;
         let payload = PipelinePayload {
-            hidden: self.finish_ingress(state, execution, stream)?,
+            hidden: state.forward.hidden.into_array(),
             auxiliary: PipelineAuxiliaryState::default(),
         };
         self.forward_decoder(
@@ -649,7 +666,7 @@ impl InklingPipelinePartition {
         execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
     ) -> Result<(), Error> {
-        if !self.ingress_active(state) {
+        if !self.ingress_active(state, eredu_architectures::inkling::VISION_EXECUTION_GROUP)? {
             return Ok(());
         }
         if let Some(storage) = self.dense_layers.take() {
@@ -703,6 +720,81 @@ impl InklingPipelinePartition {
             self.vision_layers = layers;
             result?;
         }
+        let vision_group = architecture_group_by_id::<_, MlxHybridState>(
+            &self.architecture,
+            eredu_architectures::inkling::VISION_EXECUTION_GROUP,
+        )?;
+        state.forward.hidden = match execution.and_then(ParallelExecutionContext::group) {
+            Some(parallel) => <eredu_architectures::inkling::LayeredModel<MlxNeuralBackend> as ParallelLayeredArchitecture<
+                MlxNeuralBackend,
+                MlxHybridState,
+            >>::complete_execution_group_parallel(
+                &mut self.architecture,
+                vision_group,
+                &state.forward.hidden,
+                &mut state.state,
+                &mut state.forward.context,
+                parallel,
+                stream,
+            ),
+            None => <eredu_architectures::inkling::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
+                MlxNeuralBackend,
+                MlxHybridState,
+            >>::complete_execution_group(
+                &mut self.architecture,
+                vision_group,
+                &state.forward.hidden,
+                &mut state.state,
+                &mut state.forward.context,
+                stream,
+            ),
+        }
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        state.vision_complete = true;
+        Ok(())
+    }
+
+    fn execute_placed_audio(
+        &mut self,
+        state: &mut InklingIngressState,
+        stream: &Stream,
+    ) -> Result<(), Error> {
+        if !self.ingress_active(state, eredu_architectures::inkling::AUDIO_EXECUTION_GROUP)? {
+            return Ok(());
+        }
+        let audio_group = architecture_group_by_id::<_, MlxHybridState>(
+            &self.architecture,
+            eredu_architectures::inkling::AUDIO_EXECUTION_GROUP,
+        )?;
+        let initial = state.forward.hidden.clone();
+        let hidden =
+            <eredu_architectures::inkling::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
+                MlxNeuralBackend,
+                MlxHybridState,
+            >>::begin_execution_group(
+                &mut self.architecture,
+                audio_group,
+                &initial,
+                &[],
+                &mut state.state,
+                &mut state.forward.context,
+                stream,
+            )
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        state.forward.hidden =
+            <eredu_architectures::inkling::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
+                MlxNeuralBackend,
+                MlxHybridState,
+            >>::complete_execution_group(
+                &mut self.architecture,
+                audio_group,
+                &hidden,
+                &mut state.state,
+                &mut state.forward.context,
+                stream,
+            )
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        state.audio_complete = true;
         Ok(())
     }
 

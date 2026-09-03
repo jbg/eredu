@@ -1,6 +1,6 @@
 //! Composite artifact and checkpoint-name policy for Muse-Glimmer.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use eredu_checkpoint::{
     composite::{
@@ -37,6 +37,32 @@ pub fn load_time_quantization(
     if let Some(vision) = &mut target.vision_config {
         vision.weight_quantization = Some(quantization);
         vision.quantized_weight_configs.clear();
+    }
+    target.validate().map_err(|error| error.to_string())?;
+    Ok(target)
+}
+
+/// Applies exact selected text and vision formats to a complete composite.
+pub fn with_checkpoint_formats(
+    args: &DecoderConfig,
+    formats: HashMap<String, WeightQuantization>,
+) -> Result<DecoderConfig, String> {
+    let mut target = args.clone();
+    let mut text = HashMap::new();
+    let mut vision = HashMap::new();
+    for (name, format) in formats {
+        if name.starts_with("model.vision_") {
+            vision.insert(name, format);
+        } else {
+            text.insert(name, format);
+        }
+    }
+    target.quantization = None;
+    target.quantized_weights = None;
+    target.quantized_weight_configs = (!text.is_empty()).then_some(text);
+    if let Some(config) = target.vision_config.as_mut() {
+        config.weight_quantization = None;
+        config.quantized_weight_configs = vision;
     }
     target.validate().map_err(|error| error.to_string())?;
     Ok(target)
@@ -1180,7 +1206,9 @@ pub fn expert_residency_catalog<C: RecipeCatalog + ?Sized>(
             );
         }
     }
-    crate::ExpertResidencyCatalog::new(units).map_err(|error| error.to_string())
+    crate::ExpertResidencyCatalog::new(units)
+        .and_then(|residency| residency.with_inferred_byte_geometry(catalog))
+        .map_err(|error| error.to_string())
 }
 
 /// Translates one released dense text GGUF name to its neutral identity.
@@ -1277,7 +1305,7 @@ pub fn translate_projector_gguf_name(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashMap};
 
     use eredu_checkpoint::{
         recipe::{DerivedWeightRecipe, RecipeCatalog},
@@ -1368,6 +1396,28 @@ mod tests {
             value["text_config"]["norm_topk_prob"] = true.into();
         }
         DecoderConfig::from_hf_value(&value).unwrap()
+    }
+
+    #[test]
+    fn selected_formats_are_partitioned_between_text_and_vision() {
+        let source = decoder(false);
+        let format = WeightQuantization::MxFp4;
+        let text = "model.layers.0.self_attn.q_proj.weight";
+        let vision = "model.vision_tower.layers.0.attn.q_proj.weight";
+        let target = with_checkpoint_formats(
+            &source,
+            HashMap::from([(text.into(), format), (vision.into(), format)]),
+        )
+        .unwrap();
+        assert_eq!(target.linear_format_for(text), format.into());
+        assert_eq!(
+            target
+                .vision_config
+                .as_ref()
+                .unwrap()
+                .linear_format_for(vision),
+            format.into()
+        );
     }
 
     #[test]

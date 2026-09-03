@@ -7,21 +7,29 @@ use eredu_core::SpeculativeCapability;
 use safemlx::{error::Exception, Stream};
 
 use crate::backend::error::Error;
-
-#[derive(Clone, Copy)]
-pub(super) struct CompositeInputProof(());
-
-impl CompositeInputProof {
-    pub(super) fn from_plan(
-        plan: &eredu_architectures::processor_plan::ArtifactArchitecturePlan,
-    ) -> Option<Self> {
-        plan.has_processor().then_some(Self(()))
-    }
-}
 use crate::composition::gpt_oss;
 use eredu_architectures::ModelKind;
 use eredu_runtime::CacheResidencyReport;
 use eredu_runtime::{CacheResidencyPolicy, PagedCacheOptions};
+
+const REPLICATED_TEXT_KINDS: &[ModelKind] = &[
+    ModelKind::Llama,
+    ModelKind::Qwen2,
+    ModelKind::Qwen3,
+    ModelKind::Lfm2,
+    ModelKind::KimiLinear,
+    ModelKind::NemotronH,
+    ModelKind::Qwen3Next,
+    ModelKind::Gemma4,
+    ModelKind::Inkling,
+    ModelKind::MuseGlimmer,
+    ModelKind::Qwen3Vl,
+    ModelKind::Qwen3VlMoe,
+    ModelKind::Qwen35,
+    ModelKind::GptOss,
+    ModelKind::DeepSeekV3,
+    ModelKind::DeepSeekV4,
+];
 
 /// Admitted architecture identity checked against the concrete model variant.
 #[derive(Clone, Copy)]
@@ -129,18 +137,6 @@ pub enum Executable {
         crate::composition::qwen::hybrid::QwenHybridModel,
         crate::backend::runtime::cache::state::MlxHybridState,
     ),
-    /// Qwen3-VL multimodal model.
-    Qwen3Vl(
-        AdmittedModelKind,
-        crate::composition::qwen::vl::QwenVlModel,
-        crate::backend::runtime::cache::state::MlxHybridState,
-    ),
-    /// Qwen3-VL-MoE multimodal model.
-    Qwen3VlMoe(
-        AdmittedModelKind,
-        crate::composition::qwen::vl::QwenVlModel,
-        crate::backend::runtime::cache::state::MlxHybridState,
-    ),
     /// Qwen3.5 dense or MoE model, optionally multimodal.
     Qwen35(
         AdmittedModelKind,
@@ -216,22 +212,7 @@ impl Executable {
         kind: ModelKind,
         model: Box<dyn super::replicated_text::ErasedReplicatedTextExecutable>,
     ) -> Result<Self, Error> {
-        let identity = AdmittedModelKind::new(
-            kind,
-            &[
-                ModelKind::Llama,
-                ModelKind::Qwen2,
-                ModelKind::Qwen3,
-                ModelKind::Lfm2,
-                ModelKind::KimiLinear,
-                ModelKind::NemotronH,
-                ModelKind::Qwen3Next,
-                ModelKind::Qwen35,
-                ModelKind::GptOss,
-                ModelKind::DeepSeekV3,
-                ModelKind::DeepSeekV4,
-            ],
-        )?;
+        let identity = AdmittedModelKind::new(kind, REPLICATED_TEXT_KINDS)?;
         Ok(Self::ReplicatedText(identity, model))
     }
 
@@ -295,24 +276,6 @@ impl Executable {
         Ok(Self::Qwen3Next(identity, model, cache))
     }
 
-    pub(super) fn qwen3_vl(
-        kind: ModelKind,
-        model: crate::composition::qwen::vl::QwenVlModel,
-    ) -> Result<Self, Error> {
-        let identity = AdmittedModelKind::new(kind, &[ModelKind::Qwen3Vl])?;
-        let cache = model.new_cache();
-        Ok(Self::Qwen3Vl(identity, model, cache))
-    }
-
-    pub(super) fn qwen3_vl_moe(
-        kind: ModelKind,
-        model: crate::composition::qwen::vl::QwenVlModel,
-    ) -> Result<Self, Error> {
-        let identity = AdmittedModelKind::new(kind, &[ModelKind::Qwen3VlMoe])?;
-        let cache = model.new_cache();
-        Ok(Self::Qwen3VlMoe(identity, model, cache))
-    }
-
     pub(super) fn qwen35(
         kind: ModelKind,
         model: crate::composition::qwen::hybrid::QwenHybridModel,
@@ -322,16 +285,6 @@ impl Executable {
                 "replicated Qwen3.5 text requires generic composition".into(),
             ));
         }
-        let identity = AdmittedModelKind::new(kind, &[ModelKind::Qwen35])?;
-        let cache = model.new_cache();
-        Ok(Self::Qwen35(identity, model, cache))
-    }
-
-    pub(super) fn qwen35_composite(
-        kind: ModelKind,
-        model: crate::composition::qwen::hybrid::QwenHybridModel,
-        _proof: CompositeInputProof,
-    ) -> Result<Self, Error> {
         let identity = AdmittedModelKind::new(kind, &[ModelKind::Qwen35])?;
         let cache = model.new_cache();
         Ok(Self::Qwen35(identity, model, cache))
@@ -357,7 +310,6 @@ impl Executable {
             Self::Lfm2(_, model, _) => model.parallel_info(),
             Self::NemotronH(_, model, _) => model.parallel_info(),
             Self::Qwen3Next(_, model, _) | Self::Qwen35(_, model, _) => model.parallel_info(),
-            Self::Qwen3Vl(_, model, _) | Self::Qwen3VlMoe(_, model, _) => model.parallel_info(),
             Self::Gemma4(_, model, _) => model.parallel_info(),
             Self::Inkling(_, model, _) => model.parallel_info(),
         }
@@ -390,9 +342,6 @@ impl Executable {
             }
             Self::Qwen(_, model, _) => model.residency_report(),
             Self::MuseGlimmer(_, model, _) => model.residency_report(),
-            Self::Qwen3Vl(_, model, _) | Self::Qwen3VlMoe(_, model, _) => {
-                Ok(Some(model.residency_report()?))
-            }
         }
     }
 
@@ -413,9 +362,6 @@ impl Executable {
             Self::Qwen3Next(_, model, _) | Self::Qwen35(_, model, _) => model.dense_stream_report(),
             Self::Qwen(_, model, _) => model.dense_stream_report(),
             Self::MuseGlimmer(_, model, _) => model.dense_stream_report(),
-            Self::Qwen3Vl(_, model, _) | Self::Qwen3VlMoe(_, model, _) => {
-                model.dense_stream_report()
-            }
         }
     }
 
@@ -434,8 +380,6 @@ impl Executable {
             | Self::NemotronH(_, _, _)
             | Self::Qwen(_, _, _)
             | Self::Qwen3Next(_, _, _)
-            | Self::Qwen3Vl(_, _, _)
-            | Self::Qwen3VlMoe(_, _, _)
             | Self::Qwen35(_, _, _) => None,
         }
     }
@@ -459,10 +403,9 @@ impl Executable {
             Self::Qwen3Next(_, model, _) | Self::Qwen35(_, model, _) => {
                 model.parameter_bank_report()
             }
-            Self::Qwen3VlMoe(_, model, _) => model.parameter_bank_report(),
             Self::MuseGlimmer(_, model, _) => model.parameter_bank_report(),
             Self::ReplicatedText(_, model) => model.parameter_bank_report(),
-            Self::PartitionedLlama(_, _, _) | Self::Qwen3Vl(_, _, _) => Ok(None),
+            Self::PartitionedLlama(_, _, _) => Ok(None),
         }
     }
 
@@ -480,8 +423,6 @@ impl Executable {
             | Self::NemotronH(kind, _, _)
             | Self::Qwen(kind, _, _)
             | Self::Qwen3Next(kind, _, _)
-            | Self::Qwen3Vl(kind, _, _)
-            | Self::Qwen3VlMoe(kind, _, _)
             | Self::Qwen35(kind, _, _) => kind.get(),
             Self::ReplicatedText(kind, _) => kind.get(),
         }
@@ -502,8 +443,6 @@ impl Executable {
             Self::Qwen(_, model, _) => &model.args().model_type,
             Self::MuseGlimmer(_, model, _) => &model.args().model_type,
             Self::Qwen3Next(_, model, _) => &model.args().model_type,
-            Self::Qwen3Vl(_, model, _) => model.effective_model_type(),
-            Self::Qwen3VlMoe(_, model, _) => model.effective_model_type(),
             Self::Qwen35(_, model, _) => &model.args().model_type,
         }
     }
@@ -525,9 +464,6 @@ impl Executable {
             Self::Qwen(_, model, _) => model.prompt_cache_model_identity(),
             Self::MuseGlimmer(_, model, _) => model.prompt_cache_model_identity(),
             Self::Qwen3Next(_, model, _) | Self::Qwen35(_, model, _) => {
-                model.prompt_cache_model_identity()
-            }
-            Self::Qwen3Vl(_, model, _) | Self::Qwen3VlMoe(_, model, _) => {
                 model.prompt_cache_model_identity()
             }
         }
@@ -567,9 +503,6 @@ impl Executable {
                 Self::NemotronH(_, model, cache) => reset_paged!(model, cache, options),
                 Self::Qwen(_, model, cache) => reset_paged!(model, cache, options),
                 Self::Qwen3Next(_, model, cache) => reset_paged!(model, cache, options),
-                Self::Qwen3Vl(_, model, cache) | Self::Qwen3VlMoe(_, model, cache) => {
-                    reset_paged!(model, cache, options)
-                }
                 Self::Qwen35(_, model, cache) => reset_paged!(model, cache, options),
             },
         }
@@ -594,9 +527,6 @@ impl Executable {
             Self::NemotronH(_, model, cache) => *cache = model.new_cache(),
             Self::Qwen(_, model, cache) => *cache = model.new_cache(),
             Self::Qwen3Next(_, model, cache) => *cache = model.new_cache(),
-            Self::Qwen3Vl(_, model, cache) | Self::Qwen3VlMoe(_, model, cache) => {
-                *cache = model.new_cache()
-            }
             Self::Qwen35(_, model, cache) => *cache = model.new_cache(),
         }
         Ok(())
@@ -635,10 +565,32 @@ impl Executable {
             Self::NemotronH(_, model, cache) => load_into!(model, cache),
             Self::Qwen(_, model, cache) => load_into!(model, cache),
             Self::Qwen3Next(_, model, cache) => load_into!(model, cache),
-            Self::Qwen3Vl(_, model, cache) | Self::Qwen3VlMoe(_, model, cache) => {
-                load_into!(model, cache)
-            }
             Self::Qwen35(_, model, cache) => load_into!(model, cache),
+        }
+    }
+
+    /// Opens a cache while binding composite state to an exact prepared-input identity.
+    pub fn load_prompt_cache_for_input(
+        &mut self,
+        directory: impl AsRef<Path>,
+        expected: &PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        input_identity: eredu_runtime::PreparedInputCacheIdentity,
+        options: PagedCacheOptions,
+        stream: &Stream,
+    ) -> Result<PromptCacheManifest, Exception> {
+        match self {
+            Self::ReplicatedText(_, model) => model
+                .load_prompt_cache_for_input(
+                    directory.as_ref(),
+                    expected,
+                    prefix_token_ids,
+                    input_identity,
+                )
+                .map_err(|error| Exception::custom(error.to_string())),
+            other => {
+                other.load_prompt_cache(directory, expected, prefix_token_ids, options, stream)
+            }
         }
     }
 
@@ -682,9 +634,6 @@ impl Executable {
             Self::NemotronH(_, model, cache) => save_from!(model, cache),
             Self::Qwen(_, model, cache) => save_from!(model, cache),
             Self::Qwen3Next(_, model, cache) => save_from!(model, cache),
-            Self::Qwen3Vl(_, model, cache) | Self::Qwen3VlMoe(_, model, cache) => {
-                save_from!(model, cache)
-            }
             Self::Qwen35(_, model, cache) => save_from!(model, cache),
         }
     }
@@ -704,8 +653,6 @@ impl Executable {
             | Self::Lfm2(_, _, cache)
             | Self::NemotronH(_, _, cache)
             | Self::Qwen3Next(_, _, cache)
-            | Self::Qwen3Vl(_, _, cache)
-            | Self::Qwen3VlMoe(_, _, cache)
             | Self::Qwen35(_, _, cache) => cache.residency_report(),
         }
     }
@@ -754,6 +701,21 @@ mod tests {
         assert_eq!(aliased_identity.get(), ModelKind::Qwen2);
 
         assert!(AdmittedModelKind::new(ModelKind::Qwen35, &[ModelKind::Qwen3Next]).is_err());
+    }
+
+    #[test]
+    fn replicated_text_erasure_accepts_every_composite_identity() {
+        for kind in [
+            ModelKind::Gemma4,
+            ModelKind::Inkling,
+            ModelKind::MuseGlimmer,
+            ModelKind::Qwen3Vl,
+            ModelKind::Qwen3VlMoe,
+            ModelKind::Qwen35,
+        ] {
+            assert!(AdmittedModelKind::new(kind, REPLICATED_TEXT_KINDS).is_ok());
+        }
+        assert!(AdmittedModelKind::new(ModelKind::Moshi, REPLICATED_TEXT_KINDS).is_err());
     }
 
     #[test]

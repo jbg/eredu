@@ -20,6 +20,10 @@ use crate::qwen::vision::{
     VisionBlock, VisionInput, VisionMode, VisionState, VisionStatic,
 };
 use crate::qwen::{self, AttentionInput};
+use crate::{
+    composite_execution::{CompositeArchitecture, PreparedCompositeInput},
+    media_plan::QwenVlInputPartPlan,
+};
 
 use super::{
     mrope_embeddings, multimodal_position_ids, position_ids_tensor, LocalGeometry, ModelArgs,
@@ -66,6 +70,179 @@ pub struct ModelInput<'a, T> {
     pub pixels: Option<&'a T>,
     /// Optional explicit text attention mask.
     pub mask: Option<&'a T>,
+}
+
+enum PreparedInputKind {
+    Text(usize),
+    Projected(usize, usize),
+    Image(usize, usize),
+    Video(usize, usize),
+}
+
+/// Architecture-owned tensor assembly for one admitted Qwen3-VL request.
+pub struct PreparedInput<T> {
+    tokens: Vec<T>,
+    grids: Vec<Vec<(i32, i32, i32)>>,
+    pixels: Option<T>,
+    kinds: Vec<PreparedInputKind>,
+    projected: Vec<Option<T>>,
+}
+
+impl<T> PreparedInput<T> {
+    /// Borrows the assembled request through the canonical model input vocabulary.
+    pub fn with_model_input<R>(&self, apply: impl FnOnce(ModelInput<'_, T>) -> R) -> R {
+        let parts = self
+            .kinds
+            .iter()
+            .map(|kind| match *kind {
+                PreparedInputKind::Text(token) => InputPart::Text(&self.tokens[token]),
+                PreparedInputKind::Projected(token, original) => InputPart::Projected {
+                    tokens: &self.tokens[token],
+                    embeddings: self.projected[original]
+                        .as_ref()
+                        .expect("projected input retains its embeddings"),
+                },
+                PreparedInputKind::Image(token, grid) => InputPart::Image {
+                    tokens: &self.tokens[token],
+                    grid: &self.grids[grid],
+                },
+                PreparedInputKind::Video(token, grid) => InputPart::Video {
+                    tokens: &self.tokens[token],
+                    grid: &self.grids[grid],
+                },
+            })
+            .collect::<Vec<_>>();
+        apply(ModelInput {
+            parts: &parts,
+            pixels: self.pixels.as_ref(),
+            mask: None,
+        })
+    }
+}
+
+/// Materializes Qwen3-VL placeholder IDs, patch grids, and ordered segments
+/// from an architecture admission.
+pub fn prepare_input<T: Tensor>(
+    input: PreparedCompositeInput<'_, T, QwenVlInputPartPlan>,
+    context: &T::Context,
+) -> Result<PreparedInput<T>, Error> {
+    let prepared = input.prepared();
+    let admitted = input.admitted();
+    if prepared.identity() != admitted.identity() || prepared.len() != admitted.parts().len() {
+        return Err(Error::backend(
+            "Qwen3-VL prepared input no longer matches its admission",
+        ));
+    }
+
+    let mut tokens = Vec::with_capacity(prepared.len());
+    let mut grids = Vec::new();
+    let mut pixels = Vec::new();
+    let mut kinds = Vec::with_capacity(prepared.len());
+    let mut projected = Vec::with_capacity(prepared.len());
+    for (part_index, (part, plan)) in prepared.parts().iter().zip(admitted.parts()).enumerate() {
+        match plan {
+            QwenVlInputPartPlan::TextTokens { .. } => {
+                let eredu_runtime::PreparedInputPayload::TokenIds(value) = part.payload() else {
+                    return Err(Error::backend(
+                        "Qwen3-VL admitted text part lost its token payload",
+                    ));
+                };
+                tokens.push(value.clone());
+                kinds.push(PreparedInputKind::Text(tokens.len() - 1));
+                projected.push(None);
+            }
+            QwenVlInputPartPlan::ProjectedText { positions } => {
+                let eredu_runtime::PreparedInputPayload::Embeddings(value) = part.payload() else {
+                    return Err(Error::backend(
+                        "Qwen3-VL admitted projected part lost its embedding payload",
+                    ));
+                };
+                let positions = i32::try_from(*positions)
+                    .map_err(|_| Error::backend("Qwen3-VL projected span exceeds I32"))?;
+                tokens.push(T::full_i32(0, &[1, positions], context)?);
+                kinds.push(PreparedInputKind::Projected(tokens.len() - 1, part_index));
+                projected.push(Some(value.clone()));
+            }
+            QwenVlInputPartPlan::Media { ingress, .. } => {
+                let eredu_runtime::PreparedInputPayload::Tensor(value) = part.payload() else {
+                    return Err(Error::backend(
+                        "Qwen3-VL admitted media part lost its tensor payload",
+                    ));
+                };
+                let count = i32::try_from(ingress.placeholder_count)
+                    .map_err(|_| Error::backend("Qwen3-VL media span exceeds I32"))?;
+                let token = i32::try_from(ingress.placeholder_token_id)
+                    .map_err(|_| Error::backend("Qwen3-VL placeholder ID exceeds I32"))?;
+                tokens.push(T::full_i32(token, &[1, count], context)?);
+                grids.push(ingress.patch_grid.clone());
+                pixels.push(value.clone());
+                let token_index = tokens.len() - 1;
+                let grid_index = grids.len() - 1;
+                kinds.push(match part.modality() {
+                    eredu_core::InputModality::Image => {
+                        PreparedInputKind::Image(token_index, grid_index)
+                    }
+                    eredu_core::InputModality::Video => {
+                        PreparedInputKind::Video(token_index, grid_index)
+                    }
+                    _ => {
+                        return Err(Error::backend(
+                            "Qwen3-VL media admission contains an unsupported modality",
+                        ));
+                    }
+                });
+                projected.push(None);
+            }
+        }
+    }
+    let pixels = match pixels.len() {
+        0 => None,
+        1 => pixels.pop(),
+        _ => Some(T::concatenate(&pixels, 0, context)?),
+    };
+    Ok(PreparedInput {
+        tokens,
+        grids,
+        pixels,
+        kinds,
+        projected,
+    })
+}
+
+impl<B, S> CompositeArchitecture<B, S> for LayeredModel<B>
+where
+    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
+    S: LayerRuntimeState<B>,
+    S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+{
+    type InputPartPlan = QwenVlInputPartPlan;
+    type AdmissionConfig = ModelArgs;
+
+    fn admission_config(&self) -> Self::AdmissionConfig {
+        self.args.clone()
+    }
+
+    fn admit_prepared_input(
+        config: &Self::AdmissionConfig,
+        input: &eredu_runtime::PreparedModelInput<B::Tensor>,
+        inspector: &impl eredu_runtime::PreparedInputInspector<B::Tensor>,
+    ) -> Result<
+        crate::media_plan::AdmittedCompositeInput<Self::InputPartPlan>,
+        eredu_core::CapabilityError,
+    > {
+        crate::media_plan::admit_qwen_vl_input(config, input, inspector)
+    }
+
+    fn begin_composite_forward<'a>(
+        &mut self,
+        input: PreparedCompositeInput<'a, B::Tensor, Self::InputPartPlan>,
+        state: &mut S,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
+        prepare_input(input, context)?.with_model_input(|input| {
+            <Self as LayeredArchitecture<B, S>>::begin_forward(self, input, state, context)
+        })
+    }
 }
 
 enum PreparedPart<T> {
@@ -175,6 +352,7 @@ pub struct PipelineVisionState<T> {
     mask: Option<T>,
     vision: Option<VisionState<T>>,
     vision_output: Option<T>,
+    deepstack: Vec<T>,
 }
 
 /// Decoder-facing values produced after the placed vision group completes.
@@ -1152,6 +1330,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
             mask,
             vision,
             vision_output: None,
+            deepstack: Vec::new(),
         })
     }
 
@@ -1265,14 +1444,17 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         Ok(())
     }
 
-    /// Finishes the vision merger and assembles decoder-width input.
-    pub fn finish_pipeline(
+    /// Finishes the placed vision projector without assembling decoder ingress.
+    pub fn complete_pipeline_vision(
         &mut self,
-        mut state: PipelineVisionState<B::Tensor>,
+        state: &mut PipelineVisionState<B::Tensor>,
         parallel: Option<&B::ParallelContext>,
         context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<PipelinePrepared<B::Tensor>, Error> {
-        let deepstack = if let Some(vision) = &mut state.vision {
+    ) -> Result<(), Error> {
+        if state.vision_output.is_some() || state.vision.is_none() {
+            return Ok(());
+        }
+        if let Some(vision) = &mut state.vision {
             let output = match parallel {
                 Some(parallel) => self.static_modules.vision.finish_parallel(
                     &state.hidden,
@@ -1286,12 +1468,34 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
                     .finish(&state.hidden, vision, context)?,
             };
             state.vision_output = Some(output.embeddings);
-            output.deepstack_features
-        } else {
-            Vec::new()
-        };
+            state.deepstack = output.deepstack_features;
+        }
+        Ok(())
+    }
+
+    /// Returns the completed placed projector output.
+    pub fn pipeline_vision_output(state: &PipelineVisionState<B::Tensor>) -> Option<&B::Tensor> {
+        state.vision_output.as_ref()
+    }
+
+    /// Replaces the completed placed projector output before decoder assembly.
+    pub fn replace_pipeline_vision_output(
+        state: &mut PipelineVisionState<B::Tensor>,
+        output: B::Tensor,
+    ) {
+        state.vision_output = Some(output);
+    }
+
+    /// Finishes the vision projector and assembles decoder-width input.
+    pub fn finish_pipeline(
+        &mut self,
+        mut state: PipelineVisionState<B::Tensor>,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<PipelinePrepared<B::Tensor>, Error> {
+        self.complete_pipeline_vision(&mut state, parallel, context)?;
         let assembled = self.assemble(&state.parts, state.vision_output.as_ref(), context)?;
-        let visual_mask = if deepstack.is_empty() {
+        let visual_mask = if state.deepstack.is_empty() {
             None
         } else {
             Some(
@@ -1307,7 +1511,8 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
             )
         };
         let deepstack = match visual_mask.as_ref() {
-            Some(mask) => deepstack
+            Some(mask) => state
+                .deepstack
                 .into_iter()
                 .map(|features| {
                     assembled.embeddings.zeros_like(context)?.masked_scatter(
@@ -1317,7 +1522,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
                     )
                 })
                 .collect::<Result<Vec<_>, Error>>()?,
-            None => deepstack,
+            None => state.deepstack,
         };
         Ok(PipelinePrepared {
             hidden: assembled.embeddings,
@@ -1593,6 +1798,14 @@ where
         }
     }
 
+    fn group_input_observation_path(&self, group: usize) -> Result<Option<String>, Self::Error> {
+        Ok((group == 1).then(|| eredu_core::MODALITY_MERGE_OUTPUT_OBSERVATION_PATH.to_owned()))
+    }
+
+    fn group_output_observation_path(&self, group: usize) -> Result<Option<String>, Self::Error> {
+        Ok((group == 0).then(|| eredu_core::VISION_PROJECTOR_OUTPUT_OBSERVATION_PATH.to_owned()))
+    }
+
     fn static_modules(&self) -> &Self::StaticModules {
         &self.static_modules
     }
@@ -1736,7 +1949,7 @@ where
         &mut self,
         group: usize,
         initial: &B::Tensor,
-        _dependencies: &[&B::Tensor],
+        dependencies: &[&B::Tensor],
         _state: &mut S,
         forward: &mut Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
@@ -1744,8 +1957,12 @@ where
         match group {
             0 => Ok(forward.vision_initial.as_ref().unwrap_or(initial).clone()),
             1 => {
-                let assembled =
-                    self.assemble(&forward.parts, forward.vision_output.as_ref(), context)?;
+                let vision = forward
+                    .vision_output
+                    .as_ref()
+                    .and_then(|_| dependencies.first().copied())
+                    .or(forward.vision_output.as_ref());
+                let assembled = self.assemble(&forward.parts, vision, context)?;
                 forward.visual_mask = if forward.deepstack.is_empty() {
                     None
                 } else {

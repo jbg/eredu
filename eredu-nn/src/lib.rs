@@ -4343,6 +4343,11 @@ pub trait Tensor: Clone + Debug + Sized + 'static {
     }
     /// Elementwise maximum with a scalar.
     fn maximum_scalar(&self, rhs: f32, context: &Self::Context) -> Result<Self, Error>;
+    /// Elementwise maximum with one signed integer while preserving an
+    /// integral input representation.
+    fn maximum_i32(&self, rhs: i32, context: &Self::Context) -> Result<Self, Error> {
+        self.maximum_scalar(rhs as f32, context)
+    }
     /// Elementwise clamp using backend tensor bounds that may be scalar or broadcastable.
     fn clip(&self, minimum: &Self, maximum: &Self, context: &Self::Context) -> Result<Self, Error> {
         let _ = (minimum, maximum, context);
