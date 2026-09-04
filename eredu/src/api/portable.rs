@@ -106,11 +106,20 @@ pub struct LoadedModel<B: TextGenerationBackend> {
 pub struct PlannedModel<B: TextGenerationBackend, D> {
     model: LoadedModel<B>,
     drafting: RealizedDrafting<D>,
+    drafting_plan: eredu_core::DraftingPlan,
 }
 
 impl<B: TextGenerationBackend, D> PlannedModel<B, D> {
-    pub(crate) fn new(model: LoadedModel<B>, drafting: RealizedDrafting<D>) -> Self {
-        Self { model, drafting }
+    pub(crate) fn new(
+        model: LoadedModel<B>,
+        drafting: RealizedDrafting<D>,
+        drafting_plan: eredu_core::DraftingPlan,
+    ) -> Self {
+        Self {
+            model,
+            drafting,
+            drafting_plan,
+        }
     }
 
     /// Borrows the loaded target model.
@@ -126,6 +135,45 @@ impl<B: TextGenerationBackend, D> PlannedModel<B, D> {
     /// Borrows the backend-owned drafting realization.
     pub const fn drafting(&self) -> &RealizedDrafting<D> {
         &self.drafting
+    }
+
+    /// Returns the portable drafting policy that produced these resources.
+    pub const fn drafting_plan(&self) -> &eredu_core::DraftingPlan {
+        &self.drafting_plan
+    }
+
+    /// Resolves the execution plan's speculative request controls.
+    ///
+    /// This prevents automatic-plan proposal and lookahead limits from being
+    /// silently replaced by unrelated request defaults.
+    pub fn speculative_generation_options(
+        &self,
+    ) -> Result<Option<super::PreparedChatSpeculativeGenerationOptions>, eredu_core::GenerationError>
+    {
+        let (maximum, lookahead, adaptive) = match &self.drafting_plan {
+            eredu_core::DraftingPlan::Disabled => return Ok(None),
+            eredu_core::DraftingPlan::Embedded {
+                max_draft_tokens,
+                lookahead,
+                adaptive_lookahead,
+            }
+            | eredu_core::DraftingPlan::External {
+                max_draft_tokens,
+                lookahead,
+                adaptive_lookahead,
+                ..
+            } => (*max_draft_tokens, *lookahead, *adaptive_lookahead),
+            _ => return Ok(None),
+        };
+        let max_draft_tokens = std::num::NonZeroUsize::new(maximum)
+            .ok_or(eredu_core::GenerationError::ZeroDraftTokens)?;
+        let mut scheduler =
+            eredu_core::SpeculativeSchedulerOptions::default().with_lookahead(lookahead);
+        scheduler.adaptive_lookahead = adaptive;
+        Ok(Some(super::PreparedChatSpeculativeGenerationOptions {
+            max_draft_tokens,
+            scheduler: scheduler.validate()?,
+        }))
     }
 
     /// Mutably borrows the target and drafting resources as one planned session.

@@ -51,6 +51,8 @@ pub mod replicated_text;
 pub mod residency;
 /// Backend-neutral speculative request lifecycle and fair scheduling.
 pub mod speculative;
+/// Family-blind speculative requirements, selection, and construction gating.
+pub mod speculative_selection;
 /// Architecture-declared mutable state and concrete runtime realizations.
 pub mod state;
 mod weight_residency;
@@ -224,6 +226,20 @@ pub use residency::{
     WeightBinding, WeightBindingPlan, WeightBindingSelectionError, WeightMaterializationReport,
 };
 pub use speculative::{RunSpeculativeGeneration, SpeculativeScheduler};
+pub use speculative_selection::{
+    select_and_prepare_speculative_realization,
+    select_and_prepare_speculative_realization_observed, select_speculative_realization,
+    ConstructedSpeculativeResources, PreparedSpeculativeRealization, SelectedSpeculativeCompletion,
+    SelectedSpeculativePlacement, SelectedSpeculativeRealization, SelectedSpeculativeSampling,
+    SelectedSpeculativeState, SpeculativeArchitectureCompatibilityProof, SpeculativeCaptureEntry,
+    SpeculativeCaptureEnvelope, SpeculativeCaptureError, SpeculativeCaptureMetadata,
+    SpeculativeCaptureSchema, SpeculativeContractError, SpeculativeIdentity,
+    SpeculativeLaneIdentity, SpeculativeMechanism, SpeculativeMechanismCapabilities,
+    SpeculativeMechanismRequirements, SpeculativePlacementRequest, SpeculativePreparationError,
+    SpeculativeRealizationRequirements, SpeculativeSelectionError, SpeculativeSelectionRequest,
+    SpeculativeStateCacheIdentityIngredients, SpeculativeStrategyClass,
+    SpeculativeStrategyRequirements,
+};
 pub use state::{
     realize_architecture_state, ArchitectureStateFactory, ArchitectureStatePartitionError,
     ArchitectureStatePartitionPlan, ArchitectureStatePartitionRule, ArchitectureStatePlacement,

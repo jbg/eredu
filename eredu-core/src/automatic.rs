@@ -740,8 +740,9 @@ pub trait ExecutionPlanBackendFactory: AutomaticPlanningBackend {
     ///
     /// `external_artifact` is present exactly for [`DraftingPlan::External`].
     /// It is assembled by the portable facade, which owns architecture
-    /// inspection and tokenizer loading, while the backend owns only assistant
-    /// materialization, placement, and architecture compatibility validation.
+    /// inspection, tokenizer loading, and architecture compatibility proof.
+    /// The backend binds only the already selected materialization, placement,
+    /// and mechanism resources.
     fn realize_drafting(
         &self,
         plan: &ExecutionPlan,

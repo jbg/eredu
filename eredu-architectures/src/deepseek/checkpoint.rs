@@ -1728,7 +1728,14 @@ fn append_v4_draft_specs(specs: &mut Vec<V4TensorSpec>, args: &V4Args) -> Result
     if let Some(dspark) = &args.dspark {
         let last = draft_layers - 1;
         let markov = dimension(dspark.markov_rank, "DSpark Markov rank")?;
-        let captured = checked_mul(hidden, dspark.target_layer_ids.len(), "captured hidden")?;
+        let captured = checked_mul(
+            hidden,
+            args.target_capture_policy
+                .as_ref()
+                .expect("validated DSpark target capture policy")
+                .len(),
+            "captured hidden",
+        )?;
         for (name, shape, operation, format) in [
             (
                 "mtp.0.main_proj.weight".to_string(),

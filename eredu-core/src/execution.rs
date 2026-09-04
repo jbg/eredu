@@ -221,6 +221,42 @@ pub enum DraftingPlan {
     },
 }
 
+impl DraftingPlan {
+    /// Returns the maximum proposal count selected for each verification round.
+    pub const fn max_draft_tokens(&self) -> Option<usize> {
+        match self {
+            Self::Disabled => None,
+            Self::Embedded {
+                max_draft_tokens, ..
+            }
+            | Self::External {
+                max_draft_tokens, ..
+            } => Some(*max_draft_tokens),
+        }
+    }
+
+    /// Returns whether the selected plan enables same-request lookahead.
+    pub const fn lookahead(&self) -> bool {
+        match self {
+            Self::Disabled => false,
+            Self::Embedded { lookahead, .. } | Self::External { lookahead, .. } => *lookahead,
+        }
+    }
+
+    /// Returns whether deterministic adaptive lookahead is selected.
+    pub const fn adaptive_lookahead(&self) -> bool {
+        match self {
+            Self::Disabled => false,
+            Self::Embedded {
+                adaptive_lookahead, ..
+            }
+            | Self::External {
+                adaptive_lookahead, ..
+            } => *adaptive_lookahead,
+        }
+    }
+}
+
 /// External assistant placement selected by an execution plan.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case")]
@@ -233,6 +269,19 @@ pub enum DraftPlacementPlan {
         /// Explicit process-local assistant device.
         device: DevicePlan,
     },
+}
+
+impl DraftPlacementPlan {
+    /// Resolves target/draft topology from the portable plan before queue construction.
+    pub fn execution_topology(&self, target: &DevicePlan) -> crate::SpeculativeExecutionTopology {
+        match self {
+            Self::Target => crate::SpeculativeExecutionTopology::Single,
+            Self::Device { device } if device == target => {
+                crate::SpeculativeExecutionTopology::SameDeviceSplit
+            }
+            Self::Device { .. } => crate::SpeculativeExecutionTopology::CrossDeviceSplit,
+        }
+    }
 }
 
 /// Optional load-time transformation applied to checkpoint weights.
@@ -567,6 +616,29 @@ mod tests {
         assert_eq!(
             plan.validate_structure(),
             Err(ExecutionPlanError::EmptyDraftModel)
+        );
+    }
+
+    #[test]
+    fn draft_topology_is_selected_from_the_portable_plan_before_queue_construction() {
+        let target = DevicePlan::new("mlx", "metal:0").unwrap();
+        assert_eq!(
+            DraftPlacementPlan::Target.execution_topology(&target),
+            crate::SpeculativeExecutionTopology::Single
+        );
+        assert_eq!(
+            DraftPlacementPlan::Device {
+                device: target.clone(),
+            }
+            .execution_topology(&target),
+            crate::SpeculativeExecutionTopology::SameDeviceSplit
+        );
+        assert_eq!(
+            DraftPlacementPlan::Device {
+                device: DevicePlan::new("mlx", "cpu:0").unwrap(),
+            }
+            .execution_topology(&target),
+            crate::SpeculativeExecutionTopology::CrossDeviceSplit
         );
     }
 }

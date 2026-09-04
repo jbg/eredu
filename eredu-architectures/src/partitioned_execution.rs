@@ -7124,7 +7124,7 @@ pub enum PartitionedDispatchError<E> {
     Visitor(E),
 }
 
-fn prepare_partitioned<B, S, A, R, Q, G, W>(
+pub(crate) fn prepare_partitioned<B, S, A, R, Q, G, W>(
     architecture: A,
     selected: SelectedPartitionedAdmission<R, Q>,
     partition: ArchitecturePartition<G, W>,
@@ -7748,6 +7748,44 @@ where
         G: 'static;
 }
 
+/// Family-blind backend visitor for an exact resident partitioned prediction target.
+pub trait PartitionedPredictionTargetVisitor<B, S, M>
+where
+    B: eredu_nn::BlockwiseAttentionBackend
+        + eredu_nn::DistributedNeuralBackend
+        + eredu_nn::GroupedNeuralBackend
+        + eredu_nn::HyperNeuralBackend,
+    S: eredu_runtime::RuntimeState<B>,
+    M: crate::prediction_extension::PredictionExtensionMaterializer<B>,
+{
+    /// Completed backend binding.
+    type Output;
+    /// Backend binding failure.
+    type Error;
+
+    /// Receives one exact resident target after architecture-owned extension pairing.
+    fn visit<A, G>(
+        self,
+        prepared: PreparedPartitionedArchitecture<
+            B,
+            A,
+            G,
+            <A as eredu_runtime::PartitionedLayeredArchitecture<B, S>>::Boundary,
+        >,
+        extension: <A as crate::prediction_extension::MaterializedPredictionTarget<B>>::Extension<
+            M,
+        >,
+        store: eredu_checkpoint::store::SharedCheckpointSource,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        A: TextPartitionArchitecture<B, S>
+            + eredu_runtime::ReplicatedTextArchitecture<B, S, Error = eredu_nn::Error>
+            + crate::prediction_extension::MaterializedPredictionTarget<B>
+            + 'static,
+        A::StaticModules: Clone,
+        G: 'static;
+}
+
 /// Failure while selecting, constructing, or binding one dense-decoder partition.
 #[derive(Debug, thiserror::Error)]
 pub enum DenseDecoderPartitionedDispatchError<E> {
@@ -7937,14 +7975,14 @@ where
             crate::capability::nemotron_h(&selected_args).map_err(|error| {
                 DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
             })?;
-        return prepare_nemotron_h_partition::<B, S, V>(
+        return prepare_nemotron_h_partition::<B, S, _>(
             selected_args.model_type.clone(),
             selected_args,
             source_args,
             selected,
             store,
             context,
-            visitor,
+            OrdinaryNemotronPartitionVisitor(visitor),
             capability_estimate,
         );
     }
@@ -8048,6 +8086,179 @@ where
     )
 }
 
+/// Constructs a resident Nemotron-H prediction target and pairs it before backend erasure.
+pub fn visit_resident_partitioned_prediction_target_architecture<B, S, M, V>(
+    inspection: &ArtifactInspection<ArtifactArchitecturePlan>,
+    selected: SelectedPartitionedAdmission<
+        eredu_runtime::SelectedReplicatedTextRealization,
+        eredu_runtime::ReplicatedTextRequirements,
+    >,
+    extension: crate::prediction_extension::MaterializedPredictionExtension<B, M>,
+    store: eredu_checkpoint::store::SharedCheckpointSource,
+    context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    visitor: V,
+) -> Result<V::Output, DenseDecoderPartitionedDispatchError<V::Error>>
+where
+    B: eredu_nn::TensorParallelGroupedNeuralBackend
+        + eredu_nn::DistributedNeuralBackend
+        + eredu_nn::BlockwiseAttentionBackend
+        + eredu_nn::HyperNeuralBackend,
+    S: eredu_runtime::LayerRuntimeState<B>,
+    S::LayerState: eredu_nn::AttentionCache<B::Tensor>
+        + eredu_nn::CompressedAttentionCache<B::Tensor>
+        + eredu_runtime::RuntimeStateComponents<B>,
+    M: crate::prediction_extension::PredictionExtensionMaterializer<B>,
+    V: PartitionedPredictionTargetVisitor<B, S, M>,
+{
+    let extension = <crate::nemotron_h::PartitionedLayeredModel<B> as crate::prediction_extension::MaterializedPredictionTarget<B>>::pair_prediction_extension(extension)
+        .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
+    let args = match (
+        inspection
+            .architecture_plan()
+            .safetensors_architecture()
+            .map(|plan| plan.model()),
+        inspection
+            .architecture_plan()
+            .gguf_plan()
+            .map(|plan| plan.model()),
+    ) {
+        (Some(crate::configuration::SafetensorsModelConfig::NemotronH(args)), None)
+        | (None, Some(crate::configuration::GgufModelConfig::NemotronH(args))) => args,
+        _ => {
+            return Err(DenseDecoderPartitionedDispatchError::Architecture(
+                "resident prediction target requires Nemotron-H".into(),
+            ));
+        }
+    };
+    let expected = crate::replicated_text::replicated_text_requirements(inspection)
+        .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
+    if &expected != selected.requirements().execution() {
+        return Err(DenseDecoderPartitionedDispatchError::Architecture(
+            "partitioned admission belongs to a different architecture or artifact".into(),
+        ));
+    }
+    crate::replicated_text::validate_store_handoff(&expected, store.as_ref())
+        .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
+    let selected_args = crate::replicated_text::selected_nemotron_h_args(args, selected.base())
+        .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
+    let source_args = selected
+        .base()
+        .parameters()
+        .iter()
+        .any(|parameter| {
+            matches!(
+                parameter.lowering(),
+                eredu_runtime::WeightLoweringKind::Transform
+                    | eredu_runtime::WeightLoweringKind::DerivedTransform
+            )
+        })
+        .then(|| args.clone());
+    let capability_estimate = crate::capability::nemotron_h(&selected_args)
+        .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
+    prepare_nemotron_h_partition::<B, S, _>(
+        selected_args.model_type.clone(),
+        selected_args,
+        source_args,
+        selected,
+        store,
+        context,
+        PredictionNemotronPartitionVisitor::<B, M, _> {
+            extension,
+            visitor,
+            marker: PhantomData,
+        },
+        capability_estimate,
+    )
+}
+
+trait NemotronPartitionVisitor<B, S>
+where
+    B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
+    S: eredu_runtime::LayerRuntimeState<B>,
+    S::LayerState: eredu_nn::AttentionCache<B::Tensor> + eredu_runtime::RuntimeStateComponents<B>,
+{
+    type Output;
+    type Error;
+
+    fn visit(
+        self,
+        prepared: PreparedPartitionedArchitecture<
+            B,
+            crate::nemotron_h::PartitionedLayeredModel<B>,
+            crate::nemotron_h::PartitionLocalGeometry,
+            crate::nemotron_h::TargetBoundarySchema,
+        >,
+        store: eredu_checkpoint::store::SharedCheckpointSource,
+    ) -> Result<Self::Output, Self::Error>;
+}
+
+struct OrdinaryNemotronPartitionVisitor<V>(V);
+
+impl<B, S, V> NemotronPartitionVisitor<B, S> for OrdinaryNemotronPartitionVisitor<V>
+where
+    B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
+    S: eredu_runtime::LayerRuntimeState<B>,
+    S::LayerState: eredu_nn::AttentionCache<B::Tensor> + eredu_runtime::RuntimeStateComponents<B>,
+    V: PartitionedArchitectureVisitor<B, S>,
+{
+    type Output = V::Output;
+    type Error = V::Error;
+
+    fn visit(
+        self,
+        prepared: PreparedPartitionedArchitecture<
+            B,
+            crate::nemotron_h::PartitionedLayeredModel<B>,
+            crate::nemotron_h::PartitionLocalGeometry,
+            crate::nemotron_h::TargetBoundarySchema,
+        >,
+        store: eredu_checkpoint::store::SharedCheckpointSource,
+    ) -> Result<Self::Output, Self::Error> {
+        self.0.visit(prepared, store)
+    }
+}
+
+struct PredictionNemotronPartitionVisitor<B, M, V>
+where
+    B: eredu_nn::BlockwiseAttentionBackend
+        + eredu_nn::DistributedNeuralBackend
+        + eredu_nn::TensorParallelGroupedNeuralBackend
+        + eredu_nn::HyperNeuralBackend,
+    M: crate::prediction_extension::PredictionExtensionMaterializer<B>,
+{
+    extension: <crate::nemotron_h::PartitionedLayeredModel<B> as crate::prediction_extension::MaterializedPredictionTarget<B>>::Extension<M>,
+    visitor: V,
+    marker: PhantomData<fn() -> (B, M)>,
+}
+
+impl<B, S, M, V> NemotronPartitionVisitor<B, S> for PredictionNemotronPartitionVisitor<B, M, V>
+where
+    B: eredu_nn::TensorParallelGroupedNeuralBackend
+        + eredu_nn::DistributedNeuralBackend
+        + eredu_nn::BlockwiseAttentionBackend
+        + eredu_nn::HyperNeuralBackend,
+    S: eredu_runtime::LayerRuntimeState<B>,
+    S::LayerState: eredu_nn::AttentionCache<B::Tensor> + eredu_runtime::RuntimeStateComponents<B>,
+    M: crate::prediction_extension::PredictionExtensionMaterializer<B>,
+    V: PartitionedPredictionTargetVisitor<B, S, M>,
+{
+    type Output = V::Output;
+    type Error = V::Error;
+
+    fn visit(
+        self,
+        prepared: PreparedPartitionedArchitecture<
+            B,
+            crate::nemotron_h::PartitionedLayeredModel<B>,
+            crate::nemotron_h::PartitionLocalGeometry,
+            crate::nemotron_h::TargetBoundarySchema,
+        >,
+        store: eredu_checkpoint::store::SharedCheckpointSource,
+    ) -> Result<Self::Output, Self::Error> {
+        self.visitor.visit(prepared, self.extension, store)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn prepare_nemotron_h_partition<B, S, V>(
     effective_model_type: String,
@@ -8070,7 +8281,7 @@ where
     S::LayerState: eredu_nn::AttentionCache<B::Tensor>
         + eredu_nn::CompressedAttentionCache<B::Tensor>
         + eredu_runtime::RuntimeStateComponents<B>,
-    V: PartitionedArchitectureVisitor<B, S>,
+    V: NemotronPartitionVisitor<B, S>,
 {
     if selected_args.has_sparse_moe_layers() || selected_args.num_nextn_predict_layers != 0 {
         return Err(DenseDecoderPartitionedDispatchError::Architecture(
@@ -8995,13 +9206,13 @@ where
             let capability = crate::capability::deepseek_v3(&selected_args).map_err(|error| {
                 DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
             })?;
-            prepare_deepseek_v3_routed_partition::<B, S, V>(
+            prepare_deepseek_v3_routed_partition::<B, S, _>(
                 selected_args.model_type.clone(),
                 selected_args,
                 selected,
                 store,
                 context,
-                visitor,
+                OrdinaryFamilyRoutedPartitionVisitor(visitor),
                 capability,
             )
         }
@@ -9055,13 +9266,141 @@ where
             .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
     let capability = crate::capability::deepseek_v4(&selected_args)
         .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
-    prepare_deepseek_v4_routed_partition::<B, S, V>(
+    prepare_deepseek_v4_routed_partition::<B, S, _>(
         selected_args.model_type.clone(),
         selected_args,
         selected,
         store,
         context,
-        visitor,
+        OrdinaryFamilyRoutedPartitionVisitor(visitor),
+        capability,
+    )
+}
+
+/// Constructs a DeepSeek-V4 routed prediction target and pairs it before backend erasure.
+pub fn visit_deepseek_v4_routed_partitioned_prediction_target_production<B, S, M, V>(
+    inspection: &ArtifactInspection<ArtifactArchitecturePlan>,
+    selected: SelectedPartitionedAdmission<SelectedRoutedTextRealization, RoutedTextRequirements>,
+    extension: crate::prediction_extension::MaterializedPredictionExtension<B, M>,
+    store: eredu_checkpoint::store::SharedCheckpointSource,
+    context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    visitor: V,
+) -> Result<V::Output, DenseDecoderPartitionedDispatchError<V::Error>>
+where
+    B: eredu_nn::TensorParallelGroupedNeuralBackend
+        + eredu_nn::DistributedNeuralBackend
+        + eredu_nn::BlockwiseAttentionBackend
+        + eredu_nn::HyperNeuralBackend,
+    S: eredu_runtime::LayerRuntimeState<B>,
+    S::LayerState: eredu_nn::PoolingAttentionCache<B::Tensor>,
+    M: crate::prediction_extension::PredictionExtensionMaterializer<B>,
+    V: RoutedPartitionedPredictionTargetProductionVisitor<B, S, M>,
+{
+    let extension = <crate::deepseek::v4::Model<B> as crate::prediction_extension::MaterializedPredictionTarget<B>>::pair_prediction_extension(extension)
+        .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
+    let expected = crate::routed_text::routed_text_requirements(inspection)
+        .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
+    if &expected != selected.requirements().execution() {
+        return Err(DenseDecoderPartitionedDispatchError::Architecture(
+            "DeepSeek-V4 routed admission belongs to a different artifact".into(),
+        ));
+    }
+    crate::replicated_text::validate_store_handoff(expected.text(), store.as_ref())
+        .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
+    let Some(crate::configuration::SafetensorsModelConfig::DeepSeekV4(args)) = inspection
+        .architecture_plan()
+        .safetensors_architecture()
+        .map(|plan| plan.model())
+    else {
+        return Err(DenseDecoderPartitionedDispatchError::Architecture(
+            "DeepSeek-V4 routed production requires indexed SafeTensors".into(),
+        ));
+    };
+    let selected_args =
+        crate::replicated_text::selected_deepseek_v4_args(args, selected.base().text())
+            .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
+    let capability = crate::capability::deepseek_v4(&selected_args)
+        .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
+    prepare_deepseek_v4_routed_partition::<B, S, _>(
+        selected_args.model_type.clone(),
+        selected_args,
+        selected,
+        store,
+        context,
+        PredictionFamilyRoutedPartitionVisitor::<B, crate::deepseek::v4::Model<B>, M, _> {
+            extension,
+            visitor,
+            marker: PhantomData,
+        },
+        capability,
+    )
+}
+
+/// Constructs a DeepSeek-V3 routed prediction target and pairs it before backend erasure.
+pub fn visit_routed_partitioned_prediction_target_production<B, S, M, V>(
+    inspection: &ArtifactInspection<ArtifactArchitecturePlan>,
+    selected: SelectedPartitionedAdmission<SelectedRoutedTextRealization, RoutedTextRequirements>,
+    extension: crate::prediction_extension::MaterializedPredictionExtension<B, M>,
+    store: eredu_checkpoint::store::SharedCheckpointSource,
+    context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    visitor: V,
+) -> Result<V::Output, DenseDecoderPartitionedDispatchError<V::Error>>
+where
+    B: eredu_nn::TensorParallelGroupedNeuralBackend
+        + eredu_nn::DistributedNeuralBackend
+        + eredu_nn::BlockwiseAttentionBackend
+        + eredu_nn::HyperNeuralBackend,
+    S: eredu_runtime::LayerRuntimeState<B>,
+    S::LayerState:
+        eredu_nn::CompressedAttentionCache<B::Tensor> + eredu_runtime::RuntimeStateComponents<B>,
+    M: crate::prediction_extension::PredictionExtensionMaterializer<B>,
+    V: RoutedPartitionedPredictionTargetProductionVisitor<B, S, M>,
+{
+    let extension = <crate::deepseek::v3::Model<B> as crate::prediction_extension::MaterializedPredictionTarget<B>>::pair_prediction_extension(extension)
+        .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
+    let expected = crate::routed_text::routed_text_requirements(inspection)
+        .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
+    if &expected != selected.requirements().execution() {
+        return Err(DenseDecoderPartitionedDispatchError::Architecture(
+            "DeepSeek-V3 routed admission belongs to a different artifact".into(),
+        ));
+    }
+    crate::replicated_text::validate_store_handoff(expected.text(), store.as_ref())
+        .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
+    let args = match (
+        inspection
+            .architecture_plan()
+            .safetensors_architecture()
+            .map(|plan| plan.model()),
+        inspection
+            .architecture_plan()
+            .gguf_plan()
+            .map(|plan| plan.model()),
+    ) {
+        (Some(crate::configuration::SafetensorsModelConfig::DeepSeekV3(args)), None)
+        | (None, Some(crate::configuration::GgufModelConfig::DeepSeekV3(args))) => args,
+        _ => {
+            return Err(DenseDecoderPartitionedDispatchError::Architecture(
+                "routed prediction target requires DeepSeek-V3".into(),
+            ));
+        }
+    };
+    let selected_args =
+        crate::replicated_text::selected_deepseek_v3_args(args, selected.base().text())
+            .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
+    let capability = crate::capability::deepseek_v3(&selected_args)
+        .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
+    prepare_deepseek_v3_routed_partition::<B, S, _>(
+        selected_args.model_type.clone(),
+        selected_args,
+        selected,
+        store,
+        context,
+        PredictionFamilyRoutedPartitionVisitor::<B, crate::deepseek::v3::Model<B>, M, _> {
+            extension,
+            visitor,
+            marker: PhantomData,
+        },
         capability,
     )
 }
@@ -9345,7 +9684,7 @@ where
         eredu_runtime::NoAuxiliaryBoundarySchema::new(selected_args.hidden_size),
     )
     .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
-    prepare_family_routed_partition::<B, S, _, _, _, V>(
+    prepare_family_routed_partition::<B, S, _, _, _, _>(
         crate::lfm2::PartitionedLayeredModel::<B>::from_partition(
             selected_args,
             &parameters,
@@ -9359,7 +9698,7 @@ where
         layout,
         plan,
         store,
-        visitor,
+        OrdinaryFamilyRoutedPartitionVisitor(visitor),
         capability_estimate,
         effective_model_type,
     )
@@ -9441,7 +9780,7 @@ where
         eredu_runtime::NoAuxiliaryBoundarySchema::new(selected_args.hidden_size),
     )
     .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
-    prepare_family_routed_partition::<B, S, _, _, _, V>(
+    prepare_family_routed_partition::<B, S, _, _, _, _>(
         crate::kimi_linear::PartitionedLayeredModel::<B>::from_partition(
             selected_args,
             &parameters,
@@ -9455,7 +9794,7 @@ where
         layout,
         plan,
         store,
-        visitor,
+        OrdinaryFamilyRoutedPartitionVisitor(visitor),
         capability_estimate,
         effective_model_type,
     )
@@ -9534,7 +9873,7 @@ where
         crate::nemotron_h::TargetBoundarySchema::from_args(&selected_args),
     )
     .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
-    prepare_family_routed_partition::<B, S, _, _, _, V>(
+    prepare_family_routed_partition::<B, S, _, _, _, _>(
         crate::nemotron_h::PartitionedLayeredModel::<B>::from_partition(
             selected_args,
             &parameters,
@@ -9548,7 +9887,7 @@ where
         layout,
         plan,
         store,
-        visitor,
+        OrdinaryFamilyRoutedPartitionVisitor(visitor),
         capability_estimate,
         effective_model_type,
     )
@@ -9571,7 +9910,12 @@ where
     S: eredu_runtime::LayerRuntimeState<B>,
     S::LayerState:
         eredu_nn::CompressedAttentionCache<B::Tensor> + eredu_runtime::RuntimeStateComponents<B>,
-    V: RoutedPartitionedProductionVisitor<B, S>,
+    V: FamilyRoutedPartitionVisitor<
+        B,
+        S,
+        crate::deepseek::v3::Model<B>,
+        eredu_nn::GroupedGatedProductSpec,
+    >,
 {
     if selected.base().plan().gated().is_none() {
         return Err(DenseDecoderPartitionedDispatchError::Architecture(
@@ -9631,7 +9975,7 @@ where
         )?;
     architecture.set_partition_target_start(owned.units().start);
     architecture.install_expert_realization(plan.clone());
-    prepare_family_routed_partition::<B, S, _, _, _, V>(
+    prepare_family_routed_partition::<B, S, _, _, _, _>(
         architecture,
         selected,
         partition,
@@ -9661,7 +10005,12 @@ where
         + eredu_nn::HyperNeuralBackend,
     S: eredu_runtime::LayerRuntimeState<B>,
     S::LayerState: eredu_nn::PoolingAttentionCache<B::Tensor>,
-    V: RoutedPartitionedProductionVisitor<B, S>,
+    V: FamilyRoutedPartitionVisitor<
+        B,
+        S,
+        crate::deepseek::v4::Model<B>,
+        eredu_nn::GroupedGatedProductSpec,
+    >,
 {
     if selected.base().plan().gated().is_none() {
         return Err(DenseDecoderPartitionedDispatchError::Architecture(
@@ -9723,7 +10072,7 @@ where
         )?;
     architecture.set_partition_target_start(owned.units().start);
     architecture.install_expert_realization(plan.clone());
-    prepare_family_routed_partition::<B, S, _, _, _, V>(
+    prepare_family_routed_partition::<B, S, _, _, _, _>(
         architecture,
         selected,
         partition,
@@ -9760,7 +10109,7 @@ where
     A::StaticModules: Clone,
     G: 'static,
     E: RoutedCollectiveSpec + crate::routed_text::RoutedGroupedSpec,
-    V: RoutedPartitionedProductionVisitor<B, S, E>,
+    V: FamilyRoutedPartitionVisitor<B, S, A, E>,
 {
     validate_partitioned_binding(selected.requirements(), &partition)
         .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
@@ -10130,6 +10479,73 @@ where
         .map_err(PartitionedDispatchError::Architecture)?;
     visitor
         .visit(prepared)
+        .map_err(PartitionedDispatchError::Visitor)
+}
+
+/// Family-blind backend visitor for an exact direct partitioned prediction target.
+pub trait DirectPartitionedPredictionTargetVisitor<B, S, M, G, W>
+where
+    B: eredu_nn::BlockwiseAttentionBackend
+        + eredu_nn::DistributedNeuralBackend
+        + eredu_nn::GroupedNeuralBackend
+        + eredu_nn::HyperNeuralBackend,
+    S: eredu_runtime::RuntimeState<B>,
+    M: crate::prediction_extension::PredictionExtensionMaterializer<B>,
+{
+    /// Completed neutral construction output.
+    type Output;
+    /// Mechanism binding failure.
+    type Error;
+
+    /// Receives a direct partition only after exact extension pairing.
+    fn visit<A>(
+        self,
+        prepared: PreparedPartitionedAdmission<
+            A,
+            eredu_runtime::SelectedReplicatedTextRealization,
+            eredu_runtime::ReplicatedTextRequirements,
+            G,
+            W,
+        >,
+        extension: <A as crate::prediction_extension::MaterializedPredictionTarget<B>>::Extension<
+            M,
+        >,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        A: eredu_runtime::PartitionedLayeredArchitecture<B, S, Boundary = W>
+            + crate::prediction_extension::MaterializedPredictionTarget<B>,
+        A::Error: std::fmt::Display;
+}
+
+/// Pairs and dispatches one direct partitioned prediction target.
+pub fn visit_direct_partitioned_prediction_target_architecture<B, S, M, A, G, W, V>(
+    architecture: A,
+    extension: crate::prediction_extension::MaterializedPredictionExtension<B, M>,
+    selected: SelectedPartitionedAdmission<
+        eredu_runtime::SelectedReplicatedTextRealization,
+        eredu_runtime::ReplicatedTextRequirements,
+    >,
+    partition: ArchitecturePartition<G, W>,
+    visitor: V,
+) -> Result<V::Output, PartitionedDispatchError<V::Error>>
+where
+    B: eredu_nn::BlockwiseAttentionBackend
+        + eredu_nn::DistributedNeuralBackend
+        + eredu_nn::GroupedNeuralBackend
+        + eredu_nn::HyperNeuralBackend,
+    S: eredu_runtime::RuntimeState<B>,
+    M: crate::prediction_extension::PredictionExtensionMaterializer<B>,
+    A: eredu_runtime::PartitionedLayeredArchitecture<B, S, Boundary = W>
+        + crate::prediction_extension::MaterializedPredictionTarget<B>,
+    A::Error: std::fmt::Display,
+    V: DirectPartitionedPredictionTargetVisitor<B, S, M, G, W>,
+{
+    let prepared = prepare_partitioned::<B, S, _, _, _, _, _>(architecture, selected, partition)
+        .map_err(PartitionedDispatchError::Architecture)?;
+    let extension = A::pair_prediction_extension(extension)
+        .map_err(|error| PartitionedDispatchError::Architecture(error.to_string()))?;
+    visitor
+        .visit(prepared, extension)
         .map_err(PartitionedDispatchError::Visitor)
 }
 
@@ -10687,6 +11103,150 @@ where
         G: 'static;
 }
 
+/// Family-blind backend visitor for an exact routed partitioned prediction target.
+pub trait RoutedPartitionedPredictionTargetProductionVisitor<
+    B,
+    S,
+    M,
+    E = eredu_nn::GroupedGatedProductSpec,
+> where
+    B: eredu_nn::TensorParallelGroupedNeuralBackend
+        + eredu_nn::DistributedNeuralBackend
+        + eredu_nn::BlockwiseAttentionBackend
+        + eredu_nn::HyperNeuralBackend,
+    S: eredu_runtime::RuntimeState<B>,
+    M: crate::prediction_extension::PredictionExtensionMaterializer<B>,
+{
+    /// Completed backend binding.
+    type Output;
+    /// Backend binding failure.
+    type Error;
+
+    /// Receives one routed target after architecture-owned extension pairing.
+    fn visit<A, G>(
+        self,
+        prepared: PreparedRoutedPartitionedArchitecture<
+            B,
+            A,
+            G,
+            <A as eredu_runtime::PartitionedLayeredArchitecture<B, S>>::Boundary,
+            E,
+        >,
+        extension: <A as crate::prediction_extension::MaterializedPredictionTarget<B>>::Extension<
+            M,
+        >,
+        store: eredu_checkpoint::store::SharedCheckpointSource,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        A: TextPartitionArchitecture<B, S>
+            + eredu_runtime::ReplicatedTextArchitecture<B, S, Error = eredu_nn::Error>
+            + eredu_runtime::ParallelRoutedLayeredArchitecture<B, S>
+            + crate::prediction_extension::MaterializedPredictionTarget<B>
+            + 'static,
+        A::StaticModules: Clone,
+        G: 'static;
+}
+
+trait FamilyRoutedPartitionVisitor<B, S, A, E>
+where
+    B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
+    S: eredu_runtime::RuntimeState<B>,
+    A: TextPartitionArchitecture<B, S>
+        + eredu_runtime::ReplicatedTextArchitecture<B, S, Error = eredu_nn::Error>
+        + eredu_runtime::ParallelRoutedLayeredArchitecture<B, S>
+        + 'static,
+    A::StaticModules: Clone,
+    E: RoutedCollectiveSpec + crate::routed_text::RoutedGroupedSpec,
+{
+    type Output;
+    type Error;
+
+    fn visit<G>(
+        self,
+        prepared: PreparedRoutedPartitionedArchitecture<B, A, G, A::Boundary, E>,
+        store: eredu_checkpoint::store::SharedCheckpointSource,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        G: 'static;
+}
+
+struct OrdinaryFamilyRoutedPartitionVisitor<V>(V);
+
+impl<B, S, A, E, V> FamilyRoutedPartitionVisitor<B, S, A, E>
+    for OrdinaryFamilyRoutedPartitionVisitor<V>
+where
+    B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
+    S: eredu_runtime::RuntimeState<B>,
+    A: TextPartitionArchitecture<B, S>
+        + eredu_runtime::ReplicatedTextArchitecture<B, S, Error = eredu_nn::Error>
+        + eredu_runtime::ParallelRoutedLayeredArchitecture<B, S>
+        + 'static,
+    A::StaticModules: Clone,
+    E: RoutedCollectiveSpec + crate::routed_text::RoutedGroupedSpec,
+    V: RoutedPartitionedProductionVisitor<B, S, E>,
+{
+    type Output = V::Output;
+    type Error = V::Error;
+
+    fn visit<G>(
+        self,
+        prepared: PreparedRoutedPartitionedArchitecture<B, A, G, A::Boundary, E>,
+        store: eredu_checkpoint::store::SharedCheckpointSource,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        G: 'static,
+    {
+        self.0.visit(prepared, store)
+    }
+}
+
+struct PredictionFamilyRoutedPartitionVisitor<B, A, M, V>
+where
+    B: eredu_nn::BlockwiseAttentionBackend
+        + eredu_nn::DistributedNeuralBackend
+        + eredu_nn::GroupedNeuralBackend
+        + eredu_nn::HyperNeuralBackend,
+    A: crate::prediction_extension::MaterializedPredictionTarget<B>,
+    M: crate::prediction_extension::PredictionExtensionMaterializer<B>,
+{
+    extension: A::Extension<M>,
+    visitor: V,
+    marker: PhantomData<fn() -> B>,
+}
+
+impl<B, S, A, E, M, V> FamilyRoutedPartitionVisitor<B, S, A, E>
+    for PredictionFamilyRoutedPartitionVisitor<B, A, M, V>
+where
+    B: eredu_nn::TensorParallelGroupedNeuralBackend
+        + eredu_nn::DistributedNeuralBackend
+        + eredu_nn::BlockwiseAttentionBackend
+        + eredu_nn::HyperNeuralBackend,
+    S: eredu_runtime::RuntimeState<B>,
+    A: TextPartitionArchitecture<B, S>
+        + eredu_runtime::ReplicatedTextArchitecture<B, S, Error = eredu_nn::Error>
+        + eredu_runtime::ParallelRoutedLayeredArchitecture<B, S>
+        + crate::prediction_extension::MaterializedPredictionTarget<B>
+        + 'static,
+    A::StaticModules: Clone,
+    E: RoutedCollectiveSpec + crate::routed_text::RoutedGroupedSpec,
+    M: crate::prediction_extension::PredictionExtensionMaterializer<B>,
+    V: RoutedPartitionedPredictionTargetProductionVisitor<B, S, M, E>,
+{
+    type Output = V::Output;
+    type Error = V::Error;
+
+    fn visit<G>(
+        self,
+        prepared: PreparedRoutedPartitionedArchitecture<B, A, G, A::Boundary, E>,
+        store: eredu_checkpoint::store::SharedCheckpointSource,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        G: 'static,
+    {
+        self.visitor.visit(prepared, self.extension, store)
+    }
+}
+
 /// Pairs and dispatches one routed architecture without re-selecting its realization.
 pub fn visit_routed_partitioned_architecture<B, S, A, G, W, V>(
     architecture: A,
@@ -10706,6 +11266,72 @@ where
         .map_err(PartitionedDispatchError::Architecture)?;
     visitor
         .visit(prepared)
+        .map_err(PartitionedDispatchError::Visitor)
+}
+
+/// Family-blind backend visitor for an exact routed partitioned prediction target.
+pub trait RoutedPartitionedPredictionTargetVisitor<B, S, M, G, W>
+where
+    B: eredu_nn::BlockwiseAttentionBackend
+        + eredu_nn::DistributedNeuralBackend
+        + eredu_nn::GroupedNeuralBackend
+        + eredu_nn::HyperNeuralBackend,
+    S: eredu_runtime::RuntimeState<B>,
+    M: crate::prediction_extension::PredictionExtensionMaterializer<B>,
+{
+    /// Completed neutral construction output.
+    type Output;
+    /// Mechanism binding failure.
+    type Error;
+
+    /// Receives a routed partition only after exact extension pairing.
+    fn visit<A>(
+        self,
+        prepared: PreparedPartitionedAdmission<
+            A,
+            SelectedRoutedTextRealization,
+            RoutedTextRequirements,
+            G,
+            W,
+        >,
+        extension: <A as crate::prediction_extension::MaterializedPredictionTarget<B>>::Extension<
+            M,
+        >,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        A: eredu_runtime::PartitionedLayeredArchitecture<B, S, Boundary = W>
+            + eredu_runtime::ParallelRoutedLayeredArchitecture<B, S>
+            + crate::prediction_extension::MaterializedPredictionTarget<B>,
+        A::Error: std::fmt::Display;
+}
+
+/// Pairs and dispatches one routed partitioned prediction target.
+pub fn visit_routed_partitioned_prediction_target_architecture<B, S, M, A, G, W, V>(
+    architecture: A,
+    extension: crate::prediction_extension::MaterializedPredictionExtension<B, M>,
+    selected: SelectedPartitionedAdmission<SelectedRoutedTextRealization, RoutedTextRequirements>,
+    partition: ArchitecturePartition<G, W>,
+    visitor: V,
+) -> Result<V::Output, PartitionedDispatchError<V::Error>>
+where
+    B: eredu_nn::BlockwiseAttentionBackend
+        + eredu_nn::DistributedNeuralBackend
+        + eredu_nn::GroupedNeuralBackend
+        + eredu_nn::HyperNeuralBackend,
+    S: eredu_runtime::RuntimeState<B>,
+    M: crate::prediction_extension::PredictionExtensionMaterializer<B>,
+    A: eredu_runtime::PartitionedLayeredArchitecture<B, S, Boundary = W>
+        + eredu_runtime::ParallelRoutedLayeredArchitecture<B, S>
+        + crate::prediction_extension::MaterializedPredictionTarget<B>,
+    A::Error: std::fmt::Display,
+    V: RoutedPartitionedPredictionTargetVisitor<B, S, M, G, W>,
+{
+    let prepared = prepare_partitioned::<B, S, _, _, _, _, _>(architecture, selected, partition)
+        .map_err(PartitionedDispatchError::Architecture)?;
+    let extension = A::pair_prediction_extension(extension)
+        .map_err(|error| PartitionedDispatchError::Architecture(error.to_string()))?;
+    visitor
+        .visit(prepared, extension)
         .map_err(PartitionedDispatchError::Visitor)
 }
 
@@ -10765,6 +11391,81 @@ where
         .map_err(PartitionedDispatchError::Architecture)?;
     visitor
         .visit(prepared)
+        .map_err(PartitionedDispatchError::Visitor)
+}
+
+/// Family-blind backend visitor for an exact composite partitioned prediction target.
+pub trait CompositePartitionedPredictionTargetVisitor<B, S, M, G, W>
+where
+    B: eredu_nn::BlockwiseAttentionBackend
+        + eredu_nn::DistributedNeuralBackend
+        + eredu_nn::GroupedNeuralBackend
+        + eredu_nn::HyperNeuralBackend,
+    S: eredu_runtime::RuntimeState<B>,
+    M: crate::prediction_extension::PredictionExtensionMaterializer<B>,
+    W: eredu_runtime::ArchitectureBoundary,
+{
+    /// Completed neutral construction output.
+    type Output;
+    /// Mechanism binding failure.
+    type Error;
+
+    /// Receives a composite partition only after exact extension pairing.
+    fn visit<A>(
+        self,
+        prepared: PreparedPartitionedAdmission<
+            A,
+            SelectedCompositeTextRealization,
+            CompositeTextRequirements,
+            G,
+            W,
+        >,
+        extension: <A as crate::prediction_extension::MaterializedPredictionTarget<B>>::Extension<
+            M,
+        >,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        A: crate::composite_execution::CompositeArchitecture<B, S, Error = eredu_nn::Error>
+            + eredu_runtime::PartitionedLayeredArchitecture<B, S, Boundary = W>
+            + eredu_runtime::ParallelRoutedLayeredArchitecture<B, S>
+            + crate::prediction_extension::MaterializedPredictionTarget<B>
+            + 'static,
+        A::Error: std::fmt::Display;
+}
+
+/// Pairs and dispatches one composite partitioned prediction target.
+pub fn visit_composite_partitioned_prediction_target_architecture<B, S, M, A, G, W, V>(
+    architecture: A,
+    extension: crate::prediction_extension::MaterializedPredictionExtension<B, M>,
+    selected: SelectedPartitionedAdmission<
+        SelectedCompositeTextRealization,
+        CompositeTextRequirements,
+    >,
+    partition: ArchitecturePartition<G, W>,
+    visitor: V,
+) -> Result<V::Output, PartitionedDispatchError<V::Error>>
+where
+    B: eredu_nn::BlockwiseAttentionBackend
+        + eredu_nn::DistributedNeuralBackend
+        + eredu_nn::GroupedNeuralBackend
+        + eredu_nn::HyperNeuralBackend,
+    S: eredu_runtime::RuntimeState<B>,
+    M: crate::prediction_extension::PredictionExtensionMaterializer<B>,
+    A: crate::composite_execution::CompositeArchitecture<B, S, Error = eredu_nn::Error>
+        + eredu_runtime::PartitionedLayeredArchitecture<B, S, Boundary = W>
+        + eredu_runtime::ParallelRoutedLayeredArchitecture<B, S>
+        + crate::prediction_extension::MaterializedPredictionTarget<B>
+        + 'static,
+    A::Error: std::fmt::Display,
+    W: eredu_runtime::ArchitectureBoundary,
+    V: CompositePartitionedPredictionTargetVisitor<B, S, M, G, W>,
+{
+    let prepared = prepare_partitioned::<B, S, _, _, _, _, _>(architecture, selected, partition)
+        .map_err(PartitionedDispatchError::Architecture)?;
+    let extension = A::pair_prediction_extension(extension)
+        .map_err(|error| PartitionedDispatchError::Architecture(error.to_string()))?;
+    visitor
+        .visit(prepared, extension)
         .map_err(PartitionedDispatchError::Visitor)
 }
 

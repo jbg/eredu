@@ -28,8 +28,13 @@ pub use configuration::{GgufArchitecture, ModelKind};
 /// Architecture-owned external assistant inspection and preparation.
 pub mod external_assistant;
 pub use external_assistant::{
-    prepare_external_assistant, ExternalAssistantCheckpoint, ExternalAssistantPreparationPlan,
-    Gemma4AssistantPreparationPlan, MuseGlimmerAssistantPreparationPlan,
+    prepare_external_assistant, CompatibleExternalAssistantPreparation,
+    ExternalAssistantArchitecture, ExternalAssistantCheckpoint,
+    ExternalAssistantExecutionMechanisms, ExternalAssistantExecutorVisitor,
+    ExternalAssistantPreparation, ExternalAssistantPreparationVisitor,
+    ExternalAssistantTargetProfile, ExternalAssistantTensorPlacement, ExternalAssistantTransfer,
+    ExternalSpeculativeContract, ExternalSpeculativeContractRequest, MaterializedExternalAssistant,
+    MaterializedExternalAssistantVisitor, PreparedExternalAssistant,
 };
 /// Backend-neutral schedules and recipes for independent expert residency.
 pub mod expert_residency;
@@ -60,6 +65,8 @@ pub mod replicated_text;
 pub mod rotary;
 /// Architecture-owned routed execution over generic backend mechanisms.
 pub mod routed_text;
+/// Backend-generic speculative execution over architecture-owned strategies.
+pub mod speculative_execution;
 mod static_parameters;
 mod transport;
 pub use expert_residency::{

@@ -35,7 +35,6 @@ use eredu_runtime::CacheResidencyPolicy;
 
 use super::{
     execution::{decode_model, prefill_model},
-    speculative::{MlxDrafter, MlxDrafterKind},
     Executable, MlxBackend, MlxCompletion, MlxDistributedSession, MlxModel,
 };
 
@@ -532,6 +531,30 @@ impl MlxModelSession {
         }
     }
 
+    /// Installs causal observers on this session's selected embedded-prediction executor.
+    pub fn install_embedded_prediction_observers<TensorObserver, LogitsObserver>(
+        &mut self,
+        tensors: TensorObserver,
+        logits: LogitsObserver,
+    ) -> Result<(), Error>
+    where
+        TensorObserver: RuntimeActivationObserver<MlxTensor, Exception> + 'static,
+        LogitsObserver: RuntimeActivationObserver<Array, Exception> + 'static,
+    {
+        let observers =
+            eredu_architectures::speculative_execution::EmbeddedPredictionObservers::new(
+                tensors, logits,
+            );
+        let MlxSessionKind::Complete(model) = &mut self.inner;
+        if model.install_embedded_prediction_observers(observers) {
+            Ok(())
+        } else {
+            Err(Error::ArchitectureModel(
+                "session has no selected embedded-prediction executor".into(),
+            ))
+        }
+    }
+
     /// Returns bounded parameter-residency telemetry when available.
     pub fn residency_report(&self) -> Result<Option<eredu_runtime::ResidencyReport>, Error> {
         match &self.inner {
@@ -571,53 +594,24 @@ impl MlxModelSession {
         }
     }
 
-    pub(super) fn validate_external_drafter(&self, drafter: &MlxDrafter) -> Result<(), Error> {
+    pub(super) fn external_assistant_target_profile(
+        &self,
+    ) -> Result<eredu_architectures::external_assistant::ExternalAssistantTargetProfile, Error>
+    {
         match &self.inner {
-            MlxSessionKind::Complete(model) => match model {
-                Executable::Gemma4(_, target, _)
-                    if drafter.kind() == MlxDrafterKind::Gemma4Assistant =>
-                {
-                    let _compatibility = drafter
-                        .gemma4()
-                        .config
-                        .prove_compatibility(&target.args().text)
-                        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-                }
-                Executable::MuseGlimmer(_, target, _)
-                    if drafter.kind() == MlxDrafterKind::MuseGlimmerDFlash =>
-                {
-                    let _compatibility = drafter
-                        .muse_glimmer()
-                        .config
-                        .prove_compatibility(target.args())
-                        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-                }
-                Executable::ReplicatedText(_, target)
-                    if target
-                        .external_prediction_capture_request(drafter)?
-                        .is_some() => {}
-                model @ (Executable::DeepSeek(_, _, _)
-                | Executable::Gemma4(_, _, _)
-                | Executable::GptOss(_, _, _)
-                | Executable::Inkling(_, _, _)
-                | Executable::KimiLinear(_, _, _)
-                | Executable::Lfm2(_, _, _)
-                | Executable::ReplicatedText(_, _)
-                | Executable::MuseGlimmer(_, _, _)
-                | Executable::NemotronH(_, _, _)
-                | Executable::Qwen(_, _, _)
-                | Executable::Qwen3Next(_, _, _)
-                | Executable::Qwen35(_, _, _)) => {
-                    return Err(Error::ArchitectureModel(format!(
-                        "drafter {:?} is incompatible with target {} ({:?})",
-                        drafter.kind(),
-                        model.effective_model_type(),
-                        model.speculative_capability()
-                    )))
-                }
-            },
+            MlxSessionKind::Complete(Executable::ReplicatedText(_, target)) => target
+                .external_prediction()
+                .map(|target| target.external_assistant_target_profile())
+                .ok_or_else(|| {
+                    Error::ArchitectureModel(
+                        "selected target does not publish an external-assistant profile".into(),
+                    )
+                }),
+            MlxSessionKind::Complete(model) => Err(Error::ArchitectureModel(format!(
+                "external assistants are unavailable for target {}",
+                model.effective_model_type()
+            ))),
         }
-        Ok(())
     }
 
     pub(super) fn capability_estimate(

@@ -35,7 +35,7 @@ use crate::{
 
 struct Lfm2Replicated;
 struct KimiLinearReplicated;
-struct NemotronHReplicated;
+pub(crate) struct NemotronHReplicated;
 struct QwenHybridReplicated;
 
 #[derive(Debug)]
@@ -580,6 +580,66 @@ pub enum ReplicatedTextDispatchError<E> {
     /// The backend visitor rejected the checked architecture.
     #[error("replicated text backend binding failed: {0}")]
     Backend(E),
+}
+
+/// Family-blind backend visitor for an exact replicated prediction target.
+pub trait ReplicatedPredictionTargetVisitor<B, S, M>: Sized
+where
+    B: eredu_nn::BlockwiseAttentionBackend
+        + eredu_nn::DistributedNeuralBackend
+        + eredu_nn::TensorParallelGroupedNeuralBackend
+        + eredu_nn::HyperNeuralBackend,
+    S: RuntimeState<B>,
+    M: crate::prediction_extension::PredictionExtensionMaterializer<B>,
+{
+    /// Completed backend adapter.
+    type Output;
+    /// Backend binding failure.
+    type Error;
+
+    /// Receives an exact target only after its materialized extension was paired.
+    fn visit<A>(
+        self,
+        prepared: PreparedReplicatedTextArchitecture<A>,
+        extension: <A as crate::prediction_extension::MaterializedPredictionTarget<B>>::Extension<
+            M,
+        >,
+        store: eredu_checkpoint::store::SharedCheckpointSource,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        A: ReplicatedTextArchitecture<B, S, Error = eredu_nn::Error>
+            + crate::prediction_extension::MaterializedPredictionTarget<B>
+            + 'static,
+        A::StaticModules: Clone,
+        A::Error: std::fmt::Display;
+}
+
+/// Pairs one materialized extension with its exact replicated target before backend erasure.
+pub fn visit_replicated_prediction_target_architecture<B, S, M, A, V>(
+    prepared: PreparedReplicatedTextArchitecture<A>,
+    extension: crate::prediction_extension::MaterializedPredictionExtension<B, M>,
+    store: eredu_checkpoint::store::SharedCheckpointSource,
+    visitor: V,
+) -> Result<V::Output, ReplicatedTextDispatchError<V::Error>>
+where
+    B: eredu_nn::BlockwiseAttentionBackend
+        + eredu_nn::DistributedNeuralBackend
+        + eredu_nn::TensorParallelGroupedNeuralBackend
+        + eredu_nn::HyperNeuralBackend,
+    S: RuntimeState<B>,
+    M: crate::prediction_extension::PredictionExtensionMaterializer<B>,
+    A: ReplicatedTextArchitecture<B, S, Error = eredu_nn::Error>
+        + crate::prediction_extension::MaterializedPredictionTarget<B>
+        + 'static,
+    A::StaticModules: Clone,
+    A::Error: std::fmt::Display,
+    V: ReplicatedPredictionTargetVisitor<B, S, M>,
+{
+    let extension = A::pair_prediction_extension(extension)
+        .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+    visitor
+        .visit(prepared, extension, store)
+        .map_err(ReplicatedTextDispatchError::Backend)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1768,6 +1828,100 @@ where
             "selected state profile {profile:?} does not match the dispatched architecture"
         ))),
     }
+}
+
+/// Supplies prediction-aware visitors while architecture dispatch selects a replicated state profile.
+pub trait ReplicatedPredictionProfileDispatcher<B, M>: Sized
+where
+    B: eredu_nn::BlockwiseAttentionBackend
+        + eredu_nn::DistributedNeuralBackend
+        + eredu_nn::TensorParallelGroupedNeuralBackend
+        + eredu_nn::HyperNeuralBackend,
+    M: crate::prediction_extension::PredictionExtensionMaterializer<B>,
+{
+    /// Completed construction output.
+    type Output;
+    /// Mechanism binding failure.
+    type Error;
+    /// State representation selected for the target.
+    type State: LayerRuntimeState<B>;
+    /// Exact prediction-aware visitor for that representation.
+    type Visitor: ReplicatedPredictionTargetVisitor<
+        B,
+        Self::State,
+        M,
+        Output = Self::Output,
+        Error = Self::Error,
+    >;
+
+    /// Consumes the adapter into its exact typed visitor.
+    fn into_visitor(self) -> Self::Visitor;
+}
+
+/// Constructs the replicated Nemotron-H target and pairs its extension before backend erasure.
+pub fn dispatch_replicated_prediction_target_architecture<B, M, D>(
+    plan: &ArtifactArchitecturePlan,
+    selected: SelectedReplicatedTextRealization,
+    extension: crate::prediction_extension::MaterializedPredictionExtension<B, M>,
+    store: eredu_checkpoint::store::SharedCheckpointSource,
+    context: &<B::Tensor as Tensor>::Context,
+    dispatcher: D,
+) -> Result<D::Output, ReplicatedTextDispatchError<D::Error>>
+where
+    B: eredu_nn::BlockwiseAttentionBackend
+        + eredu_nn::DistributedNeuralBackend
+        + eredu_nn::TensorParallelGroupedNeuralBackend
+        + eredu_nn::HyperNeuralBackend,
+    M: crate::prediction_extension::PredictionExtensionMaterializer<B>,
+    D: ReplicatedPredictionProfileDispatcher<B, M>,
+    <D::State as LayerRuntimeState<B>>::LayerState:
+        AttentionCache<B::Tensor> + eredu_runtime::RuntimeStateComponents<B>,
+{
+    let requirements = selected.requirements().clone();
+    let eligible = eligible_config(plan)?;
+    let EligibleConfig::NemotronH(args) = eligible else {
+        return Err(ReplicatedTextIneligibility::Unrelated.into());
+    };
+    validate_plan_identity(&requirements, &EligibleConfig::NemotronH(args))
+        .map_err(ReplicatedTextDispatchError::Architecture)?;
+    validate_store_handoff(&requirements, store.as_ref())
+        .map_err(ReplicatedTextDispatchError::Architecture)?;
+    let capability_estimate = crate::capability::nemotron_h(args)
+        .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+    let effective_model_type = args.model_type.clone();
+    let source_architecture = selected_uses_transform(&selected)
+        .then(|| {
+            <MixedState as FixedProfile<B, D::State, NemotronHReplicated>>::new(
+                args.clone(),
+                context,
+            )
+        })
+        .transpose()
+        .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+    let args = selected_nemotron_h_args(args, &selected)
+        .map_err(ReplicatedTextDispatchError::Architecture)?;
+    let prompt_cache_architecture_identity =
+        crate::nemotron_h::prompt_cache_architecture_fingerprint(&args);
+    let architecture =
+        <MixedState as FixedProfile<B, D::State, NemotronHReplicated>>::new(args, context)
+            .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+    let prepared = prepare_architecture_handoff::<B, D::State, _>(
+        architecture,
+        source_architecture,
+        requirements,
+        selected,
+        capability_estimate,
+        effective_model_type,
+        prompt_cache_architecture_identity,
+        context,
+    )
+    .map_err(ReplicatedTextDispatchError::Architecture)?;
+    visit_replicated_prediction_target_architecture(
+        prepared,
+        extension,
+        store,
+        dispatcher.into_visitor(),
+    )
 }
 
 enum EligibleConfig<'a> {
@@ -4893,6 +5047,142 @@ where
         A::Error: std::fmt::Display;
 }
 
+/// Family-blind backend visitor for an exact composite prediction target.
+pub trait CompositePredictionTargetVisitor<B, S, M>: Sized
+where
+    B: eredu_nn::BlockwiseAttentionBackend
+        + eredu_nn::DistributedNeuralBackend
+        + eredu_nn::TensorParallelGroupedNeuralBackend
+        + eredu_nn::HyperNeuralBackend
+        + Clone,
+    S: LayerRuntimeState<B>,
+    M: crate::prediction_extension::PredictionExtensionMaterializer<B>,
+{
+    /// Completed backend adapter.
+    type Output;
+    /// Backend binding failure.
+    type Error;
+
+    /// Records that validated dispatch is about to construct architecture modules.
+    fn construction_started(&mut self) {}
+
+    /// Receives a direct composite target after exact extension pairing.
+    fn visit<A>(
+        self,
+        prepared: PreparedCompositeTextArchitecture<
+            A,
+            <A as crate::composite_execution::CompositeArchitecture<B, S>>::AdmissionConfig,
+        >,
+        extension: <crate::composite_execution::PreparedCompositeArchitecture<A> as crate::prediction_extension::MaterializedPredictionTarget<B>>::Extension<M>,
+        store: eredu_checkpoint::store::SharedCheckpointSource,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        A: crate::composite_execution::CompositeArchitecture<B, S, Error = eredu_nn::Error>
+            + eredu_runtime::RoutedLayeredArchitecture<B, S>
+            + 'static,
+        crate::composite_execution::PreparedCompositeArchitecture<A>:
+            crate::prediction_extension::MaterializedPredictionTarget<B>,
+        A::InputPartPlan: 'static,
+        A::StaticModules: Clone,
+        A::Error: std::fmt::Display;
+
+    /// Receives a routed composite target after exact extension pairing.
+    fn visit_routed<A>(
+        self,
+        prepared: PreparedRoutedCompositeTextArchitecture<
+            A,
+            <A as crate::composite_execution::CompositeArchitecture<B, S>>::AdmissionConfig,
+        >,
+        extension: <crate::composite_execution::PreparedCompositeArchitecture<A> as crate::prediction_extension::MaterializedPredictionTarget<B>>::Extension<M>,
+        store: eredu_checkpoint::store::SharedCheckpointSource,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        A: crate::composite_execution::CompositeArchitecture<B, S, Error = eredu_nn::Error>
+            + eredu_runtime::RoutedLayeredArchitecture<B, S>
+            + 'static,
+        crate::composite_execution::PreparedCompositeArchitecture<A>:
+            crate::prediction_extension::MaterializedPredictionTarget<B>,
+        A::InputPartPlan: 'static,
+        A::StaticModules: Clone,
+        A::Error: std::fmt::Display;
+}
+
+/// Pairs one materialized extension with an exact direct composite target.
+pub fn visit_composite_prediction_target_architecture<B, S, M, A, V>(
+    prepared: PreparedCompositeTextArchitecture<
+        A,
+        <A as crate::composite_execution::CompositeArchitecture<B, S>>::AdmissionConfig,
+    >,
+    extension: crate::prediction_extension::MaterializedPredictionExtension<B, M>,
+    store: eredu_checkpoint::store::SharedCheckpointSource,
+    visitor: V,
+) -> Result<V::Output, ReplicatedTextDispatchError<V::Error>>
+where
+    B: eredu_nn::BlockwiseAttentionBackend
+        + eredu_nn::DistributedNeuralBackend
+        + eredu_nn::TensorParallelGroupedNeuralBackend
+        + eredu_nn::HyperNeuralBackend
+        + Clone,
+    S: LayerRuntimeState<B>,
+    M: crate::prediction_extension::PredictionExtensionMaterializer<B>,
+    A: crate::composite_execution::CompositeArchitecture<B, S, Error = eredu_nn::Error>
+        + eredu_runtime::RoutedLayeredArchitecture<B, S>
+        + 'static,
+    crate::composite_execution::PreparedCompositeArchitecture<A>:
+        crate::prediction_extension::MaterializedPredictionTarget<B>,
+    A::InputPartPlan: 'static,
+    A::StaticModules: Clone,
+    A::Error: std::fmt::Display,
+    V: CompositePredictionTargetVisitor<B, S, M>,
+{
+    type Target<A> = crate::composite_execution::PreparedCompositeArchitecture<A>;
+    let extension = <Target<A> as crate::prediction_extension::MaterializedPredictionTarget<
+        B,
+    >>::pair_prediction_extension(extension)
+    .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+    visitor
+        .visit(prepared, extension, store)
+        .map_err(ReplicatedTextDispatchError::Backend)
+}
+
+/// Pairs one materialized extension with an exact routed composite target.
+pub fn visit_routed_composite_prediction_target_architecture<B, S, M, A, V>(
+    prepared: PreparedRoutedCompositeTextArchitecture<
+        A,
+        <A as crate::composite_execution::CompositeArchitecture<B, S>>::AdmissionConfig,
+    >,
+    extension: crate::prediction_extension::MaterializedPredictionExtension<B, M>,
+    store: eredu_checkpoint::store::SharedCheckpointSource,
+    visitor: V,
+) -> Result<V::Output, ReplicatedTextDispatchError<V::Error>>
+where
+    B: eredu_nn::BlockwiseAttentionBackend
+        + eredu_nn::DistributedNeuralBackend
+        + eredu_nn::TensorParallelGroupedNeuralBackend
+        + eredu_nn::HyperNeuralBackend
+        + Clone,
+    S: LayerRuntimeState<B>,
+    M: crate::prediction_extension::PredictionExtensionMaterializer<B>,
+    A: crate::composite_execution::CompositeArchitecture<B, S, Error = eredu_nn::Error>
+        + eredu_runtime::RoutedLayeredArchitecture<B, S>
+        + 'static,
+    crate::composite_execution::PreparedCompositeArchitecture<A>:
+        crate::prediction_extension::MaterializedPredictionTarget<B>,
+    A::InputPartPlan: 'static,
+    A::StaticModules: Clone,
+    A::Error: std::fmt::Display,
+    V: CompositePredictionTargetVisitor<B, S, M>,
+{
+    type Target<A> = crate::composite_execution::PreparedCompositeArchitecture<A>;
+    let extension = <Target<A> as crate::prediction_extension::MaterializedPredictionTarget<
+        B,
+    >>::pair_prediction_extension(extension)
+    .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+    visitor
+        .visit_routed(prepared, extension, store)
+        .map_err(ReplicatedTextDispatchError::Backend)
+}
+
 pub(crate) enum CompositeConfig<'a> {
     Gemma4(&'a crate::gemma4::FamilyConfig),
     Inkling(&'a crate::inkling::ModelArgs),
@@ -6075,6 +6365,145 @@ where
                 effective_model_type,
                 cache_identity
             )
+        }
+    }
+}
+
+/// Constructs an admitted embedded-prediction composite target and pairs it before backend erasure.
+pub fn visit_composite_prediction_target_text_architecture<B, S, M, V>(
+    requirements: CompositeTextRequirements,
+    selected: SelectedCompositeTextRealization,
+    extension: crate::prediction_extension::MaterializedPredictionExtension<B, M>,
+    store: eredu_checkpoint::store::SharedCheckpointSource,
+    context: &<B::Tensor as Tensor>::Context,
+    mut visitor: V,
+) -> Result<V::Output, ReplicatedTextDispatchError<V::Error>>
+where
+    B: eredu_nn::BlockwiseAttentionBackend
+        + eredu_nn::DistributedNeuralBackend
+        + eredu_nn::TensorParallelGroupedNeuralBackend
+        + eredu_nn::HyperNeuralBackend
+        + Clone,
+    S: LayerRuntimeState<B>,
+    S::LayerState: AttentionCache<B::Tensor>
+        + eredu_runtime::RuntimeStateComponents<B>
+        + eredu_nn::AuxiliaryConvolutionState<B::Tensor>,
+    M: crate::prediction_extension::PredictionExtensionMaterializer<B>,
+    V: CompositePredictionTargetVisitor<B, S, M>,
+{
+    validate_store_handoff(requirements.execution(), store.as_ref())
+        .map_err(ReplicatedTextDispatchError::Architecture)?;
+    let retained = requirements.inspection.clone();
+    let config = composite_config(retained.architecture_plan())
+        .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?
+        .ok_or(ReplicatedTextIneligibility::Unrelated)?;
+    let source_linear_formats = requirement_linear_formats(requirements.execution());
+    let target_linear_formats =
+        selected_linear_formats(requirements.execution(), selected.execution());
+    let source_formats = requirement_formats(requirements.execution());
+    let target_formats = selected_formats(selected.execution());
+    let has_transform = selected_uses_transform(selected.execution());
+    visitor.construction_started();
+    macro_rules! visit_constructed_prediction_target {
+        ($architecture:expr, $source:expr, $capability:expr, $model_type:expr, $cache_identity:expr) => {{
+            match selected {
+                SelectedCompositeTextRealization::Direct(selected) => {
+                    let (execution, processor) = selected.into_parts();
+                    let prepared = prepare_composite_architecture_handoff::<B, S, _>(
+                        $architecture,
+                        $source,
+                        requirements,
+                        execution,
+                        processor,
+                        $capability,
+                        $model_type,
+                        $cache_identity,
+                        context,
+                    )
+                    .map_err(ReplicatedTextDispatchError::Architecture)?;
+                    visit_composite_prediction_target_architecture(
+                        prepared, extension, store, visitor,
+                    )
+                }
+                SelectedCompositeTextRealization::Routed {
+                    execution,
+                    processor,
+                } => {
+                    let prepared = prepare_routed_composite_architecture_handoff::<B, S, _>(
+                        $architecture,
+                        $source,
+                        requirements,
+                        execution,
+                        processor,
+                        $capability,
+                        $model_type,
+                        $cache_identity,
+                        context,
+                    )
+                    .map_err(ReplicatedTextDispatchError::Architecture)?;
+                    visit_routed_composite_prediction_target_architecture(
+                        prepared, extension, store, visitor,
+                    )
+                }
+            }
+        }};
+    }
+    match config {
+        CompositeConfig::Inkling(args) => {
+            let capability = crate::capability::inkling(args)
+                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+            let source = has_transform
+                .then(|| crate::inkling::with_checkpoint_formats(args, source_formats))
+                .transpose()
+                .map_err(ReplicatedTextDispatchError::Architecture)?
+                .map(|args| crate::inkling::LayeredModel::<B>::new(args, context))
+                .transpose()
+                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+            let target = crate::inkling::with_checkpoint_formats(args, target_formats)
+                .map_err(ReplicatedTextDispatchError::Architecture)?;
+            let effective_model_type = target.model_type.clone();
+            let cache_identity = target.architecture_fingerprint();
+            let architecture = crate::inkling::LayeredModel::<B>::new(target, context)
+                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+            visit_constructed_prediction_target!(
+                architecture,
+                source,
+                capability,
+                effective_model_type,
+                cache_identity
+            )
+        }
+        CompositeConfig::QwenHybrid(args) => {
+            let capability = crate::capability::qwen_hybrid(args)
+                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+            let source = has_transform
+                .then(|| qwen_hybrid_composite_with_formats(args, source_linear_formats))
+                .transpose()
+                .map_err(ReplicatedTextDispatchError::Architecture)?
+                .map(|args| crate::qwen::hybrid::ConditionalLayeredModel::<B>::new(args, context))
+                .transpose()
+                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+            let target = qwen_hybrid_composite_with_formats(args, target_linear_formats)
+                .map_err(ReplicatedTextDispatchError::Architecture)?;
+            let effective_model_type = target.text.model_type.clone();
+            let cache_identity =
+                crate::qwen::hybrid::conditional_prompt_cache_architecture_fingerprint(&target);
+            let architecture = crate::qwen::hybrid::ConditionalLayeredModel::<B>::new(
+                target, context,
+            )
+            .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+            visit_constructed_prediction_target!(
+                architecture,
+                source,
+                capability,
+                effective_model_type,
+                cache_identity
+            )
+        }
+        CompositeConfig::Gemma4(_) | CompositeConfig::Muse(_) | CompositeConfig::QwenVl(_) => {
+            Err(ReplicatedTextDispatchError::Architecture(
+                "composite architecture does not admit an embedded prediction extension".into(),
+            ))
         }
     }
 }

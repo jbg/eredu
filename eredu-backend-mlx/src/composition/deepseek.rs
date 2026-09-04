@@ -7,7 +7,7 @@ use eredu_checkpoint::WeightQuantization;
 use eredu_runtime::{
     ArchitectureParameters, CacheResidencyPolicy, CausalModel, DeviceState, ExecutionUnitLayout,
     LayerWeightResidency, LayeredArchitecture, LayerwiseRuntime, PagedCacheOptions, ParameterRole,
-    RoutedLayeredArchitecture, RuntimeLayerState, RuntimeState, StateSegmentId, WeightResidency,
+    RoutedLayeredArchitecture, RuntimeState, WeightResidency,
 };
 use safemlx::{error::Exception, ops::indexing::TryIndexOp, Array, Stream};
 
@@ -103,37 +103,6 @@ fn construct_v4_unit(
     .map_err(neutral_error)
 }
 
-fn neutral_embedded_input<'a>(
-    input: deepseek::mtp::EmbeddedInput<'a, Array>,
-) -> deepseek::mtp::EmbeddedInput<'a, crate::MlxTensor> {
-    match input {
-        deepseek::mtp::EmbeddedInput::Target { tokens, mask } => {
-            deepseek::mtp::EmbeddedInput::target(
-                crate::composition::tensor_ref(tokens),
-                crate::composition::tensor_opt(mask),
-            )
-        }
-        deepseek::mtp::EmbeddedInput::Draft {
-            tokens,
-            hidden,
-            depth,
-        } => deepseek::mtp::EmbeddedInput::draft(
-            crate::composition::tensor_ref(tokens),
-            crate::composition::tensor_ref(hidden),
-            depth,
-        ),
-        deepseek::mtp::EmbeddedInput::DsparkContext { captures } => {
-            deepseek::mtp::EmbeddedInput::dspark_context(crate::composition::tensor_ref(captures))
-        }
-        deepseek::mtp::EmbeddedInput::DsparkProposal { anchor, capacity } => {
-            deepseek::mtp::EmbeddedInput::dspark_proposal(
-                crate::composition::tensor_ref(anchor),
-                capacity,
-            )
-        }
-    }
-}
-
 #[derive(Clone)]
 struct V3UnitPopulator {
     external_experts: bool,
@@ -221,64 +190,6 @@ enum DeepSeekStateInner {
 }
 
 impl DeepSeekState {
-    pub fn clear(&mut self) -> Result<(), Exception> {
-        match &mut self.inner {
-            DeepSeekStateInner::V3(state) => {
-                for cache in state.as_mut() {
-                    cache.clear()?;
-                }
-            }
-            DeepSeekStateInner::V4(state) => {
-                for cache in state.as_mut() {
-                    cache.clear()?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn commit_prediction_layers_from(&mut self, draft: &Self) -> Result<(), Exception> {
-        match (&mut self.inner, &draft.inner) {
-            (DeepSeekStateInner::V3(current), DeepSeekStateInner::V3(draft)) => {
-                commit_state_segment(current, draft, deepseek::PREDICTION_STATE_SEGMENT, "V3")?;
-            }
-            (DeepSeekStateInner::V4(current), DeepSeekStateInner::V4(draft)) => {
-                commit_state_segment(current, draft, deepseek::PREDICTION_STATE_SEGMENT, "V4")?;
-            }
-            _ => return Err(Exception::custom("DeepSeek draft state family mismatch")),
-        }
-        Ok(())
-    }
-
-    fn restore_checkpoint(&mut self, checkpoint: &Self, stream: &Stream) -> Result<(), Exception> {
-        match (&mut self.inner, &checkpoint.inner) {
-            (DeepSeekStateInner::V3(current), DeepSeekStateInner::V3(previous)) => {
-                if current.as_ref().len() != previous.as_ref().len() {
-                    return Err(Exception::custom("V3 checkpoint state layout mismatch"));
-                }
-                for (current, previous) in current.as_mut().iter_mut().zip(previous.as_ref()) {
-                    eredu_nn::CompressedAttentionCache::restore(current, previous, stream)
-                        .map_err(|error| Exception::custom(error.to_string()))?;
-                }
-            }
-            (DeepSeekStateInner::V4(current), DeepSeekStateInner::V4(previous)) => {
-                if current.as_ref().len() != previous.as_ref().len() {
-                    return Err(Exception::custom("V4 checkpoint state layout mismatch"));
-                }
-                for (current, previous) in current.as_mut().iter_mut().zip(previous.as_ref()) {
-                    eredu_nn::PoolingAttentionCache::restore(current, previous, stream)
-                        .map_err(|error| Exception::custom(error.to_string()))?;
-                }
-            }
-            _ => {
-                return Err(Exception::custom(
-                    "DeepSeek checkpoint state family mismatch",
-                ))
-            }
-        }
-        Ok(())
-    }
-
     pub fn residency_report(
         &self,
     ) -> Result<Option<eredu_runtime::CacheResidencyReport>, Exception> {
@@ -297,31 +208,6 @@ impl DeepSeekState {
                 .map_err(|error| Exception::custom(error.to_string())),
         }
     }
-}
-
-fn commit_state_segment<L>(
-    current: &mut DeviceState<MlxNeuralBackend, L>,
-    draft: &DeviceState<MlxNeuralBackend, L>,
-    segment: &str,
-    family: &str,
-) -> Result<(), Exception>
-where
-    L: Clone + RuntimeLayerState<MlxNeuralBackend>,
-{
-    if current.layout() != draft.layout() || current.as_ref().len() != draft.as_ref().len() {
-        return Err(Exception::custom(format!(
-            "{family} draft state layout mismatch"
-        )));
-    }
-    let segment =
-        StateSegmentId::new(segment).map_err(|error| Exception::custom(error.to_string()))?;
-    let range = current
-        .layout()
-        .segment(&segment)
-        .map(eredu_runtime::StateSegmentSpec::layers)
-        .ok_or_else(|| Exception::custom(format!("{family} state has no {segment:?} segment")))?;
-    current.as_mut()[range.clone()].clone_from_slice(&draft.as_ref()[range]);
-    Ok(())
 }
 
 impl DeepSeekModel {
@@ -1036,103 +922,11 @@ impl DeepSeekModel {
             .map_err(Into::into)
     }
 
-    fn forward_embedded<'a>(
-        &mut self,
-        input: deepseek::mtp::EmbeddedInput<'a, Array>,
-        state: &mut DeepSeekState,
-        stream: &Stream,
-    ) -> Result<(Array, Array), Exception> {
-        let input = neutral_embedded_input(input);
-        match (&mut self.inner, &mut state.inner) {
-            (
-                DeepSeekModelInner::V3 {
-                    args,
-                    execution,
-                    parameter_bank,
-                    ..
-                },
-                DeepSeekStateInner::V3(state),
-            ) => {
-                let (logits, context) = Self::run_v3(
-                    args,
-                    execution,
-                    parameter_bank.as_ref(),
-                    input,
-                    state,
-                    stream,
-                )
-                .map_err(|error| Exception::custom(error.to_string()))?;
-                let hidden = context
-                    .target_capture()
-                    .or_else(|| context.draft_hidden())
-                    .cloned()
-                    .unwrap_or_else(|| logits.clone());
-                Ok((logits.into_array(), hidden.into_array()))
-            }
-            (
-                DeepSeekModelInner::V4 {
-                    args,
-                    execution,
-                    parameter_bank,
-                    ..
-                },
-                DeepSeekStateInner::V4(state),
-            ) => {
-                let (logits, context) = Self::run_v4(
-                    args,
-                    execution,
-                    parameter_bank.as_ref(),
-                    input,
-                    state,
-                    stream,
-                )
-                .map_err(|error| Exception::custom(error.to_string()))?;
-                let hidden = context
-                    .target_capture()
-                    .or_else(|| context.draft_hidden())
-                    .cloned()
-                    .unwrap_or_else(|| logits.clone());
-                Ok((logits.into_array(), hidden.into_array()))
-            }
-            _ => Err(Exception::custom(
-                "DeepSeek embedded model and state families do not match",
-            )),
-        }
-    }
-
     /// Returns the normalized family model type.
     pub fn model_type(&self) -> &str {
         match &self.inner {
             DeepSeekModelInner::V3 { args, .. } => &args.model_type,
             DeepSeekModelInner::V4 { args, .. } => &args.model_type,
-        }
-    }
-
-    /// Returns the number of embedded prediction units.
-    pub fn mtp_len(&self) -> usize {
-        match &self.inner {
-            DeepSeekModelInner::V3 { execution, .. } => match execution {
-                V3Execution::Resident(runtime) => runtime.architecture().mtp_len(),
-                V3Execution::Layerwise(runtime) => runtime.architecture().mtp_len(),
-            },
-            DeepSeekModelInner::V4 { execution, .. } => match execution {
-                V4Execution::Resident(runtime) => runtime.architecture().mtp_len(),
-                V4Execution::Layerwise(runtime) => runtime.architecture().mtp_len(),
-            },
-        }
-    }
-
-    /// Returns the architecture-declared token capacity of one draft proposal.
-    pub fn draft_proposal_capacity(&self) -> usize {
-        match &self.inner {
-            DeepSeekModelInner::V3 { execution, .. } => match execution {
-                V3Execution::Resident(runtime) => runtime.architecture().mtp_len(),
-                V3Execution::Layerwise(runtime) => runtime.architecture().mtp_len(),
-            },
-            DeepSeekModelInner::V4 { execution, .. } => match execution {
-                V4Execution::Resident(runtime) => runtime.architecture().draft_proposal_capacity(),
-                V4Execution::Layerwise(runtime) => runtime.architecture().draft_proposal_capacity(),
-            },
         }
     }
 
@@ -1406,192 +1200,6 @@ impl DeepSeekModel {
             }
         }
         Ok((state, manifest))
-    }
-}
-
-impl crate::composition::mlx::speculative::embedded::EmbeddedMtpTarget for DeepSeekModel {
-    type Cache = DeepSeekState;
-    type DraftCache = DeepSeekState;
-
-    fn prefill_target(
-        &mut self,
-        input: input::ModelInput<'_>,
-        cache: &mut Self::Cache,
-        stream: &Stream,
-    ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Exception> {
-        let tokens = input::text_token_ids(input, stream)?;
-        cache.clear()?;
-        let (logits, hidden) = self.forward_embedded(
-            deepseek::mtp::EmbeddedInput::target(&tokens, None),
-            cache,
-            stream,
-        )?;
-        Ok(
-            crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput {
-                logits: crate::MlxTensor::from_array(logits),
-                hidden: crate::MlxTensor::from_array(hidden),
-                tokens: crate::MlxTensor::from_array(tokens),
-            },
-        )
-    }
-
-    fn verify_target(
-        &mut self,
-        tokens: &crate::MlxTensor,
-        cache: &mut Self::Cache,
-        stream: &Stream,
-    ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Exception> {
-        let (logits, hidden) = self.forward_embedded(
-            deepseek::mtp::EmbeddedInput::target(tokens.as_array(), None),
-            cache,
-            stream,
-        )?;
-        Ok(
-            crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput {
-                logits: crate::MlxTensor::from_array(logits),
-                hidden: crate::MlxTensor::from_array(hidden),
-                tokens: tokens.clone(),
-            },
-        )
-    }
-
-    fn prefill_draft_cache(
-        &mut self,
-        output: &crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput,
-        tokens: &crate::MlxTensor,
-        cache: &mut Self::Cache,
-        stream: &Stream,
-    ) -> Result<(), Exception> {
-        if matches!(&self.inner, DeepSeekModelInner::V4 { args, .. } if args.dspark.is_some()) {
-            let _ = self.forward_embedded(
-                deepseek::mtp::EmbeddedInput::dspark_context(output.hidden.as_array()),
-                cache,
-                stream,
-            )?;
-            return Ok(());
-        }
-        let sequence = tokens.as_array().dim(1);
-        if sequence <= 1 {
-            return Ok(());
-        }
-        let hidden = match &self.inner {
-            DeepSeekModelInner::V3 { .. } => output
-                .hidden
-                .as_array()
-                .try_index_device((.., ..sequence - 1, ..), stream)?,
-            DeepSeekModelInner::V4 { .. } => output
-                .hidden
-                .as_array()
-                .try_index_device((.., ..sequence - 1, .., ..), stream)?,
-        };
-        let next = tokens.as_array().try_index_device((.., 1..), stream)?;
-        for depth in 0..self.mtp_len() {
-            let _ = self.forward_embedded(
-                deepseek::mtp::EmbeddedInput::draft(&next, &hidden, depth),
-                cache,
-                stream,
-            )?;
-        }
-        Ok(())
-    }
-
-    fn draft_cache(&self, cache: &Self::Cache) -> Self::DraftCache {
-        cache.clone()
-    }
-
-    fn commit_draft_cache(&self, cache: &mut Self::Cache, draft: &Self::DraftCache) {
-        cache
-            .commit_prediction_layers_from(draft)
-            .expect("validated DeepSeek draft and target layouts match");
-    }
-
-    fn restore_target_checkpoint(
-        cache: &mut Self::Cache,
-        checkpoint: &Self::Cache,
-        stream: &Stream,
-    ) -> Result<(), Exception> {
-        cache.restore_checkpoint(checkpoint, stream)
-    }
-
-    fn draft_logits(
-        &mut self,
-        hidden: &crate::MlxTensor,
-        last_token: u32,
-        draft_index: usize,
-        cache: &mut Self::DraftCache,
-        stream: &Stream,
-    ) -> Result<(crate::MlxTensor, crate::MlxTensor), Exception> {
-        if matches!(&self.inner, DeepSeekModelInner::V4 { args, .. } if args.dspark.is_some()) {
-            return Err(Exception::custom(
-                "DSpark uses fused proposal execution, not sequential prediction layers",
-            ));
-        }
-        let token = Array::from_slice(&[last_token], &[1, 1]);
-        self.forward_embedded(
-            deepseek::mtp::EmbeddedInput::draft(&token, hidden.as_array(), draft_index),
-            cache,
-            stream,
-        )
-        .map(|(logits, hidden)| {
-            (
-                crate::MlxTensor::from_array(logits),
-                crate::MlxTensor::from_array(hidden),
-            )
-        })
-    }
-
-    fn fused_draft_logits(
-        &mut self,
-        _hidden: &crate::MlxTensor,
-        last_token: u32,
-        proposal_capacity: usize,
-        cache: &mut Self::DraftCache,
-        stream: &Stream,
-    ) -> Result<Option<crate::MlxTensor>, Exception> {
-        if !matches!(&self.inner, DeepSeekModelInner::V4 { args, .. } if args.dspark.is_some()) {
-            return Ok(None);
-        }
-        let anchor = Array::from_slice(&[last_token], &[1, 1]);
-        let mut proposal = cache.clone();
-        self.forward_embedded(
-            deepseek::mtp::EmbeddedInput::dspark_proposal(&anchor, proposal_capacity),
-            &mut proposal,
-            stream,
-        )
-        .map(|(logits, _)| Some(crate::MlxTensor::from_array(logits)))
-    }
-
-    fn advance_draft_cache(
-        &mut self,
-        hidden: &crate::MlxTensor,
-        tokens: &crate::MlxTensor,
-        cache: &mut Self::DraftCache,
-        stream: &Stream,
-    ) -> Result<(), Exception> {
-        if matches!(&self.inner, DeepSeekModelInner::V4 { args, .. } if args.dspark.is_some()) {
-            let _ = self.forward_embedded(
-                deepseek::mtp::EmbeddedInput::dspark_context(hidden.as_array()),
-                cache,
-                stream,
-            )?;
-        } else {
-            for depth in 0..self.mtp_len() {
-                let _ = self.forward_embedded(
-                    deepseek::mtp::EmbeddedInput::draft(
-                        tokens.as_array(),
-                        hidden.as_array(),
-                        depth,
-                    ),
-                    cache,
-                    stream,
-                )?;
-            }
-        }
-        Ok(())
-    }
-
-    fn max_draft_tokens(&self) -> usize {
-        self.draft_proposal_capacity()
     }
 }
 

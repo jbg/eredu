@@ -810,7 +810,7 @@ impl QwenHybridModel {
         tokens: &crate::MlxTensor,
         cache: &mut MlxHybridState,
         stream: &Stream,
-    ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Exception> {
+    ) -> Result<eredu_architectures::speculative_execution::EmbeddedPredictionOutput<crate::MlxTensor>, Exception> {
         if let Some(parameter_bank) = self.parameter_bank.take() {
             let config = self.parsed.text.clone();
             let result = {
@@ -862,9 +862,9 @@ impl QwenHybridModel {
                     Exception::custom("conditional Qwen3.5 retained no hidden state")
                 })?;
             return Ok(
-                crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput {
+                eredu_architectures::speculative_execution::EmbeddedPredictionOutput::<crate::MlxTensor> {
                     logits: result.0,
-                    hidden,
+                    capture: hidden,
                     tokens: tokens.clone(),
                 },
             );
@@ -887,9 +887,9 @@ impl QwenHybridModel {
             .cloned()
             .ok_or_else(|| Exception::custom("Qwen hybrid pass retained no hidden state"))?;
         Ok(
-            crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput {
+            eredu_architectures::speculative_execution::EmbeddedPredictionOutput::<crate::MlxTensor> {
                 logits: result.0,
-                hidden,
+                capture: hidden,
                 tokens: tokens.clone(),
             },
         )
@@ -902,7 +902,7 @@ impl QwenHybridModel {
         cache: &mut MlxHybridState,
         provider: &mut P,
         stream: &Stream,
-    ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Exception>
+    ) -> Result<eredu_architectures::speculative_execution::EmbeddedPredictionOutput<crate::MlxTensor>, Exception>
     where
         P: eredu_runtime::RoutedExpertProvider<MlxNeuralBackend>,
         P::Error: std::fmt::Display,
@@ -999,9 +999,9 @@ impl QwenHybridModel {
                     Exception::custom("conditional Qwen3.5 retained no hidden state")
                 })?;
             return Ok(
-                crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput {
+                eredu_architectures::speculative_execution::EmbeddedPredictionOutput::<crate::MlxTensor> {
                     logits: conditional.0,
-                    hidden,
+                    capture: hidden,
                     tokens: tokens.clone(),
                 },
             );
@@ -1042,9 +1042,9 @@ impl QwenHybridModel {
             .cloned()
             .ok_or_else(|| Exception::custom("Qwen hybrid pass retained no hidden state"))?;
         Ok(
-            crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput {
+            eredu_architectures::speculative_execution::EmbeddedPredictionOutput::<crate::MlxTensor> {
                 logits: result.0,
-                hidden,
+                capture: hidden,
                 tokens: tokens.clone(),
             },
         )
@@ -1062,13 +1062,41 @@ impl CausalModel<MlxHybridState> for QwenHybridModel {
         cache: &mut MlxHybridState,
         stream: &Stream,
     ) -> Result<crate::MlxTensor, Exception> {
-        let output = <Self as crate::composition::mlx::speculative::embedded::EmbeddedMtpTarget>::prefill_target(
-            self, input, cache, stream,
-        )?;
+        cache.clear()?;
+        let output = if self.parsed.vision.is_some() {
+            let prepared = self.prepared_conditional_forward(input, cache, stream, None)?;
+            let hidden = prepared.hidden.ok_or_else(|| {
+                Exception::custom("conditional Qwen3.5 prefill retained no target hidden state")
+            })?;
+            eredu_architectures::speculative_execution::EmbeddedPredictionOutput::new(
+                prepared.logits,
+                hidden,
+                prepared.tokens,
+            )
+        } else {
+            let tokens = crate::MlxTensor::from_array(input::text_token_ids(input, stream)?);
+            self.forward_mtp(EmbeddedInput::target(&tokens, None), &tokens, cache, stream)?
+        };
         let tokens = output.tokens.clone();
-        <Self as crate::composition::mlx::speculative::embedded::EmbeddedMtpTarget>::prefill_draft_cache(
-            self, &output, &tokens, cache, stream,
-        )?;
+        let sequence = tokens.dim(1);
+        if sequence > 1 {
+            let hidden = crate::MlxTensor::from_array(
+                output
+                    .capture
+                    .as_array()
+                    .try_index_device((.., ..sequence - 1, ..), stream)?,
+            );
+            let next =
+                crate::MlxTensor::from_array(tokens.as_array().try_index_device((.., 1..), stream)?);
+            for depth in 0..self.mtp_len() {
+                let _ = self.forward_mtp(
+                    EmbeddedInput::draft(&next, &hidden, depth),
+                    &next,
+                    cache,
+                    stream,
+                )?;
+            }
+        }
         output
             .logits
             .as_array()
@@ -1088,135 +1116,6 @@ impl CausalModel<MlxHybridState> for QwenHybridModel {
         output
             .try_index_device((.., -1, ..), stream)
             .map(crate::MlxTensor::from_array)
-    }
-}
-
-impl crate::composition::mlx::speculative::embedded::EmbeddedMtpTarget for QwenHybridModel {
-    type Cache = MlxHybridState;
-    type DraftCache = MlxHybridState;
-
-    fn prefill_target(
-        &mut self,
-        input: input::ModelInput<'_>,
-        cache: &mut Self::Cache,
-        stream: &Stream,
-    ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Exception> {
-        cache.clear()?;
-        if self.parsed.vision.is_some() {
-            let prepared = self.prepared_conditional_forward(input, cache, stream, None)?;
-            let hidden = prepared.hidden.ok_or_else(|| {
-                Exception::custom("conditional Qwen3.5 prefill retained no target hidden state")
-            })?;
-            return Ok(
-                crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput {
-                    logits: prepared.logits,
-                    hidden,
-                    tokens: prepared.tokens,
-                },
-            );
-        }
-        let tokens = input::text_token_ids(input, stream)?;
-        let tokens = crate::MlxTensor::from_array(tokens);
-        self.forward_mtp(EmbeddedInput::target(&tokens, None), &tokens, cache, stream)
-    }
-
-    fn verify_target(
-        &mut self,
-        tokens: &crate::MlxTensor,
-        cache: &mut Self::Cache,
-        stream: &Stream,
-    ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Exception> {
-        self.forward_mtp(EmbeddedInput::target(tokens, None), tokens, cache, stream)
-    }
-
-    fn prefill_draft_cache(
-        &mut self,
-        output: &crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput,
-        tokens: &crate::MlxTensor,
-        cache: &mut Self::Cache,
-        stream: &Stream,
-    ) -> Result<(), Exception> {
-        let sequence = tokens.dim(1);
-        if sequence <= 1 {
-            return Ok(());
-        }
-        let hidden = crate::MlxTensor::from_array(
-            output
-                .hidden
-                .as_array()
-                .try_index_device((.., ..sequence - 1, ..), stream)?,
-        );
-        let next =
-            crate::MlxTensor::from_array(tokens.as_array().try_index_device((.., 1..), stream)?);
-        for depth in 0..self.mtp_len() {
-            let _ = self.forward_mtp(
-                EmbeddedInput::draft(&next, &hidden, depth),
-                &next,
-                cache,
-                stream,
-            )?;
-        }
-        Ok(())
-    }
-
-    fn draft_cache(&self, cache: &Self::Cache) -> Self::DraftCache {
-        cache
-            .deep_clone_state()
-            .expect("evaluated Qwen hybrid state must be forkable")
-    }
-
-    fn commit_draft_cache(&self, cache: &mut Self::Cache, draft: &Self::DraftCache) {
-        cache
-            .commit_segment_from(draft, hybrid::PREDICTION_STATE_SEGMENT)
-            .expect("validated Qwen hybrid prediction state segment")
-    }
-
-    fn restore_target_checkpoint(
-        cache: &mut Self::Cache,
-        checkpoint: &Self::Cache,
-        stream: &Stream,
-    ) -> Result<(), Exception> {
-        cache.restore_checkpoint(checkpoint, stream)
-    }
-
-    fn draft_logits(
-        &mut self,
-        hidden: &crate::MlxTensor,
-        last_token: u32,
-        draft_index: usize,
-        cache: &mut Self::DraftCache,
-        stream: &Stream,
-    ) -> Result<(crate::MlxTensor, crate::MlxTensor), Exception> {
-        let token = crate::MlxTensor::from_array(Array::from_slice(&[last_token], &[1, 1]));
-        let output = self.forward_mtp(
-            EmbeddedInput::draft(&token, hidden, draft_index),
-            &token,
-            cache,
-            stream,
-        )?;
-        Ok((output.logits, output.hidden))
-    }
-
-    fn advance_draft_cache(
-        &mut self,
-        hidden: &crate::MlxTensor,
-        tokens: &crate::MlxTensor,
-        cache: &mut Self::DraftCache,
-        stream: &Stream,
-    ) -> Result<(), Exception> {
-        for depth in 0..self.mtp_len() {
-            let _ = self.forward_mtp(
-                EmbeddedInput::draft(tokens, hidden, depth),
-                tokens,
-                cache,
-                stream,
-            )?;
-        }
-        Ok(())
-    }
-
-    fn max_draft_tokens(&self) -> usize {
-        self.mtp_len()
     }
 }
 

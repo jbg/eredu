@@ -221,9 +221,11 @@ application-facing `eredu::api::ConstraintError` path.
 For an external speculative assistant, the facade reconstructs both target and
 assistant tokenizers and establishes the neutral `TokenizerCompatibilityProof`
 before assistant materialization. Equality of their token-id vocabulary
-fingerprints is portable compatibility policy. Backend factories receive that
-proof and its shared fingerprint; they own assistant placement, materialization,
-and architecture compatibility, but do not decide tokenizer compatibility.
+fingerprints is portable compatibility policy. Architecture composition owns
+target/assistant compatibility and selects assistant placement before native
+construction. Backend factories receive those proven contracts, materialize
+only the selected assistant tasks, and bind the selected native placement; they
+decide neither tokenizer nor architecture compatibility.
 
 `eredu-runtime` owns statically dispatched resident and bounded execution,
 parameter binding, residency, mutable state, exact completion, distributed-plan
@@ -965,7 +967,11 @@ checkpoint-global and rank-local neutral units, and fixes recipes plus
 prediction-only state geometry in a consumed typed handoff. MLX receives no
 family configuration or semantic rank topology at this seam; it only lowers
 the prepared bindings, moves tensors, populates local modules, and wraps native
-execution objects. Its physical sources are the exact admitted sources
+execution objects. The architecture layer also owns the exhaustive
+post-materialization topology and mutable lane-state variants; MLX implements
+one generic materializer for arbitrary prepared modules, pooling caches,
+sequential caches, and complete state layouts instead of repeating a
+family-shaped construction match. Its physical sources are the exact admitted sources
 not claimed by the projected target schema, rather than a backend prefix
 filter. MLX materializes those units against the target's selected local
 geometry carried by the handoff and invokes them through the neutral prediction-target operation
@@ -1588,16 +1594,47 @@ Core owns the speculative transaction:
 6. commit or roll back backend cache state; and
 7. publish only committed tokens and semantic events.
 
-`SpeculativeExecutor` and `SpeculativeSampling` expose high-level opaque
-operations for these stages. A backend owns assistant execution, target logits,
-probability arithmetic, random state, cache checkpoints, and concrete
-completion values. Embedded prediction heads and external assistant models use
-the same portable lifecycle.
+`SpeculativeExecutor` is the portable protocol implemented by architecture-owned
+embedded and external strategies. `SpeculativeSampling` exposes only generic
+logits, probability-arithmetic, sampling, and random-state mechanisms. A
+backend supplies native tensors and operators, state storage, cache checkpoint
+mechanics, queue and transfer operations, and concrete completion values; it
+does not own proposal, verification, replay, or commit semantics. Embedded
+prediction heads and external assistant models use the same portable lifecycle.
+
+For embedded prediction, `eredu-architectures` owns the cache envelope that
+pairs target state, typed prediction state, the selected realization, prepared
+input identity, capture frontier, and fork/commit/restore membership. It also
+owns the materialized prediction strategy and the object-safe executor erasure;
+the MLX adapter performs one final continuation over that already paired
+executor. Backend composition cannot re-pair an erased target with a different
+prediction cache or substitute a family-specific speculative driver.
+
+For external assistants, `eredu-architectures` likewise owns the semantic cache
+envelope, capture schema validation, observer ordering, checkpoint restoration,
+proposal/verification sequencing, and replay. The family-neutral MLX mechanism
+adapter retains only opaque native cache storage, tensor operations, transfers,
+streams, and completion values. Its activation observers are installed through
+the architecture executor, so interventions and failures participate in the
+same transaction rather than a test-only side channel. MLX sessions retain the
+installed embedded observer set across erased executor lends; the backend does
+not recreate a no-op observer set at each scheduler turn.
+
+`SpeculativeLifecycleObserver` is an explicit, production-carried coarse
+instrumentation seam. Neutral selection observes admission and compatibility
+before native construction; the shared request table observes input,
+execution, completion, resolution, cache persistence, publication, and
+cancellation before each corresponding boundary. Observer failure prevents
+that boundary from starting, and failures after verification submission restore
+the retained cache checkpoint before publication. This lifecycle seam does not
+replace typed `ActivationObserver` intervention over backend-native tensors;
+the two report complementary control-flow and value-flow evidence.
 
 The prepared-generation capability does not expose whole-request execution
-methods. A backend implements `with_speculative_execution` only to validate the
-draft pairing, prepare typed lane resources, and lend them through
-`SpeculativeGenerationVisitor`. The facade supplies
+methods. A backend implements `with_speculative_execution` only to consume the
+retained neutral realization, prepare typed lane resources, and lend them
+through `SpeculativeGenerationVisitor`. Compatibility and placement are fixed
+before assistant or extension construction. The facade supplies
 `RunSpeculativeGeneration`; `eredu-runtime::SpeculativeScheduler` registers
 lanes, selects fair actions, drives exact completions, validates terminal
 reasons, and constructs public outputs. Single requests use that same path as
@@ -1606,9 +1643,44 @@ fair-batch loop.
 
 Architecture families also own external-assistant compatibility proofs. Those
 proofs match target-state publishers, hidden and rotary geometry, target-layer
-captures, and vocabulary requirements before a concrete backend composes the
-two executables. Backend composition may enforce the proof, but must not
-restate family-specific compatibility rules.
+captures, and vocabulary requirements before neutral composition constructs
+the paired executables. The facade supplies the distinct tokenizer proof.
+Backend composition consumes both proven contracts and does not restate
+family-specific compatibility rules.
+
+Gemma 4 and Muse-Glimmer own their external-assistant execution strategies.
+Gemma shared-attention capture truncation, target-to-draft state assembly,
+proposal progression, and partial-verification replay live in
+`eredu-architectures::gemma4::speculative`; ordered DFlash capture assembly,
+sliding committed context, anchor-plus-mask proposal construction, and replay
+live in `eredu-architectures::muse_glimmer::speculative`. The MLX adapter binds
+both strategies through one family-neutral mechanism implementation for arrays,
+streams, exact completions, target-cache checkpointing, and already materialized
+neutral assistants. `ExternalAssistantArchitecture` selects and constructs the
+typed executor before lending it to the shared runtime visitor; MLX neither
+matches assistant families nor provides a second family-specific
+`SpeculativeExecutor` lifecycle. Compatibility-proven preparation is the only
+public path to assistant materialization, so an incompatible pairing cannot
+open assistant weight payloads.
+
+Before materialization, the compatible external preparation derives one
+neutral selection contract. Architecture-owned target profiles supply the
+stable target/geometry identity and maximum capture sequence; the admitted
+assistant checkpoint supplies artifact and physical-format identities. The
+facade supplies only its tokenizer proof, requested proposal capacity,
+processor identity, and already selected rank topology. Concrete backends must
+not synthesize family, artifact-format, or capture identities.
+
+The selected capture schema fixes paths, order, ownership, observation seams,
+fixed dimensions, and upper bounds for request-sized sequence dimensions.
+Immediately before target execution, each lane binds its exact prepared-input
+identity. Each committed target pass then closes the actual positive sequence
+extents and target-cache generation, and the architecture executor validates
+that capture against the retained realization before proposal state can
+advance. A stale generation, reordered path, wrong fixed dimension, oversized
+request dimension, or cache/input mismatch fails the transaction. External
+assistant targets are replicated-only; partitioned target requests fail during
+architecture contract selection before assistant payload or queue creation.
 
 Prediction-enabled composition is additive to the ordinary target session.
 Architecture admission projects the target and a typed prediction-extension
@@ -1618,15 +1690,15 @@ prefill, decode, mutable state, prompt-cache control, completion, observation,
 rollback, and publication. A target pass may retain an architecture-declared
 hidden capture from that same transaction for an embedded predictor or
 external assistant. Missing capture fails the transaction before publication.
-Backend composition may own prediction-local state and native prediction
-mechanisms, but must not construct a second target model or target cache. Any
-extension whose unit execution lacks a typed additive handoff remains
-fail-closed; loading a second complete model beside the neutral target is not
-an admissible compatibility mechanism.
-DeepSeek-V4 DSpark remains in that fail-closed set: its target capture is a
-configured set of intermediate-layer values rather than the sequential MTP
-target hidden state, so projecting it as ordinary final hidden state would
-change prediction semantics.
+Architecture composition owns prediction-local state geometry, identity, and
+transaction semantics; a backend owns only its native storage and prediction
+operator mechanisms. It must not construct a second target model or target
+cache. Any extension whose unit execution lacks a typed additive handoff
+remains fail-closed; loading a second complete model beside the neutral target
+is not an admissible compatibility mechanism. DeepSeek-V4 DSpark uses its
+configured, ordered intermediate-layer captures and exact fused block capacity
+through that typed handoff. Ordinary final hidden state is never substituted
+for the declared capture.
 
 ## Scheduling and cancellation
 

@@ -1530,6 +1530,237 @@ where
         A::Error: std::fmt::Display;
 }
 
+/// Family-blind backend visitor for an exact routed prediction target.
+pub trait RoutedPredictionTargetVisitor<B, S, M>
+where
+    B: eredu_nn::BlockwiseAttentionBackend
+        + eredu_nn::DistributedNeuralBackend
+        + eredu_nn::GroupedNeuralBackend
+        + eredu_nn::HyperNeuralBackend,
+    S: eredu_runtime::RuntimeState<B>,
+    M: crate::prediction_extension::PredictionExtensionMaterializer<B>,
+{
+    /// Completed backend adapter.
+    type Output;
+    /// Backend binding failure.
+    type Error;
+
+    /// Called immediately before architecture construction begins.
+    fn construction_started(&mut self) {}
+
+    /// Receives a routed target only after exact extension pairing.
+    fn visit<A>(
+        self,
+        prepared: PreparedRoutedTextArchitecture<A>,
+        extension: <A as crate::prediction_extension::MaterializedPredictionTarget<B>>::Extension<
+            M,
+        >,
+        store: eredu_checkpoint::store::SharedCheckpointSource,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        A: eredu_runtime::ReplicatedTextArchitecture<B, S, Error = eredu_nn::Error>
+            + eredu_runtime::RoutedLayeredArchitecture<B, S>
+            + crate::prediction_extension::MaterializedPredictionTarget<B>
+            + 'static,
+        A::StaticModules: Clone,
+        A::Error: std::fmt::Display;
+}
+
+/// Supplies exact state-profile visitors while architecture dispatch selects
+/// the admitted routed prediction family.
+pub trait RoutedPredictionProfileDispatcher<B, M>
+where
+    B: eredu_nn::BlockwiseAttentionBackend
+        + eredu_nn::DistributedNeuralBackend
+        + eredu_nn::GroupedNeuralBackend
+        + eredu_nn::HyperNeuralBackend,
+    M: crate::prediction_extension::PredictionExtensionMaterializer<B>,
+{
+    /// Completed construction output shared by both admitted profiles.
+    type Output;
+    /// Mechanism-binding failure shared by both admitted profiles.
+    type Error;
+    /// State selected for compressed-latent DeepSeek-V3 execution.
+    type GatedState: eredu_runtime::LayerRuntimeState<B>;
+    /// State selected for pooling-attention DeepSeek-V4 execution.
+    type PoolingState: eredu_runtime::LayerRuntimeState<B>;
+    /// Exact visitor for the DeepSeek-V3 profile.
+    type GatedVisitor: RoutedPredictionTargetVisitor<
+        B,
+        Self::GatedState,
+        M,
+        Output = Self::Output,
+        Error = Self::Error,
+    >;
+    /// Exact visitor for the DeepSeek-V4 profile.
+    type PoolingVisitor: RoutedPredictionTargetVisitor<
+        B,
+        Self::PoolingState,
+        M,
+        Output = Self::Output,
+        Error = Self::Error,
+    >;
+
+    /// Consumes the dispatcher into its compressed-latent visitor.
+    fn into_gated_visitor(self) -> Self::GatedVisitor;
+    /// Consumes the dispatcher into its pooling-attention visitor.
+    fn into_pooling_visitor(self) -> Self::PoolingVisitor;
+}
+
+/// Selects, constructs, and pairs either admitted routed prediction target
+/// without requiring backend family inspection.
+pub fn dispatch_routed_prediction_target_architecture<B, M, D>(
+    inspection: &eredu_core::ArtifactInspection<crate::processor_plan::ArtifactArchitecturePlan>,
+    selected: SelectedRoutedTextRealization,
+    extension: crate::prediction_extension::MaterializedPredictionExtension<B, M>,
+    store: eredu_checkpoint::store::SharedCheckpointSource,
+    context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    dispatcher: D,
+) -> Result<D::Output, RoutedTextDispatchError<D::Error>>
+where
+    B: eredu_nn::BlockwiseAttentionBackend
+        + eredu_nn::DistributedNeuralBackend
+        + eredu_nn::GroupedNeuralBackend
+        + eredu_nn::HyperNeuralBackend,
+    M: crate::prediction_extension::PredictionExtensionMaterializer<B>,
+    D: RoutedPredictionProfileDispatcher<B, M>,
+    <D::GatedState as eredu_runtime::LayerRuntimeState<B>>::LayerState:
+        eredu_nn::AttentionCache<B::Tensor>
+            + eredu_runtime::RuntimeStateComponents<B>
+            + eredu_nn::CompressedAttentionCache<B::Tensor>,
+    <D::PoolingState as eredu_runtime::LayerRuntimeState<B>>::LayerState:
+        eredu_nn::PoolingAttentionCache<B::Tensor>,
+{
+    let models = (
+        inspection
+            .architecture_plan()
+            .safetensors_architecture()
+            .map(|plan| plan.model()),
+        inspection
+            .architecture_plan()
+            .gguf_plan()
+            .map(|plan| plan.model()),
+    );
+    match models {
+        (Some(crate::configuration::SafetensorsModelConfig::DeepSeekV3(_)), None)
+        | (None, Some(crate::configuration::GgufModelConfig::DeepSeekV3(_))) => {
+            visit_gated_routed_prediction_target_architecture::<B, D::GatedState, M, _>(
+                inspection,
+                selected,
+                extension,
+                store,
+                context,
+                dispatcher.into_gated_visitor(),
+            )
+        }
+        (Some(crate::configuration::SafetensorsModelConfig::DeepSeekV4(_)), None)
+        | (None, Some(crate::configuration::GgufModelConfig::DeepSeekV4(_))) => {
+            visit_pooling_routed_prediction_target_architecture::<B, D::PoolingState, M, _>(
+                inspection,
+                selected,
+                extension,
+                store,
+                context,
+                dispatcher.into_pooling_visitor(),
+            )
+        }
+        _ => Err(RoutedTextDispatchError::Architecture(
+            "routed prediction target requires DeepSeek-V3 or DeepSeek-V4".into(),
+        )),
+    }
+}
+
+/// Constructs the admitted DeepSeek-V3 target, pairs its extension, and invokes generic mechanisms.
+pub fn visit_gated_routed_prediction_target_architecture<B, S, M, V>(
+    inspection: &eredu_core::ArtifactInspection<crate::processor_plan::ArtifactArchitecturePlan>,
+    selected: SelectedRoutedTextRealization,
+    extension: crate::prediction_extension::MaterializedPredictionExtension<B, M>,
+    store: eredu_checkpoint::store::SharedCheckpointSource,
+    context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    mut visitor: V,
+) -> Result<V::Output, RoutedTextDispatchError<V::Error>>
+where
+    B: eredu_nn::BlockwiseAttentionBackend
+        + eredu_nn::DistributedNeuralBackend
+        + eredu_nn::GroupedNeuralBackend
+        + eredu_nn::HyperNeuralBackend,
+    S: eredu_runtime::LayerRuntimeState<B>,
+    S::LayerState: eredu_nn::AttentionCache<B::Tensor>
+        + eredu_runtime::RuntimeStateComponents<B>
+        + eredu_nn::CompressedAttentionCache<B::Tensor>,
+    M: crate::prediction_extension::PredictionExtensionMaterializer<B>,
+    V: RoutedPredictionTargetVisitor<B, S, M>,
+{
+    visitor.construction_started();
+    let prepared = prepare_deepseek_v3_routed_text_architecture::<B, S>(
+        inspection,
+        selected,
+        store.clone(),
+        context,
+    )
+    .map_err(|error| RoutedTextDispatchError::Architecture(error.to_string()))?;
+    visit_routed_prediction_target_architecture(prepared, extension, store, visitor)
+}
+
+/// Constructs the admitted DeepSeek-V4 target, pairs its extension, and invokes generic mechanisms.
+pub fn visit_pooling_routed_prediction_target_architecture<B, S, M, V>(
+    inspection: &eredu_core::ArtifactInspection<crate::processor_plan::ArtifactArchitecturePlan>,
+    selected: SelectedRoutedTextRealization,
+    extension: crate::prediction_extension::MaterializedPredictionExtension<B, M>,
+    store: eredu_checkpoint::store::SharedCheckpointSource,
+    context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    mut visitor: V,
+) -> Result<V::Output, RoutedTextDispatchError<V::Error>>
+where
+    B: eredu_nn::BlockwiseAttentionBackend
+        + eredu_nn::DistributedNeuralBackend
+        + eredu_nn::GroupedNeuralBackend
+        + eredu_nn::HyperNeuralBackend,
+    S: eredu_runtime::LayerRuntimeState<B>,
+    S::LayerState: eredu_nn::PoolingAttentionCache<B::Tensor>,
+    M: crate::prediction_extension::PredictionExtensionMaterializer<B>,
+    V: RoutedPredictionTargetVisitor<B, S, M>,
+{
+    visitor.construction_started();
+    let prepared = prepare_deepseek_v4_routed_text_architecture::<B, S>(
+        inspection,
+        selected,
+        store.clone(),
+        context,
+    )
+    .map_err(|error| RoutedTextDispatchError::Architecture(error.to_string()))?;
+    visit_routed_prediction_target_architecture(prepared, extension, store, visitor)
+}
+
+/// Pairs one materialized extension with its exact routed target before backend erasure.
+pub fn visit_routed_prediction_target_architecture<B, S, M, A, V>(
+    prepared: PreparedRoutedTextArchitecture<A>,
+    extension: crate::prediction_extension::MaterializedPredictionExtension<B, M>,
+    store: eredu_checkpoint::store::SharedCheckpointSource,
+    visitor: V,
+) -> Result<V::Output, RoutedTextDispatchError<V::Error>>
+where
+    B: eredu_nn::BlockwiseAttentionBackend
+        + eredu_nn::DistributedNeuralBackend
+        + eredu_nn::GroupedNeuralBackend
+        + eredu_nn::HyperNeuralBackend,
+    S: eredu_runtime::RuntimeState<B>,
+    M: crate::prediction_extension::PredictionExtensionMaterializer<B>,
+    A: eredu_runtime::ReplicatedTextArchitecture<B, S, Error = eredu_nn::Error>
+        + eredu_runtime::RoutedLayeredArchitecture<B, S>
+        + crate::prediction_extension::MaterializedPredictionTarget<B>
+        + 'static,
+    A::StaticModules: Clone,
+    A::Error: std::fmt::Display,
+    V: RoutedPredictionTargetVisitor<B, S, M>,
+{
+    let extension = A::pair_prediction_extension(extension)
+        .map_err(|error| RoutedTextDispatchError::Architecture(error.to_string()))?;
+    visitor
+        .visit(prepared, extension, store)
+        .map_err(RoutedTextDispatchError::Backend)
+}
+
 /// Constructs an admitted pooling-attention routed family and invokes generic mechanisms.
 pub fn visit_pooling_routed_text_architecture<B, S, V>(
     inspection: &eredu_core::ArtifactInspection<crate::processor_plan::ArtifactArchitecturePlan>,

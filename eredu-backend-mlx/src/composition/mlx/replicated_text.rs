@@ -13,17 +13,16 @@ use eredu_core::cache::{
     PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
     PromptCacheTopology, StateResidencyClass,
 };
-use eredu_nn::{NeuralBackend, Parameterized, PoolingAttentionCache, Tensor};
+use eredu_nn::{NeuralBackend, Parameterized, PoolingAttentionCache};
 use eredu_runtime::{
     BackendMechanismCapabilities, CacheResidencyPolicy, CacheResidencyReport,
     DenseDiskStreamReport, GroupedOperationRequirement, LayerRuntimeState, LayeredArchitecture,
     ReplicatedTextArchitecture, ReplicatedTextMaterializationTask, ReplicatedTextRequirements,
     ReplicatedTextSelectionRequest, ReplicatedTextSession, ReplicatedTextSessionMechanisms,
-    ResidencyReport, RuntimeState, RuntimeStateComponents, SelectedReplicatedTextRealization,
-    SelectedStateRealization, StateComponentMechanism, StateComponentPlacement,
-    StateMechanismCapabilities, TransactionalPromptCacheMechanisms, WeightBinding,
-    WeightLoweringCapability, WeightLoweringDescriptor, WeightLoweringKind,
-    WeightResidencyMechanism,
+    ResidencyReport, RuntimeState, SelectedReplicatedTextRealization, SelectedStateRealization,
+    StateComponentMechanism, StateComponentPlacement, StateMechanismCapabilities,
+    TransactionalPromptCacheMechanisms, WeightBinding, WeightLoweringCapability,
+    WeightLoweringDescriptor, WeightLoweringKind, WeightResidencyMechanism,
 };
 
 type MlxDirectPartitionExecutor<A> =
@@ -46,6 +45,12 @@ type MlxDirectPartitionStrategy<A> = eredu_runtime::PartitionedTextExecution<
 
 type MlxSharedAddressableBank =
     crate::backend::runtime::residency::parameter_bank::SharedAddressableParameterBank;
+type MlxEmbeddedPredictionObservers =
+    eredu_architectures::speculative_execution::EmbeddedPredictionObservers<
+        MlxTensor,
+        Array,
+        Exception,
+    >;
 use safemlx::{
     error::Exception, ops::indexing::TryIndexOp, transforms::async_eval_with_event, Array, Dtype,
     Stream,
@@ -736,6 +741,7 @@ trait ErasedPredictionTargetState: std::any::Any {
     ) -> Result<(), Exception>;
     fn as_any(&self) -> &dyn std::any::Any;
     fn into_any(self: Box<Self>) -> Box<dyn std::any::Any>;
+    fn offset(&self) -> i32;
 }
 
 impl<S> ErasedPredictionTargetState for S
@@ -766,85 +772,72 @@ where
     fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
         self
     }
-}
 
-pub(crate) struct MlxPredictionTargetCache {
-    state: Option<Box<dyn ErasedPredictionTargetState>>,
-    extension: Option<MlxPredictionExtensionState>,
-}
-
-#[derive(Clone)]
-pub(crate) struct MlxPredictionDraftCache {
-    extension: Option<MlxPredictionExtensionState>,
-}
-
-impl Clone for MlxPredictionTargetCache {
-    fn clone(&self) -> Self {
-        Self {
-            state: self.state.as_ref().map(|state| {
-                state
-                    .deep_clone_box()
-                    .expect("evaluated neutral prediction target state must be forkable")
-            }),
-            extension: self.extension.clone(),
-        }
+    fn offset(&self) -> i32 {
+        MlxStateMechanisms::offset(self)
     }
 }
 
-impl MlxPredictionTargetCache {
-    pub(crate) fn draft_cache(&self) -> MlxPredictionDraftCache {
-        MlxPredictionDraftCache {
-            extension: self.extension.clone(),
-        }
+/// Opaque MLX storage for one ordinary target lane.
+///
+/// Neutral prediction membership and transaction metadata live in
+/// `EmbeddedPredictionCache`; this wrapper supplies only native clone,
+/// restore, type transfer, and frontier inspection mechanisms.
+pub(crate) struct MlxPredictionTargetState(Option<Box<dyn ErasedPredictionTargetState>>);
+
+impl MlxPredictionTargetState {
+    pub(crate) fn new<S: MlxStateMechanisms + 'static>(state: S) -> Self {
+        Self(Some(Box::new(state)))
     }
 
-    pub(crate) fn commit_draft_cache(&mut self, draft: &MlxPredictionDraftCache) {
-        self.extension.clone_from(&draft.extension);
-    }
-
-    pub(crate) fn offset(&self) -> Result<i32, Error> {
-        self.state
+    fn is<S: 'static>(&self) -> bool {
+        self.0
             .as_ref()
-            .and_then(|state| state.as_any().downcast_ref::<MlxHybridState>())
-            .map(MlxHybridState::offset)
+            .is_some_and(|state| state.as_ref().as_any().is::<S>())
+    }
+
+    fn take_state<S: 'static>(&mut self) -> Result<S, Error> {
+        Ok(*self
+            .0
+            .take()
             .ok_or_else(|| {
-                Error::ArchitectureModel(
-                    "external-assistant lane does not own hybrid target state".into(),
-                )
-            })
+                Error::ArchitectureModel("prediction target state is already active".into())
+            })?
+            .into_any()
+            .downcast::<S>()
+            .expect("prediction target state type checked before transfer"))
     }
 
-    pub(crate) fn restore_checkpoint(
-        &mut self,
-        checkpoint: &Self,
-        stream: &Stream,
-    ) -> Result<(), Exception> {
-        match (&mut self.state, &checkpoint.state) {
-            (Some(current), Some(previous)) => current.restore_box(previous.as_ref(), stream)?,
-            (None, None) => {}
-            _ => {
-                return Err(Exception::custom(
-                    "prediction target checkpoint state presence changed",
-                ))
-            }
-        }
-        self.extension.clone_from(&checkpoint.extension);
-        Ok(())
+    fn restore_state<S: MlxStateMechanisms + 'static>(&mut self, state: S) {
+        self.0 = Some(Box::new(state));
     }
-}
 
-impl MlxPredictionDraftCache {
-    pub(crate) fn with_extension<T, E>(
-        &mut self,
-        operation: impl FnOnce(&mut MlxPredictionTargetCache) -> Result<T, E>,
-    ) -> Result<T, E> {
-        let mut cache = MlxPredictionTargetCache {
-            state: None,
-            extension: self.extension.take(),
-        };
-        let result = operation(&mut cache);
-        self.extension = cache.extension;
-        result
+    pub(crate) fn deep_clone(&self) -> Result<Self, Exception> {
+        self.0
+            .as_ref()
+            .ok_or_else(|| Exception::custom("prediction target state is already active"))?
+            .deep_clone_box()
+            .map(|state| Self(Some(state)))
+    }
+
+    pub(crate) fn restore(&mut self, checkpoint: &Self, stream: &Stream) -> Result<(), Exception> {
+        let current = self
+            .0
+            .as_mut()
+            .ok_or_else(|| Exception::custom("prediction target state is already active"))?;
+        let checkpoint = checkpoint
+            .0
+            .as_ref()
+            .ok_or_else(|| Exception::custom("prediction target checkpoint is active"))?;
+        current.restore_box(checkpoint.as_ref(), stream)
+    }
+
+    pub(crate) fn generation(&self) -> Result<u64, Error> {
+        let state = self.0.as_ref().ok_or_else(|| {
+            Error::ArchitectureModel("prediction target state is already active".into())
+        })?;
+        u64::try_from(state.offset())
+            .map_err(|_| Error::ArchitectureModel("target capture generation is negative".into()))
     }
 }
 
@@ -928,448 +921,13 @@ where
     }
 }
 
-pub(crate) enum MlxPredictionExtension {
-    DeepSeekV3 {
-        units: Vec<
-            crate::backend::nn::shared::MlxModule<
-                eredu_architectures::deepseek::v3::Unit<MlxNeuralBackend>,
-            >,
-        >,
-    },
-    DeepSeekV4 {
-        units: Vec<
-            crate::backend::nn::shared::MlxModule<
-                eredu_architectures::deepseek::v4::Unit<MlxNeuralBackend>,
-            >,
-        >,
-        state: Vec<crate::backend::runtime::cache::state::MlxPoolingAttentionCache>,
-    },
-    Inkling {
-        model: crate::backend::nn::shared::MlxModule<
-            eredu_architectures::inkling::MtpModel<MlxNeuralBackend>,
-        >,
-        state: MlxHybridState,
-    },
-    QwenHybrid {
-        units: Vec<
-            crate::backend::nn::shared::MlxModule<
-                eredu_architectures::qwen::hybrid::PredictionUnit<MlxNeuralBackend>,
-            >,
-        >,
-        state: MlxHybridState,
-    },
-    NemotronH {
-        groups: Vec<
-            Vec<
-                crate::backend::nn::shared::MlxModule<
-                    eredu_architectures::nemotron_h::PredictionUnit<MlxNeuralBackend>,
-                >,
-            >,
-        >,
-        state: MlxHybridState,
-    },
-}
+pub(crate) struct MlxEmbeddedPredictionMaterializer;
 
-#[derive(Clone)]
-enum MlxPredictionExtensionState {
-    DeepSeekV3(Vec<crate::backend::runtime::cache::kv::CompressedLatentCache>),
-    DeepSeekV4(Vec<crate::backend::runtime::cache::state::MlxPoolingAttentionCache>),
-    Inkling(MlxHybridState),
-    QwenHybrid(MlxHybridState),
-    NemotronH(MlxHybridState),
-}
-
-impl MlxPredictionExtension {
-    fn depth(&self) -> usize {
-        match self {
-            Self::DeepSeekV3 { units } => units.len(),
-            Self::DeepSeekV4 { units, .. } => units.len(),
-            Self::Inkling { model, .. } => model.len(),
-            Self::QwenHybrid { units, .. } => units.len(),
-            Self::NemotronH { groups, .. } => groups.len(),
-        }
-    }
-
-    fn new_state(&self) -> MlxPredictionExtensionState {
-        match self {
-            Self::DeepSeekV3 { units } => MlxPredictionExtensionState::DeepSeekV3(
-                (0..units.len())
-                    .map(|_| crate::backend::runtime::cache::kv::CompressedLatentCache::new())
-                    .collect(),
-            ),
-            Self::DeepSeekV4 { state, .. } => {
-                MlxPredictionExtensionState::DeepSeekV4(state.clone())
-            }
-            Self::Inkling { state, .. } => MlxPredictionExtensionState::Inkling(state.clone()),
-            Self::QwenHybrid { state, .. } => {
-                MlxPredictionExtensionState::QwenHybrid(state.clone())
-            }
-            Self::NemotronH { state, .. } => MlxPredictionExtensionState::NemotronH(state.clone()),
-        }
-    }
-}
-
-struct V3PredictionUnitOperation<'a> {
-    unit: &'a mut crate::backend::nn::shared::MlxModule<
-        eredu_architectures::deepseek::v3::Unit<MlxNeuralBackend>,
-    >,
-    hidden: &'a MlxTensor,
-    tokens: &'a MlxTensor,
-    cache: &'a mut crate::backend::runtime::cache::kv::CompressedLatentCache,
-}
-
-impl<A, S> eredu_runtime::PredictionTargetOperation<A, MlxNeuralBackend, S>
-    for V3PredictionUnitOperation<'_>
-where
-    S: RuntimeState<MlxNeuralBackend>,
-    A: ReplicatedTextArchitecture<MlxNeuralBackend, S, Error = eredu_nn::Error> + 'static,
-{
-    type Output = eredu_architectures::deepseek::mtp::PredictionOutput<MlxTensor>;
-
-    fn apply(
-        self,
-        architecture: &mut A,
-        _state: &mut S,
-        parallel: Option<&<MlxNeuralBackend as NeuralBackend>::ParallelContext>,
-        context: &Stream,
-    ) -> Result<Self::Output, eredu_nn::Error> {
-        let architecture = (architecture as &mut dyn std::any::Any)
-            .downcast_mut::<eredu_architectures::deepseek::v3::Model<MlxNeuralBackend>>()
-            .ok_or_else(|| {
-                eredu_nn::Error::backend(
-                    "DeepSeek-V3 prediction extension received a different target architecture",
-                )
-            })?;
-        let result = if let Some(parallel) = parallel {
-            architecture.pipeline_forward_prediction_neutral_parallel(
-                self.unit,
-                self.hidden,
-                self.tokens,
-                self.cache,
-                parallel,
-                context,
-            )
-        } else {
-            architecture.pipeline_forward_prediction(
-                self.unit,
-                self.hidden,
-                self.tokens,
-                self.cache,
-                context,
-            )
-        };
-        result.map_err(|error| eredu_nn::Error::backend(error.to_string()))
-    }
-}
-
-struct V4PredictionUnitOperation<'a> {
-    unit: &'a mut crate::backend::nn::shared::MlxModule<
-        eredu_architectures::deepseek::v4::Unit<MlxNeuralBackend>,
-    >,
-    hidden: &'a MlxTensor,
-    tokens: &'a MlxTensor,
-    cache: &'a mut crate::backend::runtime::cache::state::MlxPoolingAttentionCache,
-}
-
-impl<A, S> eredu_runtime::PredictionTargetOperation<A, MlxNeuralBackend, S>
-    for V4PredictionUnitOperation<'_>
-where
-    S: RuntimeState<MlxNeuralBackend>,
-    A: ReplicatedTextArchitecture<MlxNeuralBackend, S, Error = eredu_nn::Error> + 'static,
-{
-    type Output = eredu_architectures::deepseek::mtp::PredictionOutput<MlxTensor>;
-
-    fn apply(
-        self,
-        architecture: &mut A,
-        _state: &mut S,
-        parallel: Option<&<MlxNeuralBackend as NeuralBackend>::ParallelContext>,
-        context: &Stream,
-    ) -> Result<Self::Output, eredu_nn::Error> {
-        let architecture = (architecture as &mut dyn std::any::Any)
-            .downcast_mut::<eredu_architectures::deepseek::v4::Model<MlxNeuralBackend>>()
-            .ok_or_else(|| {
-                eredu_nn::Error::backend(
-                    "DeepSeek-V4 prediction extension received a different target architecture",
-                )
-            })?;
-        let hidden = architecture.begin_partition_prediction_hidden(self.hidden, context)?;
-        let output = if let Some(parallel) = parallel {
-            architecture.pipeline_forward_prediction_neutral_parallel(
-                self.unit,
-                &hidden,
-                self.tokens,
-                self.cache,
-                parallel,
-                context,
-            )
-        } else {
-            architecture.pipeline_forward_prediction(
-                self.unit,
-                &hidden,
-                self.tokens,
-                self.cache,
-                context,
-            )
-        }?;
-        architecture.finish_partition_prediction_output(output, context)
-    }
-}
-
-struct InklingPredictionUnitOperation<'a> {
-    model: &'a mut crate::backend::nn::shared::MlxModule<
-        eredu_architectures::inkling::MtpModel<MlxNeuralBackend>,
-    >,
-    hidden: &'a MlxTensor,
-    tokens: &'a MlxTensor,
-    depth: usize,
-    state: &'a mut MlxHybridState,
-}
-
-struct QwenHybridPredictionUnitOperation<'a> {
-    unit: &'a mut crate::backend::nn::shared::MlxModule<
-        eredu_architectures::qwen::hybrid::PredictionUnit<MlxNeuralBackend>,
-    >,
-    hidden: &'a MlxTensor,
-    tokens: &'a MlxTensor,
-    depth: usize,
-    state: &'a mut MlxHybridState,
-}
-
-struct NemotronHPredictionGroupOperation<'a> {
-    units: &'a mut [crate::backend::nn::shared::MlxModule<
-        eredu_architectures::nemotron_h::PredictionUnit<MlxNeuralBackend>,
-    >],
-    hidden: &'a MlxTensor,
-    tokens: &'a MlxTensor,
-    depth: usize,
-    state: &'a mut MlxHybridState,
-}
-
-impl<A, S> eredu_runtime::PredictionTargetOperation<A, MlxNeuralBackend, S>
-    for NemotronHPredictionGroupOperation<'_>
-where
-    S: RuntimeState<MlxNeuralBackend>,
-    A: ReplicatedTextArchitecture<MlxNeuralBackend, S, Error = eredu_nn::Error> + 'static,
-{
-    type Output = crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput;
-
-    fn apply(
-        self,
-        architecture: &mut A,
-        _state: &mut S,
-        parallel: Option<&<MlxNeuralBackend as NeuralBackend>::ParallelContext>,
-        context: &Stream,
-    ) -> Result<Self::Output, eredu_nn::Error> {
-        let architecture = (architecture as &mut dyn std::any::Any)
-            .downcast_mut::<
-                eredu_architectures::nemotron_h::PartitionedLayeredModel<MlxNeuralBackend>,
-            >()
-            .ok_or_else(|| {
-                eredu_nn::Error::backend(
-                    "Nemotron-H prediction extension received a different target architecture",
-                )
-            })?;
-        if self.units.is_empty() {
-            return Err(eredu_nn::Error::backend(
-                "Nemotron-H prediction group has no physical units",
-            ));
-        }
-        let embedded = match parallel {
-            Some(parallel) => {
-                architecture.embed_prediction_parallel(self.tokens, parallel, context)?
-            }
-            None => architecture.embed_prediction(self.tokens, context)?,
-        };
-        let state_start = self
-            .depth
-            .checked_mul(self.units.len())
-            .ok_or_else(|| eredu_nn::Error::backend("Nemotron-H MTP state index overflowed"))?;
-        let sequence = self.tokens.dim(1);
-        let mask = if sequence > 1 {
-            Some(<MlxNeuralBackend as NeuralBackend>::causal_mask(
-                sequence,
-                self.state
-                    .layer(state_start)
-                    .map_err(eredu_nn::Error::backend)?
-                    .position(),
-                None,
-                context,
-            )?)
-        } else {
-            None
-        };
-        let mut hidden = self.hidden.clone();
-        for (relative, unit) in self.units.iter_mut().enumerate() {
-            let state = self
-                .state
-                .layer(state_start + relative)
-                .map_err(eredu_nn::Error::backend)?;
-            hidden = match parallel {
-                Some(parallel) => unit.forward_parallel_with_provider(
-                    &hidden,
-                    &embedded,
-                    mask.as_ref(),
-                    state,
-                    parallel,
-                    context,
-                    &mut eredu_runtime::ResidentExpertProvider,
-                )?,
-                None => unit.forward(&hidden, &embedded, mask.as_ref(), state, context)?,
-            };
-        }
-        let logits = match parallel {
-            Some(parallel) => {
-                architecture.project_prediction_parallel(&hidden, parallel, context)?
-            }
-            None => architecture.project_prediction(&hidden, context)?,
-        };
-        Ok(
-            crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput {
-                logits,
-                hidden,
-                tokens: self.tokens.clone(),
-            },
-        )
-    }
-}
-
-impl<A>
-    eredu_runtime::PredictionTargetOperation<
-        PreparedCompositeArchitecture<A>,
+pub(crate) type MaterializedEmbeddedPrediction =
+    eredu_architectures::prediction_extension::MaterializedPredictionExtension<
         MlxNeuralBackend,
-        MlxHybridState,
-    > for QwenHybridPredictionUnitOperation<'_>
-where
-    A: CompositeArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error> + 'static,
-    A::InputPartPlan: 'static,
-{
-    type Output = crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput;
-
-    fn apply(
-        self,
-        architecture: &mut PreparedCompositeArchitecture<A>,
-        _state: &mut MlxHybridState,
-        parallel: Option<&<MlxNeuralBackend as NeuralBackend>::ParallelContext>,
-        context: &Stream,
-    ) -> Result<Self::Output, eredu_nn::Error> {
-        let architecture = (architecture.inner_mut() as &mut dyn std::any::Any)
-            .downcast_mut::<
-                eredu_architectures::qwen::hybrid::ConditionalLayeredModel<MlxNeuralBackend>,
-            >()
-            .ok_or_else(|| {
-                eredu_nn::Error::backend(
-                    "Qwen hybrid prediction extension received a different target architecture",
-                )
-            })?;
-        let embedded = match parallel {
-            Some(parallel) => architecture.begin_partition_prediction_embedding_parallel(
-                self.tokens,
-                parallel,
-                context,
-            )?,
-            None => architecture.begin_partition_prediction_embedding(self.tokens, context)?,
-        };
-        let state = self
-            .state
-            .layer(self.depth)
-            .map_err(eredu_nn::Error::backend)?;
-        let sequence = self.tokens.dim(1);
-        let mask = if sequence > 1 {
-            Some(<MlxNeuralBackend as NeuralBackend>::causal_mask(
-                sequence,
-                state.position(),
-                None,
-                context,
-            )?)
-        } else {
-            None
-        };
-        let hidden = match parallel {
-            Some(parallel) => self.unit.forward_parallel(
-                self.hidden,
-                &embedded,
-                mask.as_ref(),
-                state,
-                parallel,
-                context,
-                &mut eredu_runtime::ResidentExpertProvider,
-            )?,
-            None => self
-                .unit
-                .forward(self.hidden, &embedded, mask.as_ref(), state, context)?,
-        };
-        let logits = match parallel {
-            Some(parallel) => {
-                architecture.finish_partition_prediction_parallel(&hidden, parallel, context)?
-            }
-            None => architecture.finish_partition_prediction(&hidden, context)?,
-        };
-        Ok(
-            crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput {
-                logits,
-                hidden,
-                tokens: self.tokens.clone(),
-            },
-        )
-    }
-}
-
-impl<A>
-    eredu_runtime::PredictionTargetOperation<
-        PreparedCompositeArchitecture<A>,
-        MlxNeuralBackend,
-        MlxHybridState,
-    > for InklingPredictionUnitOperation<'_>
-where
-    A: CompositeArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error> + 'static,
-    A::InputPartPlan: 'static,
-{
-    type Output = crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput;
-
-    fn apply(
-        self,
-        architecture: &mut PreparedCompositeArchitecture<A>,
-        _state: &mut MlxHybridState,
-        parallel: Option<&<MlxNeuralBackend as NeuralBackend>::ParallelContext>,
-        context: &Stream,
-    ) -> Result<Self::Output, eredu_nn::Error> {
-        let architecture = (architecture.inner_mut() as &mut dyn std::any::Any)
-            .downcast_mut::<eredu_architectures::inkling::LayeredModel<MlxNeuralBackend>>()
-            .ok_or_else(|| {
-                eredu_nn::Error::backend(
-                    "Inkling prediction extension received a different target architecture",
-                )
-            })?;
-        let embeddings = match parallel {
-            Some(parallel) => {
-                architecture.mtp_token_embeddings_parallel(self.tokens, parallel, context)?
-            }
-            None => architecture.mtp_token_embeddings(self.tokens, context)?,
-        };
-        let output = self.model.forward_step(
-            self.hidden,
-            &embeddings,
-            self.tokens,
-            self.depth,
-            self.state.layers_mut(),
-            context,
-        )?;
-        let logits = match parallel {
-            Some(parallel) => {
-                architecture.project_mtp_logits_parallel(&output.hidden, parallel, context)?
-            }
-            None => architecture.project_mtp_logits(&output.hidden, context)?,
-        };
-        Ok(
-            crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput {
-                logits,
-                hidden: output.hidden,
-                tokens: output.tokens,
-            },
-        )
-    }
-}
+        MlxEmbeddedPredictionMaterializer,
+    >;
 
 fn materialize_prepared_prediction_unit<M>(
     prepared: eredu_architectures::prediction_extension::PreparedPredictionUnit<M>,
@@ -1409,107 +967,154 @@ pub(crate) fn materialize_prediction_extension(
     store: &dyn CheckpointSource,
     stream: &Stream,
     weights_stream: &Stream,
-) -> Result<MlxPredictionExtension, Error> {
-    use crate::backend::runtime::cache::state::MlxPoolingAttentionCache;
-    match prepared {
-        eredu_architectures::prediction_extension::PreparedPredictionExtension::DeepSeekV3 {
+) -> Result<MaterializedEmbeddedPrediction, Error> {
+    let mut context = MlxPredictionMaterializationContext {
+        store,
+        stream,
+        weights_stream,
+    };
+    prepared.materialize::<MlxEmbeddedPredictionMaterializer>(&mut context)
+}
+
+pub(crate) struct MlxPredictionMaterializationContext<'a> {
+    store: &'a dyn CheckpointSource,
+    stream: &'a Stream,
+    weights_stream: &'a Stream,
+}
+
+impl eredu_architectures::prediction_extension::PredictionExtensionMaterializer<MlxNeuralBackend>
+    for MlxEmbeddedPredictionMaterializer
+{
+    type Error = Error;
+    type Module<M> = crate::backend::nn::shared::MlxModule<M>;
+    type PoolingState = crate::backend::runtime::cache::state::MlxPoolingAttentionCache;
+    type SequentialState = crate::backend::runtime::cache::kv::CompressedLatentCache;
+    type ModelState = MlxHybridState;
+    type Context<'a> = MlxPredictionMaterializationContext<'a>;
+
+    fn materialize_module<M>(
+        context: &mut Self::Context<'_>,
+        prepared: eredu_architectures::prediction_extension::PreparedPredictionUnit<M>,
+        layout: Option<&eredu_runtime::LocalModelLayout>,
+    ) -> Result<Self::Module<M>, Self::Error>
+    where
+        M: Parameterized<MlxTensor>,
+    {
+        materialize_prepared_prediction_unit(
+            prepared,
             layout,
-            units,
-        } => Ok(MlxPredictionExtension::DeepSeekV3 {
-            units: units
-                .into_iter()
-                .map(|unit| {
-                    materialize_prepared_prediction_unit(
-                        unit,
-                        Some(&layout),
-                        store,
-                        stream,
-                        weights_stream,
-                    )
-                })
-                .collect::<Result<_, _>>()?,
-        }),
-        eredu_architectures::prediction_extension::PreparedPredictionExtension::DeepSeekV4 {
-            layout,
-            units,
-            state,
-        } => Ok(MlxPredictionExtension::DeepSeekV4 {
-            units: units
-                .into_iter()
-                .map(|unit| {
-                    materialize_prepared_prediction_unit(
-                        unit,
-                        Some(&layout),
-                        store,
-                        stream,
-                        weights_stream,
-                    )
-                })
-                .collect::<Result<_, _>>()?,
-            state: state
-                .into_iter()
-                .map(|(ordinal, policy)| {
-                    MlxPoolingAttentionCache::resident_from_policy(ordinal, &policy)
-                })
-                .collect::<Result<_, _>>()?,
-        }),
-        eredu_architectures::prediction_extension::PreparedPredictionExtension::Inkling {
-            model,
-            state,
-        } => Ok(MlxPredictionExtension::Inkling {
-            model: materialize_prepared_prediction_unit(
-                model,
-                None,
-                store,
-                stream,
-                weights_stream,
-            )?,
-            state: MlxHybridState::device(state)?,
-        }),
-        eredu_architectures::prediction_extension::PreparedPredictionExtension::QwenHybrid {
-            layout,
-            units,
-            state,
-        } => Ok(MlxPredictionExtension::QwenHybrid {
-            units: units
-                .into_iter()
-                .map(|unit| {
-                    materialize_prepared_prediction_unit(
-                        unit,
-                        Some(&layout),
-                        store,
-                        stream,
-                        weights_stream,
-                    )
-                })
-                .collect::<Result<_, _>>()?,
-            state: MlxHybridState::device(state)?,
-        }),
-        eredu_architectures::prediction_extension::PreparedPredictionExtension::NemotronH {
-            layout,
-            groups,
-            state,
-        } => Ok(MlxPredictionExtension::NemotronH {
-            groups: groups
-                .into_iter()
-                .map(|units| {
-                    units
-                        .into_iter()
-                        .map(|unit| {
-                            materialize_prepared_prediction_unit(
-                                unit,
-                                Some(&layout),
-                                store,
-                                stream,
-                                weights_stream,
-                            )
-                        })
-                        .collect::<Result<_, _>>()
-                })
-                .collect::<Result<_, _>>()?,
-            state: MlxHybridState::device(state)?,
-        }),
+            context.store,
+            context.stream,
+            context.weights_stream,
+        )
     }
+
+    fn pooling_state(
+        _context: &mut Self::Context<'_>,
+        ordinal: usize,
+        policy: eredu_core::cache::LayerCachePolicy,
+    ) -> Result<Self::PoolingState, Self::Error> {
+        Ok(Self::PoolingState::resident_from_policy(ordinal, &policy)?)
+    }
+
+    fn model_state(
+        _context: &mut Self::Context<'_>,
+        layout: eredu_runtime::StateLayout,
+    ) -> Result<Self::ModelState, Self::Error> {
+        Ok(MlxHybridState::device(layout)?)
+    }
+
+    fn sequential_state() -> Self::SequentialState {
+        Self::SequentialState::new()
+    }
+}
+
+impl eredu_architectures::prediction_extension::PredictionModelState<MlxNeuralBackend>
+    for MlxHybridState
+{
+    type LayerState = crate::backend::runtime::cache::state::MlxHybridLayerState;
+
+    fn prediction_layers_mut(&mut self) -> &mut [Self::LayerState] {
+        self.layers_mut()
+    }
+}
+
+struct SelectedPrediction<P> {
+    extension: P,
+    selected: eredu_runtime::SelectedSpeculativeRealization,
+}
+
+struct NoSelectedPrediction;
+
+trait ReplicatedPredictionCapability<A, S, D>: Sized
+where
+    S: MlxStateMechanisms,
+    A: ReplicatedTextArchitecture<MlxNeuralBackend, S, Error = eredu_nn::Error>,
+    A::StaticModules: Clone,
+    D: eredu_runtime::ReplicatedTextExecutionStrategy<
+        A,
+        MlxNeuralBackend,
+        S,
+        MlxArchitectureLayerwisePolicy<A, S>,
+        MlxArchitectureLayerwisePolicy<A, S>,
+    >,
+{
+    fn lend(
+        model: &mut CompletedReplicatedText<A, S, D, Self>,
+        continuation: &mut dyn super::prepared_speculative::MlxEmbeddedExecutorContinuation,
+    ) -> Option<Result<eredu_core::SpeculativeGenerationBatchOutput, Error>>;
+
+    fn present() -> bool;
+}
+
+impl<A, S, D> ReplicatedPredictionCapability<A, S, D> for NoSelectedPrediction
+where
+    S: MlxStateMechanisms,
+    A: ReplicatedTextArchitecture<MlxNeuralBackend, S, Error = eredu_nn::Error>,
+    A::StaticModules: Clone,
+    D: eredu_runtime::ReplicatedTextExecutionStrategy<
+        A,
+        MlxNeuralBackend,
+        S,
+        MlxArchitectureLayerwisePolicy<A, S>,
+        MlxArchitectureLayerwisePolicy<A, S>,
+    >,
+{
+    fn lend(
+        _: &mut CompletedReplicatedText<A, S, D, Self>,
+        _: &mut dyn super::prepared_speculative::MlxEmbeddedExecutorContinuation,
+    ) -> Option<Result<eredu_core::SpeculativeGenerationBatchOutput, Error>> {
+        None
+    }
+
+    fn present() -> bool {
+        false
+    }
+}
+
+pub(crate) trait ErasedExternalPredictionExecutable: 'static {
+    fn external_assistant_target_profile(
+        &self,
+    ) -> eredu_architectures::external_assistant::ExternalAssistantTargetProfile;
+    fn prepare_external_prediction_target_cache(
+        &mut self,
+    ) -> Result<MlxPredictionTargetState, Error>;
+    fn prefill_external_prediction_target(
+        &mut self,
+        input: input::ModelInput<'_>,
+        request: &ExternalPredictionCaptureRequest,
+        cache: &mut MlxPredictionTargetState,
+    ) -> Result<(MlxTensor, ExternalPredictionTargetCapture<MlxTensor>), Error>;
+    fn verify_external_prediction_target(
+        &mut self,
+        tokens: &MlxTensor,
+        request: &ExternalPredictionCaptureRequest,
+        cache: &mut MlxPredictionTargetState,
+    ) -> Result<(MlxTensor, ExternalPredictionTargetCapture<MlxTensor>), Error>;
+    fn apply_external_prediction_target_operation(
+        &mut self,
+        operation: ExternalPredictionTargetOperation<'_, MlxTensor>,
+    ) -> Result<MlxTensor, Error>;
 }
 
 /// Backend-private erased operations for a paired architecture and mutable state.
@@ -1553,114 +1158,28 @@ pub(crate) trait ErasedReplicatedTextExecutable {
     fn partition_public_output(&self) -> bool {
         true
     }
-    fn install_prediction_extension_contract(
+    fn with_embedded_prediction(
         &mut self,
-        _extension: MlxPredictionExtension,
-        _capability: eredu_architectures::capability::CapabilityEstimate,
-    ) -> Result<(), Error> {
-        Err(Error::ArchitectureModel(
-            "the selected neutral executable cannot host a prediction extension".into(),
-        ))
-    }
-    fn prediction_extension_depth(&self) -> Option<usize> {
+        _continuation: &mut dyn super::prepared_speculative::MlxEmbeddedExecutorContinuation,
+    ) -> Option<Result<eredu_core::SpeculativeGenerationBatchOutput, Error>> {
         None
     }
-    fn external_prediction_capture_request(
-        &self,
-        _drafter: &super::speculative::MlxDrafter,
-    ) -> Result<Option<ExternalPredictionCaptureRequest>, Error> {
-        Ok(None)
+    fn has_embedded_prediction(&self) -> bool {
+        false
     }
-    fn prepare_external_prediction_target_cache(
+    fn install_embedded_prediction_observers(
         &mut self,
-    ) -> Result<MlxPredictionTargetCache, Error> {
-        Err(Error::ArchitectureModel(
-            "the selected neutral executable has no external-assistant target contract".into(),
-        ))
+        _observers: MlxEmbeddedPredictionObservers,
+    ) -> bool {
+        false
     }
-    fn prefill_external_prediction_target(
+    fn external_prediction(&self) -> Option<&(dyn ErasedExternalPredictionExecutable + 'static)> {
+        None
+    }
+    fn external_prediction_mut(
         &mut self,
-        _input: input::ModelInput<'_>,
-        _request: &ExternalPredictionCaptureRequest,
-        _cache: &mut MlxPredictionTargetCache,
-    ) -> Result<(MlxTensor, ExternalPredictionTargetCapture<MlxTensor>), Error> {
-        Err(Error::ArchitectureModel(
-            "the selected neutral executable has no external-assistant target contract".into(),
-        ))
-    }
-    fn verify_external_prediction_target(
-        &mut self,
-        _tokens: &MlxTensor,
-        _request: &ExternalPredictionCaptureRequest,
-        _cache: &mut MlxPredictionTargetCache,
-    ) -> Result<(MlxTensor, ExternalPredictionTargetCapture<MlxTensor>), Error> {
-        Err(Error::ArchitectureModel(
-            "the selected neutral executable has no external-assistant target contract".into(),
-        ))
-    }
-    fn apply_external_prediction_target_operation(
-        &mut self,
-        _operation: ExternalPredictionTargetOperation<'_, MlxTensor>,
-    ) -> Result<MlxTensor, Error> {
-        Err(Error::ArchitectureModel(
-            "the selected neutral executable has no external-assistant target contract".into(),
-        ))
-    }
-    fn prepare_prediction_target_cache(&mut self) -> Result<MlxPredictionTargetCache, Error> {
-        Err(Error::ArchitectureModel(
-            "the selected neutral executable has no prediction-target extension".into(),
-        ))
-    }
-    fn prefill_prediction_target(
-        &mut self,
-        input: input::ModelInput<'_>,
-        cache: &mut MlxPredictionTargetCache,
-    ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Error> {
-        let _ = (input, cache);
-        Err(Error::ArchitectureModel(
-            "the selected neutral executable has no prediction-target extension".into(),
-        ))
-    }
-    fn verify_prediction_target(
-        &mut self,
-        tokens: &MlxTensor,
-        cache: &mut MlxPredictionTargetCache,
-    ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Error> {
-        let _ = (tokens, cache);
-        Err(Error::ArchitectureModel(
-            "the selected neutral executable has no prediction-target extension".into(),
-        ))
-    }
-    fn prefill_prediction_extension(
-        &mut self,
-        _output: &crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput,
-        _tokens: &MlxTensor,
-        _cache: &mut MlxPredictionTargetCache,
-    ) -> Result<(), Error> {
-        Err(Error::ArchitectureModel(
-            "the selected neutral executable has no prediction extension".into(),
-        ))
-    }
-    fn prediction_extension_logits(
-        &mut self,
-        _hidden: &MlxTensor,
-        _last_token: u32,
-        _draft_index: usize,
-        _cache: &mut MlxPredictionTargetCache,
-    ) -> Result<(MlxTensor, MlxTensor), Error> {
-        Err(Error::ArchitectureModel(
-            "the selected neutral executable has no prediction extension".into(),
-        ))
-    }
-    fn advance_prediction_extension(
-        &mut self,
-        _hidden: &MlxTensor,
-        _tokens: &MlxTensor,
-        _cache: &mut MlxPredictionTargetCache,
-    ) -> Result<(), Error> {
-        Err(Error::ArchitectureModel(
-            "the selected neutral executable has no prediction extension".into(),
-        ))
+    ) -> Option<&mut (dyn ErasedExternalPredictionExecutable + 'static)> {
+        None
     }
     fn prompt_cache_model_identity(&self) -> &PromptCacheModelIdentity;
     fn reset_cache(&mut self) -> Result<(), Exception>;
@@ -1783,7 +1302,8 @@ pub(crate) fn prepared_composite_input(
         .map_err(|error| Error::ArchitectureModel(error.to_string()))
 }
 
-trait MlxStateMechanisms: LayerRuntimeState<MlxNeuralBackend> + Sized {
+pub(crate) trait MlxStateMechanisms: LayerRuntimeState<MlxNeuralBackend> + Sized {
+    fn offset(&self) -> i32;
     fn realize(
         selected: &SelectedStateRealization,
         rank: Option<eredu_core::cache::CacheRankIdentity>,
@@ -1845,6 +1365,10 @@ fn selected_state_manager(
 }
 
 impl MlxStateMechanisms for MlxKeyValueState {
+    fn offset(&self) -> i32 {
+        MlxKeyValueState::offset(self)
+    }
+
     fn realize(
         selected: &SelectedStateRealization,
         rank: Option<eredu_core::cache::CacheRankIdentity>,
@@ -1955,6 +1479,10 @@ impl MlxStateMechanisms for MlxKeyValueState {
 }
 
 impl MlxStateMechanisms for MlxHybridState {
+    fn offset(&self) -> i32 {
+        MlxHybridState::offset(self)
+    }
+
     fn realize(
         selected: &SelectedStateRealization,
         rank: Option<eredu_core::cache::CacheRankIdentity>,
@@ -2064,6 +1592,10 @@ impl MlxStateMechanisms for MlxHybridState {
 }
 
 impl MlxStateMechanisms for MlxPoolingAttentionState {
+    fn offset(&self) -> i32 {
+        self.as_ref().first().map_or(0, |layer| layer.offset())
+    }
+
     fn realize(
         selected: &SelectedStateRealization,
         rank: Option<eredu_core::cache::CacheRankIdentity>,
@@ -3134,8 +2666,12 @@ where
     }
 }
 
-struct CompletedReplicatedText<A, S, D = eredu_runtime::DirectReplicatedTextExecution>
-where
+struct CompletedReplicatedText<
+    A,
+    S,
+    D = eredu_runtime::DirectReplicatedTextExecution,
+    P = NoSelectedPrediction,
+> where
     S: MlxStateMechanisms,
     A: ReplicatedTextArchitecture<MlxNeuralBackend, S, Error = eredu_nn::Error>,
     A::StaticModules: Clone,
@@ -3152,8 +2688,8 @@ where
     capability_estimate: eredu_architectures::capability::CapabilityEstimate,
     effective_model_type: String,
     materialization: Option<eredu_runtime::WeightMaterializationReport>,
-    prediction_extension_depth: Option<usize>,
-    prediction_extension: Option<MlxPredictionExtension>,
+    prediction: P,
+    embedded_prediction_observers: MlxEmbeddedPredictionObservers,
     parameter_bank:
         Option<crate::backend::runtime::residency::parameter_bank::SharedAddressableParameterBank>,
     #[cfg(test)]
@@ -3216,8 +2752,8 @@ where
             capability_estimate,
             effective_model_type,
             materialization,
-            prediction_extension_depth: None,
-            prediction_extension: None,
+            prediction: NoSelectedPrediction,
+            embedded_prediction_observers: MlxEmbeddedPredictionObservers::default(),
             parameter_bank: None,
             #[cfg(test)]
             selected_residency,
@@ -3264,8 +2800,8 @@ where
             capability_estimate,
             effective_model_type,
             materialization,
-            prediction_extension_depth: None,
-            prediction_extension: None,
+            prediction: NoSelectedPrediction,
+            embedded_prediction_observers: MlxEmbeddedPredictionObservers::default(),
             parameter_bank: None,
             #[cfg(test)]
             selected_residency,
@@ -3277,12 +2813,6 @@ where
         }
     }
 
-    fn published<T>(&self, value: T) -> T {
-        #[cfg(test)]
-        super::path_instrumentation::state_publication();
-        value
-    }
-
     fn with_parameter_bank(
         mut self,
         parameter_bank: crate::backend::runtime::residency::parameter_bank::SharedAddressableParameterBank,
@@ -3291,65 +2821,64 @@ where
         self
     }
 
-    fn with_prediction_target_state<T>(
-        &mut self,
-        cache: &mut MlxPredictionTargetCache,
-        operation: impl FnOnce(
-            &mut ReplicatedTextSession<A, MlxNeuralBackend, MlxReplicatedTextMechanisms<A, S>, D>,
-        ) -> Result<T, Error>,
-    ) -> Result<T, Error>
+    fn with_prediction<P>(
+        self,
+        prediction: SelectedPrediction<P>,
+        capability: eredu_architectures::capability::CapabilityEstimate,
+    ) -> Result<CompletedReplicatedText<A, S, D, SelectedPrediction<P>>, Error>
     where
-        S: 'static,
+        P: eredu_architectures::prediction_extension::MaterializedPredictionExecutor<
+            A,
+            MlxNeuralBackend,
+            MlxEmbeddedPredictionMaterializer,
+        >,
     {
-        if !cache
-            .state
-            .as_ref()
-            .is_some_and(|state| state.as_any().is::<S>())
-        {
+        if prediction.extension.depth() == 0 || capability.speculative_draft_source().is_none() {
             return Err(Error::ArchitectureModel(
-                "prediction target cache state type differs from the neutral session".into(),
+                "prediction extension contract is missing executable draft depth".into(),
             ));
         }
-        let erased = cache.state.take().ok_or_else(|| {
-            Error::ArchitectureModel("prediction target cache is already active".into())
-        })?;
-        let mut lane = *erased
-            .into_any()
-            .downcast::<S>()
-            .expect("prediction target cache type checked before ownership transfer");
-        if let Err(error) = self
-            .session
-            .exchange_prediction_target_state(&mut lane, &self.stream)
-        {
-            cache.state = Some(Box::new(lane));
-            return Err(Error::ArchitectureModel(error.to_string()));
-        }
-        let result = operation(&mut self.session);
-        let restored = match self
-            .session
-            .exchange_prediction_target_state(&mut lane, &self.stream)
-        {
-            Ok(()) => Ok(()),
-            Err(error) => self
-                .session
-                .recover_prediction_target_state_after_failure(&mut lane)
-                .map_err(|recovery| {
-                    Error::ArchitectureModel(format!(
-                        "prediction target state exchange failed: {error}; local ownership recovery failed: {recovery}"
-                    ))
-                })
-                .and(Err(Error::ArchitectureModel(error.to_string()))),
-        };
-        cache.state = Some(Box::new(lane));
-        match (result, restored) {
-            (Err(error), _) => Err(error),
-            (Ok(output), Ok(())) => Ok(output),
-            (Ok(_), Err(error)) => Err(error),
-        }
+        Ok(CompletedReplicatedText {
+            session: self.session,
+            prompt_cache_identity: self.prompt_cache_identity,
+            capability_estimate: capability,
+            effective_model_type: self.effective_model_type,
+            materialization: self.materialization,
+            prediction,
+            embedded_prediction_observers: self.embedded_prediction_observers,
+            parameter_bank: self.parameter_bank,
+            #[cfg(test)]
+            selected_residency: self.selected_residency,
+            partition_sampling_group: self.partition_sampling_group,
+            partition_communication_authority: self.partition_communication_authority,
+            partition_sampling_rank: self.partition_sampling_rank,
+            partition_public_output: self.partition_public_output,
+            stream: self.stream,
+        })
     }
 }
 
-impl<A, S, D> ErasedReplicatedTextExecutable for CompletedReplicatedText<A, S, D>
+impl<A, S, D, P> CompletedReplicatedText<A, S, D, P>
+where
+    S: MlxStateMechanisms,
+    A: ReplicatedTextArchitecture<MlxNeuralBackend, S, Error = eredu_nn::Error>,
+    A::StaticModules: Clone,
+    D: eredu_runtime::ReplicatedTextExecutionStrategy<
+        A,
+        MlxNeuralBackend,
+        S,
+        MlxArchitectureLayerwisePolicy<A, S>,
+        MlxArchitectureLayerwisePolicy<A, S>,
+    >,
+{
+    fn published<T>(&self, value: T) -> T {
+        #[cfg(test)]
+        super::path_instrumentation::state_publication();
+        value
+    }
+}
+
+impl<A, S, D, P> ErasedReplicatedTextExecutable for CompletedReplicatedText<A, S, D, P>
 where
     S: MlxStateMechanisms + 'static,
     A: ReplicatedTextArchitecture<MlxNeuralBackend, S, Error = eredu_nn::Error> + 'static,
@@ -3363,6 +2892,7 @@ where
             MlxArchitectureLayerwisePolicy<A, S>,
         > + MlxParameterBankTelemetry
         + 'static,
+    P: ReplicatedPredictionCapability<A, S, D> + 'static,
 {
     fn effective_model_type(&self) -> &str {
         &self.effective_model_type
@@ -3401,370 +2931,27 @@ where
         self.partition_public_output
     }
 
-    fn install_prediction_extension_contract(
+    fn with_embedded_prediction(
         &mut self,
-        extension: MlxPredictionExtension,
-        capability: eredu_architectures::capability::CapabilityEstimate,
-    ) -> Result<(), Error> {
-        let depth = extension.depth();
-        if depth == 0 || capability.speculative_draft_source().is_none() {
-            return Err(Error::ArchitectureModel(
-                "prediction extension contract is missing executable draft depth".into(),
-            ));
-        }
-        if self.prediction_extension_depth.replace(depth).is_some() {
-            return Err(Error::ArchitectureModel(
-                "prediction extension contract was installed more than once".into(),
-            ));
-        }
-        self.capability_estimate = capability;
-        self.prediction_extension = Some(extension);
-        Ok(())
+        continuation: &mut dyn super::prepared_speculative::MlxEmbeddedExecutorContinuation,
+    ) -> Option<Result<eredu_core::SpeculativeGenerationBatchOutput, Error>> {
+        P::lend(self, continuation)
     }
 
-    fn prediction_extension_depth(&self) -> Option<usize> {
-        self.prediction_extension_depth
+    fn has_embedded_prediction(&self) -> bool {
+        P::present()
     }
 
-    fn prepare_prediction_target_cache(&mut self) -> Result<MlxPredictionTargetCache, Error> {
-        self.session
-            .prepare_prediction_target_state(&self.stream)
-            .map(|state| MlxPredictionTargetCache {
-                state: Some(Box::new(state)),
-                extension: self
-                    .prediction_extension
-                    .as_ref()
-                    .map(MlxPredictionExtension::new_state),
-            })
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))
-    }
-
-    fn prefill_prediction_target(
+    fn install_embedded_prediction_observers(
         &mut self,
-        input: input::ModelInput<'_>,
-        cache: &mut MlxPredictionTargetCache,
-    ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Error> {
-        let stream = self.stream.clone();
-        let tokens = input::text_token_ids(input, &stream)?;
-        let input = MlxTensor::from_array(tokens.clone());
-        self.with_prediction_target_state(cache, |session| {
-            session
-                .prefill_prediction_target(&input, None, &stream)
-                .map(|(logits, hidden)| {
-                    crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput {
-                        logits,
-                        hidden,
-                        tokens: input,
-                    }
-                })
-                .map_err(|error| Error::ArchitectureModel(error.to_string()))
-        })
-    }
-
-    fn verify_prediction_target(
-        &mut self,
-        tokens: &MlxTensor,
-        cache: &mut MlxPredictionTargetCache,
-    ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Error> {
-        let stream = self.stream.clone();
-        let tokens = tokens.clone();
-        self.with_prediction_target_state(cache, |session| {
-            session
-                .decode_prediction_target(&tokens, &stream)
-                .map(|(logits, hidden)| {
-                    crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput {
-                        logits,
-                        hidden,
-                        tokens,
-                    }
-                })
-                .map_err(|error| Error::ArchitectureModel(error.to_string()))
-        })
-    }
-
-    fn prefill_prediction_extension(
-        &mut self,
-        output: &crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput,
-        tokens: &MlxTensor,
-        cache: &mut MlxPredictionTargetCache,
-    ) -> Result<(), Error> {
-        let sequence = tokens.as_array().dim(1);
-        if sequence <= 1 {
-            return Ok(());
+        observers: MlxEmbeddedPredictionObservers,
+    ) -> bool {
+        if P::present() {
+            self.embedded_prediction_observers = observers;
+            true
+        } else {
+            false
         }
-        let hidden = MlxTensor::from_array(
-            output
-                .hidden
-                .as_array()
-                .try_index_device((.., ..sequence - 1, ..), &self.stream)?,
-        );
-        let next = MlxTensor::from_array(
-            tokens
-                .as_array()
-                .try_index_device((.., 1..), &self.stream)?,
-        );
-        let mut extension = self.prediction_extension.take().ok_or_else(|| {
-            Error::ArchitectureModel("prediction extension was not installed".into())
-        })?;
-        let mut lane = cache.extension.take().ok_or_else(|| {
-            Error::ArchitectureModel("prediction lane has no extension state".into())
-        })?;
-        let checkpoint = lane.clone();
-        let result = match (&mut extension, &mut lane) {
-            (
-                MlxPredictionExtension::DeepSeekV3 { units },
-                MlxPredictionExtensionState::DeepSeekV3(states),
-            ) if units.len() == states.len() => {
-                units.iter_mut().zip(states).try_for_each(|(unit, state)| {
-                    self.session
-                        .apply_prediction_target_operation(
-                            V3PredictionUnitOperation {
-                                unit,
-                                hidden: &hidden,
-                                tokens: &next,
-                                cache: state,
-                            },
-                            &self.stream,
-                        )
-                        .map(|_| ())
-                        .map_err(|error| Error::ArchitectureModel(error.to_string()))
-                })
-            }
-            (
-                MlxPredictionExtension::DeepSeekV4 { units, .. },
-                MlxPredictionExtensionState::DeepSeekV4(states),
-            ) if units.len() == states.len() => {
-                units.iter_mut().zip(states).try_for_each(|(unit, state)| {
-                    self.session
-                        .apply_prediction_target_operation(
-                            V4PredictionUnitOperation {
-                                unit,
-                                hidden: &hidden,
-                                tokens: &next,
-                                cache: state,
-                            },
-                            &self.stream,
-                        )
-                        .map(|_| ())
-                        .map_err(|error| Error::ArchitectureModel(error.to_string()))
-                })
-            }
-            (
-                MlxPredictionExtension::NemotronH { groups, .. },
-                MlxPredictionExtensionState::NemotronH(state),
-            ) => groups
-                .iter_mut()
-                .enumerate()
-                .try_for_each(|(depth, units)| {
-                    self.session
-                        .apply_prediction_target_operation(
-                            NemotronHPredictionGroupOperation {
-                                units,
-                                hidden: &hidden,
-                                tokens: &next,
-                                depth,
-                                state,
-                            },
-                            &self.stream,
-                        )
-                        .map(|_| ())
-                        .map_err(|error| Error::ArchitectureModel(error.to_string()))
-                }),
-            _ => Err(Error::ArchitectureModel(
-                "prediction extension units and lane state differ".into(),
-            )),
-        };
-        if result.is_err() {
-            lane = checkpoint;
-        }
-        cache.extension = Some(lane);
-        self.prediction_extension = Some(extension);
-        result
-    }
-
-    fn prediction_extension_logits(
-        &mut self,
-        hidden: &MlxTensor,
-        last_token: u32,
-        draft_index: usize,
-        cache: &mut MlxPredictionTargetCache,
-    ) -> Result<(MlxTensor, MlxTensor), Error> {
-        let token = MlxTensor::from_array(Array::from_slice(&[last_token], &[1, 1]));
-        let mut extension = self.prediction_extension.take().ok_or_else(|| {
-            Error::ArchitectureModel("prediction extension was not installed".into())
-        })?;
-        let mut lane = cache.extension.take().ok_or_else(|| {
-            Error::ArchitectureModel("prediction lane has no extension state".into())
-        })?;
-        let checkpoint = lane.clone();
-        let result = match (&mut extension, &mut lane) {
-            (
-                MlxPredictionExtension::DeepSeekV3 { units },
-                MlxPredictionExtensionState::DeepSeekV3(states),
-            ) if units.len() == states.len() => {
-                match (units.get_mut(draft_index), states.get_mut(draft_index)) {
-                    (Some(unit), Some(state)) => self
-                        .session
-                        .apply_prediction_target_operation(
-                            V3PredictionUnitOperation {
-                                unit,
-                                hidden,
-                                tokens: &token,
-                                cache: state,
-                            },
-                            &self.stream,
-                        )
-                        .map(|output| (output.logits, output.hidden))
-                        .map_err(|error| Error::ArchitectureModel(error.to_string())),
-                    _ => Err(Error::ArchitectureModel(format!(
-                        "prediction depth {draft_index} exceeds {} units",
-                        units.len()
-                    ))),
-                }
-            }
-            (
-                MlxPredictionExtension::DeepSeekV4 { units, .. },
-                MlxPredictionExtensionState::DeepSeekV4(states),
-            ) if units.len() == states.len() => {
-                match (units.get_mut(draft_index), states.get_mut(draft_index)) {
-                    (Some(unit), Some(state)) => self
-                        .session
-                        .apply_prediction_target_operation(
-                            V4PredictionUnitOperation {
-                                unit,
-                                hidden,
-                                tokens: &token,
-                                cache: state,
-                            },
-                            &self.stream,
-                        )
-                        .map(|output| (output.logits, output.hidden))
-                        .map_err(|error| Error::ArchitectureModel(error.to_string())),
-                    _ => Err(Error::ArchitectureModel(format!(
-                        "prediction depth {draft_index} exceeds {} units",
-                        units.len()
-                    ))),
-                }
-            }
-            (
-                MlxPredictionExtension::NemotronH { groups, .. },
-                MlxPredictionExtensionState::NemotronH(state),
-            ) => {
-                let group_count = groups.len();
-                let units = groups.get_mut(draft_index).ok_or_else(|| {
-                    Error::ArchitectureModel(format!(
-                        "prediction depth {draft_index} exceeds {group_count} groups"
-                    ))
-                })?;
-                self.session
-                    .apply_prediction_target_operation(
-                        NemotronHPredictionGroupOperation {
-                            units,
-                            hidden,
-                            tokens: &token,
-                            depth: draft_index,
-                            state,
-                        },
-                        &self.stream,
-                    )
-                    .map(|output| (output.logits, output.hidden))
-                    .map_err(|error| Error::ArchitectureModel(error.to_string()))
-            }
-            _ => Err(Error::ArchitectureModel(
-                "prediction extension units and lane state differ".into(),
-            )),
-        };
-        if result.is_err() {
-            lane = checkpoint;
-        }
-        cache.extension = Some(lane);
-        self.prediction_extension = Some(extension);
-        result
-    }
-
-    fn advance_prediction_extension(
-        &mut self,
-        hidden: &MlxTensor,
-        tokens: &MlxTensor,
-        cache: &mut MlxPredictionTargetCache,
-    ) -> Result<(), Error> {
-        let mut extension = self.prediction_extension.take().ok_or_else(|| {
-            Error::ArchitectureModel("prediction extension was not installed".into())
-        })?;
-        let mut lane = cache.extension.take().ok_or_else(|| {
-            Error::ArchitectureModel("prediction lane has no extension state".into())
-        })?;
-        let checkpoint = lane.clone();
-        let result = match (&mut extension, &mut lane) {
-            (
-                MlxPredictionExtension::DeepSeekV3 { units },
-                MlxPredictionExtensionState::DeepSeekV3(states),
-            ) if units.len() == states.len() => {
-                units.iter_mut().zip(states).try_for_each(|(unit, state)| {
-                    self.session
-                        .apply_prediction_target_operation(
-                            V3PredictionUnitOperation {
-                                unit,
-                                hidden,
-                                tokens,
-                                cache: state,
-                            },
-                            &self.stream,
-                        )
-                        .map(|_| ())
-                        .map_err(|error| Error::ArchitectureModel(error.to_string()))
-                })
-            }
-            (
-                MlxPredictionExtension::DeepSeekV4 { units, .. },
-                MlxPredictionExtensionState::DeepSeekV4(states),
-            ) if units.len() == states.len() => {
-                units.iter_mut().zip(states).try_for_each(|(unit, state)| {
-                    self.session
-                        .apply_prediction_target_operation(
-                            V4PredictionUnitOperation {
-                                unit,
-                                hidden,
-                                tokens,
-                                cache: state,
-                            },
-                            &self.stream,
-                        )
-                        .map(|_| ())
-                        .map_err(|error| Error::ArchitectureModel(error.to_string()))
-                })
-            }
-            (
-                MlxPredictionExtension::NemotronH { groups, .. },
-                MlxPredictionExtensionState::NemotronH(state),
-            ) => groups
-                .iter_mut()
-                .enumerate()
-                .try_for_each(|(depth, units)| {
-                    self.session
-                        .apply_prediction_target_operation(
-                            NemotronHPredictionGroupOperation {
-                                units,
-                                hidden,
-                                tokens,
-                                depth,
-                                state,
-                            },
-                            &self.stream,
-                        )
-                        .map(|_| ())
-                        .map_err(|error| Error::ArchitectureModel(error.to_string()))
-                }),
-            _ => Err(Error::ArchitectureModel(
-                "prediction extension units and lane state differ".into(),
-            )),
-        };
-        if result.is_err() {
-            lane = checkpoint;
-        }
-        cache.extension = Some(lane);
-        self.prediction_extension = Some(extension);
-        result
     }
 
     #[cfg(test)]
@@ -4075,8 +3262,53 @@ where
     }
 }
 
-struct CompletedComposite<A, D = eredu_runtime::DirectReplicatedTextExecution>
+trait CompositePredictionCapability<A, D>: Sized
 where
+    A: CompositeArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error> + 'static,
+    A::InputPartPlan: 'static,
+    D: eredu_runtime::ReplicatedTextExecutionStrategy<
+        PreparedCompositeArchitecture<A>,
+        MlxNeuralBackend,
+        MlxHybridState,
+        MlxArchitectureLayerwisePolicy<PreparedCompositeArchitecture<A>, MlxHybridState>,
+        MlxArchitectureLayerwisePolicy<PreparedCompositeArchitecture<A>, MlxHybridState>,
+    >,
+{
+    fn lend(
+        model: &mut CompletedComposite<A, D, Self>,
+        continuation: &mut dyn super::prepared_speculative::MlxEmbeddedExecutorContinuation,
+    ) -> Option<Result<eredu_core::SpeculativeGenerationBatchOutput, Error>>;
+    fn present() -> bool;
+}
+
+impl<A, D> CompositePredictionCapability<A, D> for NoSelectedPrediction
+where
+    A: CompositeArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error> + 'static,
+    A::InputPartPlan: 'static,
+    D: eredu_runtime::ReplicatedTextExecutionStrategy<
+        PreparedCompositeArchitecture<A>,
+        MlxNeuralBackend,
+        MlxHybridState,
+        MlxArchitectureLayerwisePolicy<PreparedCompositeArchitecture<A>, MlxHybridState>,
+        MlxArchitectureLayerwisePolicy<PreparedCompositeArchitecture<A>, MlxHybridState>,
+    >,
+{
+    fn lend(
+        _: &mut CompletedComposite<A, D, Self>,
+        _: &mut dyn super::prepared_speculative::MlxEmbeddedExecutorContinuation,
+    ) -> Option<Result<eredu_core::SpeculativeGenerationBatchOutput, Error>> {
+        None
+    }
+    fn present() -> bool {
+        false
+    }
+}
+
+struct CompletedComposite<
+    A,
+    D = eredu_runtime::DirectReplicatedTextExecution,
+    P = NoSelectedPrediction,
+> where
     A: CompositeArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error> + 'static,
     A::InputPartPlan: 'static,
     D: eredu_runtime::ReplicatedTextExecutionStrategy<
@@ -4099,8 +3331,8 @@ where
     capability_estimate: eredu_architectures::capability::CapabilityEstimate,
     effective_model_type: String,
     materialization: Option<eredu_runtime::WeightMaterializationReport>,
-    prediction_extension_depth: Option<usize>,
-    prediction_extension: Option<MlxPredictionExtension>,
+    prediction: P,
+    embedded_prediction_observers: MlxEmbeddedPredictionObservers,
     #[cfg(test)]
     selected_residency: eredu_runtime::LayerWeightResidency,
     partition_sampling_group: Option<crate::backend::runtime::distributed::Group>,
@@ -4108,6 +3340,170 @@ where
     partition_sampling_rank: Option<usize>,
     partition_public_output: bool,
     stream: Stream,
+}
+
+struct MlxCompositePredictionInput<'a, A>
+where
+    A: CompositeArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error> + 'static,
+    A::InputPartPlan: 'static,
+{
+    admission: &'a A::AdmissionConfig,
+    processor: &'a eredu_runtime::SelectedProcessorExecution,
+}
+
+fn prepare_composite_prediction_input<A>(
+    admission: &A::AdmissionConfig,
+    processor: &eredu_runtime::SelectedProcessorExecution,
+    input: input::ModelInput<'_>,
+) -> Result<
+    (
+        eredu_runtime::PreparedModelInput<MlxTensor>,
+        eredu_architectures::media_plan::AdmittedCompositeInput<A::InputPartPlan>,
+        Option<eredu_runtime::PreparedInputCacheIdentity>,
+    ),
+    Error,
+>
+where
+    A: CompositeArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error> + 'static,
+    A::InputPartPlan: 'static,
+{
+    if let Some(modality) = input
+        .parts
+        .iter()
+        .map(|part| part.modality())
+        .find(|modality| !processor.modalities().contains(modality))
+    {
+        return Err(Error::ArchitectureModel(format!(
+            "prepared input modality {} is outside the selected composite modalities {:?}",
+            modality.as_str(),
+            processor.modalities()
+        )));
+    }
+    if !processor.prepared_tensors()
+        && input
+            .parts
+            .iter()
+            .any(|part| part.modality() != eredu_core::InputModality::Text)
+    {
+        return Err(Error::ArchitectureModel(
+            "prepared media tensors were not admitted by processor selection".into(),
+        ));
+    }
+    if let Some(modality) = input.parts.iter().find_map(|part| {
+        matches!(part.payload(), input::InputPayload::Embeddings(_))
+            .then_some(part.modality())
+            .filter(|modality| !processor.projected_modalities().contains(modality))
+    }) {
+        return Err(Error::ArchitectureModel(format!(
+            "projected {} embeddings were not admitted by processor selection",
+            modality.as_str()
+        )));
+    }
+    let supplied_cache_identity = input.cache_identity().cloned();
+    let text_fingerprint = if supplied_cache_identity.is_none()
+        && input.parts.iter().all(|part| {
+            part.modality() == eredu_core::InputModality::Text
+                && matches!(part.payload(), input::InputPayload::TokenIds(_))
+        }) {
+        let mut tokens = Vec::new();
+        for part in input.parts {
+            let input::InputPayload::TokenIds(value) = part.payload() else {
+                unreachable!("text-only token payload checked above")
+            };
+            let value = value.evaluated()?;
+            tokens.extend_from_slice(
+                value
+                    .try_as_slice::<u32>()
+                    .map_err(|error| Error::ArchitectureModel(error.to_string()))?,
+            );
+        }
+        Some(eredu_core::cache::prompt_cache_token_fingerprint(&tokens))
+    } else {
+        None
+    };
+    let prepared = prepared_composite_input(input)?;
+    if supplied_cache_identity
+        .as_ref()
+        .is_some_and(|identity| identity.prepared() != prepared.identity())
+    {
+        return Err(Error::ArchitectureModel(
+            "prepared-input cache identity differs from the submitted tensors".into(),
+        ));
+    }
+    let admitted = A::admit_prepared_input(admission, &prepared, &input::MlxTensorInputInspector)
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let cache_identity = match (supplied_cache_identity, text_fingerprint) {
+        (Some(identity), _) => Some(identity),
+        (None, Some(fingerprint)) => Some(
+            prepared
+                .cache_identity(fingerprint)
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?,
+        ),
+        (None, None) => None,
+    };
+    Ok((prepared, admitted, cache_identity))
+}
+
+impl<A>
+    eredu_architectures::speculative_execution::ReplicatedPredictionInput<
+        PreparedCompositeArchitecture<A>,
+        MlxNeuralBackend,
+        MlxHybridState,
+        Exception,
+    > for MlxCompositePredictionInput<'_, A>
+where
+    A: CompositeArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error> + 'static,
+    A::InputPartPlan: 'static,
+{
+    type Input = super::MlxModelInput;
+
+    fn with_prefill<R>(
+        &mut self,
+        input: Self::Input,
+        context: &Stream,
+        operation: impl for<'a> FnOnce(
+            <PreparedCompositeArchitecture<A> as eredu_runtime::LayeredArchitecture<
+                MlxNeuralBackend,
+                MlxHybridState,
+            >>::Input<'a>,
+            MlxTensor,
+            Option<&'a eredu_runtime::PreparedInputCacheIdentity>,
+        ) -> Result<R, Exception>,
+    ) -> Result<R, Exception> {
+        input.with_borrowed(|input| {
+            let tokens = input::text_token_ids(input, context)
+                .map(MlxTensor::from_array)
+                .map_err(|error| Exception::custom(error.to_string()))?;
+            let (prepared, admitted, identity) =
+                prepare_composite_prediction_input::<A>(self.admission, self.processor, input)
+                    .map_err(|error| Exception::custom(error.to_string()))?;
+            let paired =
+                PreparedCompositeInput::new(&prepared, &admitted).map_err(Exception::custom)?;
+            operation(paired, tokens, identity.as_ref())
+        })
+    }
+
+    fn with_decode<R>(
+        &mut self,
+        tokens: &MlxTensor,
+        _context: &Stream,
+        operation: impl for<'a> FnOnce(
+            <PreparedCompositeArchitecture<A> as eredu_runtime::LayeredArchitecture<
+                MlxNeuralBackend,
+                MlxHybridState,
+            >>::Input<'a>,
+        ) -> Result<R, Exception>,
+    ) -> Result<R, Exception> {
+        let part = input::token_ids_part(tokens.as_array())
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        let input = input::ModelInput::new(std::slice::from_ref(&part));
+        let (prepared, admitted, _) =
+            prepare_composite_prediction_input::<A>(self.admission, self.processor, input)
+                .map_err(|error| Exception::custom(error.to_string()))?;
+        let paired =
+            PreparedCompositeInput::new(&prepared, &admitted).map_err(Exception::custom)?;
+        operation(paired)
+    }
 }
 
 impl<A> CompletedComposite<A>
@@ -4160,8 +3556,8 @@ where
             capability_estimate,
             effective_model_type,
             materialization,
-            prediction_extension_depth: None,
-            prediction_extension: None,
+            prediction: NoSelectedPrediction,
+            embedded_prediction_observers: MlxEmbeddedPredictionObservers::default(),
             #[cfg(test)]
             selected_residency,
             partition_sampling_group: None,
@@ -4173,7 +3569,7 @@ where
     }
 }
 
-impl<A, D> CompletedComposite<A, D>
+impl<A, D, P> CompletedComposite<A, D, P>
 where
     A: CompositeArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error> + 'static,
     A::InputPartPlan: 'static,
@@ -4185,87 +3581,9 @@ where
         MlxArchitectureLayerwisePolicy<PreparedCompositeArchitecture<A>, MlxHybridState>,
     >,
 {
-    fn with_inkling_prediction_extension<T>(
+    fn with_native_prediction_target_state<T>(
         &mut self,
-        cache: &mut MlxPredictionTargetCache,
-        operation: impl FnOnce(
-            &mut Self,
-            &mut crate::backend::nn::shared::MlxModule<
-                eredu_architectures::inkling::MtpModel<MlxNeuralBackend>,
-            >,
-            &mut MlxHybridState,
-        ) -> Result<T, Error>,
-    ) -> Result<T, Error> {
-        let mut extension = self.prediction_extension.take().ok_or_else(|| {
-            Error::ArchitectureModel("prediction extension was not installed".into())
-        })?;
-        let mut lane = cache.extension.take().ok_or_else(|| {
-            Error::ArchitectureModel("prediction lane has no extension state".into())
-        })?;
-        let checkpoint = lane.clone();
-        let result = match (&mut extension, &mut lane) {
-            (
-                MlxPredictionExtension::Inkling { model, .. },
-                MlxPredictionExtensionState::Inkling(state),
-            ) => operation(self, model, state),
-            _ => Err(Error::ArchitectureModel(
-                "prediction extension differs from the composite target".into(),
-            )),
-        };
-        if result.is_err() {
-            lane = checkpoint;
-        }
-        cache.extension = Some(lane);
-        self.prediction_extension = Some(extension);
-        result
-    }
-
-    fn with_qwen_hybrid_prediction_extension<T>(
-        &mut self,
-        cache: &mut MlxPredictionTargetCache,
-        operation: impl FnOnce(
-            &mut Self,
-            &mut [crate::backend::nn::shared::MlxModule<
-                eredu_architectures::qwen::hybrid::PredictionUnit<MlxNeuralBackend>,
-            >],
-            &mut MlxHybridState,
-        ) -> Result<T, Error>,
-    ) -> Result<T, Error> {
-        let mut extension = self.prediction_extension.take().ok_or_else(|| {
-            Error::ArchitectureModel("prediction extension was not installed".into())
-        })?;
-        let mut lane = cache.extension.take().ok_or_else(|| {
-            Error::ArchitectureModel("prediction lane has no extension state".into())
-        })?;
-        let checkpoint = lane.clone();
-        let result = match (&mut extension, &mut lane) {
-            (
-                MlxPredictionExtension::QwenHybrid { units, .. },
-                MlxPredictionExtensionState::QwenHybrid(state),
-            ) => {
-                if units.len() != state.layers_mut().len() {
-                    Err(Error::ArchitectureModel(
-                        "Qwen hybrid prediction units and state differ".into(),
-                    ))
-                } else {
-                    operation(self, units, state)
-                }
-            }
-            _ => Err(Error::ArchitectureModel(
-                "prediction extension differs from the composite target".into(),
-            )),
-        };
-        if result.is_err() {
-            lane = checkpoint;
-        }
-        cache.extension = Some(lane);
-        self.prediction_extension = Some(extension);
-        result
-    }
-
-    fn with_prediction_target_state<T>(
-        &mut self,
-        cache: &mut MlxPredictionTargetCache,
+        cache: &mut MlxPredictionTargetState,
         operation: impl FnOnce(
             &mut ReplicatedTextSession<
                 PreparedCompositeArchitecture<A>,
@@ -4275,27 +3593,17 @@ where
             >,
         ) -> Result<T, Error>,
     ) -> Result<T, Error> {
-        if !cache
-            .state
-            .as_ref()
-            .is_some_and(|state| state.as_any().is::<MlxHybridState>())
-        {
+        if !cache.is::<MlxHybridState>() {
             return Err(Error::ArchitectureModel(
                 "external-assistant target cache differs from the neutral composite state".into(),
             ));
         }
-        let erased = cache.state.take().ok_or_else(|| {
-            Error::ArchitectureModel("external-assistant target cache is already active".into())
-        })?;
-        let mut lane = *erased
-            .into_any()
-            .downcast::<MlxHybridState>()
-            .expect("external-assistant target state type checked before transfer");
+        let mut lane = cache.take_state::<MlxHybridState>()?;
         if let Err(error) = self
             .session
             .exchange_prediction_target_state(&mut lane, &self.stream)
         {
-            cache.state = Some(Box::new(lane));
+            cache.restore_state(lane);
             return Err(Error::ArchitectureModel(error.to_string()));
         }
         let result = operation(&mut self.session);
@@ -4314,12 +3622,49 @@ where
                 })
                 .and(Err(Error::ArchitectureModel(error.to_string()))),
         };
-        cache.state = Some(Box::new(lane));
+        cache.restore_state(lane);
         match (result, restored) {
-            (Ok(output), Ok(())) => Ok(output),
             (Err(error), _) => Err(error),
+            (Ok(output), Ok(())) => Ok(output),
             (Ok(_), Err(error)) => Err(error),
         }
+    }
+
+    fn with_prediction<Q>(
+        self,
+        prediction: SelectedPrediction<Q>,
+        capability: eredu_architectures::capability::CapabilityEstimate,
+    ) -> Result<CompletedComposite<A, D, SelectedPrediction<Q>>, Error>
+    where
+        Q: eredu_architectures::prediction_extension::MaterializedPredictionExecutor<
+            PreparedCompositeArchitecture<A>,
+            MlxNeuralBackend,
+            MlxEmbeddedPredictionMaterializer,
+        >,
+    {
+        if prediction.extension.depth() == 0 || capability.speculative_draft_source().is_none() {
+            return Err(Error::ArchitectureModel(
+                "prediction extension contract is missing executable draft depth".into(),
+            ));
+        }
+        Ok(CompletedComposite {
+            session: self.session,
+            admission: self.admission,
+            processor: self.processor,
+            prompt_cache_identity: self.prompt_cache_identity,
+            capability_estimate: capability,
+            effective_model_type: self.effective_model_type,
+            materialization: self.materialization,
+            prediction,
+            embedded_prediction_observers: self.embedded_prediction_observers,
+            #[cfg(test)]
+            selected_residency: self.selected_residency,
+            partition_sampling_group: self.partition_sampling_group,
+            partition_communication_authority: self.partition_communication_authority,
+            partition_sampling_rank: self.partition_sampling_rank,
+            partition_public_output: self.partition_public_output,
+            stream: self.stream,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4342,10 +3687,10 @@ where
         partition_sampling_rank: Option<usize>,
         partition_public_output: bool,
         stream: &Stream,
-    ) -> Self {
+    ) -> CompletedComposite<A, D, NoSelectedPrediction> {
         #[cfg(not(test))]
         let _ = selected_residency;
-        Self {
+        CompletedComposite {
             session,
             admission,
             processor,
@@ -4353,8 +3698,8 @@ where
             capability_estimate,
             effective_model_type,
             materialization,
-            prediction_extension_depth: None,
-            prediction_extension: None,
+            prediction: NoSelectedPrediction,
+            embedded_prediction_observers: MlxEmbeddedPredictionObservers::default(),
             #[cfg(test)]
             selected_residency,
             partition_sampling_group,
@@ -4476,7 +3821,7 @@ where
     }
 }
 
-impl<A, D> ErasedReplicatedTextExecutable for CompletedComposite<A, D>
+impl<A, D, P> ErasedReplicatedTextExecutable for CompletedComposite<A, D, P>
 where
     A: CompositeArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error> + 'static,
     A::InputPartPlan: 'static,
@@ -4490,413 +3835,37 @@ where
             MlxArchitectureLayerwisePolicy<PreparedCompositeArchitecture<A>, MlxHybridState>,
         > + MlxParameterBankTelemetry
         + 'static,
+    P: CompositePredictionCapability<A, D> + 'static,
 {
-    fn install_prediction_extension_contract(
-        &mut self,
-        extension: MlxPredictionExtension,
-        capability: eredu_architectures::capability::CapabilityEstimate,
-    ) -> Result<(), Error> {
-        let depth = extension.depth();
-        if depth == 0 || capability.speculative_draft_source().is_none() {
-            return Err(Error::ArchitectureModel(
-                "prediction extension contract is missing executable draft depth".into(),
-            ));
-        }
-        if self.prediction_extension_depth.replace(depth).is_some() {
-            return Err(Error::ArchitectureModel(
-                "prediction extension contract was installed more than once".into(),
-            ));
-        }
-        self.capability_estimate = capability;
-        self.prediction_extension = Some(extension);
-        Ok(())
-    }
-
-    fn prediction_extension_depth(&self) -> Option<usize> {
-        self.prediction_extension_depth
-    }
-
-    fn prepare_prediction_target_cache(&mut self) -> Result<MlxPredictionTargetCache, Error> {
-        self.session
-            .prepare_prediction_target_state(&self.stream)
-            .map(|state| MlxPredictionTargetCache {
-                state: Some(Box::new(state)),
-                extension: self
-                    .prediction_extension
-                    .as_ref()
-                    .map(MlxPredictionExtension::new_state),
-            })
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))
-    }
-
-    fn prefill_prediction_target(
-        &mut self,
-        input: input::ModelInput<'_>,
-        cache: &mut MlxPredictionTargetCache,
-    ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Error> {
-        let stream = self.stream.clone();
-        let tokens = input::text_token_ids(input, &stream)?;
-        let (prepared, admitted, _) = self.prepare(input)?;
-        let paired =
-            PreparedCompositeInput::new(&prepared, &admitted).map_err(Error::ArchitectureModel)?;
-        let tokens = MlxTensor::from_array(tokens.clone());
-        self.with_prediction_target_state(cache, |session| {
-            session
-                .prefill_input_prediction_target(paired, &stream)
-                .map(|(logits, hidden)| {
-                    crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput {
-                        logits,
-                        hidden,
-                        tokens,
-                    }
-                })
-                .map_err(|error| Error::ArchitectureModel(error.to_string()))
-        })
-    }
-
-    fn verify_prediction_target(
-        &mut self,
-        tokens: &MlxTensor,
-        cache: &mut MlxPredictionTargetCache,
-    ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Error> {
-        let stream = self.stream.clone();
-        let (prepared, admitted, _) = self.text_input(tokens.as_array())?;
-        let paired =
-            PreparedCompositeInput::new(&prepared, &admitted).map_err(Error::ArchitectureModel)?;
-        let retained_tokens = tokens.clone();
-        self.with_prediction_target_state(cache, |session| {
-            session
-                .decode_input_prediction_target(paired, &stream)
-                .map(|(logits, hidden)| {
-                    crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput {
-                        logits,
-                        hidden,
-                        tokens: retained_tokens,
-                    }
-                })
-                .map_err(|error| Error::ArchitectureModel(error.to_string()))
-        })
-    }
-
-    fn prefill_prediction_extension(
-        &mut self,
-        output: &crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput,
-        tokens: &MlxTensor,
-        cache: &mut MlxPredictionTargetCache,
-    ) -> Result<(), Error> {
-        let sequence = tokens.as_array().dim(1);
-        if sequence <= 1 {
-            return Ok(());
-        }
-        let hidden = MlxTensor::from_array(
-            output
-                .hidden
-                .as_array()
-                .try_index_device((.., ..sequence - 1, ..), &self.stream)?,
-        );
-        let next = MlxTensor::from_array(
-            tokens
-                .as_array()
-                .try_index_device((.., 1..), &self.stream)?,
-        );
-        if matches!(
-            self.prediction_extension,
-            Some(MlxPredictionExtension::QwenHybrid { .. })
-        ) {
-            self.with_qwen_hybrid_prediction_extension(cache, |this, units, state| {
-                units.iter_mut().enumerate().try_for_each(|(depth, unit)| {
-                    this.session
-                        .apply_prediction_target_operation(
-                            QwenHybridPredictionUnitOperation {
-                                unit,
-                                hidden: &hidden,
-                                tokens: &next,
-                                depth,
-                                state,
-                            },
-                            &this.stream,
-                        )
-                        .map(|_| ())
-                        .map_err(|error| Error::ArchitectureModel(error.to_string()))
-                })
-            })
-        } else {
-            self.with_inkling_prediction_extension(cache, |this, model, state| {
-                (0..model.len()).try_for_each(|depth| {
-                    this.session
-                        .apply_prediction_target_operation(
-                            InklingPredictionUnitOperation {
-                                model,
-                                hidden: &hidden,
-                                tokens: &next,
-                                depth,
-                                state,
-                            },
-                            &this.stream,
-                        )
-                        .map(|_| ())
-                        .map_err(|error| Error::ArchitectureModel(error.to_string()))
-                })
-            })
-        }
-    }
-
-    fn prediction_extension_logits(
-        &mut self,
-        hidden: &MlxTensor,
-        last_token: u32,
-        draft_index: usize,
-        cache: &mut MlxPredictionTargetCache,
-    ) -> Result<(MlxTensor, MlxTensor), Error> {
-        let token = MlxTensor::from_array(Array::from_slice(&[last_token], &[1, 1]));
-        if matches!(
-            self.prediction_extension,
-            Some(MlxPredictionExtension::QwenHybrid { .. })
-        ) {
-            self.with_qwen_hybrid_prediction_extension(cache, |this, units, state| {
-                let unit_count = units.len();
-                let unit = units.get_mut(draft_index).ok_or_else(|| {
-                    Error::ArchitectureModel(format!(
-                        "prediction depth {draft_index} exceeds {unit_count} units"
-                    ))
-                })?;
-                this.session
-                    .apply_prediction_target_operation(
-                        QwenHybridPredictionUnitOperation {
-                            unit,
-                            hidden,
-                            tokens: &token,
-                            depth: draft_index,
-                            state,
-                        },
-                        &this.stream,
-                    )
-                    .map(|output| (output.logits, output.hidden))
-                    .map_err(|error| Error::ArchitectureModel(error.to_string()))
-            })
-        } else {
-            self.with_inkling_prediction_extension(cache, |this, model, state| {
-                if draft_index >= model.len() {
-                    return Err(Error::ArchitectureModel(format!(
-                        "prediction depth {draft_index} exceeds {} units",
-                        model.len()
-                    )));
-                }
-                this.session
-                    .apply_prediction_target_operation(
-                        InklingPredictionUnitOperation {
-                            model,
-                            hidden,
-                            tokens: &token,
-                            depth: draft_index,
-                            state,
-                        },
-                        &this.stream,
-                    )
-                    .map(|output| (output.logits, output.hidden))
-                    .map_err(|error| Error::ArchitectureModel(error.to_string()))
-            })
-        }
-    }
-
-    fn advance_prediction_extension(
-        &mut self,
-        hidden: &MlxTensor,
-        tokens: &MlxTensor,
-        cache: &mut MlxPredictionTargetCache,
-    ) -> Result<(), Error> {
-        if matches!(
-            self.prediction_extension,
-            Some(MlxPredictionExtension::QwenHybrid { .. })
-        ) {
-            self.with_qwen_hybrid_prediction_extension(cache, |this, units, state| {
-                units.iter_mut().enumerate().try_for_each(|(depth, unit)| {
-                    this.session
-                        .apply_prediction_target_operation(
-                            QwenHybridPredictionUnitOperation {
-                                unit,
-                                hidden,
-                                tokens,
-                                depth,
-                                state,
-                            },
-                            &this.stream,
-                        )
-                        .map(|_| ())
-                        .map_err(|error| Error::ArchitectureModel(error.to_string()))
-                })
-            })
-        } else {
-            self.with_inkling_prediction_extension(cache, |this, model, state| {
-                (0..model.len()).try_for_each(|depth| {
-                    this.session
-                        .apply_prediction_target_operation(
-                            InklingPredictionUnitOperation {
-                                model,
-                                hidden,
-                                tokens,
-                                depth,
-                                state,
-                            },
-                            &this.stream,
-                        )
-                        .map(|_| ())
-                        .map_err(|error| Error::ArchitectureModel(error.to_string()))
-                })
-            })
-        }
-    }
-
-    fn external_prediction_capture_request(
-        &self,
-        drafter: &super::speculative::MlxDrafter,
-    ) -> Result<Option<ExternalPredictionCaptureRequest>, Error> {
-        use super::speculative::MlxDrafterKind;
-
-        let admission = &self.admission as &dyn std::any::Any;
-        match drafter.kind() {
-            MlxDrafterKind::Gemma4Assistant => admission
-                .downcast_ref::<eredu_architectures::gemma4::FamilyConfig>()
-                .map(|target| {
-                    eredu_architectures::gemma4::model::external_assistant_capture_request(
-                        target,
-                        &drafter.gemma4().config,
-                    )
-                    .map_err(Error::ArchitectureModel)
-                })
-                .transpose(),
-            MlxDrafterKind::MuseGlimmerDFlash => admission
-                .downcast_ref::<eredu_architectures::muse_glimmer::DecoderConfig>()
-                .map(|target| {
-                    eredu_architectures::muse_glimmer::model::external_assistant_capture_request(
-                        target,
-                        &drafter.muse_glimmer().config,
-                    )
-                    .map_err(Error::ArchitectureModel)
-                })
-                .transpose(),
-        }
-    }
-
-    fn prepare_external_prediction_target_cache(
-        &mut self,
-    ) -> Result<MlxPredictionTargetCache, Error> {
-        self.session
-            .prepare_prediction_target_state(&self.stream)
-            .map(|state| MlxPredictionTargetCache {
-                state: Some(Box::new(state)),
-                extension: None,
-            })
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))
-    }
-
-    fn prefill_external_prediction_target(
-        &mut self,
-        input: input::ModelInput<'_>,
-        request: &ExternalPredictionCaptureRequest,
-        cache: &mut MlxPredictionTargetCache,
-    ) -> Result<(MlxTensor, ExternalPredictionTargetCapture<MlxTensor>), Error> {
-        let paths = A::external_prediction_capture_paths(request)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?
-            .ok_or_else(|| {
-                Error::ArchitectureModel(
-                    "assistant capture request differs from the neutral target architecture".into(),
-                )
-            })?;
-        let mut observer = ExactPredictionCaptureObserver::new(paths)?;
-        let (prepared, admitted, _) = self.prepare(input)?;
-        let paired =
-            PreparedCompositeInput::new(&prepared, &admitted).map_err(Error::ArchitectureModel)?;
-        let request = request.clone();
-        let captured = observer.values.clone();
-        let stream = self.stream.clone();
-        self.with_prediction_target_state(cache, |session| {
-            session
-                .prefill_input_with_capture(paired, &stream, &mut observer, |forward| {
-                    let values = captured
-                        .borrow()
-                        .iter()
-                        .cloned()
-                        .enumerate()
-                        .map(|(index, value)| {
-                            value.ok_or_else(|| {
-                                eredu_nn::Error::backend(format!(
-                                    "external-assistant target did not reach capture path {index}"
-                                ))
-                            })
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
-                    A::external_prediction_capture(&request, forward, values)?.ok_or_else(|| {
-                        eredu_nn::Error::backend(
-                            "architecture did not produce its selected assistant capture",
-                        )
-                    })
-                })
-                .map_err(|error| Error::ArchitectureModel(error.to_string()))
-        })
-    }
-
-    fn verify_external_prediction_target(
-        &mut self,
-        tokens: &MlxTensor,
-        request: &ExternalPredictionCaptureRequest,
-        cache: &mut MlxPredictionTargetCache,
-    ) -> Result<(MlxTensor, ExternalPredictionTargetCapture<MlxTensor>), Error> {
-        let token_array = tokens.as_array().clone();
-        let (prepared, admitted, _) = self.text_input(&token_array)?;
-        let paired =
-            PreparedCompositeInput::new(&prepared, &admitted).map_err(Error::ArchitectureModel)?;
-        let paths = A::external_prediction_capture_paths(request)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?
-            .ok_or_else(|| {
-                Error::ArchitectureModel(
-                    "assistant capture request differs from the neutral target architecture".into(),
-                )
-            })?;
-        let mut observer = ExactPredictionCaptureObserver::new(paths)?;
-        let request = request.clone();
-        let captured = observer.values.clone();
-        let stream = self.stream.clone();
-        self.with_prediction_target_state(cache, |session| {
-            session
-                .decode_input_with_capture(paired, &stream, &mut observer, |forward| {
-                    let values = captured
-                        .borrow()
-                        .iter()
-                        .cloned()
-                        .enumerate()
-                        .map(|(index, value)| {
-                            value.ok_or_else(|| {
-                                eredu_nn::Error::backend(format!(
-                                    "external-assistant target did not reach capture path {index}"
-                                ))
-                            })
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
-                    A::external_prediction_capture(&request, forward, values)?.ok_or_else(|| {
-                        eredu_nn::Error::backend(
-                            "architecture did not produce its selected assistant capture",
-                        )
-                    })
-                })
-                .map_err(|error| Error::ArchitectureModel(error.to_string()))
-        })
-    }
-
-    fn apply_external_prediction_target_operation(
-        &mut self,
-        operation: ExternalPredictionTargetOperation<'_, MlxTensor>,
-    ) -> Result<MlxTensor, Error> {
-        self.session
-            .apply_prediction_target_operation(
-                CompositePredictionTargetOperation { operation },
-                &self.stream,
-            )
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))
-    }
-
     fn effective_model_type(&self) -> &str {
         &self.effective_model_type
+    }
+
+    fn capability_estimate(&self) -> &eredu_architectures::capability::CapabilityEstimate {
+        &self.capability_estimate
+    }
+
+    fn with_embedded_prediction(
+        &mut self,
+        continuation: &mut dyn super::prepared_speculative::MlxEmbeddedExecutorContinuation,
+    ) -> Option<Result<eredu_core::SpeculativeGenerationBatchOutput, Error>> {
+        P::lend(self, continuation)
+    }
+
+    fn has_embedded_prediction(&self) -> bool {
+        P::present()
+    }
+
+    fn install_embedded_prediction_observers(
+        &mut self,
+        observers: MlxEmbeddedPredictionObservers,
+    ) -> bool {
+        if P::present() {
+            self.embedded_prediction_observers = observers;
+            true
+        } else {
+            false
+        }
     }
 
     fn has_partition_control(&self) -> bool {
@@ -4928,8 +3897,14 @@ where
         self.partition_public_output
     }
 
-    fn capability_estimate(&self) -> &eredu_architectures::capability::CapabilityEstimate {
-        &self.capability_estimate
+    fn external_prediction(&self) -> Option<&(dyn ErasedExternalPredictionExecutable + 'static)> {
+        A::external_assistant_target_profile(&self.admission).map(|_| self as _)
+    }
+
+    fn external_prediction_mut(
+        &mut self,
+    ) -> Option<&mut (dyn ErasedExternalPredictionExecutable + 'static)> {
+        A::external_assistant_target_profile(&self.admission).map(|_| self as _)
     }
 
     #[cfg(test)]
@@ -5295,11 +4270,427 @@ where
     }
 }
 
+impl<A, D, P> ErasedExternalPredictionExecutable for CompletedComposite<A, D, P>
+where
+    A: CompositeArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error> + 'static,
+    A::InputPartPlan: 'static,
+    A::AdmissionConfig: 'static,
+    A::Error: std::fmt::Display,
+    D: eredu_runtime::ReplicatedTextExecutionStrategy<
+            PreparedCompositeArchitecture<A>,
+            MlxNeuralBackend,
+            MlxHybridState,
+            MlxArchitectureLayerwisePolicy<PreparedCompositeArchitecture<A>, MlxHybridState>,
+            MlxArchitectureLayerwisePolicy<PreparedCompositeArchitecture<A>, MlxHybridState>,
+        > + MlxParameterBankTelemetry
+        + 'static,
+    P: 'static,
+{
+    fn external_assistant_target_profile(
+        &self,
+    ) -> eredu_architectures::external_assistant::ExternalAssistantTargetProfile {
+        A::external_assistant_target_profile(&self.admission)
+            .expect("external prediction capability checked before borrowing")
+    }
+
+    fn prepare_external_prediction_target_cache(
+        &mut self,
+    ) -> Result<MlxPredictionTargetState, Error> {
+        self.session
+            .prepare_prediction_target_state(&self.stream)
+            .map(MlxPredictionTargetState::new)
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))
+    }
+
+    fn prefill_external_prediction_target(
+        &mut self,
+        input: input::ModelInput<'_>,
+        request: &ExternalPredictionCaptureRequest,
+        cache: &mut MlxPredictionTargetState,
+    ) -> Result<(MlxTensor, ExternalPredictionTargetCapture<MlxTensor>), Error> {
+        let paths = A::external_prediction_capture_paths(request)
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?
+            .ok_or_else(|| {
+                Error::ArchitectureModel(
+                    "assistant capture request differs from the neutral target architecture".into(),
+                )
+            })?;
+        let mut observer = ExactPredictionCaptureObserver::new(paths)?;
+        let (prepared, admitted, _) = self.prepare(input)?;
+        let paired =
+            PreparedCompositeInput::new(&prepared, &admitted).map_err(Error::ArchitectureModel)?;
+        let request = request.clone();
+        let captured = observer.values.clone();
+        let stream = self.stream.clone();
+        self.with_native_prediction_target_state(cache, |session| {
+            session
+                .prefill_input_with_capture(paired, &stream, &mut observer, |forward| {
+                    let values = captured
+                        .borrow()
+                        .iter()
+                        .cloned()
+                        .enumerate()
+                        .map(|(index, value)| {
+                            value.ok_or_else(|| {
+                                eredu_nn::Error::backend(format!(
+                                    "external-assistant target did not reach capture path {index}"
+                                ))
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    A::external_prediction_capture(&request, forward, values)?.ok_or_else(|| {
+                        eredu_nn::Error::backend(
+                            "architecture did not produce its selected assistant capture",
+                        )
+                    })
+                })
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))
+        })
+    }
+
+    fn verify_external_prediction_target(
+        &mut self,
+        tokens: &MlxTensor,
+        request: &ExternalPredictionCaptureRequest,
+        cache: &mut MlxPredictionTargetState,
+    ) -> Result<(MlxTensor, ExternalPredictionTargetCapture<MlxTensor>), Error> {
+        let (prepared, admitted, _) = self.text_input(tokens.as_array())?;
+        let paired =
+            PreparedCompositeInput::new(&prepared, &admitted).map_err(Error::ArchitectureModel)?;
+        let paths = A::external_prediction_capture_paths(request)
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?
+            .ok_or_else(|| {
+                Error::ArchitectureModel(
+                    "assistant capture request differs from the neutral target architecture".into(),
+                )
+            })?;
+        let mut observer = ExactPredictionCaptureObserver::new(paths)?;
+        let request = request.clone();
+        let captured = observer.values.clone();
+        let stream = self.stream.clone();
+        self.with_native_prediction_target_state(cache, |session| {
+            session
+                .decode_input_with_capture(paired, &stream, &mut observer, |forward| {
+                    let values = captured
+                        .borrow()
+                        .iter()
+                        .cloned()
+                        .enumerate()
+                        .map(|(index, value)| {
+                            value.ok_or_else(|| {
+                                eredu_nn::Error::backend(format!(
+                                    "external-assistant target did not reach capture path {index}"
+                                ))
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    A::external_prediction_capture(&request, forward, values)?.ok_or_else(|| {
+                        eredu_nn::Error::backend(
+                            "architecture did not produce its selected assistant capture",
+                        )
+                    })
+                })
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))
+        })
+    }
+
+    fn apply_external_prediction_target_operation(
+        &mut self,
+        operation: ExternalPredictionTargetOperation<'_, MlxTensor>,
+    ) -> Result<MlxTensor, Error> {
+        self.session
+            .apply_prediction_target_operation(
+                CompositePredictionTargetOperation { operation },
+                &self.stream,
+            )
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))
+    }
+}
+
+impl<A, S, D, P> ReplicatedPredictionCapability<A, S, D> for SelectedPrediction<P>
+where
+    S: MlxStateMechanisms + 'static,
+    A: ReplicatedTextArchitecture<MlxNeuralBackend, S, Error = eredu_nn::Error> + 'static,
+    A::StaticModules: Clone,
+    A::Error: std::fmt::Display,
+    D: eredu_runtime::ReplicatedTextExecutionStrategy<
+            A,
+            MlxNeuralBackend,
+            S,
+            MlxArchitectureLayerwisePolicy<A, S>,
+            MlxArchitectureLayerwisePolicy<A, S>,
+        > + MlxParameterBankTelemetry
+        + 'static,
+    P: eredu_architectures::prediction_extension::MaterializedPredictionExecutor<
+            A,
+            MlxNeuralBackend,
+            MlxEmbeddedPredictionMaterializer,
+        > + 'static,
+{
+    fn lend(
+        model: &mut CompletedReplicatedText<A, S, D, Self>,
+        continuation: &mut dyn super::prepared_speculative::MlxEmbeddedExecutorContinuation,
+    ) -> Option<Result<eredu_core::SpeculativeGenerationBatchOutput, Error>> {
+        let selected = &model.prediction.selected;
+        let mut strategy =
+            eredu_architectures::speculative_execution::ReplicatedMaterializedPredictionStrategy::<
+                A,
+                MlxNeuralBackend,
+                S,
+                MlxReplicatedTextMechanisms<A, S>,
+                D,
+                P,
+                super::prepared_speculative::MlxTextPredictionInput,
+                MlxEmbeddedPredictionMaterializer,
+                super::prepared_speculative::MlxEmbeddedPredictionMechanisms,
+            >::new(
+                &mut model.session,
+                &mut model.prediction.extension,
+                selected,
+                super::prepared_speculative::MlxTextPredictionInput,
+                &model.stream,
+            );
+        let observers = std::mem::take(&mut model.embedded_prediction_observers);
+        let mut executor = eredu_architectures::speculative_execution::EmbeddedPredictionExecutor::<
+            _,
+            super::prepared_speculative::MlxEmbeddedPredictionMechanisms,
+        >::with_observers(&mut strategy, observers);
+        let result = {
+            let mut erased = eredu_architectures::speculative_execution::DynEmbeddedExecutor::<
+                super::prepared_speculative::MlxEmbeddedExecutorTypes,
+            >::new(&mut executor);
+            continuation.execute(selected, &mut erased)
+        };
+        model.embedded_prediction_observers = executor.into_observers();
+        Some(result)
+    }
+
+    fn present() -> bool {
+        true
+    }
+}
+
 /// Family-agnostic MLX binder for architecture-owned composite ingress.
 #[derive(Clone, Copy)]
 pub(crate) struct CompositeBindingVisitor<'a> {
     pub stream: &'a Stream,
     pub weights_stream: &'a Stream,
+}
+
+impl<A, D, P> CompositePredictionCapability<A, D> for SelectedPrediction<P>
+where
+    A: CompositeArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error> + 'static,
+    A::InputPartPlan: 'static,
+    A::AdmissionConfig: 'static,
+    A::Error: std::fmt::Display,
+    D: eredu_runtime::ReplicatedTextExecutionStrategy<
+            PreparedCompositeArchitecture<A>,
+            MlxNeuralBackend,
+            MlxHybridState,
+            MlxArchitectureLayerwisePolicy<PreparedCompositeArchitecture<A>, MlxHybridState>,
+            MlxArchitectureLayerwisePolicy<PreparedCompositeArchitecture<A>, MlxHybridState>,
+        > + MlxParameterBankTelemetry
+        + 'static,
+    P: eredu_architectures::prediction_extension::MaterializedPredictionExecutor<
+            PreparedCompositeArchitecture<A>,
+            MlxNeuralBackend,
+            MlxEmbeddedPredictionMaterializer,
+        > + 'static,
+{
+    fn lend(
+        model: &mut CompletedComposite<A, D, Self>,
+        continuation: &mut dyn super::prepared_speculative::MlxEmbeddedExecutorContinuation,
+    ) -> Option<Result<eredu_core::SpeculativeGenerationBatchOutput, Error>> {
+        let selected = &model.prediction.selected;
+        let input = MlxCompositePredictionInput::<A> {
+            admission: &model.admission,
+            processor: &model.processor,
+        };
+        let mut strategy =
+            eredu_architectures::speculative_execution::ReplicatedMaterializedPredictionStrategy::<
+                PreparedCompositeArchitecture<A>,
+                MlxNeuralBackend,
+                MlxHybridState,
+                MlxReplicatedTextMechanisms<PreparedCompositeArchitecture<A>, MlxHybridState>,
+                D,
+                P,
+                MlxCompositePredictionInput<'_, A>,
+                MlxEmbeddedPredictionMaterializer,
+                super::prepared_speculative::MlxEmbeddedPredictionMechanisms,
+            >::new(
+                &mut model.session,
+                &mut model.prediction.extension,
+                selected,
+                input,
+                &model.stream,
+            );
+        let observers = std::mem::take(&mut model.embedded_prediction_observers);
+        let mut executor = eredu_architectures::speculative_execution::EmbeddedPredictionExecutor::<
+            _,
+            super::prepared_speculative::MlxEmbeddedPredictionMechanisms,
+        >::with_observers(&mut strategy, observers);
+        let result = {
+            let mut erased = eredu_architectures::speculative_execution::DynEmbeddedExecutor::<
+                super::prepared_speculative::MlxEmbeddedExecutorTypes,
+            >::new(&mut executor);
+            continuation.execute(selected, &mut erased)
+        };
+        model.embedded_prediction_observers = executor.into_observers();
+        Some(result)
+    }
+
+    fn present() -> bool {
+        true
+    }
+}
+
+impl
+    eredu_architectures::replicated_text::CompositePredictionTargetVisitor<
+        MlxNeuralBackend,
+        MlxHybridState,
+        MlxEmbeddedPredictionMaterializer,
+    > for PredictionBindingVisitor<'_>
+{
+    type Output = Box<dyn ErasedReplicatedTextExecutable>;
+    type Error = Error;
+
+    fn visit<A>(
+        self,
+        prepared: PreparedCompositeTextArchitecture<A, A::AdmissionConfig>,
+        extension: <PreparedCompositeArchitecture<A> as eredu_architectures::prediction_extension::MaterializedPredictionTarget<MlxNeuralBackend>>::Extension<MlxEmbeddedPredictionMaterializer>,
+        store: Arc<dyn CheckpointSource>,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        A: CompositeArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error>
+            + eredu_runtime::RoutedLayeredArchitecture<MlxNeuralBackend, MlxHybridState>
+            + 'static,
+        A::InputPartPlan: 'static,
+        A::StaticModules: Clone,
+        A::Error: std::fmt::Display,
+        PreparedCompositeArchitecture<A>:
+            eredu_architectures::prediction_extension::MaterializedPredictionTarget<
+                MlxNeuralBackend,
+            >,
+    {
+        CompletedComposite::new(prepared, store, self.stream, self.weights_stream)?
+            .with_prediction(
+                SelectedPrediction {
+                    extension,
+                    selected: self.selected,
+                },
+                self.capability,
+            )
+            .map(|model| Box::new(model) as Box<dyn ErasedReplicatedTextExecutable>)
+    }
+
+    fn visit_routed<A>(
+        self,
+        prepared: PreparedRoutedCompositeTextArchitecture<A, A::AdmissionConfig>,
+        extension: <PreparedCompositeArchitecture<A> as eredu_architectures::prediction_extension::MaterializedPredictionTarget<MlxNeuralBackend>>::Extension<MlxEmbeddedPredictionMaterializer>,
+        store: Arc<dyn CheckpointSource>,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        A: CompositeArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error>
+            + eredu_runtime::RoutedLayeredArchitecture<MlxNeuralBackend, MlxHybridState>
+            + 'static,
+        A::InputPartPlan: 'static,
+        A::StaticModules: Clone,
+        A::Error: std::fmt::Display,
+        PreparedCompositeArchitecture<A>:
+            eredu_architectures::prediction_extension::MaterializedPredictionTarget<
+                MlxNeuralBackend,
+            >,
+    {
+        let prompt_cache_identity = prepared.routed().text().prompt_cache_identity().clone();
+        let effective_model_type = prepared.effective_model_type().to_owned();
+        let selected_residency = prepared.routed().text().selected().residency();
+        let bank_residency = prepared.routed().bank_residency();
+        let (routed, processor, admission) = prepared.into_parts();
+        let slot = Arc::new(std::sync::Mutex::new(None));
+        let mechanisms =
+            MlxReplicatedTextMechanisms::<PreparedCompositeArchitecture<A>, MlxHybridState>::new(
+                Arc::clone(&store),
+                Arc::clone(&slot),
+                self.stream,
+                self.weights_stream,
+            );
+        let materialization =
+            |slot: &Arc<std::sync::Mutex<Option<eredu_runtime::WeightMaterializationReport>>>| {
+                slot.lock()
+                    .map_err(|_| {
+                        Error::ArchitectureModel("materialization report lock was poisoned".into())
+                    })
+                    .map(|report| report.clone())
+            };
+        let prediction = SelectedPrediction {
+            extension,
+            selected: self.selected,
+        };
+        #[cfg(test)]
+        super::path_instrumentation::constructor();
+        match bank_residency {
+            eredu_runtime::ParameterBankResidency::WithLayer => {
+                let session = routed
+                    .construct_resident_session::<MlxNeuralBackend, _>(mechanisms, self.stream)
+                    .map_err(Error::ArchitectureModel)?;
+                CompletedComposite::<A, _, NoSelectedPrediction>::from_session(
+                    session,
+                    admission,
+                    processor,
+                    prompt_cache_identity,
+                    self.capability.clone(),
+                    effective_model_type,
+                    materialization(&slot)?,
+                    selected_residency,
+                    None,
+                    None,
+                    None,
+                    true,
+                    self.stream,
+                )
+                .with_prediction(prediction, self.capability)
+                .map(|model| Box::new(model) as Box<dyn ErasedReplicatedTextExecutable>)
+            }
+            eredu_runtime::ParameterBankResidency::IndependentCache(options) => {
+                let bank = selected_addressable_bank(
+                    routed.addressable_members(),
+                    routed.addressable_quantization(),
+                    store,
+                    options,
+                    self.weights_stream,
+                    self.stream,
+                )?;
+                let session = routed
+                    .construct_addressable_session::<MlxNeuralBackend, _, _, _>(
+                        mechanisms,
+                        bank,
+                        crate::backend::runtime::residency::parameter_bank::MlxIndexedMovement,
+                        self.stream,
+                    )
+                    .map_err(Error::ArchitectureModel)?;
+                CompletedComposite::<A, _, NoSelectedPrediction>::from_session(
+                    session,
+                    admission,
+                    processor,
+                    prompt_cache_identity,
+                    self.capability.clone(),
+                    effective_model_type,
+                    materialization(&slot)?,
+                    selected_residency,
+                    None,
+                    None,
+                    None,
+                    true,
+                    self.stream,
+                )
+                .with_prediction(prediction, self.capability)
+                .map(|model| Box::new(model) as Box<dyn ErasedReplicatedTextExecutable>)
+            }
+            _ => Err(Error::ArchitectureModel(
+                "unsupported selected composite bank residency".into(),
+            )),
+        }
+    }
 }
 
 impl CompositeTextArchitectureVisitor<MlxNeuralBackend, MlxHybridState>
@@ -5376,21 +4767,23 @@ impl CompositeTextArchitectureVisitor<MlxNeuralBackend, MlxHybridState>
                     .construct_resident_session::<MlxNeuralBackend, _>(mechanisms, self.stream)
                     .map_err(Error::ArchitectureModel)?;
                 let materialization = materialization(&materialization_slot)?;
-                Ok(Box::new(CompletedComposite::from_session(
-                    session,
-                    admission,
-                    processor,
-                    prompt_cache_identity,
-                    capability_estimate,
-                    effective_model_type,
-                    materialization,
-                    selected_residency,
-                    None,
-                    None,
-                    None,
-                    true,
-                    self.stream,
-                )))
+                Ok(Box::new(
+                    CompletedComposite::<A, _, NoSelectedPrediction>::from_session(
+                        session,
+                        admission,
+                        processor,
+                        prompt_cache_identity,
+                        capability_estimate,
+                        effective_model_type,
+                        materialization,
+                        selected_residency,
+                        None,
+                        None,
+                        None,
+                        true,
+                        self.stream,
+                    ),
+                ))
             }
             eredu_runtime::ParameterBankResidency::IndependentCache(options) => {
                 let bank = selected_addressable_bank(
@@ -5410,21 +4803,23 @@ impl CompositeTextArchitectureVisitor<MlxNeuralBackend, MlxHybridState>
                     )
                     .map_err(Error::ArchitectureModel)?;
                 let materialization = materialization(&materialization_slot)?;
-                Ok(Box::new(CompletedComposite::from_session(
-                    session,
-                    admission,
-                    processor,
-                    prompt_cache_identity,
-                    capability_estimate,
-                    effective_model_type,
-                    materialization,
-                    selected_residency,
-                    None,
-                    None,
-                    None,
-                    true,
-                    self.stream,
-                )))
+                Ok(Box::new(
+                    CompletedComposite::<A, _, NoSelectedPrediction>::from_session(
+                        session,
+                        admission,
+                        processor,
+                        prompt_cache_identity,
+                        capability_estimate,
+                        effective_model_type,
+                        materialization,
+                        selected_residency,
+                        None,
+                        None,
+                        None,
+                        true,
+                        self.stream,
+                    ),
+                ))
             }
             _ => Err(Error::ArchitectureModel(
                 "unsupported selected composite bank residency".into(),
@@ -5828,6 +5223,158 @@ where
     }
 }
 
+fn bind_prepared_routed_prediction<A, S, P>(
+    prepared: eredu_architectures::PreparedRoutedTextArchitecture<A>,
+    extension: P,
+    selected: eredu_runtime::SelectedSpeculativeRealization,
+    capability: eredu_architectures::capability::CapabilityEstimate,
+    store: Arc<dyn CheckpointSource>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<Box<dyn ErasedReplicatedTextExecutable>, Error>
+where
+    S: MlxStateMechanisms + 'static,
+    A: ReplicatedTextArchitecture<MlxNeuralBackend, S, Error = eredu_nn::Error>
+        + eredu_runtime::RoutedLayeredArchitecture<MlxNeuralBackend, S>
+        + 'static,
+    A::StaticModules: Clone,
+    A::Error: std::fmt::Display,
+    P: eredu_architectures::prediction_extension::MaterializedPredictionExecutor<
+            A,
+            MlxNeuralBackend,
+            MlxEmbeddedPredictionMaterializer,
+        > + 'static,
+{
+    let prompt_cache_identity = prepared.text().prompt_cache_identity().clone();
+    let effective_model_type = prepared.text().effective_model_type().to_owned();
+    let selected_residency = prepared.text().selected().residency();
+    let bank_residency = prepared.bank_residency();
+    let materialization_slot = Arc::new(std::sync::Mutex::new(None));
+    let mechanisms = MlxReplicatedTextMechanisms::<A, S>::new(
+        Arc::clone(&store),
+        Arc::clone(&materialization_slot),
+        stream,
+        weights_stream,
+    );
+    let prediction = SelectedPrediction {
+        extension,
+        selected,
+    };
+    #[cfg(test)]
+    super::path_instrumentation::constructor();
+    match bank_residency {
+        eredu_runtime::ParameterBankResidency::WithLayer => {
+            let session = prepared
+                .construct_resident_session::<MlxNeuralBackend, _>(mechanisms, stream)
+                .map_err(Error::ArchitectureModel)?;
+            let materialization = materialization_slot
+                .lock()
+                .map_err(|_| {
+                    Error::ArchitectureModel("materialization report lock was poisoned".into())
+                })?
+                .clone();
+            CompletedReplicatedText::from_session(
+                session,
+                prompt_cache_identity,
+                capability.clone(),
+                effective_model_type,
+                materialization,
+                selected_residency,
+                None,
+                None,
+                None,
+                true,
+                stream,
+            )
+            .with_prediction(prediction, capability)
+            .map(|model| Box::new(model) as Box<dyn ErasedReplicatedTextExecutable>)
+        }
+        eredu_runtime::ParameterBankResidency::IndependentCache(options) => {
+            let bank = selected_addressable_bank(
+                prepared.addressable_members(),
+                prepared.addressable_quantization(),
+                store,
+                options,
+                weights_stream,
+                stream,
+            )?;
+            let session = prepared
+                .construct_addressable_session::<MlxNeuralBackend, _, _, _>(
+                    mechanisms,
+                    bank,
+                    crate::backend::runtime::residency::parameter_bank::MlxIndexedMovement,
+                    stream,
+                )
+                .map_err(Error::ArchitectureModel)?;
+            let materialization = materialization_slot
+                .lock()
+                .map_err(|_| {
+                    Error::ArchitectureModel("materialization report lock was poisoned".into())
+                })?
+                .clone();
+            CompletedReplicatedText::from_session(
+                session,
+                prompt_cache_identity,
+                capability.clone(),
+                effective_model_type,
+                materialization,
+                selected_residency,
+                None,
+                None,
+                None,
+                true,
+                stream,
+            )
+            .with_prediction(prediction, capability)
+            .map(|model| Box::new(model) as Box<dyn ErasedReplicatedTextExecutable>)
+        }
+        _ => Err(Error::ArchitectureModel(
+            "unsupported selected addressable bank residency".into(),
+        )),
+    }
+}
+
+impl<S>
+    eredu_architectures::routed_text::RoutedPredictionTargetVisitor<
+        MlxNeuralBackend,
+        S,
+        MlxEmbeddedPredictionMaterializer,
+    > for PredictionBindingVisitor<'_>
+where
+    S: MlxStateMechanisms + 'static,
+{
+    type Output = Box<dyn ErasedReplicatedTextExecutable>;
+    type Error = Error;
+
+    fn visit<A>(
+        self,
+        prepared: eredu_architectures::PreparedRoutedTextArchitecture<A>,
+        extension: <A as eredu_architectures::prediction_extension::MaterializedPredictionTarget<
+            MlxNeuralBackend,
+        >>::Extension<MlxEmbeddedPredictionMaterializer>,
+        store: Arc<dyn CheckpointSource>,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        A: ReplicatedTextArchitecture<MlxNeuralBackend, S, Error = eredu_nn::Error>
+            + eredu_runtime::RoutedLayeredArchitecture<MlxNeuralBackend, S>
+            + eredu_architectures::prediction_extension::MaterializedPredictionTarget<
+                MlxNeuralBackend,
+            > + 'static,
+        A::StaticModules: Clone,
+        A::Error: std::fmt::Display,
+    {
+        bind_prepared_routed_prediction(
+            prepared,
+            extension,
+            self.selected,
+            self.capability,
+            store,
+            self.stream,
+            self.weights_stream,
+        )
+    }
+}
+
 impl
     eredu_architectures::GatedRoutedTextArchitectureVisitor<
         MlxNeuralBackend,
@@ -5894,11 +5441,245 @@ pub(crate) struct BindingVisitor<'a> {
     pub weights_stream: &'a Stream,
 }
 
+pub(crate) struct PredictionBindingVisitor<'a> {
+    pub stream: &'a Stream,
+    pub weights_stream: &'a Stream,
+    pub selected: eredu_runtime::SelectedSpeculativeRealization,
+    pub capability: eredu_architectures::capability::CapabilityEstimate,
+}
+
+#[derive(Clone, Copy)]
+struct OrdinaryReplicatedFinalizer;
+
+struct PredictionReplicatedFinalizer<P> {
+    prediction: SelectedPrediction<P>,
+    capability: eredu_architectures::capability::CapabilityEstimate,
+}
+
+trait ReplicatedExecutableFinalizer<A, S>
+where
+    S: MlxStateMechanisms + 'static,
+    A: ReplicatedTextArchitecture<MlxNeuralBackend, S, Error = eredu_nn::Error> + 'static,
+    A::StaticModules: Clone,
+    A::Error: std::fmt::Display,
+{
+    fn finish<D>(
+        self,
+        completed: CompletedReplicatedText<A, S, D>,
+    ) -> Result<Box<dyn ErasedReplicatedTextExecutable>, Error>
+    where
+        D: eredu_runtime::ReplicatedTextExecutionStrategy<
+                A,
+                MlxNeuralBackend,
+                S,
+                MlxArchitectureLayerwisePolicy<A, S>,
+                MlxArchitectureLayerwisePolicy<A, S>,
+            > + MlxParameterBankTelemetry
+            + 'static;
+}
+
+impl<A, S> ReplicatedExecutableFinalizer<A, S> for OrdinaryReplicatedFinalizer
+where
+    S: MlxStateMechanisms + 'static,
+    A: ReplicatedTextArchitecture<MlxNeuralBackend, S, Error = eredu_nn::Error> + 'static,
+    A::StaticModules: Clone,
+    A::Error: std::fmt::Display,
+{
+    fn finish<D>(
+        self,
+        completed: CompletedReplicatedText<A, S, D>,
+    ) -> Result<Box<dyn ErasedReplicatedTextExecutable>, Error>
+    where
+        D: eredu_runtime::ReplicatedTextExecutionStrategy<
+                A,
+                MlxNeuralBackend,
+                S,
+                MlxArchitectureLayerwisePolicy<A, S>,
+                MlxArchitectureLayerwisePolicy<A, S>,
+            > + MlxParameterBankTelemetry
+            + 'static,
+    {
+        Ok(Box::new(completed))
+    }
+}
+
+impl<A, S, P> ReplicatedExecutableFinalizer<A, S> for PredictionReplicatedFinalizer<P>
+where
+    S: MlxStateMechanisms + 'static,
+    A: ReplicatedTextArchitecture<MlxNeuralBackend, S, Error = eredu_nn::Error> + 'static,
+    A::StaticModules: Clone,
+    A::Error: std::fmt::Display,
+    P: eredu_architectures::prediction_extension::MaterializedPredictionExecutor<
+            A,
+            MlxNeuralBackend,
+            MlxEmbeddedPredictionMaterializer,
+        > + 'static,
+{
+    fn finish<D>(
+        self,
+        completed: CompletedReplicatedText<A, S, D>,
+    ) -> Result<Box<dyn ErasedReplicatedTextExecutable>, Error>
+    where
+        D: eredu_runtime::ReplicatedTextExecutionStrategy<
+                A,
+                MlxNeuralBackend,
+                S,
+                MlxArchitectureLayerwisePolicy<A, S>,
+                MlxArchitectureLayerwisePolicy<A, S>,
+            > + MlxParameterBankTelemetry
+            + 'static,
+    {
+        completed
+            .with_prediction(self.prediction, self.capability)
+            .map(|completed| Box::new(completed) as Box<dyn ErasedReplicatedTextExecutable>)
+    }
+}
+
+impl<S>
+    eredu_architectures::replicated_text::ReplicatedPredictionTargetVisitor<
+        MlxNeuralBackend,
+        S,
+        MlxEmbeddedPredictionMaterializer,
+    > for PredictionBindingVisitor<'_>
+where
+    S: MlxStateMechanisms + 'static,
+{
+    type Output = Box<dyn ErasedReplicatedTextExecutable>;
+    type Error = Error;
+
+    fn visit<A>(
+        self,
+        prepared: PreparedReplicatedTextArchitecture<A>,
+        extension: <A as eredu_architectures::prediction_extension::MaterializedPredictionTarget<
+            MlxNeuralBackend,
+        >>::Extension<MlxEmbeddedPredictionMaterializer>,
+        store: Arc<dyn CheckpointSource>,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        A: ReplicatedTextArchitecture<MlxNeuralBackend, S, Error = eredu_nn::Error>
+            + eredu_architectures::prediction_extension::MaterializedPredictionTarget<
+                MlxNeuralBackend,
+            > + 'static,
+        A::StaticModules: Clone,
+        A::Error: std::fmt::Display,
+    {
+        let prediction = SelectedPrediction {
+            extension,
+            selected: self.selected,
+        };
+        CompletedReplicatedText::new(prepared, store, self.stream, self.weights_stream)?
+            .with_prediction(prediction, self.capability)
+            .map(|model| Box::new(model) as Box<dyn ErasedReplicatedTextExecutable>)
+    }
+}
+
+impl
+    eredu_architectures::replicated_text::ReplicatedPredictionProfileDispatcher<
+        MlxNeuralBackend,
+        MlxEmbeddedPredictionMaterializer,
+    > for PredictionBindingVisitor<'_>
+{
+    type Output = Box<dyn ErasedReplicatedTextExecutable>;
+    type Error = Error;
+    type State = MlxHybridState;
+    type Visitor = Self;
+
+    fn into_visitor(self) -> Self::Visitor {
+        self
+    }
+}
+
+impl
+    eredu_architectures::routed_text::RoutedPredictionProfileDispatcher<
+        MlxNeuralBackend,
+        MlxEmbeddedPredictionMaterializer,
+    > for PredictionBindingVisitor<'_>
+{
+    type Output = Box<dyn ErasedReplicatedTextExecutable>;
+    type Error = Error;
+    type GatedState = MlxHybridState;
+    type PoolingState = MlxPoolingAttentionState;
+    type GatedVisitor = Self;
+    type PoolingVisitor = Self;
+
+    fn into_gated_visitor(self) -> Self::GatedVisitor {
+        self
+    }
+
+    fn into_pooling_visitor(self) -> Self::PoolingVisitor {
+        self
+    }
+}
+
 struct PartitionedDenseDecoderBindingVisitor<'a> {
     distributed: crate::backend::distributed::MlxDistributedSession,
     additional_claimed_sources: std::collections::BTreeSet<String>,
     stream: &'a Stream,
     weights_stream: &'a Stream,
+}
+
+pub(crate) struct PartitionedPredictionBindingVisitor<'a> {
+    pub distributed: crate::backend::distributed::MlxDistributedSession,
+    pub additional_claimed_sources: std::collections::BTreeSet<String>,
+    pub stream: &'a Stream,
+    pub weights_stream: &'a Stream,
+    pub selected: eredu_runtime::SelectedSpeculativeRealization,
+    pub capability: eredu_architectures::capability::CapabilityEstimate,
+}
+
+impl
+    eredu_architectures::partitioned_execution::PartitionedPredictionTargetVisitor<
+        MlxNeuralBackend,
+        MlxHybridState,
+        MlxEmbeddedPredictionMaterializer,
+    > for PartitionedPredictionBindingVisitor<'_>
+{
+    type Output = Box<dyn ErasedReplicatedTextExecutable>;
+    type Error = Error;
+
+    fn visit<A, G>(
+        self,
+        prepared: eredu_architectures::partitioned_execution::PreparedPartitionedArchitecture<
+            MlxNeuralBackend,
+            A,
+            G,
+            <A as eredu_runtime::PartitionedLayeredArchitecture<
+                MlxNeuralBackend,
+                MlxHybridState,
+            >>::Boundary,
+        >,
+        extension: <A as eredu_architectures::prediction_extension::MaterializedPredictionTarget<
+            MlxNeuralBackend,
+        >>::Extension<MlxEmbeddedPredictionMaterializer>,
+        store: Arc<dyn CheckpointSource>,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        A: eredu_architectures::partitioned_execution::TextPartitionArchitecture<
+                MlxNeuralBackend,
+                MlxHybridState,
+            > + ReplicatedTextArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error>
+            + eredu_architectures::prediction_extension::MaterializedPredictionTarget<
+                MlxNeuralBackend,
+            > + 'static,
+        A::StaticModules: Clone,
+        G: 'static,
+    {
+        bind_partitioned(
+            prepared,
+            store,
+            self.distributed,
+            self.additional_claimed_sources,
+            self.stream,
+            self.weights_stream,
+            PredictionReplicatedFinalizer {
+                prediction: SelectedPrediction {
+                    extension,
+                    selected: self.selected,
+                },
+                capability: self.capability,
+            },
+        )
+    }
 }
 
 struct PartitionedRoutedDecoderBindingVisitor<'a> {
@@ -5958,9 +5739,73 @@ impl
             std::collections::BTreeSet::new(),
             self.stream,
             self.weights_stream,
+            OrdinaryReplicatedFinalizer,
         )
     }
 }
+
+macro_rules! impl_partitioned_prediction_binding {
+    ($state:ty) => {
+        impl
+            eredu_architectures::partitioned_execution::RoutedPartitionedPredictionTargetProductionVisitor<
+                MlxNeuralBackend,
+                $state,
+                MlxEmbeddedPredictionMaterializer,
+            > for PartitionedPredictionBindingVisitor<'_>
+        {
+            type Output = Box<dyn ErasedReplicatedTextExecutable>;
+            type Error = Error;
+
+            fn visit<A, G>(
+                self,
+                prepared: eredu_architectures::partitioned_execution::PreparedRoutedPartitionedArchitecture<
+                    MlxNeuralBackend,
+                    A,
+                    G,
+                    <A as eredu_runtime::PartitionedLayeredArchitecture<
+                        MlxNeuralBackend,
+                        $state,
+                    >>::Boundary,
+                >,
+                extension: <A as eredu_architectures::prediction_extension::MaterializedPredictionTarget<
+                    MlxNeuralBackend,
+                >>::Extension<MlxEmbeddedPredictionMaterializer>,
+                store: Arc<dyn CheckpointSource>,
+            ) -> Result<Self::Output, Self::Error>
+            where
+                A: eredu_architectures::partitioned_execution::TextPartitionArchitecture<
+                        MlxNeuralBackend,
+                        $state,
+                    > + ReplicatedTextArchitecture<MlxNeuralBackend, $state, Error = eredu_nn::Error>
+                    + eredu_runtime::ParallelRoutedLayeredArchitecture<MlxNeuralBackend, $state>
+                    + eredu_architectures::prediction_extension::MaterializedPredictionTarget<
+                        MlxNeuralBackend,
+                    > + 'static,
+                A::StaticModules: Clone,
+                G: 'static,
+            {
+                bind_partitioned_routed_resident(
+                    prepared,
+                    store,
+                    self.distributed,
+                    self.additional_claimed_sources,
+                    self.stream,
+                    self.weights_stream,
+                    PredictionReplicatedFinalizer {
+                        prediction: SelectedPrediction {
+                            extension,
+                            selected: self.selected,
+                        },
+                        capability: self.capability,
+                    },
+                )
+            }
+        }
+    };
+}
+
+impl_partitioned_prediction_binding!(MlxHybridState);
+impl_partitioned_prediction_binding!(MlxPoolingAttentionState);
 
 impl
     eredu_architectures::partitioned_execution::RoutedPartitionedProductionVisitor<
@@ -6001,6 +5846,7 @@ impl
             self.additional_claimed_sources,
             self.stream,
             self.weights_stream,
+            OrdinaryReplicatedFinalizer,
         )
     }
 }
@@ -6085,11 +5931,12 @@ impl
             self.additional_claimed_sources,
             self.stream,
             self.weights_stream,
+            OrdinaryReplicatedFinalizer,
         )
     }
 }
 
-fn bind_partitioned<A, G>(
+fn bind_partitioned<A, G, F>(
     prepared: eredu_architectures::partitioned_execution::PreparedPartitionedArchitecture<
         MlxNeuralBackend,
         A,
@@ -6101,6 +5948,7 @@ fn bind_partitioned<A, G>(
     additional_claimed_sources: std::collections::BTreeSet<String>,
     stream: &Stream,
     weights_stream: &Stream,
+    finalizer: F,
 ) -> Result<Box<dyn ErasedReplicatedTextExecutable>, Error>
 where
     A: eredu_architectures::partitioned_execution::TextPartitionArchitecture<
@@ -6110,6 +5958,7 @@ where
         + 'static,
     A::StaticModules: Clone,
     G: 'static,
+    F: ReplicatedExecutableFinalizer<A, MlxHybridState>,
 {
     prepared.dispatch_execution(
         (
@@ -6118,8 +5967,9 @@ where
             additional_claimed_sources,
             stream,
             weights_stream,
+            finalizer,
         ),
-        |prepared, (store, distributed, additional, stream, weights_stream)| {
+        |prepared, (store, distributed, additional, stream, weights_stream, finalizer)| {
             bind_partitioned_local(
                 prepared,
                 store,
@@ -6127,9 +5977,10 @@ where
                 additional,
                 stream,
                 weights_stream,
+                finalizer,
             )
         },
-        |prepared, (store, distributed, additional, stream, weights_stream)| {
+        |prepared, (store, distributed, additional, stream, weights_stream, finalizer)| {
             bind_partitioned_pipeline(
                 prepared,
                 store,
@@ -6137,12 +5988,13 @@ where
                 additional,
                 stream,
                 weights_stream,
+                finalizer,
             )
         },
     )
 }
 
-fn bind_partitioned_local<A, G>(
+fn bind_partitioned_local<A, G, F>(
     prepared: eredu_architectures::partitioned_execution::PreparedPartitionedArchitecture<
         MlxNeuralBackend,
         A,
@@ -6157,6 +6009,7 @@ fn bind_partitioned_local<A, G>(
     additional_claimed_sources: std::collections::BTreeSet<String>,
     stream: &Stream,
     weights_stream: &Stream,
+    finalizer: F,
 ) -> Result<Box<dyn ErasedReplicatedTextExecutable>, Error>
 where
     A: eredu_architectures::partitioned_execution::TextPartitionArchitecture<
@@ -6166,6 +6019,7 @@ where
         + 'static,
     A::StaticModules: Clone,
     G: 'static,
+    F: ReplicatedExecutableFinalizer<A, MlxHybridState>,
 {
     let capability_estimate = prepared.capability_estimate().clone();
     let effective_model_type = prepared.effective_model_type().to_owned();
@@ -6369,7 +6223,7 @@ where
         .lock()
         .map_err(|_| Error::ArchitectureModel("materialization report lock was poisoned".into()))?
         .clone();
-    Ok(Box::new(CompletedReplicatedText::from_session(
+    finalizer.finish(CompletedReplicatedText::from_session(
         session,
         prompt_cache_identity,
         capability_estimate,
@@ -6381,10 +6235,10 @@ where
         Some(publication_authority.owner_group_rank()),
         publication_authority.local_public_output(),
         stream,
-    )))
+    ))
 }
 
-fn bind_partitioned_routed_resident<A, S, G>(
+fn bind_partitioned_routed_resident<A, S, G, F>(
     prepared: eredu_architectures::partitioned_execution::PreparedRoutedPartitionedArchitecture<
         MlxNeuralBackend,
         A,
@@ -6396,6 +6250,7 @@ fn bind_partitioned_routed_resident<A, S, G>(
     additional_claimed_sources: std::collections::BTreeSet<String>,
     stream: &Stream,
     weights_stream: &Stream,
+    finalizer: F,
 ) -> Result<Box<dyn ErasedReplicatedTextExecutable>, Error>
 where
     S: MlxStateMechanisms + 'static,
@@ -6405,6 +6260,7 @@ where
         + 'static,
     A::StaticModules: Clone,
     G: 'static,
+    F: ReplicatedExecutableFinalizer<A, S>,
 {
     match prepared.bank_residency() {
         eredu_runtime::ParameterBankResidency::WithLayer => {
@@ -6420,6 +6276,7 @@ where
                 additional_claimed_sources,
                 stream,
                 weights_stream,
+                finalizer,
             )
         }
         eredu_runtime::ParameterBankResidency::IndependentCache(options) => {
@@ -6433,6 +6290,7 @@ where
                     additional_claimed_sources,
                     stream,
                     weights_stream,
+                    finalizer,
                 );
             }
             let (selected_member_bytes, bank) = selected_addressable_partition_bank(
@@ -6461,6 +6319,7 @@ where
                 additional_claimed_sources,
                 stream,
                 weights_stream,
+                finalizer,
             )
         }
         _ => Err(Error::ArchitectureModel(
@@ -6509,6 +6368,7 @@ where
                 std::collections::BTreeSet::new(),
                 stream,
                 weights_stream,
+                OrdinaryReplicatedFinalizer,
             )
         }
         eredu_runtime::ParameterBankResidency::IndependentCache(options) => {
@@ -6523,6 +6383,7 @@ where
                     std::collections::BTreeSet::new(),
                     stream,
                     weights_stream,
+                    OrdinaryReplicatedFinalizer,
                 );
             }
             let (selected_member_bytes, bank) = selected_addressable_partition_bank(
@@ -6551,6 +6412,7 @@ where
                 std::collections::BTreeSet::new(),
                 stream,
                 weights_stream,
+                OrdinaryReplicatedFinalizer,
             )
         }
         _ => Err(Error::ArchitectureModel(
@@ -6560,7 +6422,7 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-fn bind_partitioned_routed_with_provider<A, S, G, E, Provider>(
+fn bind_partitioned_routed_with_provider<A, S, G, E, Provider, F>(
     prepared: eredu_architectures::partitioned_execution::PreparedRoutedPartitionedArchitecture<
         MlxNeuralBackend,
         A,
@@ -6575,6 +6437,7 @@ fn bind_partitioned_routed_with_provider<A, S, G, E, Provider>(
     additional_claimed_sources: std::collections::BTreeSet<String>,
     stream: &Stream,
     weights_stream: &Stream,
+    finalizer: F,
 ) -> Result<Box<dyn ErasedReplicatedTextExecutable>, Error>
 where
     S: MlxStateMechanisms + 'static,
@@ -6589,6 +6452,7 @@ where
         + 'static,
     Provider: eredu_runtime::TensorParallelRoutedExpertProvider<MlxNeuralBackend> + 'static,
     Provider::Error: std::fmt::Display,
+    F: ReplicatedExecutableFinalizer<A, S>,
 {
     prepared.dispatch_execution(
         (
@@ -6599,8 +6463,9 @@ where
             additional_claimed_sources,
             stream,
             weights_stream,
+            finalizer,
         ),
-        |prepared, (store, distributed, provider, bank, additional, stream, weights_stream)| {
+        |prepared, (store, distributed, provider, bank, additional, stream, weights_stream, finalizer)| {
             bind_partitioned_routed_local_with_provider(
                 prepared,
                 store,
@@ -6610,9 +6475,10 @@ where
                 additional,
                 stream,
                 weights_stream,
+                finalizer,
             )
         },
-        |prepared, (store, distributed, provider, bank, additional, stream, weights_stream)| {
+        |prepared, (store, distributed, provider, bank, additional, stream, weights_stream, finalizer)| {
             bind_partitioned_routed_pipeline_with_provider(
                 prepared,
                 store,
@@ -6622,13 +6488,14 @@ where
                 additional,
                 stream,
                 weights_stream,
+                finalizer,
             )
         },
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-fn bind_partitioned_routed_local_with_provider<A, S, G, E, Provider>(
+fn bind_partitioned_routed_local_with_provider<A, S, G, E, Provider, F>(
     prepared: eredu_architectures::partitioned_execution::PreparedRoutedPartitionedArchitecture<
         MlxNeuralBackend,
         A,
@@ -6643,6 +6510,7 @@ fn bind_partitioned_routed_local_with_provider<A, S, G, E, Provider>(
     additional_claimed_sources: std::collections::BTreeSet<String>,
     stream: &Stream,
     weights_stream: &Stream,
+    finalizer: F,
 ) -> Result<Box<dyn ErasedReplicatedTextExecutable>, Error>
 where
     S: MlxStateMechanisms + 'static,
@@ -6655,6 +6523,7 @@ where
     E: eredu_architectures::routed_text::RoutedGroupedSpec + 'static,
     Provider: eredu_runtime::TensorParallelRoutedExpertProvider<MlxNeuralBackend> + 'static,
     Provider::Error: std::fmt::Display,
+    F: ReplicatedExecutableFinalizer<A, S>,
 {
     let capability_estimate = prepared.capability_estimate().clone();
     let effective_model_type = prepared.effective_model_type().to_owned();
@@ -6841,11 +6710,11 @@ where
     if let Some(bank) = parameter_bank {
         completed = completed.with_parameter_bank(bank);
     }
-    Ok(Box::new(completed))
+    finalizer.finish(completed)
 }
 
 #[allow(clippy::too_many_arguments)]
-fn bind_partitioned_routed_pipeline_with_provider<A, S, G, E, Provider>(
+fn bind_partitioned_routed_pipeline_with_provider<A, S, G, E, Provider, F>(
     prepared: eredu_architectures::partitioned_execution::PreparedRoutedPartitionedArchitecture<
         MlxNeuralBackend,
         A,
@@ -6860,6 +6729,7 @@ fn bind_partitioned_routed_pipeline_with_provider<A, S, G, E, Provider>(
     additional_claimed_sources: std::collections::BTreeSet<String>,
     stream: &Stream,
     weights_stream: &Stream,
+    finalizer: F,
 ) -> Result<Box<dyn ErasedReplicatedTextExecutable>, Error>
 where
     S: MlxStateMechanisms + 'static,
@@ -6874,6 +6744,7 @@ where
         + 'static,
     Provider: eredu_runtime::TensorParallelRoutedExpertProvider<MlxNeuralBackend> + 'static,
     Provider::Error: std::fmt::Display,
+    F: ReplicatedExecutableFinalizer<A, S>,
 {
     let capability_estimate = prepared.capability_estimate().clone();
     let effective_model_type = prepared.effective_model_type().to_owned();
@@ -7078,10 +6949,10 @@ where
     if let Some(bank) = parameter_bank {
         completed = completed.with_parameter_bank(bank);
     }
-    Ok(Box::new(completed))
+    finalizer.finish(completed)
 }
 
-fn bind_partitioned_pipeline<A, G>(
+fn bind_partitioned_pipeline<A, G, F>(
     prepared: eredu_architectures::partitioned_execution::PreparedPartitionedArchitecture<
         MlxNeuralBackend,
         A,
@@ -7093,6 +6964,7 @@ fn bind_partitioned_pipeline<A, G>(
     additional_claimed_sources: std::collections::BTreeSet<String>,
     stream: &Stream,
     weights_stream: &Stream,
+    finalizer: F,
 ) -> Result<Box<dyn ErasedReplicatedTextExecutable>, Error>
 where
     A: eredu_architectures::partitioned_execution::TextPartitionArchitecture<
@@ -7102,6 +6974,7 @@ where
         + 'static,
     A::StaticModules: Clone,
     G: 'static,
+    F: ReplicatedExecutableFinalizer<A, MlxHybridState>,
 {
     let capability_estimate = prepared.capability_estimate().clone();
     let effective_model_type = prepared.effective_model_type().to_owned();
@@ -7300,7 +7173,7 @@ where
         .lock()
         .map_err(|_| Error::ArchitectureModel("materialization report lock was poisoned".into()))?
         .clone();
-    Ok(Box::new(CompletedReplicatedText::from_session(
+    finalizer.finish(CompletedReplicatedText::from_session(
         session,
         prompt_cache_identity,
         capability_estimate,
@@ -7312,7 +7185,7 @@ where
         Some(publication_authority.owner_group_rank()),
         publication_authority.local_public_output(),
         stream,
-    )))
+    ))
 }
 
 struct PartitionedCompositeBindingVisitor<'a> {
@@ -7320,6 +7193,85 @@ struct PartitionedCompositeBindingVisitor<'a> {
     distributed: crate::backend::distributed::MlxDistributedSession,
     stream: &'a Stream,
     weights_stream: &'a Stream,
+}
+
+trait CompositeExecutableFinalizer<A>
+where
+    A: CompositeArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error> + 'static,
+    A::InputPartPlan: 'static,
+    A::AdmissionConfig: 'static,
+    A::Error: std::fmt::Display,
+{
+    fn finish<D>(
+        self,
+        completed: CompletedComposite<A, D>,
+    ) -> Result<Box<dyn ErasedReplicatedTextExecutable>, Error>
+    where
+        D: eredu_runtime::ReplicatedTextExecutionStrategy<
+                PreparedCompositeArchitecture<A>,
+                MlxNeuralBackend,
+                MlxHybridState,
+                MlxArchitectureLayerwisePolicy<PreparedCompositeArchitecture<A>, MlxHybridState>,
+                MlxArchitectureLayerwisePolicy<PreparedCompositeArchitecture<A>, MlxHybridState>,
+            > + MlxParameterBankTelemetry
+            + 'static;
+}
+
+impl<A> CompositeExecutableFinalizer<A> for OrdinaryReplicatedFinalizer
+where
+    A: CompositeArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error> + 'static,
+    A::InputPartPlan: 'static,
+    A::AdmissionConfig: 'static,
+    A::Error: std::fmt::Display,
+{
+    fn finish<D>(
+        self,
+        completed: CompletedComposite<A, D>,
+    ) -> Result<Box<dyn ErasedReplicatedTextExecutable>, Error>
+    where
+        D: eredu_runtime::ReplicatedTextExecutionStrategy<
+                PreparedCompositeArchitecture<A>,
+                MlxNeuralBackend,
+                MlxHybridState,
+                MlxArchitectureLayerwisePolicy<PreparedCompositeArchitecture<A>, MlxHybridState>,
+                MlxArchitectureLayerwisePolicy<PreparedCompositeArchitecture<A>, MlxHybridState>,
+            > + MlxParameterBankTelemetry
+            + 'static,
+    {
+        Ok(Box::new(completed))
+    }
+}
+
+impl<A, P> CompositeExecutableFinalizer<A> for PredictionReplicatedFinalizer<P>
+where
+    A: CompositeArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error> + 'static,
+    A::InputPartPlan: 'static,
+    A::AdmissionConfig: 'static,
+    A::Error: std::fmt::Display,
+    P: eredu_architectures::prediction_extension::MaterializedPredictionExecutor<
+            PreparedCompositeArchitecture<A>,
+            MlxNeuralBackend,
+            MlxEmbeddedPredictionMaterializer,
+        > + 'static,
+{
+    fn finish<D>(
+        self,
+        completed: CompletedComposite<A, D>,
+    ) -> Result<Box<dyn ErasedReplicatedTextExecutable>, Error>
+    where
+        D: eredu_runtime::ReplicatedTextExecutionStrategy<
+                PreparedCompositeArchitecture<A>,
+                MlxNeuralBackend,
+                MlxHybridState,
+                MlxArchitectureLayerwisePolicy<PreparedCompositeArchitecture<A>, MlxHybridState>,
+                MlxArchitectureLayerwisePolicy<PreparedCompositeArchitecture<A>, MlxHybridState>,
+            > + MlxParameterBankTelemetry
+            + 'static,
+    {
+        completed
+            .with_prediction(self.prediction, self.capability)
+            .map(|completed| Box::new(completed) as Box<dyn ErasedReplicatedTextExecutable>)
+    }
 }
 
 impl
@@ -7346,189 +7298,273 @@ impl
         A::Error: std::fmt::Display,
         W: eredu_runtime::ArchitectureBoundary,
     {
-        let execution_plan = prepared
-            .execution_plan()
-            .map_err(Error::ArchitectureModel)?;
-        let publication_authority = execution_plan
-            .publication_authority(prepared.communication())
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?
-            .ok_or_else(|| {
-                Error::ArchitectureModel(
-                    "composite partition has no selected output publication authority".into(),
-                )
-            })?;
-        let selected_residency = prepared
-            .prepared()
-            .selected()
-            .base()
-            .execution()
-            .residency();
-        let session_group = prepared
-            .prepared()
-            .selected()
-            .session_group()
-            .ok_or_else(|| {
-                Error::ArchitectureModel("composite partition has no selected session group".into())
-            })?;
-        let prompt_topology = prepared
-            .prepared()
-            .selected()
-            .prompt_cache_topology()
-            .map_err(Error::ArchitectureModel)?;
-        let local_state = prepared
-            .prepared()
-            .selected()
-            .partition()
-            .state()
-            .ok_or_else(|| {
-                Error::ArchitectureModel("composite partition has no selected local state".into())
-            })?;
-        let prompt_cache_identity = local_state
-            .prompt_cache_identity::<MlxNeuralBackend, _>(
-                prepared.prepared().architecture(),
-                prompt_topology.clone(),
-            )
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        let admission = prepared.prepared().architecture().admission_config();
-        let processor = prepared.prepared().selected().base().processor().clone();
-        let capability_estimate = prepared.capability_estimate().clone();
-        let effective_model_type = prepared.effective_model_type().to_owned();
-        let materialization_slot = Arc::new(std::sync::Mutex::new(None));
-        let mut mechanisms: MlxReplicatedTextMechanisms<
-            PreparedCompositeArchitecture<A>,
-            MlxHybridState,
-        > = MlxReplicatedTextMechanisms::new(
+        bind_prepared_partitioned_composite(
+            prepared,
             self.store,
-            Arc::clone(&materialization_slot),
+            self.distributed,
             self.stream,
             self.weights_stream,
-        );
-        let mut distributed = Some(self.distributed);
-        let mut partition_sampling_group = None;
-        let mut partition_communication_authority = None;
-        #[cfg(test)]
-        {
-            super::path_instrumentation::constructor();
-            super::path_instrumentation::neutral_partitioned_construction();
-        }
-        let binding = prepared
-            .prepare_session_runtime::<MlxNeuralBackend, _, _, _, _>(
-                prompt_topology.clone(),
-                self.stream,
-                |input, physical_layout, executor_plan, selected, context| {
-                    let tensor_group = executor_plan.communication_tensor_group();
-                    let (mut architecture, partition, manifest, tasks) = input.into_parts();
-                    mechanisms.set_parallel_layout(physical_layout);
-                    let global_layout = partition.unit_layout().clone();
-                    let addresses = partition.units().collect::<Vec<_>>();
-                    let mut units = addresses
-                        .iter()
-                        .map(|address| {
-                            architecture
-                                .build_unit(address.group(), address.index(), context)
-                                .map_err(|error| Error::ArchitectureModel(error.to_string()))
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
-                    mechanisms.prepare_local_partition_materialization(
-                        &architecture,
-                        None,
-                        &global_layout,
-                        &addresses,
-                        &units,
-                        None,
-                        None,
-                        &tasks,
-                    )?;
-                    let (execution_policy, bounded_policy) = match selected_residency {
-                        eredu_runtime::LayerWeightResidency::FullyResident => (
-                            mechanisms.resident_policy(
-                                &mut architecture,
-                                std::mem::take(&mut units),
-                                selected,
-                                context,
-                            )?,
-                            None,
-                        ),
-                        eredu_runtime::LayerWeightResidency::LayerwiseHost(_)
-                        | eredu_runtime::LayerWeightResidency::DenseDiskStream(_) => {
-                            drop(units);
-                            let policy =
-                                mechanisms.bounded_policy(&mut architecture, selected, context)?;
-                            (policy.clone(), Some(policy))
-                        }
-                        _ => {
-                            return Err(Error::ArchitectureModel(
-                                "composite partition selected an unknown weight residency".into(),
-                            ));
-                        }
-                    };
-                    let local_state = partition.state().ok_or_else(|| {
-                        Error::ArchitectureModel(
-                            "composite partition has no selected local state".into(),
-                        )
-                    })?;
-                    let selected_state = selected
-                        .state()
-                        .for_partitioned_geometry(local_state)
-                        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-                    let rank = eredu_core::cache::CacheRankIdentity::new(
-                        prompt_topology.stage().map(|(_, rank)| rank),
-                        prompt_topology.shard().map(|(_, rank)| rank),
-                        prompt_topology.addressable().map(|(_, rank)| rank),
-                    );
-                    mechanisms.set_state_partition(rank, local_state.global_layer_offset());
-                    let state = <MlxHybridState as MlxStateMechanisms>::realize(
-                        &selected_state,
-                        Some(rank),
-                        local_state.global_layer_offset(),
-                    )?;
-                    let distributed = distributed.take().ok_or_else(|| {
-                        Error::Parallel("composite communication was already consumed".into())
-                    })?;
-                    let (communication, parallel, sampling, communication_executor) = distributed
-                        .into_partition_communication(
-                        manifest,
-                        tensor_group,
-                        session_group,
-                    )?;
-                    partition_communication_authority = Some(communication.authority());
-                    partition_sampling_group = Some(sampling);
-                    let executor = executor_plan.bind(
-                        architecture.into_inner(),
-                        execution_policy,
-                        parallel,
-                        MlxPartitionTensorAllocator,
-                        super::distributed::expert::MlxExpertRouteTensorMovement::new(self.stream),
-                    )?;
-                    let runtime = eredu_runtime::PartitionedTextRuntime::new(
-                        execution_plan,
-                        executor,
-                        communication,
-                        communication_executor,
-                        eredu_runtime::OpaqueBoundaryTransport,
-                        eredu_runtime::OpaqueOutputPublisher,
-                        eredu_runtime::OpaqueFailureAgreement,
-                        selected_residency.execution_residency(),
-                        bounded_policy,
-                    )
-                    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-                    Ok::<_, Error>((runtime, state))
+            OrdinaryReplicatedFinalizer,
+        )
+    }
+}
+
+pub(crate) struct PartitionedCompositePredictionBindingVisitor<'a> {
+    pub store: Arc<dyn CheckpointSource>,
+    pub distributed: crate::backend::distributed::MlxDistributedSession,
+    pub stream: &'a Stream,
+    pub weights_stream: &'a Stream,
+    pub selected: eredu_runtime::SelectedSpeculativeRealization,
+    pub capability: eredu_architectures::capability::CapabilityEstimate,
+}
+
+impl
+    eredu_architectures::composite_partitioned::AuthoritativeCompositePartitionPredictionTargetVisitor<
+        MlxNeuralBackend,
+        MlxHybridState,
+        MlxEmbeddedPredictionMaterializer,
+    > for PartitionedCompositePredictionBindingVisitor<'_>
+{
+    type Output = Box<dyn ErasedReplicatedTextExecutable>;
+    type Error = Error;
+
+    fn visit<A, G, W>(
+        self,
+        prepared: eredu_architectures::composite_partitioned::PreparedCompositePartition<A, G, W>,
+        extension: <PreparedCompositeArchitecture<A> as eredu_architectures::prediction_extension::MaterializedPredictionTarget<
+            MlxNeuralBackend,
+        >>::Extension<MlxEmbeddedPredictionMaterializer>,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        A: CompositeArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error>
+            + eredu_runtime::PartitionedLayeredArchitecture<
+                MlxNeuralBackend,
+                MlxHybridState,
+                Boundary = W,
+            > + eredu_runtime::ParallelRoutedLayeredArchitecture<MlxNeuralBackend, MlxHybridState>
+            + 'static,
+        A::Error: std::fmt::Display,
+        W: eredu_runtime::ArchitectureBoundary,
+        PreparedCompositeArchitecture<A>:
+            eredu_architectures::prediction_extension::MaterializedPredictionTarget<
+                MlxNeuralBackend,
+            >,
+    {
+        bind_prepared_partitioned_composite(
+            prepared,
+            self.store,
+            self.distributed,
+            self.stream,
+            self.weights_stream,
+            PredictionReplicatedFinalizer {
+                prediction: SelectedPrediction {
+                    extension,
+                    selected: self.selected,
                 },
+                capability: self.capability,
+            },
+        )
+    }
+}
+
+fn bind_prepared_partitioned_composite<A, G, W, F>(
+    prepared: eredu_architectures::composite_partitioned::PreparedCompositePartition<A, G, W>,
+    store: Arc<dyn CheckpointSource>,
+    distributed: crate::backend::distributed::MlxDistributedSession,
+    stream: &Stream,
+    weights_stream: &Stream,
+    finalizer: F,
+) -> Result<Box<dyn ErasedReplicatedTextExecutable>, Error>
+where
+    A: CompositeArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error>
+        + eredu_runtime::PartitionedLayeredArchitecture<
+            MlxNeuralBackend,
+            MlxHybridState,
+            Boundary = W,
+        > + eredu_runtime::ParallelRoutedLayeredArchitecture<MlxNeuralBackend, MlxHybridState>
+        + 'static,
+    A::Error: std::fmt::Display,
+    W: eredu_runtime::ArchitectureBoundary,
+    F: CompositeExecutableFinalizer<A>,
+{
+    let execution_plan = prepared
+        .execution_plan()
+        .map_err(Error::ArchitectureModel)?;
+    let publication_authority = execution_plan
+        .publication_authority(prepared.communication())
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?
+        .ok_or_else(|| {
+            Error::ArchitectureModel(
+                "composite partition has no selected output publication authority".into(),
             )
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        let session = eredu_runtime::construct_replicated_text_session_with_runtime(
-            binding,
-            mechanisms,
-            eredu_runtime::PartitionedTextExecution::new(),
+        })?;
+    let selected_residency = prepared
+        .prepared()
+        .selected()
+        .base()
+        .execution()
+        .residency();
+    let session_group = prepared
+        .prepared()
+        .selected()
+        .session_group()
+        .ok_or_else(|| {
+            Error::ArchitectureModel("composite partition has no selected session group".into())
+        })?;
+    let prompt_topology = prepared
+        .prepared()
+        .selected()
+        .prompt_cache_topology()
+        .map_err(Error::ArchitectureModel)?;
+    let local_state = prepared
+        .prepared()
+        .selected()
+        .partition()
+        .state()
+        .ok_or_else(|| {
+            Error::ArchitectureModel("composite partition has no selected local state".into())
+        })?;
+    let prompt_cache_identity = local_state
+        .prompt_cache_identity::<MlxNeuralBackend, _>(
+            prepared.prepared().architecture(),
+            prompt_topology.clone(),
         )
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        let materialization = materialization_slot
-            .lock()
-            .map_err(|_| {
-                Error::ArchitectureModel("materialization report lock was poisoned".into())
-            })?
-            .clone();
-        Ok(Box::new(CompletedComposite::from_session(
+    let admission = prepared.prepared().architecture().admission_config();
+    let processor = prepared.prepared().selected().base().processor().clone();
+    let capability_estimate = prepared.capability_estimate().clone();
+    let effective_model_type = prepared.effective_model_type().to_owned();
+    let materialization_slot = Arc::new(std::sync::Mutex::new(None));
+    let mut mechanisms: MlxReplicatedTextMechanisms<
+        PreparedCompositeArchitecture<A>,
+        MlxHybridState,
+    > = MlxReplicatedTextMechanisms::new(
+        store,
+        Arc::clone(&materialization_slot),
+        stream,
+        weights_stream,
+    );
+    let mut distributed = Some(distributed);
+    let mut partition_sampling_group = None;
+    let mut partition_communication_authority = None;
+    #[cfg(test)]
+    {
+        super::path_instrumentation::constructor();
+        super::path_instrumentation::neutral_partitioned_construction();
+    }
+    let binding = prepared
+        .prepare_session_runtime::<MlxNeuralBackend, _, _, _, _>(
+            prompt_topology.clone(),
+            stream,
+            |input, physical_layout, executor_plan, selected, context| {
+                let tensor_group = executor_plan.communication_tensor_group();
+                let (mut architecture, partition, manifest, tasks) = input.into_parts();
+                mechanisms.set_parallel_layout(physical_layout);
+                let global_layout = partition.unit_layout().clone();
+                let addresses = partition.units().collect::<Vec<_>>();
+                let mut units = addresses
+                    .iter()
+                    .map(|address| {
+                        architecture
+                            .build_unit(address.group(), address.index(), context)
+                            .map_err(|error| Error::ArchitectureModel(error.to_string()))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                mechanisms.prepare_local_partition_materialization(
+                    &architecture,
+                    None,
+                    &global_layout,
+                    &addresses,
+                    &units,
+                    None,
+                    None,
+                    &tasks,
+                )?;
+                let (execution_policy, bounded_policy) = match selected_residency {
+                    eredu_runtime::LayerWeightResidency::FullyResident => (
+                        mechanisms.resident_policy(
+                            &mut architecture,
+                            std::mem::take(&mut units),
+                            selected,
+                            context,
+                        )?,
+                        None,
+                    ),
+                    eredu_runtime::LayerWeightResidency::LayerwiseHost(_)
+                    | eredu_runtime::LayerWeightResidency::DenseDiskStream(_) => {
+                        drop(units);
+                        let policy =
+                            mechanisms.bounded_policy(&mut architecture, selected, context)?;
+                        (policy.clone(), Some(policy))
+                    }
+                    _ => {
+                        return Err(Error::ArchitectureModel(
+                            "composite partition selected an unknown weight residency".into(),
+                        ));
+                    }
+                };
+                let local_state = partition.state().ok_or_else(|| {
+                    Error::ArchitectureModel(
+                        "composite partition has no selected local state".into(),
+                    )
+                })?;
+                let selected_state = selected
+                    .state()
+                    .for_partitioned_geometry(local_state)
+                    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+                let rank = eredu_core::cache::CacheRankIdentity::new(
+                    prompt_topology.stage().map(|(_, rank)| rank),
+                    prompt_topology.shard().map(|(_, rank)| rank),
+                    prompt_topology.addressable().map(|(_, rank)| rank),
+                );
+                mechanisms.set_state_partition(rank, local_state.global_layer_offset());
+                let state = <MlxHybridState as MlxStateMechanisms>::realize(
+                    &selected_state,
+                    Some(rank),
+                    local_state.global_layer_offset(),
+                )?;
+                let distributed = distributed.take().ok_or_else(|| {
+                    Error::Parallel("composite communication was already consumed".into())
+                })?;
+                let (communication, parallel, sampling, communication_executor) = distributed
+                    .into_partition_communication(manifest, tensor_group, session_group)?;
+                partition_communication_authority = Some(communication.authority());
+                partition_sampling_group = Some(sampling);
+                let executor = executor_plan.bind(
+                    architecture.into_inner(),
+                    execution_policy,
+                    parallel,
+                    MlxPartitionTensorAllocator,
+                    super::distributed::expert::MlxExpertRouteTensorMovement::new(stream),
+                )?;
+                let runtime = eredu_runtime::PartitionedTextRuntime::new(
+                    execution_plan,
+                    executor,
+                    communication,
+                    communication_executor,
+                    eredu_runtime::OpaqueBoundaryTransport,
+                    eredu_runtime::OpaqueOutputPublisher,
+                    eredu_runtime::OpaqueFailureAgreement,
+                    selected_residency.execution_residency(),
+                    bounded_policy,
+                )
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+                Ok::<_, Error>((runtime, state))
+            },
+        )
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let session = eredu_runtime::construct_replicated_text_session_with_runtime(
+        binding,
+        mechanisms,
+        eredu_runtime::PartitionedTextExecution::new(),
+    )
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let materialization = materialization_slot
+        .lock()
+        .map_err(|_| Error::ArchitectureModel("materialization report lock was poisoned".into()))?
+        .clone();
+    finalizer.finish(
+        CompletedComposite::<A, _, NoSelectedPrediction>::from_session(
             session,
             admission,
             processor,
@@ -7541,9 +7577,9 @@ impl
             partition_communication_authority,
             Some(publication_authority.owner_group_rank()),
             publication_authority.local_public_output(),
-            self.stream,
-        )))
-    }
+            stream,
+        ),
+    )
 }
 
 pub(crate) fn bind_partitioned_composite(
@@ -7682,6 +7718,114 @@ pub(crate) fn bind_partitioned_routed_decoder(
                     distributed,
                     stream,
                     weights_stream,
+                },
+            )
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn bind_partitioned_routed_prediction_decoder(
+    inspection: &eredu_core::ArtifactInspection<
+        eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+    >,
+    selected: eredu_architectures::partitioned_execution::SelectedPartitionedAdmission<
+        eredu_architectures::SelectedRoutedTextRealization,
+        eredu_architectures::RoutedTextRequirements,
+    >,
+    extension: MaterializedEmbeddedPrediction,
+    realization: eredu_runtime::SelectedSpeculativeRealization,
+    capability: eredu_architectures::capability::CapabilityEstimate,
+    store: Arc<dyn CheckpointSource>,
+    distributed: crate::backend::distributed::MlxDistributedSession,
+    additional_claimed_sources: std::collections::BTreeSet<String>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<Box<dyn ErasedReplicatedTextExecutable>, Error> {
+    eredu_architectures::partitioned_execution::dispatch_routed_partitioned_production(
+        inspection,
+        selected,
+        (
+            extension,
+            realization,
+            capability,
+            store,
+            distributed,
+            additional_claimed_sources,
+            stream,
+            weights_stream,
+        ),
+        |(
+            extension,
+            realization,
+            capability,
+            store,
+            distributed,
+            additional,
+            stream,
+            weights_stream,
+        ),
+         inspection,
+         selected| {
+            eredu_architectures::partitioned_execution::visit_routed_partitioned_prediction_target_production::<
+                MlxNeuralBackend,
+                MlxHybridState,
+                MlxEmbeddedPredictionMaterializer,
+                _,
+            >(
+                inspection,
+                selected,
+                extension,
+                store,
+                stream,
+                PartitionedPredictionBindingVisitor {
+                    distributed,
+                    additional_claimed_sources: additional,
+                    stream,
+                    weights_stream,
+                    selected: realization,
+                    capability,
+                },
+            )
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))
+        },
+        |_, _, _| {
+            Err(Error::ArchitectureModel(
+                "the selected ReLU-squared routed partition has no embedded prediction target"
+                    .into(),
+            ))
+        },
+        |(
+            extension,
+            realization,
+            capability,
+            store,
+            distributed,
+            additional,
+            stream,
+            weights_stream,
+        ),
+         inspection,
+         selected| {
+            eredu_architectures::partitioned_execution::visit_deepseek_v4_routed_partitioned_prediction_target_production::<
+                MlxNeuralBackend,
+                MlxPoolingAttentionState,
+                MlxEmbeddedPredictionMaterializer,
+                _,
+            >(
+                inspection,
+                selected,
+                extension,
+                store,
+                stream,
+                PartitionedPredictionBindingVisitor {
+                    distributed,
+                    additional_claimed_sources: additional,
+                    stream,
+                    weights_stream,
+                    selected: realization,
+                    capability,
                 },
             )
             .map_err(|error| Error::ArchitectureModel(error.to_string()))
@@ -7961,6 +8105,7 @@ fn gguf_affine(ggml_type: eredu_gguf::GgmlType) -> Option<eredu_checkpoint::Affi
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use eredu_checkpoint::SourceTensorEncoding;
     use eredu_core::{
         cache::LayerCachePolicy, AttentionPolicy, LayerSchedule, ModelConfigurationResolver,

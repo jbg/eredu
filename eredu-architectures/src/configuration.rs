@@ -1117,10 +1117,22 @@ impl PredictionExtensionPlan {
             SafetensorsModelConfig::DeepSeekV4(args) if args.dspark.is_none() => {
                 (4, vec![args.hc_mult, args.hidden_size])
             }
-            SafetensorsModelConfig::DeepSeekV4(_) => {
-                return Err(ArtifactError::InvalidArchitecturePlan(
-                    "DSpark target capture requires a dedicated typed target projection".into(),
-                ));
+            SafetensorsModelConfig::DeepSeekV4(args) => {
+                let capture_count = args
+                    .target_capture_policy
+                    .as_ref()
+                    .ok_or_else(|| {
+                        ArtifactError::InvalidArchitecturePlan(
+                            "DSpark prediction has no target capture policy".into(),
+                        )
+                    })?
+                    .len();
+                let capture_count = i32::try_from(capture_count).map_err(|_| {
+                    ArtifactError::InvalidArchitecturePlan(
+                        "DSpark target capture count exceeds i32".into(),
+                    )
+                })?;
+                (3, vec![capture_count, args.hidden_size])
             }
             SafetensorsModelConfig::Inkling(args) => (3, vec![args.text_config.hidden_size]),
             SafetensorsModelConfig::QwenHybrid(args) => (3, vec![args.text.hidden_size]),
@@ -1502,6 +1514,94 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("identity does not match"));
+    }
+
+    #[test]
+    fn admitted_prediction_extension_builds_neutral_speculative_contract() {
+        let extension = resolve_model_config(&tiny_deepseek_prediction_config())
+            .unwrap()
+            .architecture
+            .prediction_target_projection()
+            .unwrap()
+            .unwrap()
+            .1;
+        let topology = eredu_core::ParallelRankTopology::new(
+            eredu_core::ParallelTopology::new(1, 1, 1, 1).unwrap(),
+            0,
+        )
+        .unwrap();
+        let identity = |value| eredu_runtime::SpeculativeIdentity::new(value).unwrap();
+        let contract = crate::prediction_extension::embedded_speculative_contract(
+            &extension,
+            crate::prediction_extension::EmbeddedSpeculativeContractRequest::new(
+                identity("deepseek-v3-target"),
+                identity("artifact-v1"),
+                identity("safetensors-v1"),
+                topology,
+                identity("text-input-v1"),
+                std::num::NonZeroUsize::new(2).unwrap(),
+                std::num::NonZeroUsize::new(8).unwrap(),
+                std::num::NonZeroUsize::new(1).unwrap(),
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            contract.requirements().strategy().class(),
+            eredu_runtime::SpeculativeStrategyClass::EmbeddedSequential
+        );
+        assert_eq!(contract.target_capture().entries()[0].shape(), [2, 8, 16]);
+        assert_eq!(
+            contract.target_capture().entries()[0]
+                .bounded_dimensions()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            [0, 1]
+        );
+        contract
+            .target_capture()
+            .instantiate([vec![1, 3, 16]])
+            .unwrap();
+        assert!(contract
+            .target_capture()
+            .instantiate([vec![3, 3, 16]])
+            .is_err());
+        assert!(contract
+            .target_capture()
+            .instantiate([vec![1, 9, 16]])
+            .is_err());
+        assert!(contract
+            .target_capture()
+            .instantiate([vec![1, 3, 15]])
+            .is_err());
+        assert!(contract
+            .target_capture()
+            .instantiate([vec![0, 3, 16]])
+            .is_err());
+        assert!(contract
+            .requirements()
+            .mechanisms()
+            .mechanisms()
+            .contains(&eredu_runtime::SpeculativeMechanism::GroupedNeuralOperations));
+        let mechanisms = eredu_runtime::SpeculativeMechanismCapabilities::new(
+            contract
+                .requirements()
+                .mechanisms()
+                .mechanisms()
+                .iter()
+                .copied(),
+        );
+        let selected = eredu_runtime::select_speculative_realization(
+            contract.requirements(),
+            &contract.selection_request(eredu_runtime::SpeculativePlacementRequest::Single),
+            &mechanisms,
+        )
+        .unwrap();
+        assert_eq!(
+            selected.requirements().strategy().identity(),
+            contract.requirements().strategy().identity()
+        );
     }
 
     #[test]

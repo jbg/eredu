@@ -1293,7 +1293,11 @@ pub fn v4_static_parameter_groups(
             .map_err(|_| invalid("V4 DSpark depth exceeds usize"))?
             .checked_sub(1)
             .ok_or_else(|| invalid("V4 DSpark requires at least one draft layer"))?;
-        let captures = config.target_layer_ids.len();
+        let captures = args
+            .target_capture_policy
+            .as_ref()
+            .expect("validated DSpark target capture policy")
+            .len();
         let markov = dim(config.markov_rank)?;
         groups.push(replicated(
             "dspark",

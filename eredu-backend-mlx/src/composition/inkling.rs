@@ -6,7 +6,6 @@ use eredu_architectures::inkling::{
     DecoderInputPart, LayeredModel as Architecture, ModelArgs, ModelInput, Unit,
 };
 use eredu_checkpoint::{store::SharedCheckpointSource, WeightQuantization};
-use eredu_nn::Tensor;
 use eredu_runtime::{
     ArchitectureParameters, CacheResidencyPolicy, CausalModel, LayeredArchitecture,
     LayerwiseRuntime, PagedCacheOptions, ParameterRole, RuntimeState, WeightResidency,
@@ -70,22 +69,6 @@ pub struct InklingState {
 impl InklingState {
     pub fn target(&self) -> &MlxHybridState {
         &self.target
-    }
-
-    fn clear(&mut self) -> Result<(), Exception> {
-        self.target.clear()?;
-        if let Some(mtp) = &mut self.mtp {
-            mtp.clear()?;
-        }
-        Ok(())
-    }
-
-    fn restore_target_checkpoint(
-        &mut self,
-        checkpoint: &Self,
-        stream: &Stream,
-    ) -> Result<(), Exception> {
-        self.target.restore_checkpoint(&checkpoint.target, stream)
     }
 }
 
@@ -391,7 +374,10 @@ impl InklingModel {
         input: ModelInput<'_, crate::MlxTensor>,
         state: &mut InklingState,
         stream: &Stream,
-    ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Error> {
+    ) -> Result<
+        eredu_architectures::speculative_execution::EmbeddedPredictionOutput<crate::MlxTensor>,
+        Error,
+    > {
         if state.target.layout() != self.state_layouts.target() {
             return Err(Error::ArchitectureModel(
                 "Inkling cache layout mismatch".into(),
@@ -463,9 +449,11 @@ impl InklingModel {
             let (logits, _) =
                 result.map_err(|error| Error::ArchitectureModel(error.to_string()))?;
             return Ok(
-                crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput {
+                eredu_architectures::speculative_execution::EmbeddedPredictionOutput::<
+                    crate::MlxTensor,
+                > {
                     logits,
-                    hidden: final_text_hidden.ok_or_else(|| {
+                    capture: final_text_hidden.ok_or_else(|| {
                         Error::ArchitectureModel(
                             "Inkling text graph produced no target activation".into(),
                         )
@@ -512,9 +500,11 @@ impl InklingModel {
         }
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         Ok(
-            crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput {
+            eredu_architectures::speculative_execution::EmbeddedPredictionOutput::<
+                crate::MlxTensor,
+            > {
                 logits: result.0,
-                hidden: final_text_hidden.ok_or_else(|| {
+                capture: final_text_hidden.ok_or_else(|| {
                     Error::ArchitectureModel(
                         "Inkling text graph produced no target activation".into(),
                     )
@@ -655,7 +645,10 @@ impl InklingModel {
         typed: input::ModelInput<'_>,
         state: &mut InklingState,
         stream: &Stream,
-    ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Error> {
+    ) -> Result<
+        eredu_architectures::speculative_execution::EmbeddedPredictionOutput<crate::MlxTensor>,
+        Error,
+    > {
         prepare_input(&self.args, typed, stream)?
             .with_model_input(|input| self.forward_with_capture(input, state, stream))
     }
@@ -668,50 +661,6 @@ impl InklingModel {
     ) -> Result<crate::MlxTensor, Error> {
         self.forward_input_with_capture(typed, state, stream)
             .map(|output| output.logits)
-    }
-
-    pub fn mtp_len(&self) -> usize {
-        match &self.execution {
-            Execution::Resident(runtime) => runtime.architecture().mtp_len(),
-            Execution::Bounded(runtime) => runtime.architecture().mtp_len(),
-        }
-    }
-
-    fn forward_mtp_draft(
-        &mut self,
-        hidden: &crate::MlxTensor,
-        tokens: &crate::MlxTensor,
-        depth: usize,
-        state: &mut MlxHybridState,
-        stream: &Stream,
-    ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Exception> {
-        let architecture = match &mut self.execution {
-            Execution::Resident(runtime) => runtime.architecture_mut(),
-            Execution::Bounded(runtime) => runtime.architecture_mut(),
-        };
-        let embeddings = architecture
-            .mtp_token_embeddings(tokens, stream)
-            .map_err(|error| Exception::custom(error.to_string()))?;
-        let output = architecture
-            .forward_mtp_step(
-                hidden,
-                &embeddings,
-                tokens,
-                depth,
-                state.layers_mut(),
-                stream,
-            )
-            .map_err(|error| Exception::custom(error.to_string()))?;
-        let logits = architecture
-            .project_mtp_logits(&output.hidden, stream)
-            .map_err(|error| Exception::custom(error.to_string()))?;
-        Ok(
-            crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput {
-                logits,
-                hidden: output.hidden,
-                tokens: output.tokens,
-            },
-        )
     }
 }
 
@@ -767,120 +716,6 @@ impl CausalModel<InklingState> for InklingModel {
             .as_array()
             .try_index_device((.., -1, ..), stream)
             .map(crate::MlxTensor::from_array)
-    }
-}
-
-impl crate::composition::mlx::speculative::embedded::EmbeddedMtpTarget for InklingModel {
-    type Cache = InklingState;
-    type DraftCache = MlxHybridState;
-
-    fn prefill_target(
-        &mut self,
-        input: input::ModelInput<'_>,
-        cache: &mut Self::Cache,
-        stream: &Stream,
-    ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Exception> {
-        cache.clear()?;
-        self.forward_input_with_capture(input, cache, stream)
-            .map_err(|error| Exception::custom(error.to_string()))
-    }
-
-    fn verify_target(
-        &mut self,
-        tokens: &crate::MlxTensor,
-        cache: &mut Self::Cache,
-        stream: &Stream,
-    ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Exception> {
-        let parts = [DecoderInputPart::Text(tokens)];
-        self.forward_with_capture(
-            ModelInput {
-                parts: &parts,
-                vision_patches: None,
-                audio: None,
-            },
-            cache,
-            stream,
-        )
-        .map_err(|error| Exception::custom(error.to_string()))
-    }
-
-    fn prefill_draft_cache(
-        &mut self,
-        output: &crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput,
-        tokens: &crate::MlxTensor,
-        cache: &mut Self::Cache,
-        stream: &Stream,
-    ) -> Result<(), Exception> {
-        let sequence = tokens.dim(1);
-        if sequence <= 1 {
-            return Ok(());
-        }
-        let hidden = crate::MlxTensor::from_array(
-            output
-                .hidden
-                .as_array()
-                .try_index_device((.., ..sequence - 1, ..), stream)?,
-        );
-        let next =
-            crate::MlxTensor::from_array(tokens.as_array().try_index_device((.., 1..), stream)?);
-        let depth_count = self.mtp_len();
-        let mtp = cache
-            .mtp
-            .as_mut()
-            .ok_or_else(|| Exception::custom("Inkling checkpoint has no MTP state"))?;
-        for depth in 0..depth_count {
-            let _ = self.forward_mtp_draft(&hidden, &next, depth, mtp, stream)?;
-        }
-        Ok(())
-    }
-
-    fn draft_cache(&self, cache: &Self::Cache) -> Self::DraftCache {
-        cache
-            .mtp
-            .clone()
-            .expect("MTP target is invoked only when Inkling has embedded predictor state")
-    }
-
-    fn commit_draft_cache(&self, cache: &mut Self::Cache, draft: &Self::DraftCache) {
-        cache.mtp = Some(draft.clone());
-    }
-
-    fn restore_target_checkpoint(
-        cache: &mut Self::Cache,
-        checkpoint: &Self::Cache,
-        stream: &Stream,
-    ) -> Result<(), Exception> {
-        cache.restore_target_checkpoint(checkpoint, stream)
-    }
-
-    fn draft_logits(
-        &mut self,
-        hidden: &crate::MlxTensor,
-        last_token: u32,
-        draft_index: usize,
-        cache: &mut Self::DraftCache,
-        stream: &Stream,
-    ) -> Result<(crate::MlxTensor, crate::MlxTensor), Exception> {
-        let token = crate::MlxTensor::from_array(Array::from_slice(&[last_token], &[1, 1]));
-        let output = self.forward_mtp_draft(hidden, &token, draft_index, cache, stream)?;
-        Ok((output.logits, output.hidden))
-    }
-
-    fn advance_draft_cache(
-        &mut self,
-        hidden: &crate::MlxTensor,
-        tokens: &crate::MlxTensor,
-        cache: &mut Self::DraftCache,
-        stream: &Stream,
-    ) -> Result<(), Exception> {
-        for depth in 0..self.mtp_len() {
-            let _ = self.forward_mtp_draft(hidden, tokens, depth, cache, stream)?;
-        }
-        Ok(())
-    }
-
-    fn max_draft_tokens(&self) -> usize {
-        self.mtp_len()
     }
 }
 

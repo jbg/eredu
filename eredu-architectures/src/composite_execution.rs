@@ -141,6 +141,13 @@ where
     /// Clones the normalized architecture facts required by input admission.
     fn admission_config(&self) -> Self::AdmissionConfig;
 
+    /// Publishes the target facts required to prove external-assistant compatibility.
+    fn external_assistant_target_profile(
+        _config: &Self::AdmissionConfig,
+    ) -> Option<crate::external_assistant::ExternalAssistantTargetProfile> {
+        None
+    }
+
     /// Admits exact prepared tensor identity and derives ordered ingress plans.
     fn admit_prepared_input(
         config: &Self::AdmissionConfig,

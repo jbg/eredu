@@ -1180,6 +1180,45 @@ mod tests {
     }
 
     #[test]
+    fn gguf_catalog_translation_and_format_transforms_preserve_dflash_identities() {
+        let config = DFlashConfig::from_hf_json(&released()).unwrap();
+        let plan = dflash_gguf_plan(&config).unwrap();
+        let names = plan
+            .common_tensors
+            .iter()
+            .map(|tensor| tensor.key.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert!(plan.catalog_policy.strict);
+        assert!(names.contains("fc.weight"));
+        assert!(names.contains("enc.output_norm.weight"));
+        assert!(names.contains("blk.4.ffn_down.weight"));
+        assert_eq!(
+            translate_dflash_gguf_weight_name("fc.weight"),
+            "encoder.fc.weight"
+        );
+        assert_eq!(
+            translate_dflash_gguf_weight_name("blk.4.ffn_down.weight"),
+            "layers.4.mlp.down_proj.weight"
+        );
+
+        let checkpoint_format = eredu_checkpoint::WeightQuantization::MxFp4;
+        let formatted = config
+            .with_checkpoint_formats(HashMap::from([(
+                "encoder.fc.weight".into(),
+                checkpoint_format,
+            )]))
+            .unwrap();
+        assert_eq!(
+            formatted.quantized_weights["encoder.fc.weight"],
+            checkpoint_format
+        );
+        let transformed = config.load_time_quantization(checkpoint_format).unwrap();
+        assert_eq!(transformed.quantization, Some(checkpoint_format));
+        assert!(transformed.quantized_weights.is_empty());
+    }
+
+    #[test]
     fn proves_target_layer_and_vocabulary_compatibility_without_a_backend() {
         let config = DFlashConfig::from_hf_json(&released()).unwrap();
         let mut target = target();

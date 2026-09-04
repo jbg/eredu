@@ -397,6 +397,60 @@ impl<B: NeuralBackend, F: FixedReplicatedFamily<B>, P> FixedReplicatedModel<B, F
     }
 }
 
+impl<B, P> crate::prediction_extension::NemotronHPredictionTarget<B>
+    for FixedReplicatedModel<B, crate::replicated_text::NemotronHReplicated, P>
+where
+    B: BlockwiseAttentionBackend
+        + eredu_nn::DistributedNeuralBackend
+        + eredu_nn::TensorParallelGroupedNeuralBackend
+        + eredu_nn::HyperNeuralBackend,
+{
+    fn embed_prediction(
+        &mut self,
+        tokens: &B::Tensor,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        match parallel {
+            Some(parallel) => B::vocabulary_parallel_lookup(
+                &mut self.decoder.static_modules_mut().embeddings,
+                tokens,
+                eredu_nn::EmbeddingLookupPolicy::Strict,
+                parallel,
+                context,
+            ),
+            None => self
+                .decoder
+                .static_modules_mut()
+                .embeddings
+                .forward(tokens, context),
+        }
+    }
+
+    fn project_prediction(
+        &mut self,
+        hidden: &B::Tensor,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        use eredu_nn::LinearOperator;
+        let modules = self.decoder.static_modules_mut();
+        match (parallel, modules.lm_head.as_mut()) {
+            (Some(parallel), Some(head)) => {
+                B::vocabulary_parallel_project(head, hidden, parallel, context)
+            }
+            (None, Some(head)) => head.forward(hidden, context),
+            (Some(parallel), None) => B::vocabulary_parallel_embedding_project(
+                &mut modules.embeddings,
+                hidden,
+                parallel,
+                context,
+            ),
+            (None, None) => modules.embeddings.as_linear(hidden, context),
+        }
+    }
+}
+
 impl<B: BlockwiseAttentionBackend, F: CompressedReplicatedFamily<B>, P>
     CompressedReplicatedModel<B, F, P>
 {

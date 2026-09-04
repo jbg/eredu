@@ -665,6 +665,12 @@ where
         self.args.clone()
     }
 
+    fn external_assistant_target_profile(
+        config: &Self::AdmissionConfig,
+    ) -> Option<crate::external_assistant::ExternalAssistantTargetProfile> {
+        Some(crate::external_assistant::ExternalAssistantTargetProfile::Gemma4(config.clone()))
+    }
+
     fn admit_prepared_input(
         config: &Self::AdmissionConfig,
         input: &eredu_runtime::PreparedModelInput<B::Tensor>,

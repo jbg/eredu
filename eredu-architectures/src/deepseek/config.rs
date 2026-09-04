@@ -556,10 +556,70 @@ pub struct DsparkConfig {
     pub block_size: i32,
     /// Token used to seed unfilled draft positions.
     pub noise_token_id: i32,
-    /// Target decoder layers captured by the drafter.
-    pub target_layer_ids: Vec<i32>,
     /// Rank of the token-conditioned Markov head.
     pub markov_rank: i32,
+}
+
+/// Ordered target-decoder layers captured for prediction conditioning.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct V4TargetCapturePolicy {
+    layer_ids: Box<[usize]>,
+}
+
+impl V4TargetCapturePolicy {
+    fn from_source(layer_ids: Vec<i32>, target_layer_count: i32) -> Result<Self, ConfigError> {
+        let target_layer_count = usize::try_from(target_layer_count)
+            .map_err(|_| invalid_v4("target layer count exceeds usize"))?;
+        let layer_ids = layer_ids
+            .into_iter()
+            .map(|layer| {
+                usize::try_from(layer)
+                    .map_err(|_| invalid_v4("DSpark target layer must be nonnegative"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Self::new(layer_ids, target_layer_count)
+    }
+
+    /// Validates and preserves an exact ordered target-layer capture list.
+    pub fn new(layer_ids: Vec<usize>, target_layer_count: usize) -> Result<Self, ConfigError> {
+        if layer_ids.is_empty() {
+            return Err(invalid_v4("target capture policy must not be empty"));
+        }
+        if layer_ids.iter().any(|layer| *layer >= target_layer_count) {
+            return Err(invalid_v4(
+                "target capture layer lies outside the target decoder",
+            ));
+        }
+        let mut distinct = layer_ids.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        if distinct.len() != layer_ids.len() {
+            return Err(invalid_v4("target capture layers must be distinct"));
+        }
+        Ok(Self {
+            layer_ids: layer_ids.into_boxed_slice(),
+        })
+    }
+
+    /// Returns target-layer identities in the checkpoint-declared capture order.
+    pub fn layer_ids(&self) -> &[usize] {
+        &self.layer_ids
+    }
+
+    /// Returns the ordered capture slot for one target layer.
+    pub fn position(&self, layer: usize) -> Option<usize> {
+        self.layer_ids.iter().position(|wanted| *wanted == layer)
+    }
+
+    /// Returns the number of target tensors in the prediction input.
+    pub fn len(&self) -> usize {
+        self.layer_ids.len()
+    }
+
+    /// Returns whether the policy requests no target layers.
+    pub fn is_empty(&self) -> bool {
+        self.layer_ids.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -676,6 +736,8 @@ pub struct V4Args {
     /// Canonical per-parameter overrides used by mixed physical checkpoints.
     pub linear_formats: BTreeMap<String, LinearFormat>,
     pub tie_word_embeddings: bool,
+    /// Ordered intermediate target layers retained for prediction conditioning.
+    pub target_capture_policy: Option<V4TargetCapturePolicy>,
     pub dspark: Option<DsparkConfig>,
 }
 
@@ -706,17 +768,23 @@ impl V4Source {
             self.dspark_target_layer_ids.is_some(),
             self.dspark_markov_rank.is_some(),
         ];
-        let dspark = if draft_fields.iter().all(|present| *present) {
-            Some(DsparkConfig {
-                block_size: self.dspark_block_size.unwrap(),
-                noise_token_id: self.dspark_noise_token_id.unwrap(),
-                target_layer_ids: self.dspark_target_layer_ids.unwrap(),
-                markov_rank: self.dspark_markov_rank.unwrap(),
-            })
+        let (dspark, target_capture_policy) = if draft_fields.iter().all(|present| *present) {
+            let target_capture_policy = V4TargetCapturePolicy::from_source(
+                self.dspark_target_layer_ids.unwrap(),
+                self.num_hidden_layers,
+            )?;
+            (
+                Some(DsparkConfig {
+                    block_size: self.dspark_block_size.unwrap(),
+                    noise_token_id: self.dspark_noise_token_id.unwrap(),
+                    markov_rank: self.dspark_markov_rank.unwrap(),
+                }),
+                Some(target_capture_policy),
+            )
         } else if draft_fields.iter().any(|present| *present) {
             return Err(invalid_v4("fused DSpark requires all dspark_* fields"));
         } else {
-            None
+            (None, None)
         };
         let attention_schedule = LayerSchedule::new(
             self.compress_ratios.len(),
@@ -786,6 +854,7 @@ impl V4Source {
             linear_format,
             linear_formats: BTreeMap::new(),
             tie_word_embeddings: self.tie_word_embeddings,
+            target_capture_policy,
             dspark,
         };
         args.validate()?;
@@ -801,21 +870,15 @@ impl V4Source {
 impl V4Args {
     /// Projects a complete checkpoint configuration onto its ordinary target decoder.
     ///
-    /// Prediction-only local-attention entries are retained by the prediction
-    /// extension rather than entering the ordinary target session. DSpark is
-    /// rejected until its architecture-selected target-layer capture set is a
-    /// typed additive target contract; dropping that policy would change its
-    /// verifier semantics.
+    /// Prediction-only local-attention entries and DSpark modules remain in the
+    /// complete extension configuration. The typed target capture policy stays
+    /// attached to the ordinary target so it emits the exact conditioning value.
     pub fn prediction_target(&self) -> Result<Self, ConfigError> {
-        if self.dspark.is_some() {
-            return Err(invalid_v4(
-                "DSpark target projection requires typed target-layer captures",
-            ));
-        }
         let target_layers = usize::try_from(self.num_hidden_layers)
             .map_err(|_| invalid_v4("target layer count exceeds usize"))?;
         let mut target = self.clone();
         target.num_nextn_predict_layers = 0;
+        target.dspark = None;
         target.attention_schedule = LayerSchedule::new(
             target_layers,
             self.attention_schedule
@@ -916,20 +979,25 @@ impl V4Args {
                 return Err(invalid_v4("invalid YaRN configuration"));
             }
         }
+        if let Some(policy) = &self.target_capture_policy {
+            let target_layer_count = usize::try_from(self.num_hidden_layers)
+                .map_err(|_| invalid_v4("target layer count exceeds usize"))?;
+            V4TargetCapturePolicy::new(policy.layer_ids().to_vec(), target_layer_count)?;
+        }
         if let Some(dspark) = &self.dspark {
             if self.num_nextn_predict_layers <= 0
                 || dspark.block_size <= 0
                 || dspark.noise_token_id < 0
                 || dspark.noise_token_id >= self.vocab_size
                 || dspark.markov_rank <= 0
-                || dspark.target_layer_ids.is_empty()
-                || dspark
-                    .target_layer_ids
-                    .iter()
-                    .any(|layer| *layer < 0 || *layer >= self.num_hidden_layers)
+                || self.target_capture_policy.is_none()
             {
                 return Err(invalid_v4("invalid DSpark configuration"));
             }
+        } else if self.num_nextn_predict_layers > 0 && self.target_capture_policy.is_some() {
+            return Err(invalid_v4(
+                "target capture policy without DSpark requires an ordinary target projection",
+            ));
         }
         self.linear_format
             .validate()
@@ -1321,6 +1389,10 @@ pub fn v4_architecture_fingerprint(args: &V4Args) -> String {
                 format!("{:?}", args.attention_schedule),
             ),
             ("hc_mult", args.hc_mult.to_string()),
+            (
+                "target_capture_policy",
+                format!("{:?}", args.target_capture_policy),
+            ),
             ("dspark", format!("{:?}", args.dspark)),
             ("linear_format", format!("{:?}", args.linear_format)),
         ],
@@ -1558,12 +1630,123 @@ mod tests {
         dspark["dspark_noise_token_id"] = Value::from(0);
         dspark["dspark_target_layer_ids"] = serde_json::json!([0, 2]);
         dspark["dspark_markov_rank"] = Value::from(4);
-        let dspark = parse_v4_config(&dspark).unwrap();
-        assert!(dspark
-            .prediction_target()
+        let complete = parse_v4_config(&dspark).unwrap();
+        let extension = complete.dspark.as_ref().unwrap();
+        assert_eq!(extension.block_size, 4);
+        assert_eq!(extension.noise_token_id, 0);
+        assert_eq!(extension.markov_rank, 4);
+        assert_eq!(
+            complete.target_capture_policy.as_ref().unwrap().layer_ids(),
+            [0, 2]
+        );
+        let strategy =
+            crate::prediction_extension::DsparkPredictionStrategy::from_args(&complete).unwrap();
+        assert_eq!(strategy.target_layer_ids(), [0, 2]);
+        assert_eq!(strategy.proposal_capacity(), 4);
+        assert_eq!(strategy.target_capture_width().unwrap(), 32);
+        strategy.validate_target_capture_shape(&[2, 5, 32]).unwrap();
+        assert!(strategy
+            .validate_target_capture_shape(&[2, 5, 16])
             .unwrap_err()
             .to_string()
-            .contains("typed target-layer captures"));
+            .contains("[batch, sequence, 32]"));
+        assert!(strategy
+            .validate_target_capture_shape(&[2, 5, 2, 16])
+            .is_err());
+        strategy.validate_proposal_capacity(4).unwrap();
+        assert!(strategy.validate_proposal_capacity(0).is_err());
+        assert!(strategy.validate_proposal_capacity(5).is_err());
+
+        let dspark_plan = crate::configuration::resolve_model_config(&dspark)
+            .unwrap()
+            .architecture;
+        let (_, dspark_extension) = dspark_plan.prediction_target_projection().unwrap().unwrap();
+        assert_eq!(
+            dspark_extension.target_capture_limits(2, 5).unwrap(),
+            (3, 320)
+        );
+        let topology = eredu_core::ParallelRankTopology::new(
+            eredu_core::ParallelTopology::new(1, 1, 1, 1).unwrap(),
+            0,
+        )
+        .unwrap();
+        let identity = |value| eredu_runtime::SpeculativeIdentity::new(value).unwrap();
+        let contract = crate::prediction_extension::embedded_speculative_contract(
+            &dspark_extension,
+            crate::prediction_extension::EmbeddedSpeculativeContractRequest::new(
+                identity("deepseek-v4-target"),
+                identity("artifact-v1"),
+                identity("safetensors-v1"),
+                topology,
+                identity("text-input-v1"),
+                std::num::NonZeroUsize::new(2).unwrap(),
+                std::num::NonZeroUsize::new(5).unwrap(),
+                std::num::NonZeroUsize::new(3).unwrap(),
+            ),
+        )
+        .unwrap();
+        let captures = contract.target_capture().entries();
+        assert_eq!(captures.len(), 2);
+        assert_eq!(captures[0].path().as_str(), "layers.0.output");
+        assert_eq!(captures[1].path().as_str(), "layers.2.output");
+        for capture in captures {
+            assert_eq!(capture.shape(), [2, 5, 16]);
+            assert_eq!(
+                capture
+                    .bounded_dimensions()
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>(),
+                [0, 1]
+            );
+        }
+        contract
+            .target_capture()
+            .instantiate([vec![1, 3, 16], vec![2, 1, 16]])
+            .unwrap();
+        assert!(contract
+            .target_capture()
+            .instantiate([vec![1, 6, 16], vec![2, 1, 16]])
+            .is_err());
+        assert!(contract
+            .target_capture()
+            .instantiate([vec![1, 3, 15], vec![2, 1, 16]])
+            .is_err());
+
+        let target = complete.prediction_target().unwrap();
+        assert_eq!(target.num_nextn_predict_layers, 0);
+        assert!(target.dspark.is_none());
+        assert_eq!(target.attention_schedule.len(), 3);
+        assert_eq!(
+            target.target_capture_policy.as_ref().unwrap().layer_ids(),
+            [0, 2]
+        );
+        assert_eq!(crate::deepseek::v4::state_layout(&target).unwrap().len(), 3);
+
+        let mut reordered = target.clone();
+        reordered.target_capture_policy = Some(V4TargetCapturePolicy::new(vec![2, 0], 3).unwrap());
+        assert_ne!(
+            v4_architecture_fingerprint(&target),
+            v4_architecture_fingerprint(&reordered)
+        );
+        let mut reordered_complete = complete;
+        reordered_complete.target_capture_policy = reordered.target_capture_policy.clone();
+        let reordered_strategy =
+            crate::prediction_extension::DsparkPredictionStrategy::from_args(&reordered_complete)
+                .unwrap();
+        assert_eq!(reordered_strategy.target_layer_ids(), [2, 0]);
+    }
+
+    #[test]
+    fn v4_target_capture_policy_rejects_duplicate_or_out_of_range_layers() {
+        assert!(V4TargetCapturePolicy::new(vec![0, 0], 3)
+            .unwrap_err()
+            .to_string()
+            .contains("distinct"));
+        assert!(V4TargetCapturePolicy::new(vec![0, 3], 3)
+            .unwrap_err()
+            .to_string()
+            .contains("outside"));
     }
 
     #[test]

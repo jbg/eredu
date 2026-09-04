@@ -6,6 +6,8 @@ pub mod config;
 pub mod graph;
 pub mod model;
 pub mod parallel;
+/// Architecture-owned external DFlash speculative lifecycle.
+pub mod speculative;
 pub mod text;
 pub mod vision;
 

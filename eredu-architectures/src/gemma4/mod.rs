@@ -11,6 +11,8 @@ pub mod media;
 pub mod model;
 pub mod parallel;
 pub mod projector;
+/// Architecture-owned external-assistant speculative lifecycle.
+pub mod speculative;
 pub mod text;
 pub mod vision;
 

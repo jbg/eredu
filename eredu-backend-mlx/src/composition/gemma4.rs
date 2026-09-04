@@ -14,7 +14,6 @@ use eredu_runtime::{
 };
 use safemlx::{error::Exception, ops::indexing::TryIndexOp, Array, Stream};
 
-use crate::backend::runtime::checkpoint::gguf::GgufCheckpoint;
 use crate::backend::{
     error::Error,
     nn::shared::{MlxModule, MlxNeuralBackend},
@@ -28,10 +27,9 @@ use crate::backend::{
         checkpoint::{
             binding::{
                 build_module_bindings, build_module_bindings_with_recipes_excluding,
-                materialize_module_bindings, parameter_name_in_targets,
-                populate_module_from_arrays_excluding, populate_module_from_lease_excluding,
+                parameter_name_in_targets, populate_module_from_lease_excluding,
             },
-            load::{gguf_metadata, gguf_quantization_configs},
+            load::gguf_quantization_configs,
             quantization::should_quantize_on_load,
         },
         execution::{
@@ -39,7 +37,7 @@ use crate::backend::{
                 construct_architecture_unit, prepare_layerwise_policy_with_bindings,
                 MlxLayerwisePolicy, MlxResidentPolicy, MlxUnitPopulator,
             },
-            layerwise::{quantize_parameterized_module_store, quantize_parameterized_store},
+            layerwise::quantize_parameterized_store,
         },
         media::input,
         residency::parameter_bank::{AddressableParameterBank, ParameterBankResidencyReport},
@@ -48,7 +46,6 @@ use crate::backend::{
 
 type NeutralArchitecture = Architecture<MlxNeuralBackend>;
 type NeutralUnit = Unit<MlxNeuralBackend>;
-type NeutralAssistant = eredu_architectures::gemma4::Assistant<MlxNeuralBackend>;
 
 type Resident = LayerwiseRuntime<
     NeutralArchitecture,
@@ -142,161 +139,6 @@ pub struct Gemma4Model {
     state_layout: eredu_runtime::StateLayout,
     execution: Execution,
     parameter_bank: Option<AddressableParameterBank>,
-}
-
-/// Fully resident external assistant built from the neutral Gemma equations.
-pub struct Gemma4AssistantModel {
-    pub config: eredu_architectures::gemma4::AssistantConfig,
-    module: MlxModule<NeutralAssistant>,
-}
-
-impl Gemma4AssistantModel {
-    pub fn max_proposals(&self) -> usize {
-        self.module.max_proposals()
-    }
-
-    pub fn begin_round(
-        &self,
-        shared_kv: eredu_architectures::gemma4::SharedAttentionStates<crate::MlxTensor>,
-        kv_offset: i32,
-        hidden: crate::MlxTensor,
-    ) -> eredu_architectures::gemma4::AssistantState<crate::MlxTensor> {
-        self.module.begin_round(shared_kv, kv_offset, hidden)
-    }
-
-    pub fn draft_step(
-        &mut self,
-        embedding: &crate::MlxTensor,
-        state: &mut eredu_architectures::gemma4::AssistantState<crate::MlxTensor>,
-        stream: &Stream,
-    ) -> Result<crate::MlxTensor, Error> {
-        self.module
-            .draft_step::<crate::backend::runtime::cache::kv::ConcatKeyValueCache>(
-                embedding, state, stream,
-            )
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))
-    }
-}
-
-/// Loads the released SafeTensors assistant into the backend-neutral module.
-pub fn load_assistant_safetensors(
-    store: SharedCheckpointSource,
-    source_config: eredu_architectures::gemma4::AssistantConfig,
-    options: crate::MlxLoadRequest,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<Gemma4AssistantModel, Error> {
-    let quantization = options.weight_quantization()?;
-    if !options.weight_residency.is_fully_resident() {
-        return Err(Error::ArchitectureModel(
-            "Gemma 4 assistant loading supports fully resident weights only".into(),
-        ));
-    }
-    if options
-        .parallel_topology()
-        .is_some_and(|topology| !topology.is_replicated())
-    {
-        return Err(Error::Parallel(
-            "Gemma 4 assistant loading requires replicated placement".into(),
-        ));
-    }
-    let requested = quantization
-        .map(|requested| {
-            should_quantize_on_load("Gemma 4 assistant", source_config.quantization, requested)
-                .map(|required| required.then_some(requested))
-        })
-        .transpose()?
-        .flatten();
-    let config = requested
-        .map(|requested| {
-            source_config
-                .load_time_quantization(requested)
-                .map_err(|error| Error::ArchitectureModel(error.to_string()))
-        })
-        .transpose()?
-        .unwrap_or_else(|| source_config.clone());
-    let store = if let Some(requested) = requested {
-        let source = NeutralAssistant::new(source_config, stream)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        let target = NeutralAssistant::new(config.clone(), stream)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        quantize_parameterized_module_store(store, &source, &target, requested, stream)?.0
-    } else {
-        store
-    };
-    let mut module = MlxModule::new(
-        NeutralAssistant::new(config.clone(), stream)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?,
-    );
-    let bindings = build_module_bindings(&module, "", store.as_ref())?;
-    let arrays = materialize_module_bindings(store.as_ref(), &bindings, weights_stream, stream)?;
-    populate_module_from_arrays_excluding(&mut module, &arrays, |_| false)?;
-    Ok(Gemma4AssistantModel { config, module })
-}
-
-pub fn load_assistant_gguf(
-    checkpoint: eredu_gguf::Checkpoint,
-    resolution: eredu_checkpoint::validation::ResolvedCheckpointPlan,
-    tensor_mapping: Vec<eredu_gguf::TranslatedTensorLayout>,
-    source_config: eredu_architectures::gemma4::AssistantConfig,
-    options: crate::MlxLoadRequest,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<Gemma4AssistantModel, Error> {
-    let quantization = options.weight_quantization()?;
-    if !options.weight_residency.is_fully_resident() {
-        return Err(Error::ArchitectureModel(
-            "Gemma 4 assistant loading supports fully resident weights only".into(),
-        ));
-    }
-    if options
-        .parallel_topology()
-        .is_some_and(|topology| !topology.is_replicated())
-    {
-        return Err(Error::Parallel(
-            "Gemma 4 assistant loading requires replicated placement".into(),
-        ));
-    }
-    let mlx_checkpoint = GgufCheckpoint::from_portable(checkpoint.clone());
-    let metadata = gguf_metadata(&mlx_checkpoint);
-    let formats = gguf_quantization_configs(&mlx_checkpoint, &tensor_mapping)?;
-    let source_config = source_config
-        .with_checkpoint_formats(formats)
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    crate::composition::mlx::validate_gguf_quantization_source(
-        &mlx_checkpoint,
-        &metadata,
-        quantization,
-    )?;
-    let store: SharedCheckpointSource = Arc::new(
-        eredu_checkpoint::gguf_store::GgufWeightStore::builder()
-            .max_cached_readers(options.weight_residency.max_cached_shards())?
-            .add_resolved_checkpoint(checkpoint, &resolution, &tensor_mapping)?
-            .build()?,
-    );
-    let (store, config) = if let Some(requested) = quantization {
-        let config = source_config
-            .load_time_quantization(requested)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        let source = NeutralAssistant::new(source_config, stream)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        let target = NeutralAssistant::new(config.clone(), stream)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        (
-            quantize_parameterized_module_store(store, &source, &target, requested, stream)?.0,
-            config,
-        )
-    } else {
-        (store, source_config)
-    };
-    let mut module = MlxModule::new(
-        NeutralAssistant::new(config.clone(), stream)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?,
-    );
-    let bindings = build_module_bindings(&module, "", store.as_ref())?;
-    let arrays = materialize_module_bindings(store.as_ref(), &bindings, weights_stream, stream)?;
-    populate_module_from_arrays_excluding(&mut module, &arrays, |_| false)?;
-    Ok(Gemma4AssistantModel { config, module })
 }
 
 impl Gemma4Model {

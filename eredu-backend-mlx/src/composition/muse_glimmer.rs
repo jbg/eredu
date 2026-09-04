@@ -16,8 +16,6 @@ use eredu_runtime::{
 };
 use safemlx::{error::Exception, ops::indexing::TryIndexOp, Stream};
 
-use crate::backend::runtime::checkpoint::gguf::GgufCheckpoint;
-
 use crate::backend::{
     error::Error,
     nn::shared::{MlxModule, MlxNeuralBackend},
@@ -26,11 +24,9 @@ use crate::backend::{
         cache::state::MlxKeyValueState,
         checkpoint::{
             binding::{
-                build_module_bindings, build_module_bindings_with_recipes_excluding,
-                materialize_module_bindings, parameter_name_in_targets,
-                populate_module_from_arrays_excluding, populate_module_from_lease_excluding,
+                build_module_bindings_with_recipes_excluding, parameter_name_in_targets,
+                populate_module_from_lease_excluding,
             },
-            load::{gguf_metadata, gguf_quantization_configs},
             quantization::should_quantize_on_load,
         },
         execution::{
@@ -39,7 +35,7 @@ use crate::backend::{
                 prepare_layerwise_policy_with_bindings, MlxLayerwisePolicy, MlxResidentPolicy,
                 MlxUnitPopulator,
             },
-            layerwise::{quantize_parameterized_module_store, quantize_parameterized_store},
+            layerwise::quantize_parameterized_store,
         },
         media::input,
         residency::parameter_bank::{AddressableParameterBank, ParameterBankResidencyReport},
@@ -48,7 +44,6 @@ use crate::backend::{
 
 type NeutralArchitecture = Architecture<MlxNeuralBackend>;
 type NeutralUnit = Unit<MlxNeuralBackend>;
-type NeutralDFlash = eredu_architectures::muse_glimmer::DFlash<MlxNeuralBackend>;
 
 type Resident = LayerwiseRuntime<
     NeutralArchitecture,
@@ -143,168 +138,6 @@ pub struct MuseGlimmerModel {
     state_layout: eredu_runtime::StateLayout,
     execution: Execution,
     parameter_bank: Option<AddressableParameterBank>,
-}
-
-/// Fully resident DFlash assistant built from neutral equations.
-pub struct MuseGlimmerDFlashModel {
-    pub config: eredu_architectures::muse_glimmer::DFlashConfig,
-    module: MlxModule<NeutralDFlash>,
-}
-
-impl MuseGlimmerDFlashModel {
-    pub fn assemble_target_states(
-        &self,
-        states: &[crate::MlxTensor],
-        stream: &Stream,
-    ) -> Result<crate::MlxTensor, Error> {
-        self.module
-            .assemble_target_states(states, stream)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))
-    }
-
-    pub fn update_context(
-        &mut self,
-        previous: Option<eredu_architectures::muse_glimmer::DFlashContext<crate::MlxTensor>>,
-        states: &crate::MlxTensor,
-        absolute_end: i32,
-        stream: &Stream,
-    ) -> Result<eredu_architectures::muse_glimmer::DFlashContext<crate::MlxTensor>, Error> {
-        self.module
-            .update_context(previous, states, absolute_end, stream)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))
-    }
-
-    pub fn proposal_states(
-        &mut self,
-        embeddings: &crate::MlxTensor,
-        committed: &eredu_architectures::muse_glimmer::DFlashContext<crate::MlxTensor>,
-        absolute_end: i32,
-        stream: &Stream,
-    ) -> Result<crate::MlxTensor, Error> {
-        self.module
-            .proposal_states(embeddings, committed, absolute_end, stream)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))
-    }
-}
-
-pub fn load_dflash_safetensors(
-    store: SharedCheckpointSource,
-    source_config: eredu_architectures::muse_glimmer::DFlashConfig,
-    options: crate::MlxLoadRequest,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<MuseGlimmerDFlashModel, Error> {
-    let quantization = options.weight_quantization()?;
-    if !options.weight_residency.is_fully_resident() {
-        return Err(Error::ArchitectureModel(
-            "Muse-Glimmer DFlash requires fully resident assistant weights".into(),
-        ));
-    }
-    if options
-        .parallel_topology()
-        .is_some_and(|topology| !topology.is_replicated())
-    {
-        return Err(Error::Parallel(
-            "Muse-Glimmer DFlash requires replicated placement".into(),
-        ));
-    }
-    let requested = quantization
-        .map(|requested| {
-            should_quantize_on_load("Muse-Glimmer DFlash", source_config.quantization, requested)
-                .map(|required| required.then_some(requested))
-        })
-        .transpose()?
-        .flatten();
-    let config = requested
-        .map(|requested| {
-            source_config
-                .load_time_quantization(requested)
-                .map_err(|error| Error::ArchitectureModel(error.to_string()))
-        })
-        .transpose()?
-        .unwrap_or_else(|| source_config.clone());
-    let store = if let Some(requested) = requested {
-        let source = NeutralDFlash::new(source_config, stream)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        let target = NeutralDFlash::new(config.clone(), stream)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        quantize_parameterized_module_store(store, &source, &target, requested, stream)?.0
-    } else {
-        store
-    };
-    let mut module = MlxModule::new(
-        NeutralDFlash::new(config.clone(), stream)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?,
-    );
-    let bindings = build_module_bindings(&module, "", store.as_ref())?;
-    let arrays = materialize_module_bindings(store.as_ref(), &bindings, weights_stream, stream)?;
-    populate_module_from_arrays_excluding(&mut module, &arrays, |_| false)?;
-    Ok(MuseGlimmerDFlashModel { config, module })
-}
-
-pub fn load_dflash_gguf(
-    checkpoint: eredu_gguf::Checkpoint,
-    resolution: eredu_checkpoint::validation::ResolvedCheckpointPlan,
-    tensor_mapping: Vec<eredu_gguf::TranslatedTensorLayout>,
-    source_config: eredu_architectures::muse_glimmer::DFlashConfig,
-    options: crate::MlxLoadRequest,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<MuseGlimmerDFlashModel, Error> {
-    let quantization = options.weight_quantization()?;
-    if !options.weight_residency.is_fully_resident() {
-        return Err(Error::ArchitectureModel(
-            "Muse-Glimmer DFlash requires fully resident assistant weights".into(),
-        ));
-    }
-    if options
-        .parallel_topology()
-        .is_some_and(|topology| !topology.is_replicated())
-    {
-        return Err(Error::Parallel(
-            "Muse-Glimmer DFlash requires replicated placement".into(),
-        ));
-    }
-    let mlx_checkpoint = GgufCheckpoint::from_portable(checkpoint.clone());
-    let metadata = gguf_metadata(&mlx_checkpoint);
-    let formats = gguf_quantization_configs(&mlx_checkpoint, &tensor_mapping)?;
-    let source_config = source_config
-        .with_checkpoint_formats(formats)
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    crate::composition::mlx::validate_gguf_quantization_source(
-        &mlx_checkpoint,
-        &metadata,
-        quantization,
-    )?;
-    let store: SharedCheckpointSource = Arc::new(
-        eredu_checkpoint::gguf_store::GgufWeightStore::builder()
-            .max_cached_readers(options.weight_residency.max_cached_shards())?
-            .add_resolved_checkpoint(checkpoint, &resolution, &tensor_mapping)?
-            .build()?,
-    );
-    let (store, config) = if let Some(requested) = quantization {
-        let config = source_config
-            .load_time_quantization(requested)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        let source = NeutralDFlash::new(source_config, stream)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        let target = NeutralDFlash::new(config.clone(), stream)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        (
-            quantize_parameterized_module_store(store, &source, &target, requested, stream)?.0,
-            config,
-        )
-    } else {
-        (store, source_config)
-    };
-    let mut module = MlxModule::new(
-        NeutralDFlash::new(config.clone(), stream)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?,
-    );
-    let bindings = build_module_bindings(&module, "", store.as_ref())?;
-    let arrays = materialize_module_bindings(store.as_ref(), &bindings, weights_stream, stream)?;
-    populate_module_from_arrays_excluding(&mut module, &arrays, |_| false)?;
-    Ok(MuseGlimmerDFlashModel { config, module })
 }
 
 pub struct MuseGlimmerSpeculativeOutput {

@@ -24,6 +24,7 @@ use eredu_architectures::{
     PlannedAddressableGatedProduct, PlannedAddressableRelu2, PlannedResidentGatedProduct,
     PreparedRoutedTextArchitecture, RoutedTextExecutionError,
 };
+use eredu_checkpoint::store::MemoryWeightStore;
 use eredu_core::cache::{LayerCachePolicy, PromptCacheTopology, StateTensorRole};
 use eredu_core::{
     CollectiveGroupId, Completion, CompletionCancellationMode, DistributedCommitOutcome,
@@ -77,6 +78,7 @@ use eredu_runtime::{
     SubmissionBackend, TensorParallelRoutedExpertProvider, TensorPlacement, TokenDomain,
     VariableAllToAllBackend,
 };
+use safetensors::tensor::Dtype;
 
 fn dense_linear_format() -> eredu_nn::LinearFormatSpec {
     eredu_nn::LinearFormatSpec::unscaled(eredu_checkpoint::LinearFormat::Dense).unwrap()
@@ -22947,6 +22949,235 @@ fn tiny_v4_args() -> deepseek::V4Args {
     .unwrap()
 }
 
+struct CaptureOnlyModule<T>(std::marker::PhantomData<fn() -> T>);
+
+impl<T> CaptureOnlyModule<T> {
+    fn new() -> Self {
+        Self(std::marker::PhantomData)
+    }
+}
+
+impl<T> AsMut<T> for CaptureOnlyModule<T> {
+    fn as_mut(&mut self) -> &mut T {
+        panic!("capture-shape tests never invoke prediction modules")
+    }
+}
+
+#[derive(Clone)]
+struct CaptureOnlyModelState {
+    layout: eredu_runtime::StateLayout,
+    layers: Vec<NumericHybridLayerState>,
+}
+
+impl RuntimeState<NumericBackend> for CaptureOnlyModelState {
+    type RetainedValues<'a> = std::iter::Empty<&'a NumericTensor>;
+
+    fn layout(&self) -> &eredu_runtime::StateLayout {
+        &self.layout
+    }
+
+    fn retained_values(
+        &self,
+        _ordinal: usize,
+        _address: ExecutionUnitAddress,
+    ) -> Result<Self::RetainedValues<'_>, StateError> {
+        Ok(std::iter::empty())
+    }
+}
+
+impl eredu_architectures::prediction_extension::PredictionModelState<NumericBackend>
+    for CaptureOnlyModelState
+{
+    type LayerState = NumericHybridLayerState;
+
+    fn prediction_layers_mut(&mut self) -> &mut [Self::LayerState] {
+        &mut self.layers
+    }
+}
+
+struct CaptureOnlyMaterializer;
+
+impl eredu_architectures::prediction_extension::PredictionExtensionMaterializer<NumericBackend>
+    for CaptureOnlyMaterializer
+{
+    type Error = Error;
+    type Module<M> = CaptureOnlyModule<M>;
+    type PoolingState = NumericPoolingCache;
+    type SequentialState = NumericCompressedCache;
+    type ModelState = CaptureOnlyModelState;
+    type Context<'a> = ();
+
+    fn materialize_module<M>(
+        _context: &mut Self::Context<'_>,
+        _prepared: eredu_architectures::prediction_extension::PreparedPredictionUnit<M>,
+        _layout: Option<&LocalModelLayout>,
+    ) -> Result<Self::Module<M>, Self::Error>
+    where
+        M: Parameterized<NumericTensor>,
+    {
+        Ok(CaptureOnlyModule::new())
+    }
+
+    fn pooling_state(
+        _context: &mut Self::Context<'_>,
+        _ordinal: usize,
+        _policy: LayerCachePolicy,
+    ) -> Result<Self::PoolingState, Self::Error> {
+        Ok(NumericPoolingCache::new(4, &[]))
+    }
+
+    fn model_state(
+        _context: &mut Self::Context<'_>,
+        layout: eredu_runtime::StateLayout,
+    ) -> Result<Self::ModelState, Self::Error> {
+        let layers = layout
+            .layers()
+            .iter()
+            .map(NumericHybridLayerState::new)
+            .collect();
+        Ok(CaptureOnlyModelState { layout, layers })
+    }
+
+    fn sequential_state() -> Self::SequentialState {
+        NumericCompressedCache::resident()
+    }
+}
+
+#[test]
+fn materialized_executor_closes_sequential_and_dspark_capture_shapes() {
+    use eredu_architectures::prediction_extension::{
+        DsparkPredictionStrategy, MaterializedDeepSeekV3Prediction,
+        MaterializedDeepSeekV4Prediction, MaterializedPredictionExecutor,
+    };
+
+    let sequential = MaterializedDeepSeekV3Prediction::<NumericBackend, CaptureOnlyMaterializer> {
+        units: vec![CaptureOnlyModule::new()],
+    };
+    assert_eq!(
+        sequential.logical_capture_shapes(&[1, 3, 4]).unwrap(),
+        [vec![1, 3, 4]]
+    );
+    assert!(sequential.logical_capture_shapes(&[1, 0, 4]).is_err());
+
+    let mut args = tiny_v4_args();
+    args.num_nextn_predict_layers = 1;
+    args.attention_schedule = LayerSchedule::new(
+        4,
+        vec![
+            deepseek::V4AttentionPolicy::Local,
+            deepseek::V4AttentionPolicy::Compressed { ratio: 4 },
+            deepseek::V4AttentionPolicy::Local,
+            deepseek::V4AttentionPolicy::Local,
+        ],
+    )
+    .unwrap();
+    args.target_capture_policy =
+        Some(deepseek::config::V4TargetCapturePolicy::new(vec![0, 1], 2).unwrap());
+    args.dspark = Some(deepseek::DsparkConfig {
+        block_size: 3,
+        noise_token_id: 0,
+        markov_rank: 2,
+    });
+    let strategy = DsparkPredictionStrategy::from_args(&args).unwrap();
+    let dspark =
+        MaterializedDeepSeekV4Prediction::<NumericBackend, CaptureOnlyMaterializer>::Dspark {
+            strategy,
+            static_modules: CaptureOnlyModule::new(),
+            units: Vec::new(),
+            state: Vec::new(),
+        };
+    assert_eq!(
+        dspark.logical_capture_shapes(&[2, 5, 8]).unwrap(),
+        [vec![2, 5, 4], vec![2, 5, 4]]
+    );
+    assert!(dspark.logical_capture_shapes(&[2, 5, 7]).is_err());
+    assert!(dspark.logical_capture_shapes(&[2, 5, 8, 1]).is_err());
+
+    let selected = |layers: [usize; 2]| {
+        let id = |value| eredu_runtime::SpeculativeIdentity::new(value).unwrap();
+        let target = id("v4-target");
+        let strategy_id = id("dspark-strategy");
+        let capture = eredu_runtime::SpeculativeCaptureSchema::new(
+            id("dspark-capture"),
+            layers.map(|layer| {
+                eredu_runtime::SpeculativeCaptureEntry::new(
+                    eredu_runtime::SpeculativeIdentity::new(format!("layers.{layer}.output"))
+                        .unwrap(),
+                    vec![2, 5, 4],
+                    id("rank-0"),
+                    eredu_runtime::SpeculativeIdentity::new(format!("capture-{layer}")).unwrap(),
+                )
+                .unwrap()
+                .with_bounded_dimension(0)
+                .unwrap()
+                .with_bounded_dimension(1)
+                .unwrap()
+            }),
+        )
+        .unwrap();
+        let strategy = eredu_runtime::SpeculativeStrategyRequirements::embedded(
+            eredu_runtime::SpeculativeStrategyClass::EmbeddedFused,
+            strategy_id.clone(),
+            std::num::NonZeroUsize::new(3).unwrap(),
+        )
+        .unwrap();
+        let state = eredu_runtime::SpeculativeStateCacheIdentityIngredients::new(
+            target.clone(),
+            strategy_id.clone(),
+            None,
+            None,
+            id("artifact"),
+            id("format"),
+            id("topology"),
+            0,
+            id("processor"),
+            vec![id("dspark-state")],
+        )
+        .unwrap();
+        let requirements = eredu_runtime::SpeculativeRealizationRequirements::new(
+            target.clone(),
+            strategy,
+            capture.clone(),
+            eredu_runtime::SpeculativeMechanismRequirements::default(),
+            state,
+        )
+        .unwrap();
+        let request = eredu_runtime::SpeculativeSelectionRequest::new(
+            eredu_runtime::SpeculativePlacementRequest::Single,
+            capture.clone(),
+        )
+        .with_architecture_proof(
+            eredu_runtime::SpeculativeArchitectureCompatibilityProof::new(
+                target,
+                strategy_id,
+                capture.identity().clone(),
+            ),
+        );
+        let capabilities = eredu_runtime::SpeculativeMechanismCapabilities::new(
+            requirements.mechanisms().mechanisms().iter().copied(),
+        );
+        eredu_runtime::select_speculative_realization(&requirements, &request, &capabilities)
+            .unwrap()
+    };
+    let selected_in_order = selected([0, 1]);
+    let lane = selected_in_order.lane_identity(
+        eredu_runtime::SpeculativeIdentity::new("input-1").unwrap(),
+        7,
+    );
+    dspark
+        .validate_capture(&selected_in_order, &lane, &[1, 3, 8])
+        .unwrap();
+    let selected_reordered = selected([1, 0]);
+    let lane = selected_reordered.lane_identity(
+        eredu_runtime::SpeculativeIdentity::new("input-1").unwrap(),
+        7,
+    );
+    assert_eq!(
+        dspark.validate_capture(&selected_reordered, &lane, &[1, 3, 8]),
+        Err(eredu_runtime::SpeculativeCaptureError::SchemaMismatch)
+    );
+}
+
 #[test]
 fn v4_attention_policies_are_invariant_to_prefill_chunking() {
     let args = tiny_v4_args();
@@ -23262,7 +23493,173 @@ fn deepseek_execution_graphs_run_target_mtp_and_dspark_transactions() {
     assert_eq!(v3_state.layer(0).unwrap().offset(), 2);
     assert_eq!(v3_state.layer(1).unwrap().offset(), 1);
 
-    let v4 = deepseek::parse_v4_config(&serde_json::json!({
+    let v4_config = serde_json::json!({
+        "model_type": "deepseek_v4",
+        "hidden_size": 4,
+        "moe_intermediate_size": 4,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 1,
+        "head_dim": 4,
+        "qk_rope_head_dim": 2,
+        "q_lora_rank": 2,
+        "o_lora_rank": 2,
+        "o_groups": 2,
+        "vocab_size": 16,
+        "max_position_embeddings": 128,
+        "sliding_window": 8,
+        "compress_ratios": [0, 0, 0],
+        "index_n_heads": 2,
+        "index_head_dim": 4,
+        "index_topk": 1,
+        "hc_mult": 2,
+        "hc_sinkhorn_iters": 2,
+        "n_routed_experts": 2,
+        "n_shared_experts": 1,
+        "num_experts_per_tok": 1,
+        "num_hash_layers": 0,
+        "scoring_func": "sqrtsoftplus",
+        "topk_method": "noaux_tc",
+        "norm_topk_prob": true,
+        "routed_scaling_factor": 1.0,
+        "swiglu_limit": 4.0,
+        "num_nextn_predict_layers": 1,
+        "dspark_block_size": 2,
+        "dspark_noise_token_id": 0,
+        "dspark_target_layer_ids": [0, 1],
+        "dspark_markov_rank": 2
+    });
+    let v4 = deepseek::parse_v4_config(&v4_config).unwrap();
+    let architecture_plan = eredu_architectures::configuration::resolve_model_config(&v4_config)
+        .unwrap()
+        .architecture;
+    let (_, extension_plan) = architecture_plan
+        .prediction_target_projection()
+        .unwrap()
+        .unwrap();
+    let store = MemoryWeightStore::from_safetensors([
+        (
+            "mtp.0.ffn.switch_mlp.gate_up_proj".to_owned(),
+            Dtype::F16,
+            vec![2, 8, 4],
+            vec![0; 2 * 8 * 4 * 2],
+        ),
+        (
+            "mtp.0.ffn.switch_mlp.down_proj".to_owned(),
+            Dtype::F16,
+            vec![2, 4, 4],
+            vec![0; 2 * 4 * 4 * 2],
+        ),
+    ])
+    .unwrap();
+    let prepared =
+        eredu_architectures::prediction_extension::prepare_replicated_prediction_extension::<
+            NumericBackend,
+        >(&extension_plan, &store, &context, &context)
+        .unwrap();
+    let eredu_architectures::prediction_extension::PreparedPredictionExtension::DeepSeekV4Dspark {
+        extension,
+        units,
+        state,
+        ..
+    } = prepared
+    else {
+        panic!("DSpark configuration prepared a sequential prediction extension")
+    };
+    assert_eq!(extension.strategy().target_layer_ids(), [0, 1]);
+    assert_eq!(extension.strategy().proposal_capacity(), 2);
+    assert_eq!(units.len(), 1);
+    assert_eq!(state.len(), 1);
+    let mut v4_state = DeviceState::<NumericBackend, _>::create(
+        deepseek::v4::state_layout(&v4).unwrap(),
+        |_, _| Ok::<_, Error>(NumericPoolingCache::new(8, &[])),
+    )
+    .unwrap();
+    let mut v4_runtime = ResidentRuntime::new(
+        deepseek::v4::Model::<NumericBackend>::new(v4, &context).unwrap(),
+        &context,
+    )
+    .unwrap();
+    assert_eq!(v4_runtime.architecture().mtp_len(), 1);
+    assert_eq!(v4_runtime.architecture().draft_proposal_capacity(), 2);
+    let (target_logits, target_context) = v4_runtime
+        .forward_with_context(
+            deepseek::mtp::EmbeddedInput::target(&target_tokens, None),
+            &mut v4_state,
+            &context,
+        )
+        .unwrap();
+    let captures = target_context.target_capture().unwrap().clone();
+    assert_eq!(target_logits.shape, [1, 2, 16]);
+    assert_eq!(captures.shape, [1, 2, 8]);
+    let missing_capture = captures.axis_slice(2, 0, 4);
+    let missing_error = v4_runtime
+        .forward(
+            deepseek::mtp::EmbeddedInput::dspark_context(&missing_capture),
+            &mut v4_state,
+            &context,
+        )
+        .expect_err("DSpark context must contain every configured target-layer capture");
+    assert!(
+        missing_error
+            .to_string()
+            .contains("DSpark target capture must have shape [batch, sequence, 8]"),
+        "{missing_error}"
+    );
+    let final_hidden_shape = captures.reshape(&[1, 2, 2, 4], &context).unwrap();
+    let rank_error = v4_runtime
+        .forward(
+            deepseek::mtp::EmbeddedInput::dspark_context(&final_hidden_shape),
+            &mut v4_state,
+            &context,
+        )
+        .expect_err("DSpark context must not accept final hyper-stream hidden state");
+    assert!(
+        rank_error
+            .to_string()
+            .contains("DSpark target capture must have shape [batch, sequence, 8]"),
+        "{rank_error}"
+    );
+    assert_eq!(v4_state.layer(2).unwrap().offset(), 0);
+    v4_runtime
+        .forward(
+            deepseek::mtp::EmbeddedInput::dspark_context(&captures),
+            &mut v4_state,
+            &context,
+        )
+        .unwrap();
+    assert_eq!(v4_state.layer(2).unwrap().offset(), 2);
+
+    let mut transaction = eredu_runtime::DraftStateTransaction::fork(&v4_state);
+    let anchor = NumericTensor::token_ids(&[3]);
+    let oversized = v4_runtime
+        .forward(
+            deepseek::mtp::EmbeddedInput::dspark_proposal(&anchor, 3),
+            transaction.draft_mut(),
+            &context,
+        )
+        .expect_err("proposal capacity exceeds the DSpark block width");
+    assert!(oversized
+        .to_string()
+        .contains("DSpark proposal capacity must be between 1 and 2, got 3"));
+    let proposal = v4_runtime
+        .forward(
+            deepseek::mtp::EmbeddedInput::dspark_proposal(&anchor, 2),
+            transaction.draft_mut(),
+            &context,
+        )
+        .unwrap();
+    assert_eq!(proposal.shape, [1, 2, 16]);
+    assert_eq!(transaction.draft_mut().layer(2).unwrap().offset(), 4);
+    assert_eq!(v4_state.layer(2).unwrap().offset(), 2);
+    transaction.rollback(&mut v4_state);
+    assert_eq!(v4_state.layer(2).unwrap().offset(), 2);
+}
+
+#[test]
+fn v4_prediction_target_captures_exact_intermediate_layers_in_policy_order() {
+    let context = NumericContext::default();
+    let complete = deepseek::parse_v4_config(&serde_json::json!({
         "model_type": "deepseek_v4",
         "hidden_size": 4,
         "moe_intermediate_size": 4,
@@ -23299,61 +23696,73 @@ fn deepseek_execution_graphs_run_target_mtp_and_dspark_transactions() {
         "dspark_markov_rank": 2
     }))
     .unwrap();
-    let mut v4_state = DeviceState::<NumericBackend, _>::create(
-        deepseek::v4::state_layout(&v4).unwrap(),
-        |_, _| Ok::<_, Error>(NumericPoolingCache::new(8, &[])),
-    )
-    .unwrap();
-    let mut v4_runtime = ResidentRuntime::new(
-        deepseek::v4::Model::<NumericBackend>::new(v4, &context).unwrap(),
-        &context,
-    )
-    .unwrap();
-    assert_eq!(v4_runtime.architecture().mtp_len(), 1);
-    assert_eq!(v4_runtime.architecture().draft_proposal_capacity(), 2);
-    let (target_logits, target_context) = v4_runtime
-        .forward_with_context(
-            deepseek::mtp::EmbeddedInput::target(&target_tokens, None),
-            &mut v4_state,
-            &context,
-        )
-        .unwrap();
-    let captures = target_context.target_capture().unwrap().clone();
-    assert_eq!(target_logits.shape, [1, 2, 16]);
-    assert_eq!(captures.shape, [1, 2, 8]);
-    v4_runtime
-        .forward(
-            deepseek::mtp::EmbeddedInput::dspark_context(&captures),
-            &mut v4_state,
-            &context,
-        )
-        .unwrap();
-    assert_eq!(v4_state.layer(2).unwrap().offset(), 2);
+    let target = complete.prediction_target().unwrap();
+    assert!(target.dspark.is_none());
+    assert_eq!(target.num_nextn_predict_layers, 0);
+    assert_eq!(
+        target.target_capture_policy.as_ref().unwrap().layer_ids(),
+        [0, 1]
+    );
 
-    let mut transaction = eredu_runtime::DraftStateTransaction::fork(&v4_state);
-    let anchor = NumericTensor::token_ids(&[3]);
-    let oversized = v4_runtime
-        .forward(
-            deepseek::mtp::EmbeddedInput::dspark_proposal(&anchor, 3),
-            transaction.draft_mut(),
-            &context,
-        )
-        .expect_err("proposal capacity exceeds the DSpark block width");
-    assert!(oversized
-        .to_string()
-        .contains("DSpark proposal capacity must be between 1 and 2, got 3"));
-    let proposal = v4_runtime
-        .forward(
-            deepseek::mtp::EmbeddedInput::dspark_proposal(&anchor, 2),
-            transaction.draft_mut(),
-            &context,
-        )
+    let tokens = NumericTensor::token_ids(&[1, 2]);
+    let execute = |args: deepseek::V4Args| {
+        let layout = deepseek::v4::state_layout(&args).unwrap();
+        assert_eq!(layout.len(), 2);
+        let architecture = deepseek::v4::Model::<NumericBackend>::new(args, &context).unwrap();
+        assert_eq!(architecture.mtp_len(), 0);
+        assert!(architecture.static_modules().dspark.is_none());
+        let mut state = DeviceState::<NumericBackend, _>::create(layout, |_, _| {
+            Ok::<_, Error>(NumericPoolingCache::new(8, &[]))
+        })
         .unwrap();
-    assert_eq!(proposal.shape, [1, 2, 16]);
-    assert_eq!(transaction.draft_mut().layer(2).unwrap().offset(), 4);
-    assert_eq!(v4_state.layer(2).unwrap().offset(), 2);
-    transaction.rollback(&mut v4_state);
-    assert_eq!(v4_state.layer(2).unwrap().offset(), 2);
+        let mut runtime = ResidentRuntime::new(architecture, &context).unwrap();
+        let (_, forward) = runtime
+            .forward_with_context(
+                deepseek::mtp::EmbeddedInput::target(&tokens, None),
+                &mut state,
+                &context,
+            )
+            .unwrap();
+        forward.target_capture().unwrap().clone()
+    };
+
+    let ordered = execute(target.clone());
+    let mut reversed_args = target.clone();
+    reversed_args.target_capture_policy =
+        Some(deepseek::config::V4TargetCapturePolicy::new(vec![1, 0], 2).unwrap());
+    let reversed = execute(reversed_args);
+    let mut first_only_args = target.clone();
+    first_only_args.target_capture_policy =
+        Some(deepseek::config::V4TargetCapturePolicy::new(vec![0], 2).unwrap());
+    let first_only = execute(first_only_args);
+
+    assert_eq!(ordered.shape, [1, 2, 8]);
+    assert_ne!(
+        ordered.axis_slice(2, 0, 4).data,
+        ordered.axis_slice(2, 4, 8).data,
+        "the two intermediate layers must produce distinguishable captures"
+    );
+    assert_tensor_close(
+        &ordered.axis_slice(2, 0, 4),
+        &reversed.axis_slice(2, 4, 8),
+        "V4 first configured target layer",
+    );
+    assert_tensor_close(
+        &ordered.axis_slice(2, 4, 8),
+        &reversed.axis_slice(2, 0, 4),
+        "V4 second configured target layer",
+    );
+    assert_tensor_close(
+        &first_only,
+        &ordered.axis_slice(2, 0, 4),
+        "V4 perturbed single-layer capture policy",
+    );
+
+    let mut direct_args = target;
+    direct_args.target_capture_policy = None;
+    let final_hidden = execute(direct_args);
+    assert_eq!(final_hidden.shape, [1, 2, 2, 4]);
+    assert_ne!(ordered.shape, final_hidden.shape);
 }
 
 #[test]

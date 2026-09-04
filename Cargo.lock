@@ -507,7 +507,7 @@ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 
 [[package]]
 name = "eredu"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "eredu-architectures",
@@ -526,7 +526,7 @@ dependencies = [
 
 [[package]]
 name = "eredu-architectures"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "eredu-checkpoint",
  "eredu-core",
@@ -542,7 +542,7 @@ dependencies = [
 
 [[package]]
 name = "eredu-backend-mlx"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -620,7 +620,7 @@ dependencies = [
 
 [[package]]
 name = "eredu-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "eredu-checkpoint",
  "eredu-gguf",
@@ -633,7 +633,7 @@ dependencies = [
 
 [[package]]
 name = "eredu-evaluation"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "clap",
  "eredu-architectures",
@@ -686,7 +686,7 @@ dependencies = [
 
 [[package]]
 name = "eredu-runtime"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "eredu-checkpoint",
  "eredu-core",

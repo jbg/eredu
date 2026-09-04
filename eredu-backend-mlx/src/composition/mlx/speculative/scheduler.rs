@@ -793,10 +793,7 @@ mod tests {
             _input: MlxModelInput,
             cache: &mut Self::Cache,
             streams: SpeculativeExecutionStreams<'context>,
-        ) -> Result<SpeculativePrefill<Self::TargetState, Self::Logits>, Exception>
-        where
-            Self: 'context,
-        {
+        ) -> Result<SpeculativePrefill<Self::TargetState, Self::Logits>, Exception> {
             let stream = streams.target();
             self.record("prefill", stream)?;
             *cache = 1;
@@ -845,8 +842,18 @@ mod tests {
             Ok(logits)
         }
 
-        fn checkpoint(cache: &Self::Cache) -> Self::CacheCheckpoint {
-            *cache
+        fn checkpoint(&self, cache: &Self::Cache) -> Result<Self::CacheCheckpoint, Self::Error> {
+            Ok(*cache)
+        }
+
+        fn restore_checkpoint<'a>(
+            &mut self,
+            cache: &mut Self::Cache,
+            checkpoint: &Self::CacheCheckpoint,
+            _: Self::Context<'a>,
+        ) -> Result<(), Self::Error> {
+            *cache = *checkpoint;
+            Ok(())
         }
 
         fn submit_verification(
@@ -893,13 +900,11 @@ mod tests {
         }
 
         fn verification_logits<'a>(
+            &self,
             output: &Self::Verification,
             index: usize,
             streams: SpeculativeExecutionStreams<'a>,
-        ) -> Result<Array, Exception>
-        where
-            Self: 'a,
-        {
+        ) -> Result<Array, Exception> {
             output.try_index_device((.., index as i32, ..), streams.target())
         }
 
@@ -908,7 +913,7 @@ mod tests {
             output: Self::Verification,
             _draft_state: Self::DraftState,
             cache: &mut Self::Cache,
-            checkpoint: Self::CacheCheckpoint,
+            checkpoint: &Self::CacheCheckpoint,
             verified_inputs: usize,
             streams: SpeculativeExecutionStreams<'_>,
         ) -> Result<SpeculativeCommit<Self::TargetState>, Exception> {
@@ -917,7 +922,7 @@ mod tests {
             }
             self.record("commit_target", streams.target())?;
             self.record("commit_draft", streams.draft())?;
-            *cache = checkpoint + verified_inputs;
+            *cache = *checkpoint + verified_inputs;
             Ok(SpeculativeCommit::new((), 0))
         }
     }
@@ -948,10 +953,7 @@ mod tests {
             input: MlxModelInput,
             cache: &mut Self::Cache,
             streams: SpeculativeExecutionStreams<'context>,
-        ) -> Result<SpeculativePrefill<Self::TargetState, Self::Logits>, Exception>
-        where
-            Self: 'context,
-        {
+        ) -> Result<SpeculativePrefill<Self::TargetState, Self::Logits>, Exception> {
             self.inner.prefill(input, cache, streams)
         }
 
@@ -975,8 +977,18 @@ mod tests {
             self.inner.proposal_logits(state, last_token, streams)
         }
 
-        fn checkpoint(cache: &Self::Cache) -> Self::CacheCheckpoint {
-            *cache
+        fn checkpoint(&self, cache: &Self::Cache) -> Result<Self::CacheCheckpoint, Self::Error> {
+            Ok(*cache)
+        }
+
+        fn restore_checkpoint<'a>(
+            &mut self,
+            cache: &mut Self::Cache,
+            checkpoint: &Self::CacheCheckpoint,
+            _: Self::Context<'a>,
+        ) -> Result<(), Self::Error> {
+            *cache = *checkpoint;
+            Ok(())
         }
 
         fn submit_verification(
@@ -989,13 +1001,11 @@ mod tests {
         }
 
         fn verification_logits<'a>(
+            &self,
             output: &Self::Verification,
             index: usize,
             streams: SpeculativeExecutionStreams<'a>,
-        ) -> Result<Array, Exception>
-        where
-            Self: 'a,
-        {
+        ) -> Result<Array, Exception> {
             output.try_index_device((.., index as i32, ..), streams.target())
         }
 
@@ -1004,7 +1014,7 @@ mod tests {
             _output: Self::Verification,
             _draft_state: Self::DraftState,
             _cache: &mut Self::Cache,
-            _checkpoint: Self::CacheCheckpoint,
+            _checkpoint: &Self::CacheCheckpoint,
             _verified_inputs: usize,
             _streams: SpeculativeExecutionStreams<'_>,
         ) -> Result<SpeculativeCommit<Self::TargetState>, Exception> {
@@ -1077,7 +1087,7 @@ mod tests {
             let mut backend = scripted_backend();
             let mut scheduler = MlxSpeculativeScheduler::new(
                 &mut backend,
-                SpeculativeExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
+                SpeculativeExecutionStreams::for_test(target.stream(), draft.stream()).unwrap(),
                 SpeculativeSchedulerOptions::default().with_lookahead(lookahead),
             )
             .unwrap();
@@ -1138,7 +1148,7 @@ mod tests {
         let mut backend = scripted_backend();
         let mut scheduler = MlxSpeculativeScheduler::new(
             &mut backend,
-            SpeculativeExecutionStreams::new(stream, draft.stream()).unwrap(),
+            SpeculativeExecutionStreams::for_test(stream, draft.stream()).unwrap(),
             SpeculativeSchedulerOptions::default(),
         )
         .unwrap();
@@ -1275,7 +1285,7 @@ mod tests {
         backend.bonus_token = 0;
         let mut scheduler = MlxSpeculativeScheduler::new(
             &mut backend,
-            SpeculativeExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
+            SpeculativeExecutionStreams::for_test(target.stream(), draft.stream()).unwrap(),
             SpeculativeSchedulerOptions::default(),
         )
         .unwrap();
@@ -1329,7 +1339,7 @@ mod tests {
         let mut backend = scripted_backend();
         let mut scheduler = MlxSpeculativeScheduler::new(
             &mut backend,
-            SpeculativeExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
+            SpeculativeExecutionStreams::for_test(target.stream(), draft.stream()).unwrap(),
             SpeculativeSchedulerOptions::default(),
         )
         .unwrap();
@@ -1710,7 +1720,7 @@ mod tests {
             &config,
             None,
             &mut DefaultSampler,
-            SpeculativeExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
+            SpeculativeExecutionStreams::for_test(target.stream(), draft.stream()).unwrap(),
         )
         .unwrap();
 
@@ -1763,7 +1773,7 @@ mod tests {
             &config,
             Some(key),
             &mut sampler,
-            SpeculativeExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
+            SpeculativeExecutionStreams::for_test(target.stream(), draft.stream()).unwrap(),
         )
         .unwrap();
 
@@ -1871,13 +1881,13 @@ mod tests {
             SpeculativeExecutionTopology::Single
         );
         assert_eq!(
-            SpeculativeExecutionStreams::new(target.stream(), second_stream.stream())
+            SpeculativeExecutionStreams::for_test(target.stream(), second_stream.stream())
                 .unwrap()
                 .topology(),
             SpeculativeExecutionTopology::SameDeviceSplit
         );
         assert_eq!(
-            SpeculativeExecutionStreams::new(target.stream(), second_device.stream())
+            SpeculativeExecutionStreams::for_test(target.stream(), second_device.stream())
                 .unwrap()
                 .topology(),
             SpeculativeExecutionTopology::CrossDeviceSplit
@@ -1888,7 +1898,8 @@ mod tests {
     fn same_device_event_handoffs_order_both_cpu_stream_directions() {
         let target = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let draft = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let streams = SpeculativeExecutionStreams::new(target.stream(), draft.stream()).unwrap();
+        let streams =
+            SpeculativeExecutionStreams::for_test(target.stream(), draft.stream()).unwrap();
         assert_eq!(
             streams.topology(),
             SpeculativeExecutionTopology::SameDeviceSplit
@@ -1933,8 +1944,9 @@ mod tests {
 
         let single = SpeculativeExecutionStreams::single(target.stream());
         let same_device =
-            SpeculativeExecutionStreams::new(target.stream(), second_gpu.stream()).unwrap();
-        let cross_device = SpeculativeExecutionStreams::new(target.stream(), cpu.stream()).unwrap();
+            SpeculativeExecutionStreams::for_test(target.stream(), second_gpu.stream()).unwrap();
+        let cross_device =
+            SpeculativeExecutionStreams::for_test(target.stream(), cpu.stream()).unwrap();
 
         assert_eq!(single.topology(), SpeculativeExecutionTopology::Single);
         assert!(!single.is_split());
@@ -1977,7 +1989,7 @@ mod tests {
         let mut cache = 0;
         let mut scheduler = MlxSpeculativeScheduler::new(
             &mut backend,
-            SpeculativeExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
+            SpeculativeExecutionStreams::for_test(target.stream(), draft.stream()).unwrap(),
             SpeculativeSchedulerOptions::default(),
         )
         .unwrap();
@@ -2041,7 +2053,8 @@ mod tests {
     fn same_gpu_speculative_handoff_does_not_synchronize_the_producer_stream() {
         let target = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
         let draft = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
-        let streams = SpeculativeExecutionStreams::new(target.stream(), draft.stream()).unwrap();
+        let streams =
+            SpeculativeExecutionStreams::for_test(target.stream(), draft.stream()).unwrap();
         assert_eq!(
             streams.topology(),
             SpeculativeExecutionTopology::SameDeviceSplit
@@ -2086,7 +2099,7 @@ mod tests {
             let mut cache = 0;
             let mut scheduler = MlxSpeculativeScheduler::new(
                 &mut backend,
-                SpeculativeExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
+                SpeculativeExecutionStreams::for_test(target.stream(), draft.stream()).unwrap(),
                 SpeculativeSchedulerOptions::default().with_lookahead(lookahead),
             )
             .unwrap();
@@ -2141,7 +2154,7 @@ mod tests {
         let mut cache = 0;
         let mut scheduler = MlxSpeculativeScheduler::new(
             &mut backend,
-            SpeculativeExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
+            SpeculativeExecutionStreams::for_test(target.stream(), draft.stream()).unwrap(),
             SpeculativeSchedulerOptions::default(),
         )
         .unwrap();
@@ -2204,7 +2217,7 @@ mod tests {
         let mut cache = 0;
         let mut scheduler = MlxSpeculativeScheduler::new(
             &mut backend,
-            SpeculativeExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
+            SpeculativeExecutionStreams::for_test(target.stream(), draft.stream()).unwrap(),
             SpeculativeSchedulerOptions::default(),
         )
         .unwrap();
@@ -2303,7 +2316,7 @@ mod tests {
             {
                 let mut scheduler = MlxSpeculativeScheduler::new(
                     &mut backend,
-                    SpeculativeExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
+                    SpeculativeExecutionStreams::for_test(target.stream(), draft.stream()).unwrap(),
                     options,
                 )
                 .unwrap();
@@ -2386,7 +2399,7 @@ mod tests {
                 .penalties(1.2, -1, 0.1, 0.1);
             let mut scheduler = MlxSpeculativeScheduler::new(
                 &mut backend,
-                SpeculativeExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
+                SpeculativeExecutionStreams::for_test(target.stream(), draft.stream()).unwrap(),
                 options,
             )
             .unwrap();
@@ -2447,7 +2460,7 @@ mod tests {
             let mut cache_b = 0;
             let mut scheduler = MlxSpeculativeScheduler::new(
                 &mut backend,
-                SpeculativeExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
+                SpeculativeExecutionStreams::for_test(target.stream(), draft.stream()).unwrap(),
                 options,
             )
             .unwrap();
@@ -2537,7 +2550,7 @@ mod tests {
         let mut cache = 0;
         let mut scheduler = MlxSpeculativeScheduler::new(
             &mut backend,
-            SpeculativeExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
+            SpeculativeExecutionStreams::for_test(target.stream(), draft.stream()).unwrap(),
             SpeculativeSchedulerOptions::default(),
         )
         .unwrap();
@@ -2594,7 +2607,7 @@ mod tests {
         let mut cache = 0;
         let mut scheduler = MlxSpeculativeScheduler::new(
             &mut backend,
-            SpeculativeExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
+            SpeculativeExecutionStreams::for_test(target.stream(), draft.stream()).unwrap(),
             SpeculativeSchedulerOptions::default(),
         )
         .unwrap();
@@ -2653,7 +2666,7 @@ mod tests {
             let mut cache = 0;
             let mut scheduler = MlxSpeculativeScheduler::new(
                 &mut backend,
-                SpeculativeExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
+                SpeculativeExecutionStreams::for_test(target.stream(), draft.stream()).unwrap(),
                 options,
             )
             .unwrap();
@@ -2711,7 +2724,7 @@ mod tests {
         let mut cache = 0;
         let mut scheduler = MlxSpeculativeScheduler::new(
             &mut backend,
-            SpeculativeExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
+            SpeculativeExecutionStreams::for_test(target.stream(), draft.stream()).unwrap(),
             SpeculativeSchedulerOptions::default(),
         )
         .unwrap();
@@ -2764,7 +2777,7 @@ mod tests {
         {
             let mut scheduler = MlxSpeculativeScheduler::new(
                 &mut backend,
-                SpeculativeExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
+                SpeculativeExecutionStreams::for_test(target.stream(), draft.stream()).unwrap(),
                 SpeculativeSchedulerOptions::default(),
             )
             .unwrap();
@@ -2838,7 +2851,7 @@ mod tests {
         let mut cache = 0;
         let mut scheduler = MlxSpeculativeScheduler::new(
             &mut backend,
-            SpeculativeExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
+            SpeculativeExecutionStreams::for_test(target.stream(), draft.stream()).unwrap(),
             SpeculativeSchedulerOptions::default(),
         )
         .unwrap();
@@ -2893,7 +2906,7 @@ mod tests {
         let mut cache = 0;
         let mut scheduler = MlxSpeculativeScheduler::new(
             &mut backend,
-            SpeculativeExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
+            SpeculativeExecutionStreams::for_test(target.stream(), draft.stream()).unwrap(),
             SpeculativeSchedulerOptions::default(),
         )
         .unwrap();
@@ -2987,7 +3000,7 @@ mod tests {
         let mut cache_b = 0;
         let mut scheduler = MlxSpeculativeScheduler::new(
             &mut backend,
-            SpeculativeExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
+            SpeculativeExecutionStreams::for_test(target.stream(), draft.stream()).unwrap(),
             SpeculativeSchedulerOptions::default(),
         )
         .unwrap();
@@ -3067,7 +3080,7 @@ mod tests {
         let mut cache_b = 0;
         let mut scheduler = MlxSpeculativeScheduler::new(
             &mut backend,
-            SpeculativeExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
+            SpeculativeExecutionStreams::for_test(target.stream(), draft.stream()).unwrap(),
             SpeculativeSchedulerOptions {
                 max_in_flight_verifications: 2,
                 max_optimistic_branches: 1,
@@ -3132,7 +3145,7 @@ mod tests {
             let callback = Rc::clone(&events);
             let mut scheduler = MlxSpeculativeScheduler::new(
                 &mut backend,
-                SpeculativeExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
+                SpeculativeExecutionStreams::for_test(target.stream(), draft.stream()).unwrap(),
                 SpeculativeSchedulerOptions::default(),
             )
             .unwrap();
@@ -3199,7 +3212,7 @@ mod tests {
             let mut cache = 0;
             let mut scheduler = MlxSpeculativeScheduler::new(
                 &mut backend,
-                SpeculativeExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
+                SpeculativeExecutionStreams::for_test(target.stream(), draft.stream()).unwrap(),
                 options,
             )
             .unwrap();

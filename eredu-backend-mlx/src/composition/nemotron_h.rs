@@ -2,7 +2,7 @@
 
 use std::{path::Path, sync::Arc};
 
-use eredu_architectures::nemotron_h::{LayeredModel, ModelArgs, Unit, PREDICTION_STATE_SEGMENT};
+use eredu_architectures::nemotron_h::{LayeredModel, ModelArgs, Unit};
 use eredu_checkpoint::{store::CheckpointSource, WeightQuantization};
 use eredu_runtime::{
     ActivationObserver, ArchitectureParameters, CacheResidencyPolicy, CausalModel,
@@ -370,14 +370,6 @@ impl NemotronHModel {
         &self.args
     }
 
-    /// Returns the number of embedded prediction depths.
-    pub fn mtp_len(&self) -> usize {
-        match &self.execution {
-            NemotronHExecution::Resident(runtime) => runtime.architecture().mtp_len(),
-            NemotronHExecution::Layerwise(runtime) => runtime.architecture().mtp_len(),
-        }
-    }
-
     /// Creates device-resident heterogeneous state.
     pub fn new_cache(&self) -> MlxHybridState {
         MlxHybridState::device(self.state_layout.clone())
@@ -632,143 +624,6 @@ impl NemotronHModel {
         Ok(output)
     }
 
-    fn forward_mtp_target(
-        &mut self,
-        tokens: &Array,
-        cache: &mut MlxHybridState,
-        stream: &Stream,
-    ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Exception> {
-        let parameter_bank = self.parameter_bank.take();
-        let result = match parameter_bank.as_ref() {
-            Some(cache_store) => {
-                let descriptor = self.expert_provider.clone().ok_or_else(|| {
-                    Exception::custom(
-                        "Nemotron-H expert cache has no architecture provider descriptor",
-                    )
-                })?;
-                let mut provider = cached_provider(cache_store, &descriptor);
-                self.forward_with_provider_context(tokens, None, cache, &mut provider, stream)
-            }
-            None => self.forward_with_provider_context(
-                tokens,
-                None,
-                cache,
-                &mut eredu_runtime::ResidentExpertProvider,
-                stream,
-            ),
-        };
-        self.parameter_bank = parameter_bank;
-        let (logits, context) = result.map_err(|error| Exception::custom(error.to_string()))?;
-        let hidden = context
-            .target_capture()
-            .cloned()
-            .ok_or_else(|| Exception::custom("Nemotron-H target pass retained no hidden state"))?;
-        Ok(
-            crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput {
-                logits,
-                hidden,
-                tokens: crate::MlxTensor::from_array(tokens.clone()),
-            },
-        )
-    }
-
-    fn forward_input_with_provider_context<'a, P>(
-        &mut self,
-        input: eredu_architectures::nemotron_h::EmbeddedInput<'a, crate::MlxTensor>,
-        cache: &mut MlxHybridState,
-        provider: &mut P,
-        stream: &Stream,
-    ) -> Result<
-        (
-            crate::MlxTensor,
-            eredu_architectures::nemotron_h::ForwardContext<crate::MlxTensor>,
-        ),
-        Error,
-    >
-    where
-        P: eredu_runtime::RoutedExpertProvider<MlxNeuralBackend>,
-        P::Error: std::fmt::Display,
-    {
-        let hook =
-            |architecture: &mut NeutralArchitecture,
-             group: usize,
-             index: usize,
-             unit: &mut NeutralBlock,
-             hidden: &crate::MlxTensor,
-             state: &mut MlxHybridState,
-             forward: &mut eredu_architectures::nemotron_h::ForwardContext<crate::MlxTensor>,
-             context: &Stream| {
-                architecture.forward_unit_with_provider(
-                    group, index, unit, hidden, state, forward, provider, context,
-                )
-            };
-        match &mut self.execution {
-            NemotronHExecution::Resident(runtime) => runtime
-                .forward_with_unit_executor_and_context_hook(
-                    input,
-                    cache,
-                    stream,
-                    hook,
-                    |_, _, _| Ok(()),
-                ),
-            NemotronHExecution::Layerwise(runtime) => runtime
-                .forward_with_unit_executor_and_context_hook(
-                    input,
-                    cache,
-                    stream,
-                    hook,
-                    |_, _, _| Ok(()),
-                ),
-        }
-        .map_err(|error| Error::Parallel(error.to_string()))
-    }
-
-    fn forward_mtp_draft(
-        &mut self,
-        hidden: &Array,
-        tokens: &Array,
-        depth: usize,
-        cache: &mut MlxHybridState,
-        stream: &Stream,
-    ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Exception> {
-        let input = eredu_architectures::nemotron_h::EmbeddedInput::draft(
-            crate::composition::tensor_ref(tokens),
-            crate::composition::tensor_ref(hidden),
-            depth,
-        );
-        let parameter_bank = self.parameter_bank.take();
-        let result = match parameter_bank.as_ref() {
-            Some(cache_store) => {
-                let descriptor = self.expert_provider.clone().ok_or_else(|| {
-                    Exception::custom(
-                        "Nemotron-H expert cache has no architecture provider descriptor",
-                    )
-                })?;
-                let mut provider = cached_provider(cache_store, &descriptor);
-                self.forward_input_with_provider_context(input, cache, &mut provider, stream)
-            }
-            None => self.forward_input_with_provider_context(
-                input,
-                cache,
-                &mut eredu_runtime::ResidentExpertProvider,
-                stream,
-            ),
-        };
-        self.parameter_bank = parameter_bank;
-        let (logits, context) = result.map_err(|error| Exception::custom(error.to_string()))?;
-        let hidden = context
-            .target_capture()
-            .cloned()
-            .ok_or_else(|| Exception::custom("Nemotron-H draft pass retained no hidden state"))?;
-        Ok(
-            crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput {
-                logits,
-                hidden,
-                tokens: crate::MlxTensor::from_array(tokens.clone()),
-            },
-        )
-    }
-
     pub fn forward_with_observer(
         &mut self,
         tokens: &Array,
@@ -894,105 +749,6 @@ impl CausalModel<MlxHybridState> for NemotronHModel {
             .map_err(|error| Exception::custom(error.to_string()))?
             .try_index_device((.., -1, ..), stream)
             .map(crate::MlxTensor::from_array)
-    }
-}
-
-impl crate::composition::mlx::speculative::embedded::EmbeddedMtpTarget for NemotronHModel {
-    type Cache = MlxHybridState;
-    type DraftCache = MlxHybridState;
-
-    fn prefill_target(
-        &mut self,
-        input: input::ModelInput<'_>,
-        cache: &mut Self::Cache,
-        stream: &Stream,
-    ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Exception> {
-        let tokens = input::text_token_ids(input, stream)?;
-        cache.clear()?;
-        self.forward_mtp_target(&tokens, cache, stream)
-    }
-
-    fn verify_target(
-        &mut self,
-        tokens: &crate::MlxTensor,
-        cache: &mut Self::Cache,
-        stream: &Stream,
-    ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Exception> {
-        self.forward_mtp_target(tokens.as_array(), cache, stream)
-    }
-
-    fn prefill_draft_cache(
-        &mut self,
-        output: &crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput,
-        tokens: &crate::MlxTensor,
-        cache: &mut Self::Cache,
-        stream: &Stream,
-    ) -> Result<(), Exception> {
-        let sequence = tokens.as_array().dim(1);
-        if sequence <= 1 {
-            return Ok(());
-        }
-        let hidden = output
-            .hidden
-            .as_array()
-            .try_index_device((.., ..sequence - 1, ..), stream)?;
-        let next = tokens.as_array().try_index_device((.., 1..), stream)?;
-        for depth in 0..self.mtp_len() {
-            let _ = self.forward_mtp_draft(&hidden, &next, depth, cache, stream)?;
-        }
-        Ok(())
-    }
-
-    fn draft_cache(&self, cache: &Self::Cache) -> Self::DraftCache {
-        cache
-            .deep_clone_state()
-            .expect("evaluated Nemotron-H draft state must be forkable")
-    }
-
-    fn commit_draft_cache(&self, cache: &mut Self::Cache, draft: &Self::DraftCache) {
-        cache
-            .commit_segment_from(draft, PREDICTION_STATE_SEGMENT)
-            .expect("validated Nemotron-H prediction state segment");
-    }
-
-    fn restore_target_checkpoint(
-        cache: &mut Self::Cache,
-        checkpoint: &Self::Cache,
-        stream: &Stream,
-    ) -> Result<(), Exception> {
-        cache.restore_checkpoint(checkpoint, stream)
-    }
-
-    fn draft_logits(
-        &mut self,
-        hidden: &crate::MlxTensor,
-        last_token: u32,
-        draft_index: usize,
-        cache: &mut Self::DraftCache,
-        stream: &Stream,
-    ) -> Result<(crate::MlxTensor, crate::MlxTensor), Exception> {
-        let token = Array::from_slice(&[last_token], &[1, 1]);
-        let output =
-            self.forward_mtp_draft(hidden.as_array(), &token, draft_index, cache, stream)?;
-        Ok((output.logits, output.hidden))
-    }
-
-    fn advance_draft_cache(
-        &mut self,
-        hidden: &crate::MlxTensor,
-        tokens: &crate::MlxTensor,
-        cache: &mut Self::DraftCache,
-        stream: &Stream,
-    ) -> Result<(), Exception> {
-        for depth in 0..self.mtp_len() {
-            let _ =
-                self.forward_mtp_draft(hidden.as_array(), tokens.as_array(), depth, cache, stream)?;
-        }
-        Ok(())
-    }
-
-    fn max_draft_tokens(&self) -> usize {
-        self.mtp_len()
     }
 }
 

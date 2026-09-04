@@ -152,6 +152,7 @@ pub struct MlxSelectedPreparation {
     session: eredu_core::SessionCapabilities,
     rank_context: Option<crate::backend::MlxRankContext>,
     prediction_extension: Option<eredu_architectures::configuration::PredictionExtensionPlan>,
+    prediction_realization: Option<eredu_runtime::SelectedSpeculativeRealization>,
 }
 
 type OrdinaryMlxSelectedExecution =
@@ -191,12 +192,14 @@ impl MlxSelectedPreparation {
         session: eredu_core::SessionCapabilities,
         rank_context: Option<crate::backend::MlxRankContext>,
         prediction_extension: Option<eredu_architectures::configuration::PredictionExtensionPlan>,
+        prediction_realization: Option<eredu_runtime::SelectedSpeculativeRealization>,
     ) -> Self {
         Self {
             execution,
             session,
             rank_context,
             prediction_extension,
+            prediction_realization,
         }
     }
 
@@ -751,6 +754,99 @@ pub(crate) fn select_preparation_with_grouped_capabilities(
     )
 }
 
+fn select_embedded_prediction_realization(
+    inspection: &eredu_core::ArtifactInspection<ArtifactArchitecturePlan>,
+    extension: &eredu_architectures::configuration::PredictionExtensionPlan,
+    options: &MlxLoadRequest,
+) -> Result<eredu_runtime::SelectedSpeculativeRealization, Error> {
+    use std::num::NonZeroUsize;
+
+    let identity = |value: String| {
+        eredu_runtime::SpeculativeIdentity::new(value)
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))
+    };
+    let topology = options.parallel_topology().unwrap_or(
+        eredu_core::ParallelRankTopology::new(
+            eredu_core::ParallelTopology::new(1, 1, 1, 1)
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?,
+            0,
+        )
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?,
+    );
+    let (maximum_batch_size, maximum_sequence_length) = match options
+        .partitioned_invocation_limits()?
+    {
+        Some(limits) => limits,
+        None => {
+            let capability =
+                eredu_architectures::prediction_extension::prediction_extension_capability(
+                    extension,
+                )
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+            let maximum_sequence_length = capability
+                .capabilities()
+                .effective_max_context
+                .value()
+                .copied()
+                .ok_or_else(|| {
+                    Error::ArchitectureModel(
+                        "embedded prediction target has no effective context bound".into(),
+                    )
+                })?;
+            let maximum_sequence_length = i32::try_from(maximum_sequence_length).map_err(|_| {
+                Error::ArchitectureModel(
+                    "embedded prediction effective context exceeds MLX dimensions".into(),
+                )
+            })?;
+            (1, maximum_sequence_length)
+        }
+    };
+    let maximum_batch_size = NonZeroUsize::new(
+        usize::try_from(maximum_batch_size)
+            .map_err(|_| Error::ArchitectureModel("maximum batch size is negative".into()))?,
+    )
+    .ok_or_else(|| Error::ArchitectureModel("maximum batch size is zero".into()))?;
+    let maximum_sequence_length = NonZeroUsize::new(
+        usize::try_from(maximum_sequence_length)
+            .map_err(|_| Error::ArchitectureModel("maximum sequence length is negative".into()))?,
+    )
+    .ok_or_else(|| Error::ArchitectureModel("maximum sequence length is zero".into()))?;
+    let requested_capacity = match options.speculative_load_request() {
+        super::load_request::SpeculativeLoadRequest::Embedded { max_draft_tokens } => {
+            max_draft_tokens
+        }
+        _ => eredu_architectures::prediction_extension::embedded_prediction_capacity(extension)
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?,
+    };
+    let contract = eredu_architectures::prediction_extension::embedded_speculative_contract(
+        extension,
+        eredu_architectures::prediction_extension::EmbeddedSpeculativeContractRequest::new(
+            identity(format!("target/{:?}", extension.kind()))?,
+            identity(format!("artifact/{}", inspection.path().display()))?,
+            identity(format!("format/{:?}", inspection.format()))?,
+            topology,
+            identity("prepared-input/text-token-ids/v1".into())?,
+            maximum_batch_size,
+            maximum_sequence_length,
+            requested_capacity,
+        ),
+    )
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let prepared = eredu_runtime::select_and_prepare_speculative_realization_observed(
+        contract.requirements(),
+        &contract.selection_request(eredu_runtime::SpeculativePlacementRequest::Single),
+        &super::speculative::speculative_mechanism_capabilities(),
+        &|_| Ok(()),
+        |_| Ok::<_, Error>(()),
+        |_, &()| Ok::<_, Error>(()),
+        |_, &()| Ok::<_, Error>(()),
+        |_| Ok::<_, Error>(()),
+        |_, &()| Ok::<_, Error>(()),
+    )
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    Ok(prepared.into_parts().0)
+}
+
 fn select_preparation_with_capabilities(
     inspection: &eredu_core::ArtifactInspection<ArtifactArchitecturePlan>,
     options: MlxLoadRequest,
@@ -789,7 +885,27 @@ fn select_preparation_with_capabilities(
         .architecture_plan()
         .prediction_target_projection()
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    let prediction_extension = projection.as_ref().map(|(_, extension)| extension.clone());
+    let discovered_prediction_extension =
+        projection.as_ref().map(|(_, extension)| extension.clone());
+    let prediction_extension = match options.speculative_load_request() {
+        super::load_request::SpeculativeLoadRequest::ArchitectureDefault => {
+            discovered_prediction_extension
+        }
+        super::load_request::SpeculativeLoadRequest::Disabled
+        | super::load_request::SpeculativeLoadRequest::ExternalTarget => None,
+        super::load_request::SpeculativeLoadRequest::Embedded { .. } => Some(
+            discovered_prediction_extension.ok_or_else(|| {
+                Error::ArchitectureModel(
+                    "execution plan requires embedded drafting but the artifact has no admitted prediction extension"
+                        .into(),
+                )
+            })?,
+        ),
+    };
+    let prediction_realization = prediction_extension
+        .as_ref()
+        .map(|extension| select_embedded_prediction_realization(inspection, extension, &options))
+        .transpose()?;
     let projected_inspection =
         projection.map(|(target, _)| inspection.clone().map_architecture_plan(|_complete| target));
     let inspection = projected_inspection.as_ref().unwrap_or(inspection);
@@ -915,6 +1031,7 @@ fn select_preparation_with_capabilities(
         admitted_session,
         rank_context,
         prediction_extension,
+        prediction_realization,
     ))
 }
 
@@ -930,10 +1047,12 @@ pub fn materialize_model_plan(
         session: _,
         rank_context: _,
         prediction_extension,
+        prediction_realization,
     } = selected;
     let materializer = MlxSelectedExecutionMaterializer {
         plan,
         prediction_extension,
+        prediction_realization,
         stream,
         weights_stream,
     };
@@ -946,6 +1065,7 @@ pub fn materialize_model_plan(
             materialize_partitioned_dense_decoder(
                 materializer.plan,
                 materializer.prediction_extension,
+                materializer.prediction_realization,
                 selected,
                 distributed,
                 stream,
@@ -956,6 +1076,7 @@ pub fn materialize_model_plan(
             materialize_partitioned_routed_decoder(
                 materializer.plan,
                 materializer.prediction_extension,
+                materializer.prediction_realization,
                 selected,
                 distributed,
                 stream,
@@ -966,6 +1087,7 @@ pub fn materialize_model_plan(
             materialize_partitioned_composite(
                 materializer.plan,
                 materializer.prediction_extension,
+                materializer.prediction_realization,
                 selected,
                 distributed,
                 stream,
@@ -980,6 +1102,7 @@ fn materialize_partitioned_composite(
     selected_prediction_extension: Option<
         eredu_architectures::configuration::PredictionExtensionPlan,
     >,
+    prediction_realization: Option<eredu_runtime::SelectedSpeculativeRealization>,
     selected: eredu_architectures::partitioned_execution::SelectedPartitionedAdmission<
         eredu_architectures::replicated_text::SelectedCompositeTextRealization,
         eredu_architectures::replicated_text::CompositeTextRequirements,
@@ -1122,19 +1245,49 @@ fn materialize_partitioned_composite(
                 prediction_extension_sources,
             ))
         };
-    let mut executable = super::replicated_text::bind_partitioned_composite(
-        selected,
-        target_store,
-        distributed,
-        stream,
-        weights_stream,
-    )?;
-    if let Some((extension, execution)) = prediction_extension.zip(prediction_extension_execution) {
-        let capability =
-            eredu_architectures::prediction_extension::prediction_extension_capability(&extension)
+    let executable = match (
+        prediction_extension,
+        prediction_extension_execution,
+        prediction_realization,
+    ) {
+        (Some(extension), Some(execution), Some(realization)) => {
+            let capability =
+                eredu_architectures::prediction_extension::prediction_extension_capability(
+                    &extension,
+                )
                 .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        executable.install_prediction_extension_contract(execution, capability)?;
-    }
+            eredu_architectures::composite_partitioned::visit_authoritative_composite_prediction_target_partition::<
+                MlxNeuralBackend,
+                crate::backend::runtime::cache::state::MlxHybridState,
+                super::replicated_text::MlxEmbeddedPredictionMaterializer,
+                _,
+            >(
+                selected,
+                execution,
+                stream,
+                super::replicated_text::PartitionedCompositePredictionBindingVisitor {
+                    store: target_store,
+                    distributed,
+                    stream,
+                    weights_stream,
+                    selected: realization,
+                    capability,
+                },
+            ).map_err(|error| Error::ArchitectureModel(error.to_string()))?
+        }
+        (None, None, None) => super::replicated_text::bind_partitioned_composite(
+            selected,
+            target_store,
+            distributed,
+            stream,
+            weights_stream,
+        )?,
+        _ => {
+            return Err(Error::ArchitectureModel(
+                "embedded prediction selection and materialization disagree".into(),
+            ))
+        }
+    };
     let model = MlxModel::complete(
         Executable::replicated_text(kind, executable)?,
         floating_state_dtype_bytes,
@@ -1148,6 +1301,7 @@ fn materialize_partitioned_routed_decoder(
     selected_prediction_extension: Option<
         eredu_architectures::configuration::PredictionExtensionPlan,
     >,
+    prediction_realization: Option<eredu_runtime::SelectedSpeculativeRealization>,
     selected: eredu_architectures::partitioned_execution::SelectedPartitionedAdmission<
         eredu_architectures::SelectedRoutedTextRealization,
         eredu_architectures::RoutedTextRequirements,
@@ -1274,21 +1428,45 @@ fn materialize_partitioned_routed_decoder(
                 prediction_extension_sources.clone(),
             ))
         };
-    let mut executable = super::replicated_text::bind_partitioned_routed_decoder(
-        &inspection,
-        selected,
-        target_store,
-        distributed,
-        prediction_extension_sources,
-        stream,
-        weights_stream,
-    )?;
-    if let Some((extension, execution)) = prediction_extension.zip(prediction_extension_execution) {
-        let capability =
-            eredu_architectures::prediction_extension::prediction_extension_capability(&extension)
+    let executable = match (
+        prediction_extension,
+        prediction_extension_execution,
+        prediction_realization,
+    ) {
+        (Some(extension), Some(execution), Some(realization)) => {
+            let capability =
+                eredu_architectures::prediction_extension::prediction_extension_capability(
+                    &extension,
+                )
                 .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        executable.install_prediction_extension_contract(execution, capability)?;
-    }
+            super::replicated_text::bind_partitioned_routed_prediction_decoder(
+                &inspection,
+                selected,
+                execution,
+                realization,
+                capability,
+                target_store,
+                distributed,
+                prediction_extension_sources,
+                stream,
+                weights_stream,
+            )?
+        }
+        (None, None, None) => super::replicated_text::bind_partitioned_routed_decoder(
+            &inspection,
+            selected,
+            target_store,
+            distributed,
+            prediction_extension_sources,
+            stream,
+            weights_stream,
+        )?,
+        _ => {
+            return Err(Error::ArchitectureModel(
+                "embedded prediction selection and materialization disagree".into(),
+            ))
+        }
+    };
     Ok(MlxModel::complete(
         Executable::replicated_text(kind, executable)?,
         floating_state_dtype_bytes,
@@ -1301,6 +1479,7 @@ fn materialize_partitioned_dense_decoder(
     selected_prediction_extension: Option<
         eredu_architectures::configuration::PredictionExtensionPlan,
     >,
+    prediction_realization: Option<eredu_runtime::SelectedSpeculativeRealization>,
     selected: eredu_architectures::partitioned_execution::SelectedPartitionedAdmission<
         eredu_runtime::SelectedReplicatedTextRealization,
         eredu_runtime::ReplicatedTextRequirements,
@@ -1443,21 +1622,53 @@ fn materialize_partitioned_dense_decoder(
                 prediction_extension_sources.clone(),
             ))
         };
-    let mut executable = super::replicated_text::bind_partitioned_dense_decoder(
-        &inspection,
-        selected,
-        target_store,
-        distributed,
-        prediction_extension_sources,
-        stream,
-        weights_stream,
-    )?;
-    if let Some((extension, execution)) = prediction_extension.zip(prediction_extension_execution) {
-        let capability =
-            eredu_architectures::prediction_extension::prediction_extension_capability(&extension)
+    let executable = match (
+        prediction_extension,
+        prediction_extension_execution,
+        prediction_realization,
+    ) {
+        (Some(extension), Some(execution), Some(realization)) => {
+            let capability =
+                eredu_architectures::prediction_extension::prediction_extension_capability(
+                    &extension,
+                )
                 .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        executable.install_prediction_extension_contract(execution, capability)?;
-    }
+            eredu_architectures::partitioned_execution::visit_resident_partitioned_prediction_target_architecture::<
+                MlxNeuralBackend,
+                crate::backend::runtime::cache::state::MlxHybridState,
+                super::replicated_text::MlxEmbeddedPredictionMaterializer,
+                _,
+            >(
+                &inspection,
+                selected,
+                execution,
+                target_store,
+                stream,
+                super::replicated_text::PartitionedPredictionBindingVisitor {
+                    distributed,
+                    additional_claimed_sources: prediction_extension_sources,
+                    stream,
+                    weights_stream,
+                    selected: realization,
+                    capability,
+                },
+            ).map_err(|error| Error::ArchitectureModel(error.to_string()))?
+        }
+        (None, None, None) => super::replicated_text::bind_partitioned_dense_decoder(
+            &inspection,
+            selected,
+            target_store,
+            distributed,
+            prediction_extension_sources,
+            stream,
+            weights_stream,
+        )?,
+        _ => {
+            return Err(Error::ArchitectureModel(
+                "embedded prediction selection and materialization disagree".into(),
+            ))
+        }
+    };
     Ok(MlxModel::complete(
         Executable::replicated_text(kind, executable)?,
         floating_state_dtype_bytes,
@@ -1468,6 +1679,7 @@ fn materialize_partitioned_dense_decoder(
 struct MlxSelectedExecutionMaterializer<'a> {
     plan: ModelPreparationPlan<ArtifactArchitecturePlan>,
     prediction_extension: Option<eredu_architectures::configuration::PredictionExtensionPlan>,
+    prediction_realization: Option<eredu_runtime::SelectedSpeculativeRealization>,
     stream: &'a Stream,
     weights_stream: &'a Stream,
 }
@@ -1490,6 +1702,7 @@ impl
         materialize_replicated_text_plan(
             self.plan,
             self.prediction_extension,
+            self.prediction_realization,
             selected,
             self.stream,
             self.weights_stream,
@@ -1503,6 +1716,7 @@ impl
         materialize_routed_text_plan(
             self.plan,
             self.prediction_extension,
+            self.prediction_realization,
             selected,
             self.stream,
             self.weights_stream,
@@ -1516,6 +1730,7 @@ impl
         materialize_composite_text_plan(
             self.plan,
             self.prediction_extension,
+            self.prediction_realization,
             selected,
             self.stream,
             self.weights_stream,
@@ -1576,7 +1791,7 @@ fn materialize_replicated_prediction_extension(
     store: &dyn eredu_checkpoint::store::CheckpointSource,
     stream: &Stream,
     weights_stream: &Stream,
-) -> Result<super::replicated_text::MlxPredictionExtension, Error> {
+) -> Result<super::replicated_text::MaterializedEmbeddedPrediction, Error> {
     let prepared =
         eredu_architectures::prediction_extension::prepare_replicated_prediction_extension::<
             MlxNeuralBackend,
@@ -1590,22 +1805,12 @@ fn materialize_replicated_prediction_extension(
     )
 }
 
-fn install_replicated_prediction_extension(
-    executable: &mut Box<dyn super::replicated_text::ErasedReplicatedTextExecutable>,
-    extension: eredu_architectures::configuration::PredictionExtensionPlan,
-    materialized: super::replicated_text::MlxPredictionExtension,
-) -> Result<(), Error> {
-    let capability =
-        eredu_architectures::prediction_extension::prediction_extension_capability(&extension)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    executable.install_prediction_extension_contract(materialized, capability)
-}
-
 fn materialize_replicated_text_plan(
     plan: ModelPreparationPlan<ArtifactArchitecturePlan>,
     selected_prediction_extension: Option<
         eredu_architectures::configuration::PredictionExtensionPlan,
     >,
+    prediction_realization: Option<eredu_runtime::SelectedSpeculativeRealization>,
     realization: eredu_runtime::SelectedReplicatedTextRealization,
     stream: &Stream,
     weights_stream: &Stream,
@@ -1656,17 +1861,40 @@ fn materialize_replicated_text_plan(
                         prediction_extension_sources,
                     ))
                 };
-            let mut executable = bind_replicated_text(
-                &architecture_plan,
-                realization,
-                target_store,
-                stream,
-                weights_stream,
-            )?;
-            if let Some((extension, materialized)) = prediction_extension.zip(materialized) {
-                install_replicated_prediction_extension(&mut executable, extension, materialized)?;
+            match (prediction_extension, materialized, prediction_realization) {
+                (Some(extension), Some(materialized), Some(selected)) => {
+                    let capability =
+                        eredu_architectures::prediction_extension::prediction_extension_capability(
+                            &extension,
+                        )
+                        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+                    eredu_architectures::replicated_text::dispatch_replicated_prediction_target_architecture(
+                        &architecture_plan,
+                        realization,
+                        materialized,
+                        target_store,
+                        stream,
+                        super::replicated_text::PredictionBindingVisitor {
+                            stream,
+                            weights_stream,
+                            selected,
+                            capability,
+                        },
+                    ).map_err(|error| Error::ArchitectureModel(error.to_string()))?
+                }
+                (None, None, None) => bind_replicated_text(
+                    &architecture_plan,
+                    realization,
+                    target_store,
+                    stream,
+                    weights_stream,
+                )?,
+                _ => {
+                    return Err(Error::ArchitectureModel(
+                        "embedded prediction selection and materialization disagree".into(),
+                    ))
+                }
             }
-            executable
         }
         ModelArtifact::Gguf { validated, .. } => {
             let architecture = prepared_gguf_plan(&architecture_plan)?.clone();
@@ -1717,6 +1945,7 @@ fn materialize_routed_text_plan(
     selected_prediction_extension: Option<
         eredu_architectures::configuration::PredictionExtensionPlan,
     >,
+    prediction_realization: Option<eredu_runtime::SelectedSpeculativeRealization>,
     realization: eredu_architectures::SelectedRoutedTextRealization,
     stream: &Stream,
     weights_stream: &Stream,
@@ -1770,17 +1999,40 @@ fn materialize_routed_text_plan(
                         prediction_extension_sources,
                     ))
                 };
-            let mut executable = super::replicated_text::bind_routed_text(
-                &inspection,
-                realization,
-                target_store,
-                stream,
-                weights_stream,
-            )?;
-            if let Some((extension, materialized)) = prediction_extension.zip(materialized) {
-                install_replicated_prediction_extension(&mut executable, extension, materialized)?;
+            match (prediction_extension, materialized, prediction_realization) {
+                (Some(extension), Some(materialized), Some(selected)) => {
+                    let capability =
+                        eredu_architectures::prediction_extension::prediction_extension_capability(
+                            &extension,
+                        )
+                        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+                    eredu_architectures::routed_text::dispatch_routed_prediction_target_architecture(
+                        &inspection,
+                        realization,
+                        materialized,
+                        target_store,
+                        stream,
+                        super::replicated_text::PredictionBindingVisitor {
+                            stream,
+                            weights_stream,
+                            selected,
+                            capability,
+                        },
+                    ).map_err(|error| Error::ArchitectureModel(error.to_string()))?
+                }
+                (None, None, None) => super::replicated_text::bind_routed_text(
+                    &inspection,
+                    realization,
+                    target_store,
+                    stream,
+                    weights_stream,
+                )?,
+                _ => {
+                    return Err(Error::ArchitectureModel(
+                        "embedded prediction selection and materialization disagree".into(),
+                    ))
+                }
             }
-            executable
         }
         ModelArtifact::Gguf { validated, .. } => {
             let architecture = prepared_gguf_plan(&architecture_plan)?.clone();
@@ -1831,6 +2083,7 @@ fn materialize_composite_text_plan(
     selected_prediction_extension: Option<
         eredu_architectures::configuration::PredictionExtensionPlan,
     >,
+    prediction_realization: Option<eredu_runtime::SelectedSpeculativeRealization>,
     realization: eredu_architectures::replicated_text::SelectedCompositeTextRealization,
     stream: &Stream,
     weights_stream: &Stream,
@@ -1934,24 +2187,50 @@ fn materialize_composite_text_plan(
                 prediction_extension_sources,
             ))
         };
-    let mut executable = eredu_architectures::replicated_text::visit_composite_text_architecture::<
-        crate::backend::nn::shared::MlxNeuralBackend,
-        crate::backend::runtime::cache::state::MlxHybridState,
-        _,
-    >(
-        requirements,
-        realization,
-        target_store,
-        stream,
-        super::replicated_text::CompositeBindingVisitor {
-            stream,
-            weights_stream,
-        },
-    )
-    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    if let Some((extension, materialized)) = prediction_extension.zip(materialized) {
-        install_replicated_prediction_extension(&mut executable, extension, materialized)?;
-    }
+    let executable = match (prediction_extension, materialized, prediction_realization) {
+        (Some(extension), Some(materialized), Some(selected)) => {
+            let capability =
+                eredu_architectures::prediction_extension::prediction_extension_capability(
+                    &extension,
+                )
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+            eredu_architectures::replicated_text::visit_composite_prediction_target_text_architecture::<
+                MlxNeuralBackend,
+                crate::backend::runtime::cache::state::MlxHybridState,
+                super::replicated_text::MlxEmbeddedPredictionMaterializer,
+                _,
+            >(
+                requirements,
+                realization,
+                materialized,
+                target_store,
+                stream,
+                super::replicated_text::PredictionBindingVisitor { stream, weights_stream, selected, capability },
+            ).map_err(|error| Error::ArchitectureModel(error.to_string()))?
+        }
+        (None, None, None) => {
+            eredu_architectures::replicated_text::visit_composite_text_architecture::<
+                MlxNeuralBackend,
+                crate::backend::runtime::cache::state::MlxHybridState,
+                _,
+            >(
+                requirements,
+                realization,
+                target_store,
+                stream,
+                super::replicated_text::CompositeBindingVisitor {
+                    stream,
+                    weights_stream,
+                },
+            )
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?
+        }
+        _ => {
+            return Err(Error::ArchitectureModel(
+                "embedded prediction selection and materialization disagree".into(),
+            ))
+        }
+    };
     let model = MlxModel::complete(
         Executable::replicated_text(kind, executable)?,
         floating_state_dtype_bytes,
@@ -2179,6 +2458,25 @@ mod floating_state_dtype_tests {
         ));
         assert!(selected.realized_communication_manifest().is_some());
         assert!(selected.rank_context().is_some());
+    }
+
+    #[test]
+    fn disabled_plan_projects_one_ordinary_target_without_selecting_extension_payloads() {
+        let root = tempfile::tempdir().unwrap();
+        crate::tests::distributed_pipeline_ring::write_deepseek_v4_fixture(root.path(), 1);
+        let inspection = eredu_architectures::configuration::inspect_artifact(root.path()).unwrap();
+        let options = crate::MlxLoadRequest::default()
+            .with_drafting_plan(&eredu_core::DraftingPlan::Disabled)
+            .unwrap();
+        let policy = options.preparation_policy().unwrap();
+
+        let selected = super::select_preparation(&inspection, options, policy).unwrap();
+
+        assert!(selected.prediction_extension.is_none());
+        assert!(matches!(
+            selected.execution,
+            MlxSelectedExecution::Ordinary(_)
+        ));
     }
     use safemlx::{Device, DeviceType};
     use std::collections::BTreeMap;

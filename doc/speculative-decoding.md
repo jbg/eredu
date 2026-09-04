@@ -18,14 +18,25 @@ embedded prediction heads.
 An external assistant is loaded separately and validated against the target's
 tokenizer, vocabulary, and model-specific interface. Gemma 4 assistant and
 Muse-Glimmer DFlash artifacts are supported through this path. Prepared Gemma 4
-and Muse-Glimmer targets advertise a separate-checkpoint capability so automatic
-execution-plan realization can load and validate the matching assistant.
+and Muse-Glimmer targets report a `Declared` separate-checkpoint capability so
+automatic execution-plan realization can prove compatibility and construct the
+matching assistant. `Ready` is reserved for a speculative realization that is
+executable without further pairing.
+
+For embedded prediction, readiness is reported from the installed, typed
+executor retained by the session. The ordinary target projection deliberately
+has prediction depth zero, so its target-only configuration is not used as a
+proxy for installed execution capability.
+
+External assistants currently pair only with replicated target topology. An
+external plan requesting a partitioned target is rejected before assistant
+weights or draft queues are materialized.
 
 Embedded MTP is available for registered checkpoints with executable prediction
 weights, including supported DeepSeek, Inkling, Nemotron-H, Qwen3-Next, and
 Qwen3.5 variants. DeepSeek-V4 SafeTensors checkpoints support both ordinary
-embedded MTP heads and fused DSpark draft blocks, including persisted
-draft-cache continuation. A base `deepseek4` GGUF contains target weights only;
+embedded MTP heads and fused DSpark draft blocks, including architecture-owned
+draft-cache transactions in each live lane. A base `deepseek4` GGUF contains target weights only;
 its metadata may describe omitted companion prediction weights but does not
 advertise an embedded-draft capability. The usable proposal depth is capped by
 the checkpoint's validated capability. For sequential MTP that capacity is the
@@ -34,12 +45,21 @@ number of prediction layers. For a fused DSpark head it is
 to compute the block.
 
 Applications should query `speculative_capability` or run model inspection
-instead of assuming support from a family name.
+instead of assuming support from a family name. A declaration admits planning;
+it does not claim that assistant compatibility, placement, and construction
+have already completed.
 
-Embedded and external assistants use one neutral scheduling path. Each model
-form provides a `SpeculativeExecutor`; the selected backend prepares concrete
-executors, caches, sampling state, queues, and completions, then lends them
-through `SpeculativeGenerationVisitor`. The facade-selected
+Target-capture contracts fix semantic paths, order, ownership, observation
+identity, fixed tensor dimensions, and bounded request-sized dimensions before
+loading. At execution, the prepared-input identity, exact tensor extents, and
+target-cache generation close the per-lane identity before assistant proposal
+work. Mismatched or stale captures fail transactionally.
+
+Embedded and external assistants use one neutral scheduling path. Architecture
+composition constructs each `SpeculativeExecutor`; the selected backend binds
+its generic caches, sampling state, queues, transfers, and completions, then
+lends the paired executor through `SpeculativeGenerationVisitor`. The
+facade-selected
 `eredu-runtime::SpeculativeScheduler` owns token or semantic publication,
 request lifecycles, fair action selection, verification resolution, and final
 statistics. Embedded heads do not maintain a second acceptance loop or a
@@ -59,11 +79,12 @@ ordinary generation.
 
 ## Execution placement
 
-Prepared-chat requests do not accept backend queues. The target retains the
-execution placement selected when it was loaded; an external assistant
-independently retains its load-time placement. Drafter loading receives the
-tokenizer as an explicit portable input; the backend fingerprints it but never
-discovers or parses tokenizer sidecars. The execution pair is classified as:
+Prepared-chat requests do not accept backend queues. The portable execution
+plan selects target/draft placement before native queue construction. The
+backend binds streams and devices to that selected topology and validates the
+binding; it does not classify semantic placement by comparing streams after
+loading. Tokenizer compatibility is proven by the facade before assistant
+payload materialization. The selected modes are:
 
 | Placement | Behavior |
 | --- | --- |
@@ -74,6 +95,11 @@ discovers or parses tokenizer sidecars. The execution pair is classified as:
 Two streams on one GPU are an experiment, not an automatic optimization. The
 target and assistant can contend for the same compute and memory bandwidth.
 Compare the placement with lookahead disabled before adopting it.
+
+`PlannedModel::speculative_generation_options` exposes the proposal and
+lookahead controls retained from an automatic execution plan. Requests may use
+stricter bounds, but cannot silently replace the selected realization with a
+larger proposal capacity.
 
 ## Verification and cache state
 

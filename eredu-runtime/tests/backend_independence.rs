@@ -3711,7 +3711,9 @@ fn prediction_target_capture_uses_one_authoritative_transaction_and_publication(
         DeviceState<FakeBackend, FakeLayerState>,
     >(&architecture, None, selected, &expected_identity, &())
     .unwrap();
+    let prompt_model_identity = contract.prompt_cache_identity().clone();
     let completions = Rc::new(RefCell::new(Vec::new()));
+    let prompt_cache = Rc::new(RefCell::new(None));
     let mut session = construct_replicated_text_session::<_, FakeBackend, _>(
         architecture,
         None,
@@ -3722,7 +3724,7 @@ fn prediction_target_capture_uses_one_authoritative_transaction_and_publication(
             counters: counters.clone(),
             fail_completion: Rc::new(Cell::new(false)),
             fail_checkpoint: false,
-            prompt_cache: None,
+            prompt_cache: Some(Rc::clone(&prompt_cache)),
         },
         &(),
     )
@@ -3746,12 +3748,29 @@ fn prediction_target_capture_uses_one_authoritative_transaction_and_publication(
     session
         .exchange_prediction_target_state(&mut lane, &())
         .unwrap();
-    assert_eq!(session.report().unwrap().state_report(), &[0]);
+    assert_eq!(session.report().unwrap().state_report(), &[1]);
     session
         .exchange_prediction_target_state(&mut lane, &())
         .unwrap();
     assert_eq!(session.report().unwrap().state_report(), &[1]);
-    assert_eq!(lane.as_ref()[0].0, 0);
+    assert_eq!(lane.as_ref()[0].0, 1);
+
+    let descriptor = eredu_core::cache::PromptCacheDescriptor::from_model_identity(
+        prompt_model_identity,
+        "prediction-target-fixture",
+        "tokens:[1,2]",
+        1,
+    )
+    .unwrap();
+    session
+        .save_prompt_cache(
+            std::path::Path::new("unused"),
+            descriptor.clone(),
+            &[1, 2],
+            &eredu_core::cache::PromptCacheOptions::default(),
+            &(),
+        )
+        .unwrap();
 
     assert_eq!(
         session
@@ -3759,6 +3778,13 @@ fn prediction_target_capture_uses_one_authoritative_transaction_and_publication(
             .unwrap(),
         11
     );
+    assert_eq!(session.report().unwrap().state_report(), &[11]);
+    session
+        .load_prompt_cache(std::path::Path::new("unused"), &descriptor, &[1, 2], &())
+        .unwrap();
+    assert_eq!(session.report().unwrap().state_report(), &[1]);
+    let restored_lane = session.prepare_prediction_target_state(&()).unwrap();
+    assert_eq!(restored_lane.as_ref()[0].0, 1);
     let before_failure = session.report().unwrap().state_report().to_vec();
     assert!(session
         .apply_prediction_target_operation(PredictionStateOperation { fail: true }, &())

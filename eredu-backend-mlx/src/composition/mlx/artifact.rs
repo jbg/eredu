@@ -74,6 +74,8 @@ pub(crate) fn open_prepared_safetensors_checkpoint(
     admitted_resolution: &eredu_checkpoint::validation::ResolvedCheckpointPlan,
     max_cached_shards: usize,
 ) -> Result<SharedCheckpointSource, Error> {
+    #[cfg(test)]
+    super::path_instrumentation::payload_open();
     let store = open_catalog_bound_store(path, catalog, max_cached_shards)?;
     let resolution = eredu_checkpoint::validation::resolve_safetensors_plan(store.as_ref(), plan)
         .map_err(|failure| {

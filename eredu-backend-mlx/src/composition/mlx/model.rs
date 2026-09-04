@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use eredu_core::cache::{PromptCacheDescriptor, PromptCacheManifest, PromptCacheOptions};
-use eredu_core::SpeculativeCapability;
+use eredu_core::{SpeculativeCapability, SpeculativeDraftSource};
 use safemlx::{error::Exception, Stream};
 
 use crate::backend::error::Error;
@@ -30,6 +30,35 @@ const REPLICATED_TEXT_KINDS: &[ModelKind] = &[
     ModelKind::DeepSeekV3,
     ModelKind::DeepSeekV4,
 ];
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum SpeculativeDraftRealization {
+    #[cfg(test)]
+    Installed,
+    TargetDeclaration,
+    Unsupported,
+}
+
+fn speculative_capability_report(
+    draft_source: Option<SpeculativeDraftSource>,
+    realization: SpeculativeDraftRealization,
+    architecture: &str,
+) -> SpeculativeCapability {
+    let Some(draft_source) = draft_source else {
+        return SpeculativeCapability::Unavailable;
+    };
+    match realization {
+        #[cfg(test)]
+        SpeculativeDraftRealization::Installed => SpeculativeCapability::Ready { draft_source },
+        SpeculativeDraftRealization::TargetDeclaration => {
+            SpeculativeCapability::Declared { draft_source }
+        }
+        SpeculativeDraftRealization::Unsupported => SpeculativeCapability::Unsupported {
+            draft_source,
+            architecture: architecture.to_owned(),
+        },
+    }
+}
 
 /// Admitted architecture identity checked against the concrete model variant.
 #[derive(Clone, Copy)]
@@ -140,6 +169,23 @@ pub(crate) enum Executable {
 }
 
 impl Executable {
+    /// Installs observers on an already selected architecture-owned embedded executor.
+    pub(crate) fn install_embedded_prediction_observers(
+        &mut self,
+        observers: eredu_architectures::speculative_execution::EmbeddedPredictionObservers<
+            crate::MlxTensor,
+            safemlx::Array,
+            Exception,
+        >,
+    ) -> bool {
+        match self {
+            Self::ReplicatedText(_, model) => {
+                model.install_embedded_prediction_observers(observers)
+            }
+            _ => false,
+        }
+    }
+
     /// Whether this executable carries the neutral partition control lifecycle.
     pub(crate) fn has_neutral_partitioned_control(&self) -> bool {
         matches!(self, Self::ReplicatedText(_, model) if model.has_partition_control())
@@ -352,12 +398,22 @@ impl Executable {
 
     /// Reports how this model architecture exposes speculative drafting weights.
     pub fn speculative_capability(&self) -> SpeculativeCapability {
-        self.architecture_capability_estimate()
+        if matches!(self, Self::ReplicatedText(_, target) if target.has_embedded_prediction()) {
+            return SpeculativeCapability::Ready {
+                draft_source: SpeculativeDraftSource::Embedded,
+            };
+        }
+        let draft_source = self
+            .architecture_capability_estimate()
             .ok()
-            .and_then(|estimate| estimate.speculative_draft_source())
-            .map_or(SpeculativeCapability::Unavailable, |draft_source| {
-                SpeculativeCapability::Ready { draft_source }
-            })
+            .and_then(|estimate| estimate.speculative_draft_source());
+        let realization = match (self, draft_source) {
+            (Self::ReplicatedText(_, _), Some(SpeculativeDraftSource::Separate)) => {
+                SpeculativeDraftRealization::TargetDeclaration
+            }
+            _ => SpeculativeDraftRealization::Unsupported,
+        };
+        speculative_capability_report(draft_source, realization, self.effective_model_type())
     }
 
     /// Returns residency telemetry when this model uses bounded layer execution.
@@ -738,6 +794,51 @@ mod tests {
             assert!(AdmittedModelKind::new(kind, REPLICATED_TEXT_KINDS).is_ok());
         }
         assert!(AdmittedModelKind::new(ModelKind::Moshi, REPLICATED_TEXT_KINDS).is_err());
+    }
+
+    #[test]
+    fn external_target_declaration_does_not_claim_ready_execution() {
+        let capability = speculative_capability_report(
+            Some(SpeculativeDraftSource::Separate),
+            SpeculativeDraftRealization::TargetDeclaration,
+            "gemma4",
+        );
+
+        assert_eq!(
+            capability,
+            SpeculativeCapability::Declared {
+                draft_source: SpeculativeDraftSource::Separate,
+            }
+        );
+        assert!(capability.admits_source(SpeculativeDraftSource::Separate));
+        assert!(!capability.is_ready_for(SpeculativeDraftSource::Separate));
+    }
+
+    #[test]
+    fn installed_embedded_realization_is_ready_and_unsupported_is_fail_closed() {
+        let installed = speculative_capability_report(
+            Some(SpeculativeDraftSource::Embedded),
+            SpeculativeDraftRealization::Installed,
+            "qwen3_next",
+        );
+        let unsupported = speculative_capability_report(
+            Some(SpeculativeDraftSource::Embedded),
+            SpeculativeDraftRealization::Unsupported,
+            "legacy_path",
+        );
+        let absent =
+            speculative_capability_report(None, SpeculativeDraftRealization::Installed, "ordinary");
+
+        assert!(installed.is_ready_for(SpeculativeDraftSource::Embedded));
+        assert_eq!(
+            unsupported,
+            SpeculativeCapability::Unsupported {
+                draft_source: SpeculativeDraftSource::Embedded,
+                architecture: "legacy_path".into(),
+            }
+        );
+        assert!(!unsupported.admits_source(SpeculativeDraftSource::Embedded));
+        assert_eq!(absent, SpeculativeCapability::Unavailable);
     }
 
     #[test]

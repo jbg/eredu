@@ -13,7 +13,7 @@ use eredu_runtime::{
 };
 
 use crate::partitioned_execution::{
-    derive_partitioned_local_layout, visit_composite_partitioned_architecture,
+    derive_partitioned_local_layout, prepare_partitioned, visit_composite_partitioned_architecture,
     CompositePartitionedArchitectureVisitor, PartitionedDispatchError,
     PreparedPartitionedAdmission, SelectedPartitionedAdmission,
 };
@@ -1102,6 +1102,38 @@ where
         W: eredu_runtime::ArchitectureBoundary;
 }
 
+/// Backend-generic consumer for an exact composite partition and its paired prediction extension.
+pub trait AuthoritativeCompositePartitionPredictionTargetVisitor<B, S, M>: Sized
+where
+    B: eredu_nn::BlockwiseAttentionBackend
+        + eredu_nn::DistributedNeuralBackend
+        + eredu_nn::GroupedNeuralBackend
+        + eredu_nn::HyperNeuralBackend,
+    S: eredu_runtime::RuntimeState<B>,
+    M: crate::prediction_extension::PredictionExtensionMaterializer<B>,
+{
+    /// Completed neutral construction output.
+    type Output;
+    /// Mechanism-binding failure.
+    type Error;
+
+    /// Receives the exact target only after architecture-owned extension pairing.
+    fn visit<A, G, W>(
+        self,
+        prepared: PreparedCompositePartition<A, G, W>,
+        extension: <crate::composite_execution::PreparedCompositeArchitecture<A> as crate::prediction_extension::MaterializedPredictionTarget<B>>::Extension<M>,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        A: crate::composite_execution::CompositeArchitecture<B, S, Error = eredu_nn::Error>
+            + PartitionedLayeredArchitecture<B, S, Boundary = W>
+            + eredu_runtime::ParallelRoutedLayeredArchitecture<B, S>
+            + 'static,
+        A::Error: std::fmt::Display,
+        crate::composite_execution::PreparedCompositeArchitecture<A>:
+            crate::prediction_extension::MaterializedPredictionTarget<B>,
+        W: eredu_runtime::ArchitectureBoundary;
+}
+
 struct EnrichedVisitor<V> {
     visitor: V,
     layout: LocalModelLayout,
@@ -2082,6 +2114,433 @@ where
                 },
                 routed_execution
             )
+        }
+    }
+}
+
+/// Constructs an admitted Inkling or conditional-Qwen partition and pairs its prediction
+/// extension before the concrete target type can be erased by a backend adapter.
+pub fn visit_authoritative_composite_prediction_target_partition<B, S, M, V>(
+    selected: SelectedPartitionedAdmission<
+        SelectedCompositeTextRealization,
+        CompositeTextRequirements,
+    >,
+    extension: crate::prediction_extension::MaterializedPredictionExtension<B, M>,
+    context: &<B::Tensor as Tensor>::Context,
+    visitor: V,
+) -> Result<V::Output, CompositePartitionPreparationError<V::Error>>
+where
+    B: eredu_nn::TensorParallelGroupedNeuralBackend
+        + eredu_nn::DistributedNeuralBackend
+        + eredu_nn::BlockwiseAttentionBackend
+        + eredu_nn::HyperNeuralBackend,
+    S: eredu_runtime::LayerRuntimeState<B>,
+    S::LayerState: AttentionCache<B::Tensor>
+        + RuntimeStateComponents<B>
+        + AuxiliaryConvolutionState<B::Tensor>,
+    M: crate::prediction_extension::PredictionExtensionMaterializer<B>,
+    V: AuthoritativeCompositePartitionPredictionTargetVisitor<B, S, M>,
+{
+    let routed = matches!(
+        selected.base(),
+        SelectedCompositeTextRealization::Routed { .. }
+    );
+    if routed
+        != selected
+            .requirements()
+            .execution()
+            .routed_execution()
+            .is_some()
+    {
+        return Err(CompositePartitionPreparationError::Architecture(
+            "selected composite decoder strategy differs from its requirements".into(),
+        ));
+    }
+    let target_formats = selected_formats(selected.base().execution());
+    let target_linear_formats = selected_linear_formats(
+        selected.requirements().execution().execution(),
+        selected.base().execution(),
+    );
+    let config = composite_config(
+        selected
+            .requirements()
+            .execution()
+            .inspection()
+            .architecture_plan(),
+    )
+    .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?
+    .ok_or_else(|| {
+        CompositePartitionPreparationError::Architecture(
+            "selected artifact is not a supported composite architecture".into(),
+        )
+    })?;
+
+    macro_rules! finish_prediction_target {
+        ($target:ty, $architecture:expr, $parameters:expr, $layout:expr, $geometry:expr,
+         $capability:expr, $effective:expr, $output_width:expr, $foundation:expr,
+         $routed:expr) => {{
+            let architecture = $architecture;
+            let boundary =
+                <_ as PartitionedLayeredArchitecture<B, S>>::boundary_schema(&architecture)
+                    .map_err(|error| {
+                        CompositePartitionPreparationError::Architecture(error.to_string())
+                    })?;
+            let partition = ArchitecturePartition::from_architecture::<B, S, _, _>(
+                &architecture,
+                selected
+                    .requirements()
+                    .groups()
+                    .iter()
+                    .map(|group| (group.group().as_str(), group.units())),
+                selected.requirements().ownership().clone(),
+                $geometry.clone(),
+                boundary,
+                &$parameters,
+            )
+            .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
+            let selected = selected
+                .with_family_local_state(partition.state().cloned())
+                .map_err(CompositePartitionPreparationError::Architecture)?;
+            $foundation(&partition).map_err(|error| {
+                CompositePartitionPreparationError::Architecture(error.to_string())
+            })?;
+            let tasks = eredu_runtime::partitioned_replicated_text_materialization_tasks(
+                selected.base().execution(),
+                &$parameters,
+                &partition,
+            )
+            .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
+            let publication =
+                crate::partitioned_execution::PublicationValueDescriptor::new($output_width)
+                    .map_err(|error| {
+                        CompositePartitionPreparationError::Architecture(error.to_string())
+                    })?;
+            let extension = <crate::composite_execution::PreparedCompositeArchitecture<$target> as crate::prediction_extension::MaterializedPredictionTarget<B>>::pair_prediction_extension(extension)
+                .map_err(|error| {
+                    CompositePartitionPreparationError::Architecture(error.to_string())
+                })?;
+            let prepared =
+                prepare_partitioned::<B, S, _, _, _, _, _>(architecture, selected, partition)
+                    .map_err(CompositePartitionPreparationError::Architecture)?;
+            visitor
+                .visit(
+                    PreparedCompositePartition {
+                        prepared,
+                        layout: $layout,
+                        tasks,
+                        capability_estimate: $capability,
+                        effective_model_type: $effective,
+                        publication,
+                        routed: $routed,
+                    },
+                    extension,
+                )
+                .map_err(CompositePartitionPreparationError::Visitor)
+        }};
+    }
+
+    match config {
+        CompositeConfig::QwenHybrid(source) => {
+            let args = qwen_hybrid_composite_with_formats(source, target_linear_formats)
+                .map_err(CompositePartitionPreparationError::Architecture)?;
+            if args.text.mtp_num_hidden_layers > 0 {
+                return Err(CompositePartitionPreparationError::Architecture(
+                    "partitioned conditional Qwen target still contains prediction units".into(),
+                ));
+            }
+            if routed != args.text.is_moe() {
+                return Err(CompositePartitionPreparationError::Architecture(
+                    "conditional Qwen selected decoder strategy differs from its normalized configuration"
+                        .into(),
+                ));
+            }
+            let description =
+                crate::qwen::hybrid::ConditionalLayeredModel::<B>::new(args.clone(), context)
+                    .map_err(|error| {
+                        CompositePartitionPreparationError::Architecture(error.to_string())
+                    })?;
+            let parameters = ArchitectureParameters::parameter_description(&description, context)
+                .map_err(|error| {
+                CompositePartitionPreparationError::Architecture(error.to_string())
+            })?;
+            let layout =
+                derive_partitioned_local_layout(&parameters, selected.requirements().topology())
+                    .map_err(CompositePartitionPreparationError::Architecture)?;
+            let local = crate::qwen::hybrid::conditional_local_geometry(&args, &layout).map_err(
+                |error| CompositePartitionPreparationError::Architecture(error.to_string()),
+            )?;
+            let group_ranges = selected
+                .requirements()
+                .groups()
+                .iter()
+                .map(|group| (group.group().as_str().to_owned(), group.units()))
+                .collect::<Vec<_>>();
+            let ownership = selected.requirements().ownership().clone();
+            let rank = selected.requirements().topology();
+            let architecture = crate::qwen::hybrid::ConditionalLayeredModel::<B>::new_parallel(
+                args.clone(),
+                local,
+                context,
+            )
+            .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
+            let realization = if routed {
+                Some(
+                    crate::qwen::hybrid::conditional_expert_realization_plan(&architecture, rank)
+                        .map_err(|error| {
+                            CompositePartitionPreparationError::Architecture(error.to_string())
+                        })?
+                        .ok_or_else(|| {
+                            CompositePartitionPreparationError::Architecture(
+                                "routed conditional Qwen has no expert realization".into(),
+                            )
+                        })?,
+                )
+            } else {
+                None
+            };
+            let geometry = match &realization {
+                Some(_) => crate::qwen::hybrid::routed_conditional_partition_local_geometry(
+                    &args,
+                    &layout,
+                    group_ranges
+                        .iter()
+                        .map(|(group, units)| (group.as_str(), units.clone())),
+                    &ownership,
+                ),
+                None => crate::qwen::hybrid::conditional_partition_local_geometry(
+                    &args,
+                    &layout,
+                    group_ranges
+                        .iter()
+                        .map(|(group, units)| (group.as_str(), units.clone())),
+                    &ownership,
+                ),
+            }
+            .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
+            let architecture = geometry
+                .local_state_layout()
+                .map_err(|error| {
+                    CompositePartitionPreparationError::Architecture(error.to_string())
+                })
+                .and_then(|state| {
+                    architecture
+                        .with_partition_state_layout(geometry.target_units().start, state)
+                        .map_err(|error| {
+                            CompositePartitionPreparationError::Architecture(error.to_string())
+                        })
+                })?;
+            let routed_execution = realization
+                .clone()
+                .map(|plan| {
+                    let owner_units = plan
+                        .unit_specs()
+                        .keys()
+                        .map(|(_, unit)| (*unit, *unit))
+                        .collect();
+                    prepared_gated_composite_execution::<B, S, _>(
+                        &selected,
+                        &architecture,
+                        plan,
+                        owner_units,
+                        usize::try_from(args.text.num_hidden_layers)
+                            .map_err(|_| "conditional Qwen layer count exceeds usize".to_owned())?,
+                        usize::try_from(args.text.hidden_size).map_err(|_| {
+                            "conditional Qwen hidden width exceeds usize".to_owned()
+                        })?,
+                    )
+                })
+                .transpose()
+                .map_err(CompositePartitionPreparationError::Architecture)?;
+            let capability = crate::capability::qwen_hybrid(&args).map_err(|error| {
+                CompositePartitionPreparationError::Architecture(error.to_string())
+            })?;
+            let effective = args.text.model_type.clone();
+            finish_prediction_target!(
+                crate::qwen::hybrid::ConditionalLayeredModel<B>,
+                architecture,
+                parameters,
+                layout,
+                geometry,
+                capability,
+                effective,
+                args.text.vocab_size,
+                |partition| {
+                    match &realization {
+                        Some(realization) => routed_conditional_qwen_partition_foundation(
+                            &args,
+                            &layout,
+                            group_ranges
+                                .iter()
+                                .map(|(group, units)| (group.as_str(), units.clone())),
+                            &ownership,
+                            rank,
+                            realization,
+                        )
+                        .map(|_| ()),
+                        None => crate::qwen::hybrid::ConditionalPartitionLocalFoundation::from_partition(
+                            &args, partition,
+                        )
+                        .map(|_| ())
+                        .map_err(|error| error.to_string()),
+                    }
+                },
+                routed_execution
+            )
+        }
+        CompositeConfig::Inkling(source) => {
+            let args = crate::inkling::with_checkpoint_formats(source, target_formats)
+                .map_err(CompositePartitionPreparationError::Architecture)?;
+            if args
+                .mtp_config
+                .as_ref()
+                .is_some_and(|prediction| prediction.num_nextn_predict_layers > 0)
+            {
+                return Err(CompositePartitionPreparationError::Architecture(
+                    "partitioned Inkling target still contains prediction units".into(),
+                ));
+            }
+            if routed != args.text_config.has_sparse_moe_layers() {
+                return Err(CompositePartitionPreparationError::Architecture(
+                    "Inkling selected decoder strategy differs from its normalized configuration"
+                        .into(),
+                ));
+            }
+            let description = crate::inkling::LayeredModel::<B>::new(args.clone(), context)
+                .map_err(|error| {
+                    CompositePartitionPreparationError::Architecture(error.to_string())
+                })?;
+            let parameters = ArchitectureParameters::parameter_description(&description, context)
+                .map_err(|error| {
+                CompositePartitionPreparationError::Architecture(error.to_string())
+            })?;
+            let layout =
+                derive_partitioned_local_layout(&parameters, selected.requirements().topology())
+                    .map_err(CompositePartitionPreparationError::Architecture)?;
+            let local = crate::inkling::local_geometry(&args, &layout).map_err(|error| {
+                CompositePartitionPreparationError::Architecture(error.to_string())
+            })?;
+            let group_ranges = selected
+                .requirements()
+                .groups()
+                .iter()
+                .map(|group| (group.group().as_str().to_owned(), group.units()))
+                .collect::<Vec<_>>();
+            let ownership = selected.requirements().ownership().clone();
+            let rank = selected.requirements().topology();
+            let geometry = if routed {
+                crate::inkling::parallel::routed_partition_local_geometry(
+                    &args,
+                    &layout,
+                    group_ranges
+                        .iter()
+                        .map(|(group, units)| (group.as_str(), units.clone())),
+                    &ownership,
+                )
+            } else {
+                crate::inkling::partition_local_geometry(
+                    &args,
+                    &layout,
+                    group_ranges
+                        .iter()
+                        .map(|(group, units)| (group.as_str(), units.clone())),
+                    &ownership,
+                )
+            }
+            .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
+            let mut architecture = crate::inkling::LayeredModel::<B>::new_parallel(
+                args.clone(),
+                std::sync::Arc::new(local),
+                context,
+            )
+            .and_then(|architecture| {
+                architecture.with_partition_state_offset(geometry.text_units().start)
+            })
+            .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
+            let realization = if routed {
+                let realization = crate::inkling::expert_realization_plan(&architecture, rank)
+                    .map_err(|error| {
+                        CompositePartitionPreparationError::Architecture(error.to_string())
+                    })?
+                    .ok_or_else(|| {
+                        CompositePartitionPreparationError::Architecture(
+                            "routed Inkling has no expert realization".into(),
+                        )
+                    })?;
+                architecture = architecture
+                    .with_expert_realization(realization.clone())
+                    .map_err(|error| {
+                        CompositePartitionPreparationError::Architecture(error.to_string())
+                    })?;
+                Some(realization)
+            } else {
+                None
+            };
+            let routed_execution = realization
+                .as_ref()
+                .map(|realization| {
+                    let layers = usize::try_from(args.text_config.num_hidden_layers)
+                        .map_err(|_| "Inkling layer count exceeds usize".to_owned())?;
+                    inkling_gated_execution_plan(&args, rank, realization).and_then(|plan| {
+                        let owner_units = plan
+                            .unit_specs()
+                            .keys()
+                            .map(|(_, unit)| (*unit, *unit % layers))
+                            .collect();
+                        prepared_gated_composite_execution::<B, S, _>(
+                            &selected,
+                            &architecture,
+                            plan,
+                            owner_units,
+                            layers,
+                            usize::try_from(args.text_config.hidden_size)
+                                .map_err(|_| "Inkling hidden width exceeds usize".to_owned())?,
+                        )
+                    })
+                })
+                .transpose()
+                .map_err(CompositePartitionPreparationError::Architecture)?;
+            let capability = crate::capability::inkling(&args).map_err(|error| {
+                CompositePartitionPreparationError::Architecture(error.to_string())
+            })?;
+            let effective = args.model_type.clone();
+            finish_prediction_target!(
+                crate::inkling::LayeredModel<B>,
+                architecture,
+                parameters,
+                layout,
+                geometry,
+                capability,
+                effective,
+                args.text_config
+                    .unpadded_vocab_size
+                    .unwrap_or(args.text_config.vocab_size),
+                |partition| {
+                    match &realization {
+                        Some(realization) => routed_inkling_partition_foundation(
+                            &args,
+                            &layout,
+                            group_ranges
+                                .iter()
+                                .map(|(group, units)| (group.as_str(), units.clone())),
+                            &ownership,
+                            rank,
+                            realization,
+                        )
+                        .map(|_| ()),
+                        None => crate::inkling::PartitionLocalFoundation::from_partition(
+                            &args, partition,
+                        )
+                        .map(|_| ())
+                        .map_err(|error| error.to_string()),
+                    }
+                },
+                routed_execution
+            )
+        }
+        CompositeConfig::Gemma4(_) | CompositeConfig::Muse(_) | CompositeConfig::QwenVl(_) => {
+            Err(CompositePartitionPreparationError::Architecture(
+                "composite partition does not admit an embedded prediction extension".into(),
+            ))
         }
     }
 }

@@ -1,7 +1,5 @@
 //! MLX execution primitives for speculative model sessions.
 
-/// MLX executor for checkpoint-embedded prediction heads.
-pub mod embedded;
 /// External assistant adapters over neutral family equations and state.
 pub mod external;
 /// MLX semantic-generation resource adapter over the portable runtime driver.
@@ -10,10 +8,13 @@ pub mod scheduler;
 pub use scheduler::SpeculativeComponentTimingGuard;
 
 use eredu_core::{
-    Completion, ProposalDecision, SamplingPlacement, SpeculativeExecutionTopology,
-    SpeculativeRandomness, SpeculativeSampling, TokenizerCompatibilityProof,
+    Completion, SamplingPlacement, SpeculativeDraftRandomPosition, SpeculativeExecutionTopology,
+    SpeculativeSampling, TokenizerCompatibilityProof,
 };
-use eredu_runtime::SpeculativeSampler;
+use eredu_runtime::{
+    SelectedSpeculativeRealization, SpeculativeMechanism, SpeculativeMechanismCapabilities,
+    SpeculativeSampler,
+};
 use safemlx::{
     error::Exception,
     ops::{indexing::TryIndexOp, maximum, softmax_axis},
@@ -24,165 +25,265 @@ use safemlx::{
 
 use crate::{
     backend::error::Error,
+    backend::nn::shared::{MlxModule, MlxNeuralBackend},
     backend::random::RandomState,
     backend::runtime::generation::MlxSamplingBackend,
-    composition::gemma4::{load_assistant_gguf, load_assistant_safetensors, Gemma4AssistantModel},
-    composition::muse_glimmer::{
-        load_dflash_gguf, load_dflash_safetensors, MuseGlimmerDFlashModel,
-    },
     MlxLoadRequest, MlxTensor,
 };
 
+/// Reports only generic mechanisms available to neutral speculative selection.
+///
+/// Architecture identity, proposal mode, capture paths, and assistant family
+/// never enter this report.
+pub(crate) fn speculative_mechanism_capabilities() -> SpeculativeMechanismCapabilities {
+    SpeculativeMechanismCapabilities::new([
+        SpeculativeMechanism::TensorOperations,
+        SpeculativeMechanism::NeuralOperations,
+        SpeculativeMechanism::GroupedNeuralOperations,
+        SpeculativeMechanism::HyperNeuralOperations,
+        SpeculativeMechanism::PayloadMaterialization,
+        SpeculativeMechanism::LogitsProcessing,
+        SpeculativeMechanism::Sampling,
+        SpeculativeMechanism::Randomness,
+        SpeculativeMechanism::StateStorage,
+        SpeculativeMechanism::StorageResidency,
+        SpeculativeMechanism::ExactCompletion,
+        SpeculativeMechanism::Observation,
+        SpeculativeMechanism::Timing,
+        SpeculativeMechanism::QueueBinding,
+        SpeculativeMechanism::Communication,
+        SpeculativeMechanism::Agreement,
+        SpeculativeMechanism::Publication,
+        SpeculativeMechanism::SameDeviceHandoff,
+        SpeculativeMechanism::CrossDeviceTransfer,
+    ])
+}
+
+pub(crate) struct MlxExternalAssistant<A: eredu_architectures::ExternalAssistantArchitecture> {
+    pub(crate) config: A::Config,
+    pub(crate) module: MlxModule<A::Module<MlxNeuralBackend>>,
+    pub(crate) observers: eredu_architectures::external_assistant::ExternalAssistantObservers<
+        MlxTensor,
+        Array,
+        Exception,
+    >,
+}
+
+pub(crate) struct MlxAssistantPreparationVisitor {
+    options: MlxLoadRequest,
+    stream: Stream,
+    weights_stream: Stream,
+}
+
+impl eredu_architectures::ExternalAssistantPreparationVisitor for MlxAssistantPreparationVisitor {
+    type Output<A: eredu_architectures::ExternalAssistantArchitecture> = MlxExternalAssistant<A>;
+    type Error = Error;
+
+    fn visit<A: eredu_architectures::ExternalAssistantArchitecture>(
+        self,
+        prepared: eredu_architectures::PreparedExternalAssistant<A>,
+    ) -> Result<Self::Output<A>, Self::Error> {
+        materialize_external_assistant::<A>(
+            prepared,
+            self.options,
+            &self.stream,
+            &self.weights_stream,
+        )
+    }
+}
+
+fn materialize_external_assistant<A: eredu_architectures::ExternalAssistantArchitecture>(
+    prepared: eredu_architectures::PreparedExternalAssistant<A>,
+    options: MlxLoadRequest,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<MlxExternalAssistant<A>, Error> {
+    use crate::backend::runtime::{
+        checkpoint::{
+            binding::{
+                build_module_bindings, materialize_module_bindings,
+                populate_module_from_arrays_excluding,
+            },
+            load::{gguf_metadata, gguf_quantization_configs},
+            quantization::should_quantize_on_load,
+        },
+        execution::layerwise::quantize_parameterized_module_store,
+    };
+    use std::sync::Arc;
+
+    let quantization = options.weight_quantization()?;
+    if !options.weight_residency.is_fully_resident() {
+        return Err(Error::ArchitectureModel(
+            "external assistants require fully resident weights".into(),
+        ));
+    }
+    if options
+        .parallel_topology()
+        .is_some_and(|topology| !topology.is_replicated())
+    {
+        return Err(Error::Parallel(
+            "external assistants require replicated placement".into(),
+        ));
+    }
+    let (checkpoint, source_config) = prepared.into_parts();
+    let (store, source_config) = match checkpoint {
+        eredu_architectures::ExternalAssistantCheckpoint::SafeTensors {
+            source,
+            catalog,
+            plan,
+            resolution,
+        } => {
+            let store = crate::composition::mlx::artifact::open_prepared_safetensors_checkpoint(
+                &source,
+                catalog,
+                &plan,
+                &resolution,
+                options.weight_residency.max_cached_shards(),
+            )?;
+            (store, source_config)
+        }
+        eredu_architectures::ExternalAssistantCheckpoint::Gguf {
+            checkpoint,
+            resolution,
+            tensor_mapping,
+        } => {
+            let mlx_checkpoint =
+                crate::backend::runtime::checkpoint::gguf::GgufCheckpoint::from_portable(
+                    checkpoint.clone(),
+                );
+            let metadata = gguf_metadata(&mlx_checkpoint);
+            let formats = gguf_quantization_configs(&mlx_checkpoint, &tensor_mapping)?;
+            let source_config = A::with_checkpoint_formats(&source_config, formats)
+                .map_err(Error::ArchitectureModel)?;
+            crate::composition::mlx::validate_gguf_quantization_source(
+                &mlx_checkpoint,
+                &metadata,
+                quantization,
+            )?;
+            let store: eredu_checkpoint::store::SharedCheckpointSource = Arc::new(
+                eredu_checkpoint::gguf_store::GgufWeightStore::builder()
+                    .max_cached_readers(options.weight_residency.max_cached_shards())?
+                    .add_resolved_checkpoint(checkpoint, &resolution, &tensor_mapping)?
+                    .build()?,
+            );
+            (store, source_config)
+        }
+    };
+    let requested = quantization
+        .map(|requested| {
+            should_quantize_on_load(
+                A::configuration_model_type(&source_config),
+                A::quantization(&source_config),
+                requested,
+            )
+            .map(|required| required.then_some(requested))
+        })
+        .transpose()?
+        .flatten();
+    let config = requested
+        .map(|requested| {
+            A::load_time_quantization(&source_config, requested).map_err(Error::ArchitectureModel)
+        })
+        .transpose()?
+        .unwrap_or_else(|| source_config.clone());
+    let store = if let Some(requested) = requested {
+        let source = A::module::<MlxNeuralBackend>(source_config, stream)
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        let target = A::module::<MlxNeuralBackend>(config.clone(), stream)
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        quantize_parameterized_module_store(store, &source, &target, requested, stream)?.0
+    } else {
+        store
+    };
+    let mut module = MlxModule::new(
+        A::module::<MlxNeuralBackend>(config.clone(), stream)
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?,
+    );
+    let bindings = build_module_bindings(&module, "", store.as_ref())?;
+    let arrays = materialize_module_bindings(store.as_ref(), &bindings, weights_stream, stream)?;
+    populate_module_from_arrays_excluding(&mut module, &arrays, |_| false)?;
+    Ok(MlxExternalAssistant {
+        config,
+        module,
+        observers: Default::default(),
+    })
+}
+
 /// Architecture-dispatched MLX draft model with its fixed execution placement.
 pub struct MlxDrafter {
-    model: MlxDrafterModel,
+    assistant: eredu_architectures::MaterializedExternalAssistant<MlxAssistantPreparationVisitor>,
     tokenizer_compatibility: TokenizerCompatibilityProof,
     stream: Stream,
-}
-
-enum MlxDrafterModel {
-    Gemma4(Box<Gemma4AssistantModel>),
-    MuseGlimmerDFlash(Box<MuseGlimmerDFlashModel>),
-}
-
-/// Stable architecture identity for an independently loaded MLX draft model.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub(crate) enum MlxDrafterKind {
-    /// Gemma 4 external assistant.
-    Gemma4Assistant,
-    /// Muse-Glimmer anchor-plus-15-mask DFlash assistant.
-    MuseGlimmerDFlash,
+    selected: SelectedSpeculativeRealization,
+    capture: eredu_architectures::composite_execution::ExternalPredictionCaptureRequest,
 }
 
 impl MlxDrafter {
+    /// Installs typed production observers for external-assistant tensors and logits.
+    pub fn install_external_observers<TensorObserver, LogitsObserver>(
+        &mut self,
+        tensors: TensorObserver,
+        logits: LogitsObserver,
+    ) where
+        TensorObserver: eredu_runtime::ActivationObserver<MlxTensor, Exception> + 'static,
+        LogitsObserver: eredu_runtime::ActivationObserver<Array, Exception> + 'static,
+    {
+        self.assistant.visit(InstallExternalObservers {
+            observers: Some(
+                eredu_architectures::external_assistant::ExternalAssistantObservers::new(
+                    tensors, logits,
+                ),
+            ),
+        });
+    }
+
     /// Materializes an architecture-inspected drafter with proven tokenizer compatibility.
     pub(crate) fn materialize_with_compatibility(
-        preparation: eredu_architectures::ExternalAssistantPreparationPlan,
+        preparation: eredu_architectures::CompatibleExternalAssistantPreparation,
         tokenizer_compatibility: TokenizerCompatibilityProof,
         options: MlxLoadRequest,
         stream: &Stream,
         weights_stream: &Stream,
+        selected: SelectedSpeculativeRealization,
     ) -> Result<Self, Error> {
-        use eredu_architectures::{ExternalAssistantCheckpoint, ExternalAssistantPreparationPlan};
-        let model = match preparation {
-            ExternalAssistantPreparationPlan::Gemma4(plan) => {
-                let (checkpoint, config) = plan.into_parts();
-                let model = match checkpoint {
-                    ExternalAssistantCheckpoint::SafeTensors {
-                        source,
-                        catalog,
-                        plan,
-                        resolution,
-                    } => {
-                        let store = crate::composition::mlx::artifact::open_prepared_safetensors_checkpoint(
-                            &source,
-                            catalog,
-                            &plan,
-                            &resolution,
-                            options.weight_residency.max_cached_shards(),
-                        )?;
-                        load_assistant_safetensors(store, config, options, stream, weights_stream)?
-                    }
-                    ExternalAssistantCheckpoint::Gguf {
-                        checkpoint,
-                        resolution,
-                        tensor_mapping,
-                    } => load_assistant_gguf(
-                        checkpoint,
-                        resolution,
-                        tensor_mapping,
-                        config,
-                        options,
-                        stream,
-                        weights_stream,
-                    )?,
-                };
-                MlxDrafterModel::Gemma4(Box::new(model))
-            }
-            ExternalAssistantPreparationPlan::MuseGlimmer(plan) => {
-                let (checkpoint, config) = plan.into_parts();
-                let model = match checkpoint {
-                    ExternalAssistantCheckpoint::SafeTensors {
-                        source,
-                        catalog,
-                        plan,
-                        resolution,
-                    } => {
-                        let store = crate::composition::mlx::artifact::open_prepared_safetensors_checkpoint(
-                            &source,
-                            catalog,
-                            &plan,
-                            &resolution,
-                            options.weight_residency.max_cached_shards(),
-                        )?;
-                        load_dflash_safetensors(store, config, options, stream, weights_stream)?
-                    }
-                    ExternalAssistantCheckpoint::Gguf {
-                        checkpoint,
-                        resolution,
-                        tensor_mapping,
-                    } => load_dflash_gguf(
-                        checkpoint,
-                        resolution,
-                        tensor_mapping,
-                        config,
-                        options,
-                        stream,
-                        weights_stream,
-                    )?,
-                };
-                MlxDrafterModel::MuseGlimmerDFlash(Box::new(model))
-            }
-        };
+        if !matches!(
+            selected.requirements().strategy().class(),
+            eredu_runtime::SpeculativeStrategyClass::External
+        ) || selected.requirements().strategy().tokenizer_fingerprint()
+            != Some(tokenizer_compatibility.fingerprint())
+        {
+            return Err(Error::ArchitectureModel(
+                "external assistant materialization received a different neutral realization"
+                    .into(),
+            ));
+        }
+        let capture = preparation.capture().clone();
+        let assistant = preparation.visit(MlxAssistantPreparationVisitor {
+            options,
+            stream: stream.clone(),
+            weights_stream: weights_stream.clone(),
+        })?;
         Ok(Self {
-            model,
+            assistant,
             tokenizer_compatibility,
             stream: stream.clone(),
+            selected,
+            capture,
         })
     }
 
-    /// Architecture fixed by the inspected preparation plan.
-    pub(crate) const fn kind(&self) -> MlxDrafterKind {
-        match self.model {
-            MlxDrafterModel::Gemma4(_) => MlxDrafterKind::Gemma4Assistant,
-            MlxDrafterModel::MuseGlimmerDFlash(_) => MlxDrafterKind::MuseGlimmerDFlash,
-        }
-    }
-
-    pub(crate) fn gemma4(&self) -> &Gemma4AssistantModel {
-        match &self.model {
-            MlxDrafterModel::Gemma4(model) => model,
-            MlxDrafterModel::MuseGlimmerDFlash(_) => {
-                panic!("requested Gemma 4 assistant from Muse-Glimmer DFlash drafter")
-            }
-        }
-    }
-
-    pub(crate) fn gemma4_mut(&mut self) -> &mut Gemma4AssistantModel {
-        match &mut self.model {
-            MlxDrafterModel::Gemma4(model) => model,
-            MlxDrafterModel::MuseGlimmerDFlash(_) => {
-                panic!("requested Gemma 4 assistant from Muse-Glimmer DFlash drafter")
-            }
-        }
-    }
-
-    pub(crate) fn muse_glimmer(&self) -> &MuseGlimmerDFlashModel {
-        match &self.model {
-            MlxDrafterModel::MuseGlimmerDFlash(model) => model,
-            MlxDrafterModel::Gemma4(_) => {
-                panic!("requested Muse-Glimmer DFlash from Gemma 4 assistant")
-            }
-        }
-    }
-
-    pub(crate) fn muse_glimmer_mut(&mut self) -> &mut MuseGlimmerDFlashModel {
-        match &mut self.model {
-            MlxDrafterModel::MuseGlimmerDFlash(model) => model,
-            MlxDrafterModel::Gemma4(_) => {
-                panic!("requested Muse-Glimmer DFlash from Gemma 4 assistant")
-            }
-        }
+    pub(crate) fn visit<W>(
+        &mut self,
+        visitor: W,
+    ) -> <W as eredu_architectures::MaterializedExternalAssistantVisitor<
+        MlxAssistantPreparationVisitor,
+    >>::Output
+    where
+        W: eredu_architectures::MaterializedExternalAssistantVisitor<
+            MlxAssistantPreparationVisitor,
+        >,
+    {
+        self.assistant.visit(visitor)
     }
 
     /// Returns the portable proof established before this assistant was materialized.
@@ -193,6 +294,48 @@ impl MlxDrafter {
     /// Execution stream selected when this drafter was loaded.
     pub const fn stream(&self) -> &Stream {
         &self.stream
+    }
+
+    /// Returns topology selected by the portable execution plan before queue construction.
+    pub const fn topology(&self) -> SpeculativeExecutionTopology {
+        self.selected.placement().topology()
+    }
+
+    /// Returns the one neutral realization retained from preconstruction selection.
+    pub const fn selected(&self) -> &SelectedSpeculativeRealization {
+        &self.selected
+    }
+
+    pub(crate) const fn capture(
+        &self,
+    ) -> &eredu_architectures::composite_execution::ExternalPredictionCaptureRequest {
+        &self.capture
+    }
+}
+
+struct InstallExternalObservers {
+    observers: Option<
+        eredu_architectures::external_assistant::ExternalAssistantObservers<
+            MlxTensor,
+            Array,
+            Exception,
+        >,
+    >,
+}
+
+impl eredu_architectures::MaterializedExternalAssistantVisitor<MlxAssistantPreparationVisitor>
+    for InstallExternalObservers
+{
+    type Output = ();
+
+    fn visit<A: eredu_architectures::ExternalAssistantArchitecture>(
+        mut self,
+        assistant: &mut MlxExternalAssistant<A>,
+    ) -> Self::Output {
+        assistant.observers = self
+            .observers
+            .take()
+            .expect("external observers are installed exactly once");
     }
 }
 
@@ -205,8 +348,40 @@ pub struct SpeculativeExecutionStreams<'a> {
 }
 
 impl<'a> SpeculativeExecutionStreams<'a> {
-    /// Creates an execution assignment and classifies its device topology.
-    pub fn new(target: &'a Stream, draft: &'a Stream) -> Result<Self, Exception> {
+    /// Binds queues to topology already selected by portable composition.
+    pub fn bind(
+        target: &'a Stream,
+        draft: &'a Stream,
+        topology: SpeculativeExecutionTopology,
+    ) -> Result<Self, Exception> {
+        let matches = match topology {
+            SpeculativeExecutionTopology::Single => target == draft,
+            SpeculativeExecutionTopology::SameDeviceSplit => {
+                target != draft && target.get_device()? == draft.get_device()?
+            }
+            SpeculativeExecutionTopology::CrossDeviceSplit => {
+                target.get_device()? != draft.get_device()?
+            }
+            _ => {
+                return Err(Exception::custom(
+                    "selected speculative topology is unsupported by the MLX queue binder",
+                ))
+            }
+        };
+        if !matches {
+            return Err(Exception::custom(format!(
+                "selected speculative topology {topology:?} does not match bound MLX queues"
+            )));
+        }
+        Ok(Self {
+            target,
+            draft,
+            topology,
+        })
+    }
+
+    #[cfg(test)]
+    fn for_test(target: &'a Stream, draft: &'a Stream) -> Result<Self, Exception> {
         let topology = if target == draft {
             SpeculativeExecutionTopology::Single
         } else if target.get_device()? == draft.get_device()? {
@@ -214,11 +389,7 @@ impl<'a> SpeculativeExecutionStreams<'a> {
         } else {
             SpeculativeExecutionTopology::CrossDeviceSplit
         };
-        Ok(Self {
-            target,
-            draft,
-            topology,
-        })
+        Self::bind(target, draft, topology)
     }
 
     /// Creates an assignment in which all speculative work uses one stream.
@@ -308,6 +479,11 @@ impl MlxSpeculativeCompletion {
             _retained: retained,
         })
     }
+
+    #[cfg(test)]
+    fn retained(&self) -> &[Array] {
+        &self._retained
+    }
 }
 
 impl Completion for MlxSpeculativeCompletion {
@@ -366,6 +542,7 @@ where
     type Seed = Array;
     type RandomState = RandomState;
     type DraftRandomness = Array;
+    type RandomnessRoot = RandomState;
     type Context<'a>
         = SpeculativeExecutionStreams<'a>
     where
@@ -384,22 +561,34 @@ where
         SpeculativeSampler::<MlxSamplingBackend>::prefix_is_complete(&self.inner, history)
     }
 
-    fn initialize_randomness<'a>(
+    fn randomness_root<'a>(
         seed: Option<Self::Seed>,
-        temperature: f32,
-        context: Self::Context<'a>,
-    ) -> Result<SpeculativeRandomness<Self::RandomState, Self::DraftRandomness>, Self::Error>
+        _: Self::Context<'a>,
+    ) -> Result<Self::RandomnessRoot, Self::Error>
     where
         Self: 'a,
     {
-        if temperature == 0.0 {
-            return Ok(SpeculativeRandomness::new(None, None));
-        }
-        let mut root =
-            RandomState::from_key(seed.ok_or_else(|| {
-                Exception::custom("random operations require an explicit PRNG key")
-            })?);
-        let target_key = root.next_key(context.target())?;
+        seed.map(RandomState::from_key)
+            .ok_or_else(|| Exception::custom("random operations require an explicit PRNG key"))
+    }
+
+    fn target_randomness_from_root<'a>(
+        root: &mut Self::RandomnessRoot,
+        context: Self::Context<'a>,
+    ) -> Result<Self::RandomState, Self::Error>
+    where
+        Self: 'a,
+    {
+        root.next_key(context.target()).map(RandomState::from_key)
+    }
+
+    fn draft_randomness_from_root<'a>(
+        root: &mut Self::RandomnessRoot,
+        context: Self::Context<'a>,
+    ) -> Result<Self::DraftRandomness, Self::Error>
+    where
+        Self: 'a,
+    {
         let draft_key = root.next_key(context.target())?;
         let draft_key = if context.is_split() {
             if context.crosses_devices() {
@@ -414,15 +603,12 @@ where
         } else {
             draft_key
         };
-        Ok(SpeculativeRandomness::new(
-            Some(RandomState::from_key(target_key)),
-            Some(draft_key),
-        ))
+        Ok(draft_key)
     }
 
     fn draft_randomness_at<'a>(
         root: &Self::DraftRandomness,
-        position: usize,
+        position: SpeculativeDraftRandomPosition,
         context: Self::Context<'a>,
     ) -> Result<Self::RandomState, Self::Error>
     where
@@ -430,7 +616,7 @@ where
     {
         Ok(RandomState::from_key(crate::backend::random::split_key_at(
             root,
-            position,
+            position.get(),
             context.draft(),
         )?))
     }
@@ -479,73 +665,59 @@ where
         Ok(token.into_array().item::<u32>(stream))
     }
 
-    fn decide_proposal<'a>(
+    fn probability_at<'a>(
         &self,
-        target: &Self::Distribution,
-        draft: &Self::Distribution,
-        proposed: u32,
-        temperature: f32,
-        randomness: Option<&mut Self::RandomState>,
+        distribution: &Self::Distribution,
+        token: u32,
+        placement: SamplingPlacement,
         context: Self::Context<'a>,
-    ) -> Result<ProposalDecision, Self::Error>
+    ) -> Result<f32, Self::Error>
     where
         Self: 'a,
     {
-        let stream = context.target();
-        if temperature == 0.0 {
-            let chosen = SpeculativeSampler::<MlxSamplingBackend>::sample_processed(
-                &self.inner,
-                &MlxTensor::from_array(target.clone()),
-                0.0,
-                None,
-                stream,
-            )?
-            .into_array()
-            .item::<u32>(stream);
-            return Ok(if chosen == proposed {
-                ProposalDecision::Accept
-            } else {
-                ProposalDecision::Reject(chosen)
-            });
-        }
+        let stream = sampling_stream(placement, context)?;
+        let probabilities = probabilities(distribution, stream)?;
+        array_probability_at(&probabilities, token, stream)
+    }
 
-        let target_probabilities = probabilities(target, stream)?;
-        let draft_probabilities = probabilities(draft, stream)?;
-        let target_probability = probability_at(&target_probabilities, proposed, stream)?;
-        let draft_probability = probability_at(&draft_probabilities, proposed, stream)?;
-        let acceptance = if draft_probability <= 0.0 {
-            1.0
-        } else {
-            (target_probability / draft_probability).min(1.0)
-        };
-        let mut randomness = randomness;
-        if uniform(randomness.as_deref_mut(), stream)? <= acceptance {
-            return Ok(ProposalDecision::Accept);
-        }
-        let residual = maximum(
-            target_probabilities.subtract(&draft_probabilities, stream)?,
+    fn sample_unit_interval<'a>(
+        &self,
+        randomness: Option<&mut Self::RandomState>,
+        context: Self::Context<'a>,
+    ) -> Result<f32, Self::Error>
+    where
+        Self: 'a,
+    {
+        uniform(randomness, context.target())
+    }
+
+    fn positive_probability_difference<'a>(
+        &self,
+        left: &Self::Distribution,
+        right: &Self::Distribution,
+        placement: SamplingPlacement,
+        context: Self::Context<'a>,
+    ) -> Result<Option<Self::Distribution>, Self::Error>
+    where
+        Self: 'a,
+    {
+        let stream = sampling_stream(placement, context)?;
+        let left_probabilities = probabilities(left, stream)?;
+        let right_probabilities = probabilities(right, stream)?;
+        let difference = maximum(
+            left_probabilities.subtract(&right_probabilities, stream)?,
             Array::from_f32(0.0),
             stream,
         )?;
-        let mass = residual.sum(None, stream)?.item::<f32>(stream);
-        let logits = if mass <= f32::EPSILON {
-            target.clone()
+        let mass = difference.sum(None, stream)?.item::<f32>(stream);
+        if mass <= f32::EPSILON {
+            Ok(None)
         } else {
-            residual.log(stream)?
-        };
-        let replacement = SpeculativeSampler::<MlxSamplingBackend>::sample_processed(
-            &self.inner,
-            &MlxTensor::from_array(logits),
-            temperature,
-            randomness,
-            stream,
-        )?
-        .into_array()
-        .item::<u32>(stream);
-        Ok(ProposalDecision::Reject(replacement))
+            difference.log(stream).map(Some)
+        }
     }
 
-    fn commit_token<'a>(
+    fn update_sampler_state<'a>(
         &mut self,
         distribution: &Self::Distribution,
         token: u32,
@@ -606,7 +778,11 @@ fn probabilities(logits: &Array, stream: &Stream) -> Result<Array, Exception> {
     softmax_axis(&logits.as_type::<f32>(stream)?, -1, true, stream)
 }
 
-fn probability_at(probabilities: &Array, token: u32, stream: &Stream) -> Result<f32, Exception> {
+fn array_probability_at(
+    probabilities: &Array,
+    token: u32,
+    stream: &Stream,
+) -> Result<f32, Exception> {
     if token as i32 >= probabilities.dim(-1) {
         return Err(Exception::custom(format!(
             "sampled token {token} exceeds vocabulary size {}",
@@ -630,4 +806,306 @@ fn uniform(state: Option<&mut RandomState>, stream: &Stream) -> Result<f32, Exce
         .ok_or_else(|| Exception::custom("stochastic speculative decoding requires a PRNG key"))?;
     let key = state.next_key(stream)?;
     Ok(random::uniform::<_, f32>(0.0, 1.0, &[1], &key, stream)?.item::<f32>(stream))
+}
+
+#[cfg(test)]
+mod completion_tests {
+    use eredu_core::Completion;
+    use safemlx::{Array, Device, DeviceType, Stream};
+
+    use super::MlxSpeculativeCompletion;
+
+    #[test]
+    fn native_speculative_completion_retains_every_submitted_array_handle() {
+        let stream = Stream::try_new_with_device(&Device::new(DeviceType::Cpu, 0)).unwrap();
+        let logits = Array::from_slice(&[1.0_f32], &[1]);
+        let capture = Array::from_slice(&[3.0_f32], &[1]);
+        let completion = MlxSpeculativeCompletion::submit([&logits, &capture]).unwrap();
+        drop(logits);
+        drop(capture);
+
+        assert_eq!(completion.retained().len(), 2);
+        completion.wait().unwrap();
+        assert!(completion.is_complete().unwrap());
+        assert_eq!(completion.retained()[0].clone().item::<f32>(&stream), 1.0);
+        assert_eq!(completion.retained()[1].clone().item::<f32>(&stream), 3.0);
+    }
+}
+
+#[cfg(test)]
+mod external_materialization_tests {
+    use std::io::Write;
+
+    use eredu_architectures::{
+        gemma4, ExternalAssistantArchitecture, ExternalAssistantTargetProfile,
+        MaterializedExternalAssistantVisitor,
+    };
+    use eredu_checkpoint::schema::StoredDtypeConstraint;
+    use eredu_runtime::{LayerwiseLoadOptions, WeightResidency};
+    use safemlx::{Device, DeviceType, Stream};
+    use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
+
+    use super::{MlxAssistantPreparationVisitor, MlxExternalAssistant};
+    use crate::MlxLoadRequest;
+
+    const ASSISTANT_CONFIG: &str = r#"{
+      "model_type":"gemma4_assistant","backbone_hidden_size":32,
+      "use_ordered_embeddings":false,"tie_word_embeddings":false,"block_size":4,
+      "text_config":{"model_type":"gemma4_text","hidden_size":32,
+        "num_hidden_layers":1,"intermediate_size":64,"num_attention_heads":4,
+        "num_key_value_heads":2,"head_dim":8,"rms_norm_eps":0.00001,
+        "vocab_size":32,"max_position_embeddings":128,"tie_word_embeddings":false,
+        "attention_k_eq_v":false,"layer_types":["full_attention"]}
+    }"#;
+
+    const MUSE_ASSISTANT_CONFIG: &str = r#"{
+      "model_type":"muse_glimmer_assistant","hidden_size":6656,
+      "intermediate_size":19968,"num_hidden_layers":5,"num_attention_heads":32,
+      "num_key_value_heads":8,"head_dim":128,"rms_norm_eps":0.000001,
+      "max_position_embeddings":131072,"sliding_window":2048,"block_size":16,
+      "mask_token_id":201818,"target_layer_ids":[1,13,25,37,49],
+      "layer_types":["sliding_attention","sliding_attention","sliding_attention",
+                     "sliding_attention","sliding_attention"],
+      "hidden_act":"silu","attention_dropout":0.0,
+      "rope_parameters":{"rope_theta":500000.0}
+    }"#;
+
+    fn assistant_artifact() -> tempfile::TempDir {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("config.json"), ASSISTANT_CONFIG).unwrap();
+        let config = gemma4::AssistantConfig::from_json(ASSISTANT_CONFIG.as_bytes()).unwrap();
+        let plan = gemma4::assistant_safetensors_plan(&config).unwrap();
+        assert!(plan.layout_groups.is_empty());
+        let tensors = plan
+            .common_tensors
+            .iter()
+            .map(|tensor| {
+                assert_eq!(tensor.dtype, StoredDtypeConstraint::Floating);
+                let bytes = vec![0; tensor.shape.iter().product::<usize>() * 4];
+                (tensor.key.clone(), tensor.shape.clone(), bytes)
+            })
+            .collect::<Vec<_>>();
+        let views = tensors
+            .iter()
+            .map(|(name, shape, bytes)| {
+                (
+                    name.as_str(),
+                    TensorView::new(Dtype::F32, shape.clone(), bytes).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        serialize_to_file(views, None, &directory.path().join("model.safetensors")).unwrap();
+        directory
+    }
+
+    fn sparse_muse_assistant_artifact() -> tempfile::TempDir {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("config.json"), MUSE_ASSISTANT_CONFIG).unwrap();
+        let config = eredu_architectures::muse_glimmer::DFlashConfig::from_hf_json(
+            MUSE_ASSISTANT_CONFIG.as_bytes(),
+        )
+        .unwrap();
+        let plan = eredu_architectures::muse_glimmer::dflash_safetensors_plan(&config).unwrap();
+        let mut offset = 0_u64;
+        let mut header = serde_json::Map::new();
+        for tensor in plan.common_tensors {
+            assert_eq!(tensor.dtype, StoredDtypeConstraint::Floating);
+            let bytes = tensor
+                .shape
+                .iter()
+                .try_fold(4_u64, |bytes, dimension| {
+                    bytes.checked_mul(u64::try_from(*dimension).unwrap())
+                })
+                .unwrap();
+            let end = offset.checked_add(bytes).unwrap();
+            header.insert(
+                tensor.key,
+                serde_json::json!({
+                    "dtype": "F32",
+                    "shape": tensor.shape,
+                    "data_offsets": [offset, end],
+                }),
+            );
+            offset = end;
+        }
+        let mut header = serde_json::to_vec(&header).unwrap();
+        while !header.len().is_multiple_of(8) {
+            header.push(b' ');
+        }
+        let path = directory.path().join("model.safetensors");
+        let mut file = std::fs::File::create(path).unwrap();
+        let header_len = u64::try_from(header.len()).unwrap();
+        file.write_all(&header_len.to_le_bytes()).unwrap();
+        file.write_all(&header).unwrap();
+        file.set_len(8 + header_len + offset).unwrap();
+        directory
+    }
+
+    fn target_profile() -> ExternalAssistantTargetProfile {
+        let assistant = gemma4::AssistantConfig::from_json(ASSISTANT_CONFIG.as_bytes()).unwrap();
+        let mut text = assistant.text_config;
+        let mut publisher = *text.layer_schedule.get(0).unwrap();
+        publisher.key_value = eredu_nn::AttentionStateSource::Publish {
+            value: eredu_nn::AttentionValueSource::Projected,
+        };
+        text.layer_schedule = eredu_core::LayerSchedule::new(1, vec![publisher]).unwrap();
+        ExternalAssistantTargetProfile::Gemma4(gemma4::FamilyConfig {
+            model_type: "gemma4".into(),
+            text,
+            vision: None,
+            image_token_id: None,
+            video_token_id: None,
+            audio: None,
+            audio_token_id: None,
+        })
+    }
+
+    fn muse_target_profile() -> ExternalAssistantTargetProfile {
+        let target = serde_json::json!({
+            "architectures":["MuseGlimmerForConditionalGeneration"],
+            "model_type":"muse_glimmer","image_token_id":22,"video_token_id":23,
+            "out_hidden_size":32,"projector_hidden_size":16,
+            "text_config":{
+                "model_type":"muse_glimmer_text","hidden_size":16,"num_hidden_layers":2,
+                "intermediate_size":24,"num_attention_heads":4,"num_key_value_heads":2,
+                "head_dim":4,"rms_norm_eps":0.00001,"post_norm_eps":0.00001,
+                "vocab_size":24,"max_position_embeddings":64,"rope_theta":10000.0,
+                "layer_types":["sliding_attention","full_attention"],
+                "layer_rope_theta":[10000.0,0.0],"sliding_window":8,
+                "tie_word_embeddings":false,"hidden_act":"silu","attention_dropout":0.0,
+                "qk_scale_factor":1.0,"output_multiplier":1.0,
+                "final_logit_softcapping":30.0
+            },
+            "vision_config":{
+                "model_type":"muse_glimmer_vision","hidden_size":8,
+                "intermediate_size":12,"num_attention_heads":2,"num_hidden_layers":1,
+                "patch_size":2,"patch_temporal":1,"merge_size":2,
+                "pos_emb_height":2,"pos_emb_width":2,"max_position_embeddings":4,
+                "layer_norm_eps":0.00001,"hidden_act":"gelu",
+                "layer_types":["full_attention"],
+                "rope_parameters":{"rope_theta":10000.0,"rope_type":"default"}
+            }
+        });
+        let mut target =
+            eredu_architectures::muse_glimmer::DecoderConfig::from_hf_value(&target).unwrap();
+        target.hidden_size = 6656;
+        target.num_hidden_layers = 50;
+        target.vocab_size = 201819;
+        target.max_position_embeddings = 131072;
+        ExternalAssistantTargetProfile::MuseGlimmer(target)
+    }
+
+    fn visitor(options: MlxLoadRequest, stream: &Stream) -> MlxAssistantPreparationVisitor {
+        MlxAssistantPreparationVisitor {
+            options,
+            stream: stream.clone(),
+            weights_stream: stream.clone(),
+        }
+    }
+
+    struct InspectMaterialized;
+
+    impl MaterializedExternalAssistantVisitor<MlxAssistantPreparationVisitor> for InspectMaterialized {
+        type Output = (String, Option<eredu_checkpoint::WeightQuantization>);
+
+        fn visit<A: ExternalAssistantArchitecture>(
+            self,
+            assistant: &mut MlxExternalAssistant<A>,
+        ) -> Self::Output {
+            (
+                A::configuration_model_type(&assistant.config).to_owned(),
+                A::quantization(&assistant.config),
+            )
+        }
+    }
+
+    #[test]
+    fn family_blind_mlx_materializer_revalidates_catalog_without_reloading_target() {
+        let artifact = assistant_artifact();
+        let compatible = eredu_architectures::prepare_external_assistant(artifact.path())
+            .unwrap()
+            .prove_target_compatibility(&target_profile())
+            .unwrap();
+        let stream = Stream::try_new_with_device(&Device::new(DeviceType::Cpu, 0)).unwrap();
+        crate::composition::mlx::path_instrumentation::reset();
+
+        let mut materialized = compatible
+            .visit(visitor(MlxLoadRequest::default(), &stream))
+            .unwrap();
+        assert_eq!(
+            materialized.visit(InspectMaterialized),
+            ("gemma4_assistant".into(), None)
+        );
+        let counts = crate::composition::mlx::path_instrumentation::snapshot();
+        assert_eq!(counts.payload_opens, 1);
+        assert_eq!(counts.constructors, 0);
+    }
+
+    #[test]
+    fn family_blind_mlx_materializer_applies_architecture_load_time_format() {
+        let artifact = assistant_artifact();
+        let compatible = eredu_architectures::prepare_external_assistant(artifact.path())
+            .unwrap()
+            .prove_target_compatibility(&target_profile())
+            .unwrap();
+        let stream = Stream::try_new_with_device(&Device::new(DeviceType::Cpu, 0)).unwrap();
+        crate::composition::mlx::path_instrumentation::reset();
+
+        let mut materialized = compatible
+            .visit(visitor(
+                MlxLoadRequest::with_quantization(eredu_core::QuantizationRequest::MxFp4),
+                &stream,
+            ))
+            .unwrap();
+        assert_eq!(
+            materialized.visit(InspectMaterialized),
+            (
+                "gemma4_assistant".into(),
+                Some(eredu_checkpoint::WeightQuantization::MxFp4)
+            )
+        );
+        let counts = crate::composition::mlx::path_instrumentation::snapshot();
+        assert_eq!(counts.payload_opens, 1);
+        assert_eq!(counts.constructors, 0);
+    }
+
+    #[test]
+    fn nonresident_gemma_and_muse_policies_fail_before_payload_or_target_work() {
+        fn assert_rejected(
+            compatible: eredu_architectures::CompatibleExternalAssistantPreparation,
+            stream: &Stream,
+        ) {
+            let options = MlxLoadRequest::default().with_weight_residency(
+                WeightResidency::layerwise_host(LayerwiseLoadOptions::default()),
+            );
+            crate::composition::mlx::path_instrumentation::reset();
+
+            let error = match compatible.visit(visitor(options, stream)) {
+                Ok(_) => panic!("nonresident external assistant unexpectedly materialized"),
+                Err(error) => error,
+            };
+            assert!(error
+                .to_string()
+                .contains("external assistants require fully resident weights"));
+            let counts = crate::composition::mlx::path_instrumentation::snapshot();
+            assert_eq!(counts.payload_opens, 0);
+            assert_eq!(counts.constructors, 0);
+            assert_eq!(counts.materializations, 0);
+        }
+
+        let stream = Stream::try_new_with_device(&Device::new(DeviceType::Cpu, 0)).unwrap();
+        let gemma = assistant_artifact();
+        let gemma = eredu_architectures::prepare_external_assistant(gemma.path())
+            .unwrap()
+            .prove_target_compatibility(&target_profile())
+            .unwrap();
+        assert_rejected(gemma, &stream);
+
+        let muse = sparse_muse_assistant_artifact();
+        let muse = eredu_architectures::prepare_external_assistant(muse.path())
+            .unwrap()
+            .prove_target_compatibility(&muse_target_profile())
+            .unwrap();
+        assert_rejected(muse, &stream);
+    }
 }

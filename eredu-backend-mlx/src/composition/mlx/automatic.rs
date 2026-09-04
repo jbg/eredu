@@ -1,6 +1,6 @@
 //! MLX observations and plan realization for neutral automatic planning.
 
-use std::path::Path;
+use std::{num::NonZeroUsize, path::Path};
 
 use eredu_core::scheduler::SemanticStateTransaction;
 use eredu_core::{
@@ -11,10 +11,9 @@ use eredu_core::{
     HardwareProfile, InspectionSeverity, ModelResourceProfile, ModelRuntime, Observed,
     PhysicalMemorySemantics, QuantizationRequest, RealizedDrafting, RealtimeBackend,
     RealtimeInputFrame, RealtimeModelLoadingBackend, RealtimeOutputFrame, RealtimeSampling,
-    RealtimeSpeechConfig, ResidencyPlan, ResidencyTelemetry, SpeculativeCapability,
-    SpeculativeDecodingTelemetry, SpeculativeDraftSource, SpeculativeGenerationBackend,
-    SpeculativeStats, Submission, TransferTelemetry, WeightTransformationPlan,
-    AUTOMATIC_SCHEMA_VERSION,
+    RealtimeSpeechConfig, ResidencyPlan, ResidencyTelemetry, SpeculativeDecodingTelemetry,
+    SpeculativeDraftSource, SpeculativeGenerationBackend, SpeculativeStats, Submission,
+    TransferTelemetry, WeightTransformationPlan, AUTOMATIC_SCHEMA_VERSION,
 };
 use safemlx::{Device, DeviceType, Stream};
 
@@ -384,7 +383,9 @@ fn mlx_load_options(
             }
         }
     };
-    load = load.with_weight_residency(residency);
+    load = load
+        .with_weight_residency(residency)
+        .with_drafting_plan(plan.drafting())?;
     Ok(load)
 }
 
@@ -530,7 +531,7 @@ impl AutomaticPlanningBackend for MlxBackendFactory {
 
 impl ExecutionPlanBackendFactory for MlxBackendFactory {
     type Backend = MlxBackend<'static>;
-    type DrafterPreparation = eredu_architectures::ExternalAssistantPreparationPlan;
+    type DrafterPreparation = eredu_architectures::ExternalAssistantPreparation;
     type Drafter = MlxDrafter;
 
     fn realize_target(
@@ -561,23 +562,19 @@ impl ExecutionPlanBackendFactory for MlxBackendFactory {
         match plan.drafting() {
             DraftingPlan::Disabled => Ok(RealizedDrafting::Disabled),
             DraftingPlan::Embedded { .. } => {
-                if capability
-                    != (SpeculativeCapability::Ready {
-                        draft_source: SpeculativeDraftSource::Embedded,
-                    })
-                {
+                if !capability.is_ready_for(SpeculativeDraftSource::Embedded) {
                     return Err(AutomaticPlanningError::Invalid(format!(
                         "execution plan selects embedded drafting but target capability is {capability:?}"
                     )));
                 }
                 Ok(RealizedDrafting::Embedded)
             }
-            DraftingPlan::External { placement, .. } => {
-                if capability
-                    != (SpeculativeCapability::Ready {
-                        draft_source: SpeculativeDraftSource::Separate,
-                    })
-                {
+            DraftingPlan::External {
+                placement,
+                max_draft_tokens,
+                ..
+            } => {
+                if !capability.admits_source(SpeculativeDraftSource::Separate) {
                     return Err(AutomaticPlanningError::Invalid(format!(
                         "execution plan selects external drafting but target capability is {capability:?}"
                     )));
@@ -587,6 +584,63 @@ impl ExecutionPlanBackendFactory for MlxBackendFactory {
                         "external drafting is missing proven tokenizer compatibility".into(),
                     )
                 })?;
+                let target_profile = target
+                    .session()
+                    .external_assistant_target_profile()
+                    .map_err(|error| {
+                        planning_backend_error("prove_external_drafter_compatibility", error)
+                    })?;
+                let preparation = artifact
+                    .preparation
+                    .prove_target_compatibility(&target_profile)
+                    .map_err(|error| {
+                        AutomaticPlanningError::Invalid(format!(
+                            "external assistant is incompatible with the selected target: {error}"
+                        ))
+                    })?;
+                let topology = placement.execution_topology(plan.device());
+                let placement_request =
+                    eredu_runtime::SpeculativePlacementRequest::from_topology(topology)
+                        .map_err(|error| AutomaticPlanningError::Invalid(error.to_string()))?;
+                let rank_topology = eredu_core::ParallelRankTopology::new(*plan.topology(), 0)
+                    .map_err(|error| AutomaticPlanningError::Invalid(error.to_string()))?;
+                let processor =
+                    eredu_runtime::SpeculativeIdentity::new("prepared-chat/text-token-ids/v1")
+                        .map_err(|error| AutomaticPlanningError::Invalid(error.to_string()))?;
+                let maximum_draft_tokens =
+                    NonZeroUsize::new(*max_draft_tokens).ok_or_else(|| {
+                        AutomaticPlanningError::Invalid(
+                            "external draft capacity must be positive".into(),
+                        )
+                    })?;
+                let contract = preparation
+                    .speculative_contract(
+                        eredu_architectures::ExternalSpeculativeContractRequest::new(
+                            rank_topology,
+                            processor,
+                            artifact.tokenizer_compatibility,
+                            artifact.tokenizer_compatibility.fingerprint(),
+                            maximum_draft_tokens,
+                        ),
+                    )
+                    .map_err(|error| {
+                        AutomaticPlanningError::Invalid(format!(
+                            "external speculative contract is invalid: {error}"
+                        ))
+                    })?;
+                let prepared = eredu_runtime::select_and_prepare_speculative_realization_observed(
+                    contract.requirements(),
+                    &contract.selection_request(placement_request),
+                    &super::speculative::speculative_mechanism_capabilities(),
+                    &|_| Ok(()),
+                    |_| Ok::<_, AutomaticPlanningError>(()),
+                    |_, &()| Ok::<_, AutomaticPlanningError>(()),
+                    |_, &()| Ok::<_, AutomaticPlanningError>(()),
+                    |_| Ok::<_, AutomaticPlanningError>(()),
+                    |_, &()| Ok::<_, AutomaticPlanningError>(()),
+                )
+                .map_err(|error| AutomaticPlanningError::Invalid(error.to_string()))?;
+                let selected = prepared.into_parts().0;
                 let draft_stream = match placement {
                     DraftPlacementPlan::Target => target.backend().stream().clone(),
                     DraftPlacementPlan::Device { device } => {
@@ -604,17 +658,14 @@ impl ExecutionPlanBackendFactory for MlxBackendFactory {
                 let options = mlx_drafter_load_options(plan)
                     .map_err(|error| planning_backend_error("realize_external_drafter", error))?;
                 let drafter = MlxDrafter::materialize_with_compatibility(
-                    artifact.preparation,
+                    preparation,
                     artifact.tokenizer_compatibility,
                     options,
                     &draft_stream,
                     target.backend().weights_stream(),
+                    selected,
                 )
                 .map_err(|error| planning_backend_error("realize_external_drafter", error))?;
-                target
-                    .session()
-                    .validate_external_drafter(&drafter)
-                    .map_err(|error| planning_backend_error("validate_external_drafter", error))?;
                 draft_stream.synchronize().map_err(|error| {
                     planning_backend_error("complete_external_drafter_load", error)
                 })?;

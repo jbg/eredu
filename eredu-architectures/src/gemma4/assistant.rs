@@ -961,6 +961,48 @@ mod tests {
     }
 
     #[test]
+    fn gguf_catalog_translation_and_format_transforms_preserve_assistant_identities() {
+        let config = AssistantConfig::from_json(CONFIG.as_bytes()).unwrap();
+        let plan = assistant_gguf_plan(&config).unwrap();
+        let names = plan
+            .common_tensors
+            .iter()
+            .map(|tensor| tensor.key.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert!(plan.catalog_policy.strict);
+        assert!(names.contains("mtp.pre_projection.weight"));
+        assert!(names.contains("mtp.post_projection.weight"));
+        assert_eq!(
+            translate_assistant_gguf_weight_name("nextn.pre_projection.weight"),
+            "pre_projection.weight"
+        );
+        assert_eq!(
+            translate_assistant_gguf_weight_name("blk.0.attn_q.weight"),
+            "model.layers.0.self_attn.q_proj.weight"
+        );
+
+        let checkpoint_format = eredu_checkpoint::WeightQuantization::MxFp4;
+        let formatted = config
+            .with_checkpoint_formats(HashMap::from([(
+                "pre_projection.weight".into(),
+                checkpoint_format,
+            )]))
+            .unwrap();
+        assert_eq!(
+            formatted
+                .text_config
+                .quantized_weight_configs
+                .as_ref()
+                .unwrap()["pre_projection.weight"],
+            checkpoint_format
+        );
+        let transformed = config.load_time_quantization(checkpoint_format).unwrap();
+        assert_eq!(transformed.quantization, Some(checkpoint_format));
+        assert!(transformed.text_config.quantized_weight_configs.is_none());
+    }
+
+    #[test]
     fn ordered_head_rejects_non_integral_or_quantized_centroids() {
         let mut value: serde_json::Value = serde_json::from_str(CONFIG).unwrap();
         value["use_ordered_embeddings"] = true.into();

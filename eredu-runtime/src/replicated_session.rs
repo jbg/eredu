@@ -682,6 +682,24 @@ where
             observer,
         )
     }
+
+    fn apply_prediction_target_operation<O>(
+        runtime: &mut Self::Runtime,
+        state: &mut S,
+        operation: O,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<
+        Option<O::Output>,
+        ReplicatedTextSessionError<A::Error, R::Error, std::convert::Infallible>,
+    >
+    where
+        O: PredictionTargetOperation<A, B, S>,
+    {
+        runtime
+            .apply_prediction_target_operation(state, operation, context)
+            .map(Some)
+            .map_err(ReplicatedTextSessionError::Architecture)
+    }
 }
 
 impl<A, B, S, R, P, Provider> ReplicatedRuntimeExecutionStrategy<A, B, S, R, P>
@@ -2173,9 +2191,11 @@ where
         Ok(())
     }
 
-    /// Realizes one blank prediction-lane target state without replacing canonical state.
+    /// Forks one prediction-lane target state from the exact canonical state.
     ///
-    /// Every rank prepares and validates its local shard before any caller may retain the lane.
+    /// This preserves any prompt-cache restoration already installed in the ordinary target.
+    /// Every rank realizes, restores, and validates its local fork before any caller may retain
+    /// the lane; failure leaves the canonical state untouched.
     pub fn prepare_prediction_target_state(
         &mut self,
         context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
@@ -2191,7 +2211,15 @@ where
                 self.mechanisms
                     .realize_state(selected, context)
                     .map_err(ReplicatedTextSessionError::Mechanism)
-                    .and_then(|state| {
+                    .and_then(|mut state| {
+                        validate_realized_state(&state, selected)?;
+                        let checkpoint = self
+                            .mechanisms
+                            .checkpoint_state(&self.state, context)
+                            .map_err(ReplicatedTextSessionError::Mechanism)?;
+                        self.mechanisms
+                            .restore_state(&mut state, checkpoint, context)
+                            .map_err(ReplicatedTextSessionError::Mechanism)?;
                         validate_realized_state(&state, selected)?;
                         Ok(state)
                     })

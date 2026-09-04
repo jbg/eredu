@@ -476,7 +476,7 @@ where
     where
         F: eredu_core::ExecutionPlanBackendFactory<
             Backend = B,
-            DrafterPreparation = eredu_architectures::ExternalAssistantPreparationPlan,
+            DrafterPreparation = eredu_architectures::ExternalAssistantPreparation,
         >,
     {
         let artifact = artifact.as_ref();
@@ -517,7 +517,7 @@ where
             model.runtime(),
             external_artifact,
         )?;
-        Ok(PlannedModel::new(model, drafting))
+        Ok(PlannedModel::new(model, drafting, plan.drafting().clone()))
     }
 
     /// Plans and loads one complete model session without exposing backend construction.
@@ -536,7 +536,7 @@ where
     where
         F: eredu_core::ExecutionPlanBackendFactory<
             Backend = B,
-            DrafterPreparation = eredu_architectures::ExternalAssistantPreparationPlan,
+            DrafterPreparation = eredu_architectures::ExternalAssistantPreparation,
         >,
     {
         let report = planner.plan(factory, request)?;

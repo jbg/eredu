@@ -6,6 +6,22 @@ use eredu_core::QuantizationRequest;
 use crate::backend::error::Error;
 use eredu_runtime::{PipelineWireContract, WeightResidency};
 
+/// Portable drafting intent applied before checkpoint payload selection.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub(crate) enum SpeculativeLoadRequest {
+    /// Preserve direct-load behavior by installing an admitted embedded extension.
+    #[default]
+    ArchitectureDefault,
+    /// Materialize only the ordinary target.
+    Disabled,
+    /// Require and install an embedded extension with this proposal bound.
+    Embedded {
+        max_draft_tokens: std::num::NonZeroUsize,
+    },
+    /// Prepare only the ordinary target for later external-assistant pairing.
+    ExternalTarget,
+}
+
 /// Caller request translated into an authoritative realization before materialization.
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
 pub struct MlxLoadRequest {
@@ -27,6 +43,8 @@ pub struct MlxLoadRequest {
     pub(crate) state_residency: eredu_runtime::CacheResidencyPolicy,
     /// Capabilities required from the exact realized model session.
     pub(crate) required_session_capabilities: eredu_core::SessionCapabilities,
+    /// Drafting intent selected by portable planning before payload work.
+    speculative: SpeculativeLoadRequest,
 }
 
 impl MlxLoadRequest {
@@ -50,6 +68,7 @@ impl MlxLoadRequest {
             weight_residency: WeightResidency::fully_resident(),
             state_residency: eredu_runtime::CacheResidencyPolicy::Device,
             required_session_capabilities: eredu_core::SessionCapabilities::default(),
+            speculative: SpeculativeLoadRequest::ArchitectureDefault,
         }
     }
 
@@ -118,6 +137,35 @@ impl MlxLoadRequest {
     ) -> Self {
         self.required_session_capabilities = capabilities;
         self
+    }
+
+    /// Applies the execution plan's drafting mode before target payload selection.
+    pub(crate) fn with_drafting_plan(
+        mut self,
+        plan: &eredu_core::DraftingPlan,
+    ) -> Result<Self, Error> {
+        self.speculative = match plan {
+            eredu_core::DraftingPlan::Disabled => SpeculativeLoadRequest::Disabled,
+            eredu_core::DraftingPlan::Embedded {
+                max_draft_tokens, ..
+            } => SpeculativeLoadRequest::Embedded {
+                max_draft_tokens: std::num::NonZeroUsize::new(*max_draft_tokens).ok_or_else(
+                    || Error::AutomaticPlanning("embedded draft capacity must be positive".into()),
+                )?,
+            },
+            eredu_core::DraftingPlan::External { .. } => SpeculativeLoadRequest::ExternalTarget,
+            _ => {
+                return Err(Error::AutomaticPlanning(
+                    "unsupported speculative drafting plan".into(),
+                ))
+            }
+        };
+        Ok(self)
+    }
+
+    /// Returns the pre-payload drafting intent.
+    pub(crate) const fn speculative_load_request(&self) -> SpeculativeLoadRequest {
+        self.speculative
     }
 
     /// Returns the selected distributed topology, if any.
@@ -281,7 +329,7 @@ impl MlxLoadRequest {
 
 #[cfg(test)]
 mod tests {
-    use eredu_core::{ParallelRankTopology, ParallelTopology, QuantizationRequest};
+    use eredu_core::{DraftingPlan, ParallelRankTopology, ParallelTopology, QuantizationRequest};
     use eredu_runtime::LayerwiseLoadOptions;
 
     use super::MlxLoadRequest;
@@ -396,5 +444,38 @@ mod tests {
         assert!(error
             .to_string()
             .contains("partitioned invocation limits must be positive"));
+    }
+
+    #[test]
+    fn portable_drafting_plan_is_fixed_before_payload_selection() {
+        let disabled = MlxLoadRequest::default()
+            .with_drafting_plan(&DraftingPlan::Disabled)
+            .unwrap();
+        assert_eq!(
+            disabled.speculative_load_request(),
+            super::SpeculativeLoadRequest::Disabled
+        );
+
+        let embedded = MlxLoadRequest::default()
+            .with_drafting_plan(&DraftingPlan::Embedded {
+                max_draft_tokens: 3,
+                lookahead: false,
+                adaptive_lookahead: false,
+            })
+            .unwrap();
+        assert_eq!(
+            embedded.speculative_load_request(),
+            super::SpeculativeLoadRequest::Embedded {
+                max_draft_tokens: std::num::NonZeroUsize::new(3).unwrap()
+            }
+        );
+
+        assert!(MlxLoadRequest::default()
+            .with_drafting_plan(&DraftingPlan::Embedded {
+                max_draft_tokens: 0,
+                lookahead: false,
+                adaptive_lookahead: false,
+            })
+            .is_err());
     }
 }

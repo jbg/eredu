@@ -30,10 +30,49 @@ use crate::decoder::{
 
 use super::{
     block::V4Block,
+    config::V4TargetCapturePolicy,
     moe::MoePolicy,
     mtp::{EmbeddedInput, ForwardMode, RetainedValues, V4PredictionLayer},
     DsparkConfig, ExpertFormat, V4Args, V4AttentionPolicy,
 };
+
+fn capture_target_layer<T: Tensor>(
+    policy: Option<&V4TargetCapturePolicy>,
+    layer: usize,
+    hidden: &T,
+    captures: &mut [Option<T>],
+    context: &T::Context,
+) -> Result<(), Error> {
+    if let Some(position) = policy.and_then(|policy| policy.position(layer)) {
+        captures[position] = Some(T::mean_axis(hidden, 2, false, context)?);
+    }
+    Ok(())
+}
+
+fn complete_target_capture<T: Tensor>(
+    policy: Option<&V4TargetCapturePolicy>,
+    hidden: &T,
+    captures: &[Option<T>],
+    context: &T::Context,
+) -> Result<T, Error> {
+    let Some(policy) = policy else {
+        return Ok(hidden.clone());
+    };
+    let ordered = captures
+        .iter()
+        .cloned()
+        .enumerate()
+        .map(|(position, capture)| {
+            capture.ok_or_else(|| {
+                Error::backend(format!(
+                    "target layer {} did not produce capture slot {position}",
+                    policy.layer_ids()[position]
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    T::concatenate(&ordered, -1, context)
+}
 
 /// Declares V4 cache identity independently of concrete state storage.
 pub fn state_identity(
@@ -267,6 +306,12 @@ fn validate_dspark_proposal<T: Tensor>(
     Ok(())
 }
 
+fn validate_dspark_target_capture<T: Tensor>(args: &V4Args, captures: &T) -> Result<(), Error> {
+    crate::prediction_extension::DsparkPredictionStrategy::from_args(args)
+        .and_then(|strategy| strategy.validate_target_capture_shape(captures.shape()))
+        .map_err(|error| Error::backend(error.to_string()))
+}
+
 /// Family-owned schema for immutable V4 target context crossing pipeline ranks.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct TargetBoundarySchema {
@@ -287,9 +332,9 @@ impl TargetBoundarySchema {
             hidden_size: args.hidden_size,
             activation_hidden_size,
             capture_count: args
-                .dspark
+                .target_capture_policy
                 .as_ref()
-                .map_or(0, |config| config.target_layer_ids.len()),
+                .map_or(0, V4TargetCapturePolicy::len),
         })
     }
 
@@ -590,11 +635,12 @@ where
     ) -> Result<TargetPartitionOutput<B::Tensor>, Error> {
         let boundary = self.routed_target_boundary(forward)?;
         if owns_output {
-            let draft_hidden = if self.args.dspark.is_some() {
-                B::Tensor::concatenate(&boundary.captures, -1, context)?
-            } else {
-                hidden.clone()
-            };
+            let draft_hidden = complete_target_capture(
+                self.args.target_capture_policy.as_ref(),
+                hidden,
+                &boundary.captures.into_iter().map(Some).collect::<Vec<_>>(),
+                context,
+            )?;
             let logits = match parallel {
                 Some(parallel) => {
                     self.finish_partition_target_parallel(hidden, parallel, context)?
@@ -632,9 +678,9 @@ where
                 };
                 let captures = (0..self
                     .args
-                    .dspark
+                    .target_capture_policy
                     .as_ref()
-                    .map_or(0, |config| config.target_layer_ids.len()))
+                    .map_or(0, V4TargetCapturePolicy::len))
                     .map(|_| {
                         B::Tensor::full_f32(
                             0.0,
@@ -1200,6 +1246,7 @@ where
         if units.len() != caches.len() {
             return Err(Error::backend("DSpark unit/cache count mismatch"));
         }
+        validate_dspark_target_capture(&self.args, captures)?;
         let dspark = self
             .static_modules
             .dspark
@@ -1216,6 +1263,210 @@ where
             unit.prefill_attention_cache(&hidden, cache, context)?;
         }
         Ok(())
+    }
+
+    /// Rebuilds fused DSpark caches for an ordinary target using extension-owned modules.
+    pub fn pipeline_prefill_dspark_extension_context<C, M>(
+        &mut self,
+        strategy: &crate::prediction_extension::DsparkPredictionStrategy,
+        dspark: &mut DsparkStatic<B>,
+        units: &mut [M],
+        captures: &B::Tensor,
+        caches: &mut [C],
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<(), Error>
+    where
+        C: PoolingAttentionCache<B::Tensor>,
+        M: AsMut<Unit<B>>,
+    {
+        if self
+            .args
+            .target_capture_policy
+            .as_ref()
+            .map(V4TargetCapturePolicy::layer_ids)
+            != Some(strategy.target_layer_ids())
+        {
+            return Err(Error::backend(
+                "ordinary V4 target and DSpark extension capture policies differ",
+            ));
+        }
+        strategy
+            .validate_target_capture_shape(captures.shape())
+            .map_err(|error| Error::backend(error.to_string()))?;
+        if units.len() != caches.len() {
+            return Err(Error::backend("DSpark unit/cache count mismatch"));
+        }
+        let main = dspark
+            .main_norm
+            .forward(&dspark.main_projection.forward(captures, context)?, context)?;
+        let hidden = broadcast_streams::<B>(&main, &self.args, context)?;
+        for (unit, cache) in units.iter_mut().zip(caches) {
+            let Unit::Dspark(unit) = unit.as_mut() else {
+                return Err(Error::backend("DSpark context received a non-DSpark unit"));
+            };
+            unit.prefill_attention_cache(&hidden, cache, context)?;
+        }
+        Ok(())
+    }
+
+    /// Executes one fused proposal using extension-owned modules and target-owned vocabulary I/O.
+    pub fn pipeline_dspark_extension_proposal<C, M>(
+        &mut self,
+        strategy: &crate::prediction_extension::DsparkPredictionStrategy,
+        dspark: &mut DsparkStatic<B>,
+        units: &mut [M],
+        anchor: &B::Tensor,
+        capacity: usize,
+        caches: &mut [C],
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error>
+    where
+        C: PoolingAttentionCache<B::Tensor>,
+        M: AsMut<Unit<B>>,
+    {
+        strategy
+            .validate_proposal_capacity(capacity)
+            .map_err(|error| Error::backend(error.to_string()))?;
+        validate_dspark_proposal(strategy.config(), anchor, capacity)?;
+        if units.len() != caches.len() {
+            return Err(Error::backend("DSpark unit/cache count mismatch"));
+        }
+        let input_ids = if capacity == 1 {
+            anchor.clone()
+        } else {
+            let noise = B::Tensor::full_i32(
+                strategy.config().noise_token_id,
+                &[
+                    anchor.dim(0),
+                    i32::try_from(capacity - 1).map_err(Error::backend)?,
+                ],
+                context,
+            )?;
+            B::Tensor::concatenate(&[anchor.clone(), noise], 1, context)?
+        };
+        let embedded = self
+            .static_modules
+            .text
+            .embeddings
+            .forward(&input_ids, context)?;
+        let mut hidden = broadcast_streams::<B>(&embedded, &self.args, context)?;
+        for (unit, cache) in units.iter_mut().zip(caches) {
+            let Unit::Dspark(unit) = unit.as_mut() else {
+                return Err(Error::backend("DSpark proposal received a non-DSpark unit"));
+            };
+            let keys = (cache.offset() + i32::try_from(capacity).map_err(Error::backend)?)
+                .min(self.args.sliding_window);
+            let mask = B::Tensor::full_f32(
+                0.0,
+                &[i32::try_from(capacity).map_err(Error::backend)?, keys],
+                context,
+            )?;
+            hidden = unit.forward(&hidden, &input_ids, Some(&mask), Some(cache), context)?;
+        }
+        self.finish_dspark_extension_proposal(dspark, anchor, hidden, None, context)
+    }
+
+    /// Executes a tensor-partitioned fused proposal with target-owned vocabulary shards.
+    #[allow(clippy::too_many_arguments)]
+    pub fn pipeline_dspark_extension_proposal_neutral_parallel<C, M>(
+        &mut self,
+        strategy: &crate::prediction_extension::DsparkPredictionStrategy,
+        dspark: &mut DsparkStatic<B>,
+        units: &mut [M],
+        anchor: &B::Tensor,
+        capacity: usize,
+        caches: &mut [C],
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error>
+    where
+        C: PoolingAttentionCache<B::Tensor>,
+        M: AsMut<Unit<B>>,
+    {
+        strategy
+            .validate_proposal_capacity(capacity)
+            .map_err(|error| Error::backend(error.to_string()))?;
+        validate_dspark_proposal(strategy.config(), anchor, capacity)?;
+        if units.len() != caches.len() {
+            return Err(Error::backend("DSpark unit/cache count mismatch"));
+        }
+        let input_ids = if capacity == 1 {
+            anchor.clone()
+        } else {
+            let noise = B::Tensor::full_i32(
+                strategy.config().noise_token_id,
+                &[
+                    anchor.dim(0),
+                    i32::try_from(capacity - 1).map_err(Error::backend)?,
+                ],
+                context,
+            )?;
+            B::Tensor::concatenate(&[anchor.clone(), noise], 1, context)?
+        };
+        let embedded = B::vocabulary_parallel_lookup(
+            &mut self.static_modules.text.embeddings,
+            &input_ids,
+            EmbeddingLookupPolicy::Strict,
+            parallel,
+            context,
+        )?;
+        let mut hidden = broadcast_streams::<B>(&embedded, &self.args, context)?;
+        for (unit, cache) in units.iter_mut().zip(caches) {
+            let Unit::Dspark(unit) = unit.as_mut() else {
+                return Err(Error::backend("DSpark proposal received a non-DSpark unit"));
+            };
+            let keys = (cache.offset() + i32::try_from(capacity).map_err(Error::backend)?)
+                .min(self.args.sliding_window);
+            let mask = B::Tensor::full_f32(
+                0.0,
+                &[i32::try_from(capacity).map_err(Error::backend)?, keys],
+                context,
+            )?;
+            hidden = unit.forward_parallel(
+                &hidden,
+                &input_ids,
+                Some(&mask),
+                Some(cache),
+                context,
+                |value, context| B::sum_parallel(value, parallel, context),
+            )?;
+        }
+        self.finish_dspark_extension_proposal(dspark, anchor, hidden, Some(parallel), context)
+    }
+
+    fn finish_dspark_extension_proposal(
+        &mut self,
+        dspark: &mut DsparkStatic<B>,
+        anchor: &B::Tensor,
+        hidden: B::Tensor,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        let collapsed = dspark.hyper_head.forward(&hidden, context)?;
+        let normalized = dspark.output_norm.forward(&collapsed, context)?;
+        let mut logits = match parallel {
+            Some(parallel) => B::vocabulary_parallel_project(
+                self.static_modules
+                    .text
+                    .lm_head
+                    .as_mut()
+                    .expect("validated V4 models have an untied output head"),
+                &normalized,
+                parallel,
+                context,
+            )?,
+            None => self
+                .static_modules
+                .text
+                .lm_head
+                .as_mut()
+                .expect("validated V4 models have an untied output head")
+                .forward(&normalized, context)?,
+        };
+        let markov = dspark.markov_embedding.forward(anchor, context)?;
+        let adjustment = dspark.markov_output.forward(&markov, context)?;
+        logits = logits.add(&adjustment.broadcast_to(logits.shape(), context)?, context)?;
+        Ok(logits)
     }
 
     /// Executes one transactional fused DSpark proposal block.
@@ -1566,16 +1817,13 @@ where
                     provider,
                     context,
                 )?;
-                if let Some(config) = &self.args.dspark {
-                    if let Some(position) = config
-                        .target_layer_ids
-                        .iter()
-                        .position(|wanted| usize::try_from(*wanted).ok() == Some(index))
-                    {
-                        forward.captures[position] =
-                            Some(B::Tensor::mean_axis(&hidden, 2, false, context)?);
-                    }
-                }
+                capture_target_layer(
+                    self.args.target_capture_policy.as_ref(),
+                    index,
+                    &hidden,
+                    &mut forward.captures,
+                    context,
+                )?;
                 Ok(hidden)
             }
             Unit::Prediction(unit) if group > 0 => {
@@ -1669,16 +1917,13 @@ where
                     context,
                     |value, context| B::sum_parallel(value, parallel, context),
                 )?;
-                if let Some(config) = &self.args.dspark {
-                    if let Some(position) = config
-                        .target_layer_ids
-                        .iter()
-                        .position(|wanted| usize::try_from(*wanted).ok() == Some(index))
-                    {
-                        forward.captures[position] =
-                            Some(B::Tensor::mean_axis(&hidden, 2, false, context)?);
-                    }
-                }
+                capture_target_layer(
+                    self.args.target_capture_policy.as_ref(),
+                    index,
+                    &hidden,
+                    &mut forward.captures,
+                    context,
+                )?;
                 Ok(hidden)
             }
             Unit::Prediction(unit) if group > 0 => {
@@ -1768,17 +2013,15 @@ where
                     context,
                     observer,
                 )?;
-                if let Some(config) = &self.args.dspark {
-                    if let Some(position) = config
-                        .target_layer_ids
-                        .iter()
-                        .position(|wanted| usize::try_from(*wanted).ok() == Some(index))
-                    {
-                        let capture = B::Tensor::mean_axis(&output, 2, false, context)?;
-                        observer
-                            .observe(&format!("dspark.target_captures.{position}"), &capture)?;
-                        forward.captures[position] = Some(capture);
-                    }
+                if let Some(position) = self
+                    .args
+                    .target_capture_policy
+                    .as_ref()
+                    .and_then(|policy| policy.position(index))
+                {
+                    let capture = B::Tensor::mean_axis(&output, 2, false, context)?;
+                    observer.observe(&format!("dspark.target_captures.{position}"), &capture)?;
+                    forward.captures[position] = Some(capture);
                 }
                 Ok(output)
             }
@@ -1838,17 +2081,15 @@ where
                     context,
                     observer,
                 )?;
-                if let Some(config) = &self.args.dspark {
-                    if let Some(position) = config
-                        .target_layer_ids
-                        .iter()
-                        .position(|wanted| usize::try_from(*wanted).ok() == Some(index))
-                    {
-                        let capture = B::Tensor::mean_axis(&output, 2, false, context)?;
-                        observer
-                            .observe(&format!("dspark.target_captures.{position}"), &capture)?;
-                        forward.captures[position] = Some(capture);
-                    }
+                if let Some(position) = self
+                    .args
+                    .target_capture_policy
+                    .as_ref()
+                    .and_then(|policy| policy.position(index))
+                {
+                    let capture = B::Tensor::mean_axis(&output, 2, false, context)?;
+                    observer.observe(&format!("dspark.target_captures.{position}"), &capture)?;
+                    forward.captures[position] = Some(capture);
                 }
                 Ok(output)
             }
@@ -1992,7 +2233,13 @@ impl<B: HyperNeuralBackend + eredu_nn::DistributedNeuralBackend> DsparkStatic<B>
             main_projection: projection::<B>(
                 "mtp.0.main_proj.weight",
                 args.hidden_size
-                    * i32::try_from(config.target_layer_ids.len()).map_err(Error::backend)?,
+                    * i32::try_from(
+                        args.target_capture_policy
+                            .as_ref()
+                            .expect("validated DSpark target capture policy")
+                            .len(),
+                    )
+                    .map_err(Error::backend)?,
                 args.hidden_size,
                 args.linear_format_for("mtp.0.main_proj.weight"),
                 context,
@@ -2086,14 +2333,14 @@ where
         forward: &Self::ForwardContext,
     ) -> Result<Option<Vec<i32>>, Self::Error> {
         let input = forward.input_ids();
-        let shape = match &self.args.dspark {
-            Some(dspark) => vec![
+        let shape = match &self.args.target_capture_policy {
+            Some(policy) => vec![
                 input.dim(0),
                 input.dim(1),
-                i32::try_from(dspark.target_layer_ids.len())
-                    .map_err(|_| Error::backend("DSpark capture count exceeds i32"))?
+                i32::try_from(policy.len())
+                    .map_err(|_| Error::backend("target capture count exceeds i32"))?
                     .checked_mul(self.args.hidden_size)
-                    .ok_or_else(|| Error::backend("DSpark capture width overflowed"))?,
+                    .ok_or_else(|| Error::backend("target capture width overflowed"))?,
             ],
             None => vec![input.dim(0), input.dim(1), self.args.hidden_size],
         };
@@ -2191,6 +2438,7 @@ where
                 )
             }
             EmbeddedInput::DsparkContext { captures } => {
+                validate_dspark_target_capture(&self.args, captures)?;
                 let dspark = self
                     .static_modules
                     .dspark
@@ -2265,9 +2513,9 @@ where
                 draft_hidden: None,
                 captures: self
                     .args
-                    .dspark
+                    .target_capture_policy
                     .as_ref()
-                    .map_or_else(Vec::new, |config| vec![None; config.target_layer_ids.len()]),
+                    .map_or_else(Vec::new, |policy| vec![None; policy.len()]),
             },
         })
     }
@@ -2312,16 +2560,13 @@ where
                     Some(state.layer(index).map_err(Error::backend)?),
                     context,
                 )?;
-                if let Some(config) = &self.args.dspark {
-                    if let Some(position) = config
-                        .target_layer_ids
-                        .iter()
-                        .position(|wanted| usize::try_from(*wanted).ok() == Some(index))
-                    {
-                        forward.captures[position] =
-                            Some(B::Tensor::mean_axis(&hidden, 2, false, context)?);
-                    }
-                }
+                capture_target_layer(
+                    self.args.target_capture_policy.as_ref(),
+                    index,
+                    &hidden,
+                    &mut forward.captures,
+                    context,
+                )?;
                 Ok(hidden)
             }
             Unit::Prediction(unit) if group > 0 => {
@@ -2380,23 +2625,12 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
         if group == 0 && matches!(forward.mode, ForwardMode::Target) {
-            forward.target_capture = if self.args.dspark.is_some() {
-                Some(B::Tensor::concatenate(
-                    &forward
-                        .captures
-                        .iter()
-                        .map(|capture| {
-                            capture.clone().ok_or_else(|| {
-                                Error::backend("configured DSpark target capture was not produced")
-                            })
-                        })
-                        .collect::<Result<Vec<_>, _>>()?,
-                    -1,
-                    context,
-                )?)
-            } else {
-                Some(hidden.clone())
-            };
+            forward.target_capture = Some(complete_target_capture(
+                self.args.target_capture_policy.as_ref(),
+                hidden,
+                &forward.captures,
+                context,
+            )?);
         }
         if group == self.groups.prediction_count()
             && matches!(forward.mode, ForwardMode::DsparkProposal)
@@ -2549,6 +2783,7 @@ where
                 )
             }
             EmbeddedInput::DsparkContext { captures } => {
+                validate_dspark_target_capture(&self.args, captures)?;
                 let dspark = self
                     .static_modules
                     .dspark
@@ -2625,9 +2860,9 @@ where
                 draft_hidden: None,
                 captures: self
                     .args
-                    .dspark
+                    .target_capture_policy
                     .as_ref()
-                    .map_or_else(Vec::new, |config| vec![None; config.target_layer_ids.len()]),
+                    .map_or_else(Vec::new, |policy| vec![None; policy.len()]),
             },
         })
     }
@@ -2654,16 +2889,13 @@ where
                     context,
                     |value, context| B::sum_parallel(value, parallel, context),
                 )?;
-                if let Some(config) = &self.args.dspark {
-                    if let Some(position) = config
-                        .target_layer_ids
-                        .iter()
-                        .position(|wanted| usize::try_from(*wanted).ok() == Some(index))
-                    {
-                        forward.captures[position] =
-                            Some(B::Tensor::mean_axis(&hidden, 2, false, context)?);
-                    }
-                }
+                capture_target_layer(
+                    self.args.target_capture_policy.as_ref(),
+                    index,
+                    &hidden,
+                    &mut forward.captures,
+                    context,
+                )?;
                 Ok(hidden)
             }
             Unit::Prediction(unit) if group > 0 => {
@@ -2730,23 +2962,12 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
         if group == 0 && matches!(forward.mode, ForwardMode::Target) {
-            forward.target_capture = if self.args.dspark.is_some() {
-                Some(B::Tensor::concatenate(
-                    &forward
-                        .captures
-                        .iter()
-                        .map(|capture| {
-                            capture.clone().ok_or_else(|| {
-                                Error::backend("configured DSpark target capture was not produced")
-                            })
-                        })
-                        .collect::<Result<Vec<_>, _>>()?,
-                    -1,
-                    context,
-                )?)
-            } else {
-                Some(hidden.clone())
-            };
+            forward.target_capture = Some(complete_target_capture(
+                self.args.target_capture_policy.as_ref(),
+                hidden,
+                &forward.captures,
+                context,
+            )?);
         }
         if group == self.groups.prediction_count()
             && matches!(forward.mode, ForwardMode::DsparkProposal)

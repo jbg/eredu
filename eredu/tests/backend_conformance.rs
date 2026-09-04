@@ -45,18 +45,18 @@ use eredu_core::{
     ModelCapabilities, ModelCapabilityBackend, ModelLoadingBackend, ModelResourceProfile,
     ModelRuntime, MultimodalPreparationBackend, MultimodalPreparationFailure, MultimodalRequest,
     MultimodalSegment, ObservationSet, ObservationValue, Observed, PhysicalMemorySemantics,
-    PreparedModel, PreparedSpeculativeLane, ProposalDecision, RealizedDrafting, RealtimeBackend,
+    PreparedModel, PreparedSpeculativeLane, RealizedDrafting, RealtimeBackend,
     RealtimeFrameConvention, RealtimeInputFrame, RealtimeModelLoadingBackend, RealtimeOutputFrame,
     RealtimeSampling, RealtimeScheduler, RealtimeSpeechConfig, ResidencyPlan, RgbImage,
     RuntimeStateEstimate, SamplingPlacement, SemanticEvent, SessionCapabilities,
     SpeculativeCallbackPublisher, SpeculativeCapability, SpeculativeCommit, SpeculativeDraft,
-    SpeculativeDraftSource, SpeculativeExecutor, SpeculativeGenerationBackend,
-    SpeculativeGenerationBatchOutput, SpeculativeGenerationBatchRequest,
-    SpeculativeGenerationOutput, SpeculativeGenerationVisitor, SpeculativeOutputRuntime,
-    SpeculativePrefill, SpeculativeRandomness, SpeculativeSampling, SpeculativeSemanticConstraint,
-    SpeculativeTokenFilterController, StateMemoryLayout, StaticMemoryReport, Submission,
-    TextGenerationBackend, TextGenerationConfig, TokenFilter, TokenOutput, ValueDescriptor,
-    AUTOMATIC_SCHEMA_VERSION,
+    SpeculativeDraftRandomPosition, SpeculativeDraftSource, SpeculativeExecutor,
+    SpeculativeGenerationBackend, SpeculativeGenerationBatchOutput,
+    SpeculativeGenerationBatchRequest, SpeculativeGenerationOutput, SpeculativeGenerationVisitor,
+    SpeculativeOutputRuntime, SpeculativePrefill, SpeculativeRandomness, SpeculativeSampling,
+    SpeculativeSemanticConstraint, SpeculativeTokenFilterController, StateMemoryLayout,
+    StaticMemoryReport, Submission, TextGenerationBackend, TextGenerationConfig, TokenFilter,
+    TokenOutput, ValueDescriptor, AUTOMATIC_SCHEMA_VERSION,
 };
 use eredu_text::tokenizer::{ModelChatTemplate, Tokenizer as ChatTokenizer};
 use tokenizers::{
@@ -609,7 +609,7 @@ impl AutomaticPlanningBackend for MockBackend {
 
 impl ExecutionPlanBackendFactory for MockBackend {
     type Backend = Self;
-    type DrafterPreparation = eredu_architectures::ExternalAssistantPreparationPlan;
+    type DrafterPreparation = eredu_architectures::ExternalAssistantPreparation;
     type Drafter = MockDrafter;
 
     fn realize_target(
@@ -674,10 +674,7 @@ impl SpeculativeExecutor for MockSpeculativeExecutor {
         input: Self::Input,
         cache: &mut Self::Cache,
         _: Self::Context<'a>,
-    ) -> Result<SpeculativePrefill<Self::TargetState, Self::Logits>, Self::Error>
-    where
-        Self: 'a,
-    {
+    ) -> Result<SpeculativePrefill<Self::TargetState, Self::Logits>, Self::Error> {
         *cache = input.len();
         Ok(SpeculativePrefill::new(7, (), input.len()))
     }
@@ -701,8 +698,18 @@ impl SpeculativeExecutor for MockSpeculativeExecutor {
         Ok(11)
     }
 
-    fn checkpoint(cache: &Self::Cache) -> Self::CacheCheckpoint {
-        *cache
+    fn checkpoint(&self, cache: &Self::Cache) -> Result<Self::CacheCheckpoint, Self::Error> {
+        Ok(*cache)
+    }
+
+    fn restore_checkpoint<'a>(
+        &mut self,
+        cache: &mut Self::Cache,
+        checkpoint: &Self::CacheCheckpoint,
+        _: Self::Context<'a>,
+    ) -> Result<(), Self::Error> {
+        *cache = *checkpoint;
+        Ok(())
     }
 
     fn submit_verification<'a>(
@@ -719,13 +726,11 @@ impl SpeculativeExecutor for MockSpeculativeExecutor {
     }
 
     fn verification_logits<'a>(
+        &self,
         output: &Self::Verification,
         index: usize,
         _: Self::Context<'a>,
-    ) -> Result<Self::Logits, Self::Error>
-    where
-        Self: 'a,
-    {
+    ) -> Result<Self::Logits, Self::Error> {
         Ok(output[index])
     }
 
@@ -734,11 +739,11 @@ impl SpeculativeExecutor for MockSpeculativeExecutor {
         _: Self::Verification,
         _: Self::DraftState,
         cache: &mut Self::Cache,
-        checkpoint: Self::CacheCheckpoint,
+        checkpoint: &Self::CacheCheckpoint,
         verified_inputs: usize,
         _: Self::Context<'a>,
     ) -> Result<SpeculativeCommit<Self::TargetState>, Self::Error> {
-        *cache = checkpoint + verified_inputs;
+        *cache = *checkpoint + verified_inputs;
         Ok(SpeculativeCommit::new((), 0))
     }
 }
@@ -752,8 +757,39 @@ impl SpeculativeSampling for MockSpeculativeSampling {
     type Seed = ();
     type RandomState = ();
     type DraftRandomness = ();
+    type RandomnessRoot = ();
     type Context<'a> = ();
     type Error = MockError;
+
+    fn randomness_root<'a>(
+        _: Option<Self::Seed>,
+        _: Self::Context<'a>,
+    ) -> Result<Self::RandomnessRoot, Self::Error>
+    where
+        Self: 'a,
+    {
+        Ok(())
+    }
+
+    fn target_randomness_from_root<'a>(
+        _: &mut Self::RandomnessRoot,
+        _: Self::Context<'a>,
+    ) -> Result<Self::RandomState, Self::Error>
+    where
+        Self: 'a,
+    {
+        Ok(())
+    }
+
+    fn draft_randomness_from_root<'a>(
+        _: &mut Self::RandomnessRoot,
+        _: Self::Context<'a>,
+    ) -> Result<Self::DraftRandomness, Self::Error>
+    where
+        Self: 'a,
+    {
+        Ok(())
+    }
 
     fn initialize_randomness<'a>(
         _: Option<Self::Seed>,
@@ -768,7 +804,7 @@ impl SpeculativeSampling for MockSpeculativeSampling {
 
     fn draft_randomness_at<'a>(
         _: &Self::DraftRandomness,
-        _: usize,
+        _: SpeculativeDraftRandomPosition,
         _: Self::Context<'a>,
     ) -> Result<Self::RandomState, Self::Error>
     where
@@ -805,22 +841,44 @@ impl SpeculativeSampling for MockSpeculativeSampling {
         Ok(*distribution)
     }
 
-    fn decide_proposal<'a>(
+    fn probability_at<'a>(
         &self,
-        _: &Self::Distribution,
-        _: &Self::Distribution,
-        _: u32,
-        _: f32,
-        _: Option<&mut Self::RandomState>,
+        distribution: &Self::Distribution,
+        token: u32,
+        _: SamplingPlacement,
         _: Self::Context<'a>,
-    ) -> Result<ProposalDecision, Self::Error>
+    ) -> Result<f32, Self::Error>
     where
         Self: 'a,
     {
-        Ok(ProposalDecision::Accept)
+        Ok(f32::from(*distribution == token))
     }
 
-    fn commit_token<'a>(
+    fn sample_unit_interval<'a>(
+        &self,
+        _: Option<&mut Self::RandomState>,
+        _: Self::Context<'a>,
+    ) -> Result<f32, Self::Error>
+    where
+        Self: 'a,
+    {
+        Ok(0.0)
+    }
+
+    fn positive_probability_difference<'a>(
+        &self,
+        left: &Self::Distribution,
+        _: &Self::Distribution,
+        _: SamplingPlacement,
+        _: Self::Context<'a>,
+    ) -> Result<Option<Self::Distribution>, Self::Error>
+    where
+        Self: 'a,
+    {
+        Ok(Some(*left))
+    }
+
+    fn update_sampler_state<'a>(
         &mut self,
         _: &Self::Distribution,
         _: u32,
@@ -1287,7 +1345,7 @@ fn planned_loading_client_code<F>(
 )
 where
     F: ExecutionPlanBackendFactory<
-        DrafterPreparation = eredu_architectures::ExternalAssistantPreparationPlan,
+        DrafterPreparation = eredu_architectures::ExternalAssistantPreparation,
     >,
     F::Backend: TextGenerationBackend,
     <F::Backend as ModelLoadingBackend>::ConfigurationResolver:
@@ -1411,6 +1469,14 @@ fn assert_automatic_planning_conformance() {
     let mut planned = LoadedModel::load_execution_plan(&backend, artifact.path(), &external)
         .expect("generic plan loading realizes the external assistant");
     assert!(planned.drafting().is_external());
+    assert_eq!(planned.drafting_plan(), external.drafting());
+    let controls = planned
+        .speculative_generation_options()
+        .unwrap()
+        .expect("external plan retains speculative controls");
+    assert_eq!(controls.max_draft_tokens.get(), 4);
+    assert_eq!(controls.scheduler.lookahead_blocks, 1);
+    assert!(controls.scheduler.adaptive_lookahead);
     let (_, drafting) = planned.parts_mut();
     assert!(matches!(
         drafting.as_speculative_draft(),
