@@ -402,6 +402,15 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMoe<B> 
         layer: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
+        Self::new_with_spec(args, layer, expert_bank_spec(args, layer)?, context)
+    }
+
+    pub(crate) fn new_with_spec(
+        args: &DecoderConfig,
+        layer: usize,
+        spec: GroupedGatedProductSpec,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
         let prefix = format!("model.layers.{layer}.mlp");
         Ok(Self {
             router: B::top_k_group_selector(
@@ -422,7 +431,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMoe<B> 
                 )?,
                 context,
             )?,
-            experts: B::grouped_gated_product(expert_bank_spec(args, layer)?, context)?,
+            experts: B::grouped_gated_product(spec, context)?,
             hidden_size: args.hidden_size,
         })
     }
@@ -585,13 +594,17 @@ pub enum FeedForward<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBacken
 }
 
 impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> FeedForward<B> {
-    fn new(
+    fn new_with_routed_spec(
         args: &DecoderConfig,
         layer: usize,
+        routed_spec: Option<GroupedGatedProductSpec>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
         if args.is_moe() {
-            Ok(Self::Sparse(SparseMoe::new(args, layer, context)?))
+            Ok(Self::Sparse(match routed_spec {
+                Some(spec) => SparseMoe::new_with_spec(args, layer, spec, context)?,
+                None => SparseMoe::new(args, layer, context)?,
+            }))
         } else {
             Ok(Self::Dense(Mlp::new(args, layer, context)?))
         }
@@ -691,6 +704,15 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> TransformerBl
         layer: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
+        Self::new_with_routed_spec(args, layer, None, context)
+    }
+
+    pub(crate) fn new_with_routed_spec(
+        args: &DecoderConfig,
+        layer: usize,
+        routed_spec: Option<GroupedGatedProductSpec>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
         let root = format!("model.layers.{layer}");
         let centered = args.weight_convention == WeightConvention::HuggingFace;
         let norm = |field: &str, epsilon| {
@@ -705,7 +727,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> TransformerBl
         Ok(Self {
             layer,
             attention: Attention::new(args, layer, context)?,
-            feed_forward: FeedForward::new(args, layer, context)?,
+            feed_forward: FeedForward::new_with_routed_spec(args, layer, routed_spec, context)?,
             input_norm: norm("input_layernorm", args.rms_norm_eps)?,
             post_attention_norm: norm("post_attention_layernorm", args.post_norm_eps)?,
             pre_feed_forward_norm: norm("pre_feedforward_layernorm", args.rms_norm_eps)?,

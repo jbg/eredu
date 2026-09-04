@@ -154,6 +154,40 @@ impl Event {
         })
     }
 
+    /// Attempts a completion query without waiting for the process-wide MLX
+    /// runtime lock. `None` means another host call currently owns that lock;
+    /// it does not imply anything about device completion.
+    pub fn try_is_complete(&self) -> Result<Option<bool>> {
+        let Some(_guard) = runtime_lock::try_enter() else {
+            return Ok(None);
+        };
+        bool::try_from_op(|complete| unsafe {
+            safemlx_sys::mlx_event_query(complete, self.c_event)
+        })
+        .map(Some)
+    }
+
+    /// Runs `on_complete` under the same nonblocking runtime-lock acquisition
+    /// which observes exact event completion. This prevents another blocking
+    /// MLX host call from entering between the completion query and a required
+    /// materialized-result read.
+    pub fn try_with_complete<T>(
+        &self,
+        on_complete: impl FnOnce() -> Result<T>,
+    ) -> Result<Option<T>> {
+        let Some(_guard) = runtime_lock::try_enter() else {
+            return Ok(None);
+        };
+        let complete = bool::try_from_op(|complete| unsafe {
+            safemlx_sys::mlx_event_query(complete, self.c_event)
+        })?;
+        if complete {
+            on_complete().map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Order subsequently submitted work on `stream` after this event.
     ///
     /// The producer and consumer must have the same logical MLX device. The
@@ -212,5 +246,32 @@ impl std::fmt::Debug for Event {
             .field("device", &self.device())
             .field("complete", &self.is_complete())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn completion_query_does_not_wait_for_busy_runtime_lock() {
+        let event =
+            crate::transforms::async_eval_with_event(std::iter::empty::<&crate::Array>()).unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _guard = runtime_lock::enter();
+            ready_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        ready_rx.recv().unwrap();
+
+        let started = std::time::Instant::now();
+        assert_eq!(event.try_is_complete().unwrap(), None);
+        assert!(started.elapsed() < std::time::Duration::from_millis(50));
+
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        event.synchronize().unwrap();
     }
 }

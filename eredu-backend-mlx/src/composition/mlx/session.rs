@@ -25,9 +25,6 @@ use crate::{
     backend::runtime::generation::MlxSamplingBackend,
     backend::runtime::media::input,
     backend::{error::Error, MlxModelKind},
-    composition::mlx::distributed::pipeline::{
-        PipelineCache, PipelineModel, PipelineStageCompletion, PipelineStep,
-    },
     MlxTensor,
 };
 #[cfg(any(feature = "image", feature = "audio"))]
@@ -37,10 +34,7 @@ use eredu_core::SpeculativeCapability;
 use eredu_runtime::CacheResidencyPolicy;
 
 use super::{
-    execution::{
-        decode_model, decode_model_tensor_parallel, forward_model_tensor_parallel_with_observer,
-        prefill_model, prefill_model_tensor_parallel, prefill_model_tensor_parallel_with_observer,
-    },
+    execution::{decode_model, prefill_model},
     speculative::{MlxDrafter, MlxDrafterKind},
     Executable, MlxBackend, MlxCompletion, MlxDistributedSession, MlxModel,
 };
@@ -365,7 +359,6 @@ enum MlxSessionCompletionKind {
         completion: MlxCompletion,
         token_validations: TokenValidationBatch,
     },
-    Pipeline(PipelineStageCompletion),
 }
 
 impl Completion for MlxSessionCompletion {
@@ -374,7 +367,6 @@ impl Completion for MlxSessionCompletion {
     fn is_complete(&self) -> Result<bool, Self::Error> {
         match &self.inner {
             MlxSessionCompletionKind::Model { completion, .. } => completion.is_complete(),
-            MlxSessionCompletionKind::Pipeline(completion) => completion.is_complete(),
         }
     }
 
@@ -387,7 +379,6 @@ impl Completion for MlxSessionCompletion {
                 completion.wait()?;
                 token_validations.validate_completed().map_err(Into::into)
             }
-            MlxSessionCompletionKind::Pipeline(completion) => completion.synchronize(),
         }
     }
 }
@@ -457,10 +448,10 @@ impl MlxModelInput {
 /// Cache state and optional communication belong to the same selected model
 /// session so callers cannot accidentally execute a sharded model with an
 /// unrelated communicator.
-pub struct MlxModelSession<'a> {
+pub struct MlxModelSession {
     inner: MlxSessionKind,
     floating_state_dtype_bytes: std::num::NonZeroU8,
-    distributed: Option<MlxDistributedSession<'a>>,
+    distributed: Option<MlxDistributedSession>,
     capabilities: eredu_core::SessionCapabilities,
     state_residency: CacheResidencyPolicy,
     #[cfg(any(feature = "image", feature = "audio"))]
@@ -469,49 +460,20 @@ pub struct MlxModelSession<'a> {
 
 enum MlxSessionKind {
     Complete(Executable),
-    Pipeline(
-        crate::composition::mlx::distributed::pipeline::PipelineModel,
-        PipelineCache,
-    ),
 }
 
-pub(super) enum MlxSpeculativeSessionParts<'session, 'world> {
-    Complete {
-        model: &'session mut Executable,
-        execution: Option<&'session MlxDistributedSession<'world>>,
-    },
-    Pipeline {
-        model: &'session mut PipelineModel,
-        execution: &'session MlxDistributedSession<'world>,
-    },
+pub(super) enum MlxSpeculativeSessionParts<'session> {
+    Complete { model: &'session mut Executable },
 }
 
-impl<'a> MlxModelSession<'a> {
+impl MlxModelSession {
     /// Creates a session and validates that its communicator matches the model topology.
     pub(crate) fn from_model(
         model: MlxModel,
-        distributed: Option<MlxDistributedSession<'a>>,
         admitted_capabilities: eredu_core::SessionCapabilities,
     ) -> Result<Self, Error> {
         let floating_state_dtype_bytes = model.floating_state_dtype_bytes();
         let state_residency = model.state_residency().clone();
-        let topology = model.topology();
-        match (topology, distributed.as_ref()) {
-            (None, None) => {}
-            (Some(expected), Some(session)) => {
-                super::distributed::topology::validate_session(expected, session)?;
-            }
-            (Some(_), None) => {
-                return Err(Error::Parallel(
-                    "distributed MLX model has no session-owned communication".into(),
-                ))
-            }
-            (None, Some(_)) => {
-                return Err(Error::Parallel(
-                    "replicated MLX model cannot own distributed communication".into(),
-                ))
-            }
-        }
         #[cfg(any(feature = "image", feature = "audio"))]
         let mut model = model;
         #[cfg(any(feature = "image", feature = "audio"))]
@@ -523,10 +485,6 @@ impl<'a> MlxModelSession<'a> {
                     .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
                 MlxSessionKind::Complete(model)
             }
-            MlxModelKind::Pipeline(model) => {
-                let cache = model.new_cache_with_options(state_residency.clone())?;
-                MlxSessionKind::Pipeline(model, cache)
-            }
         };
         let realized_capabilities = eredu_core::SessionCapabilities::new(true, true, true);
         if admitted_capabilities != realized_capabilities {
@@ -537,7 +495,7 @@ impl<'a> MlxModelSession<'a> {
         Ok(Self {
             inner,
             floating_state_dtype_bytes,
-            distributed,
+            distributed: None,
             capabilities: realized_capabilities,
             state_residency,
             #[cfg(any(feature = "image", feature = "audio"))]
@@ -558,14 +516,12 @@ impl<'a> MlxModelSession<'a> {
     pub(crate) fn model_family(&self) -> eredu_architectures::ModelKind {
         match &self.inner {
             MlxSessionKind::Complete(model) => model.model_family(),
-            MlxSessionKind::Pipeline(model, _) => model.model_family(),
         }
     }
 
     pub(crate) fn effective_model_type(&self) -> &str {
         match &self.inner {
             MlxSessionKind::Complete(model) => model.effective_model_type(),
-            MlxSessionKind::Pipeline(model, _) => model.effective_model_type(),
         }
     }
 
@@ -573,7 +529,6 @@ impl<'a> MlxModelSession<'a> {
     pub fn speculative_capability(&self) -> SpeculativeCapability {
         match &self.inner {
             MlxSessionKind::Complete(model) => model.speculative_capability(),
-            MlxSessionKind::Pipeline(model, _) => model.speculative_capability(),
         }
     }
 
@@ -581,7 +536,6 @@ impl<'a> MlxModelSession<'a> {
     pub fn residency_report(&self) -> Result<Option<eredu_runtime::ResidencyReport>, Error> {
         match &self.inner {
             MlxSessionKind::Complete(model) => model.residency_report(),
-            MlxSessionKind::Pipeline(model, _) => model.parameter_residency_report(),
         }
     }
 
@@ -591,7 +545,6 @@ impl<'a> MlxModelSession<'a> {
     ) -> Result<Option<eredu_runtime::DenseDiskStreamReport>, Error> {
         match &self.inner {
             MlxSessionKind::Complete(model) => model.dense_stream_report(),
-            MlxSessionKind::Pipeline(model, _) => model.dense_stream_report(),
         }
     }
 
@@ -604,7 +557,6 @@ impl<'a> MlxModelSession<'a> {
     > {
         match &self.inner {
             MlxSessionKind::Complete(model) => model.parameter_bank_report(),
-            MlxSessionKind::Pipeline(model, _) => model.parameter_bank_report(),
         }
     }
 
@@ -616,7 +568,6 @@ impl<'a> MlxModelSession<'a> {
             MlxSessionKind::Complete(model) => {
                 model.prompt_cache_model_identity().map_err(Into::into)
             }
-            MlxSessionKind::Pipeline(model, _) => model.prompt_cache_model_identity(),
         }
     }
 
@@ -641,13 +592,16 @@ impl<'a> MlxModelSession<'a> {
                         .prove_compatibility(target.args())
                         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
                 }
+                Executable::ReplicatedText(_, target)
+                    if target
+                        .external_prediction_capture_request(drafter)?
+                        .is_some() => {}
                 model @ (Executable::DeepSeek(_, _, _)
                 | Executable::Gemma4(_, _, _)
                 | Executable::GptOss(_, _, _)
                 | Executable::Inkling(_, _, _)
                 | Executable::KimiLinear(_, _, _)
                 | Executable::Lfm2(_, _, _)
-                | Executable::PartitionedLlama(_, _, _)
                 | Executable::ReplicatedText(_, _)
                 | Executable::MuseGlimmer(_, _, _)
                 | Executable::NemotronH(_, _, _)
@@ -662,11 +616,6 @@ impl<'a> MlxModelSession<'a> {
                     )))
                 }
             },
-            MlxSessionKind::Pipeline(_, _) => {
-                return Err(Error::Speculative(
-                    "external drafting is unavailable for pipeline sessions".into(),
-                ))
-            }
         }
         Ok(())
     }
@@ -677,7 +626,6 @@ impl<'a> MlxModelSession<'a> {
     {
         match &self.inner {
             MlxSessionKind::Complete(model) => model.architecture_capability_estimate(),
-            MlxSessionKind::Pipeline(model, _) => model.capability_estimate(),
         }
     }
 
@@ -688,47 +636,45 @@ impl<'a> MlxModelSession<'a> {
     {
         match &self.inner {
             MlxSessionKind::Complete(model) => model.prepared_input_part_plan(input),
-            MlxSessionKind::Pipeline(model, _) => model.prepared_input_part_plan(input),
         }
     }
 
     pub(super) fn speculative_parts_mut(
         &mut self,
-    ) -> Result<MlxSpeculativeSessionParts<'_, 'a>, Error> {
+    ) -> Result<MlxSpeculativeSessionParts<'_>, Error> {
         match &mut self.inner {
-            MlxSessionKind::Complete(model) => Ok(MlxSpeculativeSessionParts::Complete {
-                model,
-                execution: self.distributed.as_ref(),
-            }),
-            MlxSessionKind::Pipeline(model, _) => {
-                let execution = self.distributed.as_ref().ok_or_else(|| {
-                    Error::Parallel(
-                        "pipeline speculative execution requires session-owned communication"
-                            .into(),
-                    )
-                })?;
-                Ok(MlxSpeculativeSessionParts::Pipeline { model, execution })
-            }
+            MlxSessionKind::Complete(model) => Ok(MlxSpeculativeSessionParts::Complete { model }),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn neutral_prediction_target_mut(
+        &mut self,
+    ) -> Result<&mut dyn super::replicated_text::ErasedReplicatedTextExecutable, Error> {
+        match &mut self.inner {
+            MlxSessionKind::Complete(Executable::ReplicatedText(_, target)) => Ok(target.as_mut()),
+            MlxSessionKind::Complete(model) => Err(Error::ArchitectureModel(format!(
+                "test session retained a non-neutral prediction target for {}",
+                model.effective_model_type()
+            ))),
         }
     }
 
     /// Clears all MLX cache state under the authoritative selected policy.
     pub fn reset(&mut self) -> Result<(), Error> {
-        match &mut self.inner {
-            MlxSessionKind::Complete(model) => model
-                .reset_cache_with_options(self.state_residency.clone())
-                .map_err(Into::into),
-            MlxSessionKind::Pipeline(model, cache) => {
-                *cache = model.new_cache_with_options(self.state_residency.clone())?;
-                Ok(())
-            }
+        let MlxSessionKind::Complete(model) = &mut self.inner;
+        if model.has_neutral_partitioned_control() {
+            return model.reset_cache_distributed().map_err(Into::into);
         }
+        model
+            .reset_cache_with_options(self.state_residency.clone())
+            .map_err(Into::into)
     }
 
     /// Submits one cached decode position from a portable token id.
     pub fn submit_token_decode(
         &mut self,
-        backend: &MlxBackend<'a>,
+        backend: &MlxBackend<'_>,
         token_id: u32,
     ) -> Result<Submission<MlxModelOutput, MlxSessionCompletion>, Error> {
         let token_ids = [token_id];
@@ -745,20 +691,27 @@ impl<'a> MlxModelSession<'a> {
             MlxSessionKind::Complete(model) => model
                 .cache_residency_report()
                 .map_err(|error| Error::Parallel(error.to_string())),
-            MlxSessionKind::Pipeline(model, cache) => model.cache_residency_report(cache),
         }
     }
 
     /// Atomically persists the completed prefix owned by this session.
     pub fn save_prompt_cache(
         &mut self,
-        backend: &MlxBackend<'a>,
+        backend: &MlxBackend<'_>,
         root: impl AsRef<Path>,
         descriptor: PromptCacheDescriptor,
         prefix_token_ids: &[u32],
         options: &PromptCacheOptions,
     ) -> Result<PromptCacheManifest, Error> {
+        let root = root.as_ref();
         match &mut self.inner {
+            MlxSessionKind::Complete(model) if model.has_neutral_partitioned_control() => model
+                .save_prompt_cache_distributed(root, descriptor, prefix_token_ids, options)?
+                .ok_or_else(|| {
+                    Error::ArchitectureModel(
+                        "this partition rank owns no prompt-cache state".into(),
+                    )
+                }),
             MlxSessionKind::Complete(model) => model
                 .save_prompt_cache(
                     root,
@@ -768,25 +721,18 @@ impl<'a> MlxModelSession<'a> {
                     backend.stream(),
                 )
                 .map_err(Into::into),
-            MlxSessionKind::Pipeline(model, cache) => model.save_prompt_cache(
-                cache,
-                root,
-                descriptor,
-                prefix_token_ids,
-                options,
-                backend.stream(),
-            ),
         }
     }
 
     /// Opens a compatible persisted prefix and replaces this session's cache.
     pub fn load_prompt_cache(
         &mut self,
-        backend: &MlxBackend<'a>,
+        backend: &MlxBackend<'_>,
         root: impl AsRef<Path>,
         expected: &PromptCacheDescriptor,
         prefix_token_ids: &[u32],
     ) -> Result<PromptCacheManifest, Error> {
+        let root = root.as_ref();
         let CacheResidencyPolicy::Paged(options) = &self.state_residency else {
             return Err(Error::ArchitectureModel(
                 "prompt-cache loading requires paged state selected during preparation".into(),
@@ -794,6 +740,13 @@ impl<'a> MlxModelSession<'a> {
         };
         let options = options.clone();
         let manifest = match &mut self.inner {
+            MlxSessionKind::Complete(model) if model.has_neutral_partitioned_control() => model
+                .load_prompt_cache_distributed(root, expected, prefix_token_ids)?
+                .ok_or_else(|| {
+                    Error::ArchitectureModel(
+                        "this partition rank owns no prompt-cache state".into(),
+                    )
+                })?,
             MlxSessionKind::Complete(model) => model.load_prompt_cache(
                 root,
                 expected,
@@ -801,17 +754,6 @@ impl<'a> MlxModelSession<'a> {
                 options,
                 backend.stream(),
             )?,
-            MlxSessionKind::Pipeline(model, cache) => {
-                let (loaded_cache, manifest) = model.load_prompt_cache(
-                    root,
-                    expected,
-                    prefix_token_ids,
-                    options,
-                    backend.stream(),
-                )?;
-                *cache = loaded_cache;
-                manifest
-            }
         };
         Ok(manifest)
     }
@@ -819,7 +761,7 @@ impl<'a> MlxModelSession<'a> {
     /// Opens a persisted prefix only when it matches an exact prepared input.
     pub fn load_prompt_cache_for_input(
         &mut self,
-        backend: &MlxBackend<'a>,
+        backend: &MlxBackend<'_>,
         root: impl AsRef<Path>,
         expected: &PromptCacheDescriptor,
         prefix_token_ids: &[u32],
@@ -835,7 +777,20 @@ impl<'a> MlxModelSession<'a> {
                 "prompt-cache loading requires paged state selected during preparation".into(),
             ));
         };
+        let root = root.as_ref();
         match &mut self.inner {
+            MlxSessionKind::Complete(model) if model.has_neutral_partitioned_control() => model
+                .load_prompt_cache_for_input_distributed(
+                    root,
+                    expected,
+                    prefix_token_ids,
+                    identity,
+                )?
+                .ok_or_else(|| {
+                    Error::ArchitectureModel(
+                        "this partition rank owns no prompt-cache state".into(),
+                    )
+                }),
             MlxSessionKind::Complete(model) => model
                 .load_prompt_cache_for_input(
                     root,
@@ -846,15 +801,21 @@ impl<'a> MlxModelSession<'a> {
                     backend.stream(),
                 )
                 .map_err(Into::into),
-            MlxSessionKind::Pipeline(_, _) => Err(Error::ArchitectureModel(
-                "prepared-input cache loading is unavailable for pipeline sessions".into(),
-            )),
         }
     }
 
     /// Returns communication when this is a distributed session.
-    pub const fn distributed(&self) -> Option<&MlxDistributedSession<'a>> {
+    pub const fn distributed(&self) -> Option<&MlxDistributedSession> {
         self.distributed.as_ref()
+    }
+
+    fn synchronizes_sampling(&self) -> bool {
+        self.distributed.is_some()
+            || matches!(
+                &self.inner,
+                MlxSessionKind::Complete(Executable::ReplicatedText(_, executable))
+                    if executable.partition_sampling_context().is_some()
+            )
     }
 
     /// Samples on the canonical rank and synchronizes the result for this
@@ -869,36 +830,25 @@ impl<'a> MlxModelSession<'a> {
         prng_state: Option<&mut RandomState>,
         finished: bool,
     ) -> Result<crate::backend::runtime::distributed::parallel::SynchronizedToken, Error> {
-        let distributed = self.distributed.as_ref().ok_or_else(|| {
-            Error::Parallel("sampling synchronization requires a distributed model session".into())
-        })?;
         match &self.inner {
-            MlxSessionKind::Pipeline(model, _) => model.sample_and_synchronize_token(
-                logits.map(MlxTensor::as_array),
-                batch_size,
-                sampler,
-                temperature,
-                prng_state,
-                finished,
-                distributed,
-            ),
             MlxSessionKind::Complete(model) => {
-                let topology = model
-                    .parallel_info()
-                    .map(|info| info.topology())
-                    .ok_or_else(|| {
+                if self.distributed.is_some() {
+                    return Err(Error::Parallel(
+                        "complete-model execution has no distributed production path".into(),
+                    ));
+                }
+                let Executable::ReplicatedText(_, executable) = model else {
+                    return Err(Error::Parallel(
+                        "sampling synchronization requires a distributed model session".into(),
+                    ));
+                };
+                let (group, authority, stream, sampling_rank) =
+                    executable.partition_sampling_context().ok_or_else(|| {
                         Error::Parallel(
-                            "distributed complete-model sampling requires selected topology".into(),
+                            "sampling synchronization requires a distributed model session".into(),
                         )
                     })?;
-                let sampling_rank =
-                    topology.global_rank_for(eredu_core::ParallelCoordinates::new(
-                        0,
-                        topology.pipeline_parallel_size() - 1,
-                        0,
-                        topology.data_parallel_rank(),
-                    ))?;
-                distributed.sample_and_synchronize_on_rank(
+                crate::backend::runtime::distributed::parallel::sample_and_synchronize_bounded(
                     logits,
                     batch_size,
                     sampler,
@@ -906,6 +856,9 @@ impl<'a> MlxModelSession<'a> {
                     prng_state,
                     finished,
                     sampling_rank,
+                    group,
+                    authority,
+                    stream,
                 )
             }
         }
@@ -968,9 +921,6 @@ impl<'a> MlxModelSession<'a> {
             Executable::Lfm2(_, model, cache) => {
                 model.forward_with_observer(input_tokens, mask, cache, stream, &mut observer)
             }
-            Executable::PartitionedLlama(_, model, cache) => {
-                model.forward_with_observer(input_tokens, mask, cache, stream, &mut observer)
-            }
             Executable::ReplicatedText(_, model) => {
                 model.forward_with_observer(input_tokens, mask, stream, &mut observer)
             }
@@ -1018,34 +968,24 @@ impl<'a> MlxModelSession<'a> {
     /// Submits instrumented prefill through this selected MLX session.
     pub fn submit_prefill_with_observer(
         &mut self,
-        backend: &MlxBackend<'a>,
+        backend: &MlxBackend<'_>,
         input: MlxModelInput,
         observer: &mut impl RuntimeActivationObserver<MlxTensor, Exception>,
     ) -> Result<Submission<Array, MlxCompletion>, Error> {
         match &mut self.inner {
-            MlxSessionKind::Complete(model) => match &self.distributed {
-                Some(distributed) => {
-                    let output = input.with_borrowed(|input| {
-                        prefill_model_tensor_parallel_with_observer(
-                            model,
-                            input,
-                            distributed,
-                            backend.stream(),
-                            observer,
-                        )
-                    })?;
-                    MlxCompletion::submission(output)
+            MlxSessionKind::Complete(model) => {
+                if self.distributed.is_some() {
+                    return Err(Error::Parallel(
+                        "complete-model execution has no distributed production path".into(),
+                    ));
                 }
-                None => Self::submit_complete_prefill_with_observer(
+                Self::submit_complete_prefill_with_observer(
                     model,
                     input,
                     backend.stream(),
                     observer,
-                ),
-            },
-            MlxSessionKind::Pipeline(_, _) => unreachable!(
-                "pipeline prefill inspection is dispatched through the pipeline executor"
-            ),
+                )
+            }
         }
     }
 
@@ -1122,16 +1062,6 @@ impl<'a> MlxModelSession<'a> {
                         &mut ArrayObserverAdapter { inner: observer },
                     )?
                 }
-                Executable::PartitionedLlama(_, family, cache) => {
-                    let tokens = input::text_token_ids(input, stream)?;
-                    family.forward_with_observer(
-                        &tokens,
-                        None,
-                        cache,
-                        stream,
-                        &mut ArrayObserverAdapter { inner: observer },
-                    )?
-                }
                 Executable::ReplicatedText(_, _) => unreachable!(
                     "replicated observed prefill returned through neutral output selection"
                 ),
@@ -1185,53 +1115,39 @@ impl<'a> MlxModelSession<'a> {
 
     fn submit_decode_with_observer(
         &mut self,
-        backend: &MlxBackend<'a>,
+        backend: &MlxBackend<'_>,
         input: Array,
         observer: &mut impl RuntimeActivationObserver<MlxTensor, Exception>,
     ) -> Result<Submission<Array, MlxCompletion>, Error> {
         match &mut self.inner {
             MlxSessionKind::Complete(model) => {
-                let output = match &self.distributed {
-                    Some(distributed) => forward_model_tensor_parallel_with_observer(
-                        model,
+                if self.distributed.is_some() {
+                    return Err(Error::Parallel(
+                        "complete-model execution has no distributed production path".into(),
+                    ));
+                }
+                let output = match model {
+                    Executable::ReplicatedText(_, family) => family.decode_with_observer(
                         &input,
-                        distributed
-                            .selected_group(crate::backend::distributed::SHARD_GROUP_ID)
-                            .ok_or_else(|| {
-                                Error::Parallel(
-                                    "tensor-parallel model session has no tensor communicator"
-                                        .into(),
-                                )
-                            })?,
+                        backend.stream(),
+                        &mut ArrayObserverAdapter { inner: observer },
+                    )?,
+                    other => Self::forward_with_observer(
+                        other,
+                        &input,
+                        None,
                         backend.stream(),
                         observer,
-                    )?,
-                    None => match model {
-                        Executable::ReplicatedText(_, family) => family.decode_with_observer(
-                            &input,
-                            backend.stream(),
-                            &mut ArrayObserverAdapter { inner: observer },
-                        )?,
-                        other => Self::forward_with_observer(
-                            other,
-                            &input,
-                            None,
-                            backend.stream(),
-                            observer,
-                        )?
-                        .try_index_device((.., -1, ..), backend.stream())?,
-                    },
+                    )?
+                    .try_index_device((.., -1, ..), backend.stream())?,
                 };
                 MlxCompletion::submission(output)
             }
-            MlxSessionKind::Pipeline(_, _) => unreachable!(
-                "pipeline decode inspection is dispatched through the pipeline executor"
-            ),
         }
     }
 }
 
-impl<'a> BackendSession<MlxBackend<'a>> for MlxModelSession<'a> {
+impl<'a> BackendSession<MlxBackend<'a>> for MlxModelSession {
     type PrefillInput = MlxModelInput;
     type DecodeInput = Array;
     type Output = MlxModelOutput;
@@ -1248,55 +1164,21 @@ impl<'a> BackendSession<MlxBackend<'a>> for MlxModelSession<'a> {
     ) -> Result<Submission<Self::Output, Self::Completion>, Error> {
         match &mut self.inner {
             MlxSessionKind::Complete(model) => {
+                if self.distributed.is_some() {
+                    return Err(Error::Parallel(
+                        "complete-model execution has no distributed production path".into(),
+                    ));
+                }
                 let token_validation_scope = TokenValidationScope::begin()?;
-                let output = match &self.distributed {
-                    Some(distributed) => input.with_borrowed(|input| {
-                        prefill_model_tensor_parallel(model, input, distributed, backend.stream())
-                    })?,
-                    None => input
-                        .with_borrowed(|input| prefill_model(model, input, backend.stream()))?,
+                let output =
+                    input.with_borrowed(|input| prefill_model(model, input, backend.stream()))?;
+                let public_output = match model {
+                    Executable::ReplicatedText(_, executable) => {
+                        executable.partition_public_output()
+                    }
+                    _ => true,
                 };
-                model_submission(output, token_validation_scope.finish())
-            }
-            MlxSessionKind::Pipeline(model, cache) => {
-                let distributed = self.distributed.as_ref().ok_or_else(|| {
-                    Error::Parallel("pipeline model session has no communication".into())
-                })?;
-                let completion = input.with_borrowed(|borrowed| {
-                    if model.requires_embedded_mtp_prefill() {
-                        return model.prefill_distributed_with_embedded_mtp(
-                            borrowed,
-                            cache,
-                            distributed,
-                            None,
-                        );
-                    }
-                    let multimodal = borrowed
-                        .parts
-                        .iter()
-                        .any(|part| part.modality() != InputModality::Text);
-                    if multimodal {
-                        let step = model.prepared_input_step(borrowed)?;
-                        model.prefill_distributed(
-                            model.stage_info().owns_input().then_some(borrowed),
-                            step,
-                            None,
-                            cache,
-                            distributed,
-                        )
-                    } else {
-                        let tokens = input::text_token_ids(borrowed, backend.stream())?;
-                        let step = PipelineStep::new(tokens.dim(0), tokens.dim(1))?;
-                        model.forward_distributed(
-                            model.stage_info().owns_input().then_some(&tokens),
-                            step,
-                            None,
-                            cache,
-                            distributed,
-                        )
-                    }
-                })?;
-                pipeline_submission(completion)
+                model_submission(output, token_validation_scope.finish(), public_output)
             }
         }
     }
@@ -1308,28 +1190,20 @@ impl<'a> BackendSession<MlxBackend<'a>> for MlxModelSession<'a> {
     ) -> Result<Submission<Self::Output, Self::Completion>, Error> {
         match &mut self.inner {
             MlxSessionKind::Complete(model) => {
+                if self.distributed.is_some() {
+                    return Err(Error::Parallel(
+                        "complete-model execution has no distributed production path".into(),
+                    ));
+                }
                 let token_validation_scope = TokenValidationScope::begin()?;
-                let output = match &self.distributed {
-                    Some(distributed) => {
-                        decode_model_tensor_parallel(model, &input, distributed, backend.stream())?
+                let output = decode_model(model, &input, backend.stream())?;
+                let public_output = match model {
+                    Executable::ReplicatedText(_, executable) => {
+                        executable.partition_public_output()
                     }
-                    None => decode_model(model, &input, backend.stream())?,
+                    _ => true,
                 };
-                model_submission(output, token_validation_scope.finish())
-            }
-            MlxSessionKind::Pipeline(model, cache) => {
-                let distributed = self.distributed.as_ref().ok_or_else(|| {
-                    Error::Parallel("pipeline model session has no communication".into())
-                })?;
-                let step = PipelineStep::new(input.dim(0), input.dim(1))?;
-                let completion = model.forward_distributed(
-                    model.stage_info().owns_input().then_some(&input),
-                    step,
-                    None,
-                    cache,
-                    distributed,
-                )?;
-                pipeline_submission(completion)
+                model_submission(output, token_validation_scope.finish(), public_output)
             }
         }
     }
@@ -1352,7 +1226,7 @@ impl<'a> BackendSession<MlxBackend<'a>> for MlxModelSession<'a> {
     }
 }
 
-impl<'a> InspectableBackendSession<MlxBackend<'a>> for MlxModelSession<'a> {
+impl<'a> InspectableBackendSession<MlxBackend<'a>> for MlxModelSession {
     fn inspect_prefill(
         &mut self,
         backend: &MlxBackend<'a>,
@@ -1367,52 +1241,14 @@ impl<'a> InspectableBackendSession<MlxBackend<'a>> for MlxModelSession<'a> {
                 let logits = submission.wait()?;
                 MlxModelOutput::new(Some(MlxTensor::from_array(logits)))
             }
-            MlxSessionKind::Pipeline(model, cache) => {
-                let distributed = self.distributed.as_ref().ok_or_else(|| {
-                    Error::Parallel("pipeline model session has no communication".into())
-                })?;
-                let completion = input.with_borrowed(|borrowed| {
-                    let mut observer = ArrayObserverAdapter {
-                        inner: &mut collector,
-                    };
-                    if model.requires_embedded_mtp_prefill() {
-                        return model.prefill_distributed_with_embedded_mtp(
-                            borrowed,
-                            cache,
-                            distributed,
-                            Some(&mut observer),
-                        );
-                    }
-                    let multimodal = borrowed
-                        .parts
-                        .iter()
-                        .any(|part| part.modality() != InputModality::Text);
-                    if multimodal {
-                        let step = model.prepared_input_step(borrowed)?;
-                        model.prefill_distributed_with_observer(
-                            model.stage_info().owns_input().then_some(borrowed),
-                            step,
-                            None,
-                            cache,
-                            distributed,
-                            &mut observer,
-                        )
-                    } else {
-                        let tokens = input::text_token_ids(borrowed, backend.stream())?;
-                        let step = PipelineStep::new(tokens.dim(0), tokens.dim(1))?;
-                        model.forward_distributed_with_observer(
-                            model.stage_info().owns_input().then_some(&tokens),
-                            step,
-                            None,
-                            cache,
-                            distributed,
-                            &mut observer,
-                        )
-                    }
-                })?;
-                completion.synchronize()?;
-                MlxModelOutput::new(completion.logits().cloned().map(MlxTensor::from_array))
+        };
+        let output = match &self.inner {
+            MlxSessionKind::Complete(Executable::ReplicatedText(_, executable))
+                if !executable.partition_public_output() =>
+            {
+                MlxModelOutput::new(None)
             }
+            _ => output,
         };
         let observations = collector.materialize(backend.stream())?;
         Ok(InspectedOutput {
@@ -1435,25 +1271,14 @@ impl<'a> InspectableBackendSession<MlxBackend<'a>> for MlxModelSession<'a> {
                 let logits = submission.wait()?;
                 MlxModelOutput::new(Some(MlxTensor::from_array(logits)))
             }
-            MlxSessionKind::Pipeline(model, cache) => {
-                let distributed = self.distributed.as_ref().ok_or_else(|| {
-                    Error::Parallel("pipeline model session has no communication".into())
-                })?;
-                let step = PipelineStep::new(input.dim(0), input.dim(1))?;
-                let mut observer = ArrayObserverAdapter {
-                    inner: &mut collector,
-                };
-                let completion = model.forward_distributed_with_observer(
-                    model.stage_info().owns_input().then_some(&input),
-                    step,
-                    None,
-                    cache,
-                    distributed,
-                    &mut observer,
-                )?;
-                completion.synchronize()?;
-                MlxModelOutput::new(completion.logits().cloned().map(MlxTensor::from_array))
+        };
+        let output = match &self.inner {
+            MlxSessionKind::Complete(Executable::ReplicatedText(_, executable))
+                if !executable.partition_public_output() =>
+            {
+                MlxModelOutput::new(None)
             }
+            _ => output,
         };
         let observations = collector.materialize(backend.stream())?;
         Ok(InspectedOutput {
@@ -1553,7 +1378,7 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
 }
 
 fn sample_text_submission(
-    session: &MlxModelSession<'_>,
+    session: &MlxModelSession,
     submission: Submission<MlxModelOutput, MlxSessionCompletion>,
     filter: &TokenFilter,
     state: &mut MlxTextGenerationState,
@@ -1565,7 +1390,7 @@ fn sample_text_submission(
         sampler,
     } = state;
     let mut sampler = FilteredTextSampler { sampler, filter };
-    let token = if session.distributed().is_some() {
+    let token = if session.synchronizes_sampling() {
         session
             .sample_and_synchronize(
                 submission.output.logits(),
@@ -1607,28 +1432,19 @@ fn sample_text_submission(
 fn model_submission(
     output: Array,
     token_validations: TokenValidationBatch,
+    public_output: bool,
 ) -> Result<Submission<MlxModelOutput, MlxSessionCompletion>, Error> {
     let submission =
         MlxCompletion::submission_retaining(output, token_validations.arrays().cloned())?;
     Ok(Submission {
-        output: MlxModelOutput::new(Some(MlxTensor::from_array(submission.output))),
+        output: MlxModelOutput::new(
+            public_output.then(|| MlxTensor::from_array(submission.output)),
+        ),
         completion: MlxSessionCompletion {
             inner: MlxSessionCompletionKind::Model {
                 completion: submission.completion,
                 token_validations,
             },
-        },
-    })
-}
-
-fn pipeline_submission(
-    completion: PipelineStageCompletion,
-) -> Result<Submission<MlxModelOutput, MlxSessionCompletion>, Error> {
-    let output = MlxModelOutput::new(completion.logits().cloned().map(MlxTensor::from_array));
-    Ok(Submission {
-        output,
-        completion: MlxSessionCompletion {
-            inner: MlxSessionCompletionKind::Pipeline(completion),
         },
     })
 }
@@ -1695,7 +1511,7 @@ mod tests {
         let submit = |token| {
             let scope = TokenValidationScope::begin().unwrap();
             validate_token_domain(&Array::from_int(token), 4, None, stream).unwrap();
-            model_submission(Array::from_int(0), scope.finish()).unwrap()
+            model_submission(Array::from_int(0), scope.finish(), true).unwrap()
         };
 
         submit(3).completion.wait().unwrap();

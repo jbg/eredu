@@ -2,7 +2,7 @@
 
 use safemlx::{
     error::Result,
-    ops::{argsort, gather_mm, indexing::take_axis, segment_sum},
+    ops::{argsort, gather_mm, indexing::take_axis},
     Array, Dtype, Stream,
 };
 
@@ -109,13 +109,14 @@ pub fn gather_selection_values(
 /// Reduce grouped values back to source rows using summation.
 ///
 /// `values` should have shape `[selections, ...]`, and `indices` should have shape `[selections]`.
+#[cfg(test)]
 pub fn segment_sum_by_index(
     values: impl AsRef<Array>,
     indices: impl AsRef<Array>,
     num_segments: i32,
     stream: impl AsRef<Stream>,
 ) -> Result<Array> {
-    segment_sum(values, indices, num_segments, 0, stream)
+    safemlx::ops::segment_sum(values, indices, num_segments, 0, stream)
 }
 
 /// Build a sorted top-k selection plan from `[tokens, top_k]` group ids.

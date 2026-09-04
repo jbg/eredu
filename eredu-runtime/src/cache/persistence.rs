@@ -17,6 +17,7 @@ use std::{
 };
 
 static NEXT_LIVE_CACHE_PUBLICATION_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_REVERSIBLE_CACHE_PUBLICATION_ID: AtomicU64 = AtomicU64::new(1);
 static LIVE_CACHE_PROCESS_NAMESPACE: OnceLock<String> = OnceLock::new();
 
 /// Maximum accepted safetensors metadata header size for a prompt-cache shard.
@@ -69,6 +70,9 @@ pub enum PromptCachePersistenceError {
     /// The destination exists and explicit replacement was not requested.
     #[error("prompt cache destination already exists: {0}")]
     PromptCacheExists(PathBuf),
+    /// A reversible publication method was invoked in the wrong lifecycle state.
+    #[error("invalid reversible prompt cache publication state: {0}")]
+    InvalidReversiblePublication(&'static str),
 }
 
 /// Filesystem failure while publishing one ephemeral live-cache block.
@@ -359,6 +363,235 @@ impl Drop for PromptCachePublication {
             if staging.exists() {
                 let _ = fs::remove_dir_all(staging);
             }
+        }
+    }
+}
+
+/// A prepared cache directory whose visibility can be rolled back exactly.
+///
+/// The backend writes a complete ordinary cache to [`Self::staging_destination`].
+/// Publication of a new destination is one directory rename. Replacement moves
+/// only the immutable generation into the existing destination and atomically
+/// switches `CURRENT`, retaining the previous generation identity until commit.
+#[derive(Debug)]
+pub struct ReversiblePromptCachePublication {
+    destination: PathBuf,
+    parent: PathBuf,
+    staging: PathBuf,
+    replace_existing: bool,
+    previous_generation: Option<String>,
+    moved_generation: Option<PathBuf>,
+    published: bool,
+    committed: bool,
+    nonce: u128,
+}
+
+impl ReversiblePromptCachePublication {
+    /// Reserves a unique sibling destination without creating or publishing it.
+    pub fn begin(
+        destination: impl AsRef<Path>,
+        replace_existing: bool,
+    ) -> Result<Self, PromptCachePersistenceError> {
+        let destination = destination.as_ref().to_path_buf();
+        let parent = destination
+            .parent()
+            .ok_or_else(|| {
+                PromptCachePersistenceError::InvalidPromptCachePath(destination.clone())
+            })?
+            .to_path_buf();
+        fs::create_dir_all(&parent).map_err(|source| PromptCachePersistenceError::Io {
+            action: "create reversible prompt cache parent",
+            path: parent.clone(),
+            source,
+        })?;
+        if destination.exists() && !replace_existing {
+            return Err(PromptCachePersistenceError::PromptCacheExists(destination));
+        }
+        if destination.exists() && !destination.is_dir() {
+            return Err(PromptCachePersistenceError::InvalidPromptCachePath(
+                destination,
+            ));
+        }
+        let file_name = destination
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                PromptCachePersistenceError::InvalidPromptCachePath(destination.clone())
+            })?;
+        let publication_id = NEXT_REVERSIBLE_CACHE_PUBLICATION_ID.fetch_add(1, Ordering::Relaxed);
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+            ^ u128::from(publication_id);
+        let staging = parent.join(format!(
+            ".{file_name}.transaction-p{:08x}-{nonce:032x}",
+            std::process::id()
+        ));
+        if staging.exists() {
+            return Err(PromptCachePersistenceError::InvalidPromptCachePath(staging));
+        }
+        Ok(Self {
+            destination,
+            parent,
+            staging,
+            replace_existing,
+            previous_generation: None,
+            moved_generation: None,
+            published: false,
+            committed: false,
+            nonce,
+        })
+    }
+
+    /// Hidden destination into which an ordinary cache save must be completed.
+    pub fn staging_destination(&self) -> &Path {
+        &self.staging
+    }
+
+    /// Makes the prepared cache visible while retaining an exact rollback path.
+    pub fn publish(&mut self) -> Result<(), PromptCachePersistenceError> {
+        if self.published || self.moved_generation.is_some() {
+            return Err(PromptCachePersistenceError::InvalidReversiblePublication(
+                "publication was already attempted",
+            ));
+        }
+        inspect_prompt_cache(&self.staging)?;
+        if !self.destination.exists() {
+            durable_rename(&self.staging, &self.destination, false).map_err(|source| {
+                PromptCachePersistenceError::Io {
+                    action: "publish prepared prompt cache",
+                    path: self.destination.clone(),
+                    source,
+                }
+            })?;
+            sync_directory(&self.parent)?;
+            self.published = true;
+            return Ok(());
+        }
+        if !self.replace_existing {
+            return Err(PromptCachePersistenceError::PromptCacheExists(
+                self.destination.clone(),
+            ));
+        }
+
+        let previous = resolve_prompt_cache_root(&self.destination)?;
+        let previous_generation = previous
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                PromptCachePersistenceError::MalformedStorage(
+                    "active prompt-cache generation has no safe name".into(),
+                )
+            })?
+            .to_owned();
+        let staged = resolve_prompt_cache_root(&self.staging)?;
+        let generation_name = staged
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                PromptCachePersistenceError::MalformedStorage(
+                    "prepared prompt-cache generation has no safe name".into(),
+                )
+            })?
+            .to_owned();
+        let generations = self.destination.join(PROMPT_CACHE_GENERATIONS_DIRECTORY);
+        let target = generations.join(&generation_name);
+        if target.exists() {
+            return Err(PromptCachePersistenceError::InvalidPromptCachePath(target));
+        }
+        durable_rename(&staged, &target, false).map_err(|source| {
+            PromptCachePersistenceError::Io {
+                action: "install prepared prompt cache generation",
+                path: target.clone(),
+                source,
+            }
+        })?;
+        self.previous_generation = Some(previous_generation);
+        self.moved_generation = Some(target);
+        sync_directory(&generations)?;
+        publish_generation_pointer(&self.destination, &generation_name, self.nonce)?;
+        self.published = true;
+        Ok(())
+    }
+
+    /// Accepts the visible cache and releases rollback metadata.
+    pub fn commit(mut self) -> Result<(), PromptCachePersistenceError> {
+        if !self.published {
+            return Err(PromptCachePersistenceError::InvalidReversiblePublication(
+                "an unpublished cache cannot commit",
+            ));
+        }
+        if self.staging.exists() {
+            fs::remove_dir_all(&self.staging).map_err(|source| {
+                PromptCachePersistenceError::Io {
+                    action: "remove committed prompt cache staging directory",
+                    path: self.staging.clone(),
+                    source,
+                }
+            })?;
+        }
+        self.committed = true;
+        Ok(())
+    }
+
+    /// Restores the prior visible cache, or removes a newly published cache.
+    pub fn rollback(mut self) -> Result<(), PromptCachePersistenceError> {
+        self.rollback_inner()?;
+        self.committed = true;
+        Ok(())
+    }
+
+    fn rollback_inner(&mut self) -> Result<(), PromptCachePersistenceError> {
+        if self.published {
+            match self.previous_generation.as_deref() {
+                Some(previous) => {
+                    publish_generation_pointer(&self.destination, previous, self.nonce ^ 1)?;
+                }
+                None if self.destination.exists() => {
+                    fs::remove_dir_all(&self.destination).map_err(|source| {
+                        PromptCachePersistenceError::Io {
+                            action: "remove rolled-back prompt cache",
+                            path: self.destination.clone(),
+                            source,
+                        }
+                    })?;
+                    sync_directory(&self.parent)?;
+                }
+                None => {}
+            }
+        }
+        if let Some(generation) = self.moved_generation.take() {
+            if generation.exists() {
+                fs::remove_dir_all(&generation).map_err(|source| {
+                    PromptCachePersistenceError::Io {
+                        action: "remove rolled-back prompt cache generation",
+                        path: generation.clone(),
+                        source,
+                    }
+                })?;
+                if let Some(parent) = generation.parent() {
+                    sync_directory(parent)?;
+                }
+            }
+        }
+        if self.staging.exists() {
+            fs::remove_dir_all(&self.staging).map_err(|source| {
+                PromptCachePersistenceError::Io {
+                    action: "remove rolled-back prompt cache staging directory",
+                    path: self.staging.clone(),
+                    source,
+                }
+            })?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ReversiblePromptCachePublication {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = self.rollback_inner();
         }
     }
 }
@@ -901,6 +1134,7 @@ mod tests {
             state_segments: descriptor.state_segments().to_vec(),
             sink_tokens: 0,
             topology: descriptor.topology().clone(),
+            distributed_commit: None,
             application_namespace: None,
             blocks: vec![PromptCacheBlock {
                 global_layer: 0,
@@ -943,6 +1177,42 @@ mod tests {
         publication.commit(&second).unwrap();
         assert_eq!(inspect_prompt_cache(&destination).unwrap(), second);
         assert!(destination.join(PROMPT_CACHE_CURRENT_FILE).is_file());
+    }
+
+    #[test]
+    fn reversible_publication_restores_replacement_and_removes_new_destination() {
+        fn prepare_cache(destination: &Path, label: &str) -> PromptCacheManifest {
+            let publication = PromptCachePublication::begin(destination, false).unwrap();
+            let mut manifest = manifest(&publication.staging_directory().join("block.safetensors"));
+            manifest.application_namespace = Some(label.into());
+            publication.commit(&manifest).unwrap();
+            manifest
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join("cache");
+        let mut fresh = ReversiblePromptCachePublication::begin(&destination, false).unwrap();
+        let fresh_manifest = prepare_cache(fresh.staging_destination(), "fresh");
+        fresh.publish().unwrap();
+        assert_eq!(inspect_prompt_cache(&destination).unwrap(), fresh_manifest);
+        fresh.rollback().unwrap();
+        assert!(!destination.exists());
+
+        let first = prepare_cache(&destination, "first");
+        let first_root = resolve_prompt_cache_root(&destination).unwrap();
+        let mut replacement = ReversiblePromptCachePublication::begin(&destination, true).unwrap();
+        let second = prepare_cache(replacement.staging_destination(), "second");
+        replacement.publish().unwrap();
+        assert_eq!(inspect_prompt_cache(&destination).unwrap(), second);
+        replacement.rollback().unwrap();
+        assert_eq!(inspect_prompt_cache(&destination).unwrap(), first);
+        assert_eq!(resolve_prompt_cache_root(&destination).unwrap(), first_root);
+
+        let mut committed = ReversiblePromptCachePublication::begin(&destination, true).unwrap();
+        let third = prepare_cache(committed.staging_destination(), "third");
+        committed.publish().unwrap();
+        committed.commit().unwrap();
+        assert_eq!(inspect_prompt_cache(&destination).unwrap(), third);
     }
 
     #[test]

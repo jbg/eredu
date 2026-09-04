@@ -8,15 +8,11 @@ use eredu_architectures::{
         DecoderConfig, DecoderInputPart, LayeredModel as Architecture, ModelInput, Unit,
     },
 };
-use eredu_checkpoint::{
-    store::{CheckpointSource, SharedCheckpointSource},
-    WeightQuantization,
-};
-use eredu_nn::Tensor;
+use eredu_checkpoint::{store::SharedCheckpointSource, WeightQuantization};
 use eredu_runtime::{
     ArchitectureParameters, CacheResidencyPolicy, CausalModel, LayerWeightResidency,
-    LayeredArchitecture, LayeredForwardState, LayerwiseRuntime, PagedCacheOptions,
-    ParallelModelInfo, ParameterRole, RuntimeState, WeightBinding, WeightResidency,
+    LayeredArchitecture, LayerwiseRuntime, PagedCacheOptions, ParameterRole, RuntimeState,
+    WeightResidency,
 };
 use safemlx::{error::Exception, ops::indexing::TryIndexOp, Stream};
 
@@ -30,7 +26,7 @@ use crate::backend::{
         cache::state::MlxKeyValueState,
         checkpoint::{
             binding::{
-                binding_bytes, build_module_bindings, build_module_bindings_with_recipes_excluding,
+                build_module_bindings, build_module_bindings_with_recipes_excluding,
                 materialize_module_bindings, parameter_name_in_targets,
                 populate_module_from_arrays_excluding, populate_module_from_lease_excluding,
             },
@@ -43,10 +39,7 @@ use crate::backend::{
                 prepare_layerwise_policy_with_bindings, MlxLayerwisePolicy, MlxResidentPolicy,
                 MlxUnitPopulator,
             },
-            layerwise::{
-                quantize_parameterized_module_store, quantize_parameterized_store,
-                shard_layer_bindings,
-            },
+            layerwise::{quantize_parameterized_module_store, quantize_parameterized_store},
         },
         media::input,
         residency::parameter_bank::{AddressableParameterBank, ParameterBankResidencyReport},
@@ -56,31 +49,6 @@ use crate::backend::{
 type NeutralArchitecture = Architecture<MlxNeuralBackend>;
 type NeutralUnit = Unit<MlxNeuralBackend>;
 type NeutralDFlash = eredu_architectures::muse_glimmer::DFlash<MlxNeuralBackend>;
-pub type MuseGlimmerPipelineUnit = MlxModule<NeutralUnit>;
-
-fn primary_execution_group(architecture: &NeutralArchitecture) -> Result<usize, Error> {
-    let graph = <NeutralArchitecture as LayeredArchitecture<
-        MlxNeuralBackend,
-        MlxKeyValueState,
-    >>::execution_graph(architecture)
-    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    let primary = <NeutralArchitecture as LayeredArchitecture<
-        MlxNeuralBackend,
-        MlxKeyValueState,
-    >>::primary_execution_group(architecture);
-    resolve_primary_execution_group(&graph, primary)
-}
-
-fn resolve_primary_execution_group(
-    graph: &eredu_runtime::ExecutionGraph,
-    primary: &str,
-) -> Result<usize, Error> {
-    graph.group_index(primary).ok_or_else(|| {
-        Error::ArchitectureModel(format!(
-            "architecture has no primary execution group {primary:?}"
-        ))
-    })
-}
 
 type Resident = LayerwiseRuntime<
     NeutralArchitecture,
@@ -116,8 +84,6 @@ impl MlxUnitPopulator<NeutralUnit> for UnitPopulator {
 enum Execution {
     Resident(Resident),
     Bounded(Bounded),
-    ParallelResident(Box<Resident>),
-    ParallelBounded(Box<Bounded>),
 }
 
 impl Execution {
@@ -125,8 +91,6 @@ impl Execution {
         match self {
             Self::Resident(runtime) => runtime.architecture(),
             Self::Bounded(runtime) => runtime.architecture(),
-            Self::ParallelResident(runtime) => runtime.architecture(),
-            Self::ParallelBounded(runtime) => runtime.architecture(),
         }
     }
 
@@ -160,7 +124,7 @@ where
     <NeutralArchitecture as eredu_runtime::RoutedLayeredArchitecture<
         MlxNeuralBackend,
         MlxKeyValueState,
-    >>::forward_unit_with_provider(
+    >>::forward_unit_with_inferred_provider(
         architecture,
         group,
         index,
@@ -168,11 +132,6 @@ where
         hidden,
         state,
         forward,
-        if hidden.dim(1) > 1 {
-            eredu_runtime::ExpertPass::Prefill
-        } else {
-            eredu_runtime::ExpertPass::Decode
-        },
         provider,
         stream,
     )
@@ -184,8 +143,6 @@ pub struct MuseGlimmerModel {
     state_layout: eredu_runtime::StateLayout,
     execution: Execution,
     parameter_bank: Option<AddressableParameterBank>,
-    parallel_info:
-        Option<ParallelModelInfo<crate::composition::mlx::distributed::topology::MlxParallelPlan>>,
 }
 
 /// Fully resident DFlash assistant built from neutral equations.
@@ -195,10 +152,6 @@ pub struct MuseGlimmerDFlashModel {
 }
 
 impl MuseGlimmerDFlashModel {
-    pub fn target_layer_ids(&self) -> &[usize] {
-        self.module.target_layer_ids()
-    }
-
     pub fn assemble_target_states(
         &self,
         states: &[crate::MlxTensor],
@@ -359,165 +312,6 @@ pub struct MuseGlimmerSpeculativeOutput {
     pub target_states: Vec<crate::MlxTensor>,
 }
 
-/// Transportable neutral ingress state used while a pipeline placement walks
-/// the native vision group. The architecture forward context is the same one
-/// used by resident and bounded execution; only ownership of its tensors moves.
-pub struct MuseGlimmerPlacedState {
-    pub forward: LayeredForwardState<
-        crate::MlxTensor,
-        eredu_architectures::muse_glimmer::ForwardContext<crate::MlxTensor>,
-    >,
-    pub state: MlxKeyValueState,
-}
-
-impl MuseGlimmerPlacedState {
-    pub fn new(
-        forward: LayeredForwardState<
-            crate::MlxTensor,
-            eredu_architectures::muse_glimmer::ForwardContext<crate::MlxTensor>,
-        >,
-        state: MlxKeyValueState,
-    ) -> Self {
-        Self { forward, state }
-    }
-}
-
-impl MuseGlimmerPlacedState {
-    pub fn hidden(&self) -> &crate::MlxTensor {
-        &self.forward.hidden
-    }
-
-    pub fn replace_hidden(&mut self, hidden: crate::MlxTensor) {
-        self.forward.hidden = hidden;
-    }
-}
-
-/// Cold-path Muse-Glimmer checkpoint binding templates.
-///
-/// Forward execution and mutable state remain on the placed neutral model.
-#[derive(Default)]
-pub struct MuseGlimmerPipelineBindings {
-    external_experts: bool,
-}
-
-impl MuseGlimmerPipelineBindings {
-    pub const fn new() -> Self {
-        Self {
-            external_experts: false,
-        }
-    }
-
-    pub const fn new_external_experts() -> Self {
-        Self {
-            external_experts: true,
-        }
-    }
-
-    pub fn model_type<'a>(&self, architecture: &'a NeutralArchitecture) -> &'a str {
-        &architecture.args().model_type
-    }
-
-    pub fn quantizes_static_binding(&self, _binding: &WeightBinding) -> bool {
-        true
-    }
-
-    pub fn layer_count(
-        &self,
-        architecture: &NeutralArchitecture,
-        group: usize,
-    ) -> Result<usize, Error> {
-        <NeutralArchitecture as eredu_runtime::LayeredArchitecture<
-            MlxNeuralBackend,
-            MlxKeyValueState,
-        >>::group_unit_count(architecture, group)
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))
-    }
-
-    pub fn cartesian_layer_bindings(
-        &self,
-        architecture: &NeutralArchitecture,
-        group: usize,
-        index: usize,
-        global_layer: &MuseGlimmerPipelineUnit,
-        store: &dyn CheckpointSource,
-        layout: Option<&eredu_runtime::LocalModelLayout>,
-        _assignment: Option<&crate::composition::expert_dispatch::ExpertAssignment>,
-    ) -> Result<Vec<WeightBinding>, Error> {
-        let expert_targets = if group == primary_execution_group(architecture)? {
-            eredu_architectures::muse_glimmer::layer_parameter_groups(architecture.args(), index)
-                .map_err(|error| Error::Parallel(error.to_string()))?
-                .into_iter()
-                .filter(|group| group.role() == ParameterRole::ExpertIntermediate)
-                .flat_map(|group| {
-                    group
-                        .members()
-                        .iter()
-                        .map(|member| member.target().to_owned())
-                        .collect::<Vec<_>>()
-                })
-                .collect()
-        } else {
-            std::collections::BTreeSet::new()
-        };
-        let recipes = eredu_architectures::muse_glimmer::unit_safetensors_recipes(
-            architecture.args(),
-            store,
-            group,
-            index,
-        )
-        .map_err(Error::ArchitectureModel)?;
-        let bindings = build_module_bindings_with_recipes_excluding(
-            global_layer,
-            "",
-            store,
-            recipes,
-            |name| self.external_experts && parameter_name_in_targets(name, &expert_targets),
-        )?;
-        match layout {
-            Some(layout) => shard_layer_bindings(bindings, store, layout),
-            None => Ok(bindings),
-        }
-    }
-
-    pub fn layer_bindings(
-        &self,
-        architecture: &NeutralArchitecture,
-        group: usize,
-        index: usize,
-        layer: &MuseGlimmerPipelineUnit,
-        store: &dyn CheckpointSource,
-    ) -> Result<Vec<WeightBinding>, Error> {
-        self.layer_count(architecture, group)?;
-        let expert_targets = if group == primary_execution_group(architecture)? {
-            eredu_architectures::muse_glimmer::layer_parameter_groups(architecture.args(), index)
-                .map_err(|error| Error::Parallel(error.to_string()))?
-                .into_iter()
-                .filter(|group| group.role() == ParameterRole::ExpertIntermediate)
-                .flat_map(|group| {
-                    group
-                        .members()
-                        .iter()
-                        .map(|member| member.target().to_owned())
-                        .collect::<Vec<_>>()
-                })
-                .collect()
-        } else {
-            std::collections::BTreeSet::new()
-        };
-        let recipes = eredu_architectures::muse_glimmer::unit_safetensors_recipes(
-            architecture.args(),
-            store,
-            group,
-            index,
-        )
-        .map_err(Error::ArchitectureModel)?;
-        build_module_bindings_with_recipes_excluding(layer, "", store, recipes, |name| {
-            self.external_experts && parameter_name_in_targets(name, &expert_targets)
-        })
-        .map_err(Into::into)
-    }
-}
-
 pub fn prepare_muse_input(
     args: &DecoderConfig,
     typed: input::ModelInput<'_>,
@@ -540,13 +334,6 @@ impl MuseGlimmerModel {
         &self.args
     }
 
-    pub fn parallel_info(
-        &self,
-    ) -> Option<&ParallelModelInfo<crate::composition::mlx::distributed::topology::MlxParallelPlan>>
-    {
-        self.parallel_info.as_ref()
-    }
-
     pub fn new_cache(&self) -> MlxKeyValueState {
         MlxKeyValueState::device(self.state_layout.clone())
             .expect("validated neutral state must be realizable")
@@ -558,35 +345,20 @@ impl MuseGlimmerModel {
     ) -> Result<MlxKeyValueState, Error> {
         match policy {
             CacheResidencyPolicy::Device => Ok(self.new_cache()),
-            CacheResidencyPolicy::Paged(options) => {
-                let rank = self.parallel_info.as_ref().and_then(|info| {
-                    crate::composition::mlx::distributed::topology::prompt_cache_topology(
-                        info.topology(),
-                    )
-                    .cache_rank_identity()
-                });
-                MlxKeyValueState::paged(
-                    self.state_layout.clone(),
-                    CacheResidencyManager::new(options)
-                        .map_err(|error| Error::Parallel(error.to_string()))?,
-                    rank,
-                )
-                .map_err(Into::into)
-            }
+            CacheResidencyPolicy::Paged(options) => MlxKeyValueState::paged(
+                self.state_layout.clone(),
+                CacheResidencyManager::new(options)
+                    .map_err(|error| Error::Parallel(error.to_string()))?,
+                None,
+            )
+            .map_err(Into::into),
         }
     }
 
     pub(crate) fn prompt_cache_model_identity(
         &self,
     ) -> Result<eredu_core::cache::PromptCacheModelIdentity, Error> {
-        let topology = self.parallel_info.as_ref().map_or_else(
-            eredu_core::cache::PromptCacheTopology::default,
-            |info| {
-                crate::composition::mlx::distributed::topology::prompt_cache_topology(
-                    info.topology(),
-                )
-            },
-        );
+        let topology = eredu_core::cache::PromptCacheTopology::default();
         crate::composition::replicated_prompt_cache_identity(
             self.execution.architecture(),
             topology,
@@ -638,8 +410,6 @@ impl MuseGlimmerModel {
         let report = match &self.execution {
             Execution::Resident(runtime) => runtime.policy().residency_report()?,
             Execution::Bounded(runtime) => runtime.policy().residency_report()?,
-            Execution::ParallelResident(runtime) => runtime.policy().residency_report()?,
-            Execution::ParallelBounded(runtime) => runtime.policy().residency_report()?,
         };
         Ok(Some(report))
     }
@@ -648,9 +418,8 @@ impl MuseGlimmerModel {
         &self,
     ) -> Result<Option<eredu_runtime::DenseDiskStreamReport>, Error> {
         match &self.execution {
-            Execution::Resident(_) | Execution::ParallelResident(_) => Ok(None),
+            Execution::Resident(_) => Ok(None),
             Execution::Bounded(runtime) => runtime.policy().dense_stream_report(),
-            Execution::ParallelBounded(runtime) => runtime.policy().dense_stream_report(),
         }
     }
 
@@ -666,8 +435,6 @@ impl MuseGlimmerModel {
         match &self.execution {
             Execution::Resident(runtime) => runtime.policy().checkpoint_store_arc(),
             Execution::Bounded(runtime) => runtime.policy().checkpoint_store_arc(),
-            Execution::ParallelResident(runtime) => runtime.policy().checkpoint_store_arc(),
-            Execution::ParallelBounded(runtime) => runtime.policy().checkpoint_store_arc(),
         }
     }
 
@@ -678,14 +445,6 @@ impl MuseGlimmerModel {
         target_layers: &[usize],
         stream: &Stream,
     ) -> Result<MuseGlimmerSpeculativeOutput, Error> {
-        if matches!(
-            self.execution,
-            Execution::ParallelResident(_) | Execution::ParallelBounded(_)
-        ) {
-            return Err(Error::Parallel(
-                "Muse-Glimmer tensor-parallel execution requires a collective session".into(),
-            ));
-        }
         if state.layout() != &self.state_layout {
             return Err(Error::ArchitectureModel(
                 "Muse-Glimmer cache layout mismatch".into(),
@@ -769,7 +528,6 @@ impl MuseGlimmerModel {
                             Ok(())
                         },
                     ),
-                Execution::ParallelResident(_) | Execution::ParallelBounded(_) => unreachable!(),
             };
             drop(provider);
             self.parameter_bank = Some(parameter_bank);
@@ -832,7 +590,6 @@ impl MuseGlimmerModel {
                     Ok(())
                 },
             ),
-            Execution::ParallelResident(_) | Execution::ParallelBounded(_) => unreachable!(),
         }
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         let target_states = capture
@@ -853,7 +610,10 @@ impl MuseGlimmerModel {
         stream: &Stream,
     ) -> Result<crate::MlxTensor, Error> {
         self.forward_with_taps(input, state, &[], stream)
-            .map(|output| output.logits)
+            .map(|output| {
+                debug_assert!(output.target_states.is_empty());
+                output.logits
+            })
     }
 
     fn forward_with_observer(
@@ -868,18 +628,6 @@ impl MuseGlimmerModel {
                 "Muse-Glimmer cache layout mismatch".into(),
             ));
         }
-        let positions = input
-            .parts
-            .iter()
-            .map(|part| match part {
-                DecoderInputPart::Text(tokens) | DecoderInputPart::Media(tokens) => tokens.dim(1),
-            })
-            .sum::<i32>();
-        let pass = if positions > 1 {
-            eredu_runtime::ExpertPass::Prefill
-        } else {
-            eredu_runtime::ExpertPass::Decode
-        };
         let parameter_bank = self.parameter_bank.take();
         let result = {
             let mut neutral = crate::composition::NeutralActivationObserver::new(observer);
@@ -891,27 +639,22 @@ impl MuseGlimmerModel {
                         &args,
                     );
                     match &mut self.execution {
-                        Execution::Resident(runtime) => runtime.forward_with_provider_and_observer(
-                            input,
-                            state,
-                            pass,
-                            &mut provider,
-                            stream,
-                            &mut neutral,
-                        ),
-                        Execution::Bounded(runtime) => runtime.forward_with_provider_and_observer(
-                            input,
-                            state,
-                            pass,
-                            &mut provider,
-                            stream,
-                            &mut neutral,
-                        ),
-                        Execution::ParallelResident(_) | Execution::ParallelBounded(_) => {
-                            return Err(Error::Parallel(
-                                "Muse-Glimmer tensor-parallel observation requires its communicator".into(),
-                            ));
-                        }
+                        Execution::Resident(runtime) => runtime
+                            .forward_with_inferred_provider_and_observer(
+                                input,
+                                state,
+                                &mut provider,
+                                stream,
+                                &mut neutral,
+                            ),
+                        Execution::Bounded(runtime) => runtime
+                            .forward_with_inferred_provider_and_observer(
+                                input,
+                                state,
+                                &mut provider,
+                                stream,
+                                &mut neutral,
+                            ),
                     }
                 }
                 None => match &mut self.execution {
@@ -920,12 +663,6 @@ impl MuseGlimmerModel {
                     }
                     Execution::Bounded(runtime) => {
                         runtime.forward_with_observer(input, state, stream, &mut neutral)
-                    }
-                    Execution::ParallelResident(_) | Execution::ParallelBounded(_) => {
-                        return Err(Error::Parallel(
-                            "Muse-Glimmer tensor-parallel observation requires its communicator"
-                                .into(),
-                        ));
                     }
                 },
             }
@@ -978,56 +715,6 @@ impl MuseGlimmerModel {
         )
     }
 
-    pub fn embed_dflash_tokens(
-        &mut self,
-        tokens: &crate::MlxTensor,
-        stream: &Stream,
-    ) -> Result<crate::MlxTensor, Error> {
-        if matches!(
-            self.execution,
-            Execution::ParallelResident(_) | Execution::ParallelBounded(_)
-        ) {
-            return Err(Error::Parallel(
-                "Muse-Glimmer DFlash embedding is unavailable in tensor parallelism".into(),
-            ));
-        }
-        match &mut self.execution {
-            Execution::Resident(runtime) => {
-                runtime.architecture_mut().token_embeddings(tokens, stream)
-            }
-            Execution::Bounded(runtime) => {
-                runtime.architecture_mut().token_embeddings(tokens, stream)
-            }
-            Execution::ParallelResident(_) | Execution::ParallelBounded(_) => unreachable!(),
-        }
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))
-    }
-
-    pub fn project_dflash_logits(
-        &mut self,
-        hidden: &crate::MlxTensor,
-        stream: &Stream,
-    ) -> Result<crate::MlxTensor, Error> {
-        if matches!(
-            self.execution,
-            Execution::ParallelResident(_) | Execution::ParallelBounded(_)
-        ) {
-            return Err(Error::Parallel(
-                "Muse-Glimmer DFlash projection is unavailable in tensor parallelism".into(),
-            ));
-        }
-        match &mut self.execution {
-            Execution::Resident(runtime) => {
-                runtime.architecture_mut().project_logits(hidden, stream)
-            }
-            Execution::Bounded(runtime) => {
-                runtime.architecture_mut().project_logits(hidden, stream)
-            }
-            Execution::ParallelResident(_) | Execution::ParallelBounded(_) => unreachable!(),
-        }
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))
-    }
-
     pub fn forward_tokens(
         &mut self,
         tokens: &crate::MlxTensor,
@@ -1046,337 +733,12 @@ impl MuseGlimmerModel {
         )
     }
 
-    pub fn forward_tensor_parallel(
-        &mut self,
-        tokens: &crate::MlxTensor,
-        state: &mut MlxKeyValueState,
-        group: &crate::backend::runtime::distributed::Group,
-        stream: &Stream,
-    ) -> Result<crate::MlxTensor, Error> {
-        if state.layout() != &self.state_layout {
-            return Err(Error::Parallel(
-                "Muse-Glimmer tensor-parallel cache layout mismatch".into(),
-            ));
-        }
-        let parts = [DecoderInputPart::Text(tokens)];
-        self.forward_parallel_input(
-            ModelInput {
-                parts: &parts,
-                vision: None,
-                mask: None,
-            },
-            state,
-            group,
-            stream,
-        )
-    }
-
-    pub fn prefill_tensor_parallel(
-        &mut self,
-        typed: input::ModelInput<'_>,
-        state: &mut MlxKeyValueState,
-        group: &crate::backend::runtime::distributed::Group,
-        stream: &Stream,
-    ) -> Result<crate::MlxTensor, Error> {
-        let prepared = prepare_muse_input(&self.args, typed, stream)?;
-        let parts = prepared.decoder_parts();
-        let input = ModelInput {
-            parts: &parts,
-            vision: prepared.vision_input(),
-            mask: None,
-        };
-        self.forward_parallel_input(input, state, group, stream)
-    }
-
-    pub fn forward_tensor_parallel_with_observer(
-        &mut self,
-        tokens: &crate::MlxTensor,
-        state: &mut MlxKeyValueState,
-        group: &crate::backend::runtime::distributed::Group,
-        stream: &Stream,
-        observer: &mut dyn eredu_runtime::ActivationObserver<safemlx::Array, Exception>,
-    ) -> Result<crate::MlxTensor, Error> {
-        let parts = [DecoderInputPart::Text(tokens)];
-        self.forward_parallel_input_with_observer(
-            ModelInput {
-                parts: &parts,
-                vision: None,
-                mask: None,
-            },
-            state,
-            group,
-            stream,
-            observer,
-        )
-    }
-
-    pub fn prefill_tensor_parallel_with_observer(
-        &mut self,
-        typed: input::ModelInput<'_>,
-        state: &mut MlxKeyValueState,
-        group: &crate::backend::runtime::distributed::Group,
-        stream: &Stream,
-        observer: &mut dyn eredu_runtime::ActivationObserver<safemlx::Array, Exception>,
-    ) -> Result<crate::MlxTensor, Error> {
-        let prepared = prepare_muse_input(&self.args, typed, stream)?;
-        let parts = prepared.decoder_parts();
-        self.forward_parallel_input_with_observer(
-            ModelInput {
-                parts: &parts,
-                vision: prepared.vision_input(),
-                mask: None,
-            },
-            state,
-            group,
-            stream,
-            observer,
-        )
-    }
-
-    fn forward_parallel_input_with_observer(
-        &mut self,
-        input: ModelInput<'_, crate::MlxTensor>,
-        state: &mut MlxKeyValueState,
-        group: &crate::backend::runtime::distributed::Group,
-        stream: &Stream,
-        observer: &mut dyn eredu_runtime::ActivationObserver<safemlx::Array, Exception>,
-    ) -> Result<crate::MlxTensor, Error> {
-        if state.layout() != &self.state_layout {
-            return Err(Error::Parallel(
-                "Muse-Glimmer tensor-parallel cache layout mismatch".into(),
-            ));
-        }
-        let positions = input
-            .parts
-            .iter()
-            .map(|part| match part {
-                DecoderInputPart::Text(tokens) | DecoderInputPart::Media(tokens) => tokens.dim(1),
-            })
-            .sum::<i32>();
-        let pass = if positions > 1 {
-            eredu_runtime::ExpertPass::Prefill
-        } else {
-            eredu_runtime::ExpertPass::Decode
-        };
-        let parameter_bank = self.parameter_bank.take();
-        let result = {
-            let mut neutral = crate::composition::NeutralActivationObserver::new(observer);
-            let output = match parameter_bank.as_ref() {
-                Some(parameter_bank) => {
-                    let args = self.args.clone();
-                    let mut provider = crate::composition::muse_glimmer_expert::cached_provider(
-                        parameter_bank,
-                        &args,
-                    );
-                    match &mut self.execution {
-                        Execution::ParallelResident(runtime) => runtime
-                            .forward_parallel_with_provider_and_observer(
-                                input,
-                                state,
-                                pass,
-                                &mut provider,
-                                group,
-                                stream,
-                                &mut neutral,
-                            ),
-                        Execution::ParallelBounded(runtime) => runtime
-                            .forward_parallel_with_provider_and_observer(
-                                input,
-                                state,
-                                pass,
-                                &mut provider,
-                                group,
-                                stream,
-                                &mut neutral,
-                            ),
-                        _ => {
-                            return Err(Error::Parallel(
-                                "Muse-Glimmer was not loaded for tensor parallelism".into(),
-                            ))
-                        }
-                    }
-                }
-                None => match &mut self.execution {
-                    Execution::ParallelResident(runtime) => runtime.forward_parallel_with_observer(
-                        input,
-                        state,
-                        group,
-                        stream,
-                        &mut neutral,
-                    ),
-                    Execution::ParallelBounded(runtime) => runtime.forward_parallel_with_observer(
-                        input,
-                        state,
-                        group,
-                        stream,
-                        &mut neutral,
-                    ),
-                    _ => {
-                        return Err(Error::Parallel(
-                            "Muse-Glimmer was not loaded for tensor parallelism".into(),
-                        ))
-                    }
-                },
-            }
-            .map_err(|error| Error::Parallel(error.to_string()))?;
-            eredu_runtime::observe_model_logits(&mut neutral, &output).map_err(Error::from)
-        };
-        self.parameter_bank = parameter_bank;
-        result
-    }
-
-    fn forward_parallel_input(
-        &mut self,
-        input: ModelInput<'_, crate::MlxTensor>,
-        state: &mut MlxKeyValueState,
-        group: &crate::backend::runtime::distributed::Group,
-        stream: &Stream,
-    ) -> Result<crate::MlxTensor, Error> {
-        if state.layout() != &self.state_layout {
-            return Err(Error::Parallel(
-                "Muse-Glimmer tensor-parallel cache layout mismatch".into(),
-            ));
-        }
-        if let Some(parameter_bank) = self.parameter_bank.take() {
-            let args = self.args.clone();
-            let mut provider =
-                crate::composition::muse_glimmer_expert::cached_provider(&parameter_bank, &args);
-            let result = match &mut self.execution {
-                Execution::ParallelResident(runtime) => runtime
-                    .forward_parallel_with_unit_executor(
-                        input,
-                        state,
-                        group,
-                        stream,
-                        |architecture,
-                         execution_group,
-                         index,
-                         unit,
-                         hidden,
-                         state,
-                         forward,
-                         parallel,
-                         stream| {
-                            <NeutralArchitecture as eredu_runtime::ParallelRoutedLayeredArchitecture<
-                                MlxNeuralBackend,
-                                MlxKeyValueState,
-                            >>::forward_unit_parallel_with_provider(
-                                architecture,
-                                execution_group,
-                                index,
-                                unit,
-                                hidden,
-                                state,
-                                forward,
-                                if hidden.dim(1) > 1 {
-                                    eredu_runtime::ExpertPass::Prefill
-                                } else {
-                                    eredu_runtime::ExpertPass::Decode
-                                },
-                                &mut provider,
-                                parallel,
-                                stream,
-                            )
-                        },
-                    ),
-                Execution::ParallelBounded(runtime) => runtime.forward_parallel_with_unit_executor(
-                    input,
-                    state,
-                    group,
-                    stream,
-                    |architecture,
-                     execution_group,
-                     index,
-                     unit,
-                     hidden,
-                     state,
-                     forward,
-                     parallel,
-                     stream| {
-                        <NeutralArchitecture as eredu_runtime::ParallelRoutedLayeredArchitecture<
-                            MlxNeuralBackend,
-                            MlxKeyValueState,
-                        >>::forward_unit_parallel_with_provider(
-                            architecture,
-                            execution_group,
-                            index,
-                            unit,
-                            hidden,
-                            state,
-                            forward,
-                            if hidden.dim(1) > 1 {
-                                eredu_runtime::ExpertPass::Prefill
-                            } else {
-                                eredu_runtime::ExpertPass::Decode
-                            },
-                            &mut provider,
-                            parallel,
-                            stream,
-                        )
-                    },
-                ),
-                Execution::Resident(_) | Execution::Bounded(_) => {
-                    drop(provider);
-                    self.parameter_bank = Some(parameter_bank);
-                    return Err(Error::Parallel(
-                        "Muse-Glimmer model was not loaded for tensor parallelism".into(),
-                    ));
-                }
-            };
-            drop(provider);
-            self.parameter_bank = Some(parameter_bank);
-            return result.map_err(|error| Error::Parallel(error.to_string()));
-        }
-        match &mut self.execution {
-            Execution::ParallelResident(runtime) => runtime
-                .forward_parallel(input, state, group, stream)
-                .map_err(|error| Error::Parallel(error.to_string())),
-            Execution::ParallelBounded(runtime) => runtime
-                .forward_parallel(input, state, group, stream)
-                .map_err(|error| Error::Parallel(error.to_string())),
-            Execution::Resident(_) | Execution::Bounded(_) => Err(Error::Parallel(
-                "Muse-Glimmer model was not loaded for tensor parallelism".into(),
-            )),
-        }
-    }
-
-    pub fn verify_dflash(
-        &mut self,
-        tokens: &crate::MlxTensor,
-        state: &mut MlxKeyValueState,
-        target_layers: &[usize],
-        stream: &Stream,
-    ) -> Result<MuseGlimmerSpeculativeOutput, Error> {
-        let parts = [DecoderInputPart::Text(tokens)];
-        self.forward_with_taps(
-            ModelInput {
-                parts: &parts,
-                vision: None,
-                mask: None,
-            },
-            state,
-            target_layers,
-            stream,
-        )
-    }
-
     pub fn forward_input(
         &mut self,
         typed: input::ModelInput<'_>,
         state: &mut MlxKeyValueState,
         stream: &Stream,
     ) -> Result<crate::MlxTensor, Error> {
-        self.forward_input_with_taps(typed, state, &[], stream)
-            .map(|output| output.logits)
-    }
-
-    pub fn forward_input_with_taps(
-        &mut self,
-        typed: input::ModelInput<'_>,
-        state: &mut MlxKeyValueState,
-        target_layers: &[usize],
-        stream: &Stream,
-    ) -> Result<MuseGlimmerSpeculativeOutput, Error> {
         let prepared = prepare_muse_input(&self.args, typed, stream)?;
         let parts = prepared.decoder_parts();
         self.forward_with_taps(
@@ -1386,9 +748,13 @@ impl MuseGlimmerModel {
                 mask: None,
             },
             state,
-            target_layers,
+            &[],
             stream,
         )
+        .map(|output| {
+            debug_assert!(output.target_states.is_empty());
+            output.logits
+        })
     }
 }
 
@@ -1569,211 +935,7 @@ fn load_store(
         args,
         execution,
         parameter_bank: None,
-        parallel_info: None,
     })
-}
-
-fn load_parallel_store(
-    store: SharedCheckpointSource,
-    args: DecoderConfig,
-    residency: LayerWeightResidency,
-    build: crate::composition::mlx::distributed::topology::ParallelBuildContext,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<MuseGlimmerModel, Error> {
-    let global_architecture = NeutralArchitecture::new(args.clone(), stream)
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    let parameter_description = global_architecture
-        .parameter_description(stream)
-        .map_err(|error| Error::Parallel(error.to_string()))?;
-    let global_execution =
-        architecture_execution_layout::<_, MlxKeyValueState>(&global_architecture)?;
-    let layout =
-        crate::composition::parallel_layout_from_description(build, &parameter_description)?;
-    if layout.is_empty() {
-        return Err(Error::Parallel(
-            "Muse-Glimmer declared no tensor-parallel parameters".into(),
-        ));
-    }
-    let geometry = eredu_architectures::muse_glimmer::local_geometry(&args, &layout)
-        .map_err(|error| Error::Parallel(error.to_string()))?;
-    let mut architecture = NeutralArchitecture::new_parallel(args.clone(), geometry, stream)
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    let state_layout = architecture
-        .state_layout()
-        .map_err(|error| Error::Parallel(error.to_string()))?;
-    let global_static = MlxModule::new(
-        <NeutralArchitecture as LayeredArchitecture<MlxNeuralBackend, MlxKeyValueState>>::static_modules(
-            &global_architecture,
-        )
-        .clone(),
-    );
-    let static_recipes =
-        eredu_architectures::muse_glimmer::static_safetensors_recipes(&args, store.as_ref())
-            .map_err(Error::ArchitectureModel)?;
-    let global_static_bindings = build_module_bindings_with_recipes_excluding(
-        &global_static,
-        "",
-        store.as_ref(),
-        static_recipes,
-        |_| false,
-    )?;
-    let mut global_parameter_bytes = binding_bytes(&global_static_bindings)?;
-    for ordinal in 0..global_execution.len() {
-        let address = global_execution
-            .address(ordinal)
-            .expect("validated Muse-Glimmer layout covers every global unit");
-        let unit = MlxModule::new(construct_architecture_unit(
-            &global_architecture,
-            &global_execution,
-            ordinal,
-            stream,
-            std::marker::PhantomData::<MlxKeyValueState>,
-        )?);
-        let recipes = eredu_architectures::muse_glimmer::unit_safetensors_recipes(
-            &args,
-            store.as_ref(),
-            address.group(),
-            address.index(),
-        )
-        .map_err(Error::ArchitectureModel)?;
-        global_parameter_bytes = global_parameter_bytes
-            .checked_add(binding_bytes(
-                &build_module_bindings_with_recipes_excluding(
-                    &unit,
-                    "",
-                    store.as_ref(),
-                    recipes,
-                    |_| false,
-                )?,
-            )?)
-            .ok_or_else(|| {
-                Error::Parallel("Muse-Glimmer global parameter bytes overflowed".into())
-            })?;
-    }
-
-    let static_layout = Arc::new(layout);
-    let unit_sharding = Arc::clone(&static_layout);
-    let report_layout = Arc::clone(&static_layout);
-    let binding_args = args.clone();
-    let binding_architecture = global_architecture;
-    let (policy, mut metadata) = prepare_layerwise_policy_with_bindings(
-        Arc::clone(&store),
-        &mut architecture,
-        UnitPopulator {
-            external_experts: false,
-            expert_targets: Arc::new(Default::default()),
-        },
-        std::marker::PhantomData::<MlxKeyValueState>,
-        residency,
-        stream,
-        weights_stream,
-        |_| false,
-        move |_modules, store| shard_layer_bindings(global_static_bindings, store, &static_layout),
-        move |_ordinal, address, _path, _local, store, stream| {
-            let global =
-                MlxModule::new(
-                    <NeutralArchitecture as LayeredArchitecture<
-                        MlxNeuralBackend,
-                        MlxKeyValueState,
-                    >>::build_unit(
-                        &binding_architecture,
-                        address.group(),
-                        address.index(),
-                        stream,
-                    )
-                    .map_err(|error| Error::ArchitectureModel(error.to_string()))?,
-                );
-            let recipes = eredu_architectures::muse_glimmer::unit_safetensors_recipes(
-                &binding_args,
-                store,
-                address.group(),
-                address.index(),
-            )
-            .map_err(Error::ArchitectureModel)?;
-            let bindings =
-                build_module_bindings_with_recipes_excluding(&global, "", store, recipes, |_| {
-                    false
-                })?;
-            shard_layer_bindings(bindings, store, &unit_sharding)
-        },
-    )?;
-    metadata.set_effective_model_type(args.model_type.clone());
-    metadata.set_quantization(args.quantization);
-    let local_parameter_bytes = metadata
-        .static_device_bytes()
-        .checked_add(metadata.layer_parameter_bytes())
-        .ok_or_else(|| Error::Parallel("Muse-Glimmer local parameter bytes overflowed".into()))?;
-    let maximum_device_parameter_bytes = metadata
-        .static_device_bytes()
-        .checked_add(metadata.maximum_device_layer_bytes())
-        .ok_or_else(|| Error::Parallel("Muse-Glimmer device parameter bytes overflowed".into()))?;
-    let parallel_info = ParallelModelInfo::new(
-        build.topology(),
-        args.model_type.clone(),
-        report_layout
-            .tensors()
-            .map(|(target, _)| target.to_owned())
-            .collect(),
-        local_parameter_bytes,
-        global_parameter_bytes,
-        if residency.is_fully_resident() {
-            local_parameter_bytes
-        } else {
-            metadata.static_device_bytes()
-        },
-        maximum_device_parameter_bytes,
-    );
-    let execution = if residency.is_fully_resident() {
-        Execution::ParallelResident(Box::new(LayerwiseRuntime::new_policy_first(
-            policy.into_resident(
-                &architecture,
-                stream,
-                std::marker::PhantomData::<MlxKeyValueState>,
-            )?,
-            architecture,
-        )))
-    } else {
-        Execution::ParallelBounded(Box::new(LayerwiseRuntime::new(architecture, policy)))
-    };
-    Ok(MuseGlimmerModel {
-        args,
-        state_layout,
-        execution,
-        parameter_bank: None,
-        parallel_info: Some(parallel_info),
-    })
-}
-
-pub fn load_safetensors_tensor_parallel(
-    artifact: &crate::composition::mlx::artifact::PreparedSafetensorsArtifact,
-    residency: LayerWeightResidency,
-    build: crate::composition::mlx::distributed::topology::ParallelBuildContext,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<MuseGlimmerModel, Error> {
-    let eredu_architectures::configuration::SafetensorsModelConfig::MuseGlimmer(args) =
-        artifact.model()
-    else {
-        return Err(Error::ArchitectureModel(
-            "Muse-Glimmer loader received a different prepared architecture".into(),
-        ));
-    };
-    let args = args.clone();
-    let store = artifact.store();
-    load_parallel_store(store, args, residency, build, stream, weights_stream)
-}
-
-pub fn load_gguf_tensor_parallel(
-    source: &crate::composition::mlx::structural::AdmittedGguf,
-    projector: Option<&crate::composition::mlx::structural::AdmittedGgufProjector>,
-    residency: LayerWeightResidency,
-    build: crate::composition::mlx::distributed::topology::ParallelBuildContext,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<MuseGlimmerModel, Error> {
-    let (store, args) = open_gguf_store(source, projector, residency.max_cached_shards())?;
-    load_parallel_store(store, args, residency, build, stream, weights_stream)
 }
 
 fn attach_parameter_bank(
@@ -1910,50 +1072,4 @@ fn open_gguf_store(
     };
     let store: SharedCheckpointSource = Arc::new(builder.build()?);
     Ok((store, args))
-}
-
-pub fn prepare_gguf_pipeline_source(
-    source: &crate::composition::mlx::structural::AdmittedGguf,
-    projector: Option<&crate::composition::mlx::structural::AdmittedGgufProjector>,
-    max_cached_readers: usize,
-) -> Result<(DecoderConfig, SharedCheckpointSource), Error> {
-    let (store, args) = open_gguf_store(source, projector, max_cached_readers)?;
-    Ok((args, store))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::resolve_primary_execution_group;
-    use eredu_runtime::{ExecutionGraph, ExecutionGroupSpec};
-
-    #[test]
-    fn primary_execution_group_is_resolved_by_stable_identity() {
-        let primary_last = ExecutionGraph::chain(["vision", "text"]).unwrap();
-        assert_eq!(
-            resolve_primary_execution_group(&primary_last, "text").unwrap(),
-            1
-        );
-
-        let primary_first = ExecutionGraph::new(
-            vec![
-                ExecutionGroupSpec::root("text"),
-                ExecutionGroupSpec::with_dependencies("vision", ["text"]),
-            ],
-            "vision",
-        )
-        .unwrap();
-        assert_eq!(
-            resolve_primary_execution_group(&primary_first, "text").unwrap(),
-            0
-        );
-    }
-
-    #[test]
-    fn missing_primary_execution_group_is_rejected() {
-        let graph = ExecutionGraph::chain(["vision", "text"]).unwrap();
-        let error = resolve_primary_execution_group(&graph, "missing").unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("architecture has no primary execution group \"missing\""));
-    }
 }

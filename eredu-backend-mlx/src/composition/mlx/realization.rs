@@ -1,9 +1,8 @@
 //! Typed MLX materializer bindings for normalized architecture families.
 
 use eredu_architectures::ModelKind;
-use eredu_core::{ParallelAxis, ParallelTopology};
 
-/// Family binding consumed by ordinary SafeTensors and distributed-stage loaders.
+/// Family binding consumed by excluded replicated SafeTensors loaders.
 ///
 /// Absence of a binding means that the family uses another loading protocol.
 /// The variants are exhaustively dispatched by the materializers, so this is
@@ -117,43 +116,6 @@ impl GgufBinding {
     }
 }
 
-/// Family binding consumed by the complete tensor-parallel materializer.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum CompleteTensorParallelBinding {
-    Gemma4,
-    GptOss,
-    Inkling,
-    KimiLinear,
-    Llama,
-    MuseGlimmer,
-    Lfm2,
-    NemotronH,
-    Qwen,
-}
-
-impl CompleteTensorParallelBinding {
-    pub(crate) const fn for_kind(kind: ModelKind) -> Option<Self> {
-        Some(match kind {
-            ModelKind::Gemma4 => Self::Gemma4,
-            ModelKind::GptOss => Self::GptOss,
-            ModelKind::Inkling => Self::Inkling,
-            ModelKind::KimiLinear => Self::KimiLinear,
-            ModelKind::Llama => Self::Llama,
-            ModelKind::MuseGlimmer => Self::MuseGlimmer,
-            ModelKind::Lfm2 => Self::Lfm2,
-            ModelKind::NemotronH => Self::NemotronH,
-            ModelKind::Qwen2 | ModelKind::Qwen3 => Self::Qwen,
-            ModelKind::DeepSeekV3
-            | ModelKind::DeepSeekV4
-            | ModelKind::Moshi
-            | ModelKind::Qwen3Next
-            | ModelKind::Qwen3Vl
-            | ModelKind::Qwen3VlMoe
-            | ModelKind::Qwen35 => return None,
-        })
-    }
-}
-
 /// Family binding consumed by independent expert-cache materialization.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AddressableParameterBankBinding {
@@ -191,15 +153,4 @@ impl AddressableParameterBankBinding {
             }
         })
     }
-}
-
-/// Whether non-replicated materialization must use a distributed stage.
-pub(crate) const fn requires_distributed_stage(
-    kind: ModelKind,
-    topology: ParallelTopology,
-) -> bool {
-    FamilyBinding::for_kind(kind).is_some()
-        && (topology.is_axis_active(ParallelAxis::Pipeline)
-            || topology.is_axis_active(ParallelAxis::Expert)
-            || CompleteTensorParallelBinding::for_kind(kind).is_none())
 }

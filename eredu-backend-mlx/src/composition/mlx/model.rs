@@ -65,7 +65,7 @@ impl AdmittedModelKind {
 /// owns the concrete model and its correctly typed cache together; there is no
 /// independently extensible erased cache type to re-pair at operation sites.
 #[cfg_attr(not(test), allow(dead_code))]
-pub enum Executable {
+pub(crate) enum Executable {
     /// Neutral DeepSeek-V3/V4 architecture with policy-selected residency.
     DeepSeek(
         AdmittedModelKind,
@@ -95,12 +95,6 @@ pub enum Executable {
         AdmittedModelKind,
         crate::composition::inkling::InklingModel,
         crate::composition::inkling::InklingState,
-    ),
-    /// Tensor-parallel Llama model.
-    PartitionedLlama(
-        AdmittedModelKind,
-        crate::composition::llama::PartitionedLlamaModel,
-        crate::backend::runtime::cache::state::MlxKeyValueState,
     ),
     /// Ordinary replicated text model bound through the family-neutral contract.
     ReplicatedText(
@@ -146,6 +140,81 @@ pub enum Executable {
 }
 
 impl Executable {
+    /// Whether this executable carries the neutral partition control lifecycle.
+    pub(crate) fn has_neutral_partitioned_control(&self) -> bool {
+        matches!(self, Self::ReplicatedText(_, model) if model.has_partition_control())
+    }
+
+    /// Runs neutral all-rank state reset for a partitioned executable.
+    pub(crate) fn reset_cache_distributed(&mut self) -> Result<(), Exception> {
+        match self {
+            Self::ReplicatedText(_, model) => model
+                .reset_cache_distributed()
+                .map_err(|error| Exception::custom(error.to_string())),
+            _ => Err(Exception::custom(
+                "executable does not carry neutral partition control",
+            )),
+        }
+    }
+
+    /// Runs neutral all-rank provisional prompt-cache loading.
+    pub(crate) fn load_prompt_cache_distributed(
+        &mut self,
+        directory: &Path,
+        expected: &PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+    ) -> Result<Option<PromptCacheManifest>, Exception> {
+        match self {
+            Self::ReplicatedText(_, model) => model
+                .load_prompt_cache_distributed(directory, expected, prefix_token_ids)
+                .map_err(|error| Exception::custom(error.to_string())),
+            _ => Err(Exception::custom(
+                "executable does not carry neutral partition control",
+            )),
+        }
+    }
+
+    /// Runs neutral all-rank prepared-input prompt-cache loading.
+    pub(crate) fn load_prompt_cache_for_input_distributed(
+        &mut self,
+        directory: &Path,
+        expected: &PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        input_identity: eredu_runtime::PreparedInputCacheIdentity,
+    ) -> Result<Option<PromptCacheManifest>, Exception> {
+        match self {
+            Self::ReplicatedText(_, model) => model
+                .load_prompt_cache_for_input_distributed(
+                    directory,
+                    expected,
+                    prefix_token_ids,
+                    input_identity,
+                )
+                .map_err(|error| Exception::custom(error.to_string())),
+            _ => Err(Exception::custom(
+                "executable does not carry neutral partition control",
+            )),
+        }
+    }
+
+    /// Runs neutral all-rank reversible prompt-cache publication.
+    pub(crate) fn save_prompt_cache_distributed(
+        &mut self,
+        destination: &Path,
+        descriptor: PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: &PromptCacheOptions,
+    ) -> Result<Option<PromptCacheManifest>, Exception> {
+        match self {
+            Self::ReplicatedText(_, model) => model
+                .save_prompt_cache_distributed(destination, descriptor, prefix_token_ids, options)
+                .map_err(|error| Exception::custom(error.to_string())),
+            _ => Err(Exception::custom(
+                "executable does not carry neutral partition control",
+            )),
+        }
+    }
+
     pub(super) fn deepseek(
         kind: ModelKind,
         model: Box<crate::composition::deepseek::DeepSeekModel>,
@@ -197,15 +266,6 @@ impl Executable {
         let identity = AdmittedModelKind::new(kind, &[ModelKind::Inkling])?;
         let cache = model.new_cache();
         Ok(Self::Inkling(identity, model, cache))
-    }
-
-    pub(super) fn partitioned_llama(
-        kind: ModelKind,
-        model: crate::composition::llama::PartitionedLlamaModel,
-    ) -> Result<Self, Error> {
-        let identity = AdmittedModelKind::new(kind, &[ModelKind::Llama])?;
-        let cache = model.new_cache();
-        Ok(Self::PartitionedLlama(identity, model, cache))
     }
 
     pub(super) fn replicated_text(
@@ -290,31 +350,6 @@ impl Executable {
         Ok(Self::Qwen35(identity, model, cache))
     }
 
-    /// Returns architecture-neutral rank-local placement information when this
-    /// model was loaded through generalized parallel execution groups.
-    pub fn parallel_info(
-        &self,
-    ) -> Option<
-        &eredu_runtime::ParallelModelInfo<
-            crate::composition::mlx::distributed::topology::MlxParallelPlan,
-        >,
-    > {
-        match self {
-            Self::DeepSeek(_, _, _) => None,
-            Self::PartitionedLlama(_, model, _) => model.parallel_info(),
-            Self::ReplicatedText(_, _) => None,
-            Self::MuseGlimmer(_, model, _) => model.parallel_info(),
-            Self::GptOss(_, model, _) => model.parallel_info(),
-            Self::Qwen(_, model, _) => model.parallel_info(),
-            Self::KimiLinear(_, model, _) => model.parallel_info(),
-            Self::Lfm2(_, model, _) => model.parallel_info(),
-            Self::NemotronH(_, model, _) => model.parallel_info(),
-            Self::Qwen3Next(_, model, _) | Self::Qwen35(_, model, _) => model.parallel_info(),
-            Self::Gemma4(_, model, _) => model.parallel_info(),
-            Self::Inkling(_, model, _) => model.parallel_info(),
-        }
-    }
-
     /// Reports how this model architecture exposes speculative drafting weights.
     pub fn speculative_capability(&self) -> SpeculativeCapability {
         self.architecture_capability_estimate()
@@ -332,7 +367,6 @@ impl Executable {
             Self::Gemma4(_, model, _) => model.residency_report(),
             Self::Inkling(_, model, _) => model.residency_report(),
             Self::KimiLinear(_, model, _) => Ok(Some(model.residency_report()?)),
-            Self::PartitionedLlama(_, model, _) => model.residency_report(),
             Self::ReplicatedText(_, model) => model.residency_report(),
             Self::GptOss(_, model, _) => Ok(Some(model.residency_report()?)),
             Self::Lfm2(_, model, _) => Ok(Some(model.residency_report()?)),
@@ -354,7 +388,6 @@ impl Executable {
             Self::Gemma4(_, model, _) => model.dense_stream_report(),
             Self::Inkling(_, model, _) => model.dense_stream_report(),
             Self::KimiLinear(_, model, _) => model.dense_stream_report(),
-            Self::PartitionedLlama(_, model, _) => model.dense_stream_report(),
             Self::ReplicatedText(_, model) => model.dense_stream_report(),
             Self::GptOss(_, model, _) => model.dense_stream_report(),
             Self::Lfm2(_, model, _) => model.dense_stream_report(),
@@ -374,7 +407,6 @@ impl Executable {
             | Self::GptOss(_, _, _)
             | Self::KimiLinear(_, _, _)
             | Self::Inkling(_, _, _)
-            | Self::PartitionedLlama(_, _, _)
             | Self::MuseGlimmer(_, _, _)
             | Self::Lfm2(_, _, _)
             | Self::NemotronH(_, _, _)
@@ -405,7 +437,6 @@ impl Executable {
             }
             Self::MuseGlimmer(_, model, _) => model.parameter_bank_report(),
             Self::ReplicatedText(_, model) => model.parameter_bank_report(),
-            Self::PartitionedLlama(_, _, _) => Ok(None),
         }
     }
 
@@ -417,7 +448,6 @@ impl Executable {
             | Self::GptOss(kind, _, _)
             | Self::KimiLinear(kind, _, _)
             | Self::Inkling(kind, _, _)
-            | Self::PartitionedLlama(kind, _, _)
             | Self::MuseGlimmer(kind, _, _)
             | Self::Lfm2(kind, _, _)
             | Self::NemotronH(kind, _, _)
@@ -436,7 +466,6 @@ impl Executable {
             Self::GptOss(_, model, _) => &model.args().model_type,
             Self::Inkling(_, model, _) => &model.args().model_type,
             Self::KimiLinear(_, model, _) => &model.args().model_type,
-            Self::PartitionedLlama(_, model, _) => &model.args().model_type,
             Self::ReplicatedText(_, model) => model.effective_model_type(),
             Self::Lfm2(_, model, _) => &model.args().model_type,
             Self::NemotronH(_, model, _) => &model.args().model_type,
@@ -457,7 +486,6 @@ impl Executable {
             Self::GptOss(_, model, _) => model.prompt_cache_model_identity(),
             Self::Inkling(_, model, _) => model.prompt_identity(),
             Self::KimiLinear(_, model, _) => model.prompt_cache_model_identity(),
-            Self::PartitionedLlama(_, model, _) => model.prompt_cache_model_identity(),
             Self::ReplicatedText(_, model) => Ok(model.prompt_cache_model_identity().clone()),
             Self::Lfm2(_, model, _) => model.prompt_cache_model_identity(),
             Self::NemotronH(_, model, _) => model.prompt_cache_model_identity(),
@@ -497,7 +525,6 @@ impl Executable {
                 Self::Inkling(_, model, cache) => reset_paged!(model, cache, options),
                 Self::KimiLinear(_, model, cache) => reset_paged!(model, cache, options),
                 Self::Lfm2(_, model, cache) => reset_paged!(model, cache, options),
-                Self::PartitionedLlama(_, model, cache) => reset_paged!(model, cache, options),
                 Self::ReplicatedText(_, model) => model.reset_cache(),
                 Self::MuseGlimmer(_, model, cache) => reset_paged!(model, cache, options),
                 Self::NemotronH(_, model, cache) => reset_paged!(model, cache, options),
@@ -521,7 +548,6 @@ impl Executable {
             Self::Inkling(_, model, cache) => *cache = model.new_cache(),
             Self::KimiLinear(_, model, cache) => *cache = model.new_cache(),
             Self::Lfm2(_, model, cache) => *cache = model.new_cache(),
-            Self::PartitionedLlama(_, model, cache) => *cache = model.new_cache(),
             Self::ReplicatedText(_, model) => return model.reset_cache(),
             Self::MuseGlimmer(_, model, cache) => *cache = model.new_cache(),
             Self::NemotronH(_, model, cache) => *cache = model.new_cache(),
@@ -557,7 +583,6 @@ impl Executable {
             Self::Inkling(_, model, cache) => load_into!(model, cache),
             Self::KimiLinear(_, model, cache) => load_into!(model, cache),
             Self::Lfm2(_, model, cache) => load_into!(model, cache),
-            Self::PartitionedLlama(_, model, cache) => load_into!(model, cache),
             Self::ReplicatedText(_, model) => model
                 .load_prompt_cache(directory.as_ref(), expected, prefix_token_ids)
                 .map_err(|error| Exception::custom(error.to_string())),
@@ -626,7 +651,6 @@ impl Executable {
             Self::Inkling(_, model, cache) => save_from!(model, cache),
             Self::KimiLinear(_, model, cache) => save_from!(model, cache),
             Self::Lfm2(_, model, cache) => save_from!(model, cache),
-            Self::PartitionedLlama(_, model, cache) => save_from!(model, cache),
             Self::ReplicatedText(_, model) => model
                 .save_prompt_cache(destination.as_ref(), descriptor, prefix_token_ids, options)
                 .map_err(|error| Exception::custom(error.to_string())),
@@ -644,9 +668,7 @@ impl Executable {
             Self::DeepSeek(_, _, cache) => cache.residency_report(),
             Self::GptOss(_, _, cache) => cache.residency_report(),
             Self::Inkling(_, _, cache) => cache.target().residency_report(),
-            Self::PartitionedLlama(_, _, cache)
-            | Self::MuseGlimmer(_, _, cache)
-            | Self::Qwen(_, _, cache) => cache.residency_report(),
+            Self::MuseGlimmer(_, _, cache) | Self::Qwen(_, _, cache) => cache.residency_report(),
             Self::ReplicatedText(_, model) => model.cache_residency_report(),
             Self::Gemma4(_, _, cache)
             | Self::KimiLinear(_, _, cache)

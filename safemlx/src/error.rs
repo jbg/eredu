@@ -81,6 +81,14 @@ pub enum AsSliceError {
     #[error("The data pointer is null.")]
     Null,
 
+    /// The underlying data pointer does not satisfy the element alignment.
+    #[error("The data pointer is not aligned for the requested element type.")]
+    Misaligned,
+
+    /// The requested slice would exceed Rust's maximum allocation size.
+    #[error("The array is too large to represent as a Rust slice.")]
+    TooLarge,
+
     /// The output dtype does not match the data type of the array.
     #[error("dtype mismatch: expected {expecting:?}, found {found:?}")]
     DtypeMismatch {

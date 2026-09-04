@@ -40,6 +40,102 @@ pub use config::{
     DsparkConfig, ExpertFormat, Fp8QuantizationConfig, LayerPolicy, V3Args, V4Args,
     V4AttentionPolicy, YarnConfig,
 };
+pub use parallel::{
+    v3_partition_local_geometry, v4_partition_local_geometry, PartitionExpertBankOwnership,
+    V3PartitionLocalFoundation, V3PartitionLocalGeometry, V4PartitionLocalFoundation,
+    V4PartitionLocalGeometry,
+};
+
+/// Builds the prediction-free V3 routed-expert authority from planner-local geometry.
+pub fn v3_partition_expert_realization_plan(
+    args: &V3Args,
+    geometry: &parallel::V3LocalGeometry,
+    topology: eredu_core::ParallelRankTopology,
+) -> Result<crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>, eredu_nn::Error> {
+    if args.num_nextn_predict_layers != 0 || !args.has_sparse_moe_layers() {
+        return Err(eredu_nn::Error::backend(
+            "DeepSeek-V3 partition expert planning requires sparse target units and no prediction",
+        ));
+    }
+    geometry
+        .validate_for(args)
+        .map_err(eredu_nn::Error::backend)?;
+    let global_experts =
+        usize::try_from(args.n_routed_experts).map_err(eredu_nn::Error::backend)?;
+    let local_experts = i32::try_from(
+        eredu_core::balanced_contiguous_range(
+            global_experts,
+            topology.expert_parallel_size(),
+            topology.expert_parallel_rank(),
+            false,
+        )
+        .map_err(eredu_nn::Error::backend)?
+        .len(),
+    )
+    .map_err(eredu_nn::Error::backend)?;
+    let target = usize::try_from(args.num_hidden_layers).map_err(eredu_nn::Error::backend)?;
+    let owner = eredu_runtime::ExecutionGroupId::new(crate::decoder::TARGET_EXECUTION_GROUP)
+        .map_err(eredu_nn::Error::backend)?;
+    let specs = (0..target)
+        .filter(|layer| args.layer_schedule.get(*layer) == Some(&LayerPolicy::SparseMoe))
+        .map(|layer| {
+            v3::localized_expert_bank_spec(
+                args,
+                layer,
+                local_experts,
+                geometry.args().moe_intermediate_size,
+            )
+            .map(|spec| ((owner.clone(), layer), spec))
+        })
+        .collect::<Result<std::collections::BTreeMap<_, _>, _>>()?;
+    crate::ExpertRealizationPlan::balanced(global_experts, topology, specs)
+        .map_err(eredu_nn::Error::backend)
+}
+
+/// Builds the prediction-free V4 routed-expert authority from planner-local geometry.
+pub fn v4_partition_expert_realization_plan(
+    args: &V4Args,
+    geometry: &parallel::V4LocalGeometry,
+    topology: eredu_core::ParallelRankTopology,
+) -> Result<crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>, eredu_nn::Error> {
+    if args.num_nextn_predict_layers != 0 || args.dspark.is_some() {
+        return Err(eredu_nn::Error::backend(
+            "DeepSeek-V4 partition expert planning does not admit embedded prediction",
+        ));
+    }
+    geometry
+        .validate_for(args)
+        .map_err(eredu_nn::Error::backend)?;
+    let global_experts =
+        usize::try_from(args.n_routed_experts).map_err(eredu_nn::Error::backend)?;
+    let local_experts = i32::try_from(
+        eredu_core::balanced_contiguous_range(
+            global_experts,
+            topology.expert_parallel_size(),
+            topology.expert_parallel_rank(),
+            false,
+        )
+        .map_err(eredu_nn::Error::backend)?
+        .len(),
+    )
+    .map_err(eredu_nn::Error::backend)?;
+    let target = usize::try_from(args.num_hidden_layers).map_err(eredu_nn::Error::backend)?;
+    let owner = eredu_runtime::ExecutionGroupId::new(crate::decoder::TARGET_EXECUTION_GROUP)
+        .map_err(eredu_nn::Error::backend)?;
+    let specs = (0..target)
+        .map(|layer| {
+            v4::localized_expert_bank_spec(
+                args,
+                layer,
+                local_experts,
+                geometry.args().moe_intermediate_size,
+            )
+            .map(|spec| ((owner.clone(), layer), spec))
+        })
+        .collect::<Result<std::collections::BTreeMap<_, _>, _>>()?;
+    crate::ExpertRealizationPlan::balanced(global_experts, topology, specs)
+        .map_err(eredu_nn::Error::backend)
+}
 
 /// Derives complete V3 routed-expert ownership and rank-local bank geometry.
 pub fn v3_expert_realization_plan<B>(

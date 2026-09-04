@@ -1,6 +1,7 @@
-//! Inspect MLX Cartesian rank topology construction.
+//! Inspect neutral Cartesian rank topology construction for MLX execution.
 
-use eredu_backend_mlx::native::{DeviceAssignment, MlxParallelPlan};
+use eredu_backend_mlx::native::DeviceAssignment;
+use eredu_core::{ParallelAxis, ParallelRankTopology, ParallelTopology};
 use safemlx::{
     distributed::{self, Backend},
     DeviceType,
@@ -24,26 +25,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .and_then(|rank| rank.parse().ok())
         .unwrap_or(0);
-    let topology = MlxParallelPlan::for_group(
-        &world,
-        tp,
-        pp,
-        ep,
-        DeviceAssignment::new(DeviceType::Gpu, local_index),
-    )?;
-    let report = topology.preflight((pp > 1).then_some(layers), (ep > 1).then_some(experts))?;
+    let topology = ParallelRankTopology::new(ParallelTopology::new(tp, pp, ep, 1)?, world.rank())?;
+    let device = DeviceAssignment::new(DeviceType::Gpu, local_index);
+    let coordinates = topology.coordinates();
+    let local_layers =
+        layers * coordinates.pipeline() / pp..layers * (coordinates.pipeline() + 1) / pp;
+    let local_experts =
+        experts * coordinates.expert() / ep..experts * (coordinates.expert() + 1) / ep;
     eprintln!(
         "global={}/{} coordinates={:?} layers={:?} experts={:?} embedding={} head={} TP={:?} PP={:?} EP={:?}",
         topology.global_rank(),
         topology.world_size(),
         topology.coordinates(),
-        report.local_layer_range(),
-        report.local_expert_range(),
-        report.owns_embedding(),
-        report.owns_output_head(),
-        report.tensor_subgroup().global_ranks(),
-        report.pipeline_subgroup().global_ranks(),
-        report.expert_subgroup().global_ranks(),
+        local_layers,
+        local_experts,
+        coordinates.pipeline() == 0,
+        coordinates.pipeline() + 1 == pp,
+        topology.subgroup(ParallelAxis::Tensor)?.global_ranks(),
+        topology.subgroup(ParallelAxis::Pipeline)?.global_ranks(),
+        topology.subgroup(ParallelAxis::Expert)?.global_ranks(),
     );
+    let _ = device;
     Ok(())
 }

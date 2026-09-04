@@ -100,6 +100,16 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> RoutedGatedPr
         intermediate: i32,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
+        let spec = expert_bank_spec_with_width(args, layer, intermediate)?;
+        Self::new_with_spec(args, layer, spec, context)
+    }
+
+    pub(crate) fn new_with_spec(
+        args: &ModelArgs,
+        layer: usize,
+        spec: GroupedGatedProductSpec,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
         let prefix = format!("model.layers.{layer}.feed_forward");
         let gate_name = format!("{prefix}.gate.weight");
         let routing = TopKGroupSelectionSpec::new(
@@ -127,10 +137,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> RoutedGatedPr
             selector = selector.with_correction_bias(correction_bias)?;
         }
         let router = B::top_k_group_selector(selector, context)?;
-        let experts = B::grouped_gated_product(
-            expert_bank_spec_with_width(args, layer, intermediate)?,
-            context,
-        )?;
+        let experts = B::grouped_gated_product(spec, context)?;
         Ok(Self {
             layer,
             router,
@@ -282,6 +289,24 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> FeedForward<B
         expert_intermediate: i32,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
+        Self::new_with_geometry_and_routed_spec(
+            args,
+            layer,
+            dense_intermediate,
+            expert_intermediate,
+            None,
+            context,
+        )
+    }
+
+    pub(crate) fn new_with_geometry_and_routed_spec(
+        args: &ModelArgs,
+        layer: usize,
+        dense_intermediate: i32,
+        expert_intermediate: i32,
+        routed_spec: Option<GroupedGatedProductSpec>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
         match args
             .layer_policy(layer)
             .ok_or_else(|| Error::backend(format!("LFM2 has no layer {layer}")))?
@@ -290,9 +315,11 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> FeedForward<B
             FeedForwardPolicy::Dense => {
                 DenseSwiGlu::new(args, layer, dense_intermediate, context).map(Self::Dense)
             }
-            FeedForwardPolicy::SparseMoe => {
-                RoutedGatedProduct::new(args, layer, expert_intermediate, context).map(Self::Routed)
+            FeedForwardPolicy::SparseMoe => match routed_spec {
+                Some(spec) => RoutedGatedProduct::new_with_spec(args, layer, spec, context),
+                None => RoutedGatedProduct::new(args, layer, expert_intermediate, context),
             }
+            .map(Self::Routed),
         }
     }
 

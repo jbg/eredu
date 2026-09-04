@@ -11,7 +11,7 @@ use std::{
 
 use crate::{
     backend::DeviceAssignment,
-    native::{MlxParallelPlan, MlxRealtimeBackend, MlxRealtimeInput},
+    native::{MlxRealtimeBackend, MlxRealtimeInput},
     MlxLoadRequest,
 };
 use eredu_architectures::moshi::{MoshiCollectiveCount, MoshiConfig};
@@ -65,7 +65,7 @@ fn moshi_ring_collective_worker() {
         return;
     };
     let expected_rank: usize = rank.to_string_lossy().parse().unwrap();
-    let group = crate::backend::runtime::distributed::Group::native(
+    let group = crate::backend::runtime::distributed::Group::uncontracted(
         &distributed::init(true, Backend::Ring).unwrap(),
     );
     assert_eq!(group.size(), 2);
@@ -219,7 +219,7 @@ fn moshi_ring_model_parity_worker() {
     let expected_rank: usize = rank.to_string_lossy().parse().unwrap();
     let fixture = std::env::var_os(MODEL_WORKER_FIXTURE).unwrap();
     let expected_profile = std::env::var(MODEL_WORKER_PROFILE).unwrap();
-    let group = Arc::new(crate::backend::runtime::distributed::Group::native(
+    let group = Arc::new(crate::backend::runtime::distributed::Group::uncontracted(
         &distributed::init(true, Backend::Ring).unwrap(),
     ));
     assert_eq!((group.rank(), group.size()), (expected_rank, 2));
@@ -240,7 +240,11 @@ fn moshi_ring_model_parity_worker() {
     let expected = run_forced_and_greedy_sequence(&mut replicated);
     drop(replicated);
 
-    let topology = MlxParallelPlan::for_group(group.native_group(), 2, 1, 1, device).unwrap();
+    let topology = eredu_core::ParallelRankTopology::new(
+        eredu_core::ParallelTopology::new(2, 1, 1, 1).unwrap(),
+        expected_rank,
+    )
+    .unwrap();
     let backend = MlxRealtimeBackend::new(&stream, &weights_stream)
         .with_tensor_parallel_group(Arc::clone(&group));
     let mut parallel = load_realtime_model_with_options(
@@ -248,9 +252,13 @@ fn moshi_ring_model_parity_worker() {
         eredu_architectures::moshi::prepare_realtime_model(Path::new(&fixture)).unwrap(),
         MlxLoadRequest::with_parallel(
             topology,
+            device,
             eredu_runtime::PipelineWireContract::new(
                 eredu_runtime::PipelineActivationDtype::Float32,
             ),
+            1,
+            4096,
+            MlxLoadRequest::test_communication_completion_policy(),
         ),
     )
     .unwrap();

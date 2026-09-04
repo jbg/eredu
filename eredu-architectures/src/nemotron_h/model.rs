@@ -197,8 +197,14 @@ impl eredu_runtime::ArchitectureBoundary for TargetBoundarySchema {
     fn encode<T>(
         &self,
         boundary: Self::Boundary<T>,
-    ) -> Result<Vec<T>, eredu_runtime::ArchitectureBoundaryError> {
-        Ok(vec![boundary.tokens, boundary.embedded])
+    ) -> Result<
+        Vec<eredu_runtime::ArchitectureBoundaryValue<T>>,
+        eredu_runtime::ArchitectureBoundaryError,
+    > {
+        Ok(vec![
+            eredu_runtime::ArchitectureBoundaryValue::new("tokens", boundary.tokens)?,
+            eredu_runtime::ArchitectureBoundaryValue::new("embedded", boundary.embedded)?,
+        ])
     }
 
     fn decode<T>(
@@ -535,6 +541,29 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         &self,
     ) -> Option<&crate::ExpertRealizationPlan<eredu_nn::GroupedRelu2Spec>> {
         self.expert_realization.as_ref()
+    }
+
+    /// Projects the installed realization into an opaque backend provider descriptor.
+    pub fn expert_provider_descriptor(
+        &self,
+    ) -> Result<Option<super::ExpertProviderDescriptor>, Error> {
+        self.expert_realization
+            .as_ref()
+            .map(|plan| super::expert_provider_descriptor(plan, &self.args))
+            .transpose()
+    }
+
+    /// Selects, installs, and erases the rank-local expert realization for a
+    /// backend provider without exposing the realization plan.
+    pub fn prepare_expert_provider_descriptor(
+        &mut self,
+        topology: eredu_core::ParallelRankTopology,
+    ) -> Result<Option<super::ExpertProviderDescriptor>, Error> {
+        let realization = super::expert_realization_plan(self, topology)?;
+        if let Some(realization) = realization {
+            self.install_expert_realization(realization);
+        }
+        self.expert_provider_descriptor()
     }
 
     /// Constructs one canonical target or MTP unit from model-owned geometry.

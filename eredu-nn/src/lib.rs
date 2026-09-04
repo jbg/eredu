@@ -1003,6 +1003,59 @@ impl VocabularyParallelRange {
         }
         Ok(())
     }
+
+    /// Returns the exact balanced peer widths after proving this rank's local
+    /// range belongs to that partition.
+    ///
+    /// Vocabulary-parallel architectures select balanced contiguous
+    /// rows. Encoding that invariant here prevents a concrete backend from
+    /// silently substituting its own peer layout during uneven gather.
+    pub fn balanced_peer_widths(
+        &self,
+        partitions: usize,
+        rank: usize,
+    ) -> Result<Vec<usize>, Error> {
+        self.validate()?;
+        if partitions == 0 || rank >= partitions {
+            return Err(Error::backend(format!(
+                "invalid vocabulary partition rank {rank} of {partitions}"
+            )));
+        }
+        let base = self.global_vocabulary / partitions;
+        let remainder = self.global_vocabulary % partitions;
+        let widths = (0..partitions)
+            .map(|peer| base + usize::from(peer < remainder))
+            .collect::<Vec<_>>();
+        let start = widths[..rank].iter().sum::<usize>();
+        let expected = start..start + widths[rank];
+        if self.local != expected {
+            return Err(Error::backend(format!(
+                "vocabulary-parallel range {:?} differs from balanced rank {rank} ownership {expected:?}",
+                self.local
+            )));
+        }
+        Ok(widths)
+    }
+}
+
+#[cfg(test)]
+mod vocabulary_parallel_range_tests {
+    use super::VocabularyParallelRange;
+
+    #[test]
+    fn balanced_peer_widths_are_neutral_and_reject_local_layout_drift() {
+        let range = VocabularyParallelRange {
+            global_vocabulary: 11,
+            local: 4..8,
+        };
+        assert_eq!(range.balanced_peer_widths(3, 1).unwrap(), [4, 4, 3]);
+
+        let drifted = VocabularyParallelRange {
+            global_vocabulary: 11,
+            local: 3..7,
+        };
+        assert!(drifted.balanced_peer_widths(3, 1).is_err());
+    }
 }
 
 /// Token validation and sentinel behavior for one embedding lookup.

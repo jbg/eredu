@@ -110,7 +110,13 @@ impl Tensor for MlxTensor {
         } else {
             backend(self.0.as_dtype(Dtype::Float32, context))?
         };
-        Ok(backend(array.evaluated())?.as_slice::<f32>().to_vec())
+        let array = backend(array.contiguous(false, context))?;
+        if array.size() == 0 {
+            return Ok(Vec::new());
+        }
+        backend(array.evaluated())?
+            .try_to_vec::<f32>()
+            .map_err(Error::backend)
     }
 
     fn to_i32_vec(&self, context: &Self::Context) -> Result<Vec<i32>, Error> {
@@ -119,7 +125,11 @@ impl Tensor for MlxTensor {
         } else {
             backend(self.0.as_dtype(Dtype::Int32, context))?
         };
-        Ok(backend(array.evaluated())?.as_slice::<i32>().to_vec())
+        let evaluated = backend(array.evaluated())?;
+        if array.size() == 0 {
+            return Ok(Vec::new());
+        }
+        evaluated.try_to_vec::<i32>().map_err(Error::backend)
     }
 
     fn full_f32(value: f32, shape: &[i32], context: &Self::Context) -> Result<Self, Error> {

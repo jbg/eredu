@@ -8,13 +8,11 @@ use std::{
 
 use eredu_architectures::gpt_oss::ModelArgs;
 use eredu_checkpoint::{store::CheckpointSource, WeightQuantization};
-use eredu_nn::{
-    GroupedNeuralBackend, ParameterMetadata, ParameterVisitor, ParameterVisitorMut, Parameterized,
-};
+use eredu_nn::{ParameterMetadata, ParameterVisitor, ParameterVisitorMut, Parameterized};
 use eredu_runtime::{
     ArchitectureParameters, CacheResidencyPolicy, CausalModel, DenseDiskStreamReport,
-    LayerWeightResidency, LayerwiseRuntime, PagedCacheOptions, ParallelModelInfo, ParameterRole,
-    ResidencyReport, RuntimeState, WeightBinding, WeightResidency,
+    LayerWeightResidency, LayerwiseRuntime, PagedCacheOptions, ParameterRole, ResidencyReport,
+    RuntimeState, WeightResidency,
 };
 use safemlx::{error::Exception, ops::indexing::TryIndexOp, Array, Stream};
 
@@ -28,10 +26,8 @@ use crate::backend::{
         },
         checkpoint::{
             binding::{
-                apply_rank_local_parameter_recipes, binding_bytes,
-                build_module_binding_plan_with_recipes_excluding, build_module_bindings,
-                build_module_bindings_with_recipes_excluding, parameter_name_in_targets,
-                parameter_role_targets, populate_module_from_lease_excluding,
+                build_module_bindings, build_module_bindings_with_recipes_excluding,
+                parameter_name_in_targets, populate_module_from_lease_excluding,
             },
             load::gguf_quantization_configs,
             quantization::should_quantize_on_load,
@@ -43,7 +39,7 @@ use crate::backend::{
                 prepare_layerwise_policy_with_bindings, MlxLayerwisePolicy, MlxResidentPolicy,
                 MlxUnitPopulator,
             },
-            layerwise::{quantize_parameterized_store, shard_layer_bindings},
+            layerwise::quantize_parameterized_store,
         },
         media::input,
         residency::manager::ResidentUnitLease,
@@ -88,20 +84,6 @@ fn expert_parameter_targets(
     Ok(targets)
 }
 
-fn require_decoder_group(architecture: &NeutralArchitecture, group: usize) -> Result<(), Error> {
-    let transport = <NeutralArchitecture as eredu_runtime::LayeredArchitecture<
-        MlxNeuralBackend,
-        MlxKeyValueState,
-    >>::group_transport(architecture, group);
-    if transport.kind == eredu_runtime::ArchitectureGroupKind::Decoder {
-        Ok(())
-    } else {
-        Err(Error::ArchitectureModel(format!(
-            "GPT-OSS checkpoint bindings require the decoder execution group, got {group}"
-        )))
-    }
-}
-
 type ResidentRuntime = LayerwiseRuntime<
     NeutralArchitecture,
     MlxNeuralBackend,
@@ -114,13 +96,6 @@ type LayerwiseExecution = LayerwiseRuntime<
     MlxKeyValueState,
     MlxLayerwisePolicy<NeutralBlock, GptOssUnitPopulator>,
 >;
-type ParallelLayerwiseExecution = LayerwiseRuntime<
-    NeutralArchitecture,
-    MlxNeuralBackend,
-    MlxKeyValueState,
-    MlxLayerwisePolicy<NeutralBlock, GptOssParallelUnitPopulator>,
->;
-
 #[derive(Clone)]
 struct GptOssUnitPopulator {
     external_experts: bool,
@@ -140,30 +115,9 @@ impl MlxUnitPopulator<NeutralBlock> for GptOssUnitPopulator {
     }
 }
 
-#[derive(Clone)]
-struct GptOssParallelUnitPopulator {
-    external_experts: bool,
-    expert_targets: Arc<BTreeSet<String>>,
-}
-
-impl MlxUnitPopulator<NeutralBlock> for GptOssParallelUnitPopulator {
-    fn populate(
-        &mut self,
-        unit: &mut MlxModule<NeutralBlock>,
-        lease: &ResidentUnitLease,
-    ) -> Result<(), Error> {
-        populate_module_from_lease_excluding(unit, lease, |name| {
-            self.external_experts && parameter_name_in_targets(name, &self.expert_targets)
-        })?;
-        Ok(())
-    }
-}
-
 enum GptOssExecution {
     Resident(Box<ResidentRuntime>),
     Layerwise(Box<LayerwiseExecution>),
-    TensorParallelResident(Box<ResidentRuntime>),
-    TensorParallelLayerwise(Box<ParallelLayerwiseExecution>),
 }
 
 impl GptOssExecution {
@@ -171,8 +125,6 @@ impl GptOssExecution {
         match self {
             Self::Resident(runtime) => runtime.architecture(),
             Self::Layerwise(runtime) => runtime.architecture(),
-            Self::TensorParallelResident(runtime) => runtime.architecture(),
-            Self::TensorParallelLayerwise(runtime) => runtime.architecture(),
         }
     }
 }
@@ -314,7 +266,6 @@ pub fn load_neutral_with_store(
     Ok(GptOssModel {
         args,
         state_layout,
-        parallel_info: None,
         parallel_rank: None,
         planned_external_experts: None,
         prompt_cache_topology: PromptCacheTopology::default(),
@@ -323,180 +274,6 @@ pub fn load_neutral_with_store(
     })
 }
 
-fn load_neutral_parallel_with_store(
-    store: Arc<dyn CheckpointSource>,
-    args: ModelArgs,
-    options: LayerWeightResidency,
-    build: crate::composition::mlx::distributed::topology::ParallelBuildContext,
-    stream: &Stream,
-    weights_stream: &Stream,
-    external_experts: bool,
-) -> Result<GptOssModel, Error> {
-    let global_architecture = NeutralArchitecture::new(args.clone(), stream)
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    let expert_targets = Arc::new(expert_parameter_targets(&global_architecture, stream)?);
-    let parameter_description = global_architecture
-        .parameter_description(stream)
-        .map_err(|error| Error::Parallel(error.to_string()))?;
-    let execution_layout = parameter_description.unit_layout().clone();
-    let layout =
-        crate::composition::parallel_layout_from_description(build, &parameter_description)?;
-    if layout.is_empty() {
-        return Err(Error::Parallel(
-            "GPT-OSS declared no tensor-parallel parameters".into(),
-        ));
-    }
-    let geometry = eredu_architectures::gpt_oss::local_geometry(&args, &layout)
-        .map_err(|error| Error::Parallel(error.to_string()))?;
-    let mut architecture = NeutralArchitecture::new_parallel(args.clone(), geometry, stream)
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    let state_layout = architecture
-        .state_layout()
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    let factory = GptOssParallelUnitPopulator {
-        external_experts,
-        expert_targets: Arc::clone(&expert_targets),
-    };
-
-    let global_static = MlxModule::new(global_architecture.static_modules().clone());
-    let mut global_parameter_bytes =
-        binding_bytes(&build_module_bindings(&global_static, "", store.as_ref())?)?;
-    for ordinal in 0..execution_layout.len() {
-        let address = execution_layout
-            .address(ordinal)
-            .expect("canonical execution ordinal");
-        let block = construct_architecture_unit(
-            &global_architecture,
-            &execution_layout,
-            ordinal,
-            stream,
-            std::marker::PhantomData::<MlxKeyValueState>,
-        )?;
-        let recipes = if external_experts {
-            BTreeMap::new()
-        } else {
-            unit_recipes(store.as_ref(), &args, address.index())?
-        };
-        let bindings = build_module_bindings_with_recipes_excluding(
-            &MlxModule::new(block),
-            "",
-            store.as_ref(),
-            recipes,
-            |name| external_experts && parameter_name_in_targets(name, &expert_targets),
-        )?;
-        global_parameter_bytes = global_parameter_bytes
-            .checked_add(binding_bytes(&bindings)?)
-            .ok_or_else(|| Error::Parallel("global GPT-OSS parameter bytes overflowed".into()))?;
-    }
-
-    let binding_args = args.clone();
-    let global_static_modules = global_architecture.static_modules().clone();
-    let binding_execution_layout = execution_layout;
-    let local_layout = Arc::new(layout);
-    let static_layout = Arc::clone(&local_layout);
-    let unit_local_layout = Arc::clone(&local_layout);
-    let excluded_expert_targets = Arc::clone(&expert_targets);
-    let binding_expert_targets = Arc::clone(&expert_targets);
-    let (policy, mut metadata) = prepare_layerwise_policy_with_bindings(
-        Arc::clone(&store),
-        &mut architecture,
-        factory,
-        std::marker::PhantomData::<MlxKeyValueState>,
-        options,
-        stream,
-        weights_stream,
-        move |key| external_experts && parameter_name_in_targets(key, &excluded_expert_targets),
-        move |_modules, store| {
-            let global = MlxModule::new(global_static_modules.clone());
-            let bindings = build_module_bindings(&global, "", store)?;
-            shard_layer_bindings(bindings, store, &static_layout)
-        },
-        move |ordinal, address, _path, _local, store, stream| {
-            let layer = address.index();
-            let global = construct_architecture_unit(
-                &global_architecture,
-                &binding_execution_layout,
-                ordinal,
-                stream,
-                std::marker::PhantomData::<MlxKeyValueState>,
-            )?;
-            let recipes = if external_experts {
-                BTreeMap::new()
-            } else {
-                unit_recipes(store, &binding_args, layer)?
-            };
-            let bindings = build_module_bindings_with_recipes_excluding(
-                &MlxModule::new(global),
-                "",
-                store,
-                recipes,
-                |name| external_experts && parameter_name_in_targets(name, &binding_expert_targets),
-            )?;
-            shard_layer_bindings(bindings, store, &unit_local_layout)
-        },
-    )?;
-    metadata.set_effective_model_type(args.model_type.clone());
-    metadata.set_quantization(args.quantization);
-    let local_parameter_bytes = metadata
-        .static_device_bytes()
-        .checked_add(metadata.layer_parameter_bytes())
-        .ok_or_else(|| Error::Parallel("local GPT-OSS parameter bytes overflowed".into()))?;
-    let maximum_device_parameter_bytes = metadata
-        .static_device_bytes()
-        .checked_add(metadata.maximum_device_layer_bytes())
-        .ok_or_else(|| Error::Parallel("device GPT-OSS parameter bytes overflowed".into()))?;
-    let parallel_info = ParallelModelInfo::new(
-        build.topology(),
-        args.model_type.clone(),
-        local_layout
-            .tensors()
-            .map(|(target, _)| target.to_owned())
-            .collect(),
-        local_parameter_bytes,
-        global_parameter_bytes,
-        if options.is_fully_resident() {
-            local_parameter_bytes
-        } else {
-            metadata.static_device_bytes()
-        },
-        maximum_device_parameter_bytes,
-    );
-    let parallel_rank =
-        crate::composition::mlx::distributed::topology::prompt_cache_topology(build.topology())
-            .cache_rank_identity();
-    let execution = if options.is_fully_resident() {
-        GptOssExecution::TensorParallelResident(Box::new(LayerwiseRuntime::new_policy_first(
-            policy.into_resident(
-                &architecture,
-                stream,
-                std::marker::PhantomData::<MlxKeyValueState>,
-            )?,
-            architecture,
-        )))
-    } else {
-        GptOssExecution::TensorParallelLayerwise(Box::new(LayerwiseRuntime::new(
-            architecture,
-            policy,
-        )))
-    };
-    let planned_external_experts = external_experts
-        .then(|| expert::expert_catalog(&args, store.as_ref(), Some(&local_layout)))
-        .transpose()?;
-    Ok(GptOssModel {
-        args,
-        state_layout,
-        parallel_info: Some(parallel_info),
-        parallel_rank,
-        planned_external_experts,
-        prompt_cache_topology:
-            crate::composition::mlx::distributed::topology::prompt_cache_topology(build.topology()),
-        execution,
-        parameter_bank: None,
-    })
-}
-
-/// Builds a bounded packed overlay for eligible dense matrices while leaving
-/// GPT-OSS native expert tensors in their original checkpoint representation.
 pub fn quantize_neutral_store(
     store: Arc<dyn CheckpointSource>,
     source_args: &ModelArgs,
@@ -576,184 +353,10 @@ pub fn quantize_neutral_store(
     Ok((store, target_args, report))
 }
 
-/// Thin checkpoint-binding adapter used by GPT-OSS pipeline stages.
-#[derive(Default)]
-pub struct GptOssPipelineBindings {
-    external_experts: bool,
-}
-
-impl GptOssPipelineBindings {
-    pub const fn new() -> Self {
-        Self {
-            external_experts: false,
-        }
-    }
-
-    pub const fn new_external_experts() -> Self {
-        Self {
-            external_experts: true,
-        }
-    }
-
-    pub fn model_type<'a>(&self, architecture: &'a NeutralArchitecture) -> &'a str {
-        &architecture.args().model_type
-    }
-
-    pub fn quantizes_static_binding(&self, _binding: &WeightBinding) -> bool {
-        true
-    }
-
-    pub fn expert_parallel_assignment(
-        &self,
-        realization: Option<
-            &eredu_architectures::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>,
-        >,
-    ) -> Result<Option<crate::composition::expert_dispatch::ExpertAssignment>, Error> {
-        match realization {
-            None if self.external_experts => Err(Error::Parallel(
-                "GPT-OSS has no architecture expert realization".into(),
-            )),
-            None => Ok(None),
-            Some(plan) if plan.expert_parallel_size() == 1 && !self.external_experts => Ok(None),
-            Some(plan) => {
-                crate::composition::expert_dispatch::ExpertAssignment::from_realization(plan)
-                    .map(Some)
-            }
-        }
-    }
-
-    /// Applies rank-local expert residency to an architecture-constructed unit.
-    pub fn prepare_unit_expert_residency(
-        &self,
-        index: usize,
-        layer: &mut MlxModule<NeutralBlock>,
-        realization: Option<
-            &eredu_architectures::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>,
-        >,
-        assignment: Option<&crate::composition::expert_dispatch::ExpertAssignment>,
-        stream: &Stream,
-    ) -> Result<(), Error> {
-        if let Some(assignment) = assignment {
-            let plan = realization.ok_or_else(|| {
-                Error::Parallel("GPT-OSS expert assignment has no architecture realization".into())
-            })?;
-            if assignment.local_global_group_indices() != plan.local_global_group_indices() {
-                return Err(Error::Parallel(
-                    "GPT-OSS native assignment disagrees with architecture realization".into(),
-                ));
-            }
-            let spec = plan
-                .unit_spec("text_decoder", index)
-                .cloned()
-                .ok_or_else(|| {
-                    Error::Parallel(format!(
-                        "GPT-OSS architecture realization has no expert bank for unit {index}"
-                    ))
-                })?;
-            layer.inner.mlp.experts =
-                <MlxNeuralBackend as GroupedNeuralBackend>::grouped_gated_product(spec, stream)
-                    .map_err(|error| Error::Parallel(error.to_string()))?;
-        }
-        Ok(())
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn cartesian_layer_bindings(
-        &self,
-        architecture: &NeutralArchitecture,
-        group: usize,
-        index: usize,
-        store: &dyn CheckpointSource,
-        layout: Option<&eredu_runtime::LocalModelLayout>,
-        assignment: Option<&crate::composition::expert_dispatch::ExpertAssignment>,
-        stream: &Stream,
-    ) -> Result<Vec<WeightBinding>, Error> {
-        require_decoder_group(architecture, group)?;
-        let global_layer = MlxModule::new(
-            architecture
-                .construct_unit(index, stream)
-                .map_err(|error| Error::ArchitectureModel(error.to_string()))?,
-        );
-        let expert_targets = parameter_role_targets(
-            &eredu_architectures::gpt_oss::layer_parallel_parameter_groups(
-                &global_layer,
-                architecture.args(),
-                index,
-            )
-            .map_err(|error| Error::Parallel(error.to_string()))?,
-            ParameterRole::ExpertIntermediate,
-        );
-        let recipes = if self.external_experts {
-            BTreeMap::new()
-        } else {
-            unit_recipes(store, architecture.args(), index)?
-        };
-        let bindings = build_module_binding_plan_with_recipes_excluding(
-            &global_layer,
-            "",
-            store,
-            recipes,
-            |name| self.external_experts && parameter_name_in_targets(name, &expert_targets),
-        )?
-        .build_bindings(store)?;
-        let bindings = match assignment {
-            Some(assignment) if !self.external_experts => apply_rank_local_parameter_recipes(
-                bindings,
-                store,
-                eredu_architectures::gpt_oss::rank_local_expert_recipes(
-                    store,
-                    architecture.args(),
-                    index,
-                    assignment.local_global_group_indices(),
-                )
-                .map_err(Error::ArchitectureModel)?,
-            )?,
-            _ => bindings,
-        };
-        match layout {
-            Some(layout) => shard_layer_bindings(bindings, store, layout),
-            None => Ok(bindings),
-        }
-    }
-
-    pub fn layer_bindings(
-        &self,
-        architecture: &NeutralArchitecture,
-        group: usize,
-        index: usize,
-        layer: &MlxModule<NeutralBlock>,
-        store: &dyn CheckpointSource,
-    ) -> Result<Vec<WeightBinding>, Error> {
-        require_decoder_group(architecture, group)?;
-        let expert_targets = parameter_role_targets(
-            &eredu_architectures::gpt_oss::layer_parallel_parameter_groups(
-                layer,
-                architecture.args(),
-                index,
-            )
-            .map_err(|error| Error::Parallel(error.to_string()))?,
-            ParameterRole::ExpertIntermediate,
-        );
-        let recipes = if self.external_experts {
-            BTreeMap::new()
-        } else {
-            unit_recipes(store, architecture.args(), index)?
-        };
-        Ok(
-            build_module_binding_plan_with_recipes_excluding(layer, "", store, recipes, |name| {
-                self.external_experts && parameter_name_in_targets(name, &expert_targets)
-            })?
-            .build_bindings(store)?,
-        )
-    }
-}
-
 /// Neutral GPT-OSS causal LM with resident or bounded layer execution.
 pub struct GptOssModel {
     args: ModelArgs,
     state_layout: eredu_runtime::StateLayout,
-    parallel_info:
-        Option<ParallelModelInfo<crate::composition::mlx::distributed::topology::MlxParallelPlan>>,
     parallel_rank: Option<eredu_core::cache::CacheRankIdentity>,
     planned_external_experts: Option<Vec<ParameterBankEntry>>,
     prompt_cache_topology: PromptCacheTopology,
@@ -765,13 +368,6 @@ impl GptOssModel {
     /// Returns normalized model arguments.
     pub fn args(&self) -> &ModelArgs {
         &self.args
-    }
-
-    pub fn parallel_info(
-        &self,
-    ) -> Option<&ParallelModelInfo<crate::composition::mlx::distributed::topology::MlxParallelPlan>>
-    {
-        self.parallel_info.as_ref()
     }
 
     /// Builds expert-cache units with this rank's exact TP selections.
@@ -787,12 +383,6 @@ impl GptOssModel {
         match &self.execution {
             GptOssExecution::Resident(execution) => execution.policy().residency_report(),
             GptOssExecution::Layerwise(execution) => execution.policy().residency_report(),
-            GptOssExecution::TensorParallelResident(execution) => {
-                execution.policy().residency_report()
-            }
-            GptOssExecution::TensorParallelLayerwise(execution) => {
-                execution.policy().residency_report()
-            }
         }
     }
 
@@ -801,10 +391,6 @@ impl GptOssModel {
         match &self.execution {
             GptOssExecution::Resident(_) => Ok(None),
             GptOssExecution::Layerwise(execution) => execution.policy().dense_stream_report(),
-            GptOssExecution::TensorParallelResident(_) => Ok(None),
-            GptOssExecution::TensorParallelLayerwise(execution) => {
-                execution.policy().dense_stream_report()
-            }
         }
     }
 
@@ -822,12 +408,6 @@ impl GptOssModel {
         match &self.execution {
             GptOssExecution::Resident(execution) => execution.policy().checkpoint_store(),
             GptOssExecution::Layerwise(execution) => execution.policy().checkpoint_store(),
-            GptOssExecution::TensorParallelResident(execution) => {
-                execution.policy().checkpoint_store()
-            }
-            GptOssExecution::TensorParallelLayerwise(execution) => {
-                execution.policy().checkpoint_store()
-            }
         }
     }
 
@@ -835,12 +415,6 @@ impl GptOssModel {
         match &self.execution {
             GptOssExecution::Resident(execution) => execution.policy().checkpoint_store_arc(),
             GptOssExecution::Layerwise(execution) => execution.policy().checkpoint_store_arc(),
-            GptOssExecution::TensorParallelResident(execution) => {
-                execution.policy().checkpoint_store_arc()
-            }
-            GptOssExecution::TensorParallelLayerwise(execution) => {
-                execution.policy().checkpoint_store_arc()
-            }
         }
     }
 
@@ -955,10 +529,6 @@ impl GptOssModel {
             GptOssExecution::Layerwise(execution) => execution
                 .forward(input, cache, stream)
                 .map_err(|error| Error::ArchitectureModel(error.to_string())),
-            GptOssExecution::TensorParallelResident(_)
-            | GptOssExecution::TensorParallelLayerwise(_) => Err(Error::Parallel(
-                "tensor-parallel GPT-OSS execution requires a collective group".into(),
-            )),
         }?;
         Ok(output.into_array())
     }
@@ -977,11 +547,6 @@ impl GptOssModel {
         P::Error: std::fmt::Display,
     {
         self.validate_cache(cache)?;
-        let pass = if inputs.dim(1) > 1 {
-            eredu_runtime::ExpertPass::Prefill
-        } else {
-            eredu_runtime::ExpertPass::Decode
-        };
         let hook =
             |architecture: &mut NeutralArchitecture,
              group: usize,
@@ -994,7 +559,7 @@ impl GptOssModel {
                 <NeutralArchitecture as eredu_runtime::RoutedLayeredArchitecture<
                     MlxNeuralBackend,
                     Cache,
-                >>::forward_unit_with_provider(
+                >>::forward_unit_with_inferred_provider(
                     architecture,
                     group,
                     index,
@@ -1002,7 +567,6 @@ impl GptOssModel {
                     hidden,
                     state,
                     forward,
-                    pass,
                     provider,
                     context,
                 )
@@ -1018,211 +582,6 @@ impl GptOssModel {
             GptOssExecution::Layerwise(runtime) => runtime
                 .forward_with_unit_executor(input, cache, stream, hook)
                 .map_err(|error| Error::ArchitectureModel(error.to_string())),
-            GptOssExecution::TensorParallelResident(_)
-            | GptOssExecution::TensorParallelLayerwise(_) => Err(Error::Parallel(
-                "tensor-parallel GPT-OSS expert execution requires a collective group".into(),
-            )),
-        }?;
-        Ok(output.into_array())
-    }
-
-    /// Runs a rank-local neutral GPT-OSS tensor-parallel forward pass.
-    pub fn forward_tensor_parallel(
-        &mut self,
-        inputs: &Array,
-        cache: &mut Cache,
-        group: &crate::backend::runtime::distributed::Group,
-        stream: &Stream,
-    ) -> Result<Array, Error> {
-        if let Some(parameter_bank) = self.parameter_bank.take() {
-            let args = self.args.clone();
-            let result = {
-                let mut provider = expert::cached_provider(&parameter_bank, &args);
-                self.forward_tensor_grouped_provider(
-                    inputs,
-                    None,
-                    cache,
-                    group,
-                    &mut provider,
-                    stream,
-                )
-            };
-            self.parameter_bank = Some(parameter_bank);
-            return result;
-        }
-        self.validate_cache(cache)?;
-        let input = eredu_architectures::gpt_oss::LayeredInput {
-            tokens: crate::composition::tensor_ref(inputs),
-            mask: None,
-        };
-        let output = match &mut self.execution {
-            GptOssExecution::TensorParallelResident(runtime) => runtime
-                .forward_parallel(input, cache, group, stream)
-                .map_err(|error| Error::Parallel(error.to_string())),
-            GptOssExecution::TensorParallelLayerwise(runtime) => runtime
-                .forward_parallel(input, cache, group, stream)
-                .map_err(|error| Error::Parallel(error.to_string())),
-            GptOssExecution::Resident(_) | GptOssExecution::Layerwise(_) => Err(Error::Parallel(
-                "model was not loaded for GPT-OSS tensor-parallel execution".into(),
-            )),
-        }?;
-        Ok(output.into_array())
-    }
-
-    pub fn forward_tensor_parallel_with_observer(
-        &mut self,
-        inputs: &Array,
-        cache: &mut Cache,
-        group: &crate::backend::runtime::distributed::Group,
-        stream: &Stream,
-        observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
-    ) -> Result<Array, Error> {
-        self.validate_cache(cache)?;
-        let args = self.args.clone();
-        let parameter_bank = self.parameter_bank.take();
-        let result = {
-            let input = eredu_architectures::gpt_oss::LayeredInput {
-                tokens: crate::composition::tensor_ref(inputs),
-                mask: None,
-            };
-            let pass = if inputs.dim(1) > 1 {
-                eredu_runtime::ExpertPass::Prefill
-            } else {
-                eredu_runtime::ExpertPass::Decode
-            };
-            let mut neutral = crate::composition::NeutralActivationObserver::new(observer);
-            let output = match parameter_bank.as_ref() {
-                Some(parameter_bank) => {
-                    let mut provider = expert::cached_provider(parameter_bank, &args);
-                    match &mut self.execution {
-                        GptOssExecution::TensorParallelResident(runtime) => runtime
-                            .forward_parallel_with_provider_and_observer(
-                                input,
-                                cache,
-                                pass,
-                                &mut provider,
-                                group,
-                                stream,
-                                &mut neutral,
-                            ),
-                        GptOssExecution::TensorParallelLayerwise(runtime) => runtime
-                            .forward_parallel_with_provider_and_observer(
-                                input,
-                                cache,
-                                pass,
-                                &mut provider,
-                                group,
-                                stream,
-                                &mut neutral,
-                            ),
-                        _ => {
-                            return Err(Error::Parallel(
-                                "GPT-OSS was not loaded for tensor parallelism".into(),
-                            ))
-                        }
-                    }
-                }
-                None => {
-                    let mut provider = eredu_runtime::ResidentExpertProvider;
-                    match &mut self.execution {
-                        GptOssExecution::TensorParallelResident(runtime) => runtime
-                            .forward_parallel_with_provider_and_observer(
-                                input,
-                                cache,
-                                pass,
-                                &mut provider,
-                                group,
-                                stream,
-                                &mut neutral,
-                            ),
-                        GptOssExecution::TensorParallelLayerwise(runtime) => runtime
-                            .forward_parallel_with_provider_and_observer(
-                                input,
-                                cache,
-                                pass,
-                                &mut provider,
-                                group,
-                                stream,
-                                &mut neutral,
-                            ),
-                        _ => {
-                            return Err(Error::Parallel(
-                                "GPT-OSS was not loaded for tensor parallelism".into(),
-                            ))
-                        }
-                    }
-                }
-            }
-            .map_err(|error| Error::Parallel(error.to_string()))?;
-            eredu_runtime::observe_model_logits(&mut neutral, &output)
-                .map(crate::MlxTensor::into_array)
-                .map_err(Error::from)
-        };
-        self.parameter_bank = parameter_bank;
-        result
-    }
-
-    /// Runs tensor-parallel attention and provider-owned routed experts.
-    pub fn forward_tensor_grouped_provider<P>(
-        &mut self,
-        inputs: &Array,
-        mask: Option<&Array>,
-        cache: &mut Cache,
-        group: &crate::backend::runtime::distributed::Group,
-        provider: &mut P,
-        stream: &Stream,
-    ) -> Result<Array, Error>
-    where
-        P: eredu_runtime::TensorParallelRoutedExpertProvider<MlxNeuralBackend>,
-        P::Error: std::fmt::Display,
-    {
-        self.validate_cache(cache)?;
-        let pass = if inputs.dim(1) > 1 {
-            eredu_runtime::ExpertPass::Prefill
-        } else {
-            eredu_runtime::ExpertPass::Decode
-        };
-        let hook =
-            |architecture: &mut NeutralArchitecture,
-             execution_group: usize,
-             index: usize,
-             block: &mut NeutralBlock,
-             hidden: &crate::MlxTensor,
-             state: &mut Cache,
-             forward: &mut eredu_architectures::gpt_oss::ForwardContext<crate::MlxTensor>,
-             parallel: &crate::backend::runtime::distributed::Group,
-             context: &Stream| {
-                <NeutralArchitecture as eredu_runtime::ParallelRoutedLayeredArchitecture<
-                    MlxNeuralBackend,
-                    Cache,
-                >>::forward_unit_parallel_with_provider(
-                    architecture,
-                    execution_group,
-                    index,
-                    block,
-                    hidden,
-                    state,
-                    forward,
-                    pass,
-                    provider,
-                    parallel,
-                    context,
-                )
-            };
-        let input = eredu_architectures::gpt_oss::LayeredInput {
-            tokens: crate::composition::tensor_ref(inputs),
-            mask: crate::composition::tensor_opt(mask),
-        };
-        let output = match &mut self.execution {
-            GptOssExecution::TensorParallelResident(runtime) => runtime
-                .forward_parallel_with_unit_executor(input, cache, group, stream, hook)
-                .map_err(|error| Error::Parallel(error.to_string())),
-            GptOssExecution::TensorParallelLayerwise(runtime) => runtime
-                .forward_parallel_with_unit_executor(input, cache, group, stream, hook)
-                .map_err(|error| Error::Parallel(error.to_string())),
-            GptOssExecution::Resident(_) | GptOssExecution::Layerwise(_) => Err(Error::Parallel(
-                "model was not loaded for GPT-OSS tensor-parallel expert execution".into(),
-            )),
         }?;
         Ok(output.into_array())
     }
@@ -1281,45 +640,31 @@ impl GptOssModel {
         P::Error: std::fmt::Display,
     {
         self.validate_cache(cache)?;
-        let pass = if inputs.dim(1) > 1 {
-            eredu_runtime::ExpertPass::Prefill
-        } else {
-            eredu_runtime::ExpertPass::Decode
-        };
         let output = match &mut self.execution {
             GptOssExecution::Resident(runtime) => runtime
-                .forward_with_provider_and_observer(
+                .forward_with_inferred_provider_and_observer(
                     eredu_architectures::decoder::LayeredInput {
                         tokens: crate::composition::tensor_ref(inputs),
                         mask: crate::composition::tensor_opt(mask),
                     },
                     cache,
-                    pass,
                     provider,
                     stream,
                     observer,
                 )
                 .map_err(|error| Error::ArchitectureModel(error.to_string()))?,
             GptOssExecution::Layerwise(runtime) => runtime
-                .forward_with_provider_and_observer(
+                .forward_with_inferred_provider_and_observer(
                     eredu_architectures::decoder::LayeredInput {
                         tokens: crate::composition::tensor_ref(inputs),
                         mask: crate::composition::tensor_opt(mask),
                     },
                     cache,
-                    pass,
                     provider,
                     stream,
                     observer,
                 )
                 .map_err(|error| Error::ArchitectureModel(error.to_string()))?,
-            GptOssExecution::TensorParallelResident(_)
-            | GptOssExecution::TensorParallelLayerwise(_) => {
-                return Err(Error::Parallel(
-                    "tensor-parallel GPT-OSS observation requires a collective observer path"
-                        .into(),
-                ))
-            }
         };
         eredu_runtime::observe_model_logits(observer, &output)
             .map(crate::MlxTensor::into_array)
@@ -1462,31 +807,11 @@ pub fn load_safetensors(
 }
 
 /// Loads SafeTensors or an inspected GGUF through the neutral GPT-OSS tensor-parallel graph.
-pub fn load_gpt_oss_tensor_parallel_model(
-    artifact: &crate::composition::mlx::artifact::PreparedSafetensorsArtifact,
-    options: impl Into<LayerWeightResidency>,
-    build: crate::composition::mlx::distributed::topology::ParallelBuildContext,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<GptOssModel, Error> {
-    let options = options.into();
-    let eredu_architectures::configuration::SafetensorsModelConfig::GptOss(args) = artifact.model()
-    else {
-        return Err(Error::ArchitectureModel(
-            "GPT-OSS loader received a different prepared architecture".into(),
-        ));
-    };
-    let args = args.clone();
-    let store = artifact.store();
-    load_neutral_parallel_with_store(store, args, options, build, stream, weights_stream, false)
-}
-
 /// Header-only results needed to open a portable GGUF GPT-OSS checkpoint.
 pub(crate) struct PreparedGptOssGguf {
     pub args: ModelArgs,
 }
 
-/// Normalizes backend-native GGUF encoding metadata without reading payloads.
 pub(crate) fn prepare_gpt_oss_gguf_checkpoint(
     source: &crate::composition::mlx::structural::AdmittedGguf,
 ) -> Result<PreparedGptOssGguf, Error> {
@@ -1545,33 +870,5 @@ pub(crate) fn load_gpt_oss_gguf_model(
     if let Some(options) = expert_options {
         attach_parameter_bank(&mut model, options, stream, weights_stream)?;
     }
-    Ok(model)
-}
-
-/// Loads a validated GGUF checkpoint through the neutral tensor-parallel graph.
-pub(crate) fn load_gpt_oss_gguf_tensor_parallel_model(
-    source: &crate::composition::mlx::structural::AdmittedGguf,
-    options: LayerWeightResidency,
-    build: crate::composition::mlx::distributed::topology::ParallelBuildContext,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<GptOssModel, Error> {
-    let checkpoint = source.checkpoint();
-    let prepared = prepare_gpt_oss_gguf_checkpoint(source)?;
-    let store: Arc<dyn CheckpointSource> = Arc::new(open_gguf_checkpoint_source(
-        checkpoint.clone(),
-        source.plan().checkpoint(),
-        source.plan().tensor_mapping(),
-        options.max_cached_shards(),
-    )?);
-    let model = load_neutral_parallel_with_store(
-        store,
-        prepared.args,
-        options,
-        build,
-        stream,
-        weights_stream,
-        false,
-    )?;
     Ok(model)
 }

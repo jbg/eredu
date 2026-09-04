@@ -18,16 +18,18 @@ pub use config::{
     prompt_cache_architecture_fingerprint, state_identity, state_layout, ConfigError, ModelArgs,
     MxFp4Config,
 };
-pub use model::{new_layered_model, LayeredModel};
+pub use model::{new_layered_model, LayeredModel, PartitionedLayeredModel};
 pub use moe::{
-    expert_bank_spec, expert_realization_plan, replicated_expert_realization_plan, RoutedMlp,
+    expert_bank_spec, expert_realization_plan, partition_expert_realization_plan,
+    replicated_expert_realization_plan, RoutedMlp,
 };
 pub use parallel::{
     layer_parallel_parameter_groups, local_block_args, local_geometry, local_key_value_heads,
-    static_parameter_groups, LocalGeometry,
+    partition_local_routed_geometry, static_parameter_groups, LocalGeometry,
 };
 
 pub use crate::decoder::{
     cache_layout, cache_layout_with_key_value_heads, create_caches, validate_caches,
-    AttentionInput, ForwardContext, LayeredInput, StaticModules,
+    AttentionInput, ForwardContext, LayeredInput, PartitionLocalGeometry, PartitionStaticModules,
+    StaticModules,
 };

@@ -12,8 +12,9 @@ use eredu_core::{
 use eredu_nn::{NeuralBackend, NeuralOperatorCapabilities};
 
 use crate::{
-    ArchitectureGroupTransport, CacheResidencyPolicy, ExecutionGraph, ExecutionUnitLayout,
-    LayerWeightResidency, LayeredArchitecture, ParameterGroupOwner, RuntimeState, StateLayout,
+    ArchitectureGroupTransport, ArchitectureParameterDescription, ArchitecturePartition,
+    CacheResidencyPolicy, ExecutionGraph, ExecutionUnitLayout, LayerWeightResidency,
+    LayeredArchitecture, ParameterGroupOwner, ParameterGroupSpec, RuntimeState, StateLayout,
 };
 
 /// Statically dispatched text-input seam for a layered decoder.
@@ -1522,7 +1523,9 @@ impl ReplicatedTextOutputCompanion {
         mut self,
         task: ReplicatedTextMaterializationTask,
     ) -> Result<Self, ReplicatedTextContractError> {
-        if task.name() != self.name || !task.output_companions().is_empty() {
+        let names_output =
+            task.name() == self.name || task.aliases().iter().any(|alias| alias == &self.name);
+        if !names_output || !task.output_companions().is_empty() {
             return Err(ReplicatedTextContractError::invalid(format!(
                 "companion {:?} has an inconsistent standalone materialization task",
                 self.name
@@ -1819,6 +1822,194 @@ pub fn replicated_text_materialization_tasks(
         .collect()
 }
 
+/// Projects selected text materialization into one exact architecture partition.
+///
+/// Encoded-linear companions are reconstructed from the architecture's
+/// validated physical parameter groups and remain atomic with their primary
+/// task. If a partition would own only part of such a physical family, the
+/// complete projection fails instead of retaining an unowned output.
+pub fn partitioned_replicated_text_materialization_tasks<G, A>(
+    selected: &SelectedReplicatedTextRealization,
+    parameters: &ArchitectureParameterDescription,
+    partition: &ArchitecturePartition<G, A>,
+) -> Result<Vec<ReplicatedTextMaterializationTask>, ReplicatedTextContractError> {
+    let mut companions = BTreeMap::<String, Vec<ReplicatedTextOutputCompanion>>::new();
+    let mut all_targets = BTreeSet::new();
+    let mut owned_targets = BTreeSet::new();
+    for tagged in parameters.groups() {
+        let local = partition.parameter_bindings().iter().any(|binding| {
+            binding.owner() == tagged.owner()
+                && parameter_groups_have_same_members(binding.group(), tagged.group())
+        });
+        let group_targets = tagged
+            .members()
+            .iter()
+            .map(|member| member.target())
+            .collect::<BTreeSet<_>>();
+        for member in tagged.members() {
+            if !all_targets.insert(member.target().to_owned()) {
+                return Err(ReplicatedTextContractError::invalid(format!(
+                    "architecture parameter target {:?} appears more than once",
+                    member.target()
+                )));
+            }
+            if local {
+                owned_targets.insert(member.target().to_owned());
+            }
+            match (member.linear_companion(), member.linear_companion_of()) {
+                (None, None) => {}
+                (Some(role), Some(primary)) if group_targets.contains(primary) => {
+                    companions.entry(primary.to_owned()).or_default().push(
+                        ReplicatedTextOutputCompanion::new(
+                            member.target(),
+                            role,
+                            member.global_shape().to_vec(),
+                            tagged.owner().clone(),
+                        )?,
+                    );
+                }
+                (Some(_), Some(primary)) => {
+                    return Err(ReplicatedTextContractError::invalid(format!(
+                        "physical companion {:?} names primary {primary:?} outside its atomic parameter group",
+                        member.target()
+                    )));
+                }
+                _ => {
+                    return Err(ReplicatedTextContractError::invalid(format!(
+                        "physical parameter {:?} has incomplete companion metadata",
+                        member.target()
+                    )));
+                }
+            }
+        }
+    }
+
+    let mut tasks = replicated_text_materialization_tasks(selected)?;
+    let mut topology_targets = BTreeMap::<String, String>::new();
+    let mut target_claims = BTreeMap::<String, String>::new();
+    for task in &tasks {
+        let matches = std::iter::once(task.name())
+            .chain(task.aliases().iter().map(String::as_str))
+            .filter(|candidate| all_targets.contains(*candidate))
+            .collect::<BTreeSet<_>>();
+        if matches.len() != 1 {
+            return Err(ReplicatedTextContractError::invalid(format!(
+                "selected materialization output {:?} resolves to {} architecture topology targets through its canonical identity and admitted aliases: {:?}",
+                task.name(),
+                matches.len(),
+                matches
+            )));
+        }
+        let target = matches.first().expect("one topology target was validated");
+        if let Some(previous) = target_claims.insert((*target).to_owned(), task.name().to_owned()) {
+            return Err(ReplicatedTextContractError::invalid(format!(
+                "selected materialization outputs {previous:?} and {:?} ambiguously resolve to architecture target {target:?}",
+                task.name()
+            )));
+        }
+        topology_targets.insert(task.name().to_owned(), (*target).to_owned());
+    }
+    let companion_names = companions
+        .values()
+        .flatten()
+        .map(|companion| companion.name().to_owned())
+        .collect::<BTreeSet<_>>();
+    let standalone = tasks
+        .iter()
+        .filter_map(|task| {
+            let target = topology_targets
+                .get(task.name())
+                .expect("every task has one validated topology target");
+            companion_names
+                .contains(target)
+                .then(|| (target.clone(), task.clone()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    for task in &mut tasks {
+        let topology_target = topology_targets
+            .get(task.name())
+            .expect("every task has one validated topology target");
+        let attached = companions
+            .remove(topology_target)
+            .unwrap_or_default()
+            .into_iter()
+            .map(
+                |companion| match standalone.get(companion.name()).cloned() {
+                    Some(exact) => companion.with_materialization_task(exact),
+                    None => Ok(companion),
+                },
+            )
+            .collect::<Result<Vec<_>, _>>()?;
+        task.set_output_companions(attached)?;
+    }
+    if !companions.is_empty() {
+        return Err(ReplicatedTextContractError::invalid(format!(
+            "architecture companions name missing primary tasks: {:?}",
+            companions.keys().collect::<Vec<_>>()
+        )));
+    }
+    tasks.retain(|task| {
+        !companion_names.contains(
+            topology_targets
+                .get(task.name())
+                .expect("every task has one validated topology target"),
+        )
+    });
+
+    let mut projected = Vec::new();
+    for task in tasks {
+        let topology_target = topology_targets
+            .get(task.name())
+            .expect("every task has one validated topology target");
+        let emitted = std::iter::once(topology_target.as_str())
+            .chain(
+                task.output_companions()
+                    .iter()
+                    .map(ReplicatedTextOutputCompanion::name),
+            )
+            .collect::<Vec<_>>();
+        let local = emitted
+            .iter()
+            .filter(|target| owned_targets.contains(**target))
+            .count();
+        match local {
+            0 => {}
+            count if count == emitted.len() => projected.push(task),
+            count => {
+                return Err(ReplicatedTextContractError::invalid(format!(
+                    "materialization task {:?} would emit {count} of {} outputs into this partition",
+                    task.name(),
+                    emitted.len()
+                )));
+            }
+        }
+    }
+    Ok(projected)
+}
+
+/// Parameter visitation order is an implementation detail of a local module,
+/// while an architecture parameter group is an atomic, target-keyed contract.
+/// Compare that contract without making otherwise-identical local ownership
+/// depend on whether a backend-neutral module visits a bias before its weight.
+fn parameter_groups_have_same_members(
+    left: &ParameterGroupSpec,
+    right: &ParameterGroupSpec,
+) -> bool {
+    left.logical_name() == right.logical_name()
+        && left.role() == right.role()
+        && left.partition_units() == right.partition_units()
+        && left.members().len() == right.members().len()
+        && left.members().iter().all(|left_member| {
+            right.members().iter().any(|right_member| {
+                left_member.target() == right_member.target()
+                    && left_member.global_shape() == right_member.global_shape()
+                    && left_member.sharding() == right_member.sharding()
+                    && left_member.linear_companion() == right_member.linear_companion()
+                    && left_member.linear_companion_of() == right_member.linear_companion_of()
+            })
+        })
+}
+
 impl SelectedParameterRealization {
     /// Returns the canonical logical identity.
     pub fn name(&self) -> &str {
@@ -1889,6 +2080,141 @@ impl SelectedStateRealization {
     /// Returns the exact architecture-owned state layout.
     pub const fn layout(&self) -> &StateLayout {
         &self.layout
+    }
+
+    /// Selects the exact rank-local state interval while preserving global ownership proof.
+    ///
+    /// Component ordinals are rebased to the local layout consumed by a rank-local runtime;
+    /// prompt-cache identity retains the global offset separately through [`crate::PartitionState`].
+    pub fn for_partition(
+        &self,
+        partition: &crate::PartitionState,
+    ) -> Result<Self, ReplicatedTextContractError> {
+        let range = partition.global_layers();
+        let expected = self
+            .layout
+            .slice(range.clone())
+            .map_err(|error| ReplicatedTextContractError::invalid(error.to_string()))?;
+        if &expected != partition.layout() {
+            return Err(ReplicatedTextContractError::invalid(
+                "partition state layout differs from the selected global interval",
+            ));
+        }
+        let components = self
+            .components
+            .iter()
+            .filter(|component| range.contains(&component.layer))
+            .cloned()
+            .map(|mut component| {
+                component.layer -= range.start;
+                component
+            })
+            .collect::<Vec<_>>();
+        let expected_components = (0..partition.layout().len())
+            .map(|layer| {
+                partition
+                    .layout()
+                    .components(layer)
+                    .expect("validated local state layout contains every layer")
+                    .len()
+            })
+            .sum::<usize>();
+        if components.len() != expected_components {
+            return Err(ReplicatedTextContractError::invalid(
+                "partition state components differ from the selected global interval",
+            ));
+        }
+        Ok(Self {
+            layout: partition.layout().clone(),
+            access: self.access,
+            policy: self.policy.clone(),
+            components,
+            checkpoint: self.checkpoint,
+            rollback: self.rollback,
+            reset: self.reset,
+            prompt_cache: self.prompt_cache,
+            observation_retention: self.observation_retention,
+        })
+    }
+
+    /// Selects a rank-local interval whose tensor-parallel component shapes were authored by the
+    /// validated architecture partition.
+    ///
+    /// Pipeline ownership must still name the same global layer interval. Tensor-parallel
+    /// geometry may narrow fixed dimensions, but it cannot change component roles, dtype,
+    /// residency, presence, ordering, or selected physical placement.
+    pub fn for_partitioned_geometry(
+        &self,
+        partition: &crate::PartitionState,
+    ) -> Result<Self, ReplicatedTextContractError> {
+        let range = partition.global_layers();
+        let global = self
+            .layout
+            .slice(range.clone())
+            .map_err(|error| ReplicatedTextContractError::invalid(error.to_string()))?;
+        if global.len() != partition.layout().len() {
+            return Err(ReplicatedTextContractError::invalid(
+                "partition state layer count differs from the selected global interval",
+            ));
+        }
+        let mut components = Vec::new();
+        for local_layer in 0..partition.layout().len() {
+            let global_components = global
+                .components(local_layer)
+                .expect("validated selected state contains every local layer");
+            let local_components = partition
+                .layout()
+                .components(local_layer)
+                .expect("validated partition state contains every local layer");
+            if global_components.len() != local_components.len() {
+                return Err(ReplicatedTextContractError::invalid(
+                    "partition state component count differs from selected state",
+                ));
+            }
+            let global_layer = range.start + local_layer;
+            let selected_components = self
+                .components
+                .iter()
+                .filter(|component| component.layer == global_layer)
+                .collect::<Vec<_>>();
+            if selected_components.len() != local_components.len() {
+                return Err(ReplicatedTextContractError::invalid(
+                    "partition state components differ from the selected global interval",
+                ));
+            }
+            for ((global_policy, local_policy), selected) in global_components
+                .iter()
+                .zip(local_components)
+                .zip(selected_components)
+            {
+                if global_policy.role() != local_policy.role()
+                    || global_policy.dtype() != local_policy.dtype()
+                    || global_policy.residency() != local_policy.residency()
+                    || global_policy.presence() != local_policy.presence()
+                    || selected.component != *global_policy
+                {
+                    return Err(ReplicatedTextContractError::invalid(
+                        "partition state component semantics differ from selected state",
+                    ));
+                }
+                components.push(SelectedStateComponentRealization {
+                    layer: local_layer,
+                    component: local_policy.clone(),
+                    placement: selected.placement,
+                });
+            }
+        }
+        Ok(Self {
+            layout: partition.layout().clone(),
+            access: self.access,
+            policy: self.policy.clone(),
+            components,
+            checkpoint: self.checkpoint,
+            rollback: self.rollback,
+            reset: self.reset,
+            prompt_cache: self.prompt_cache,
+            observation_retention: self.observation_retention,
+        })
     }
 
     /// Returns the state-access semantics selected for typed traversal.
@@ -2258,8 +2584,11 @@ mod tests {
     use super::*;
     use crate::{
         ArchitectureGroupKind, ArchitectureGroupPlacement, ArchitectureGroupTransport,
-        ArchitectureMergeDestination, DenseDiskStreamLoadOptions, ExecutionGroupSpec,
-        ExecutionUnitLayout, LayerwiseLoadOptions, StateLayout,
+        ArchitectureMergeDestination, ArchitectureParameterDescription, ArchitecturePartition,
+        ArchitectureStatePartitionPlan, ArchitectureStatePartitionRule, DenseDiskStreamLoadOptions,
+        ExecutionGroupSpec, ExecutionUnitLayout, LayerwiseLoadOptions, MemberSharding,
+        NoAuxiliaryBoundarySchema, OwnedParameterGroupSpec, ParameterGroupSpec,
+        ParameterMemberSpec, ParameterRole, PartitionOwnership, StateLayout,
     };
     use eredu_checkpoint::{AffineQuantization, StoredDtype};
     use eredu_core::{
@@ -2638,6 +2967,224 @@ mod tests {
             LayerWeightResidency::DenseDiskStream(disk)
         );
         assert_eq!(requests[2].quantization(), Some(QuantizationRequest::MxFp4));
+    }
+
+    #[test]
+    fn partitioned_tasks_keep_encoded_companions_atomic_and_reject_split_groups() {
+        let request = request(LayerWeightResidency::FullyResident).with_quantization(
+            QuantizationRequest::Affine {
+                group_size: 64,
+                bits: 4,
+            },
+        );
+        let selected =
+            select_replicated_text_realization(&requirements(), &request, &capabilities()).unwrap();
+        let graph = selected.requirements().execution_graph().clone();
+        let layout = selected.requirements().execution_units().clone();
+        let format = eredu_nn::LinearFormatSpec::affine(
+            LinearFormat::Affine(AffineQuantization::new(64, 4).unwrap()),
+            eredu_nn::ParameterSpec::trainable("model.layers.0.mlp.scales").unwrap(),
+            eredu_nn::ParameterSpec::trainable("model.layers.0.mlp.biases").unwrap(),
+        )
+        .unwrap();
+        let [physical] = crate::expand_linear_format_parameter_groups(
+            vec![ParameterGroupSpec::new(
+                "mlp",
+                ParameterRole::FeedForwardIntermediate,
+                [ParameterMemberSpec::new(
+                    "model.layers.0.mlp.weight",
+                    vec![64, 64],
+                    MemberSharding::Replicated,
+                )],
+            )
+            .unwrap()],
+            |_| Ok(Some(format.clone())),
+        )
+        .unwrap()
+        .try_into()
+        .unwrap();
+        let norm = ParameterGroupSpec::new(
+            "norm",
+            ParameterRole::Replicated,
+            [ParameterMemberSpec::new(
+                "model.layers.0.norm.weight",
+                vec![64],
+                MemberSharding::Replicated,
+            )],
+        )
+        .unwrap();
+        let owner = ParameterGroupOwner::execution_unit(layout.group_id(0).unwrap().clone(), 0);
+        let description = ArchitectureParameterDescription::new(
+            &graph,
+            &layout,
+            [physical.clone(), norm.clone()],
+            [
+                OwnedParameterGroupSpec::new(owner.clone(), physical.clone()),
+                OwnedParameterGroupSpec::new(owner.clone(), norm.clone()),
+            ],
+        )
+        .unwrap();
+        let ownership =
+            PartitionOwnership::new(false, false, std::iter::empty::<String>()).unwrap();
+        let state = selected.requirements().state_layout();
+        let state_plan =
+            ArchitectureStatePartitionPlan::new([ArchitectureStatePartitionRule::group_units(
+                0,
+                0..state.len(),
+            )]);
+        let partition = ArchitecturePartition::from_description(
+            &description,
+            [(layout.group_id(0).unwrap().as_str(), 0..1)],
+            ownership.clone(),
+            state,
+            &state_plan,
+            (),
+            NoAuxiliaryBoundarySchema::new(64),
+        )
+        .unwrap();
+        let tasks =
+            partitioned_replicated_text_materialization_tasks(&selected, &description, &partition)
+                .unwrap();
+        let task = tasks
+            .iter()
+            .find(|task| task.name() == "model.layers.0.mlp.weight")
+            .unwrap();
+        assert_eq!(task.output_companions().len(), 2);
+
+        let members = physical.members();
+        let primary = ParameterGroupSpec::new(
+            "primary",
+            ParameterRole::FeedForwardIntermediate,
+            [members[0].clone()],
+        )
+        .unwrap();
+        let companions = ParameterGroupSpec::new(
+            "companions",
+            ParameterRole::FeedForwardIntermediate,
+            members[1..].to_vec(),
+        )
+        .unwrap();
+        let malformed = ArchitectureParameterDescription::new(
+            &graph,
+            &layout,
+            [primary.clone(), companions.clone(), norm.clone()],
+            [
+                OwnedParameterGroupSpec::new(owner.clone(), primary),
+                OwnedParameterGroupSpec::new(owner.clone(), companions),
+                OwnedParameterGroupSpec::new(owner, norm),
+            ],
+        )
+        .unwrap();
+        let malformed_partition = ArchitecturePartition::from_description(
+            &malformed,
+            [(layout.group_id(0).unwrap().as_str(), 0..1)],
+            ownership,
+            state,
+            &state_plan,
+            (),
+            NoAuxiliaryBoundarySchema::new(64),
+        )
+        .unwrap();
+        let error = partitioned_replicated_text_materialization_tasks(
+            &selected,
+            &malformed,
+            &malformed_partition,
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("outside its atomic parameter group"));
+    }
+
+    #[test]
+    fn partitioned_tasks_require_one_canonical_or_admitted_alias_topology_target() {
+        let mut requirements = requirements();
+        requirements.parameters[0].aliases = vec!["architecture.mlp.weight".into()];
+        let selected = select_replicated_text_realization(
+            &requirements,
+            &request(LayerWeightResidency::FullyResident),
+            &capabilities(),
+        )
+        .unwrap();
+        let graph = selected.requirements().execution_graph().clone();
+        let layout = selected.requirements().execution_units().clone();
+        let owner = ParameterGroupOwner::execution_unit(layout.group_id(0).unwrap().clone(), 0);
+        let ownership =
+            PartitionOwnership::new(false, false, std::iter::empty::<String>()).unwrap();
+        let state = selected.requirements().state_layout();
+        let state_plan =
+            ArchitectureStatePartitionPlan::new([ArchitectureStatePartitionRule::group_units(
+                0,
+                0..state.len(),
+            )]);
+
+        let project = |primary_targets: &[&str]| {
+            let mut groups = primary_targets
+                .iter()
+                .enumerate()
+                .map(|(index, target)| {
+                    ParameterGroupSpec::new(
+                        format!("mlp-{index}"),
+                        ParameterRole::FeedForwardIntermediate,
+                        [ParameterMemberSpec::new(
+                            *target,
+                            vec![64, 64],
+                            MemberSharding::Replicated,
+                        )],
+                    )
+                    .unwrap()
+                })
+                .collect::<Vec<_>>();
+            groups.push(
+                ParameterGroupSpec::new(
+                    "norm",
+                    ParameterRole::Replicated,
+                    [ParameterMemberSpec::new(
+                        "model.layers.0.norm.weight",
+                        vec![64],
+                        MemberSharding::Replicated,
+                    )],
+                )
+                .unwrap(),
+            );
+            let description = ArchitectureParameterDescription::new(
+                &graph,
+                &layout,
+                groups.clone(),
+                groups
+                    .into_iter()
+                    .map(|group| OwnedParameterGroupSpec::new(owner.clone(), group)),
+            )
+            .unwrap();
+            let partition = ArchitecturePartition::from_description(
+                &description,
+                [(layout.group_id(0).unwrap().as_str(), 0..1)],
+                ownership.clone(),
+                state,
+                &state_plan,
+                (),
+                NoAuxiliaryBoundarySchema::new(64),
+            )
+            .unwrap();
+            partitioned_replicated_text_materialization_tasks(&selected, &description, &partition)
+        };
+
+        let canonical = project(&["model.layers.0.mlp.weight"]).unwrap();
+        assert!(canonical
+            .iter()
+            .any(|task| task.name() == "model.layers.0.mlp.weight"));
+
+        let aliased = project(&["architecture.mlp.weight"]).unwrap();
+        let task = aliased
+            .iter()
+            .find(|task| task.name() == "model.layers.0.mlp.weight")
+            .unwrap();
+        assert_eq!(task.aliases(), ["architecture.mlp.weight"]);
+
+        let error = project(&["model.layers.0.mlp.weight", "architecture.mlp.weight"]).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("resolves to 2 architecture topology targets"));
     }
 
     #[test]

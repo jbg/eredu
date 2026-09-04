@@ -1884,9 +1884,18 @@ impl PagedKeyValueCache {
             || self.manager.session_id() != checkpoint.manager.session_id()
             || self.key_only != checkpoint.key_only
         {
-            return Err(Exception::custom(
-                "key/value cache checkpoint does not belong to the same paged layer",
-            ));
+            return Err(Exception::custom(format!(
+                "key/value cache checkpoint does not belong to the same paged layer: current \
+                 session/layer/rank/key-only={}/{}/{:?}/{}, checkpoint={}/{}/{:?}/{}",
+                self.manager.session_id(),
+                self.global_layer,
+                self.rank,
+                self.key_only,
+                checkpoint.manager.session_id(),
+                checkpoint.global_layer,
+                checkpoint.rank,
+                checkpoint.key_only,
+            )));
         }
         self.truncate(checkpoint.offset, stream)?;
         self.clone_from(checkpoint);

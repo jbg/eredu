@@ -22,6 +22,7 @@ pub use model::{
     ObservationPoint, StaticModules, Unit, DEPTH_STATE_SEGMENT, TEMPORAL_STATE_SEGMENT,
 };
 pub use parallel::{
-    collective_count, forward_temporal_block_parallel, local_geometry, static_parameter_groups,
-    unit_parameter_groups, LocalGeometry, LocalTransformerGeometry, MoshiCollectiveCount,
+    collective_count, forward_temporal_block_parallel, local_geometry, parameter_description,
+    select_parallel_execution, static_parameter_groups, unit_parameter_groups, LocalGeometry,
+    LocalTransformerGeometry, MoshiCollectiveCount, MoshiParallelSelection,
 };

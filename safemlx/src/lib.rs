@@ -34,6 +34,7 @@ pub mod memory;
 pub mod metal;
 pub mod ops;
 pub mod random;
+mod runtime_deadline;
 mod stream;
 pub mod system;
 pub mod transforms;
@@ -44,7 +45,23 @@ pub use device::*;
 pub use dtype::*;
 pub use event::*;
 pub use host_transfer::*;
+pub use runtime_deadline::*;
 pub use stream::*;
+
+/// Registers one idempotent same-thread housekeeping callback.
+///
+/// The callback runs while the process-wide MLX runtime lock is held whenever
+/// this thread next enters the runtime. Reentrant runtime calls do not invoke
+/// it recursively. This lets thread-affine completion owners release finished
+/// resources without a foreign polling thread.
+pub fn register_thread_runtime_housekeeping(hook: fn()) {
+    utils::runtime_lock::register_housekeeping_hook(hook);
+}
+
+/// Removes a previously registered same-thread housekeeping callback.
+pub fn unregister_thread_runtime_housekeeping(hook: fn()) {
+    utils::runtime_lock::unregister_housekeeping_hook(hook);
+}
 
 #[cfg(test)]
 pub(crate) fn test_stream() -> &'static Stream {

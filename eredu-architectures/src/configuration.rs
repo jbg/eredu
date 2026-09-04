@@ -20,7 +20,7 @@ use eredu_core::{
 use eredu_gguf::Checkpoint as GgufCheckpoint;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
-use std::{fs, path::Path};
+use std::{collections::BTreeSet, fs, path::Path};
 
 /// Stateless registry for every architecture family implemented by this crate.
 #[derive(Debug, Clone, Copy, Default)]
@@ -790,8 +790,8 @@ impl SafetensorsArchitecturePlan {
 
     /// Exact physical layout selected and proven during catalog admission.
     ///
-    /// This is absent on a configuration-only plan that has not yet been
-    /// finalized against an artifact catalog.
+    /// This is absent before a configuration-only plan is finalized against an
+    /// artifact catalog.
     pub const fn checkpoint_resolution(&self) -> Option<&ResolvedCheckpointPlan> {
         self.checkpoint_resolution.as_ref()
     }
@@ -799,6 +799,163 @@ impl SafetensorsArchitecturePlan {
     /// Canonical Moshi binding recipes proven against the admitted catalog.
     pub const fn moshi_recipes(&self) -> Option<&AtomicRecipeSet> {
         self.moshi_recipes.as_ref()
+    }
+
+    /// Separates an admitted embedded-prediction artifact into its ordinary
+    /// target architecture and an exact prediction-extension contract.
+    ///
+    /// This projection does not re-admit a different artifact: an exact subset
+    /// of the original checkpoint resolution remains the authority for target
+    /// source tensors, while the extension retains the omitted admitted
+    /// sources under its own typed ownership.
+    pub fn prediction_target_projection(
+        &self,
+    ) -> Result<Option<(Self, PredictionExtensionPlan)>, ArtifactError> {
+        let complete_architecture = self.clone();
+        let (model, extension) = match &self.model {
+            SafetensorsModelConfig::DeepSeekV3(args) if args.num_nextn_predict_layers > 0 => {
+                let depth = usize::try_from(args.num_nextn_predict_layers).map_err(|_| {
+                    ArtifactError::InvalidArchitecturePlan(
+                        "DeepSeek-V3 prediction depth exceeds usize".into(),
+                    )
+                })?;
+                (
+                    SafetensorsModelConfig::DeepSeekV3(args.prediction_target().map_err(
+                        |error| ArtifactError::InvalidArchitecturePlan(error.to_string()),
+                    )?),
+                    PredictionExtensionPlan::new(
+                        PredictionExtensionKind::DeepSeekV3Mtp,
+                        depth,
+                        complete_architecture.clone(),
+                    )?,
+                )
+            }
+            SafetensorsModelConfig::DeepSeekV4(args) if args.num_nextn_predict_layers > 0 => {
+                let depth = usize::try_from(args.num_nextn_predict_layers).map_err(|_| {
+                    ArtifactError::InvalidArchitecturePlan(
+                        "DeepSeek-V4 prediction depth exceeds usize".into(),
+                    )
+                })?;
+                (
+                    SafetensorsModelConfig::DeepSeekV4(args.prediction_target().map_err(
+                        |error| ArtifactError::InvalidArchitecturePlan(error.to_string()),
+                    )?),
+                    PredictionExtensionPlan::new(
+                        PredictionExtensionKind::DeepSeekV4Embedded,
+                        depth,
+                        complete_architecture.clone(),
+                    )?,
+                )
+            }
+            SafetensorsModelConfig::Inkling(args)
+                if args
+                    .mtp_config
+                    .as_ref()
+                    .is_some_and(|mtp| mtp.num_nextn_predict_layers > 0) =>
+            {
+                let depth = usize::try_from(
+                    args.mtp_config
+                        .as_ref()
+                        .expect("guarded Inkling prediction configuration")
+                        .num_nextn_predict_layers,
+                )
+                .map_err(|_| {
+                    ArtifactError::InvalidArchitecturePlan(
+                        "Inkling prediction depth exceeds usize".into(),
+                    )
+                })?;
+                let mut target = args.clone();
+                target.mtp_config = None;
+                (
+                    SafetensorsModelConfig::Inkling(target),
+                    PredictionExtensionPlan::new(
+                        PredictionExtensionKind::InklingMtp,
+                        depth,
+                        complete_architecture.clone(),
+                    )?,
+                )
+            }
+            SafetensorsModelConfig::QwenHybrid(args) if args.text.mtp_num_hidden_layers > 0 => {
+                let depth = usize::try_from(args.text.mtp_num_hidden_layers).map_err(|_| {
+                    ArtifactError::InvalidArchitecturePlan(
+                        "Qwen hybrid prediction depth exceeds usize".into(),
+                    )
+                })?;
+                let mut target = args.clone();
+                target.text.mtp_num_hidden_layers = 0;
+                (
+                    SafetensorsModelConfig::QwenHybrid(target),
+                    PredictionExtensionPlan::new(
+                        PredictionExtensionKind::QwenHybridMtp,
+                        depth,
+                        complete_architecture.clone(),
+                    )?,
+                )
+            }
+            SafetensorsModelConfig::NemotronH(args) if args.num_nextn_predict_layers > 0 => {
+                let depth = usize::try_from(args.num_nextn_predict_layers).map_err(|_| {
+                    ArtifactError::InvalidArchitecturePlan(
+                        "Nemotron-H prediction depth exceeds usize".into(),
+                    )
+                })?;
+                (
+                    SafetensorsModelConfig::NemotronH(args.prediction_target().map_err(
+                        |error| ArtifactError::InvalidArchitecturePlan(error.to_string()),
+                    )?),
+                    PredictionExtensionPlan::new(
+                        PredictionExtensionKind::NemotronHMtp,
+                        depth,
+                        complete_architecture.clone(),
+                    )?,
+                )
+            }
+            _ => return Ok(None),
+        };
+        let checkpoint = match &model {
+            SafetensorsModelConfig::DeepSeekV3(args) => {
+                crate::deepseek::v3_safetensors_plan(args, true)
+            }
+            SafetensorsModelConfig::DeepSeekV4(args) => crate::deepseek::v4_safetensors_plan(args),
+            SafetensorsModelConfig::Inkling(args) => crate::inkling::safetensors_plan(args),
+            SafetensorsModelConfig::QwenHybrid(args) => {
+                crate::qwen::hybrid::composite_safetensors_plan(args)
+            }
+            SafetensorsModelConfig::NemotronH(args) => crate::nemotron_h::safetensors_plan(args),
+            _ => unreachable!("prediction projection admits only typed extension families"),
+        }
+        .map_err(ArtifactError::InvalidArchitecturePlan)?;
+        let checkpoint_resolution = self
+            .checkpoint_resolution
+            .as_ref()
+            .map(|resolution| {
+                let target = Self {
+                    kind: self.kind,
+                    model: model.clone(),
+                    checkpoint: checkpoint.clone(),
+                    checkpoint_resolution: None,
+                    moshi_recipes: None,
+                };
+                let extension_sources = extension.source_keys(&target)?;
+                let target_sources = resolution
+                    .source_keys()
+                    .difference(&extension_sources)
+                    .cloned()
+                    .collect();
+                resolution
+                    .project_claimed_sources(checkpoint.identity.clone(), target_sources)
+                    .map_err(ArtifactError::InvalidArchitecturePlan)
+            })
+            .transpose()?;
+        Ok(Some((
+            Self {
+                kind: self.kind,
+                model,
+                checkpoint,
+                checkpoint_resolution,
+                moshi_recipes: None,
+            },
+            extension,
+        )))
     }
 
     pub(crate) fn admit_catalog(&mut self, tensors: &TensorCatalog) -> Result<(), ArtifactError> {
@@ -817,6 +974,181 @@ impl SafetensorsArchitecturePlan {
             )?);
         }
         Ok(())
+    }
+}
+
+/// Architecture identity of an adapter-owned prediction extension.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum PredictionExtensionKind {
+    /// DeepSeek-V3/R1 embedded multi-token prediction.
+    DeepSeekV3Mtp,
+    /// DeepSeek-V4 embedded multi-token prediction or DSpark proposal extension.
+    DeepSeekV4Embedded,
+    /// Inkling embedded multi-token prediction.
+    InklingMtp,
+    /// Qwen3.5/Qwen3-Next hybrid embedded multi-token prediction.
+    QwenHybridMtp,
+    /// Nemotron-H patterned embedded multi-token prediction.
+    NemotronHMtp,
+}
+
+/// Exact prediction extension separated from an ordinary target architecture.
+#[derive(Debug, Clone)]
+pub struct PredictionExtensionPlan {
+    kind: PredictionExtensionKind,
+    depth: usize,
+    complete_architecture: SafetensorsArchitecturePlan,
+}
+
+impl PredictionExtensionPlan {
+    fn new(
+        kind: PredictionExtensionKind,
+        depth: usize,
+        complete_architecture: SafetensorsArchitecturePlan,
+    ) -> Result<Self, ArtifactError> {
+        if depth == 0 {
+            return Err(ArtifactError::InvalidArchitecturePlan(
+                "prediction extension depth must be positive".into(),
+            ));
+        }
+        Ok(Self {
+            kind,
+            depth,
+            complete_architecture,
+        })
+    }
+
+    /// Exact extension architecture selected from the complete artifact.
+    pub const fn kind(&self) -> PredictionExtensionKind {
+        self.kind
+    }
+
+    /// Ordered embedded prediction depth.
+    pub const fn depth(&self) -> usize {
+        self.depth
+    }
+
+    /// Complete admitted architecture that owns the extension equations and sources.
+    ///
+    /// The ordinary target projection deliberately removes prediction policy;
+    /// this retained value preserves DSpark/MTP mode, prediction-layer
+    /// schedules, and every family dimension needed to materialize only the
+    /// extension.
+    pub const fn complete_architecture(&self) -> &SafetensorsArchitecturePlan {
+        &self.complete_architecture
+    }
+
+    /// Returns the exact admitted physical sources owned only by this extension.
+    ///
+    /// The target projection and complete artifact share one already-admitted
+    /// source resolution. This subtraction uses architecture-declared target
+    /// keys and aliases, so backend composition can reserve extension payloads
+    /// without inferring a family prefix or weakening strict target loading.
+    pub fn source_keys(
+        &self,
+        target: &SafetensorsArchitecturePlan,
+    ) -> Result<BTreeSet<String>, ArtifactError> {
+        let resolution = self
+            .complete_architecture
+            .checkpoint_resolution()
+            .ok_or_else(|| {
+                ArtifactError::InvalidArchitecturePlan(
+                    "prediction extension has no admitted checkpoint resolution".into(),
+                )
+            })?;
+        let target_names = target
+            .checkpoint()
+            .common_tensors
+            .iter()
+            .chain(
+                target
+                    .checkpoint()
+                    .layout_groups
+                    .iter()
+                    .flat_map(|group| &group.variants)
+                    .flat_map(|variant| &variant.tensors),
+            )
+            .flat_map(|tensor| {
+                std::iter::once(tensor.key.as_str())
+                    .chain(tensor.aliases.iter().map(String::as_str))
+            })
+            .collect::<BTreeSet<_>>();
+        let extension = resolution
+            .source_keys()
+            .iter()
+            .filter(|key| !target_names.contains(key.as_str()))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if extension.is_empty() {
+            return Err(ArtifactError::InvalidArchitecturePlan(
+                "prediction extension owns no admitted checkpoint sources".into(),
+            ));
+        }
+        Ok(extension)
+    }
+
+    /// Maximum logical rank and element count of the target value retained for this extension.
+    ///
+    /// The ordinary target publication group carries this value in addition to logits.  Keeping
+    /// the bound on the architecture-selected extension prevents a backend from inferring hidden
+    /// capture geometry from a family name or from a native tensor observed after construction.
+    pub fn target_capture_limits(
+        &self,
+        maximum_batch_size: i32,
+        maximum_sequence_length: i32,
+    ) -> Result<(usize, usize), ArtifactError> {
+        let batch = usize::try_from(maximum_batch_size).map_err(|_| {
+            ArtifactError::InvalidArchitecturePlan(
+                "prediction target maximum batch size is not positive".into(),
+            )
+        })?;
+        let sequence = usize::try_from(maximum_sequence_length).map_err(|_| {
+            ArtifactError::InvalidArchitecturePlan(
+                "prediction target maximum sequence length is not positive".into(),
+            )
+        })?;
+        if batch == 0 || sequence == 0 {
+            return Err(ArtifactError::InvalidArchitecturePlan(
+                "prediction target invocation bounds must be positive".into(),
+            ));
+        }
+        let (rank, dimensions) = match self.complete_architecture.model() {
+            SafetensorsModelConfig::DeepSeekV3(args) => (3, vec![args.hidden_size]),
+            SafetensorsModelConfig::DeepSeekV4(args) if args.dspark.is_none() => {
+                (4, vec![args.hc_mult, args.hidden_size])
+            }
+            SafetensorsModelConfig::DeepSeekV4(_) => {
+                return Err(ArtifactError::InvalidArchitecturePlan(
+                    "DSpark target capture requires a dedicated typed target projection".into(),
+                ));
+            }
+            SafetensorsModelConfig::Inkling(args) => (3, vec![args.text_config.hidden_size]),
+            SafetensorsModelConfig::QwenHybrid(args) => (3, vec![args.text.hidden_size]),
+            SafetensorsModelConfig::NemotronH(args) => (3, vec![args.hidden_size]),
+            _ => {
+                return Err(ArtifactError::InvalidArchitecturePlan(
+                    "prediction extension has no target capture geometry".into(),
+                ));
+            }
+        };
+        let initial = batch.checked_mul(sequence).ok_or_else(|| {
+            ArtifactError::InvalidArchitecturePlan(
+                "prediction target capture geometry overflowed".into(),
+            )
+        })?;
+        let elements = dimensions
+            .into_iter()
+            .try_fold(initial, |elements, dimension| {
+                usize::try_from(dimension)
+                    .ok()
+                    .and_then(|dimension| elements.checked_mul(dimension))
+            })
+            .ok_or_else(|| {
+                ArtifactError::InvalidArchitecturePlan(
+                    "prediction target capture geometry overflowed".into(),
+                )
+            })?;
+        Ok((rank, elements))
     }
 }
 
@@ -1126,6 +1458,50 @@ mod tests {
             "depformer_max_period": 10000.0, "depformer_pos_emb": "none",
             "delays": [0, 0, 1, 2, 1]
         })
+    }
+
+    fn tiny_deepseek_prediction_config() -> Value {
+        serde_json::json!({
+            "architectures": ["DeepseekV3ForCausalLM"],
+            "model_type": "deepseek_v3", "hidden_size": 16,
+            "intermediate_size": 32, "moe_intermediate_size": 8,
+            "num_hidden_layers": 4, "num_attention_heads": 2,
+            "vocab_size": 128, "max_position_embeddings": 4096,
+            "q_lora_rank": 4, "kv_lora_rank": 4,
+            "qk_nope_head_dim": 6, "qk_rope_head_dim": 2, "v_head_dim": 8,
+            "first_k_dense_replace": 1, "moe_layer_freq": 2,
+            "n_routed_experts": 8, "n_shared_experts": 1,
+            "num_experts_per_tok": 2, "n_group": 2, "topk_group": 1,
+            "topk_method": "noaux_tc", "scoring_func": "sigmoid",
+            "norm_topk_prob": true, "routed_scaling_factor": 1.0,
+            "tie_word_embeddings": false, "attention_dropout": 0.0,
+            "hidden_act": "silu", "num_nextn_predict_layers": 1
+        })
+    }
+
+    #[test]
+    fn prediction_extension_contract_rejects_identity_and_depth_drift() {
+        let mut extension = resolve_model_config(&tiny_deepseek_prediction_config())
+            .unwrap()
+            .architecture
+            .prediction_target_projection()
+            .unwrap()
+            .unwrap()
+            .1;
+        crate::prediction_extension::validate_extension_contract(&extension).unwrap();
+
+        extension.depth = 2;
+        let error = crate::prediction_extension::validate_extension_contract(&extension)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("differs from admitted architecture depth"));
+
+        extension.depth = 1;
+        extension.kind = PredictionExtensionKind::QwenHybridMtp;
+        let error = crate::prediction_extension::validate_extension_contract(&extension)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("identity does not match"));
     }
 
     #[test]

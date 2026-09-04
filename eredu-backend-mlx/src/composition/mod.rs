@@ -1,7 +1,8 @@
 //! Cold-path architecture/backend composition selected by public loaders.
 
 pub(crate) mod grouped_provider;
-// Multi-process adapters are also entry points for manually launched native validation.
+// Standalone exchange harnesses are available only to crate-internal validation.
+#[cfg(test)]
 #[allow(dead_code)]
 pub(crate) mod expert_dispatch;
 
@@ -9,9 +10,14 @@ use ref_cast::RefCast;
 use safemlx::error::Exception;
 use safemlx::Array;
 
-use eredu_checkpoint::{recipe::DerivedWeightRecipe, store::CheckpointSource};
+#[cfg(test)]
+use eredu_checkpoint::recipe::DerivedWeightRecipe;
+use eredu_checkpoint::store::CheckpointSource;
+#[cfg(test)]
 use eredu_nn::Parameterized;
-use eredu_runtime::{ArchitectureParameters, StaticParameterVisitor, StaticUnitBindings};
+use eredu_runtime::ArchitectureParameters;
+#[cfg(test)]
+use eredu_runtime::{StaticParameterVisitor, StaticUnitBindings};
 
 use crate::{backend::error::Error, backend::nn::shared::MlxNeuralBackend};
 
@@ -111,6 +117,7 @@ impl eredu_runtime::ActivationObserver<crate::MlxTensor, eredu_nn::Error>
     }
 }
 
+#[cfg(test)]
 struct StaticBindingVisitor<'a> {
     store: &'a dyn CheckpointSource,
     recipes: std::collections::BTreeMap<String, DerivedWeightRecipe>,
@@ -118,6 +125,7 @@ struct StaticBindingVisitor<'a> {
     units: Vec<StaticUnitBindings>,
 }
 
+#[cfg(test)]
 impl StaticParameterVisitor<MlxNeuralBackend> for StaticBindingVisitor<'_> {
     type Error = Error;
 
@@ -149,6 +157,7 @@ impl StaticParameterVisitor<MlxNeuralBackend> for StaticBindingVisitor<'_> {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn architecture_static_units<A>(
     architecture: &A,
     store: &dyn CheckpointSource,
@@ -159,6 +168,7 @@ where
     architecture_static_units_selected(architecture, store, None)
 }
 
+#[cfg(test)]
 pub(crate) fn architecture_static_units_for_roles<A>(
     architecture: &A,
     store: &dyn CheckpointSource,
@@ -170,6 +180,7 @@ where
     architecture_static_units_selected(architecture, store, Some(roles))
 }
 
+#[cfg(test)]
 fn architecture_static_units_selected<A>(
     architecture: &A,
     store: &dyn CheckpointSource,
@@ -195,19 +206,6 @@ where
         )));
     }
     Ok(visitor.units)
-}
-
-/// Lowers the architecture-owned parameter topology into this rank's native
-/// tensor-parallel layout.
-pub(crate) fn parallel_layout_from_description(
-    build: crate::composition::mlx::distributed::topology::ParallelBuildContext,
-    description: &eredu_runtime::ArchitectureParameterDescription,
-) -> Result<eredu_runtime::LocalModelLayout, Error> {
-    let mut planner = build.planner();
-    for group in description.groups() {
-        planner.register(group.group().clone())?;
-    }
-    planner.finish().map(|(_, layout)| layout)
 }
 
 /// Lowers already-selected neutral expert units into native cache entries.
@@ -278,12 +276,8 @@ pub(crate) fn architecture_expert_units(
         .collect()
 }
 
-/// Retains expert units owned by one realized execution partition and expert rank.
-///
-/// Ownership and distribution are architecture addresses, so both predicates must
-/// run while the neutral declarations are still available. Native cache entries
-/// intentionally retain only router identity and materialization state.
-pub(crate) fn select_architecture_expert_units(
+#[cfg(test)]
+fn select_architecture_expert_units(
     units: impl IntoIterator<Item = eredu_architectures::ExpertResidencyUnit>,
     mut owns_unit: impl FnMut(&eredu_runtime::ExecutionGroupId, usize) -> bool,
     mut owns_expert: impl FnMut(eredu_runtime::ParameterBankKey) -> bool,
@@ -319,7 +313,6 @@ pub mod kimi_linear;
 // MLX adapter only; the neutral family is always available from
 // `eredu_architectures::lfm2`.
 pub mod lfm2;
-pub mod llama;
 pub mod mlx;
 pub mod moshi;
 pub mod muse_glimmer;

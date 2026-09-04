@@ -10,8 +10,8 @@ use eredu_architectures::lfm2::{Block, LayeredModel, ModelArgs};
 use eredu_checkpoint::{store::CheckpointSource, WeightQuantization};
 use eredu_runtime::{
     ArchitectureParameters, CacheResidencyPolicy, CausalModel, DenseDiskStreamReport,
-    LayerWeightResidency, LayerwiseRuntime, PagedCacheOptions, ParallelModelInfo, ParameterRole,
-    ResidencyReport, WeightBinding, WeightResidency,
+    LayerWeightResidency, LayerwiseRuntime, PagedCacheOptions, ParameterRole, ResidencyReport,
+    WeightResidency,
 };
 use safemlx::{error::Exception, ops::indexing::TryIndexOp, Array, Stream};
 
@@ -29,9 +29,8 @@ use crate::backend::{
         },
         checkpoint::{
             binding::{
-                binding_bytes, build_module_bindings, build_module_bindings_with_recipes_excluding,
-                parameter_name_in_targets, parameter_role_targets,
-                populate_module_from_lease_excluding,
+                build_module_bindings, build_module_bindings_with_recipes_excluding,
+                parameter_name_in_targets, populate_module_from_lease_excluding,
             },
             load::gguf_quantization_configs,
             quantization::should_quantize_on_load,
@@ -43,7 +42,7 @@ use crate::backend::{
                 prepare_layerwise_policy_with_bindings, MlxLayerwisePolicy, MlxResidentPolicy,
                 MlxUnitPopulator,
             },
-            layerwise::{quantize_parameterized_store, shard_layer_bindings},
+            layerwise::quantize_parameterized_store,
         },
         media::input,
         residency::parameter_bank::ParameterBankEntry,
@@ -58,19 +57,6 @@ use eredu_core::cache::{
 type NeutralBlock = Block<MlxNeuralBackend>;
 type NeutralArchitecture = LayeredModel<MlxNeuralBackend>;
 
-fn require_decoder_group(architecture: &NeutralArchitecture, group: usize) -> Result<(), Error> {
-    let transport = <NeutralArchitecture as eredu_runtime::LayeredArchitecture<
-        MlxNeuralBackend,
-        MlxHybridState,
-    >>::group_transport(architecture, group);
-    if transport.kind == eredu_runtime::ArchitectureGroupKind::Decoder {
-        Ok(())
-    } else {
-        Err(Error::ArchitectureModel(format!(
-            "LFM2 checkpoint bindings require the decoder execution group, got {group}"
-        )))
-    }
-}
 type ResidentRuntime = LayerwiseRuntime<
     NeutralArchitecture,
     MlxNeuralBackend,
@@ -83,13 +69,6 @@ type BoundedRuntime = LayerwiseRuntime<
     MlxHybridState,
     MlxLayerwisePolicy<NeutralBlock, Lfm2UnitPopulator>,
 >;
-type ParallelBoundedRuntime = LayerwiseRuntime<
-    NeutralArchitecture,
-    MlxNeuralBackend,
-    MlxHybridState,
-    MlxLayerwisePolicy<NeutralBlock, Lfm2ParallelUnitPopulator>,
->;
-
 #[derive(eredu_nn::Parameterized)]
 #[parameterized(tensor = "crate::MlxTensor")]
 #[doc(hidden)]
@@ -130,135 +109,7 @@ struct Lfm2UnitPopulator {
     expert_targets: Arc<BTreeSet<String>>,
 }
 
-/// Pipeline/loading adapter over the same neutral LFM2 blocks used by resident
-/// and bounded execution.
-#[derive(Default)]
-pub struct Lfm2Bindings {
-    external_experts: bool,
-}
-
-impl Lfm2Bindings {
-    pub const fn new() -> Self {
-        Self {
-            external_experts: false,
-        }
-    }
-
-    pub const fn new_external_experts() -> Self {
-        Self {
-            external_experts: true,
-        }
-    }
-
-    pub fn model_type<'a>(&self, architecture: &'a NeutralArchitecture) -> &'a str {
-        &architecture.args().model_type
-    }
-
-    pub fn layer_count(
-        &self,
-        architecture: &NeutralArchitecture,
-        group: usize,
-    ) -> Result<usize, Error> {
-        <NeutralArchitecture as eredu_runtime::LayeredArchitecture<
-            MlxNeuralBackend,
-            MlxHybridState,
-        >>::group_unit_count(architecture, group)
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))
-    }
-
-    pub fn layer_bindings(
-        &self,
-        architecture: &NeutralArchitecture,
-        group: usize,
-        index: usize,
-        layer: &MlxModule<NeutralBlock>,
-        store: &dyn CheckpointSource,
-    ) -> Result<Vec<WeightBinding>, Error> {
-        require_decoder_group(architecture, group)?;
-        let expert_targets = parameter_role_targets(
-            &eredu_architectures::lfm2::layer_parallel_parameter_groups(
-                layer,
-                architecture.args(),
-                index,
-            )
-            .map_err(|error| Error::Parallel(error.to_string()))?,
-            ParameterRole::ExpertIntermediate,
-        );
-        let mut recipes =
-            eredu_architectures::lfm2::unit_recipes(store, architecture.args(), index)
-                .map_err(Error::ArchitectureModel)?;
-        if self.external_experts {
-            recipes.retain(|name, _| !parameter_name_in_targets(name, &expert_targets));
-        }
-        build_module_bindings_with_recipes_excluding(layer, "", store, recipes, |name| {
-            self.external_experts && parameter_name_in_targets(name, &expert_targets)
-        })
-        .map_err(Into::into)
-    }
-
-    pub fn quantizes_static_binding(&self, _binding: &WeightBinding) -> bool {
-        true
-    }
-
-    pub fn expert_parallel_assignment(
-        &self,
-        realization: Option<
-            &eredu_architectures::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>,
-        >,
-    ) -> Result<Option<crate::composition::expert_dispatch::ExpertAssignment>, Error> {
-        match realization {
-            None if self.external_experts => Err(Error::Parallel(
-                "LFM2 has no architecture expert realization".into(),
-            )),
-            None => Ok(None),
-            Some(plan) if plan.expert_parallel_size() == 1 && !self.external_experts => Ok(None),
-            Some(plan) => {
-                crate::composition::expert_dispatch::ExpertAssignment::from_realization(plan)
-                    .map(Some)
-            }
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn cartesian_layer_bindings(
-        &self,
-        architecture: &NeutralArchitecture,
-        group: usize,
-        index: usize,
-        global_layer: &MlxModule<NeutralBlock>,
-        store: &dyn CheckpointSource,
-        layout: Option<&eredu_runtime::LocalModelLayout>,
-        _assignment: Option<&crate::composition::expert_dispatch::ExpertAssignment>,
-    ) -> Result<Vec<WeightBinding>, Error> {
-        self.layer_count(architecture, group)?;
-        let bindings = self.layer_bindings(architecture, group, index, global_layer, store)?;
-        match layout {
-            Some(layout) => shard_layer_bindings(bindings, store, layout),
-            None => Ok(bindings),
-        }
-    }
-}
-
 impl MlxUnitPopulator<NeutralBlock> for Lfm2UnitPopulator {
-    fn populate(
-        &mut self,
-        unit: &mut MlxModule<NeutralBlock>,
-        lease: &crate::backend::runtime::residency::manager::ResidentUnitLease,
-    ) -> Result<(), Error> {
-        populate_module_from_lease_excluding(unit, lease, |name| {
-            self.external_experts && parameter_name_in_targets(name, &self.expert_targets)
-        })?;
-        Ok(())
-    }
-}
-
-#[derive(Clone)]
-struct Lfm2ParallelUnitPopulator {
-    external_experts: bool,
-    expert_targets: Arc<BTreeSet<String>>,
-}
-
-impl MlxUnitPopulator<NeutralBlock> for Lfm2ParallelUnitPopulator {
     fn populate(
         &mut self,
         unit: &mut MlxModule<NeutralBlock>,
@@ -274,8 +125,6 @@ impl MlxUnitPopulator<NeutralBlock> for Lfm2ParallelUnitPopulator {
 enum Lfm2Execution {
     Resident(Box<ResidentRuntime>),
     Layerwise(Box<BoundedRuntime>),
-    TensorParallelResident(Box<ResidentRuntime>),
-    TensorParallelLayerwise(Box<ParallelBoundedRuntime>),
 }
 
 impl Lfm2Execution {
@@ -283,8 +132,6 @@ impl Lfm2Execution {
         match self {
             Self::Resident(runtime) => runtime.architecture(),
             Self::Layerwise(runtime) => runtime.architecture(),
-            Self::TensorParallelResident(runtime) => runtime.architecture(),
-            Self::TensorParallelLayerwise(runtime) => runtime.architecture(),
         }
     }
 }
@@ -376,175 +223,7 @@ fn load_neutral(
         state_layout,
         execution,
         parameter_bank: None,
-        parallel_info: None,
         parallel_rank: None,
-    })
-}
-
-fn load_neutral_parallel(
-    store: Arc<dyn CheckpointSource>,
-    args: ModelArgs,
-    options: LayerWeightResidency,
-    build: crate::composition::mlx::distributed::topology::ParallelBuildContext,
-    stream: &Stream,
-    weights_stream: &Stream,
-    external_experts: bool,
-) -> Result<Lfm2Model, Error> {
-    let global_architecture = NeutralArchitecture::new(args.clone(), stream)
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    let parameter_description = global_architecture
-        .parameter_description(stream)
-        .map_err(|error| Error::Parallel(error.to_string()))?;
-    let execution_layout = parameter_description.unit_layout().clone();
-    let expert_targets =
-        Arc::new(parameter_description.targets_for_role(ParameterRole::ExpertIntermediate));
-    let layout =
-        crate::composition::parallel_layout_from_description(build, &parameter_description)?;
-    if layout.is_empty() {
-        return Err(Error::Parallel(
-            "LFM2 declared no tensor-parallel parameters".into(),
-        ));
-    }
-    let geometry = eredu_architectures::lfm2::local_geometry(&args, &layout)
-        .map_err(|error| Error::Parallel(error.to_string()))?;
-    let mut architecture = NeutralArchitecture::new_parallel(args.clone(), geometry, stream)
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    let state_layout = architecture
-        .state_layout()
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    let factory = Lfm2ParallelUnitPopulator {
-        external_experts,
-        expert_targets: Arc::clone(&expert_targets),
-    };
-
-    let global_static = MlxModule::new(global_architecture.static_modules().clone());
-    let global_static_bindings = build_module_bindings(&global_static, "", store.as_ref())?;
-    let mut global_parameter_bytes = binding_bytes(&global_static_bindings)?;
-    for ordinal in 0..execution_layout.len() {
-        let address = execution_layout
-            .address(ordinal)
-            .expect("canonical execution ordinal");
-        let block = construct_architecture_unit(
-            &global_architecture,
-            &execution_layout,
-            ordinal,
-            stream,
-            std::marker::PhantomData::<MlxHybridState>,
-        )?;
-        let bindings = build_module_bindings_with_recipes_excluding(
-            &MlxModule::new(block),
-            "",
-            store.as_ref(),
-            if external_experts {
-                BTreeMap::new()
-            } else {
-                eredu_architectures::lfm2::unit_recipes(store.as_ref(), &args, address.index())
-                    .map_err(Error::ArchitectureModel)?
-            },
-            |name| external_experts && parameter_name_in_targets(name, &expert_targets),
-        )?;
-        global_parameter_bytes = global_parameter_bytes
-            .checked_add(binding_bytes(&bindings)?)
-            .ok_or_else(|| Error::Parallel("global LFM2 parameter bytes overflowed".into()))?;
-    }
-
-    let shared_layout = Arc::new(layout);
-    let static_layout = Arc::clone(&shared_layout);
-    let unit_layout = Arc::clone(&shared_layout);
-    let binding_args = args.clone();
-    let global_static_modules = global_architecture.static_modules().clone();
-    let binding_execution_layout = execution_layout;
-    let excluded_expert_targets = Arc::clone(&expert_targets);
-    let binding_expert_targets = Arc::clone(&expert_targets);
-    let (policy, mut metadata) = prepare_layerwise_policy_with_bindings(
-        Arc::clone(&store),
-        &mut architecture,
-        factory,
-        std::marker::PhantomData::<MlxHybridState>,
-        options,
-        stream,
-        weights_stream,
-        move |key| external_experts && parameter_name_in_targets(key, &excluded_expert_targets),
-        move |_modules, store| {
-            let global = MlxModule::new(global_static_modules.clone());
-            let bindings = build_module_bindings(&global, "", store)?;
-            shard_layer_bindings(bindings, store, &static_layout)
-        },
-        move |ordinal, address, _path, _local, store, stream| {
-            let layer = address.index();
-            let global = construct_architecture_unit(
-                &global_architecture,
-                &binding_execution_layout,
-                ordinal,
-                stream,
-                std::marker::PhantomData::<MlxHybridState>,
-            )?;
-            let bindings = build_module_bindings_with_recipes_excluding(
-                &MlxModule::new(global),
-                "",
-                store,
-                if external_experts {
-                    BTreeMap::new()
-                } else {
-                    eredu_architectures::lfm2::unit_recipes(store, &binding_args, layer)
-                        .map_err(Error::ArchitectureModel)?
-                },
-                |name| external_experts && parameter_name_in_targets(name, &binding_expert_targets),
-            )?;
-            shard_layer_bindings(bindings, store, &unit_layout)
-        },
-    )?;
-    metadata.set_effective_model_type(args.model_type.clone());
-    metadata.set_quantization(args.weight_quantization);
-    let local_parameter_bytes = metadata
-        .static_device_bytes()
-        .checked_add(metadata.layer_parameter_bytes())
-        .ok_or_else(|| Error::Parallel("local LFM2 parameter bytes overflowed".into()))?;
-    let maximum_device_parameter_bytes = metadata
-        .static_device_bytes()
-        .checked_add(metadata.maximum_device_layer_bytes())
-        .ok_or_else(|| Error::Parallel("device LFM2 parameter bytes overflowed".into()))?;
-    let info = ParallelModelInfo::new(
-        build.topology(),
-        args.model_type.clone(),
-        shared_layout
-            .tensors()
-            .map(|(target, _)| target.to_owned())
-            .collect(),
-        local_parameter_bytes,
-        global_parameter_bytes,
-        if options.is_fully_resident() {
-            local_parameter_bytes
-        } else {
-            metadata.static_device_bytes()
-        },
-        maximum_device_parameter_bytes,
-    );
-    let rank =
-        crate::composition::mlx::distributed::topology::prompt_cache_topology(build.topology())
-            .cache_rank_identity();
-    let execution = if options.is_fully_resident() {
-        Lfm2Execution::TensorParallelResident(Box::new(LayerwiseRuntime::new_policy_first(
-            policy.into_resident(
-                &architecture,
-                stream,
-                std::marker::PhantomData::<MlxHybridState>,
-            )?,
-            architecture,
-        )))
-    } else {
-        Lfm2Execution::TensorParallelLayerwise(Box::new(LayerwiseRuntime::new(
-            architecture,
-            policy,
-        )))
-    };
-    Ok(Lfm2Model {
-        args,
-        state_layout,
-        execution,
-        parameter_bank: None,
-        parallel_info: Some(info),
-        parallel_rank: rank,
     })
 }
 
@@ -612,29 +291,17 @@ pub struct Lfm2Model {
     state_layout: eredu_runtime::StateLayout,
     execution: Lfm2Execution,
     parameter_bank: Option<AddressableParameterBank>,
-    parallel_info:
-        Option<ParallelModelInfo<crate::composition::mlx::distributed::topology::MlxParallelPlan>>,
     parallel_rank: Option<eredu_core::cache::CacheRankIdentity>,
 }
 
 impl Lfm2Model {
     pub(crate) fn requires_family_executable(&self) -> bool {
-        self.args.has_sparse_moe_layers()
-            || self.parameter_bank.is_some()
-            || self.parallel_info.is_some()
+        self.args.has_sparse_moe_layers() || self.parameter_bank.is_some()
     }
 
     /// Returns validated family policy.
     pub const fn args(&self) -> &ModelArgs {
         &self.args
-    }
-
-    /// Returns parallel metadata when a distributed binder supplied it.
-    pub fn parallel_info(
-        &self,
-    ) -> Option<&ParallelModelInfo<crate::composition::mlx::distributed::topology::MlxParallelPlan>>
-    {
-        self.parallel_info.as_ref()
     }
 
     /// Creates device-resident heterogeneous state.
@@ -664,8 +331,6 @@ impl Lfm2Model {
         match &self.execution {
             Lfm2Execution::Resident(runtime) => runtime.policy().residency_report(),
             Lfm2Execution::Layerwise(runtime) => runtime.policy().residency_report(),
-            Lfm2Execution::TensorParallelResident(runtime) => runtime.policy().residency_report(),
-            Lfm2Execution::TensorParallelLayerwise(runtime) => runtime.policy().residency_report(),
         }
     }
 
@@ -674,10 +339,6 @@ impl Lfm2Model {
         match &self.execution {
             Lfm2Execution::Resident(_) => Ok(None),
             Lfm2Execution::Layerwise(runtime) => runtime.policy().dense_stream_report(),
-            Lfm2Execution::TensorParallelResident(_) => Ok(None),
-            Lfm2Execution::TensorParallelLayerwise(runtime) => {
-                runtime.policy().dense_stream_report()
-            }
         }
     }
 
@@ -694,12 +355,6 @@ impl Lfm2Model {
         match &self.execution {
             Lfm2Execution::Resident(runtime) => runtime.policy().checkpoint_store_arc(),
             Lfm2Execution::Layerwise(runtime) => runtime.policy().checkpoint_store_arc(),
-            Lfm2Execution::TensorParallelResident(runtime) => {
-                runtime.policy().checkpoint_store_arc()
-            }
-            Lfm2Execution::TensorParallelLayerwise(runtime) => {
-                runtime.policy().checkpoint_store_arc()
-            }
         }
     }
 
@@ -707,13 +362,7 @@ impl Lfm2Model {
     pub fn prompt_cache_model_identity(&self) -> Result<PromptCacheModelIdentity, Error> {
         crate::composition::replicated_prompt_cache_identity(
             self.execution.architecture(),
-            self.parallel_info
-                .as_ref()
-                .map_or_else(PromptCacheTopology::default, |info| {
-                    crate::composition::mlx::distributed::topology::prompt_cache_topology(
-                        info.topology(),
-                    )
-                }),
+            PromptCacheTopology::default(),
         )
     }
 
@@ -826,12 +475,6 @@ impl Lfm2Model {
         let output = match &mut self.execution {
             Lfm2Execution::Resident(runtime) => runtime.forward(input, cache, stream),
             Lfm2Execution::Layerwise(runtime) => runtime.forward(input, cache, stream),
-            Lfm2Execution::TensorParallelResident(_)
-            | Lfm2Execution::TensorParallelLayerwise(_) => {
-                return Err(Error::Parallel(
-                    "tensor-parallel LFM2 requires collective execution".into(),
-                ))
-            }
         }
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         Ok(output.into_array())
@@ -849,11 +492,6 @@ impl Lfm2Model {
         P: eredu_runtime::RoutedExpertProvider<MlxNeuralBackend>,
         P::Error: std::fmt::Display,
     {
-        let pass = if tokens.dim(1) > 1 {
-            eredu_runtime::ExpertPass::Prefill
-        } else {
-            eredu_runtime::ExpertPass::Decode
-        };
         let input = eredu_architectures::decoder::LayeredInput {
             tokens: crate::composition::tensor_ref(tokens),
             mask: crate::composition::tensor_opt(mask),
@@ -869,7 +507,7 @@ impl Lfm2Model {
             <NeutralArchitecture as eredu_runtime::RoutedLayeredArchitecture<
                 MlxNeuralBackend,
                 MlxHybridState,
-            >>::forward_unit_with_provider(
+            >>::forward_unit_with_inferred_provider(
                 architecture,
                 group,
                 index,
@@ -877,7 +515,6 @@ impl Lfm2Model {
                 hidden,
                 state,
                 forward,
-                pass,
                 provider,
                 context,
             )
@@ -888,11 +525,6 @@ impl Lfm2Model {
             }
             Lfm2Execution::Layerwise(runtime) => {
                 runtime.forward_with_unit_executor(input, cache, stream, hook)
-            }
-            _ => {
-                return Err(Error::Parallel(
-                    "tensor-parallel LFM2 expert cache requires collective execution".into(),
-                ))
             }
         }
         .map_err(|error| Error::Parallel(error.to_string()))?;
@@ -955,102 +587,32 @@ impl Lfm2Model {
         P: eredu_runtime::RoutedExpertProvider<MlxNeuralBackend>,
         P::Error: std::fmt::Display,
     {
-        let pass = if tokens.dim(1) > 1 {
-            eredu_runtime::ExpertPass::Prefill
-        } else {
-            eredu_runtime::ExpertPass::Decode
-        };
         let output = match &mut self.execution {
-            Lfm2Execution::Resident(runtime) => runtime.forward_with_provider_and_observer(
-                eredu_architectures::decoder::LayeredInput {
-                    tokens: crate::composition::tensor_ref(tokens),
-                    mask: crate::composition::tensor_opt(mask),
-                },
-                cache,
-                pass,
-                provider,
-                stream,
-                observer,
-            ),
-            Lfm2Execution::Layerwise(runtime) => runtime.forward_with_provider_and_observer(
-                eredu_architectures::decoder::LayeredInput {
-                    tokens: crate::composition::tensor_ref(tokens),
-                    mask: crate::composition::tensor_opt(mask),
-                },
-                cache,
-                pass,
-                provider,
-                stream,
-                observer,
-            ),
-            _ => {
-                return Err(Error::Parallel(
-                    "tensor-parallel LFM2 observation requires distributed observation".into(),
-                ))
-            }
+            Lfm2Execution::Resident(runtime) => runtime
+                .forward_with_inferred_provider_and_observer(
+                    eredu_architectures::decoder::LayeredInput {
+                        tokens: crate::composition::tensor_ref(tokens),
+                        mask: crate::composition::tensor_opt(mask),
+                    },
+                    cache,
+                    provider,
+                    stream,
+                    observer,
+                ),
+            Lfm2Execution::Layerwise(runtime) => runtime
+                .forward_with_inferred_provider_and_observer(
+                    eredu_architectures::decoder::LayeredInput {
+                        tokens: crate::composition::tensor_ref(tokens),
+                        mask: crate::composition::tensor_opt(mask),
+                    },
+                    cache,
+                    provider,
+                    stream,
+                    observer,
+                ),
         }
         .map_err(|error| Error::Parallel(error.to_string()))?;
         eredu_runtime::observe_model_logits(observer, &output)
-            .map(crate::MlxTensor::into_array)
-            .map_err(Into::into)
-    }
-
-    /// Executes a rank-local tensor-parallel forward pass.
-    pub fn forward_tensor_parallel(
-        &mut self,
-        tokens: &Array,
-        cache: &mut MlxHybridState,
-        group: &crate::backend::runtime::distributed::Group,
-        stream: &Stream,
-    ) -> Result<Array, Error> {
-        let input = eredu_architectures::decoder::LayeredInput {
-            tokens: crate::composition::tensor_ref(tokens),
-            mask: None,
-        };
-        let output = match &mut self.execution {
-            Lfm2Execution::TensorParallelResident(runtime) => {
-                runtime.forward_parallel(input, cache, group, stream)
-            }
-            Lfm2Execution::TensorParallelLayerwise(runtime) => {
-                runtime.forward_parallel(input, cache, group, stream)
-            }
-            _ => {
-                return Err(Error::Parallel(
-                    "LFM2 was not loaded for tensor parallelism".into(),
-                ))
-            }
-        }
-        .map_err(|error| Error::Parallel(error.to_string()))?;
-        Ok(output.into_array())
-    }
-
-    pub fn forward_tensor_parallel_with_observer(
-        &mut self,
-        tokens: &Array,
-        cache: &mut MlxHybridState,
-        group: &crate::backend::runtime::distributed::Group,
-        stream: &Stream,
-        observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
-    ) -> Result<Array, Error> {
-        let input = eredu_architectures::decoder::LayeredInput {
-            tokens: crate::composition::tensor_ref(tokens),
-            mask: None,
-        };
-        let mut neutral = crate::composition::NeutralActivationObserver::new(observer);
-        let output =
-            match &mut self.execution {
-                Lfm2Execution::TensorParallelResident(runtime) => runtime
-                    .forward_parallel_with_observer(input, cache, group, stream, &mut neutral),
-                Lfm2Execution::TensorParallelLayerwise(runtime) => runtime
-                    .forward_parallel_with_observer(input, cache, group, stream, &mut neutral),
-                _ => {
-                    return Err(Error::Parallel(
-                        "LFM2 was not loaded for tensor parallelism".into(),
-                    ))
-                }
-            }
-            .map_err(|error| Error::Parallel(error.to_string()))?;
-        eredu_runtime::observe_model_logits(&mut neutral, &output)
             .map(crate::MlxTensor::into_array)
             .map_err(Into::into)
     }
@@ -1161,25 +723,6 @@ fn attach_parameter_bank(
 }
 
 /// Loads SafeTensors LFM2 through generalized tensor-parallel placement.
-pub fn load_lfm2_tensor_parallel_model(
-    artifact: &crate::composition::mlx::artifact::PreparedSafetensorsArtifact,
-    options: impl Into<LayerWeightResidency>,
-    build: crate::composition::mlx::distributed::topology::ParallelBuildContext,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<Lfm2Model, Error> {
-    let options = options.into();
-    let eredu_architectures::configuration::SafetensorsModelConfig::Lfm2(args) = artifact.model()
-    else {
-        return Err(Error::ArchitectureModel(
-            "LFM2 loader received a different prepared architecture".into(),
-        ));
-    };
-    let args = args.clone();
-    let store = artifact.store();
-    load_neutral_parallel(store, args, options, build, stream, weights_stream, false)
-}
-
 pub(crate) struct PreparedGguf {
     pub args: ModelArgs,
 }
@@ -1245,33 +788,5 @@ pub(crate) fn load_lfm2_gguf_model(
     if let Some(expert_options) = expert_options {
         attach_parameter_bank(&mut model, expert_options, stream, weights_stream)?;
     }
-    Ok(model)
-}
-
-/// Loads GGUF LFM2 with tensor-parallel placement.
-pub(crate) fn load_lfm2_gguf_tensor_parallel_model(
-    source: &crate::composition::mlx::structural::AdmittedGguf,
-    options: LayerWeightResidency,
-    build: crate::composition::mlx::distributed::topology::ParallelBuildContext,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<Lfm2Model, Error> {
-    let checkpoint = source.checkpoint();
-    let prepared = prepare_gguf(source)?;
-    let store: Arc<dyn CheckpointSource> = Arc::new(open_gguf_checkpoint_source(
-        checkpoint.clone(),
-        source.plan().checkpoint(),
-        source.plan().tensor_mapping(),
-        options.max_cached_shards(),
-    )?);
-    let model = load_neutral_parallel(
-        store,
-        prepared.args,
-        options,
-        build,
-        stream,
-        weights_stream,
-        false,
-    )?;
     Ok(model)
 }

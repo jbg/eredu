@@ -1,7 +1,6 @@
 //! One neutral Muse-Glimmer multimodal model for resident and bounded runtimes.
 
 use eredu_nn::{
-    multimodal::{assemble_ordered_inputs, OrderedInputPart},
     AttentionCache, EmbeddingLookupPolicy, Error, GroupedNeuralBackend, Parameterized, Tensor,
 };
 use eredu_runtime::{
@@ -13,7 +12,10 @@ use eredu_runtime::{
 };
 
 use crate::{
-    composite_execution::{CompositeArchitecture, PreparedCompositeInput},
+    composite_execution::{
+        CompositeArchitecture, ExternalPredictionCaptureRequest, ExternalPredictionTargetCapture,
+        ExternalPredictionTargetOperation, PreparedCompositeInput,
+    },
     media_plan::MuseGlimmerInputPartPlan,
 };
 
@@ -28,6 +30,26 @@ use super::{
 pub const VISION_EXECUTION_GROUP: &str = "vision_encoder";
 /// Stable execution-group identity for Muse-Glimmer text decoding.
 pub const TEXT_EXECUTION_GROUP: &str = "text_decoder";
+
+/// Proves one DFlash assistant against a target and returns exact ordered capture paths.
+pub fn external_assistant_capture_request(
+    target: &DecoderConfig,
+    assistant: &super::assistant::DFlashConfig,
+) -> Result<ExternalPredictionCaptureRequest, String> {
+    let proof = assistant
+        .prove_compatibility(target)
+        .map_err(|error| error.to_string())?;
+    let target_layers = proof.target_layer_ids().to_vec().into_boxed_slice();
+    let target_paths = target_layers
+        .iter()
+        .map(|index| format!("model.layers.{index}.output"))
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
+    Ok(ExternalPredictionCaptureRequest::MuseGlimmerDFlash {
+        target_layers,
+        target_paths,
+    })
+}
 
 /// One ordered decoder-ingress segment.
 pub enum DecoderInputPart<'a, T> {
@@ -165,6 +187,93 @@ where
         crate::media_plan::admit_muse_glimmer_input(config, input, inspector)
     }
 
+    fn should_execute_prepared_group(
+        &self,
+        group: usize,
+        input: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
+    ) -> bool {
+        group != 0
+            || input
+                .admitted()
+                .parts()
+                .iter()
+                .any(|part| matches!(part, MuseGlimmerInputPartPlan::Vision { .. }))
+    }
+
+    fn prepared_group_collective_waves(
+        &self,
+        group: usize,
+        _input: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
+        tensor_partitions: usize,
+        pipeline_stages: usize,
+    ) -> Result<Option<Vec<Vec<crate::composite_execution::CompositeTensorCollective>>>, String>
+    {
+        // Muse-Glimmer's vision blocks and projector are replicated equations.
+        // Under TP+PP they still execute on every tensor rank, but emit no tensor
+        // collective; the explicit empty waves keep that fact architecture-owned.
+        Ok((group == 0 && tensor_partitions > 1 && pipeline_stages > 1)
+            .then(|| vec![Vec::new(); pipeline_stages]))
+    }
+
+    fn external_prediction_capture_paths(
+        request: &ExternalPredictionCaptureRequest,
+    ) -> Result<Option<Vec<String>>, Self::Error> {
+        let ExternalPredictionCaptureRequest::MuseGlimmerDFlash {
+            target_layers,
+            target_paths,
+        } = request
+        else {
+            return Ok(None);
+        };
+        if target_layers.is_empty() {
+            return Err(Error::backend(
+                "Muse-Glimmer DFlash capture has no target layers",
+            ));
+        }
+        if target_paths.len() != target_layers.len() {
+            return Err(Error::backend(
+                "Muse-Glimmer DFlash capture path count differs from target layers",
+            ));
+        }
+        Ok(Some(target_paths.to_vec()))
+    }
+
+    fn external_prediction_capture(
+        request: &ExternalPredictionCaptureRequest,
+        _forward: &Self::ForwardContext,
+        observed: Vec<B::Tensor>,
+    ) -> Result<Option<ExternalPredictionTargetCapture<B::Tensor>>, Self::Error> {
+        let ExternalPredictionCaptureRequest::MuseGlimmerDFlash { target_layers, .. } = request
+        else {
+            return Ok(None);
+        };
+        if observed.len() != target_layers.len() {
+            return Err(Error::backend(format!(
+                "Muse-Glimmer DFlash capture expected {} target states, received {}",
+                target_layers.len(),
+                observed.len()
+            )));
+        }
+        Ok(Some(ExternalPredictionTargetCapture::MuseGlimmerDFlash {
+            target_states: observed,
+        }))
+    }
+
+    fn external_prediction_target_operation(
+        &mut self,
+        operation: ExternalPredictionTargetOperation<'_, B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Option<B::Tensor>, Self::Error> {
+        match operation {
+            ExternalPredictionTargetOperation::TokenEmbeddings(tokens) => {
+                self.token_embeddings(tokens, context).map(Some)
+            }
+            ExternalPredictionTargetOperation::ProjectLogits(hidden) => {
+                self.project_logits(hidden, context).map(Some)
+            }
+        }
+    }
+
     fn begin_composite_forward<'a>(
         &mut self,
         input: PreparedCompositeInput<'a, B::Tensor, Self::InputPartPlan>,
@@ -181,6 +290,31 @@ where
                 mask: None,
             },
             state,
+            context,
+        )
+    }
+
+    fn begin_composite_forward_parallel<'a>(
+        &mut self,
+        input: PreparedCompositeInput<'a, B::Tensor, Self::InputPartPlan>,
+        state: &mut S,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error>
+    where
+        B: eredu_nn::TensorParallelGroupedNeuralBackend,
+    {
+        let prepared = prepare_composite_ingress::<B>(input, context)?;
+        let decoder_parts = prepared.decoder_parts();
+        <Self as ParallelLayeredArchitecture<B, S>>::begin_forward_parallel(
+            self,
+            ModelInput {
+                parts: &decoder_parts,
+                vision: prepared.vision_input(),
+                mask: None,
+            },
+            state,
+            parallel,
             context,
         )
     }
@@ -298,6 +432,9 @@ pub struct LayeredModel<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBac
     args: DecoderConfig,
     static_modules: StaticModules<B>,
     parallel_geometry: Option<std::sync::Arc<LocalGeometry>>,
+    partition_state_offset: usize,
+    expert_realization:
+        Option<std::sync::Arc<crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>>>,
 }
 
 impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
@@ -402,7 +539,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
             }
         };
         let offset = state
-            .layer(first_state_ordinal)
+            .layer(self.local_state_ordinal(first_state_ordinal)?)
             .map_err(Error::backend)?
             .offset();
         self.begin_routed_text_partition(input, mask, sequence, offset, parallel, context)
@@ -429,6 +566,8 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
             args,
             static_modules,
             parallel_geometry: None,
+            partition_state_offset: 0,
+            expert_realization: None,
         })
     }
 
@@ -455,7 +594,57 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
             args,
             static_modules,
             parallel_geometry: Some(std::sync::Arc::new(geometry)),
+            partition_state_offset: 0,
+            expert_realization: None,
         })
+    }
+
+    /// Retains the architecture-global ordinal of this pipeline partition's first text state.
+    pub(crate) fn with_partition_state_offset(mut self, offset: usize) -> Result<Self, Error> {
+        if offset >= self.args.num_hidden_layers as usize {
+            return Err(Error::backend(
+                "Muse-Glimmer partition state offset is outside the decoder",
+            ));
+        }
+        self.partition_state_offset = offset;
+        Ok(self)
+    }
+
+    fn local_state_ordinal(&self, global: usize) -> Result<usize, Error> {
+        global
+            .checked_sub(self.partition_state_offset)
+            .ok_or_else(|| Error::backend("Muse-Glimmer unit precedes the partition state offset"))
+    }
+
+    fn validate_partition_state<S: LayerRuntimeState<B>>(&self, state: &S) -> Result<(), Error> {
+        let complete = self.state_layout_impl()?;
+        let end = self
+            .partition_state_offset
+            .checked_add(state.layout().len())
+            .ok_or_else(|| Error::backend("Muse-Glimmer partition state interval overflow"))?;
+        let expected = complete
+            .slice(self.partition_state_offset..end)
+            .map_err(Error::backend)?;
+        if state.layout() != &expected {
+            return Err(Error::backend(
+                "Muse-Glimmer rank-local state layout mismatch",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Binds the exact selected compact expert banks used by partition-local units.
+    pub fn with_expert_realization(
+        mut self,
+        realization: crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>,
+    ) -> Result<Self, Error> {
+        if !self.args.is_moe() {
+            return Err(Error::backend(
+                "dense Muse-Glimmer cannot bind an expert realization",
+            ));
+        }
+        self.expert_realization = Some(std::sync::Arc::new(realization));
+        Ok(self)
     }
 
     /// Returns normalized configuration.
@@ -798,7 +987,11 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         unit.forward_parallel(
             hidden,
             forward.mask.as_ref(),
-            Some(state.layer(index).map_err(Error::backend)?),
+            Some(
+                state
+                    .layer(self.local_state_ordinal(index)?)
+                    .map_err(Error::backend)?,
+            ),
             parallel,
             context,
         )
@@ -827,7 +1020,11 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         unit.forward_parallel_with_provider(
             hidden,
             forward.mask.as_ref(),
-            Some(state.layer(index).map_err(Error::backend)?),
+            Some(
+                state
+                    .layer(self.local_state_ordinal(index)?)
+                    .map_err(Error::backend)?,
+            ),
             pass,
             provider,
             parallel,
@@ -892,7 +1089,11 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         unit.forward_with_provider(
             hidden,
             forward.mask.as_ref(),
-            Some(state.layer(index).map_err(Error::backend)?),
+            Some(
+                state
+                    .layer(self.local_state_ordinal(index)?)
+                    .map_err(Error::backend)?,
+            ),
             pass,
             provider,
             context,
@@ -1022,17 +1223,31 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
                 }
             }
         }
-        let ordered = parts
-            .iter()
-            .zip(&owned_embeddings)
-            .map(|(part, embeddings)| OrderedInputPart {
-                token_ids: match part {
-                    PreparedPart::Text { tokens, .. } | PreparedPart::Media { tokens } => tokens,
-                },
-                embeddings,
+        let batch = parts
+            .first()
+            .map(|part| match part {
+                PreparedPart::Text { tokens, .. } | PreparedPart::Media { tokens } => tokens.dim(0),
             })
-            .collect::<Vec<_>>();
-        Ok(assemble_ordered_inputs(&ordered, self.args.hidden_size, context)?.embeddings)
+            .ok_or_else(|| Error::backend("Muse-Glimmer input has no ordered parts"))?;
+        for (index, (part, embeddings)) in parts.iter().zip(&owned_embeddings).enumerate() {
+            let tokens = match part {
+                PreparedPart::Text { tokens, .. } | PreparedPart::Media { tokens } => tokens,
+            };
+            if tokens.shape().len() != 2
+                || embeddings.shape().len() != 3
+                || tokens.dim(0) != batch
+                || embeddings.dim(0) != batch
+                || tokens.dim(1) != embeddings.dim(1)
+                || embeddings.dim(2) != self.args.hidden_size
+            {
+                return Err(Error::backend(format!(
+                    "Muse-Glimmer ordered input part {index} has incompatible token/embedding shapes {:?} and {:?}",
+                    tokens.shape(),
+                    embeddings.shape()
+                )));
+            }
+        }
+        B::Tensor::concatenate(&owned_embeddings, 1, context)
     }
 }
 
@@ -1164,7 +1379,22 @@ where
                     })
                     .transpose()?
                     .unwrap_or(&self.args);
-                Ok(Unit::Text(TransformerBlock::new(args, index, context)?))
+                let routed_spec = self
+                    .expert_realization
+                    .as_ref()
+                    .and_then(|plan| plan.unit_spec(TEXT_EXECUTION_GROUP, index))
+                    .cloned();
+                if self.expert_realization.is_some() && routed_spec.is_none() {
+                    return Err(Error::backend(format!(
+                        "Muse-Glimmer expert realization omits text unit {index}"
+                    )));
+                }
+                Ok(Unit::Text(TransformerBlock::new_with_routed_spec(
+                    args,
+                    index,
+                    routed_spec,
+                    context,
+                )?))
             }
             _ => Err(Error::backend("Muse-Glimmer has two execution groups")),
         }
@@ -1197,9 +1427,7 @@ where
         state: &mut S,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
-        if state.layout() != &state_layout(&self.args).map_err(Error::backend)? {
-            return Err(Error::backend("Muse-Glimmer runtime state layout mismatch"));
-        }
+        self.validate_partition_state(state)?;
         let parts = self.prepare_parts(input.parts, context)?;
         let (hidden, vision) = match input.vision {
             Some(vision) => {
@@ -1237,6 +1465,7 @@ where
             (1, [vision_or_assembled]) if forward.vision.is_some() => {
                 self.assemble(&forward.parts, Some(vision_or_assembled), context)
             }
+            (1, []) if forward.vision.is_none() => Ok(initial.clone()),
             (1, [assembled]) => Ok((*assembled).clone()),
             _ => Err(Error::backend(
                 "invalid Muse-Glimmer execution dependencies",
@@ -1275,7 +1504,11 @@ where
             (1, Unit::Text(unit)) => unit.forward(
                 hidden,
                 forward.mask.as_ref(),
-                Some(state.layer(index).map_err(Error::backend)?),
+                Some(
+                    state
+                        .layer(self.local_state_ordinal(index)?)
+                        .map_err(Error::backend)?,
+                ),
                 context,
             ),
             _ => Err(Error::backend("Muse-Glimmer unit/group mismatch")),
@@ -1351,18 +1584,12 @@ where
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
-        let expected = self
-            .parallel_geometry
-            .as_ref()
-            .ok_or_else(|| {
-                Error::backend("Muse-Glimmer model was not built with rank-local geometry")
-            })?
-            .state_layout();
-        if state.layout() != expected {
+        if self.parallel_geometry.is_none() {
             return Err(Error::backend(
-                "Muse-Glimmer rank-local state layout mismatch",
+                "Muse-Glimmer model was not built with rank-local geometry",
             ));
         }
+        self.validate_partition_state(state)?;
         let parts = self.prepare_parts_parallel(input.parts, parallel, context)?;
         let (hidden, vision) = match input.vision {
             Some(vision) => {

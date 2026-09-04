@@ -1,11 +1,14 @@
 //! Semantic parallel placement for DeepSeek target and prediction units.
 
+use std::ops::Range;
+
 use eredu_checkpoint::LinearFormat;
 use eredu_nn::VocabularyParallelRange;
 use eredu_runtime::{
-    ArchitectureParameterDescription, ExecutionGraph, ExecutionUnitLayout, LocalModelLayout,
-    MemberSharding, OwnedParameterGroupSpec, ParallelPlanError, ParameterGroupOwner,
-    ParameterGroupSpec, ParameterMemberSpec, ParameterRole, StateLayout, TensorPlacement,
+    ArchitectureParameterDescription, ArchitecturePartition, ExecutionGraph, ExecutionUnitLayout,
+    LocalModelLayout, MemberSharding, OwnedParameterGroupSpec, ParallelPlanError,
+    ParameterGroupOwner, ParameterGroupSpec, ParameterMemberSpec, ParameterRole,
+    PartitionOwnership, StateLayout, TensorPlacement,
 };
 
 use super::{
@@ -19,6 +22,8 @@ pub struct V3LocalGeometry {
     embedding_range: VocabularyParallelRange,
     output_range: VocabularyParallelRange,
     state_layout: StateLayout,
+    routed_expert_intermediate_range: Option<Range<usize>>,
+    shared_expert_intermediate_range: Option<Range<usize>>,
     architecture_fingerprint: String,
 }
 
@@ -43,6 +48,16 @@ impl V3LocalGeometry {
         &self.state_layout
     }
 
+    /// Returns the exact checkpoint-global TP channel range for every routed bank.
+    pub fn routed_expert_intermediate_range(&self) -> Option<Range<usize>> {
+        self.routed_expert_intermediate_range.clone()
+    }
+
+    /// Returns the exact checkpoint-global TP channel range for shared experts.
+    pub fn shared_expert_intermediate_range(&self) -> Option<Range<usize>> {
+        self.shared_expert_intermediate_range.clone()
+    }
+
     pub(super) fn validate_for(&self, args: &V3Args) -> Result<(), ParallelPlanError> {
         if self.architecture_fingerprint != v3_architecture_fingerprint(args) {
             return Err(invalid(
@@ -62,6 +77,27 @@ impl V3LocalGeometry {
                 "rank-local V3 state layout drifted from unit geometry",
             ));
         }
+        let local_expert = usize::try_from(self.args.moe_intermediate_size)
+            .map_err(|_| invalid("local V3 expert width exceeds usize"))?;
+        let local_shared = local_expert
+            .checked_mul(
+                usize::try_from(args.n_shared_experts)
+                    .map_err(|_| invalid("V3 shared expert count exceeds usize"))?,
+            )
+            .ok_or_else(|| invalid("local V3 shared expert width overflowed usize"))?;
+        match (
+            &self.routed_expert_intermediate_range,
+            &self.shared_expert_intermediate_range,
+        ) {
+            (Some(routed), Some(shared))
+                if routed.len() == local_expert && shared.len() == local_shared => {}
+            (None, None) => {}
+            _ => {
+                return Err(invalid(
+                    "rank-local V3 routed/shared expert channel ranges drifted",
+                ))
+            }
+        }
         Ok(())
     }
 }
@@ -73,6 +109,8 @@ pub struct V4LocalGeometry {
     embedding_range: VocabularyParallelRange,
     output_range: VocabularyParallelRange,
     state_layout: StateLayout,
+    routed_expert_intermediate_range: Option<Range<usize>>,
+    shared_expert_intermediate_range: Option<Range<usize>>,
     architecture_fingerprint: String,
 }
 
@@ -97,6 +135,16 @@ impl V4LocalGeometry {
         &self.state_layout
     }
 
+    /// Returns the exact checkpoint-global TP channel range for every routed bank.
+    pub fn routed_expert_intermediate_range(&self) -> Option<Range<usize>> {
+        self.routed_expert_intermediate_range.clone()
+    }
+
+    /// Returns the exact checkpoint-global TP channel range for shared experts.
+    pub fn shared_expert_intermediate_range(&self) -> Option<Range<usize>> {
+        self.shared_expert_intermediate_range.clone()
+    }
+
     pub(super) fn validate_for(&self, args: &V4Args) -> Result<(), ParallelPlanError> {
         if self.architecture_fingerprint != v4_architecture_fingerprint(args) {
             return Err(invalid(
@@ -115,6 +163,27 @@ impl V4LocalGeometry {
             return Err(invalid(
                 "rank-local V4 state layout drifted from unit geometry",
             ));
+        }
+        let local_expert = usize::try_from(self.args.moe_intermediate_size)
+            .map_err(|_| invalid("local V4 expert width exceeds usize"))?;
+        let local_shared = local_expert
+            .checked_mul(
+                usize::try_from(args.n_shared_experts)
+                    .map_err(|_| invalid("V4 shared expert count exceeds usize"))?,
+            )
+            .ok_or_else(|| invalid("local V4 shared expert width overflowed usize"))?;
+        match (
+            &self.routed_expert_intermediate_range,
+            &self.shared_expert_intermediate_range,
+        ) {
+            (Some(routed), Some(shared))
+                if routed.len() == local_expert && shared.len() == local_shared => {}
+            (None, None) => {}
+            _ => {
+                return Err(invalid(
+                    "rank-local V4 routed/shared expert channel ranges drifted",
+                ))
+            }
         }
         Ok(())
     }
@@ -221,6 +290,55 @@ fn same_local_axis(
     selected.ok_or_else(|| invalid(format!("{family} has no {label} placement")))
 }
 
+fn same_logical_range(
+    layout: &LocalModelLayout,
+    targets: impl IntoIterator<Item = String>,
+    global_units: usize,
+    family: &str,
+    label: &str,
+) -> Result<Option<Range<usize>>, ParallelPlanError> {
+    let mut selected: Option<Range<usize>> = None;
+    let mut omitted = false;
+    for target in targets {
+        let Some(tensor) = layout.tensor(&target) else {
+            omitted = true;
+            continue;
+        };
+        if tensor.logical_units().is_none() && tensor.logical_range().is_none() {
+            omitted = true;
+            continue;
+        }
+        if tensor.logical_units() != Some(global_units) {
+            return Err(invalid(format!(
+                "{family} {label} tensor {target} has semantic width {:?}, expected {global_units}",
+                tensor.logical_units()
+            )));
+        }
+        let range = tensor.logical_range().cloned().ok_or_else(|| {
+            invalid(format!(
+                "{family} {label} tensor {target} has no exact semantic range"
+            ))
+        })?;
+        if range.is_empty() || range.end > global_units {
+            return Err(invalid(format!(
+                "{family} {label} tensor {target} has invalid semantic range {range:?}"
+            )));
+        }
+        if selected.as_ref().is_some_and(|current| current != &range) {
+            return Err(invalid(format!(
+                "{family} {label} placement differs between execution units"
+            )));
+        }
+        selected = Some(range);
+    }
+    if omitted && selected.is_some() {
+        return Err(invalid(format!(
+            "{family} {label} placement mixes exact and shape-only semantic ranges"
+        )));
+    }
+    Ok(selected)
+}
+
 /// Derives complete V3 rank-local geometry exclusively from a resolved plan.
 pub fn v3_local_geometry(
     args: &V3Args,
@@ -266,23 +384,53 @@ pub fn v3_local_geometry(
             i32::try_from(width).map_err(|_| invalid("local V3 dense width exceeds i32"))?;
         let _ = first;
     }
-    let sparse_layers = (0..total).filter(|layer| {
-        *layer >= target || args.layer_schedule.get(*layer) == Some(&LayerPolicy::SparseMoe)
-    });
-    if sparse_layers.clone().next().is_some() {
-        let fused = same_local_axis(
-            layout,
-            sparse_layers.map(|layer| format!("model.layers.{layer}.mlp.experts.gate_up_proj")),
-            1,
-            "V3",
-            "expert intermediate",
-        )?;
-        if fused % 2 != 0 {
-            return Err(invalid("local V3 packed expert width is not even"));
-        }
-        local.moe_intermediate_size =
-            i32::try_from(fused / 2).map_err(|_| invalid("local V3 expert width exceeds i32"))?;
-    }
+    let sparse_layers = (0..total)
+        .filter(|layer| {
+            *layer >= target || args.layer_schedule.get(*layer) == Some(&LayerPolicy::SparseMoe)
+        })
+        .collect::<Vec<_>>();
+    let (routed_expert_intermediate_range, shared_expert_intermediate_range) =
+        if sparse_layers.is_empty() {
+            (None, None)
+        } else {
+            let fused = same_local_axis(
+                layout,
+                sparse_layers
+                    .iter()
+                    .map(|layer| format!("model.layers.{layer}.mlp.experts.gate_up_proj")),
+                1,
+                "V3",
+                "expert intermediate",
+            )?;
+            if fused % 2 != 0 {
+                return Err(invalid("local V3 packed expert width is not even"));
+            }
+            local.moe_intermediate_size = i32::try_from(fused / 2)
+                .map_err(|_| invalid("local V3 expert width exceeds i32"))?;
+            let global_routed = dim(args.moe_intermediate_size)?;
+            let routed = same_logical_range(
+                layout,
+                sparse_layers
+                    .iter()
+                    .map(|layer| format!("model.layers.{layer}.mlp.experts.gate_up_proj")),
+                global_routed,
+                "V3",
+                "routed expert intermediate",
+            )?;
+            let global_shared = global_routed
+                .checked_mul(dim(args.n_shared_experts)?)
+                .ok_or_else(|| invalid("V3 shared expert width overflowed usize"))?;
+            let shared = same_logical_range(
+                layout,
+                sparse_layers.iter().map(|layer| {
+                    format!("model.layers.{layer}.mlp.shared_experts.gate_proj.weight")
+                }),
+                global_shared,
+                "V3",
+                "shared expert intermediate",
+            )?;
+            (routed, shared)
+        };
     local
         .validate()
         .map_err(|error| invalid(error.to_string()))?;
@@ -293,6 +441,8 @@ pub fn v3_local_geometry(
             .map_err(|error| invalid(format!("invalid local V3 state layout: {error}")))?,
         embedding_range: vocabulary_range(layout, "model.embed_tokens", global_vocabulary, "V3")?,
         output_range: vocabulary_range(layout, "lm_head", global_vocabulary, "V3")?,
+        routed_expert_intermediate_range,
+        shared_expert_intermediate_range,
         architecture_fingerprint: v3_architecture_fingerprint(args),
         args: local,
     };
@@ -309,16 +459,18 @@ pub fn v4_local_geometry(
         .map_err(|error| invalid(error.to_string()))?;
     let total = usize::try_from(args.num_hidden_layers + args.num_nextn_predict_layers)
         .map_err(|_| invalid("V4 total layer count exceeds usize"))?;
-    let roots = (0..total).map(|layer| {
-        if layer < args.num_hidden_layers as usize {
-            format!("layers.{layer}")
-        } else {
-            format!("mtp.{}", layer - args.num_hidden_layers as usize)
-        }
-    });
+    let roots = (0..total)
+        .map(|layer| {
+            if layer < args.num_hidden_layers as usize {
+                format!("layers.{layer}")
+            } else {
+                format!("mtp.{}", layer - args.num_hidden_layers as usize)
+            }
+        })
+        .collect::<Vec<_>>();
     let query_width = same_local_axis(
         layout,
-        roots.clone().map(|root| format!("{root}.attn.wq_b.weight")),
+        roots.iter().map(|root| format!("{root}.attn.wq_b.weight")),
         0,
         "V4",
         "attention heads",
@@ -332,7 +484,7 @@ pub fn v4_local_geometry(
     }
     let output_width = same_local_axis(
         layout,
-        roots.clone().map(|root| format!("{root}.attn.wo_a.weight")),
+        roots.iter().map(|root| format!("{root}.attn.wo_a.weight")),
         0,
         "V4",
         "attention output groups",
@@ -346,7 +498,9 @@ pub fn v4_local_geometry(
     }
     let fused = same_local_axis(
         layout,
-        roots.map(|root| format!("{root}.ffn.switch_mlp.gate_up_proj")),
+        roots
+            .iter()
+            .map(|root| format!("{root}.ffn.switch_mlp.gate_up_proj")),
         1,
         "V4",
         "expert intermediate",
@@ -361,6 +515,28 @@ pub fn v4_local_geometry(
         .map_err(|_| invalid("local V4 output group count exceeds i32"))?;
     local.moe_intermediate_size =
         i32::try_from(fused / 2).map_err(|_| invalid("local V4 expert width exceeds i32"))?;
+    let global_routed = dim(args.moe_intermediate_size)?;
+    let routed_expert_intermediate_range = same_logical_range(
+        layout,
+        roots
+            .iter()
+            .map(|root| format!("{root}.ffn.switch_mlp.gate_up_proj")),
+        global_routed,
+        "V4",
+        "routed expert intermediate",
+    )?;
+    let global_shared = global_routed
+        .checked_mul(dim(args.n_shared_experts)?)
+        .ok_or_else(|| invalid("V4 shared expert width overflowed usize"))?;
+    let shared_expert_intermediate_range = same_logical_range(
+        layout,
+        roots
+            .iter()
+            .map(|root| format!("{root}.ffn.shared_experts.w1.weight")),
+        global_shared,
+        "V4",
+        "shared expert intermediate",
+    )?;
     local
         .validate()
         .map_err(|error| invalid(error.to_string()))?;
@@ -371,11 +547,568 @@ pub fn v4_local_geometry(
             .map_err(|error| invalid(format!("invalid local V4 state layout: {error}")))?,
         embedding_range: vocabulary_range(layout, "embed", global_vocabulary, "V4")?,
         output_range: vocabulary_range(layout, "head", global_vocabulary, "V4")?,
+        routed_expert_intermediate_range,
+        shared_expert_intermediate_range,
         architecture_fingerprint: v4_architecture_fingerprint(args),
         args: local,
     };
     geometry.validate_for(args)?;
     Ok(geometry)
+}
+
+/// One compact routed bank owned by a DeepSeek PP×EP rank.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct PartitionExpertBankOwnership {
+    global_unit: usize,
+    global_expert: usize,
+    owner_local_expert: usize,
+    intermediate_range: Range<usize>,
+}
+
+impl PartitionExpertBankOwnership {
+    /// Architecture-global target unit containing this bank.
+    pub const fn global_unit(&self) -> usize {
+        self.global_unit
+    }
+
+    /// Checkpoint-global expert identity used as the addressable bank key.
+    pub const fn global_expert(&self) -> usize {
+        self.global_expert
+    }
+
+    /// Compact owner-local execution identity used inside the realized bank.
+    pub const fn owner_local_expert(&self) -> usize {
+        self.owner_local_expert
+    }
+
+    /// Exact checkpoint-global TP intermediate-channel slice.
+    pub fn intermediate_range(&self) -> Range<usize> {
+        self.intermediate_range.clone()
+    }
+
+    /// Stable addressable cache identity; the local ordinal is never used here.
+    pub const fn bank_key(&self) -> eredu_runtime::ParameterBankKey {
+        eredu_runtime::ParameterBankKey::new(self.global_unit, self.global_expert)
+    }
+}
+
+/// Exact prediction-free V3 geometry owned by one TP×PP×EP rank.
+#[derive(Debug, Clone)]
+pub struct V3PartitionLocalGeometry {
+    target_units: Range<usize>,
+    local: V3LocalGeometry,
+    static_roles: Vec<String>,
+    expert_realization: crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>,
+    expert_banks: Vec<PartitionExpertBankOwnership>,
+}
+
+/// Exact prediction-free V4 geometry owned by one TP×PP×EP rank.
+#[derive(Debug, Clone)]
+pub struct V4PartitionLocalGeometry {
+    target_units: Range<usize>,
+    local: V4LocalGeometry,
+    static_roles: Vec<String>,
+    expert_realization: crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>,
+    expert_banks: Vec<PartitionExpertBankOwnership>,
+}
+
+macro_rules! partition_local_geometry_accessors {
+    ($ty:ty, $local:ty) => {
+        impl $ty {
+            /// Architecture-global target units owned by this pipeline rank.
+            pub fn target_units(&self) -> Range<usize> {
+                self.target_units.clone()
+            }
+
+            /// Complete planner-derived TP-local geometry before PP slicing.
+            pub const fn local_geometry(&self) -> &$local {
+                &self.local
+            }
+
+            /// Exact local compressed/pooling state slice for the owned target units.
+            pub fn local_state_layout(&self) -> Result<StateLayout, ParallelPlanError> {
+                self.local
+                    .state_layout()
+                    .slice(self.target_units.clone())
+                    .map_err(|error| invalid(error.to_string()))
+            }
+
+            /// Static roles placed on this input/output owner.
+            pub fn static_roles(&self) -> &[String] {
+                &self.static_roles
+            }
+
+            /// Immutable selected routed-expert authority.
+            pub const fn expert_realization(
+                &self,
+            ) -> &crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec> {
+                &self.expert_realization
+            }
+
+            /// Compact banks at the PP-layer ∩ EP-expert ∩ TP-channel intersection.
+            pub fn expert_banks(&self) -> &[PartitionExpertBankOwnership] {
+                &self.expert_banks
+            }
+        }
+    };
+}
+
+partition_local_geometry_accessors!(V3PartitionLocalGeometry, V3LocalGeometry);
+partition_local_geometry_accessors!(V4PartitionLocalGeometry, V4LocalGeometry);
+
+/// Validated architecture-owned V3 partition handoff.
+#[derive(Debug, Clone)]
+pub struct V3PartitionLocalFoundation {
+    geometry: V3PartitionLocalGeometry,
+    resident_parameter_targets: Vec<String>,
+    routed_parameter_targets: Vec<String>,
+}
+
+/// Validated architecture-owned V4 partition handoff.
+#[derive(Debug, Clone)]
+pub struct V4PartitionLocalFoundation {
+    geometry: V4PartitionLocalGeometry,
+    resident_parameter_targets: Vec<String>,
+    routed_parameter_targets: Vec<String>,
+}
+
+macro_rules! partition_local_foundation_accessors {
+    ($ty:ty, $geometry:ty) => {
+        impl $ty {
+            /// Exact family-local construction and state geometry.
+            pub const fn geometry(&self) -> &$geometry {
+                &self.geometry
+            }
+
+            /// Selected static, attention, router, shared-expert, and other resident targets.
+            pub fn resident_parameter_targets(&self) -> &[String] {
+                &self.resident_parameter_targets
+            }
+
+            /// Compact addressable expert recipes for packed source-bank targets.
+            pub fn routed_parameter_targets(&self) -> &[String] {
+                &self.routed_parameter_targets
+            }
+        }
+    };
+}
+
+partition_local_foundation_accessors!(V3PartitionLocalFoundation, V3PartitionLocalGeometry);
+partition_local_foundation_accessors!(V4PartitionLocalFoundation, V4PartitionLocalGeometry);
+
+fn require_prediction_free_v3(args: &V3Args) -> Result<(), ParallelPlanError> {
+    if args.num_nextn_predict_layers != 0 {
+        return Err(invalid(
+            "partition-local DeepSeek-V3 does not admit embedded prediction units",
+        ));
+    }
+    if !args.has_sparse_moe_layers() {
+        return Err(invalid(
+            "partition-local DeepSeek-V3 routed execution requires sparse target units",
+        ));
+    }
+    Ok(())
+}
+
+fn require_prediction_free_v4(args: &V4Args) -> Result<(), ParallelPlanError> {
+    if args.num_nextn_predict_layers != 0 || args.dspark.is_some() {
+        return Err(invalid(
+            "partition-local DeepSeek-V4 does not admit embedded prediction units",
+        ));
+    }
+    Ok(())
+}
+
+fn target_range(
+    group_ranges: impl IntoIterator<Item = (impl AsRef<str>, Range<usize>)>,
+    target_count: usize,
+) -> Result<Range<usize>, ParallelPlanError> {
+    let mut target = None;
+    for (group, range) in group_ranges {
+        if group.as_ref() != crate::decoder::TARGET_EXECUTION_GROUP {
+            return Err(invalid(format!(
+                "prediction-free DeepSeek partition contains unsupported group {:?}",
+                group.as_ref()
+            )));
+        }
+        if range.is_empty() || range.end > target_count || target.replace(range).is_some() {
+            return Err(invalid("invalid or duplicate DeepSeek target range"));
+        }
+    }
+    target.ok_or_else(|| invalid("DeepSeek partition has no target range"))
+}
+
+fn validate_expert_topology(
+    global_experts: usize,
+    topology: eredu_core::ParallelRankTopology,
+    realization: &crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>,
+) -> Result<Vec<usize>, ParallelPlanError> {
+    let expected = eredu_core::balanced_contiguous_range(
+        global_experts,
+        topology.expert_parallel_size(),
+        topology.expert_parallel_rank(),
+        false,
+    )
+    .map_err(|error| invalid(error.to_string()))?
+    .collect::<Vec<_>>();
+    let expected_collective = topology
+        .subgroup(eredu_core::ParallelAxis::Expert)
+        .map_err(|error| invalid(error.to_string()))?;
+    let selected_collective = realization
+        .collective_group(eredu_core::CollectiveGroupId::new(0))
+        .map_err(|error| invalid(error.to_string()))?;
+    if realization.global_expert_count() != global_experts
+        || realization.expert_parallel_size() != topology.expert_parallel_size()
+        || realization.expert_parallel_rank() != topology.expert_parallel_rank()
+        || realization.local_global_group_indices() != expected
+        || selected_collective.members() != expected_collective.global_ranks()
+        || selected_collective.local_rank() != expected_collective.rank()
+    {
+        return Err(invalid(
+            "selected DeepSeek expert ownership differs from the Cartesian rank",
+        ));
+    }
+    Ok(expected)
+}
+
+fn compact_banks(
+    target_units: Range<usize>,
+    routed_units: impl Fn(usize) -> bool,
+    global_experts: &[usize],
+    intermediate_range: Range<usize>,
+) -> Vec<PartitionExpertBankOwnership> {
+    target_units
+        .filter(|unit| routed_units(*unit))
+        .flat_map(|global_unit| {
+            global_experts.iter().copied().enumerate().map({
+                let intermediate_range = intermediate_range.clone();
+                move |(owner_local_expert, global_expert)| PartitionExpertBankOwnership {
+                    global_unit,
+                    global_expert,
+                    owner_local_expert,
+                    intermediate_range: intermediate_range.clone(),
+                }
+            })
+        })
+        .collect()
+}
+
+fn expected_static_roles(
+    target_units: &Range<usize>,
+    target_count: usize,
+    ownership: &PartitionOwnership,
+    last_roles: &[&str],
+) -> Result<Vec<String>, ParallelPlanError> {
+    if ownership.owns_input() != (target_units.start == 0)
+        || ownership.owns_output() != (target_units.end == target_count)
+    {
+        return Err(invalid(
+            "DeepSeek input/output ownership differs from the target range",
+        ));
+    }
+    let mut roles = Vec::new();
+    if ownership.owns_input() {
+        roles.push("embedding".to_owned());
+    }
+    if ownership.owns_output() {
+        roles.extend(last_roles.iter().map(|role| (*role).to_owned()));
+    }
+    if ownership.static_roles() != roles {
+        return Err(invalid(format!(
+            "DeepSeek static roles {:?} differ from {roles:?}",
+            ownership.static_roles()
+        )));
+    }
+    Ok(roles)
+}
+
+/// Derives exact prediction-free V3 TP×PP×EP geometry from routed-expert authority.
+pub fn v3_partition_local_geometry(
+    args: &V3Args,
+    layout: &LocalModelLayout,
+    group_ranges: impl IntoIterator<Item = (impl AsRef<str>, Range<usize>)>,
+    ownership: &PartitionOwnership,
+    topology: eredu_core::ParallelRankTopology,
+    realization: &crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>,
+) -> Result<V3PartitionLocalGeometry, ParallelPlanError> {
+    require_prediction_free_v3(args)?;
+    let target_count = usize::try_from(args.num_hidden_layers)
+        .map_err(|_| invalid("V3 target count exceeds usize"))?;
+    let target_units = target_range(group_ranges, target_count)?;
+    let local = v3_local_geometry(args, layout)?;
+    let global_experts = usize::try_from(args.n_routed_experts)
+        .map_err(|_| invalid("V3 expert count exceeds usize"))?;
+    let global_experts = validate_expert_topology(global_experts, topology, realization)?;
+    let routed_units = (0..target_count)
+        .filter(|unit| args.layer_schedule.get(*unit) == Some(&LayerPolicy::SparseMoe))
+        .collect::<Vec<_>>();
+    if realization.unit_specs().len() != routed_units.len() {
+        return Err(invalid("selected V3 expert unit schedule drifted"));
+    }
+    let local_expert_count = i32::try_from(global_experts.len())
+        .map_err(|_| invalid("V3 local expert count exceeds i32"))?;
+    for unit in &routed_units {
+        let expected = v3::localized_expert_bank_spec(
+            args,
+            *unit,
+            local_expert_count,
+            local.args().moe_intermediate_size,
+        )
+        .map_err(|error| invalid(error.to_string()))?;
+        if realization.unit_spec(crate::decoder::TARGET_EXECUTION_GROUP, *unit) != Some(&expected) {
+            return Err(invalid(format!(
+                "selected V3 expert bank geometry drifted at target unit {unit}"
+            )));
+        }
+    }
+    let intermediate_range = local
+        .routed_expert_intermediate_range()
+        .ok_or_else(|| invalid("V3 routed target has no TP expert range"))?;
+    let static_roles =
+        expected_static_roles(&target_units, target_count, ownership, &["norm", "output"])?;
+    let expert_banks = compact_banks(
+        target_units.clone(),
+        |unit| args.layer_schedule.get(unit) == Some(&LayerPolicy::SparseMoe),
+        &global_experts,
+        intermediate_range,
+    );
+    Ok(V3PartitionLocalGeometry {
+        target_units,
+        local,
+        static_roles,
+        expert_realization: realization.clone(),
+        expert_banks,
+    })
+}
+
+/// Derives exact prediction-free V4 TP×PP×EP geometry from routed-expert authority.
+pub fn v4_partition_local_geometry(
+    args: &V4Args,
+    layout: &LocalModelLayout,
+    group_ranges: impl IntoIterator<Item = (impl AsRef<str>, Range<usize>)>,
+    ownership: &PartitionOwnership,
+    topology: eredu_core::ParallelRankTopology,
+    realization: &crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>,
+) -> Result<V4PartitionLocalGeometry, ParallelPlanError> {
+    require_prediction_free_v4(args)?;
+    let target_count = usize::try_from(args.num_hidden_layers)
+        .map_err(|_| invalid("V4 target count exceeds usize"))?;
+    let target_units = target_range(group_ranges, target_count)?;
+    let local = v4_local_geometry(args, layout)?;
+    let global_experts = usize::try_from(args.n_routed_experts)
+        .map_err(|_| invalid("V4 expert count exceeds usize"))?;
+    let global_experts = validate_expert_topology(global_experts, topology, realization)?;
+    if realization.unit_specs().len() != target_count {
+        return Err(invalid("selected V4 expert unit schedule drifted"));
+    }
+    let local_expert_count = i32::try_from(global_experts.len())
+        .map_err(|_| invalid("V4 local expert count exceeds i32"))?;
+    for unit in 0..target_count {
+        let expected = v4::localized_expert_bank_spec(
+            args,
+            unit,
+            local_expert_count,
+            local.args().moe_intermediate_size,
+        )
+        .map_err(|error| invalid(error.to_string()))?;
+        if realization.unit_spec(crate::decoder::TARGET_EXECUTION_GROUP, unit) != Some(&expected) {
+            return Err(invalid(format!(
+                "selected V4 expert bank geometry drifted at target unit {unit}"
+            )));
+        }
+    }
+    let intermediate_range = local
+        .routed_expert_intermediate_range()
+        .ok_or_else(|| invalid("V4 routed target has no exact TP expert range"))?;
+    let static_roles = expected_static_roles(
+        &target_units,
+        target_count,
+        ownership,
+        &["norm", "output", "hyper_head"],
+    )?;
+    let expert_banks = compact_banks(
+        target_units.clone(),
+        |_| true,
+        &global_experts,
+        intermediate_range,
+    );
+    Ok(V4PartitionLocalGeometry {
+        target_units,
+        local,
+        static_roles,
+        expert_realization: realization.clone(),
+        expert_banks,
+    })
+}
+
+fn split_parameter_targets(
+    partition: &ArchitecturePartition<impl Sized, impl Sized>,
+    routed: impl Fn(&str) -> bool,
+) -> (Vec<String>, Vec<String>) {
+    let mut resident = Vec::new();
+    let mut routed_targets = Vec::new();
+    for target in partition
+        .parameter_bindings()
+        .iter()
+        .flat_map(|binding| binding.members())
+        .map(|member| member.target())
+    {
+        if routed(target) {
+            routed_targets.push(target.to_owned());
+        } else {
+            resident.push(target.to_owned());
+        }
+    }
+    (resident, routed_targets)
+}
+
+impl V3PartitionLocalFoundation {
+    /// Validates V3 groups, compressed state, boundary roles, and compact-bank selection.
+    pub fn from_partition(
+        args: &V3Args,
+        partition: &ArchitecturePartition<V3PartitionLocalGeometry, v3::TargetBoundarySchema>,
+    ) -> Result<Self, ParallelPlanError> {
+        require_prediction_free_v3(args)?;
+        let geometry = partition.local_geometry();
+        geometry.local.validate_for(args)?;
+        let target_count = usize::try_from(args.num_hidden_layers)
+            .map_err(|_| invalid("V3 target count exceeds usize"))?;
+        if geometry.target_units.is_empty() || geometry.target_units.end > target_count {
+            return Err(invalid("V3 partition-local target range drifted"));
+        }
+        let expected_groups = [(
+            crate::decoder::TARGET_EXECUTION_GROUP,
+            geometry.target_units(),
+        )];
+        validate_partition_common(
+            partition,
+            &expected_groups,
+            &geometry.local_state_layout()?,
+            v3::TargetBoundarySchema::from_args(args),
+        )?;
+        let (resident_parameter_targets, routed_parameter_targets) =
+            split_parameter_targets(partition, |target| {
+                target.contains(".mlp.experts.gate_up_proj")
+                    || target.contains(".mlp.experts.down_proj")
+            });
+        for unit in geometry
+            .target_units()
+            .filter(|unit| args.layer_schedule.get(*unit) == Some(&LayerPolicy::SparseMoe))
+        {
+            let root = format!("model.layers.{unit}.mlp");
+            if !routed_parameter_targets
+                .iter()
+                .any(|target| target.starts_with(&root))
+                || !resident_parameter_targets
+                    .iter()
+                    .any(|target| target.starts_with(&format!("{root}.shared_experts")))
+                || !resident_parameter_targets
+                    .iter()
+                    .any(|target| target.starts_with(&format!("{root}.gate")))
+            {
+                return Err(invalid(format!(
+                    "V3 target unit {unit} does not own routed, shared, and router parameters"
+                )));
+            }
+        }
+        Ok(Self {
+            geometry: geometry.clone(),
+            resident_parameter_targets,
+            routed_parameter_targets,
+        })
+    }
+}
+
+impl V4PartitionLocalFoundation {
+    /// Validates V4 groups, pooled/compressed state, boundary roles, and compact banks.
+    pub fn from_partition(
+        args: &V4Args,
+        partition: &ArchitecturePartition<V4PartitionLocalGeometry, v4::TargetBoundarySchema>,
+    ) -> Result<Self, ParallelPlanError> {
+        require_prediction_free_v4(args)?;
+        let geometry = partition.local_geometry();
+        geometry.local.validate_for(args)?;
+        let target_count = usize::try_from(args.num_hidden_layers)
+            .map_err(|_| invalid("V4 target count exceeds usize"))?;
+        if geometry.target_units.is_empty() || geometry.target_units.end > target_count {
+            return Err(invalid("V4 partition-local target range drifted"));
+        }
+        let expected_groups = [(
+            crate::decoder::TARGET_EXECUTION_GROUP,
+            geometry.target_units(),
+        )];
+        let boundary = v4::TargetBoundarySchema::from_args(args)
+            .map_err(|error| invalid(error.to_string()))?;
+        validate_partition_common(
+            partition,
+            &expected_groups,
+            &geometry.local_state_layout()?,
+            boundary,
+        )?;
+        let (resident_parameter_targets, routed_parameter_targets) =
+            split_parameter_targets(partition, |target| {
+                target.contains(".ffn.switch_mlp.gate_up_proj")
+                    || target.contains(".ffn.switch_mlp.down_proj")
+            });
+        for unit in geometry.target_units() {
+            let root = format!("layers.{unit}.ffn");
+            if !routed_parameter_targets
+                .iter()
+                .any(|target| target.starts_with(&root))
+                || !resident_parameter_targets
+                    .iter()
+                    .any(|target| target.starts_with(&format!("{root}.shared_experts")))
+                || !resident_parameter_targets
+                    .iter()
+                    .any(|target| target.starts_with(&format!("{root}.gate")))
+            {
+                return Err(invalid(format!(
+                    "V4 target unit {unit} does not own routed, shared, and router parameters"
+                )));
+            }
+        }
+        Ok(Self {
+            geometry: geometry.clone(),
+            resident_parameter_targets,
+            routed_parameter_targets,
+        })
+    }
+}
+
+fn validate_partition_common<G, A>(
+    partition: &ArchitecturePartition<G, A>,
+    expected_groups: &[(&str, Range<usize>)],
+    expected_state: &StateLayout,
+    expected_boundary: A,
+) -> Result<(), ParallelPlanError>
+where
+    A: PartialEq,
+{
+    let actual_groups = partition
+        .groups()
+        .iter()
+        .map(|group| (group.group().as_str(), group.global_units()))
+        .collect::<Vec<_>>();
+    if actual_groups != expected_groups {
+        return Err(invalid(
+            "DeepSeek partition groups differ from family-local geometry",
+        ));
+    }
+    let state = partition
+        .state()
+        .ok_or_else(|| invalid("DeepSeek target partition has no selected state"))?;
+    if state.global_layer_offset() != expected_groups[0].1.start || state.layout() != expected_state
+    {
+        return Err(invalid(
+            "DeepSeek partition state differs from its global target range",
+        ));
+    }
+    if partition.boundary_schema() != &expected_boundary {
+        return Err(invalid(
+            "DeepSeek partition boundary differs from the role-exact target schema",
+        ));
+    }
+    Ok(())
 }
 
 /// Declares pinned V3 embedding, normalization, and vocabulary placement.

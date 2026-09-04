@@ -101,6 +101,17 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMoe<B> 
         shared_intermediate: i32,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
+        let spec = expert_bank_spec_with_width(args, layer, routed_intermediate)?;
+        Self::new_with_spec(args, layer, spec, shared_intermediate, context)
+    }
+
+    fn new_with_spec(
+        args: &ModelArgs,
+        layer: usize,
+        spec: GroupedGatedProductSpec,
+        shared_intermediate: i32,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
         let prefix = format!("model.layers.{layer}.mlp");
         let gate_name = format!("{prefix}.gate.weight");
         let mut routing = TopKGroupSelectionSpec::new(
@@ -127,10 +138,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMoe<B> 
                 .map_err(Error::backend)?,
         )?;
         let router = B::top_k_group_selector(selector, context)?;
-        let experts = B::grouped_gated_product(
-            expert_bank_spec_with_width(args, layer, routed_intermediate)?,
-            context,
-        )?;
+        let experts = B::grouped_gated_product(spec, context)?;
         Ok(Self {
             layer,
             router,
@@ -300,6 +308,26 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> FeedForward<B
         shared_intermediate: i32,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
+        Self::new_with_geometry_and_routed_spec(
+            args,
+            layer,
+            dense_intermediate,
+            routed_intermediate,
+            shared_intermediate,
+            None,
+            context,
+        )
+    }
+
+    pub(crate) fn new_with_geometry_and_routed_spec(
+        args: &ModelArgs,
+        layer: usize,
+        dense_intermediate: i32,
+        routed_intermediate: i32,
+        shared_intermediate: i32,
+        routed_spec: Option<GroupedGatedProductSpec>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
         let policy = args
             .layer_policy(layer)
             .ok_or_else(|| Error::backend(format!("Kimi Linear has no layer {layer}")))?;
@@ -308,13 +336,18 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> FeedForward<B
             FeedForwardPolicy::Dense => {
                 DenseSwiGlu::new(args, &prefix, dense_intermediate, context).map(Self::Dense)
             }
-            FeedForwardPolicy::SparseMoe => SparseMoe::new(
-                args,
-                layer,
-                routed_intermediate,
-                shared_intermediate,
-                context,
-            )
+            FeedForwardPolicy::SparseMoe => match routed_spec {
+                Some(spec) => {
+                    SparseMoe::new_with_spec(args, layer, spec, shared_intermediate, context)
+                }
+                None => SparseMoe::new(
+                    args,
+                    layer,
+                    routed_intermediate,
+                    shared_intermediate,
+                    context,
+                ),
+            }
             .map(Self::Sparse),
         }
     }

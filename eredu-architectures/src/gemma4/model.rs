@@ -24,7 +24,10 @@ use super::{
     VisionIngressPartPlan, VisionInput, VisionLayer, VisionState, VisionStatic,
 };
 use crate::{
-    composite_execution::{CompositeArchitecture, PreparedCompositeInput},
+    composite_execution::{
+        CompositeArchitecture, ExternalPredictionCaptureRequest, ExternalPredictionTargetCapture,
+        ExternalPredictionTargetOperation, PreparedCompositeInput,
+    },
     media_plan::Gemma4InputPartPlan,
 };
 
@@ -34,6 +37,24 @@ pub const VISION_EXECUTION_GROUP: &str = "vision";
 pub const AUDIO_EXECUTION_GROUP: &str = "audio";
 /// Stable execution-group identity for Gemma 4 text decoding.
 pub const TEXT_EXECUTION_GROUP: &str = "text_decoder";
+
+/// Proves one external assistant against a target and returns its exact capture request.
+pub fn external_assistant_capture_request(
+    target: &FamilyConfig,
+    assistant: &super::assistant::AssistantConfig,
+) -> Result<ExternalPredictionCaptureRequest, String> {
+    let _compatibility = assistant
+        .prove_compatibility(&target.text)
+        .map_err(|error| error.to_string())?;
+    let last = target
+        .text
+        .num_hidden_layers()
+        .checked_sub(1)
+        .ok_or_else(|| "Gemma 4 assistant target has no decoder layer".to_owned())?;
+    Ok(ExternalPredictionCaptureRequest::Gemma4SharedAttention {
+        final_hidden_path: format!("model.language_model.layers.{last}.output"),
+    })
+}
 
 fn text_static_parameter_ownership(
     args: &super::ModelArgs,
@@ -655,6 +676,79 @@ where
         crate::media_plan::admit_gemma4_input(config, input, inspector)
     }
 
+    fn should_execute_prepared_group(
+        &self,
+        group: usize,
+        input: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
+    ) -> bool {
+        match group {
+            0 => input
+                .admitted()
+                .parts()
+                .iter()
+                .any(|part| matches!(part, Gemma4InputPartPlan::Vision { .. })),
+            1 => input
+                .admitted()
+                .parts()
+                .iter()
+                .any(|part| matches!(part, Gemma4InputPartPlan::Audio { .. })),
+            2 => true,
+            _ => false,
+        }
+    }
+
+    fn external_prediction_capture_paths(
+        request: &ExternalPredictionCaptureRequest,
+    ) -> Result<Option<Vec<String>>, Self::Error> {
+        match request {
+            ExternalPredictionCaptureRequest::Gemma4SharedAttention { final_hidden_path } => {
+                Ok(Some(vec![final_hidden_path.clone()]))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn external_prediction_capture(
+        request: &ExternalPredictionCaptureRequest,
+        forward: &Self::ForwardContext,
+        observed: Vec<B::Tensor>,
+    ) -> Result<Option<ExternalPredictionTargetCapture<B::Tensor>>, Self::Error> {
+        if !matches!(
+            request,
+            ExternalPredictionCaptureRequest::Gemma4SharedAttention { .. }
+        ) {
+            return Ok(None);
+        }
+        let [hidden]: [B::Tensor; 1] = observed.try_into().map_err(|observed: Vec<_>| {
+            Error::backend(format!(
+                "Gemma 4 assistant capture expected one final hidden state, received {}",
+                observed.len()
+            ))
+        })?;
+        let shared_kv = forward
+            .shared_attention_states()
+            .iter()
+            .map(|(policy, (keys, values))| (*policy, keys.clone(), values.clone()))
+            .collect();
+        Ok(Some(ExternalPredictionTargetCapture::Gemma4 {
+            hidden,
+            shared_kv,
+        }))
+    }
+
+    fn external_prediction_target_operation(
+        &mut self,
+        operation: ExternalPredictionTargetOperation<'_, B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Option<B::Tensor>, Self::Error> {
+        match operation {
+            ExternalPredictionTargetOperation::TokenEmbeddings(tokens) => {
+                self.token_embeddings(tokens, context).map(Some)
+            }
+            ExternalPredictionTargetOperation::ProjectLogits(_) => Ok(None),
+        }
+    }
+
     fn begin_composite_forward<'a>(
         &mut self,
         input: PreparedCompositeInput<'a, B::Tensor, Self::InputPartPlan>,
@@ -673,6 +767,33 @@ where
                 mask: None,
             },
             state,
+            context,
+        )
+    }
+
+    fn begin_composite_forward_parallel<'a>(
+        &mut self,
+        input: PreparedCompositeInput<'a, B::Tensor, Self::InputPartPlan>,
+        state: &mut S,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error>
+    where
+        B: eredu_nn::TensorParallelGroupedNeuralBackend,
+    {
+        let prepared = prepare_composite_ingress::<B>(input, context)?;
+        let decoder_parts = prepared.decoder_parts();
+        <Self as ParallelLayeredArchitecture<B, S>>::begin_forward_parallel(
+            self,
+            ModelInput {
+                parts: &decoder_parts,
+                vision: prepared.vision_input(),
+                audio: prepared.audio_input(),
+                per_layer_tokens: None,
+                mask: None,
+            },
+            state,
+            parallel,
             context,
         )
     }
@@ -809,6 +930,22 @@ impl TextBoundarySchema {
                 .then(|| (args.num_hidden_layers() as i32, geometry.per_layer_width())),
         }
     }
+
+    /// Derives the same wire schema from exact TP/PP-local construction geometry.
+    pub fn from_partition_args(
+        args: &super::ModelArgs,
+        geometry: &super::PartitionLocalGeometry,
+    ) -> Self {
+        Self {
+            hidden_size: args.hidden_size,
+            per_layer_geometry: (args.hidden_size_per_layer_input > 0).then(|| {
+                (
+                    args.num_hidden_layers() as i32,
+                    geometry.per_layer_range().end - geometry.per_layer_range().start,
+                )
+            }),
+        }
+    }
 }
 
 impl eredu_runtime::ArchitectureBoundary for TextBoundarySchema {
@@ -854,7 +991,10 @@ impl eredu_runtime::ArchitectureBoundary for TextBoundarySchema {
     fn encode<T>(
         &self,
         boundary: TextBoundary<T>,
-    ) -> Result<Vec<T>, eredu_runtime::ArchitectureBoundaryError> {
+    ) -> Result<
+        Vec<eredu_runtime::ArchitectureBoundaryValue<T>>,
+        eredu_runtime::ArchitectureBoundaryError,
+    > {
         let actual = usize::from(boundary.per_layer_input.is_some());
         let expected = usize::from(self.per_layer_geometry.is_some());
         if actual != expected {
@@ -864,7 +1004,11 @@ impl eredu_runtime::ArchitectureBoundary for TextBoundarySchema {
                 actual,
             });
         }
-        Ok(boundary.per_layer_input.into_iter().collect())
+        boundary
+            .per_layer_input
+            .into_iter()
+            .map(|tensor| eredu_runtime::ArchitectureBoundaryValue::new("per_layer_input", tensor))
+            .collect()
     }
 }
 
@@ -886,6 +1030,7 @@ pub struct LayeredModel<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBac
     args: FamilyConfig,
     static_modules: StaticModules<B>,
     parallel_geometry: Option<LocalGeometry>,
+    partition_state_offset: usize,
 }
 
 impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
@@ -1206,7 +1351,66 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
                 audio_projection,
             },
             parallel_geometry,
+            partition_state_offset: 0,
         })
+    }
+
+    /// Retains the architecture-global ordinal of this pipeline partition's first state row.
+    pub(crate) fn with_partition_state_offset(mut self, offset: usize) -> Result<Self, Error> {
+        if offset >= self.args.text.num_hidden_layers() {
+            return Err(Error::backend(
+                "Gemma 4 partition state offset is outside the decoder",
+            ));
+        }
+        self.partition_state_offset = offset;
+        Ok(self)
+    }
+
+    fn local_state_ordinal(&self, global: usize) -> Result<usize, Error> {
+        global
+            .checked_sub(self.partition_state_offset)
+            .ok_or_else(|| Error::backend("Gemma 4 unit precedes the partition state offset"))
+    }
+
+    fn validate_partition_state<S: LayerRuntimeState<B>>(&self, state: &S) -> Result<(), Error> {
+        let complete = self.state_layout_impl()?;
+        let end = self
+            .partition_state_offset
+            .checked_add(state.layout().len())
+            .ok_or_else(|| Error::backend("Gemma 4 partition state interval overflow"))?;
+        let expected = complete
+            .slice(self.partition_state_offset..end)
+            .map_err(Error::backend)?;
+        if state.layout() != &expected {
+            return Err(Error::backend("Gemma 4 rank-local state layout mismatch"));
+        }
+        Ok(())
+    }
+
+    fn partition_position_offset<S: LayerRuntimeState<B>>(
+        &self,
+        state: &mut S,
+    ) -> Result<i32, Error>
+    where
+        S::LayerState: AttentionCache<B::Tensor>,
+    {
+        let mut position_offset = 0;
+        for (local, policy) in self
+            .args
+            .text
+            .layer_schedule
+            .iter()
+            .skip(self.partition_state_offset)
+            .take(state.layout().len())
+            .enumerate()
+        {
+            if policy.key_value.owns_state() {
+                position_offset = position_offset.max(AttentionCache::<B::Tensor>::offset(
+                    state.layer(local).map_err(Error::backend)?,
+                ));
+            }
+        }
+        Ok(position_offset)
     }
 
     /// Applies the target's ordinary scaled token embedding operation.
@@ -1438,7 +1642,9 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         {
             if policy.key_value.owns_state() {
                 position_offset = position_offset.max(AttentionCache::<B::Tensor>::offset(
-                    state.layer(layer).map_err(Error::backend)?,
+                    state
+                        .layer(layer - first_state_ordinal)
+                        .map_err(Error::backend)?,
                 ));
             }
         }
@@ -1489,7 +1695,9 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         {
             if policy.key_value.owns_state() {
                 position_offset = position_offset.max(AttentionCache::<B::Tensor>::offset(
-                    state.layer(layer).map_err(Error::backend)?,
+                    state
+                        .layer(layer - first_state_ordinal)
+                        .map_err(Error::backend)?,
                 ));
             }
         }
@@ -2139,7 +2347,9 @@ where
             0 => eredu_runtime::ArchitectureGroupTransport {
                 placement: eredu_runtime::ArchitectureGroupPlacement::Pipeline,
                 kind: eredu_runtime::ArchitectureGroupKind::VisionEncoder,
-                first_owner_static_roles: vec!["vision".into(), "vision_projection".into()],
+                first_owner_static_roles: self.args.vision.as_ref().map_or_else(Vec::new, |_| {
+                    vec!["vision".into(), "vision_projection".into()]
+                }),
                 last_owner_static_roles: Vec::new(),
                 merge_destination: eredu_runtime::ArchitectureMergeDestination::FirstPipelineOwner,
                 parallel_subgroup: Some(eredu_runtime::ArchitectureParallelSubgroup::TensorSharded),
@@ -2148,7 +2358,9 @@ where
             1 => eredu_runtime::ArchitectureGroupTransport {
                 placement: eredu_runtime::ArchitectureGroupPlacement::Pipeline,
                 kind: eredu_runtime::ArchitectureGroupKind::AudioEncoder,
-                first_owner_static_roles: vec!["audio".into(), "audio_projection".into()],
+                first_owner_static_roles: self.args.audio.as_ref().map_or_else(Vec::new, |_| {
+                    vec!["audio".into(), "audio_projection".into()]
+                }),
                 last_owner_static_roles: Vec::new(),
                 merge_destination: eredu_runtime::ArchitectureMergeDestination::FirstPipelineOwner,
                 parallel_subgroup: Some(eredu_runtime::ArchitectureParallelSubgroup::TensorSharded),
@@ -2268,6 +2480,14 @@ where
         }
     }
 
+    fn state_ordinal(&self, group: usize, index: usize, ordinal: usize) -> usize {
+        if group == 2 {
+            index
+        } else {
+            ordinal
+        }
+    }
+
     fn static_modules(&self) -> &Self::StaticModules {
         &self.static_modules
     }
@@ -2319,9 +2539,7 @@ where
         state: &mut S,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
-        if state.layout() != &state_layout(&self.args.text).map_err(Error::backend)? {
-            return Err(Error::backend("Gemma 4 runtime state layout mismatch"));
-        }
+        self.validate_partition_state(state)?;
         let parts = self.prepare_parts(input.parts, context)?;
         let (vision_initial, vision_state) = match input.vision {
             Some(vision) => {
@@ -2363,14 +2581,7 @@ where
                     .err()
                     .unwrap_or_else(|| Error::backend("empty Gemma input"))
             })?;
-        let mut position_offset = 0;
-        for (layer, policy) in self.args.text.layer_schedule.iter().enumerate() {
-            if policy.key_value.owns_state() {
-                position_offset = position_offset.max(AttentionCache::<B::Tensor>::offset(
-                    state.layer(layer).map_err(Error::backend)?,
-                ));
-            }
-        }
+        let position_offset = self.partition_position_offset(state)?;
         Ok(LayeredForwardState {
             hidden,
             context: ForwardContext {
@@ -2506,7 +2717,11 @@ where
                     BlockInput {
                         hidden,
                         mask: forward.mask.as_ref().or(generated_mask.as_ref()),
-                        cache: Some(state.layer(index).map_err(Error::backend)?),
+                        cache: Some(
+                            state
+                                .layer(self.local_state_ordinal(index)?)
+                                .map_err(Error::backend)?,
+                        ),
                         shared: &mut forward.shared,
                         per_layer_input: per_layer_input.as_ref(),
                         rotary_position: Some(RotaryPosition::Offset(forward.position_offset)),
@@ -2630,14 +2845,10 @@ where
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
-        let expected = self
-            .parallel_geometry
+        self.parallel_geometry
             .as_ref()
-            .ok_or_else(|| Error::backend("Gemma 4 model was not built with local geometry"))?
-            .state_layout();
-        if state.layout() != expected {
-            return Err(Error::backend("Gemma 4 rank-local state layout mismatch"));
-        }
+            .ok_or_else(|| Error::backend("Gemma 4 model was not built with local geometry"))?;
+        self.validate_partition_state(state)?;
         let parts = self.prepare_parts_parallel(input.parts, parallel, context)?;
         let (vision_initial, vision_state) = match input.vision {
             Some(vision) => {
@@ -2679,14 +2890,7 @@ where
                     .err()
                     .unwrap_or_else(|| Error::backend("empty Gemma input"))
             })?;
-        let mut position_offset = 0;
-        for (layer, policy) in self.args.text.layer_schedule.iter().enumerate() {
-            if policy.key_value.owns_state() {
-                position_offset = position_offset.max(AttentionCache::<B::Tensor>::offset(
-                    state.layer(layer).map_err(Error::backend)?,
-                ));
-            }
-        }
+        let position_offset = self.partition_position_offset(state)?;
         Ok(LayeredForwardState {
             hidden,
             context: ForwardContext {

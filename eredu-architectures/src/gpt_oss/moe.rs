@@ -134,6 +134,51 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> RoutedMlp<B> 
         })
     }
 
+    /// Builds a partition-local bank while retaining global SelectedSoftmax routing.
+    pub fn new_partitioned(
+        global: &ModelArgs,
+        local: &ModelArgs,
+        layer: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        let prefix = format!("{}.layers.{layer}.mlp", global.parameter_root);
+        let router_weight = format!("{prefix}.router.weight");
+        let router_bias = format!("{prefix}.router.bias");
+        let routing = TopKGroupSelectionSpec::new(
+            global.num_local_experts,
+            global.num_experts_per_tok,
+            GroupScoring::SelectedSoftmax,
+            false,
+        )?;
+        let selector = TopKGroupSelectorSpec::new(
+            global.hidden_size,
+            ParameterSpec::trainable(&router_weight).map_err(Error::backend)?,
+            crate::linear_format::standard_linear_format(
+                &router_weight,
+                global
+                    .checkpoint_weight_quantization_for(&router_weight)
+                    .into(),
+            )?,
+            routing,
+        )?
+        .with_bias(ParameterSpec::trainable(&router_bias).map_err(Error::backend)?)?;
+        let router = B::top_k_group_selector(selector, context)?;
+        let experts = B::grouped_gated_product(
+            localized_expert_bank_spec(
+                global,
+                layer,
+                local.num_local_experts,
+                local.intermediate_size,
+            )?,
+            context,
+        )?;
+        Ok(Self {
+            layer,
+            router,
+            experts,
+        })
+    }
+
     /// Executes routed experts through a runtime-owned provider.
     pub fn forward_with_provider<P>(
         &mut self,
@@ -290,6 +335,39 @@ pub fn expert_realization_plan<B: GroupedNeuralBackend + eredu_nn::DistributedNe
     }
     crate::ExpertRealizationPlan::balanced(global_experts, topology, unit_specs)
         .map(Some)
+        .map_err(Error::backend)
+}
+
+/// Derives exact TP×EP-local expert geometry before native construction.
+pub fn partition_expert_realization_plan(
+    args: &ModelArgs,
+    layout: &eredu_runtime::LocalModelLayout,
+    topology: eredu_core::ParallelRankTopology,
+) -> Result<crate::ExpertRealizationPlan<GroupedGatedProductSpec>, Error> {
+    let global_experts = usize::try_from(args.num_local_experts).map_err(Error::backend)?;
+    let local_experts = i32::try_from(
+        eredu_core::balanced_contiguous_range(
+            global_experts,
+            topology.expert_parallel_size(),
+            topology.expert_parallel_rank(),
+            false,
+        )
+        .map_err(Error::backend)?
+        .len(),
+    )
+    .map_err(Error::backend)?;
+    let layers = usize::try_from(args.num_hidden_layers).map_err(Error::backend)?;
+    let owner_group =
+        eredu_runtime::ExecutionGroupId::new("text_decoder").map_err(Error::backend)?;
+    let unit_specs = (0..layers)
+        .map(|layer| {
+            let local =
+                super::parallel::local_block_args(args, layer, layout).map_err(Error::backend)?;
+            localized_expert_bank_spec(args, layer, local_experts, local.intermediate_size)
+                .map(|spec| ((owner_group.clone(), layer), spec))
+        })
+        .collect::<Result<std::collections::BTreeMap<_, _>, _>>()?;
+    crate::ExpertRealizationPlan::balanced(global_experts, topology, unit_specs)
         .map_err(Error::backend)
 }
 

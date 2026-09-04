@@ -365,7 +365,7 @@ fn main() -> Result<()> {
 
 fn run_probe(
     backend: &MlxBackend<'static>,
-    session: &mut MlxModelSession<'static>,
+    session: &mut MlxModelSession,
     input_ids: &[u32],
     teacher_forced_ids: Option<&[u32]>,
     decode_steps: usize,
@@ -419,7 +419,7 @@ fn run_probe(
 }
 
 fn copy_logits(
-    session: &MlxModelSession<'static>,
+    session: &MlxModelSession,
     backend: &MlxBackend<'static>,
     output: &eredu_backend_mlx::native::MlxModelOutput,
 ) -> Result<(Vec<f32>, usize)> {

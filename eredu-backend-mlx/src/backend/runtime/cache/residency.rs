@@ -2632,6 +2632,7 @@ impl CacheResidencyManager {
                 state_segments: descriptor.state_segments().to_vec(),
                 sink_tokens: descriptor.sink_tokens(),
                 topology: descriptor.topology().clone(),
+                distributed_commit: descriptor.distributed_commit(),
                 application_namespace: options.application_namespace().map(str::to_owned),
                 blocks: manifest_blocks,
                 state_tensors: manifest_state,
@@ -4157,6 +4158,7 @@ mod tests {
             layer_prefix_offsets: vec![0],
             state_segments: descriptor.state_segments().to_vec(),
             topology: PromptCacheTopology::default(),
+            distributed_commit: None,
             application_namespace: Some(namespace.into()),
             blocks: vec![PromptCacheBlock {
                 global_layer: 0,
@@ -4205,13 +4207,15 @@ mod tests {
 
     #[test]
     fn prompt_cache_topology_preserves_parallel_coordinates_and_rank_identity() {
-        use crate::{backend::DeviceAssignment, native::MlxParallelPlan};
-
-        let topology =
-            MlxParallelPlan::for_rank(5, 2, 2, 2, DeviceAssignment::new(DeviceType::Cpu, 0))
-                .unwrap();
-        let cache_topology =
-            crate::composition::mlx::distributed::topology::prompt_cache_topology(topology);
+        let topology = crate::test_parallel_rank(5, 2, 2, 2);
+        let coordinates = topology.coordinates();
+        let cache_topology = PromptCacheTopology::new(
+            Some((topology.pipeline_parallel_size(), coordinates.pipeline())),
+            Some((topology.tensor_parallel_size(), coordinates.tensor())),
+            Some((topology.expert_parallel_size(), coordinates.expert())),
+            true,
+        )
+        .unwrap();
 
         assert_eq!(cache_topology.stage(), Some((2, 1)));
         assert_eq!(cache_topology.shard(), Some((2, 0)));
@@ -4221,11 +4225,7 @@ mod tests {
             Some(CacheRankIdentity::new(Some(1), Some(0), Some(1)))
         );
 
-        let replicated =
-            MlxParallelPlan::for_rank(0, 1, 1, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
-                .unwrap();
-        let replicated =
-            crate::composition::mlx::distributed::topology::prompt_cache_topology(replicated);
+        let replicated = PromptCacheTopology::default();
         assert_eq!(replicated, PromptCacheTopology::default());
         assert_eq!(replicated.cache_rank_identity(), None);
     }
@@ -4494,6 +4494,7 @@ mod tests {
             ],
             sink_tokens: 0,
             topology: PromptCacheTopology::default(),
+            distributed_commit: None,
             application_namespace: None,
             blocks: Vec::new(),
             state_tensors: vec![PromptCacheStateTensor {
@@ -4829,12 +4830,7 @@ mod tests {
 
     #[test]
     fn model_reset_surfaces_propagate_paged_clear_failures() {
-        use crate::{
-            backend::runtime::cache::{kv::PagedKeyValueCache, state::MlxKeyValueState},
-            composition::mlx::distributed::pipeline::{
-                PipelineCache, PipelineKeyValueCache, PipelineLayerCache,
-            },
-        };
+        use crate::backend::runtime::cache::state::MlxKeyValueState;
 
         let manager = manager_with_leased_block();
         let layout = eredu_runtime::StateLayout::new(
@@ -4852,20 +4848,6 @@ mod tests {
         .unwrap();
         let mut state = MlxKeyValueState::paged(layout.clone(), manager.clone(), None).unwrap();
         assert!(state.clear().is_err());
-        assert_eq!(manager.lock().unwrap().blocks.len(), 1);
-
-        let manager = manager_with_leased_block();
-        let mut pipeline = PipelineCache::new(
-            eredu_architectures::ModelKind::Llama,
-            vec![PipelineLayerCache::KeyValue {
-                global_layer: 0,
-                cache: PipelineKeyValueCache::Paged(
-                    PagedKeyValueCache::new(manager.clone(), 0, None).unwrap(),
-                ),
-                slots: Vec::new(),
-            }],
-        );
-        assert!(pipeline.reset().is_err());
         assert_eq!(manager.lock().unwrap().blocks.len(), 1);
     }
 

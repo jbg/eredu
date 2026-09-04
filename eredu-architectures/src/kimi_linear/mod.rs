@@ -13,6 +13,7 @@ pub mod mla;
 pub mod moe;
 /// Semantic placement and rank-local Kimi geometry.
 pub mod parallel;
+mod partitioned;
 
 pub use block::{Block, BlockGeometry, TokenMixer};
 pub use checkpoint::{
@@ -33,8 +34,11 @@ pub use moe::{
 };
 pub use parallel::{
     layer_parallel_parameter_groups, local_block_geometry, local_geometry, local_state_geometry,
-    static_parallel_parameter_groups, LocalGeometry,
+    partition_local_geometry, partition_local_routed_geometry, partitioned_state_layout,
+    static_parallel_parameter_groups, LocalGeometry, PartitionExpertBankOwnership,
+    PartitionLocalGeometry,
 };
+pub use partitioned::PartitionedLayeredModel;
 
 use eredu_core::cache::PromptCacheTopology;
 use eredu_nn::{

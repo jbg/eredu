@@ -487,6 +487,7 @@ pub struct ArtifactArchitecturePlan {
     family: ArtifactFamilyPlan,
     media_projector: Option<crate::gguf_companion::GgufMediaProjectorPlan>,
     processor: Option<NormalizedProcessorPlan>,
+    prediction_extension: Option<crate::configuration::PredictionExtensionPlan>,
 }
 
 impl ArtifactArchitecturePlan {
@@ -496,6 +497,7 @@ impl ArtifactArchitecturePlan {
             family: ArtifactFamilyPlan::Safetensors(architecture),
             media_projector: None,
             processor: None,
+            prediction_extension: None,
         }
     }
 
@@ -507,6 +509,7 @@ impl ArtifactArchitecturePlan {
             family: ArtifactFamilyPlan::Gguf(architecture),
             media_projector: None,
             processor: None,
+            prediction_extension: None,
         }
     }
 
@@ -516,6 +519,37 @@ impl ArtifactArchitecturePlan {
     ) -> Self {
         self.media_projector = media_projector;
         self
+    }
+
+    /// Separates an admitted embedded-prediction artifact from its ordinary target plan.
+    pub fn prediction_target_projection(
+        &self,
+    ) -> Result<
+        Option<(Self, crate::configuration::PredictionExtensionPlan)>,
+        eredu_core::artifact::ArtifactError,
+    > {
+        let ArtifactFamilyPlan::Safetensors(family) = &self.family else {
+            return Ok(None);
+        };
+        let Some((family, extension)) = family.prediction_target_projection()? else {
+            return Ok(None);
+        };
+        Ok(Some((
+            Self {
+                family: ArtifactFamilyPlan::Safetensors(family),
+                media_projector: self.media_projector.clone(),
+                processor: self.processor.clone(),
+                prediction_extension: Some(extension.clone()),
+            },
+            extension,
+        )))
+    }
+
+    /// Typed additive prediction extension retained by a target projection.
+    pub const fn prediction_extension(
+        &self,
+    ) -> Option<&crate::configuration::PredictionExtensionPlan> {
+        self.prediction_extension.as_ref()
     }
 
     /// Finalizes catalog-dependent SafeTensors admission before processor enrichment.

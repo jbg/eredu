@@ -6,15 +6,21 @@ use eredu_core::QuantizationRequest;
 use crate::backend::error::Error;
 use eredu_runtime::{PipelineWireContract, WeightResidency};
 
-use super::distributed::topology::MlxParallelPlan;
-
 /// Caller request translated into an authoritative realization before materialization.
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
 pub struct MlxLoadRequest {
     /// Optional weight transformation requested during dense checkpoint loading.
     pub(crate) quantization: Option<QuantizationRequest>,
     /// Validated runtime topology paired with its required wire contract.
-    parallel: Option<(MlxParallelPlan, PipelineWireContract)>,
+    parallel: Option<(
+        eredu_core::ParallelRankTopology,
+        crate::backend::DeviceAssignment,
+        PipelineWireContract,
+    )>,
+    /// Maximum invocation geometry used to resolve architecture-owned wires.
+    partitioned_invocation_limits: Option<(i32, i32)>,
+    /// Caller-selected bounded completion policy for native communication.
+    communication_completion: Option<eredu_runtime::CommunicationCompletionPolicy>,
     /// Parameter placement and execution policy for cataloged checkpoint stores.
     pub(crate) weight_residency: WeightResidency,
     /// Exact mutable-state residency and paging controls.
@@ -24,11 +30,23 @@ pub struct MlxLoadRequest {
 }
 
 impl MlxLoadRequest {
+    #[cfg(test)]
+    pub(crate) fn test_communication_completion_policy(
+    ) -> eredu_runtime::CommunicationCompletionPolicy {
+        eredu_runtime::CommunicationCompletionPolicy::new(
+            std::time::Duration::from_secs(30),
+            eredu_core::CompletionCancellationMode::QuarantineUntilComplete,
+        )
+        .expect("test completion policy is positive")
+    }
+
     /// Creates load options that quantize eligible dense weights on load.
     pub fn with_quantization(quantization: QuantizationRequest) -> Self {
         Self {
             quantization: Some(quantization),
             parallel: None,
+            partitioned_invocation_limits: None,
+            communication_completion: None,
             weight_residency: WeightResidency::fully_resident(),
             state_residency: eredu_runtime::CacheResidencyPolicy::Device,
             required_session_capabilities: eredu_core::SessionCapabilities::default(),
@@ -38,20 +56,47 @@ impl MlxLoadRequest {
     /// Adds a validated MLX parallel topology and its activation wire contract.
     pub(crate) fn with_parallel_topology(
         mut self,
-        topology: MlxParallelPlan,
+        topology: eredu_core::ParallelRankTopology,
+        device: crate::backend::DeviceAssignment,
         pipeline_wire: PipelineWireContract,
+        maximum_batch_size: i32,
+        maximum_sequence_length: i32,
+        completion_policy: eredu_runtime::CommunicationCompletionPolicy,
     ) -> Self {
-        self.parallel = Some((topology, pipeline_wire));
+        self.parallel = Some((topology, device, pipeline_wire));
+        self.partitioned_invocation_limits = Some((maximum_batch_size, maximum_sequence_length));
+        self.communication_completion = Some(completion_policy);
         self
     }
 
     /// Creates load options for a validated MLX parallel topology and
     /// activation wire contract.
     pub(crate) fn with_parallel(
-        topology: MlxParallelPlan,
+        topology: eredu_core::ParallelRankTopology,
+        device: crate::backend::DeviceAssignment,
         pipeline_wire: PipelineWireContract,
+        maximum_batch_size: i32,
+        maximum_sequence_length: i32,
+        completion_policy: eredu_runtime::CommunicationCompletionPolicy,
     ) -> Self {
-        Self::default().with_parallel_topology(topology, pipeline_wire)
+        Self::default().with_parallel_topology(
+            topology,
+            device,
+            pipeline_wire,
+            maximum_batch_size,
+            maximum_sequence_length,
+            completion_policy,
+        )
+    }
+
+    /// Selects the bounded completion policy for every native communication
+    /// operation in the distributed session.
+    pub const fn with_communication_completion_policy(
+        mut self,
+        policy: eredu_runtime::CommunicationCompletionPolicy,
+    ) -> Self {
+        self.communication_completion = Some(policy);
+        self
     }
 
     /// Selects fully resident or bounded layer execution for checkpoint weights.
@@ -76,18 +121,32 @@ impl MlxLoadRequest {
     }
 
     /// Returns the selected distributed topology, if any.
-    pub(crate) const fn parallel_topology(&self) -> Option<MlxParallelPlan> {
+    pub(crate) const fn parallel_topology(&self) -> Option<eredu_core::ParallelRankTopology> {
         match self.parallel {
-            Some((topology, _)) => Some(topology),
+            Some((topology, _, _)) => Some(topology),
             None => None,
         }
+    }
+
+    pub(crate) fn parallel_rank_context(
+        &self,
+    ) -> Result<Option<crate::backend::MlxRankContext>, Error> {
+        self.parallel
+            .map(|(topology, device, _)| {
+                crate::backend::MlxRankContext::new(
+                    topology.world_size(),
+                    topology.global_rank(),
+                    device,
+                )
+            })
+            .transpose()
     }
 
     /// Returns the activation wire contract paired with the distributed
     /// topology, if any.
     pub const fn pipeline_wire_contract(&self) -> Option<PipelineWireContract> {
         match self.parallel {
-            Some((_, wire_contract)) => Some(wire_contract),
+            Some((_, _, wire_contract)) => Some(wire_contract),
             None => None,
         }
     }
@@ -117,10 +176,43 @@ impl MlxLoadRequest {
         self.required_session_capabilities
     }
 
-    pub(crate) const fn parallel_execution(
+    /// Returns validated invocation limits for partitioned selection.
+    pub(crate) fn partitioned_invocation_limits(&self) -> Result<Option<(i32, i32)>, Error> {
+        match (self.parallel, self.partitioned_invocation_limits) {
+            (None, None) => Ok(None),
+            (Some(_), Some((maximum_batch_size, maximum_sequence_length)))
+                if maximum_batch_size > 0 && maximum_sequence_length > 0 =>
+            {
+                Ok(Some((maximum_batch_size, maximum_sequence_length)))
+            }
+            (Some(_), Some((maximum_batch_size, maximum_sequence_length))) => {
+                Err(Error::Parallel(format!(
+                    "partitioned invocation limits must be positive, got batch {maximum_batch_size} and sequence {maximum_sequence_length}"
+                )))
+            }
+            (Some(_), None) => Err(Error::Parallel(
+                "parallel execution requires explicit maximum batch and sequence limits".into(),
+            )),
+            (None, Some(_)) => Err(Error::Parallel(
+                "partitioned invocation limits require a parallel topology".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn communication_completion_policy(
         &self,
-    ) -> Option<(MlxParallelPlan, PipelineWireContract)> {
-        self.parallel
+    ) -> Result<Option<eredu_runtime::CommunicationCompletionPolicy>, Error> {
+        match (self.parallel.is_some(), self.communication_completion) {
+            (true, Some(policy)) => Ok(Some(policy)),
+            (true, None) => Err(Error::Parallel(
+                "parallel execution requires an explicit bounded communication completion policy"
+                    .into(),
+            )),
+            (false, None) => Ok(None),
+            (false, Some(_)) => Err(Error::Parallel(
+                "a communication completion policy requires a parallel topology".into(),
+            )),
+        }
     }
 
     pub(crate) fn weight_quantization(&self) -> Result<Option<WeightQuantization>, Error> {
@@ -162,6 +254,8 @@ impl MlxLoadRequest {
         use eredu_runtime::LayerWeightResidency;
 
         self.weight_quantization()?;
+        self.partitioned_invocation_limits()?;
+        self.communication_completion_policy()?;
         let residency = if self.weight_residency.parameter_bank_cache().is_some() {
             ResidencyRequest::AddressableParameterBanks
         } else {
@@ -178,8 +272,8 @@ impl MlxLoadRequest {
         };
         let mut policy = eredu_core::PreparationPolicy::new(self.quantization, residency)
             .with_required_session_capabilities(self.required_session_capabilities);
-        if let Some(topology) = self.parallel_topology().map(MlxParallelPlan::topology) {
-            policy = policy.with_topology(topology);
+        if let Some(topology) = self.parallel_topology() {
+            policy = policy.with_topology(topology.topology());
         }
         Ok(policy)
     }
@@ -187,12 +281,16 @@ impl MlxLoadRequest {
 
 #[cfg(test)]
 mod tests {
-    use eredu_core::QuantizationRequest;
+    use eredu_core::{ParallelRankTopology, ParallelTopology, QuantizationRequest};
     use eredu_runtime::LayerwiseLoadOptions;
 
-    use super::{MlxLoadRequest, MlxParallelPlan};
+    use super::MlxLoadRequest;
     use crate::backend::DeviceAssignment;
     use eredu_runtime::WeightResidency;
+
+    fn topology(rank: usize, tp: usize, pp: usize, ep: usize) -> ParallelRankTopology {
+        ParallelRankTopology::new(ParallelTopology::new(tp, pp, ep, 1).unwrap(), rank).unwrap()
+    }
 
     #[test]
     fn preparation_policy_preserves_quantized_nonresident_request() {
@@ -229,19 +327,17 @@ mod tests {
 
     #[test]
     fn preparation_policy_preserves_exact_parallel_topology() {
-        let topology = MlxParallelPlan::for_rank(
-            5,
-            2,
-            3,
-            2,
-            DeviceAssignment::new(safemlx::DeviceType::Cpu, 0),
-        )
-        .unwrap();
+        let topology = topology(5, 2, 3, 2);
+        let device = DeviceAssignment::new(safemlx::DeviceType::Cpu, 0);
         let policy = MlxLoadRequest::with_parallel(
             topology,
+            device,
             eredu_runtime::PipelineWireContract::new(
                 eredu_runtime::PipelineActivationDtype::Float32,
             ),
+            1,
+            128,
+            MlxLoadRequest::test_communication_completion_policy(),
         )
         .preparation_policy()
         .unwrap();
@@ -251,25 +347,54 @@ mod tests {
     #[test]
     fn preparation_policies_distinguish_parallel_axes() {
         let device = DeviceAssignment::new(safemlx::DeviceType::Cpu, 0);
-        let tensor_pipeline = MlxParallelPlan::for_rank(0, 2, 3, 1, device).unwrap();
-        let tensor_expert = MlxParallelPlan::for_rank(0, 2, 1, 3, device).unwrap();
+        let tensor_pipeline = topology(0, 2, 3, 1);
+        let tensor_expert = topology(0, 2, 1, 3);
         let tensor_pipeline_policy = MlxLoadRequest::with_parallel(
             tensor_pipeline,
+            device,
             eredu_runtime::PipelineWireContract::new(
                 eredu_runtime::PipelineActivationDtype::Float32,
             ),
+            1,
+            128,
+            MlxLoadRequest::test_communication_completion_policy(),
         )
         .preparation_policy()
         .unwrap();
         let tensor_expert_policy = MlxLoadRequest::with_parallel(
             tensor_expert,
+            device,
             eredu_runtime::PipelineWireContract::new(
                 eredu_runtime::PipelineActivationDtype::Float32,
             ),
+            1,
+            128,
+            MlxLoadRequest::test_communication_completion_policy(),
         )
         .preparation_policy()
         .unwrap();
 
         assert_ne!(tensor_pipeline_policy, tensor_expert_policy);
+    }
+
+    #[test]
+    fn parallel_policy_rejects_nonpositive_invocation_limits() {
+        let topology = topology(0, 2, 1, 1);
+        let device = DeviceAssignment::new(safemlx::DeviceType::Cpu, 0);
+        let error = MlxLoadRequest::with_parallel(
+            topology,
+            device,
+            eredu_runtime::PipelineWireContract::new(
+                eredu_runtime::PipelineActivationDtype::Float32,
+            ),
+            0,
+            128,
+            MlxLoadRequest::test_communication_completion_policy(),
+        )
+        .preparation_policy()
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("partitioned invocation limits must be positive"));
     }
 }

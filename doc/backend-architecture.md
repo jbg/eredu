@@ -52,7 +52,7 @@ configuration are available only on their native targets, even when Cargo
 features are enabled elsewhere for build-matrix validation. The facade exposes
 a flat, application-facing local adapter under `eredu::api`; it does not
 reproduce an implementation crate's backend or composition module tree. The
-current MLX feature mapping and native build requirements are documented with
+MLX feature mapping and native build requirements are documented with
 the [MLX backend](../eredu-backend-mlx/doc/README.md).
 
 Backend-internal
@@ -287,12 +287,14 @@ Replicated composite text adds selected processor and ingress requirements to
 that same contract. Partitioned, prediction, drafting, and realtime paths
 retain their distinct selected construction values. Reusable MLX loading, residency, cache,
 stream, transfer, and completion mechanisms receive only exact tasks, generic
-limits, rank-local placement, or opaque group handles. The mechanism-only `MlxRankContext`
-contains a world rank and local device assignment. Semantic tensor, pipeline,
-and addressable axes remain in the composition-owned `MlxParallelPlan` and are
-lowered before reusable distributed facilities are invoked. Prompt-cache
-manifests record those lowered dimensions as generic stage, state-shard, and
-addressable-group coordinates.
+limits, rank-local placement, or opaque group handles. The mechanism-only
+`MlxRankContext` contains a world rank and local device assignment. Semantic
+tensor, pipeline, and addressable axes remain in the checked neutral
+`ParallelRankTopology` only until architecture selection projects them into an
+opaque communication manifest. MLX combines the selected world rank with a
+process-local `DeviceAssignment`; it never exposes a second backend parallel
+plan or reconstructs axis groups. Prompt-cache manifests record the selected
+placement as generic stage, state-shard, and addressable-group coordinates.
 
 Selection compares the complete architecture transform constraint with an
 exact backend lowering descriptor. A lowering descriptor identifies the source
@@ -421,6 +423,20 @@ plans translate tensor, pipeline, routed, data, or later axes into ordered
 world-rank memberships, group-local ranks, generic point-to-point routes, and
 required collective operations before invoking a backend. Backend sessions
 materialize groups by opaque identity and never infer why a group exists.
+Before creating any native subgroup, every rank exchanges its complete opaque
+communication manifest over the unsplit world control plane. The neutral
+runtime gathers fixed-size length metadata followed by equally padded payload
+words, reconstructs every rank artifact, and validates descriptor and
+invocation-limit compatibility. Backend-local capability and world/rank checks
+run only after that collective proof, so a mismatched rank cannot return early
+while peers block in subgroup construction.
+Each MLX manifest realization retains its exact opaque group ID and operation
+requirements on the mechanism handle, including singleton and full-world
+groups that reuse the same native membership. Reusable collective entry points
+check the selected operation, dtype, tensor geometry, peer-count and output
+limits, and exact-completion requirement before native submission. The
+unsplit world consensus handle is explicitly uncontracted and is never returned
+as a manifest group handle.
 Tensor-parallel grouped partials are a required additive mechanism separate
 from ordinary grouped execution; selection rejects the missing extension
 before construction. Routed architecture plans derive those requirements from
@@ -432,6 +448,21 @@ and convolutional components remain device-resident when append-only attention
 components use paged storage.
 Partitioning adds `PartitionedLayeredArchitecture`, boundary schemas, and
 driver-owned boundary exchange through opaque collective contexts;
+one `PipelinePartitionExecutor` retains the selected typed per-unit strategy,
+so ordinary and provider-backed routed units share the same local-address,
+boundary, scheduling, publication, and state lifecycle rather than selecting
+a backend pipeline implementation. A prepared routed partition carries one
+immutable architecture-owned execution handoff: local-versus-pipeline dispatch,
+erased grouped-expert realization, provider route cardinality, active tensor
+mechanism, boundary and output geometry, per-unit tensor-reduction order, and
+the resulting collective waves. The backend supplies only generic provider,
+movement, communication, allocation, and execution mechanisms; it does not
+inspect semantic ranks or rebuild a routed strategy. Pipeline combinations with
+an expert axis use the architecture-declared all-rank operation order; inactive
+cohorts submit exact-shaped zero work at every declared TP/EP wave and
+bounded-complete it before advancing. Missing route cardinality or an
+incomplete expert-wave recipe fails while preparing this handoff, before a
+provider or native communication mechanism is bound.
 composite models use `PreparedModelInput` and architecture-owned execution
 groups; embedded prediction uses separately identified prediction groups and
 `DraftStateTransaction`; and realtime models opt into `RealtimeFrameTransition`,
@@ -445,7 +476,10 @@ execution classes.
 Grouped execution is exposed through the required `GroupedNeuralBackend`
 extension rather than a permissive base-trait fallback. Distributed vocabulary
 and sum operations similarly live on the required
-`DistributedNeuralBackend` extension. Public execution-plan, topology, and
+`DistributedNeuralBackend` extension. The neutral vocabulary-range contract
+validates this rank against its architecture-selected balanced partition and
+publishes the exact ordered peer widths; a backend consumes those widths for
+uneven gather instead of reconstructing sharding. Public execution-plan, topology, and
 speculative handoff records keep their fields private, use checked or named
 constructors and accessors, and mark open semantic enums non-exhaustive.
 Move-only multi-value architecture handoffs are represented by named artifacts
@@ -464,10 +498,9 @@ depend on declaration order. Request optionality applies only to root media
 encoders; the neutral pipeline lifecycle rejects it on structural, decoder, or
 prediction groups. Shared decoder defaults live in `eredu-architectures`; the
 runtime does not assign decoder roles or placement to an unspecified group.
-Composite families may declare different policies per group. In particular,
-Moshi places its temporal decoder across the pipeline with the pinned embedding
-and output modules, while its ordered depth predictions run on the output owner
-and own no pinned static roles.
+Composite families may declare different policies per group. Moshi's realtime
+extension is deliberately pure tensor parallel: its temporal and ordered depth
+groups remain local traversal groups rather than pipeline stages.
 
 Mutable-state partitioning is a separate architecture declaration over the
 complete `StateLayout`. Every layered architecture publishes an
@@ -562,8 +595,8 @@ layerwise residency metadata likewise expose this identity only as
 same unambiguous key. Complete-model
 materialization stores the already resolved `ModelKind`
 alongside the concrete model implementation; it does not reconstruct family
-identity from the effective type. Distributed composition carries that same
-admitted `ModelKind` into every pipeline stage; a rank-local architecture
+identity from the effective type. Architecture-owned typed partition dispatch
+retains that same admitted `ModelKind` for every rank-local partition; the
 partition does not derive another family identity from its parsed variant or
 nested configuration. Both identities are invariant across replicated,
 tensor-parallel, and pipeline-parallel placement.
@@ -780,8 +813,8 @@ single consumed value returned by `ArchitectureParameters::state_identity`;
 the execution lifecycle does not publish a second, ambiguous identity getter.
 Concrete backend adapters use one shared visitor rather than family binding
 tables.
-Pipeline stage loaders use that same visitor for both ordinary decoder families
-and multimodal families, leaving tensor-parallel binding selection generic and
+Partitioned materializers use that same visitor for both ordinary decoder
+families and multimodal families, leaving tensor-parallel binding selection generic and
 the role-to-module mapping entirely within the architecture. Distinct pinned
 modules use distinct storage roles even when they share a broader semantic
 parameter class; for example, DeepSeek V4 exposes its target hyper-connection
@@ -830,18 +863,37 @@ and the exact rank-local bank specification for every routed execution unit.
 Each plan entry uses the same canonical execution-group and group-local unit
 address as the architecture execution layout and expert-residency catalog;
 group aliases are not interchangeable ownership addresses.
-Distributed composition consumes the plan's global count and lowers the
+Architecture/runtime composition consumes the plan's global count and lowers the
 declared owner map into group indices plus ordinary collective calls without
 running another assignment policy. The plan's presence or absence is also the
 only authority for whether the realized architecture has routed execution
 units; composition must not inspect a family schedule or configuration count
-to decide expert availability. Pipeline stage telemetry exposes local expert
+to decide expert availability. Rank-local partition telemetry exposes local expert
 identities only when the plan enumerates a routed unit owned by that stage, and
 expert-cache admission likewise follows plan presence rather than a family
 variant predicate. Backend composition must not pass family fields
 or a separately derived tensor-parallel width into expert-bank construction;
 the bank specification retained by this same plan is the only construction
 input.
+The neutral expert-exchange primitive derives a stable destination-major route
+permutation from that same ownership plan, agrees exact source-major peer
+counts, and uses the transposed counts for the return path. It transports
+owner-local identities, route scores, coefficients, and opaque route-position
+tags in row-aligned order. Local addressable grouped execution consumes every
+received row once and applies its coefficient once; the source rank accepts
+returned rows only when their tags reproduce the dispatched permutation, then
+additively combines duplicate routes into architecture source-token order.
+Zero-count peers remain explicit. Generic movement and exchange mechanisms own
+native tensor storage, selected dtype/count/shape enforcement, exact
+completion, and resource retention. Production routed architectures bind this
+primitive through their prepared routed execution handoff. MLX provides generic
+arbitrary-row gather, flattened route-value gather,
+scatter-add, and addressable-provider adapters for this primitive. It
+also constructs the neutral `PartitionExpertRouteExchange` directly from an
+already-realized opaque `PartitionCommunication`; it does not infer an expert
+axis or create another group. MLX variable all-to-all admits the floating route
+rows and I32 identity/tag rows with the same exact count, shape, completion,
+and resource-retention contract while other integer dtypes remain fail-closed.
 Qwen, Qwen3-VL, Qwen hybrid (including conditional vision and embedded MTP),
 GPT-OSS, LFM2, Kimi Linear, Nemotron-H, Muse-Glimmer, Inkling, Gemma 4, and
 DeepSeek V3/V4 expose family-specific realization entry points over their
@@ -895,13 +947,32 @@ state; compressed-attention layers are not full-KV layers.
 The same exact estimate declares whether speculative draft weights use a
 separate checkpoint, use configured embedded prediction layers, or are absent.
 A backend maps that declaration to executable or unsupported status according
-to its implementation; it does not maintain a family-name MTP table. Pipeline
-sessions therefore report architecture-declared separate draft weights as
-unsupported while external drafting remains unavailable for pipeline
-execution; only an absent architecture declaration reports unavailable.
-Pipeline prefill likewise enters embedded-prediction cache preparation whenever
-the realized architecture declares prediction layers; the backend does not gate
-that path on a family enum.
+to its implementation; it does not maintain a family-name MTP table. Typed
+prediction-extension admission reports unsupported declarations explicitly;
+only an absent architecture declaration reports unavailable.
+Prediction-enabled execution is composed exclusively through the typed neutral
+target extension below, rather than by attaching prediction modules or caches
+to the ordinary pipeline shell.
+
+An admitted artifact with embedded prediction is split before partitioned
+construction into an ordinary target projection and a typed prediction
+extension. The target retains authority for admission, communication,
+ordinary prefill/decode, state transactions, cache control, and public output;
+the extension retains only its architecture-selected units, private lane
+state, and draft depth. Architecture preparation validates the extension
+identity and depth, derives rank-local placement, constructs paired
+checkpoint-global and rank-local neutral units, and fixes recipes plus
+prediction-only state geometry in a consumed typed handoff. MLX receives no
+family configuration or semantic rank topology at this seam; it only lowers
+the prepared bindings, moves tensors, populates local modules, and wraps native
+execution objects. Its physical sources are the exact admitted sources
+not claimed by the projected target schema, rather than a backend prefix
+filter. MLX materializes those units against the target's selected local
+geometry carried by the handoff and invokes them through the neutral prediction-target operation
+hook. This does not make every prediction family or topology supported:
+extensions without a dedicated typed composition fail before target payload
+construction. An excluded prediction selection cannot fall back to a complete
+or pipeline target shell.
 
 For SafeTensors and GGUF materialization, architecture preparation also
 identifies the checkpoint parameter that establishes the generic floating-state
@@ -1006,6 +1077,17 @@ allowlist. The composition-owned MLX load request carries `QuantizationRequest`,
 variants describe load-time transforms only; checkpoint storage encodings such
 as native GGUF blocks remain internal to artifact inspection and
 materialization.
+
+Routed execution classifies prefill and decode in the neutral request or
+layered-architecture driver. Provider-backed backend wrappers invoke pass-free
+neutral entry points; they neither derive nor receive the semantic pass.
+Before an independently addressable parameter bank is invoked, the neutral
+driver projects that pass to the exact storage workload class (`Bulk` or
+`Incremental`). Reusable backend bank and grouped-execution APIs accept only
+that workload class; accepting a semantic expert pass through a generic
+conversion would make the backend mechanism another interpreter of execution
+policy.
+
 The same architecture capability report carries a typed parallel plan for
 tensor sharding, pipeline staging, and expert partitioning. Each axis is
 declared from the parsed family variant rather than inferred from parameter
@@ -1045,14 +1127,14 @@ Rank-local materialization traverses the canonical units exposed by its
 is never restated by a backend loader. Dense-stream storage indexes those
 addresses directly and derives its primary execution offset from the first
 architecture-declared decoder address rather than summing preceding group
-counts. Every distributed family loader
-registers tensor-parallel groups from the complete architecture parameter
-description; it does not enumerate static, media, decoder, or prediction
-parameters independently. The same description supplies the ownership used by
-pipeline-stage materialization, preventing tensor and pipeline planning from
-drifting apart. Conditional Qwen pipeline boundaries come from the constructed
-architecture, including hidden width and DeepStack activation cardinality,
-rather than being re-derived from family arguments in backend composition.
+counts. The generic rank-local binder consumes tensor-parallel groups from the
+complete architecture parameter description; it does not enumerate static,
+media, decoder, or prediction parameters independently. The same description
+supplies the ownership used by pipeline-stage materialization, preventing
+tensor and pipeline planning from drifting apart. Conditional Qwen pipeline
+boundaries come from the constructed architecture, including hidden width and
+DeepStack activation cardinality, rather than being re-derived from family
+arguments in backend composition.
 
 Pure EP, PP+EP, TP+EP, and TP+PP+EP must share the architecture's capability
 validation, expert assignment, residency plan, and execution declarations. A
@@ -1104,8 +1186,7 @@ architecture admission derives that companion geometry,
 validates the companion against its exact family-owned GGUF schema, and retains
 the typed composite configuration, schema, and canonical tensor mapping in the
 artifact architecture plan. A concrete backend pairs that proof with its native
-payload wrapper and
-passes the pair through complete, tensor-parallel, and distributed-stage
+payload wrapper and passes the pair through replicated and partitioned
 composition. It does not repeat companion family parsing or regenerate the
 companion checkpoint schema. For Gemma 4, Inkling, Muse-Glimmer, and
 Qwen, inspection also parses and retains the family processor plan from the
@@ -1169,7 +1250,10 @@ composite adapters build embeddings, placeholders, masks, positions, optional
 encoder roots, projectors, merge inputs, and per-layer visual contributions,
 then enter the ordinary layered driver. Direct and routed composite execution
 therefore use the same replicated session for prefill, decode, transactions,
-state reset, cache persistence, observation, reports, and exact completion.
+state reset, cache persistence, observation, reports, and exact completion. An
+admitted composite never falls back to a family pipeline implementation:
+unsupported prediction or artifact forms fail during architecture selection,
+before communication realization or payload materialization.
 Complete, tensor-parallel, and pipeline composition use the same family ingress:
 the MLX layer converts handles and pairs admitted tensors, while architecture
 code assembles placeholders, batching, positions, masks, and ordered parts.
@@ -1221,6 +1305,21 @@ backends consume that plan and load tensor payloads; checkpoint-layout identity
 names the physical Moshi or PersonaPlex SafeTensors namespace and never a
 concrete backend. Backends do not receive a raw artifact path or reinterpret
 family configuration and filename policy.
+
+The Moshi pure tensor-parallel realtime extension is selected by the
+architecture as a rank-local handoff. Architecture code validates its narrow
+topology, derives physical parameter placement and local transformer/state
+geometry from a configuration-only canonical parameter description, and projects exact
+all-reduce and uneven-gather bounds into an opaque communication manifest. It
+also publishes the fully local temporal/depth traversal as a neutral
+`PartitionedTextRuntime` plan. Selection and manifest consensus finish before
+any MLX module is constructed; MLX materialization then realizes the opaque
+group before opening tensor payloads and installs the local layered runtime in the
+generic traversal partition executor; it does not plan Moshi sharding,
+reconstruct local family geometry, retain a distributed session in the
+realtime model, or select a separate parallel forward path. Frame scheduling,
+audio handling, forcing, and realtime decisions remain the distinct realtime
+extension around that one neutral model driver.
 
 Prepared-media admission follows the same boundary after tensor construction.
 Architecture media plans validate family payload shapes,
@@ -1331,7 +1430,7 @@ GGUF error variant and its numeric type code, never from rendered diagnostic
 text.
 
 `ModelPreparationPlan` is the one-shot authority for stage 4. Materializers,
-including distributed stage loaders, consume its inspected configuration,
+including partitioned materializers, consume its inspected configuration,
 primary and companion checkpoint handles, and selected route directly. They
 must not reopen an artifact to rediscover configuration, checkpoint metadata,
 or sibling filename policy after planning; payload stores may still map weight
@@ -1375,7 +1474,7 @@ receive an unrestricted assistant store, reopen configuration or metadata for
 dispatch, bind against raw native topology, or duplicate assistant admission.
 
 `eredu::api::local_device_plan` maps the facade's CPU or accelerator choice to
-the currently selected local backend and rejects accelerator choices when that
+the selected local backend and rejects accelerator choices when that
 build contains no native accelerator family. `LocalRuntimeConfiguration`
 applies any process-global allocator or embedded accelerator-library
 configuration before the factory realizes that plan. Platform applications
@@ -1511,6 +1610,24 @@ captures, and vocabulary requirements before a concrete backend composes the
 two executables. Backend composition may enforce the proof, but must not
 restate family-specific compatibility rules.
 
+Prediction-enabled composition is additive to the ordinary target session.
+Architecture admission projects the target and a typed prediction-extension
+plan from one already-admitted artifact; it does not reopen or reclassify the
+checkpoint. The ordinary neutral session remains the sole owner of target
+prefill, decode, mutable state, prompt-cache control, completion, observation,
+rollback, and publication. A target pass may retain an architecture-declared
+hidden capture from that same transaction for an embedded predictor or
+external assistant. Missing capture fails the transaction before publication.
+Backend composition may own prediction-local state and native prediction
+mechanisms, but must not construct a second target model or target cache. Any
+extension whose unit execution lacks a typed additive handoff remains
+fail-closed; loading a second complete model beside the neutral target is not
+an admissible compatibility mechanism.
+DeepSeek-V4 DSpark remains in that fail-closed set: its target capture is a
+configured set of intermediate-layer values rather than the sequential MTP
+target hidden state, so projecting it as ordinary final hidden state would
+change prediction semantics.
+
 ## Scheduling and cancellation
 
 The core state machines own queued, prepared, submitted, committed, failed,
@@ -1524,6 +1641,24 @@ Protocol framing and cross-rank schedule agreement are portable; transport and
 native collective execution belong to the backend. Realtime backends expose
 step submission and completion, while facade/runtime schedulers own offline
 greedy loops, request registration, frame progression, and output collection.
+Distributed cancellation uses a caller-selected bounded consensus transport.
+Every turn first exchanges the exact padded active-request set so a deadline
+observed by any rank becomes a common candidate. Explicit cancellation and
+deadline expiry then run the same preparation and commit-authorization votes;
+the scheduler does not remove the request, publish a terminal disposition, or
+discard a provisional branch before both votes succeed. A transport deadline,
+malformed status, or negative vote fences the scheduler and makes retry fail
+before another transport call. After commit authorization, every submitted
+branch is marked abandoned and retained until exact backend completion.
+Backend adapters implement only a deferred equal-word all-gather returning a
+bounded completion that owns its group, buffers, stream, and native work; they
+must not synchronize or resolve host words while constructing the submission.
+Only after exact completion may the adapter resolve its opaque gathered output
+into rank-major words. The scheduler caller, not the backend, supplies the
+selected wait policy. MLX implements this contract with a lazy native gather
+whose completion retains the input, output, world handle, and stream. Timeout
+uses the same communicator-fencing quarantine as partition communication; no
+host word access occurs until the caller observes exact completion.
 
 ## Cache and residency
 
@@ -1559,6 +1694,10 @@ Portable topology uses data, tensor, pipeline, and expert axes. Core validates
 rank coordinates, subgroup membership, balanced ownership, and operation
 scopes. Runtime owns the backend-neutral tensor-placement decisions consumed by
 architecture planning and concrete backend realization.
+Data parallelism is represented but unsupported for partitioned model
+execution. A request with `data > 1` reaches neutral architecture
+selection and fails there before payload or native communication realization;
+concrete topology adapters do not erase or reject that axis independently.
 
 `ArchitecturePartition` is publicly constructed only through
 `from_architecture`, which derives its execution graph and unit layout from the
@@ -1606,7 +1745,11 @@ Backend adapters address media storage and the primary boundary by the graph's
 stable architecture-owned IDs, including when several groups have the same
 semantic kind.
 
-The partition also carries an architecture-owned boundary schema. That schema
+The partition also carries architecture-owned route-indexed boundary schemas.
+Every selected opaque route retains its semantic source and destination group
+and rank, plus the exact schema used by its manifest descriptor; composition
+must not recover those endpoints from physical adjacency or apply one route's
+schema to another. Each schema
 declares the primary evolving activation and every auxiliary tensor, including
 their stable roles, canonical order, symbolic shapes, logical dtypes, and
 configuration-dependent cardinality. It also owns conversion of auxiliaries to
@@ -1622,7 +1765,14 @@ The physical dtype of tensors declared with the logical `Activation` dtype is
 selected by the separate backend-neutral `PipelineWireContract`. Distributed
 load configuration must select that contract explicitly and provide the same
 value to every stage. Backends normalize outgoing floating activations to the
-contract before validation and transport; checkpoint parameter dtypes,
+contract during local group execution. After mechanical validation, the source
+submits every typed boundary tensor as rank-local dependencies through the same
+communication completion mechanism and caller-selected bound used by the
+route. Only exact completion advances `BoundarySourceCompletion(route)` and
+then `BoundarySourceReady(route)`; a deadline or cancellation retains the lazy
+outputs and executor through safe teardown, prevents point-to-point submission,
+and fences retry. Unsupported source conversions fail before that completion
+phase; checkpoint parameter dtypes,
 rank-local loading order, quantization encodings, and stage ownership never
 select the wire dtype.
 Distributed placement dependency routes consume that same schema directly. A
@@ -1630,11 +1780,292 @@ concrete backend must reject inactive dependency routes with tensors and active
 routes whose exact cardinality, ordered shapes, or physical dtypes differ from
 the resolved architecture boundary; backend-local string or optional-field
 schemas are not an alternate wire contract.
-Point-to-point boundary arrays are exact-completion values. A backend must
-complete each ordered receive before consuming or reusing its destination and
-complete each ordered send before submitting another boundary array that could
-alias the same lazy storage. Retaining a submitted handle without exact
-completion is not sufficient ordering for a multi-array boundary.
+Each logical point-to-point boundary tensor is one role-exact in-band frame.
+The serialized route descriptor carries the architecture schema identity and
+ordered role, logical dtype, symbolic invocation dimensions, fixed dimensions,
+and bounds. The transmitted native U8 message concatenates a canonical header
+containing route, schema, role ordinal and name, actual dtype and shape, and
+payload byte length with the tensor bytes. A receiver validates header bytes
+sliced from that received message after exact native completion and only then
+reconstructs the typed tensor. A backend-synthesized return tag or a separate
+independently reorderable control message is not role/schema metadata
+provenance. `RoleExactV1` does not add a payload digest: same-length payload-bit
+integrity remains the native transport's responsibility.
+`RoleExactV1` is an explicit communication capability, so admission fails
+before native resources or payload work if it is unavailable. Batch and
+sequence may vary within admitted maxima; architecture-fixed axes remain exact.
+
+The neutral composite executor binds dense and routed prepared ingress,
+request-optional roots, group-local traversal and merge, typed decoder
+continuation, and the selected routed-expert provider. Cross-stage routed
+execution retains the architecture-selected expert wave schedule, including
+zero-work pipeline participants. Before any payload materialization or
+mechanism binding, architecture preparation seals group transport kinds,
+boundary-route schemas, publication
+geometry, collective placement, resident routed-provider authority, and the
+complete TP/PP/EP wave order into one opaque composite executor plan. The
+backend supplies only its already-selected unit policy, parallel handle, tensor
+allocator, and route-movement mechanism; it does not inspect or reconstruct
+those semantics. Its typed prepared architecture, exact
+partition, selected manifest, and materialization tasks are consumed by the same
+`prepare_partitioned_session_runtime` handoff and ordinary
+`ReplicatedTextSession` lifecycle as other neutral partitioned text execution;
+the backend factory cannot replace the composite graph after admission.
+A media encoder split whose continuation bundle depends on request-variable
+part cardinality remains unsupported unless the architecture admits an exact
+request-bounded continuation schema; no fixed role bundle is invented from
+maximum batch or sequence limits.
+
+MLX production consumes that same family-blind composite handoff for admitted
+prediction-free Gemma 4, Muse-Glimmer, Inkling, Qwen-VL, and conditional Qwen
+partitions. Indexed SafeTensors and architecture-admitted GGUF sources share the
+selected checkpoint-source representation, and selected resident or bounded
+weight policies retain the same rank-local materialization tasks. The backend
+visitor binds only generic MLX tensors, operators, state, materialization,
+expert exchange, and opaque communication; architecture-selected static tasks
+remain the exact local payload-read set. Prediction-bearing graphs and artifact
+or media-continuation forms without an admitted architecture contract are
+rejected before native communication or payload work rather than reconstructed
+by a backend family branch.
+
+Pipeline admission also selects one opaque session group containing every
+world rank in rank order. The group is the first projected communication
+resource and carries exactly a bounded floating-tensor broadcast for final
+output publication plus payload-free failure agreement. Architecture admission
+retains that exact group ID, the publication owner, and any independent tensor
+group ID and passes them to the partitioned execution plan; a backend realizes
+the descriptors without interpreting tensor or pipeline coordinates.
+
+For prediction-free dense Llama/Mistral artifacts backed by indexed or
+unindexed SafeTensors, or by an admitted GGUF checkpoint, pure TP, pure PP, and
+TP+PP use an architecture-owned partition dispatch and executor under selected
+fully resident, host-layerwise, or dense disk-stream residency. The backend
+binds one selected layerwise policy shared by execution and reporting; it does
+not construct a second cache or residency-specific family executor.
+Selected Llama/Mistral load-time transforms use this same route. Architecture
+construction carries both the exact target partition and its source-format
+partition with rank-local physical layouts and identical local unit/owner
+addresses. The generic materializer applies each selected task recipe to the
+source-local tensor before conversion and does not shard the resulting local
+weight or companion a second time; untouched bindings retain their ordinary
+single sharding step. No Llama-specific pipeline loader participates.
+Dense Qwen2/Qwen3 select the same route for indexed or unindexed SafeTensors
+and admitted GGUF, including architecture-selected transforms, under fully
+resident, host-layerwise, and dense disk-stream residency. Prediction-free
+dense LFM2, Kimi Linear, and
+Nemotron-H select the same route for admitted SafeTensors or GGUF catalogs
+under resident, layerwise-host, and dense-disk-stream residency, including
+architecture-selected load-time transforms. Classification follows the
+normalized unit schedule: unused expert metadata does not turn an otherwise
+fully dense Kimi schedule into routed execution. One exhaustive architecture
+dispatch selects the concrete normalized configuration, block or heterogeneous
+operator policy, TP-local mutable-state geometry, and PP-local unit interval
+before a single family-blind backend visitor runs. The executor
+owns the exact partial static modules, local unit interval,
+rank-local state geometry, tensor-parallel context, and typed boundary state;
+the shared `PartitionedTextRuntime` and ordinary `ReplicatedTextSession` retain
+rollback, observation, completion, and commit ownership. The architecture's
+publication owner observes and may intervene on final logits before the
+authoritative value is broadcast. Non-owner ranks receive that value for the
+neutral lifecycle but do not expose it as public local logits, and sampling
+uses the same selected owner expressed as a local rank in the already-realized
+session group. Kimi partitions retain the exact three convolution histories
+and Float32 recurrent tensor for KDA units plus compressed-latent/rotary MLA
+state, sliced by their architecture-global PP unit offset. Nemotron-H retains
+its TP-local Mamba convolution and Float32 recurrent state together with its
+sliding/full KV policies, and transports architecture-typed `tokens` and
+`embedded` auxiliaries in addition to hidden state. Prediction-free Qwen3-MoE
+and GPT-OSS, DeepSeek V3/V4, routed LFM2 and Kimi Linear, and Nemotron-H use the
+typed routed partition constructor for admitted SafeTensors and GGUF artifacts
+under pure TP, pure PP, pure EP, and their admitted TP/PP/EP combinations.
+Independent expert parameters reside in the addressable bank selected from the
+architecture catalog; bounded ordinary non-expert parameters retain the same
+generic layerwise policy where admitted. MLX owns only bank storage, movement,
+materialization, and causal acquisition/eviction/reload telemetry. Compound
+placement first selects the exact packed expert-owner range and then applies
+the independent tensor-parallel matrix placement. For a pipeline wave, the
+architecture declares one global order containing ingress, per-unit attention,
+expert exchange, routed-output, and final vocabulary collectives. Inactive PP
+cohorts submit exact-shaped zero tensor work at those same positions; active
+cohorts bounded-complete their local lazy dependencies before advancing. This
+keeps overlapping TP and EP logical groups in one native-world order without
+turning backend topology into model policy. Overlapping logical expert
+subgroups participate in one consensus-proven native-world
+variable-all-to-all wave with zero-padded nonmembers; admission rejects an
+unproven or omitted wave before publication or commit. Qwen hybrid and
+vision-language graphs, prediction-bearing configurations, and unsupported
+family selections use their separately selected composite, extension, or
+fail-closed paths; dense execution is not used as an implicit fallback.
+Architecture selection classifies this production route exactly once, before
+opening payloads, from the normalized artifact and consumed partition
+admission. The resulting immutable neutral-partitioned or explicitly excluded
+extension selection is carried into materialization; backend composition does
+not re-test family, format, residency, or lowering eligibility and cannot
+substitute a different route after communication selection.
+
+Each opaque pipeline route is realized as its ordered two-member logical group
+`[source, destination]`. Its backend handle retains Source/Destination role and
+group-local peer rank; point-to-point execution never treats global descriptor
+endpoints as native-group indices. This permits non-neighbor semantic routes on
+a native ring without changing the neutral route graph.
+
+Partitioned execution separately defines an opt-in payload-free
+`FailureAgreement` operation. It is an all-member boolean conjunction, not a
+barrier. Before agreement, each route endpoint prepares its exact resolved
+schema and ordered values: the source retains its already wire-normalized
+activation bundle, while the destination allocates its typed placeholders.
+Both endpoints validate bundle cardinality, shapes, dtypes, route operation,
+and payload limits without submitting native point-to-point work. Every rank
+then agrees first that the source's lazy tensor dependencies completed under
+the selected bound, and next that source execution and both endpoint
+preparations succeeded. Only an agreed route consumes the retained prepared
+bundle in send/receive; preparation is not recomputed after either vote. The
+destination therefore does not enter native receive after a source conversion,
+source-completion deadline, or either endpoint's preparation failure. The
+shared session also agrees that every rank captured its transactional state
+checkpoint before any rank enters forward execution or a model collective. A
+checkpoint-capture failure therefore cannot leave a peer executing, but the
+failing rank has no checkpoint to restore; checkpoint mechanisms must leave the
+borrowed live state unchanged when capture returns an error. The same status
+operation also follows rank-local graph execution, owner-only final
+output observation, authoritative output publication, and exact mechanism
+completion. Every rank submits whether that
+phase succeeded and advances only when all statuses are successful. The shared
+session performs this agreement even on a local error, rolls back before
+returning on either a local or remote pre-decision failure, and attempts final
+commit only after the completion phase agreed. Final commit uses a positive,
+monotonic `DistributedCommitEpoch`. `Committed(epoch)` means this rank observed
+the globally fixed all-success decision; it deliberately does not claim that
+every peer observed that decision. A failure while submitting or completing
+the final decision after this rank may have contributed is
+`Indeterminate(epoch, phase)`: the session withholds its public result, does not
+roll state back over a decision a peer may have committed, records the outcome
+in its report and prompt-cache manifest, and rejects retries before execution.
+An explicitly observed global false decision is `Aborted(epoch)` and retains
+the ordinary rollback behavior. A backend selects the corresponding
+`OpaqueFailureAgreement` policy only when the session-group manifest contains
+the exact operation and the backend implements the narrow status-agreement
+trait. Barrier-only policies retain local status and are rejected if paired
+with a manifest that selects failure agreement.
+
+Manual prompt-cache control on a partitioned session uses the same selected,
+bounded failure-agreement group. Load first agrees exact descriptor, topology,
+rank-local identity, and prepared-input preflight; each stateful rank then
+loads and validates a detached provisional state while stateless pipeline ranks
+still vote. Live state and commit metadata are replaced only after the second
+all-rank success. Save requires the backend mechanism to expose a reversible
+transaction: serialization remains unpublished through preparation, publication
+retains any replaced destination, and a final all-rank vote either commits every
+rank's candidate or restores every prior destination. Failure after any selected
+control phase permanently fences that session before retry, execution, or new
+cache I/O. Replicated sessions retain their ordinary local save/load behavior;
+partitioned strategies without exact failure agreement cannot claim this atomic
+control API.
+
+MLX binds that contract directly to the neutral replicated-text session. Each
+stateful rank derives one storage directory from the descriptor's stage, tensor,
+and addressable coordinates; family configuration and native group structure do
+not participate in the path. Preparation serializes the already validated MLX
+state into a hidden reversible destination. A fresh publication becomes visible
+by directory rename. Replacement instead installs an immutable generation and
+atomically switches `CURRENT`, retaining the prior generation until the final
+all-rank vote. Rollback restores that exact pointer and removes the candidate,
+while commit discards only the transaction's retained staging metadata. The
+public MLX session selects these distributed methods from an explicit control
+capability owned by the neutral executable. A retained native communicator is
+only a mechanism resource and does not own this protocol. Cleanup or restore
+failure is fail-stop rather than allowing execution with a partially published
+cache.
+
+Manual state control follows the same rule. A partitioned checkpoint is returned
+only after every stateful rank captured its local opaque checkpoint; stateless
+ranks still vote. Reset and rollback construct or restore a detached provisional
+state, validate its selected local geometry, and swap live state plus commit/input
+metadata only after all-rank success. A failed control phase discards the
+provisional value and fences every later control or execution attempt. The
+ordinary replicated checkpoint, reset, and rollback methods remain local.
+
+This neutral mechanism does not turn a failed transport into a reliable
+failure detector. A point-to-point or collective implementation must still
+complete with an error or implement the bounded completion policy selected by
+the caller before architecture projection. That positive deadline and timeout
+disposition are serialized in every non-empty manifest, compared during
+cross-rank consensus, and capability-checked before native group, route, or
+payload realization. Partition communication poisons the session after a
+deadline, terminal completion error, or synchronous native submission error;
+later operations fail before another backend call. Routed cross-stage expert
+waves have one narrow recovery exception: after a rank reports local failure
+or its subgroup operation poisons the authority, the runtime may submit the
+canonical full-session `FailureAgreement` once under the same bound so peers
+can roll back together. A healthy rank cannot invoke that bypass for ordinary
+work; a false result fences every rank, and the bypass never clears or replaces
+the original poison. The reusable MLX
+communication backend realizes this payload-free contract with an internal
+scalar integer all-sum. Its completion polls the exact event without taking a
+blocking runtime lock, retains arrays, count storage, groups, routes, and
+streams, and defers the host boolean read until that event completes. Because
+upstream MLX exposes no event abort, timed-out work is retained in a
+thread-affine quarantine and its native communicator cannot be realized again
+until a later safe reap observes completion. If the originating thread exits
+first, that thread waits for exact completion (or a terminal asynchronous
+error) and deterministically releases the retained arrays, count storage,
+groups, routes, streams, and event; quarantine ownership is never leaked or
+transferred across threads. Complete all-rank manifest consensus also precedes
+every rank-local MLX capability, quarantine, and world-identity check, so a
+corrupt projection produces the same shared setup failure before subgroup or
+payload realization. Because the serialized completion policy is itself part
+of that untrusted projection, the unsplit control-plane exchange uses a fixed
+bounded backend setup policy; only after consensus does MLX validate and
+install the agreed manifest-selected policy. MLX capability preflight
+advertises this quarantine disposition separately from the operation.
+Architecture selection requires it for the
+resident PP and TP+PP production slice, and MLX instantiates
+`OpaqueFailureAgreement` before payload construction. Pure TP reuses
+its exact architecture-selected tensor group for owner publication and phase
+agreement; it does not invent a second session identity. Resident sampling retains a clone of the
+partition communication authority: token and stop-status broadcasts share its
+selected deadline and poison state, and stop-status host resolution occurs only
+after exact event completion. Unsupported distributed graphs fail during
+architecture admission before manifest realization, payload access, or native
+group construction; there is no backend pipeline or expert bridge fallback.
+
+Opaque MLX setup acquires the process runtime lock through the manifest's
+absolute submission deadline and rechecks it immediately before the first
+array, frame, or collective graph mutation. Lock contention therefore fails
+before native submission and poisons the one partition-communication authority.
+Manifest-owned subgroup realization never enters upstream MLX's synchronous,
+non-abortable native split: it retains an exact logical membership view of the
+world handle. A logical view may use a world-wide operation only when manifest
+consensus proves that the creation batch partitions every world rank into
+same-requirement groups; non-neighbor route relays additionally require a
+disjoint, contract-identical route batch covering the world. Partial,
+overlapping, optional, or contract-mismatched batches fail before native
+submission. A variable all-to-all in such a proven wave expands each logical
+peer-count vector into world-rank order with exact zero counts for nonmembers,
+submits one native world operation on every rank, and restores the opaque
+member order after exact event completion. All ranks must invoke creation-order
+waves in the same order; the manifest proof does not make divergent runtime
+schedules safe. The backend retains every logical membership, local index,
+route, array, stream, and event through exact completion. Uncontracted control
+groups use native-split behavior.
+
+MLX exposes no way to interrupt a C++ graph-construction call
+after that call has entered native code. The selected deadline can bound lock
+admission and all event-backed work, but cannot preempt such an individual
+native call; the backend therefore performs each native submission once and
+never retries it. The durable commit epoch and explicit indeterminate outcome
+make the remaining asymmetric-observation window honest: one rank may report
+`Committed(epoch)` while a peer reports `Indeterminate(epoch, phase)`, but
+neither may falsely report `Aborted` and the uncertain session is poisoned
+until external recovery resolves that epoch. These limits are distinct from safe
+timeout disposition: orphaned MLX work retains every native dependency and
+fences the same native world. Quarantine registers an idempotent thread-local
+runtime housekeeping callback, so any later same-thread MLX entry observes and
+releases exactly completed work even when no communication operation performs
+an explicit reap. If the owning thread exits first, it synchronizes each live
+event itself and releases the retained resources only after completion (or a
+terminal asynchronous error); thread-affine work is neither leaked nor
+transferred to a reaper thread.
 
 `DistributedSession` is an optional capability of the selected model session.
 It exposes high-level sum, gather, variable-count exchange, point-to-point, and
@@ -1646,7 +2077,7 @@ collective tensor math remain backend-specific.
 
 Concrete adapters document their public implementation surfaces, native
 features, platform requirements, and realization details with the crate that
-owns them. See the current
+owns them. See the
 [MLX backend architecture](../eredu-backend-mlx/doc/architecture.md) for one
 implementation of these contracts.
 

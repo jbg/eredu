@@ -9,39 +9,32 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::native::{ExecutionContext, MlxModelSession, MlxParallelPlan};
+use crate::native::{ExecutionContext, MlxModelInput, MlxModelSession};
 use crate::{
     backend::runtime::{
         execution::layerwise::open_safetensors_weight_store,
         media::{input::InputPayload, PreparedModelInput},
     },
     backend::{
-        error::Error as MlxError,
         nn::shared::{
             neutral_parameter_refs, neutral_parameter_refs_mut, MlxModule, MlxNeuralBackend,
         },
-        DeviceAssignment, MlxBackend, MlxDistributedSession,
+        DeviceAssignment, MlxBackend,
     },
-    composition::mlx::distributed::pipeline::{
-        load_pipeline_model_with_options, PipelineLayerCache, PipelineModel, PipelineStep,
-    },
-    composition::mlx::loading::SelectedMlxConstruction,
     composition::{kimi_linear as neutral_kimi_linear, lfm2, nemotron_h as neutral_nemotron_h},
 };
 use crate::{MlxLoadRequest, MlxTensor};
 use eredu_architectures::gpt_oss;
 use eredu_architectures::qwen::hybrid as qwen_hybrid;
 use eredu_architectures::ModelKind;
-use eredu_checkpoint::{AffineQuantization, WeightQuantization};
 use eredu_core::cache::{PromptCacheDescriptor, PromptCacheOptions};
 use eredu_core::{
     load_model, residency::OffloadConfig, BackendSession as _, FinishReason,
     GenerationCancellationToken, InputExtent, InputMetadataKey, InputModality, ModelRuntime,
     ObservationRequest, SemanticEvent, SpeculativeCapability, SpeculativeConfig, SpeculativeDraft,
-    SpeculativeDraftSource, SpeculativeGenerationBackend, SpeculativeGenerationBatchRequest,
-    SpeculativeGenerationLane, SpeculativeOutputError, SpeculativeSemanticState,
-    SpeculativeTokenFilterController, TextGenerationConfig, TokenFilter, TokenFilterController,
-    TokenOutput as _,
+    SpeculativeGenerationBackend, SpeculativeGenerationBatchRequest, SpeculativeGenerationLane,
+    SpeculativeOutputError, SpeculativeSemanticState, SpeculativeTokenFilterController,
+    TextGenerationConfig, TokenFilter, TokenFilterController, TokenOutput as _,
 };
 use eredu_gguf::{
     GgmlType, MetadataArray, MetadataValue as GgufMetadataValue, TensorInput, Writer,
@@ -56,6 +49,14 @@ use safemlx::{
     ops::{indexing::TryIndexOp, stack_axis},
     Array, Device, DeviceType, Dtype as MlxDtype, Stream,
 };
+
+fn ring_completion_policy() -> eredu_runtime::CommunicationCompletionPolicy {
+    eredu_runtime::CommunicationCompletionPolicy::new(
+        Duration::from_secs(30),
+        eredu_core::CompletionCancellationMode::QuarantineUntilComplete,
+    )
+    .unwrap()
+}
 use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
 
 const WORKER_RANK: &str = "EREDU_PIPELINE_RING_WORKER";
@@ -66,16 +67,27 @@ const LAYERWISE_HOST: &str = "EREDU_PIPELINE_LAYERWISE_HOST";
 const PROMPT_CACHE_ROOT: &str = "EREDU_PIPELINE_PROMPT_CACHE";
 const CARTESIAN_AXES: &str = "EREDU_PIPELINE_CARTESIAN_AXES";
 const EXPERT_CACHE: &str = "EREDU_PIPELINE_EXPERT_CACHE";
+const EXPERT_CACHE_EVICTION: &str = "EREDU_PIPELINE_EXPERT_CACHE_EVICTION";
 const REQUANTIZE: &str = "EREDU_PIPELINE_REQUANTIZE";
 const FINAL_OUTPUT_INTERVENTION: &str = "EREDU_PIPELINE_FINAL_OUTPUT_INTERVENTION";
 const OPAQUE_SESSION: &str = "EREDU_PIPELINE_OPAQUE_SESSION";
+const PREDICTION_FREE_TARGET: &str = "EREDU_PIPELINE_PREDICTION_FREE_TARGET";
+const PREPARED_SPECULATIVE_CAPABILITY: &str = "EREDU_PIPELINE_PREPARED_SPECULATIVE_CAPABILITY";
+const EXPECTED_UNSUPPORTED_DIRECT_PARTITION: &str =
+    "EREDU_PIPELINE_EXPECTED_UNSUPPORTED_DIRECT_PARTITION";
 const OPAQUE_INSPECTION: &str = "EREDU_PIPELINE_OPAQUE_INSPECTION";
 const OPAQUE_TEXT_GENERATION: &str = "EREDU_PIPELINE_OPAQUE_TEXT_GENERATION";
 const OPAQUE_MUSE_IMAGE: &str = "EREDU_PIPELINE_OPAQUE_MUSE_IMAGE";
 const OPAQUE_INKLING_MEDIA: &str = "EREDU_PIPELINE_OPAQUE_INKLING_MEDIA";
+const OPAQUE_QWEN_CONDITIONAL_MEDIA: &str = "EREDU_PIPELINE_OPAQUE_QWEN_CONDITIONAL_MEDIA";
 const OPAQUE_INKLING_MTP: &str = "EREDU_PIPELINE_OPAQUE_INKLING_MTP";
+const OPAQUE_QWEN_HYBRID_MTP: &str = "EREDU_PIPELINE_OPAQUE_QWEN_HYBRID_MTP";
+const OPAQUE_NEMOTRON_H_MTP: &str = "EREDU_PIPELINE_OPAQUE_NEMOTRON_H_MTP";
+const OPAQUE_DEEPSEEK_MTP_TARGET: &str = "EREDU_PIPELINE_OPAQUE_DEEPSEEK_MTP_TARGET";
 const OPAQUE_GEMMA4_MEDIA: &str = "EREDU_PIPELINE_OPAQUE_GEMMA4_MEDIA";
+const OPAQUE_QWEN3_VL_MEDIA: &str = "EREDU_PIPELINE_OPAQUE_QWEN3_VL_MEDIA";
 const QWEN_HYBRID_PROMPT_CACHE: &str = "EREDU_PIPELINE_QWEN_HYBRID_PROMPT_CACHE";
+const PROMPT_CACHE_PREPARE_FAILURE: &str = "EREDU_PIPELINE_PROMPT_CACHE_PREPARE_FAILURE";
 
 fn input_part(
     modality: InputModality,
@@ -163,7 +175,7 @@ fn run_neutral_embedded_mtp<'world>(
     runtime: &mut ModelRuntime<MlxBackend<'world>>,
     prompt: crate::composition::mlx::MlxModelInput,
     config: SpeculativeConfig,
-) -> eredu_core::SpeculativeGenerationOutput {
+) -> Result<eredu_core::SpeculativeGenerationOutput, crate::backend::error::Error> {
     let sampling = eredu_core::resolve_generation_config(
         None,
         eredu_core::GenerationConfigOverrides {
@@ -189,170 +201,36 @@ fn run_neutral_embedded_mtp<'world>(
             [0; 32],
         ),
         eredu_runtime::RunSpeculativeGeneration::default(),
-    )
-    .unwrap();
-    output.into_requests().into_iter().next().unwrap()
-}
-
-fn load_prepared_pipeline_model(
-    checkpoint: &Path,
-    options: MlxLoadRequest,
-    stream: &Stream,
-) -> PipelineModel {
-    let inspection = eredu_architectures::configuration::inspect_artifact(checkpoint).unwrap();
-    let plan = eredu_core::plan_model_preparation(
-        inspection,
-        options.preparation_policy().unwrap(),
-        eredu_core::SessionCapabilities::new(true, true, true),
-    )
-    .unwrap();
-    let selected = SelectedMlxConstruction::from_request(
-        options,
-        eredu_core::SessionCapabilities::new(true, true, true),
-    )
-    .unwrap();
-    load_pipeline_model_with_options(plan, selected, stream, stream).unwrap()
-}
-
-#[test]
-fn distributed_materialization_uses_the_planned_configuration() {
-    let checkpoint = tempfile::tempdir().unwrap();
-    write_deepseek_fixture(checkpoint.path(), 2);
-    let topology =
-        MlxParallelPlan::for_rank(0, 1, 2, 1, DeviceAssignment::new(DeviceType::Cpu, 0)).unwrap();
-    let layerwise = LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap());
-    let options = MlxLoadRequest::with_parallel(
-        topology,
-        eredu_runtime::PipelineWireContract::new(eredu_runtime::PipelineActivationDtype::Float32),
-    )
-    .with_weight_residency(WeightResidency::layerwise_host(layerwise));
-    let inspection =
-        eredu_architectures::configuration::inspect_artifact(checkpoint.path()).unwrap();
-    let plan = eredu_core::plan_model_preparation(
-        inspection,
-        options.preparation_policy().unwrap(),
-        eredu_core::SessionCapabilities::new(true, true, true),
-    )
-    .unwrap();
-
-    std::fs::remove_file(checkpoint.path().join("config.json")).unwrap();
-
-    let stream = Stream::new_with_device(&topology.device().unwrap());
-    let selected = SelectedMlxConstruction::from_request(
-        options,
-        eredu_core::SessionCapabilities::new(true, true, true),
-    )
-    .unwrap();
-    let error = match load_pipeline_model_with_options(plan, selected, &stream, &stream) {
-        Ok(model) => {
-            assert_eq!(model.stage_info().global_layer_range(), 0..1);
-            return;
-        }
-        Err(error) => error,
-    };
-    // This compact fixture intentionally retains two tensors outside the
-    // stage contract. Reaching binding validation after config.json is gone
-    // proves the distributed loader consumed the plan-owned JSON instead of
-    // reopening the artifact configuration.
-    assert!(
-        matches!(error, MlxError::StrictLoadValidation { .. }),
-        "expected checkpoint binding validation after planned configuration parsing, got {error}"
-    );
-}
-
-#[test]
-fn pipeline_identity_preserves_family_and_effective_wrapper_type() {
-    let checkpoint = tempfile::tempdir().unwrap();
-    write_qwen_fixture(checkpoint.path(), "qwen3_moe");
-    let topology =
-        MlxParallelPlan::for_rank(0, 1, 2, 1, DeviceAssignment::new(DeviceType::Cpu, 0)).unwrap();
-    let stream = Stream::new_with_device(&topology.device().unwrap());
-    let model = load_prepared_pipeline_model(
-        checkpoint.path(),
-        MlxLoadRequest::with_parallel(
-            topology,
-            eredu_runtime::PipelineWireContract::new(
-                eredu_runtime::PipelineActivationDtype::Float32,
-            ),
-        ),
-        &stream,
-    );
-
-    assert_eq!(model.model_family(), ModelKind::Qwen3);
-    assert_eq!(model.effective_model_type(), "qwen3_moe");
-
-    let checkpoint = tempfile::tempdir().unwrap();
-    write_qwen35_multimodal_fixture(checkpoint.path(), true);
-    let topology =
-        MlxParallelPlan::for_rank(0, 1, 2, 1, DeviceAssignment::new(DeviceType::Cpu, 0)).unwrap();
-    let stream = Stream::new_with_device(&topology.device().unwrap());
-    let model = load_prepared_pipeline_model(
-        checkpoint.path(),
-        MlxLoadRequest::with_parallel(
-            topology,
-            eredu_runtime::PipelineWireContract::new(
-                eredu_runtime::PipelineActivationDtype::Float32,
-            ),
-        ),
-        &stream,
-    );
-
-    assert_eq!(model.model_family(), ModelKind::Qwen35);
-    assert_eq!(model.effective_model_type(), "qwen3_5_moe_text");
-}
-
-#[test]
-fn inkling_pipeline_reports_static_embedded_mtp_ownership() {
-    let checkpoint = tempfile::tempdir().unwrap();
-    write_inkling_pipeline_mtp_fixture(checkpoint.path());
-
-    for rank in 0..2 {
-        let topology =
-            MlxParallelPlan::for_rank(rank, 1, 2, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
-                .unwrap();
-        let stream = Stream::new_with_device(&topology.device().unwrap());
-        let model = load_prepared_pipeline_model(
-            checkpoint.path(),
-            MlxLoadRequest::with_parallel(
-                topology,
-                eredu_runtime::PipelineWireContract::new(
-                    eredu_runtime::PipelineActivationDtype::Float32,
-                ),
-            ),
-            &stream,
-        );
-
-        assert_eq!(
-            model.speculative_capability(),
-            SpeculativeCapability::Ready {
-                draft_source: SpeculativeDraftSource::Embedded,
-            }
-        );
-        assert_eq!(model.stage_info().global_embedded_mtp_layers(), 2);
-        assert_eq!(model.stage_info().owns_embedded_mtp(), rank == 1);
-        assert_eq!(
-            model.stage_info().embedded_mtp_layers(),
-            if rank == 1 { 2 } else { 0 }
-        );
-    }
+    )?;
+    Ok(output.into_requests().into_iter().next().unwrap())
 }
 
 #[test]
 fn pipeline_activation_dtype_comes_from_wire_contract_not_weights() {
     let checkpoint = tempfile::tempdir().unwrap();
     write_fixture(checkpoint.path());
-    let topology =
-        MlxParallelPlan::for_rank(0, 1, 2, 1, DeviceAssignment::new(DeviceType::Cpu, 0)).unwrap();
+    let topology = crate::test_parallel_rank(0, 1, 2, 1);
     let wire_contract =
         eredu_runtime::PipelineWireContract::new(eredu_runtime::PipelineActivationDtype::Bfloat16);
-    let stream = Stream::new_with_device(&topology.device().unwrap());
-    let model = load_prepared_pipeline_model(
-        checkpoint.path(),
-        MlxLoadRequest::with_parallel(topology, wire_contract),
-        &stream,
+    let request = MlxLoadRequest::with_parallel(
+        topology,
+        DeviceAssignment::new(DeviceType::Cpu, 0),
+        wire_contract,
+        4,
+        4096,
+        ring_completion_policy(),
     );
+    let inspection = eredu_architectures::configuration::inspect_artifact(checkpoint.path())
+        .expect("fixture inspection");
+    let policy = request.preparation_policy().unwrap();
+    let selected =
+        crate::composition::mlx::loading::select_preparation(&inspection, request, policy)
+            .expect("public neutral selection");
 
-    assert_eq!(model.stage_info().wire_contract(), wire_contract);
+    assert_eq!(
+        selected.partitioned_activation_dtype(),
+        Some(wire_contract.activation_dtype())
+    );
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -365,7 +243,9 @@ enum FixtureFamily {
     Gemma,
     MuseGlimmer,
     Qwen2,
+    Qwen2Gguf,
     Qwen3,
+    Qwen3Gguf,
     Qwen3Moe,
     Qwen3MoeTied,
     Qwen3MoeGguf,
@@ -383,27 +263,18 @@ enum FixtureFamily {
     Qwen35,
     Qwen35Moe,
     Qwen35Multimodal,
+    Qwen35ZeroPrediction,
     Qwen35MoeMultimodal,
     Qwen3Vl,
     Qwen3VlMoe,
     Inkling,
+    InklingDense,
+    InklingDenseMultimodal,
     InklingMultimodal,
     InklingGguf,
 }
 
 impl FixtureFamily {
-    const fn is_qwen_hybrid(self) -> bool {
-        matches!(
-            self,
-            Self::Qwen3Next
-                | Self::Qwen3NextMoe
-                | Self::Qwen35
-                | Self::Qwen35Moe
-                | Self::Qwen35Multimodal
-                | Self::Qwen35MoeMultimodal
-        )
-    }
-
     const fn name(self) -> &'static str {
         match self {
             Self::Llama => "llama",
@@ -414,7 +285,9 @@ impl FixtureFamily {
             Self::Gemma => "gemma",
             Self::MuseGlimmer => "muse-glimmer",
             Self::Qwen2 => "qwen2",
+            Self::Qwen2Gguf => "qwen2-gguf",
             Self::Qwen3 => "qwen3",
+            Self::Qwen3Gguf => "qwen3-gguf",
             Self::Qwen3Moe => "qwen3-moe",
             Self::Qwen3MoeTied => "qwen3-moe-tied",
             Self::Qwen3MoeGguf => "qwen3-moe-gguf",
@@ -432,10 +305,13 @@ impl FixtureFamily {
             Self::Qwen35 => "qwen3.5",
             Self::Qwen35Moe => "qwen3.5-moe",
             Self::Qwen35Multimodal => "qwen3.5-multimodal",
+            Self::Qwen35ZeroPrediction => "qwen3.5-zero-prediction",
             Self::Qwen35MoeMultimodal => "qwen3.5-moe-multimodal",
             Self::Qwen3Vl => "qwen3-vl",
             Self::Qwen3VlMoe => "qwen3-vl-moe",
             Self::Inkling => "inkling",
+            Self::InklingDense => "inkling-dense",
+            Self::InklingDenseMultimodal => "inkling-dense-multimodal",
             Self::InklingMultimodal => "inkling-multimodal",
             Self::InklingGguf => "inkling-gguf",
         }
@@ -451,7 +327,9 @@ impl FixtureFamily {
             Self::Gemma,
             Self::MuseGlimmer,
             Self::Qwen2,
+            Self::Qwen2Gguf,
             Self::Qwen3,
+            Self::Qwen3Gguf,
             Self::Qwen3Moe,
             Self::Qwen3MoeTied,
             Self::Qwen3MoeGguf,
@@ -469,10 +347,13 @@ impl FixtureFamily {
             Self::Qwen35,
             Self::Qwen35Moe,
             Self::Qwen35Multimodal,
+            Self::Qwen35ZeroPrediction,
             Self::Qwen35MoeMultimodal,
             Self::Qwen3Vl,
             Self::Qwen3VlMoe,
             Self::Inkling,
+            Self::InklingDense,
+            Self::InklingDenseMultimodal,
             Self::InklingMultimodal,
             Self::InklingGguf,
         ] {
@@ -491,7 +372,9 @@ impl FixtureFamily {
             | Self::DeepSeekV4
             | Self::DeepSeekGguf
             | Self::Qwen2
+            | Self::Qwen2Gguf
             | Self::Qwen3
+            | Self::Qwen3Gguf
             | Self::Qwen3Moe
             | Self::Qwen3MoeTied
             | Self::Qwen3MoeGguf
@@ -507,9 +390,17 @@ impl FixtureFamily {
             | Self::Qwen35
             | Self::Qwen35Moe
             | Self::Qwen35Multimodal => 2,
-            Self::Qwen35MoeMultimodal | Self::Qwen3Vl | Self::Qwen3VlMoe | Self::MuseGlimmer => 2,
+            Self::Qwen35ZeroPrediction
+            | Self::Qwen35MoeMultimodal
+            | Self::Qwen3Vl
+            | Self::Qwen3VlMoe
+            | Self::MuseGlimmer => 2,
             Self::Gemma | Self::NemotronH | Self::NemotronHGguf => 4,
-            Self::Inkling | Self::InklingMultimodal | Self::InklingGguf => 3,
+            Self::Inkling
+            | Self::InklingDense
+            | Self::InklingDenseMultimodal
+            | Self::InklingMultimodal
+            | Self::InklingGguf => 3,
         }
     }
 
@@ -519,21 +410,39 @@ impl FixtureFamily {
             (Self::Gemma, 1) => 1..4,
             (Self::NemotronH | Self::NemotronHGguf, 0) => 0..2,
             (Self::NemotronH | Self::NemotronHGguf, 1) => 2..4,
-            (Self::Inkling | Self::InklingMultimodal | Self::InklingGguf, 0) => 0..2,
-            (Self::Inkling | Self::InklingMultimodal | Self::InklingGguf, 1) => 2..3,
+            (
+                Self::Inkling
+                | Self::InklingDense
+                | Self::InklingDenseMultimodal
+                | Self::InklingMultimodal
+                | Self::InklingGguf,
+                0,
+            ) => 0..2,
+            (
+                Self::Inkling
+                | Self::InklingDense
+                | Self::InklingDenseMultimodal
+                | Self::InklingMultimodal
+                | Self::InklingGguf,
+                1,
+            ) => 2..3,
             (_, rank) => rank..rank + 1,
         }
     }
 
     fn expert_layer_count(self, range: std::ops::Range<usize>) -> usize {
         match self {
-            Self::DeepSeek | Self::DeepSeekGguf | Self::KimiLinear | Self::KimiLinearGguf => {
-                range.filter(|index| *index == 1).count()
-            }
+            Self::DeepSeek
+            | Self::DeepSeekGguf
+            | Self::Lfm2Moe
+            | Self::Lfm2MoeGguf
+            | Self::KimiLinear
+            | Self::KimiLinearGguf => range.filter(|index| *index == 1).count(),
             Self::DeepSeekV4 => range.len(),
             Self::Inkling | Self::InklingMultimodal | Self::InklingGguf => {
                 range.filter(|index| matches!(*index, 1 | 2)).count()
             }
+            Self::InklingDense | Self::InklingDenseMultimodal => 0,
             Self::NemotronH => range.filter(|index| *index == 2).count(),
             Self::NemotronHGguf => range.filter(|index| matches!(*index, 1 | 2)).count(),
             _ => range.len(),
@@ -548,8 +457,8 @@ impl FixtureFamily {
             Self::DeepSeekV4 => "deepseek_v4",
             Self::Gemma => "gemma4_text",
             Self::MuseGlimmer => "muse_glimmer_text",
-            Self::Qwen2 => "qwen2",
-            Self::Qwen3 => "qwen3",
+            Self::Qwen2 | Self::Qwen2Gguf => "qwen2",
+            Self::Qwen3 | Self::Qwen3Gguf => "qwen3",
             Self::Qwen3Moe | Self::Qwen3MoeTied | Self::Qwen3MoeGguf => "qwen3_moe",
             Self::GptOss | Self::GptOssGguf => "gpt_oss",
             Self::Lfm2 => "lfm2",
@@ -557,40 +466,19 @@ impl FixtureFamily {
             Self::KimiLinear | Self::KimiLinearGguf => "kimi_linear",
             Self::NemotronH | Self::NemotronHGguf => "nemotron_h",
             Self::Qwen3Next | Self::Qwen3NextMoe => "qwen3_next",
-            Self::Qwen35 | Self::Qwen35Multimodal => "qwen3_5_text",
+            Self::Qwen35 | Self::Qwen35Multimodal | Self::Qwen35ZeroPrediction => "qwen3_5_text",
             Self::Qwen35Moe | Self::Qwen35MoeMultimodal => "qwen3_5_moe_text",
             Self::Qwen3Vl => "qwen3_vl_text",
             Self::Qwen3VlMoe => "qwen3_vl_moe_text",
-            Self::Inkling | Self::InklingMultimodal | Self::InklingGguf => "inkling_mm_model",
+            Self::Inkling
+            | Self::InklingDense
+            | Self::InklingDenseMultimodal
+            | Self::InklingMultimodal
+            | Self::InklingGguf => "inkling_mm_model",
         }
     }
 
-    const fn layer_prefix(self) -> &'static str {
-        match self {
-            Self::Gemma | Self::MuseGlimmer | Self::Qwen3Vl | Self::Qwen3VlMoe => {
-                "model.language_model.layers."
-            }
-            Self::DeepSeekV4 => "layers.",
-            Self::NemotronH | Self::NemotronHGguf => "backbone.layers.",
-            Self::Inkling | Self::InklingMultimodal | Self::InklingGguf => "model.llm.layers.",
-            _ => "model.layers.",
-        }
-    }
-
-    const fn has_gguf_source(self) -> bool {
-        matches!(
-            self,
-            Self::DeepSeekGguf
-                | Self::KimiLinearGguf
-                | Self::InklingGguf
-                | Self::Qwen3MoeGguf
-                | Self::GptOssGguf
-                | Self::Lfm2MoeGguf
-                | Self::NemotronHGguf
-        )
-    }
-
-    const fn needs_resident_reference(self) -> bool {
+    const fn needs_opaque_reference(self) -> bool {
         matches!(
             self,
             Self::Llama
@@ -598,49 +486,22 @@ impl FixtureFamily {
                 | Self::Gemma
                 | Self::MuseGlimmer
                 | Self::Qwen2
+                | Self::Qwen2Gguf
                 | Self::Qwen3
-                | Self::DeepSeek
-                | Self::DeepSeekV4
-                | Self::DeepSeekGguf
-                | Self::KimiLinear
-                | Self::KimiLinearGguf
-                | Self::NemotronH
-                | Self::NemotronHGguf
-                | Self::Qwen3Next
+                | Self::Qwen3Gguf
                 | Self::Qwen3Moe
-                | Self::Qwen3MoeTied
-                | Self::Qwen3MoeGguf
                 | Self::GptOss
-                | Self::GptOssGguf
-                | Self::Lfm2MoeGguf
-                | Self::Qwen3NextMoe
-                | Self::Qwen35
-                | Self::Qwen35Moe
-                | Self::Qwen35Multimodal
-                | Self::Qwen35MoeMultimodal
-                | Self::Qwen3Vl
-                | Self::Qwen3VlMoe
-                | Self::Inkling
-                | Self::InklingMultimodal
-                | Self::InklingGguf
-        )
-    }
-
-    const fn needs_tp2_opaque_reference(self) -> bool {
-        matches!(
-            self,
-            Self::Llama
-                | Self::Mistral
-                | Self::Gemma
-                | Self::MuseGlimmer
-                | Self::Qwen2
-                | Self::Qwen3
+                | Self::KimiLinear
+                | Self::NemotronH
                 | Self::Qwen3Next
                 | Self::Qwen35
                 | Self::Qwen35Multimodal
+                | Self::Qwen35ZeroPrediction
                 | Self::Qwen3Vl
                 | Self::DeepSeek
                 | Self::DeepSeekV4
+                | Self::InklingDense
+                | Self::InklingDenseMultimodal
         )
     }
 
@@ -648,7 +509,9 @@ impl FixtureFamily {
         matches!(
             self,
             Self::InklingMultimodal
+                | Self::InklingDenseMultimodal
                 | Self::Qwen35Multimodal
+                | Self::Qwen35ZeroPrediction
                 | Self::Qwen35MoeMultimodal
                 | Self::Qwen3Vl
                 | Self::Qwen3VlMoe
@@ -664,6 +527,7 @@ impl FixtureFamily {
             | Self::Qwen35
             | Self::Qwen35Moe
             | Self::Qwen35Multimodal
+            | Self::Qwen35ZeroPrediction
             | Self::Qwen35MoeMultimodal => 2e-3,
             Self::NemotronH | Self::NemotronHGguf => 1e-3,
             _ if self.is_multimodal() => 5e-4,
@@ -694,50 +558,460 @@ fn pipeline_ring_worker() {
             Some("tp-pp-ep") => (2, 2, 2),
             Some(other) => panic!("unexpected Cartesian pipeline axes {other:?}"),
         };
-    let topology = MlxParallelPlan::for_group(
-        &native_group,
-        tensor_parallel_size,
-        pipeline_parallel_size,
-        expert_parallel_size,
-        DeviceAssignment::new(DeviceType::Cpu, 0),
+    let topology = eredu_core::ParallelRankTopology::new(
+        eredu_core::ParallelTopology::new(
+            tensor_parallel_size,
+            pipeline_parallel_size,
+            expert_parallel_size,
+            1,
+        )
+        .unwrap(),
+        expected_rank,
     )
     .unwrap();
     assert_eq!(topology.global_rank(), expected_rank);
     let pipeline_rank = topology.pipeline_parallel_rank();
-    let stream = Stream::new_with_device(&topology.device().unwrap());
+    let neutral_gemma_config =
+        (family == FixtureFamily::Gemma && std::env::var_os(OPAQUE_SESSION).is_some()).then(|| {
+            let config: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(checkpoint.join("config.json")).expect("Gemma config"),
+            )
+            .expect("Gemma JSON config");
+            config
+        });
+    let neutral_gemma_layers = neutral_gemma_config.as_ref().map(|config| {
+        config["text_config"]["num_hidden_layers"]
+            .as_u64()
+            .expect("Gemma text layer count") as usize
+    });
+    let neutral_prediction_target_layers = ((family == FixtureFamily::Inkling
+        && std::env::var_os(OPAQUE_INKLING_MTP).is_some())
+        || (family == FixtureFamily::Qwen35Multimodal
+            && std::env::var_os(OPAQUE_QWEN_HYBRID_MTP).is_some())
+        || (family == FixtureFamily::NemotronH
+            && std::env::var_os(OPAQUE_NEMOTRON_H_MTP).is_some()))
+    .then(|| {
+        let config: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(checkpoint.join("config.json")).expect("prediction target config"),
+        )
+        .expect("prediction target JSON config");
+        if family == FixtureFamily::NemotronH {
+            config["num_hidden_layers"]
+                .as_u64()
+                .expect("prediction target layer count") as usize
+        } else {
+            config["text_config"]["num_hidden_layers"]
+                .as_u64()
+                .expect("prediction target layer count") as usize
+        }
+    });
+    let neutral_qwen_vl_config =
+        (matches!(family, FixtureFamily::Qwen3Vl | FixtureFamily::Qwen3VlMoe)
+            && std::env::var_os(OPAQUE_QWEN3_VL_MEDIA).is_some())
+        .then(|| {
+            serde_json::from_slice::<serde_json::Value>(
+                &std::fs::read(checkpoint.join("config.json")).expect("Qwen3-VL config"),
+            )
+            .expect("Qwen3-VL JSON config")
+        });
+    let local_layer_range =
+        if let Some(layers) = neutral_gemma_layers.or(neutral_prediction_target_layers) {
+            layers * pipeline_rank / pipeline_parallel_size
+                ..layers * (pipeline_rank + 1) / pipeline_parallel_size
+        } else if pipeline_parallel_size == 1 {
+            0..family.layer_count()
+        } else {
+            family.stage_range(pipeline_rank)
+        };
+    let public_output_owner = topology
+        .topology()
+        .rank_for(eredu_core::ParallelCoordinates::new(
+            0,
+            pipeline_parallel_size - 1,
+            0,
+            topology.data_parallel_rank(),
+        ))
+        .unwrap();
+    let owns_public_output = expected_rank == public_output_owner;
+    let device = DeviceAssignment::new(DeviceType::Cpu, 0);
+    let stream = Stream::new_with_device(&device.device().unwrap());
     if std::env::var_os(OPAQUE_SESSION).is_some() {
+        let dense_composite_neutral = matches!(
+            family,
+            FixtureFamily::MuseGlimmer
+                | FixtureFamily::InklingDense
+                | FixtureFamily::InklingDenseMultimodal
+                | FixtureFamily::Qwen35ZeroPrediction
+        ) && matches!(
+            cartesian_axes.as_deref(),
+            None | Some("tp") | Some("pp") | Some("tp-pp")
+        );
+        let dense_composite_neutral = dense_composite_neutral
+            || (family == FixtureFamily::Qwen35Multimodal
+                && std::env::var_os(OPAQUE_QWEN_HYBRID_MTP).is_some()
+                && matches!(
+                    cartesian_axes.as_deref(),
+                    None | Some("tp") | Some("pp") | Some("tp-pp")
+                ));
+        let dense_composite_auxiliary_units = dense_composite_neutral
+            .then(|| {
+                serde_json::from_slice::<serde_json::Value>(
+                    &std::fs::read(checkpoint.join("config.json")).expect("dense composite config"),
+                )
+                .expect("dense composite JSON config")
+            })
+            .map_or(0, |config| match family {
+                FixtureFamily::MuseGlimmer => {
+                    let depth = config["vision_config"]["num_hidden_layers"]
+                        .as_u64()
+                        .unwrap_or(0) as usize;
+                    if pipeline_rank == 0 {
+                        depth
+                    } else {
+                        0
+                    }
+                }
+                FixtureFamily::Qwen35ZeroPrediction | FixtureFamily::Qwen35Multimodal => {
+                    let depth = config["vision_config"]["depth"].as_u64().unwrap_or(0) as usize;
+                    depth * (pipeline_rank + 1) / pipeline_parallel_size
+                        - depth * pipeline_rank / pipeline_parallel_size
+                }
+                _ => 0,
+            });
+        let routed_neutral = (matches!(
+            family,
+            FixtureFamily::Qwen3Moe
+                | FixtureFamily::Qwen3MoeGguf
+                | FixtureFamily::GptOss
+                | FixtureFamily::GptOssGguf
+                | FixtureFamily::DeepSeek
+                | FixtureFamily::DeepSeekGguf
+                | FixtureFamily::NemotronH
+                | FixtureFamily::NemotronHGguf
+                | FixtureFamily::Lfm2MoeGguf
+                | FixtureFamily::KimiLinearGguf
+                | FixtureFamily::Qwen3VlMoe
+                | FixtureFamily::Inkling
+                | FixtureFamily::InklingMultimodal
+        ) || (family == FixtureFamily::DeepSeekV4
+            && (std::env::var_os(PREDICTION_FREE_TARGET).is_some()
+                || std::env::var_os(PREPARED_SPECULATIVE_CAPABILITY).is_some())))
+            && matches!(
+                cartesian_axes.as_deref(),
+                None | Some("tp")
+                    | Some("ep")
+                    | Some("tp-pp")
+                    | Some("tp-ep")
+                    | Some("pp-ep")
+                    | Some("tp-pp-ep")
+            );
+        let prove_prepared_communication_lifecycle = dense_composite_neutral
+            || routed_neutral
+            || (family == FixtureFamily::Qwen3Vl
+                && matches!(cartesian_axes.as_deref(), None | Some("tp") | Some("tp-pp")))
+            || (matches!(
+                family,
+                FixtureFamily::Llama
+                    | FixtureFamily::Mistral
+                    | FixtureFamily::Qwen2
+                    | FixtureFamily::Qwen2Gguf
+                    | FixtureFamily::Qwen3
+                    | FixtureFamily::Qwen3Gguf
+                    | FixtureFamily::KimiLinear
+                    | FixtureFamily::NemotronH
+                    | FixtureFamily::Lfm2
+                    | FixtureFamily::Gemma
+            ) && matches!(
+                cartesian_axes.as_deref(),
+                None | Some("tp") | Some("pp") | Some("tp-pp")
+            ));
+        let prove_direct_expert_communication =
+            cartesian_axes.as_deref() == Some("ep") && !routed_neutral;
+        if prove_prepared_communication_lifecycle || prove_direct_expert_communication {
+            crate::composition::mlx::path_instrumentation::reset();
+        }
         let backend = crate::native::distributed_backend(&stream, &stream, &native_group);
         let selected_paged = PagedCacheOptions::new(1, 32768, 32768, 1)
             .unwrap()
             .with_full_attention(true);
-        let load_options = if std::env::var_os(EXPERT_CACHE).is_some() {
-            MlxLoadRequest::with_parallel(
+        let dense_stream = std::env::var_os(DENSE_STREAM).is_some();
+        let layerwise_host = std::env::var_os(LAYERWISE_HOST).is_some();
+        assert!(!(dense_stream && layerwise_host));
+        let load_options = if std::env::var_os(REQUANTIZE).is_some() {
+            let request = if family == FixtureFamily::NemotronH {
+                eredu_core::QuantizationRequest::MxFp4
+            } else {
+                eredu_core::QuantizationRequest::Affine {
+                    group_size: 32,
+                    bits: 4,
+                }
+            };
+            MlxLoadRequest::with_quantization(request).with_parallel_topology(
                 topology,
+                device,
                 eredu_runtime::PipelineWireContract::new(
                     eredu_runtime::PipelineActivationDtype::Float32,
                 ),
+                4,
+                4096,
+                ring_completion_policy(),
             )
-            .with_weight_residency(WeightResidency::with_independent_parameter_banks(
-                OrdinaryWeightResidency::FullyResident,
-                ParameterBankLoadOptions::default(),
-            ))
         } else {
             MlxLoadRequest::with_parallel(
                 topology,
+                device,
                 eredu_runtime::PipelineWireContract::new(
                     eredu_runtime::PipelineActivationDtype::Float32,
                 ),
+                4,
+                4096,
+                ring_completion_policy(),
             )
+        };
+        let load_options = if std::env::var_os(EXPERT_CACHE).is_some() {
+            let ordinary = if dense_stream {
+                OrdinaryWeightResidency::DenseDiskStream(
+                    DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1).unwrap(),
+                )
+            } else if layerwise_host {
+                OrdinaryWeightResidency::LayerwiseHost(LayerwiseLoadOptions::new(
+                    OffloadConfig::new(None, None, 1).unwrap(),
+                ))
+            } else {
+                OrdinaryWeightResidency::FullyResident
+            };
+            let bank = if std::env::var_os(EXPERT_CACHE_EVICTION).is_some() {
+                ParameterBankLoadOptions::new(
+                    OffloadConfig::new(Some(12_288), Some(0), 1).unwrap(),
+                    u64::MAX,
+                    1 << 30,
+                )
+                .unwrap()
+            } else {
+                ParameterBankLoadOptions::default()
+            };
+            load_options.with_weight_residency(WeightResidency::with_independent_parameter_banks(
+                ordinary, bank,
+            ))
+        } else if dense_stream {
+            load_options.with_weight_residency(WeightResidency::dense_disk_stream(
+                DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1).unwrap(),
+            ))
+        } else if layerwise_host {
+            load_options.with_weight_residency(WeightResidency::layerwise_host(
+                LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap()),
+            ))
+        } else {
+            load_options
         }
         .with_state_residency(CacheResidencyPolicy::Paged(selected_paged));
-        let model = load_model(&backend, &checkpoint, load_options).unwrap();
+        if std::env::var_os(OPAQUE_DEEPSEEK_MTP_TARGET).is_some()
+            && family == FixtureFamily::DeepSeekV4
+        {
+            let inspection = eredu_architectures::configuration::inspect_artifact(&checkpoint)
+                .expect("V4 prediction artifact inspection");
+            let policy = load_options.preparation_policy().unwrap();
+            let selected = crate::composition::mlx::loading::select_preparation(
+                &inspection,
+                load_options.clone(),
+                policy,
+            )
+            .expect("V4 prediction target selection");
+            assert_eq!(
+                selected.prediction_extension_kind(),
+                Some(
+                    eredu_architectures::configuration::PredictionExtensionKind::DeepSeekV4Embedded
+                )
+            );
+            assert!(selected.realized_communication_manifest().is_some());
+            assert!(selected.rank_context().is_some());
+        }
+        let model = match load_model(&backend, &checkpoint, load_options) {
+            Ok(_) if std::env::var_os(EXPECTED_UNSUPPORTED_DIRECT_PARTITION).is_some() => {
+                panic!("unsupported direct partition route unexpectedly loaded")
+            }
+            Ok(model) => model,
+            Err(error) if std::env::var_os(EXPECTED_UNSUPPORTED_DIRECT_PARTITION).is_some() => {
+                assert!(
+                    error
+                        .to_string()
+                        .contains("has no neutral production implementation"),
+                    "unsupported direct partition failed for an unexpected reason: {error}"
+                );
+                return;
+            }
+            Err(error) => panic!("failed to load Ring fixture: {error}"),
+        };
+        if prove_prepared_communication_lifecycle {
+            assert_eq!(
+                crate::composition::mlx::path_instrumentation::snapshot().payload_opens,
+                1,
+                "included dense decoder must open its admitted payload store exactly once"
+            );
+            assert_eq!(
+                crate::composition::mlx::path_instrumentation::communication_realization_attempts(),
+                1,
+                "included dense decoder must realize its prepared communication exactly once before payload construction"
+            );
+            assert_eq!(
+                crate::composition::mlx::path_instrumentation::manifest_communication_realization_attempts(),
+                1,
+                "eligible dense-decoder TP/PP must realize its neutral manifest exactly once"
+            );
+            if matches!(
+                cartesian_axes.as_deref(),
+                None | Some("tp")
+                    | Some("pp")
+                    | Some("ep")
+                    | Some("tp-pp")
+                    | Some("tp-ep")
+                    | Some("pp-ep")
+                    | Some("tp-pp-ep")
+            ) {
+                assert_eq!(
+                    crate::composition::mlx::path_instrumentation::neutral_partitioned_constructions(),
+                    1,
+                    "eligible dense-decoder TP/PP must construct the neutral partitioned session"
+                );
+                assert_eq!(
+                    crate::composition::mlx::path_instrumentation::snapshot().unit_constructions,
+                    local_layer_range.len()
+                        + neutral_gemma_config.as_ref().map_or(0, |config| {
+                            if pipeline_rank == 0 {
+                                ["vision_config", "audio_config"]
+                                    .iter()
+                                    .map(|root| {
+                                        config[*root]["num_hidden_layers"].as_u64().unwrap_or(0)
+                                            as usize
+                                    })
+                                    .sum::<usize>()
+                            } else {
+                                0
+                            }
+                        })
+                        + neutral_qwen_vl_config.as_ref().map_or(0, |config| {
+                            let depth =
+                                config["vision_config"]["depth"].as_u64().unwrap_or(0) as usize;
+                            depth * (pipeline_rank + 1) / pipeline_parallel_size
+                                - depth * pipeline_rank / pipeline_parallel_size
+                        })
+                        + dense_composite_auxiliary_units,
+                    "neutral partition construction must bind every local unit exactly once"
+                );
+                assert_eq!(
+                    crate::composition::mlx::path_instrumentation::snapshot().materializations,
+                    usize::from(std::env::var_os(REQUANTIZE).is_some()),
+                    "neutral construction must execute exactly the selected transform groups"
+                );
+            }
+            if neutral_gemma_layers.is_some() && pipeline_parallel_size > 1 {
+                let counts = crate::composition::mlx::path_instrumentation::snapshot();
+                let has_media = neutral_gemma_config.as_ref().is_some_and(|config| {
+                    config.get("vision_config").is_some() || config.get("audio_config").is_some()
+                });
+                assert_eq!(
+                    counts.local_static_bindings,
+                    if has_media && pipeline_rank == 0 {
+                        12
+                    } else if pipeline_rank == 0 {
+                        1
+                    } else {
+                        2
+                    },
+                    "only exact first-owner ingress or last-owner output statics may be bound"
+                );
+                assert_eq!(
+                    counts.excluded_local_static_parameters,
+                    if has_media && pipeline_rank != 0 {
+                        12
+                    } else if pipeline_rank == 0 {
+                        2
+                    } else {
+                        1
+                    },
+                    "every unowned static definition must remain unbound and unread"
+                );
+            }
+            if neutral_qwen_vl_config.is_some() {
+                let counts = crate::composition::mlx::path_instrumentation::snapshot();
+                assert!(
+                    counts.local_static_bindings > 0,
+                    "Qwen3-VL must bind its selected stage-local static tasks"
+                );
+                if pipeline_parallel_size == 1 {
+                    assert_eq!(
+                        counts.excluded_local_static_parameters, 0,
+                        "Qwen3-VL pure TP owns every selected static task"
+                    );
+                } else {
+                    assert!(
+                        counts.excluded_local_static_parameters > 0,
+                        "Qwen3-VL PP must leave non-owned static parameters unbound"
+                    );
+                }
+            }
+        }
+        if prove_direct_expert_communication {
+            assert_eq!(
+                crate::composition::mlx::path_instrumentation::communication_realization_attempts(),
+                1
+            );
+            assert_eq!(
+                crate::composition::mlx::path_instrumentation::manifest_communication_realization_attempts(),
+                0,
+                "direct expert communication must not realize a partition manifest"
+            );
+        }
         let expected_effective_model_type = family.effective_model_type();
         let expected_model_family =
             ModelKind::resolve_model_type(expected_effective_model_type).unwrap();
         assert_eq!(model.model_family(), expected_model_family);
         assert_eq!(model.effective_model_type(), expected_effective_model_type);
+        if dense_stream {
+            let report = model.dense_stream_report().unwrap().unwrap();
+            assert_eq!(report.planned_layer_count(), local_layer_range.len());
+            let streamed = report
+                .residency()
+                .units()
+                .iter()
+                .filter(|unit| unit.planned_tier() == eredu_core::residency::MemoryTier::Disk)
+                .collect::<Vec<_>>();
+            assert_eq!(streamed.len(), local_layer_range.len());
+            assert!(streamed
+                .iter()
+                .all(|unit| !unit.host_resident() && !unit.device_resident()));
+        }
+        if layerwise_host {
+            assert!(model.dense_stream_report().unwrap().is_none());
+            let report = model.residency_report().unwrap().unwrap();
+            let layerwise = report
+                .units()
+                .iter()
+                .filter(|unit| unit.planned_tier() == eredu_core::residency::MemoryTier::Host)
+                .collect::<Vec<_>>();
+            assert_eq!(layerwise.len(), local_layer_range.len());
+            assert!(layerwise
+                .iter()
+                .all(|unit| unit.host_resident() && !unit.device_resident()));
+        }
         let expected_speculative_capability = model.speculative_capability_for_test();
+        if std::env::var_os(OPAQUE_DEEPSEEK_MTP_TARGET).is_some() {
+            assert_eq!(
+                expected_speculative_capability,
+                SpeculativeCapability::Ready {
+                    draft_source: eredu_core::SpeculativeDraftSource::Embedded,
+                },
+                "the complete prediction artifact must retain its embedded-draft capability on the neutral target"
+            );
+        }
         let mut runtime = eredu_core::ModelRuntime::from_prepared(backend, model).unwrap();
+        if prove_prepared_communication_lifecycle {
+            assert_eq!(
+                crate::composition::mlx::path_instrumentation::communication_realization_attempts(),
+                1,
+                "session creation must consume the prepared communicator without recreating it"
+            );
+        }
         if std::env::var_os(OPAQUE_TEXT_GENERATION).is_some() {
             let sampling = eredu_core::resolve_generation_config(
                 None,
@@ -810,10 +1084,18 @@ fn pipeline_ring_worker() {
             eredu_core::AdmissionResult::Admitted(_)
         ));
         <MlxBackend<'_> as eredu_core::ModelCapabilityBackend>::static_memory(&runtime).unwrap();
+        if std::env::var_os(PREPARED_SPECULATIVE_CAPABILITY).is_some() {
+            return;
+        }
         let image_mode = std::env::var_os(OPAQUE_MUSE_IMAGE).is_some();
         let inkling_media_mode = std::env::var_os(OPAQUE_INKLING_MEDIA).is_some();
         let inkling_mtp_mode = std::env::var_os(OPAQUE_INKLING_MTP).is_some();
+        let qwen_hybrid_mtp_mode = std::env::var_os(OPAQUE_QWEN_HYBRID_MTP).is_some();
+        let nemotron_h_mtp_mode = std::env::var_os(OPAQUE_NEMOTRON_H_MTP).is_some();
+        let deepseek_mtp_target_mode = std::env::var_os(OPAQUE_DEEPSEEK_MTP_TARGET).is_some();
         let gemma4_media_mode = std::env::var_os(OPAQUE_GEMMA4_MEDIA).is_some();
+        let qwen3_vl_media_mode = std::env::var_os(OPAQUE_QWEN3_VL_MEDIA).is_some();
+        let qwen_conditional_media_mode = std::env::var_os(OPAQUE_QWEN_CONDITIONAL_MEDIA).is_some();
         let prompt = Array::from_slice(&[1u32, 2], &[1, 2]);
         let text_before = Array::from_slice(&[1u32], &[1, 1]);
         let text_after = Array::from_slice(&[2u32], &[1, 1]);
@@ -826,6 +1108,8 @@ fn pipeline_ring_worker() {
         let gemma4_grid = Array::from_slice(&[1i32, 2, 2], &[1, 3]);
         let gemma4_audio = Array::from_slice(&[0.01f32; 512], &[1, 4, 128]);
         let gemma4_audio_mask = Array::from_slice(&[true, true, true, true], &[1, 4]);
+        let qwen3_vl_grid = Array::from_slice(&[1i32, 2, 4], &[1, 3]);
+        let qwen3_vl_pixels = Array::from_slice(&[0.01f32; 96], &[8, 12]);
         let parts = if image_mode {
             vec![
                 text_input_part(&text_before),
@@ -876,6 +1160,16 @@ fn pipeline_ring_worker() {
                     [InputExtent::AudioValidFrames(4)],
                 ),
             ]
+        } else if qwen3_vl_media_mode || qwen_conditional_media_mode {
+            vec![
+                text_input_part(&prompt),
+                input_part(
+                    InputModality::Image,
+                    InputPayload::Tensor(qwen3_vl_pixels.clone()),
+                    [(InputMetadataKey::PatchGrid, qwen3_vl_grid.clone())],
+                    [],
+                ),
+            ]
         } else {
             vec![text_input_part(&prompt)]
         };
@@ -885,22 +1179,65 @@ fn pipeline_ring_worker() {
             vec![1, 2, 21, 20, 20, 20]
         } else if gemma4_media_mode {
             vec![1, 2, 30, 31]
+        } else if qwen3_vl_media_mode || qwen_conditional_media_mode {
+            vec![1, 2, 42, 42]
         } else {
             vec![1, 2]
         };
         let reference_input =
             PreparedModelInput::from_model_input(ModelInput::new(&parts)).unwrap();
-        let reference = (tensor_parallel_size == 2
-            && pipeline_parallel_size == 1
+        let reference = (((tensor_parallel_size == 2
+            && (pipeline_parallel_size == 1
+                || (pipeline_parallel_size == 2
+                    && matches!(
+                        family,
+                        FixtureFamily::Llama
+                            | FixtureFamily::Mistral
+                            | FixtureFamily::Qwen2
+                            | FixtureFamily::Qwen2Gguf
+                            | FixtureFamily::Qwen3
+                            | FixtureFamily::Qwen3Gguf
+                            | FixtureFamily::KimiLinear
+                            | FixtureFamily::Qwen3Moe
+                            | FixtureFamily::GptOss
+                            | FixtureFamily::DeepSeek
+                    ))))
+            || (tensor_parallel_size == 1
+                && pipeline_parallel_size == 2
+                && matches!(
+                    family,
+                    FixtureFamily::Llama
+                        | FixtureFamily::Mistral
+                        | FixtureFamily::Qwen2
+                        | FixtureFamily::Qwen2Gguf
+                        | FixtureFamily::Qwen3
+                        | FixtureFamily::Qwen3Gguf
+                        | FixtureFamily::KimiLinear
+                        | FixtureFamily::Qwen3Moe
+                        | FixtureFamily::GptOss
+                        | FixtureFamily::DeepSeek
+                )))
             && (expert_parallel_size == 1
-                || matches!(family, FixtureFamily::DeepSeek | FixtureFamily::DeepSeekV4))
-            && family.needs_tp2_opaque_reference())
-        .then(|| resident_reference_for_prepared(&checkpoint, &reference_input, &stream));
-        let reference_tolerance = if image_mode || gemma4_media_mode {
+                || matches!(
+                    family,
+                    FixtureFamily::DeepSeek
+                        | FixtureFamily::DeepSeekV4
+                        | FixtureFamily::Qwen3Moe
+                        | FixtureFamily::GptOss
+                ))
+            && family.needs_opaque_reference()
+            && std::env::var_os(OPAQUE_DEEPSEEK_MTP_TARGET).is_none()
+            && std::env::var_os(OPAQUE_QWEN_HYBRID_MTP).is_none()
+            && std::env::var_os(OPAQUE_NEMOTRON_H_MTP).is_none())
+        .then(|| resident_reference_for_prepared(&checkpoint, &reference_input));
+        let reference_tolerance = if image_mode || gemma4_media_mode || qwen_conditional_media_mode
+        {
             5e-4
         } else {
             family.comparison_tolerance()
         };
+        let neutral_forwards_before =
+            crate::composition::mlx::path_instrumentation::snapshot().forwards;
         if std::env::var_os(OPAQUE_INSPECTION).is_some() {
             let identity = runtime.session().prompt_cache_model_identity().unwrap();
             let layer_root = if family == FixtureFamily::Gemma {
@@ -930,49 +1267,212 @@ fn pipeline_ring_worker() {
                     .observations
                     .get(eredu_core::MODEL_LOGITS_OBSERVATION_PATH)
                     .is_some(),
-                pipeline_rank + 1 == pipeline_parallel_size
+                owns_public_output
             );
             return;
         }
-        if inkling_mtp_mode {
-            let identity = runtime.session().prompt_cache_model_identity().unwrap();
-            assert_eq!(
-                identity.layer_prefix_offsets().contains(&-1),
-                pipeline_rank + 1 == pipeline_parallel_size
-            );
+        if inkling_mtp_mode
+            || qwen_hybrid_mtp_mode
+            || nemotron_h_mtp_mode
+            || deepseek_mtp_target_mode
+        {
+            if inkling_mtp_mode || qwen_hybrid_mtp_mode || nemotron_h_mtp_mode {
+                let identity = runtime.session().prompt_cache_model_identity().unwrap();
+                assert!(
+                    !identity.layer_prefix_offsets().contains(&-1),
+                    "the neutral target cache must not absorb adapter-owned prediction state"
+                );
+            }
             let max_tokens = 3;
+            if deepseek_mtp_target_mode {
+                let vocabulary_size = if family == FixtureFamily::DeepSeekV4 {
+                    16
+                } else {
+                    8
+                };
+                let invalid_prompt = Array::from_slice(&[vocabulary_size], &[1, 1]);
+                let invalid_parts = [text_input_part(&invalid_prompt)];
+                let error = match run_neutral_embedded_mtp(
+                    &mut runtime,
+                    ModelInput::new(&invalid_parts).into(),
+                    SpeculativeConfig {
+                        max_tokens,
+                        max_draft_tokens: 1,
+                        temperature: 0.0,
+                        eos_token_ids: Vec::new(),
+                    },
+                ) {
+                    Ok(_) => panic!("out-of-domain target token unexpectedly entered prediction"),
+                    Err(error) => error,
+                };
+                assert!(
+                    error
+                        .to_string()
+                        .contains(&format!("token ID is outside 0..{vocabulary_size}")),
+                    "invalid prediction target failed for an unexpected reason: {error}"
+                );
+            }
             let output = run_neutral_embedded_mtp(
                 &mut runtime,
                 ModelInput::new(&parts).into(),
                 SpeculativeConfig {
                     max_tokens,
-                    max_draft_tokens: 2,
+                    max_draft_tokens: if deepseek_mtp_target_mode { 1 } else { 2 },
                     temperature: 0.0,
                     eos_token_ids: Vec::new(),
                 },
-            );
+            )
+            .unwrap();
             assert_eq!(output.token_ids().len(), max_tokens);
             assert_eq!(output.stats().emitted_tokens(), max_tokens);
             assert!(output.stats().draft_tokens() > 0);
+            if deepseek_mtp_target_mode || qwen_hybrid_mtp_mode || nemotron_h_mtp_mode {
+                let replay = run_neutral_embedded_mtp(
+                    &mut runtime,
+                    ModelInput::new(&parts).into(),
+                    SpeculativeConfig {
+                        max_tokens,
+                        max_draft_tokens: 1,
+                        temperature: 0.0,
+                        eos_token_ids: Vec::new(),
+                    },
+                )
+                .unwrap();
+                assert_eq!(
+                    replay.token_ids(),
+                    output.token_ids(),
+                    "a fresh prediction lane must not inherit target or extension cache state"
+                );
+                assert_eq!(replay.stats().emitted_tokens(), max_tokens);
+                assert!(replay.stats().draft_tokens() > 0);
+            }
             return;
         }
         let (backend, session) = runtime.parts_mut();
+        if neutral_gemma_layers.is_some() || neutral_qwen_vl_config.is_some() {
+            let unsupported_image = Array::from_slice(&[0.0f32; 4], &[1, 1, 4]);
+            let malformed_parts = [input_part(
+                InputModality::Image,
+                InputPayload::Tensor(unsupported_image),
+                [],
+                [],
+            )];
+            let before = crate::composition::mlx::path_instrumentation::snapshot();
+            let error = match session.prefill(backend, ModelInput::new(&malformed_parts).into()) {
+                Ok(_) => panic!("unselected Gemma image input unexpectedly entered execution"),
+                Err(error) => error,
+            };
+            let expected = if neutral_gemma_layers.is_some() && !gemma4_media_mode {
+                "prepared input modality image is outside the selected composite modalities {Text}"
+            } else {
+                "unsupported prepared input"
+            };
+            assert!(
+                error.to_string().contains(expected),
+                "malformed prepared input failed for an unexpected reason: {error}"
+            );
+            let after = crate::composition::mlx::path_instrumentation::snapshot();
+            assert_eq!(after.forwards, before.forwards);
+            assert_eq!(after.completions, before.completions);
+        }
+        let prompt_input = (dense_composite_neutral
+            || neutral_gemma_layers.is_some()
+            || neutral_qwen_vl_config.is_some()
+            || inkling_media_mode
+            || matches!(
+                family,
+                FixtureFamily::Inkling | FixtureFamily::Qwen35Multimodal
+            ))
+        .then(|| {
+            MlxModelInput::from(ModelInput::new(&parts)).with_semantic_content_fingerprint(
+                eredu_core::cache::prompt_cache_token_fingerprint(&prefix_tokens),
+            )
+        })
+        .transpose()
+        .unwrap();
+        let submitted_input = prompt_input
+            .clone()
+            .unwrap_or_else(|| ModelInput::new(&parts).into());
         let mut output = session
-            .prefill(backend, ModelInput::new(&parts).into())
+            .prefill(backend, submitted_input)
             .unwrap()
             .wait()
             .unwrap();
+        assert_eq!(output.logits().is_some(), owns_public_output);
         if let (Some(actual), Some((expected, _))) = (output.logits(), &reference) {
             assert_final_logits_close(actual.as_array(), expected, reference_tolerance);
         }
         let descriptor = PromptCacheDescriptor::from_model_identity(
             session.prompt_cache_model_identity().unwrap(),
             "opaque-ring-fixture",
-            format!("tokens:{prefix_tokens:?}"),
+            prompt_input.as_ref().map_or_else(
+                || format!("tokens:{prefix_tokens:?}"),
+                |input| {
+                    input
+                        .cache_identity()
+                        .expect("neutral Gemma input carries its exact prepared identity")
+                        .prefix_content_fingerprint()
+                        .to_owned()
+                },
+            ),
             1,
         )
         .unwrap();
         let rank_prompt_cache = prompt_cache_root.join(format!("rank-{expected_rank}"));
+        if std::env::var_os(PROMPT_CACHE_PREPARE_FAILURE).is_some() {
+            if expected_rank == 0 {
+                std::fs::write(
+                    &rank_prompt_cache,
+                    b"block rank-local cache directory creation",
+                )
+                .unwrap();
+            }
+            let error = session
+                .save_prompt_cache(
+                    backend,
+                    &rank_prompt_cache,
+                    descriptor.clone(),
+                    &prefix_tokens,
+                    &PromptCacheOptions::default(),
+                )
+                .unwrap_err();
+            if expected_rank == 0 {
+                assert!(
+                    error
+                        .to_string()
+                        .contains("create reversible prompt cache parent"),
+                    "injected rank-local preparation failed for an unexpected reason: {error}"
+                );
+            } else {
+                assert!(
+                    error.to_string().contains("another rank failed")
+                        && error.to_string().contains("PromptCacheSavePreparation"),
+                    "peer preparation failure was not reported causally: {error}"
+                );
+                assert!(
+                    rank_prompt_cache.is_dir()
+                        && std::fs::read_dir(&rank_prompt_cache)
+                            .unwrap()
+                            .next()
+                            .is_none(),
+                    "successful peer preparation left a published or staged shard"
+                );
+            }
+            let retry = session
+                .save_prompt_cache(
+                    backend,
+                    &rank_prompt_cache,
+                    descriptor,
+                    &prefix_tokens,
+                    &PromptCacheOptions::default(),
+                )
+                .unwrap_err();
+            assert!(
+                retry.to_string().contains("session is fenced"),
+                "cache-control retry was not rejected by the causal fence: {retry}"
+            );
+            return;
+        }
         session
             .save_prompt_cache(
                 backend,
@@ -995,6 +1495,7 @@ fn pipeline_ring_worker() {
             .unwrap()
             .wait()
             .unwrap();
+        assert_eq!(uninterrupted.logits().is_some(), owns_public_output);
         if let (Some(actual), Some((_, expected))) = (uninterrupted.logits(), &reference) {
             assert_final_logits_close(actual.as_array(), expected, reference_tolerance);
         }
@@ -1006,9 +1507,20 @@ fn pipeline_ring_worker() {
                 .as_slice::<f32>()
                 .to_vec()
         });
-        session
-            .load_prompt_cache(backend, &rank_prompt_cache, &descriptor, &prefix_tokens)
-            .unwrap();
+        match prompt_input.as_ref() {
+            Some(input) => session
+                .load_prompt_cache_for_input(
+                    backend,
+                    &rank_prompt_cache,
+                    &descriptor,
+                    &prefix_tokens,
+                    input,
+                )
+                .unwrap(),
+            None => session
+                .load_prompt_cache(backend, &rank_prompt_cache, &descriptor, &prefix_tokens)
+                .unwrap(),
+        };
         output = session
             .decode(backend, continuity_token)
             .unwrap()
@@ -1024,600 +1536,173 @@ fn pipeline_ring_worker() {
         });
         assert_eq!(uninterrupted_logits, restored_logits);
         for _ in 0..2 {
-            assert_eq!(
-                output.logits().is_some(),
-                pipeline_rank + 1 == pipeline_parallel_size
-            );
+            assert_eq!(output.logits().is_some(), owns_public_output);
             let token = session
                 .sample_and_synchronize(output.logits(), 1, &mut DefaultSampler, 0.0, None, false)
                 .unwrap()
                 .token;
             output = session.decode(backend, token).unwrap().wait().unwrap();
         }
-        assert_eq!(
-            output.logits().is_some(),
-            pipeline_rank + 1 == pipeline_parallel_size
-        );
-        return;
-    }
-    let execution = crate::native::backend(&stream, &stream)
-        .communication_for_topology(topology, &native_group)
-        .unwrap();
-    let reference = (pipeline_rank + 1 == pipeline_parallel_size
-        && (family.needs_resident_reference()
-            || matches!(family, FixtureFamily::Lfm2 | FixtureFamily::Lfm2Moe)))
-    .then(|| {
-        if family.is_multimodal() {
-            multimodal_resident_reference(family, &checkpoint, &stream)
-        } else if family == FixtureFamily::NemotronH && std::env::var_os(REQUANTIZE).is_some() {
-            resident_reference_quantized(&checkpoint, Some(WeightQuantization::MxFp4), &stream)
-        } else {
-            resident_reference(&checkpoint, &stream)
-        }
-    });
-    let dense_stream = std::env::var_os(DENSE_STREAM).is_some();
-    let layerwise_host = std::env::var_os(LAYERWISE_HOST).is_some();
-    assert!(!(dense_stream && layerwise_host));
-    let parameter_bank = std::env::var_os(EXPERT_CACHE).is_some();
-    let requantize = std::env::var_os(REQUANTIZE).is_some();
-    let (requested_quantization, requested_weight_quantization) =
-        if family == FixtureFamily::NemotronH {
-            (
-                eredu_core::QuantizationRequest::MxFp4,
-                WeightQuantization::MxFp4,
-            )
-        } else {
-            (
-                eredu_core::QuantizationRequest::Affine {
-                    group_size: 32,
-                    bits: 4,
-                },
-                WeightQuantization::Affine(AffineQuantization::new(32, 4).unwrap()),
-            )
-        };
-    let base_options = || {
-        if requantize {
-            MlxLoadRequest::with_quantization(requested_quantization).with_parallel_topology(
-                topology,
-                eredu_runtime::PipelineWireContract::new(
-                    eredu_runtime::PipelineActivationDtype::Float32,
-                ),
-            )
-        } else {
-            MlxLoadRequest::with_parallel(
-                topology,
-                eredu_runtime::PipelineWireContract::new(
-                    eredu_runtime::PipelineActivationDtype::Float32,
-                ),
-            )
-        }
-    };
-    let layerwise_options =
-        || LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap());
-    let mut model = if parameter_bank {
-        let non_experts = if dense_stream {
-            OrdinaryWeightResidency::DenseDiskStream(
-                DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1).unwrap(),
-            )
-        } else if layerwise_host {
-            OrdinaryWeightResidency::LayerwiseHost(layerwise_options())
-        } else {
-            OrdinaryWeightResidency::FullyResident
-        };
-        load_prepared_pipeline_model(
-            &checkpoint,
-            base_options().with_weight_residency(
-                WeightResidency::with_independent_parameter_banks(
-                    non_experts,
-                    ParameterBankLoadOptions::default(),
-                ),
-            ),
-            &stream,
-        )
-    } else if layerwise_host {
-        load_prepared_pipeline_model(
-            &checkpoint,
-            base_options()
-                .with_weight_residency(WeightResidency::layerwise_host(layerwise_options())),
-            &stream,
-        )
-    } else if dense_stream {
-        let dense = DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1).unwrap();
-        load_prepared_pipeline_model(
-            &checkpoint,
-            base_options().with_weight_residency(WeightResidency::dense_disk_stream(dense)),
-            &stream,
-        )
-    } else {
-        load_prepared_pipeline_model(&checkpoint, base_options(), &stream)
-    };
-    let expected_effective_model_type = family.effective_model_type();
-    assert_eq!(
-        model.model_family(),
-        ModelKind::resolve_model_type(expected_effective_model_type).unwrap()
-    );
-    assert_eq!(model.effective_model_type(), expected_effective_model_type);
-    let info = model.stage_info();
-    let expected_range = family.stage_range(pipeline_rank);
-    assert_eq!(info.global_layer_range(), expected_range);
-    if !family.has_gguf_source() {
-        let prefix = family.layer_prefix();
-        assert_eq!(
-            info.owned_tensors().iter().any(|name| expected_range
-                .clone()
-                .any(|layer| name.starts_with(&format!("{prefix}{layer}.")))),
-            !dense_stream && !layerwise_host
-        );
-        assert!(!info.owned_tensors().iter().any(|name| {
-            (0..family.layer_count()).any(|layer| {
-                !expected_range.contains(&layer) && name.starts_with(&format!("{prefix}{layer}."))
-            })
-        }));
-    }
-    if family == FixtureFamily::Llama {
-        assert!(info.local_parameter_bytes() < 1_616);
-    }
-    let opened = info
-        .opened_checkpoint_shards()
-        .iter()
-        .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
-        .collect::<Vec<_>>();
-    if family == FixtureFamily::Llama {
-        assert_eq!(
-            opened.contains(&format!("layer-{expected_rank}.safetensors")),
-            !dense_stream
-        );
-        assert!(!opened.contains(&format!("layer-{}.safetensors", 1 - expected_rank)));
-        assert_eq!(
-            opened.contains(&"input.safetensors".into()),
-            expected_rank == 0
-        );
-    }
-    if dense_stream {
-        let report = model.dense_stream_report().unwrap().unwrap();
-        let expected_units = expected_range.len() + info.local_encoder_units();
-        assert_eq!(report.planned_layer_count(), expected_units);
-        assert!(report
-            .residency()
-            .units()
-            .iter()
-            .all(|unit| !unit.host_resident() && !unit.device_resident()));
-        if requantize {
-            let materialization = report.residency().materialization().unwrap();
-            assert!(materialization.transformed_weights > 0);
-            assert!(materialization.output_bytes < materialization.source_bytes_read);
-            assert!(info.materialization().is_some());
-        }
-        if family.has_gguf_source() {
-            let diagnostics = model.checkpoint_diagnostics().unwrap().unwrap();
-            let global_payload = std::fs::metadata(&checkpoint).unwrap().len();
-            assert!(diagnostics.physical_reads > 0);
-            assert!(
-                diagnostics.physical_read_bytes < global_payload,
-                "rank {expected_rank} read {} GGUF bytes while loading static modules from a {global_payload}-byte global tensor payload",
-                diagnostics.physical_read_bytes
+        assert_eq!(output.logits().is_some(), owns_public_output);
+        if prove_prepared_communication_lifecycle {
+            assert_eq!(
+                crate::composition::mlx::path_instrumentation::snapshot().forwards
+                    - neutral_forwards_before,
+                5,
+                "prefill, uninterrupted/restored decode, and two continued decodes must each traverse the neutral session once"
             );
-        }
-    }
-    if layerwise_host {
-        assert!(model.dense_stream_report().unwrap().is_none());
-        let report = model.parameter_residency_report().unwrap().unwrap();
-        assert!(report.initialized());
-        let expected_units = expected_range.len() + info.local_encoder_units();
-        assert_eq!(report.units().len(), expected_units);
-        assert!(report
-            .units()
-            .iter()
-            .all(|unit| unit.host_resident() && !unit.device_resident()));
-        if requantize {
-            let materialization = report.materialization().unwrap();
-            assert!(materialization.transformed_weights > 0);
-            assert!(materialization.output_bytes < materialization.source_bytes_read);
-            assert!(info.materialization().is_some());
-        }
-        if family.has_gguf_source() {
-            let diagnostics = model.checkpoint_diagnostics().unwrap().unwrap();
-            let global_payload = std::fs::metadata(&checkpoint).unwrap().len();
-            assert!(diagnostics.physical_reads > 0);
-            assert!(
-                diagnostics.physical_read_bytes < global_payload,
-                "rank {expected_rank} read {} GGUF bytes while loading a host-layerwise stage from a {global_payload}-byte global tensor payload",
-                diagnostics.physical_read_bytes
-            );
-        }
-    }
-    if requantize && !dense_stream && !layerwise_host && !parameter_bank {
-        let materialization = info
-            .materialization()
-            .expect("fully resident requantization must report its packed overlay");
-        assert!(materialization.transformed_weights > 0);
-        assert!(materialization.source_tiles > 0);
-        assert!(materialization.output_bytes < materialization.source_bytes_read);
-        assert!(
-            materialization.peak_planned_working_set_bytes
-                <= materialization.admitted_working_set_bytes,
-            "rank {expected_rank} exceeded its admitted conversion bound: {materialization:?}"
-        );
-        assert_eq!(
-            materialization.admitted_working_set_bytes,
-            materialization
-                .output_bytes
-                .max(materialization.peak_planned_working_set_bytes),
-            "rank {expected_rank} admitted slack beyond its packed stage or smallest legal row tile"
-        );
-    }
-    if parameter_bank {
-        let report = model.parameter_bank_report().unwrap();
-        let predictor_expert_layers = usize::from(
-            info.owns_output()
-                && matches!(
-                    family,
-                    FixtureFamily::DeepSeekV4
-                        | FixtureFamily::Qwen3NextMoe
-                        | FixtureFamily::Qwen35Moe
-                        | FixtureFamily::Qwen35MoeMultimodal
-                ),
-        ) * info.embedded_mtp_layers();
-        let expert_layers = family.expert_layer_count(expected_range.clone());
-        let shared_inkling_experts = usize::from(matches!(
-            family,
-            FixtureFamily::Inkling | FixtureFamily::InklingMultimodal | FixtureFamily::InklingGguf
-        )) * expert_layers;
-        let expected_experts = (expert_layers + predictor_expert_layers)
-            * info.local_group_indices().len()
-            + shared_inkling_experts;
-        assert_eq!(report.is_some(), expected_experts > 0);
-        if let Some(report) = report {
-            assert_eq!(report.owned_entries(), expected_experts);
-            assert!(report.owned_bytes() > 0);
-            assert_eq!(report.device_resident_entries(), 0);
-            if requantize {
+            if dense_stream || layerwise_host {
                 assert_eq!(
-                    report.weight_quantization(),
-                    Some(requested_weight_quantization)
+                    crate::composition::mlx::path_instrumentation::bounded_unit_acquisitions(),
+                    5 * local_layer_range.len(),
+                    "each neutral forward must acquire every selected bounded-residency unit exactly once"
                 );
-                let materialization = report.materialization().unwrap();
-                assert!(materialization.transformed_weights > 0);
-                assert!(materialization.source_tiles > 0);
-                assert!(materialization.output_bytes < materialization.source_bytes_read);
             }
-        }
-    }
-    if family == FixtureFamily::Llama {
-        assert_eq!(
-            opened.contains(&"output.safetensors".into()),
-            expected_rank == 1
-        );
-    }
-
-    let paged = PagedCacheOptions::new(1, 32768, 32768, 1)
-        .unwrap()
-        .with_full_attention(true);
-    let mut cache = model
-        .new_cache_with_options(CacheResidencyPolicy::Paged(paged.clone()))
-        .unwrap();
-    assert_eq!(
-        cache.global_layers(),
-        family.stage_range(pipeline_rank).collect::<Vec<_>>()
-    );
-    assert_family_cache(family, pipeline_rank, &cache, 0);
-    if std::env::var_os(FINAL_OUTPUT_INTERVENTION).is_some() {
-        struct ReplacingLogits {
-            observed: bool,
-        }
-
-        impl eredu_runtime::ActivationObserver<Array, safemlx::error::Exception> for ReplacingLogits {
-            fn observe(
-                &mut self,
-                path: &str,
-                _value: &Array,
-            ) -> Result<(), safemlx::error::Exception> {
-                self.observed |= path == eredu_core::MODEL_LOGITS_OBSERVATION_PATH;
-                Ok(())
-            }
-
-            fn intervene(
-                &mut self,
-                path: &str,
-                _value: &Array,
-            ) -> Result<Option<Array>, safemlx::error::Exception> {
-                Ok((path == eredu_core::MODEL_LOGITS_OBSERVATION_PATH)
-                    .then(|| Array::from_slice(&[37.0f32], &[1])))
-            }
-        }
-
-        let prompt = Array::from_slice(&[1u32, 2], &[1, 2]);
-        let mut observer = ReplacingLogits { observed: false };
-        let logits = model
-            .forward_distributed_with_observer(
-                (pipeline_rank == 0).then_some(&prompt),
-                PipelineStep::new(1, 2).unwrap(),
-                None,
-                &mut cache,
-                &execution,
-                &mut observer,
-            )
-            .unwrap()
-            .into_logits()
-            .unwrap();
-        assert_eq!(
-            observer.observed,
-            pipeline_rank + 1 == pipeline_parallel_size
-        );
-        match logits {
-            Some(logits) => {
-                assert_eq!(logits.shape(), &[1]);
-                assert_eq!(logits.evaluated().unwrap().as_slice::<f32>(), &[37.0]);
-            }
-            None => assert_ne!(pipeline_rank + 1, pipeline_parallel_size),
-        }
-        return;
-    }
-    let prefix_ids = match family {
-        FixtureFamily::InklingMultimodal => vec![1, 2, 21, 20, 20],
-        FixtureFamily::Qwen35Multimodal | FixtureFamily::Qwen35MoeMultimodal => {
-            vec![1, 2, 42, 42]
-        }
-        FixtureFamily::Qwen3Vl | FixtureFamily::Qwen3VlMoe => vec![1, 2, 42, 42],
-        _ => vec![1, 2],
-    };
-    let prompt_length = prefix_ids.len() as i32;
-    let mut logits = if family.is_multimodal() {
-        let prepared = multimodal_prepared_input(family);
-        prepared
-            .with_model_input(|input| {
-                if family.is_qwen_hybrid() {
-                    model.prefill_distributed_with_embedded_mtp(input, &mut cache, &execution, None)
+            if routed_neutral && expert_parallel_size > 1 {
+                let exchanges_per_layer = match family {
+                    FixtureFamily::Qwen3Moe
+                    | FixtureFamily::Qwen3MoeGguf
+                    | FixtureFamily::DeepSeek
+                    | FixtureFamily::DeepSeekGguf
+                    | FixtureFamily::DeepSeekV4
+                    | FixtureFamily::NemotronH
+                    | FixtureFamily::NemotronHGguf
+                    | FixtureFamily::Lfm2MoeGguf
+                    | FixtureFamily::KimiLinearGguf
+                    | FixtureFamily::Qwen3VlMoe => 8,
+                    FixtureFamily::Inkling | FixtureFamily::InklingMultimodal => 16,
+                    FixtureFamily::GptOss | FixtureFamily::GptOssGguf
+                        if tensor_parallel_size > 1 =>
+                    {
+                        9
+                    }
+                    FixtureFamily::GptOss | FixtureFamily::GptOssGguf => 8,
+                    _ => unreachable!("only routed neutral fixtures select expert exchange"),
+                };
+                let exchanged_layers = if pipeline_parallel_size > 1 {
+                    family.expert_layer_count(0..family.layer_count())
                 } else {
-                    model.prefill_distributed(
-                        model.stage_info().owns_input().then_some(input),
-                        PipelineStep::new(1, prompt_length).unwrap(),
-                        None,
-                        &mut cache,
-                        &execution,
-                    )
-                }
-            })
-            .unwrap()
-            .into_logits()
-            .unwrap()
-    } else {
-        let prompt = Array::from_slice(&prefix_ids, &[1, prompt_length]);
-        if family.is_qwen_hybrid() {
-            let parts = [text_input_part(&prompt)];
-            model
-                .prefill_distributed_with_embedded_mtp(
-                    crate::backend::runtime::media::input::ModelInput::new(&parts),
-                    &mut cache,
-                    &execution,
-                    None,
-                )
-                .unwrap()
-                .into_logits()
-                .unwrap()
-        } else {
-            forward_pipeline_model(
-                &mut model,
-                (pipeline_rank == 0).then_some(&prompt),
-                PipelineStep::new(1, prompt_length).unwrap(),
-                &mut cache,
-                &execution,
-            )
-        }
-    };
-    assert_eq!(logits.is_some(), pipeline_rank == 1);
-    if let (Some(actual), Some((expected, _))) = (&logits, &reference) {
-        assert_final_logits_close(actual, expected, family.comparison_tolerance());
-    }
-    assert_family_cache(family, pipeline_rank, &cache, prompt_length);
-    let qwen_hybrid_prompt_cache = std::env::var_os(QWEN_HYBRID_PROMPT_CACHE).is_some();
-    let identity = model.prompt_cache_model_identity().unwrap();
-    assert_eq!(
-        identity.topology(),
-        &crate::composition::mlx::distributed::topology::prompt_cache_topology(topology),
-        "rank {expected_rank} cache identity lost its distributed topology"
-    );
-    if qwen_hybrid_prompt_cache {
-        if pipeline_rank == 0 {
-            assert_eq!(
-                identity.global_layer_start()..identity.global_layer_end(),
-                0..1
-            );
-            assert_eq!(identity.state_segments().len(), 1);
-        } else {
-            assert_eq!(
-                identity.global_layer_start()..identity.global_layer_end(),
-                1..3
-            );
-            assert_eq!(identity.layer_prefix_offsets(), [0, -1]);
-            assert_eq!(identity.state_segments().len(), 2);
-            assert_eq!(identity.state_segments()[1].id(), "prediction");
-            assert_eq!(identity.state_segments()[1].layers(), 1..2);
-        }
-    }
-    let descriptor = PromptCacheDescriptor::from_model_identity(
-        identity,
-        "pipeline-ring-fixture",
-        format!("tokens:{prefix_ids:?}"),
-        1,
-    )
-    .unwrap();
-    model
-        .save_prompt_cache(
-            &mut cache,
-            &prompt_cache_root,
-            descriptor.clone(),
-            &prefix_ids,
-            &PromptCacheOptions::default(),
-            &stream,
-        )
-        .unwrap();
-    let token = Array::from_slice(&[0u32], &[1, 1]);
-    let uninterrupted = forward_pipeline_model(
-        &mut model,
-        (pipeline_rank == 0).then_some(&token),
-        PipelineStep::new(1, 1).unwrap(),
-        &mut cache,
-        &execution,
-    );
-    let uninterrupted_values = uninterrupted.as_ref().map(|value| {
-        let value = value.evaluated().unwrap();
-        value.as_slice::<f32>().to_vec()
-    });
-    if let (Some(actual), Some((_, expected))) = (&uninterrupted, &reference) {
-        assert_final_logits_close(actual, expected, family.comparison_tolerance());
-    }
-    let (mut cache, manifest) = model
-        .load_prompt_cache(&prompt_cache_root, &descriptor, &prefix_ids, paged, &stream)
-        .unwrap();
-    assert_eq!(&manifest.topology, descriptor.topology());
-    if qwen_hybrid_prompt_cache && pipeline_rank == 1 {
-        assert!(manifest.blocks.iter().any(|block| block.global_layer == 2));
-    }
-    if qwen_hybrid_prompt_cache {
-        let restored_manifest = model
-            .save_prompt_cache(
-                &mut cache,
-                prompt_cache_root.join("restored"),
-                descriptor.clone(),
-                &prefix_ids,
-                &PromptCacheOptions::default(),
-                &stream,
-            )
-            .unwrap();
-        if pipeline_rank == 1 {
-            assert!(restored_manifest
-                .blocks
-                .iter()
-                .any(|block| block.global_layer == 2));
-        }
-        return;
-    }
-    let restored = forward_pipeline_model(
-        &mut model,
-        (pipeline_rank == 0).then_some(&token),
-        PipelineStep::new(1, 1).unwrap(),
-        &mut cache,
-        &execution,
-    );
-    match (&uninterrupted_values, &restored) {
-        (Some(uninterrupted), Some(restored)) => {
-            let restored = restored.evaluated().unwrap();
-            let restored = restored.as_slice::<f32>();
-            assert_eq!(uninterrupted.len(), restored.len());
-            let tolerance = family.comparison_tolerance();
-            assert!(
-                uninterrupted
-                    .iter()
-                    .zip(restored)
-                    .all(|(left, right)| (left - right).abs() <= tolerance),
-                "prompt-cache restoration diverged: uninterrupted={uninterrupted:?}, restored={restored:?}, tolerance={tolerance}"
-            );
-        }
-        (None, None) => {}
-        _ => panic!("pipeline prompt-cache restoration changed stage output ownership"),
-    }
-    logits = restored;
-
-    let mut sampler = DefaultSampler;
-    for sample_index in 0..2 {
-        let synchronized = model
-            .sample_and_synchronize(
-                logits.as_ref(),
-                PipelineStep::new(1, 1).unwrap(),
-                &mut sampler,
-                0.0,
-                None,
-                false,
-                &execution,
-            )
-            .unwrap();
-        let token = synchronized.token.evaluated().unwrap();
-        assert_eq!(token.as_array().shape(), &[1, 1]);
-        if sample_index == 0 {
-            if let Some((_, expected)) = &reference {
-                let expected_token = expected
-                    .iter()
-                    .enumerate()
-                    .fold((0usize, f32::NEG_INFINITY), |best, (index, &value)| {
-                        if value > best.1 {
-                            (index, value)
-                        } else {
-                            best
-                        }
-                    })
-                    .0 as u32;
-                assert_eq!(token.as_slice::<u32>(), &[expected_token]);
+                    family.expert_layer_count(local_layer_range.clone())
+                };
+                assert_eq!(
+                    crate::composition::mlx::path_instrumentation::variable_all_to_all_submissions(),
+                    5 * exchanged_layers * exchanges_per_layer,
+                    "every routed layer forward must exchange global/local expert IDs, route tags, activations, scores, coefficients, and the exact inverse results without fallback"
+                );
             }
         }
-        drop(token);
-        logits = forward_pipeline_model(
-            &mut model,
-            (pipeline_rank == 0).then_some(&synchronized.token),
-            PipelineStep::new(1, 1).unwrap(),
-            &mut cache,
-            &execution,
-        );
-    }
-    if dense_stream {
-        let report = model.dense_stream_report().unwrap().unwrap();
-        assert!(report.prefill_forwards() >= 1);
-        assert!(report.decode_forwards() >= 2);
-    }
-    if layerwise_host {
-        let report = model.parameter_residency_report().unwrap().unwrap();
-        assert!(report.units().iter().all(|unit| unit.host_resident()));
-        assert!(
-            report
+        if dense_stream {
+            let report = session.dense_stream_report().unwrap().unwrap();
+            assert_eq!(report.prefill_forwards(), 1);
+            assert_eq!(report.decode_forwards(), 4);
+            assert_eq!(report.planned_layer_count(), local_layer_range.len());
+        }
+        if layerwise_host {
+            let report = session.residency_report().unwrap().unwrap();
+            let expected_units = local_layer_range.len();
+            let layerwise = report
                 .units()
                 .iter()
-                .filter(|unit| unit.device_resident())
-                .count()
-                <= 1
-        );
-    }
-    if parameter_bank {
-        if let Some(report) = model.parameter_bank_report().unwrap() {
+                .filter(|unit| unit.planned_tier() == eredu_core::residency::MemoryTier::Host)
+                .collect::<Vec<_>>();
+            assert_eq!(layerwise.len(), expected_units);
+            assert!(layerwise.iter().all(|unit| unit.host_resident()));
+            assert!(
+                layerwise
+                    .iter()
+                    .filter(|unit| unit.device_resident())
+                    .count()
+                    <= 1
+            );
+        }
+        if std::env::var_os(EXPERT_CACHE).is_some() {
+            let report = session.parameter_bank_report().unwrap();
+            let expected_owned = match family {
+                FixtureFamily::Qwen3Moe | FixtureFamily::Qwen3MoeGguf => {
+                    local_layer_range.len() * 4 / expert_parallel_size
+                }
+                FixtureFamily::GptOss | FixtureFamily::GptOssGguf => {
+                    local_layer_range.len() * 2 / expert_parallel_size
+                }
+                FixtureFamily::DeepSeek | FixtureFamily::DeepSeekGguf => {
+                    family.expert_layer_count(local_layer_range.clone()) * 4 / expert_parallel_size
+                }
+                FixtureFamily::DeepSeekV4 => {
+                    family.expert_layer_count(local_layer_range.clone()) * 4 / expert_parallel_size
+                }
+                FixtureFamily::KimiLinearGguf => {
+                    family.expert_layer_count(local_layer_range.clone()) * 4 / expert_parallel_size
+                }
+                FixtureFamily::Lfm2MoeGguf
+                | FixtureFamily::NemotronH
+                | FixtureFamily::NemotronHGguf => {
+                    family.expert_layer_count(local_layer_range.clone()) * 2 / expert_parallel_size
+                }
+                _ => unreachable!("only exact routed addressable fixtures select expert caching"),
+            };
+            if expected_owned == 0 {
+                assert!(
+                    report.is_none(),
+                    "rank with no routed units must not manufacture bank ownership"
+                );
+                return;
+            }
+            let report = report.expect("owned independent expert bank must expose live telemetry");
+            assert!(report.owned_entries() > 0);
+            assert!(report.owned_bytes() > 0);
             let requests =
                 report.bulk().device().requests() + report.incremental().device().requests();
-            if requests > 0 {
-                assert!(report.device_resident_entries() > 0);
-            } else {
-                assert_eq!(report.device_resident_entries(), 0);
+            let misses = report.bulk().device().misses() + report.incremental().device().misses();
+            assert_eq!(
+                report.owned_entries(),
+                expected_owned,
+                "the addressable bank must own only this PP×EP rank's exact expert entries"
+            );
+            assert_eq!(requests == 0, misses == 0);
+            if std::env::var_os(EXPERT_CACHE_EVICTION).is_some() {
+                let evictions =
+                    report.bulk().device().evictions() + report.incremental().device().evictions();
+                if requests > 0 {
+                    assert!(evictions > 0, "bounded expert bank never evicted an entry");
+                    assert!(misses > report.owned_entries() as u64);
+                }
             }
         }
-    }
-
-    if matches!(
-        family,
-        FixtureFamily::DeepSeekV4
-            | FixtureFamily::Qwen3Next
-            | FixtureFamily::Qwen3NextMoe
-            | FixtureFamily::Qwen35
-            | FixtureFamily::Qwen35Moe
-            | FixtureFamily::Qwen35Multimodal
-            | FixtureFamily::Qwen35MoeMultimodal
-    ) {
-        assert_eq!(
-            model.speculative_capability(),
-            SpeculativeCapability::Ready {
-                draft_source: SpeculativeDraftSource::Embedded
-            }
-        );
-        assert_eq!(model.stage_info().owns_embedded_mtp(), pipeline_rank == 1);
-        assert_eq!(
-            model.stage_info().embedded_mtp_layers(),
-            usize::from(pipeline_rank == 1)
-        );
-        assert_eq!(model.stage_info().global_embedded_mtp_layers(), 1);
-    } else if matches!(family, FixtureFamily::Gemma | FixtureFamily::MuseGlimmer) {
-        assert_eq!(
-            model.speculative_capability(),
-            SpeculativeCapability::Unsupported {
-                draft_source: SpeculativeDraftSource::Separate,
-                architecture: model.model_family().canonical_name().into(),
-            }
-        );
+        if prompt_input.is_some() {
+            let wrong_descriptor = PromptCacheDescriptor::from_model_identity(
+                session.prompt_cache_model_identity().unwrap(),
+                "opaque-ring-fixture",
+                "wrong-prepared-input-identity",
+                1,
+            )
+            .unwrap();
+            let error = session
+                .save_prompt_cache(
+                    backend,
+                    &rank_prompt_cache,
+                    wrong_descriptor,
+                    &prefix_tokens,
+                    &PromptCacheOptions::default(),
+                )
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("prepared input"),
+                "wrong prepared-input descriptor failed for an unexpected reason: {error}"
+            );
+            let retry = session
+                .save_prompt_cache(
+                    backend,
+                    &rank_prompt_cache,
+                    descriptor,
+                    &prefix_tokens,
+                    &PromptCacheOptions::default(),
+                )
+                .unwrap_err();
+            assert!(
+                retry.to_string().contains("session is fenced"),
+                "cache-control retry was not rejected by the causal fence: {retry}"
+            );
+        }
     }
 }
 
@@ -1679,6 +1764,199 @@ fn complete_gemma4_preserves_nested_effective_model_type() {
 }
 
 #[test]
+fn public_replicated_prediction_variants_install_only_the_neutral_extension() {
+    fn assert_extension(checkpoint: &std::path::Path, expected_depth: usize) {
+        crate::composition::mlx::path_instrumentation::reset();
+        let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+        let backend = crate::native::backend(&stream, &stream);
+        let model = load_model(&backend, checkpoint, MlxLoadRequest::default())
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            crate::composition::mlx::path_instrumentation::snapshot().constructors,
+            1
+        );
+        let mut session = MlxModelSession::from_model(
+            model,
+            eredu_core::SessionCapabilities::new(true, true, true),
+        )
+        .unwrap();
+        let target = session.neutral_prediction_target_mut().unwrap();
+        assert_eq!(target.prediction_extension_depth(), Some(expected_depth));
+        target.prepare_prediction_target_cache().unwrap();
+    }
+
+    let deepseek = tempfile::tempdir().unwrap();
+    write_deepseek_fixture_with_prediction(deepseek.path(), 2, 1);
+    assert_extension(deepseek.path(), 1);
+
+    let inkling = tempfile::tempdir().unwrap();
+    write_inkling_mtp_fixture(inkling.path());
+    assert_extension(inkling.path(), 2);
+
+    let qwen = tempfile::tempdir().unwrap();
+    write_qwen35_multimodal_fixture(qwen.path(), false);
+    assert_extension(qwen.path(), 1);
+
+    let nemotron = tempfile::tempdir().unwrap();
+    write_nemotron_mtp_fixture(nemotron.path());
+    assert_extension(nemotron.path(), 1);
+}
+
+#[test]
+fn gemma_external_assistant_capture_uses_neutral_target_and_rolls_back_failure() {
+    use eredu_architectures::composite_execution::{
+        ExternalPredictionCaptureRequest, ExternalPredictionTargetCapture,
+        ExternalPredictionTargetOperation,
+    };
+
+    crate::composition::mlx::path_instrumentation::reset();
+    let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+    let checkpoint = tempfile::tempdir().unwrap();
+    write_gemma_fixture(checkpoint.path());
+    let backend = crate::native::backend(&stream, &stream);
+    let model = load_model(&backend, checkpoint.path(), MlxLoadRequest::default())
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        crate::composition::mlx::path_instrumentation::snapshot().constructors,
+        1
+    );
+    let mut session = MlxModelSession::from_model(
+        model,
+        eredu_core::SessionCapabilities::new(true, true, true),
+    )
+    .unwrap();
+    let target = session.neutral_prediction_target_mut().unwrap();
+    let mut cache = target.prepare_external_prediction_target_cache().unwrap();
+    let initial_offset = cache.offset().unwrap();
+    let tokens = Array::from_slice(&[1u32, 2], &[1, 2]);
+    let parts = [text_input_part(&tokens)];
+    let invalid = ExternalPredictionCaptureRequest::Gemma4SharedAttention {
+        final_hidden_path: "model.language_model.layers.99.output".into(),
+    };
+    let error = target
+        .prefill_external_prediction_target(
+            crate::backend::runtime::media::input::ModelInput::new(&parts),
+            &invalid,
+            &mut cache,
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("did not reach capture path"));
+    assert_eq!(cache.offset().unwrap(), initial_offset);
+
+    let request = ExternalPredictionCaptureRequest::Gemma4SharedAttention {
+        final_hidden_path: "model.language_model.layers.3.output".into(),
+    };
+    let (logits, capture) = target
+        .prefill_external_prediction_target(
+            crate::backend::runtime::media::input::ModelInput::new(&parts),
+            &request,
+            &mut cache,
+        )
+        .unwrap();
+    assert_eq!(logits.as_array().shape(), [1, 2, 32]);
+    assert_eq!(cache.offset().unwrap(), 2);
+    let ExternalPredictionTargetCapture::Gemma4 { hidden, shared_kv } = capture else {
+        panic!("Gemma target returned the wrong external-assistant capture")
+    };
+    assert_eq!(hidden.as_array().shape(), [1, 2, 8]);
+    assert!(!shared_kv.is_empty());
+    assert!(shared_kv.iter().all(|(_, keys, values)| {
+        keys.as_array().dim(-2) == 2 && values.as_array().dim(-2) == 2
+    }));
+    let proposal = MlxTensor::from_array(Array::from_slice(&[3u32], &[1, 1]));
+    let embedding = target
+        .apply_external_prediction_target_operation(
+            ExternalPredictionTargetOperation::TokenEmbeddings(&proposal),
+        )
+        .unwrap();
+    assert_eq!(embedding.as_array().shape(), [1, 1, 8]);
+}
+
+#[test]
+fn muse_external_assistant_capture_uses_neutral_target_in_exact_layer_order() {
+    use eredu_architectures::composite_execution::{
+        ExternalPredictionCaptureRequest, ExternalPredictionTargetCapture,
+        ExternalPredictionTargetOperation,
+    };
+
+    crate::composition::mlx::path_instrumentation::reset();
+    let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+    let checkpoint = tempfile::tempdir().unwrap();
+    write_muse_glimmer_tensor_parallel_fixture(checkpoint.path());
+    let backend = crate::native::backend(&stream, &stream);
+    let model = load_model(&backend, checkpoint.path(), MlxLoadRequest::default())
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        crate::composition::mlx::path_instrumentation::snapshot().constructors,
+        1
+    );
+    let mut session = MlxModelSession::from_model(
+        model,
+        eredu_core::SessionCapabilities::new(true, true, true),
+    )
+    .unwrap();
+    let target = session.neutral_prediction_target_mut().unwrap();
+    let mut cache = target.prepare_external_prediction_target_cache().unwrap();
+    let initial_offset = cache.offset().unwrap();
+    let tokens = Array::from_slice(&[1u32, 2], &[1, 2]);
+    let parts = [text_input_part(&tokens)];
+    let invalid = ExternalPredictionCaptureRequest::MuseGlimmerDFlash {
+        target_layers: vec![0, 1].into_boxed_slice(),
+        target_paths: vec!["missing.0".into(), "missing.1".into()].into_boxed_slice(),
+    };
+    let error = target
+        .prefill_external_prediction_target(
+            crate::backend::runtime::media::input::ModelInput::new(&parts),
+            &invalid,
+            &mut cache,
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("did not reach capture path"));
+    assert_eq!(cache.offset().unwrap(), initial_offset);
+
+    let request = ExternalPredictionCaptureRequest::MuseGlimmerDFlash {
+        target_layers: vec![0, 1].into_boxed_slice(),
+        target_paths: vec![
+            "model.layers.0.output".into(),
+            "model.layers.1.output".into(),
+        ]
+        .into_boxed_slice(),
+    };
+    let (logits, capture) = target
+        .prefill_external_prediction_target(
+            crate::backend::runtime::media::input::ModelInput::new(&parts),
+            &request,
+            &mut cache,
+        )
+        .unwrap();
+    assert_eq!(logits.as_array().shape(), [1, 2, 32]);
+    assert_eq!(cache.offset().unwrap(), 2);
+    let ExternalPredictionTargetCapture::MuseGlimmerDFlash { target_states } = capture else {
+        panic!("Muse-Glimmer target returned the wrong external-assistant capture")
+    };
+    assert_eq!(target_states.len(), 2);
+    assert!(target_states
+        .iter()
+        .all(|state| state.as_array().shape() == [1, 2, 16]));
+    let proposal = MlxTensor::from_array(Array::from_slice(&[3u32], &[1, 1]));
+    let embedding = target
+        .apply_external_prediction_target_operation(
+            ExternalPredictionTargetOperation::TokenEmbeddings(&proposal),
+        )
+        .unwrap();
+    assert_eq!(embedding.as_array().shape(), [1, 1, 16]);
+    let projected = target
+        .apply_external_prediction_target_operation(
+            ExternalPredictionTargetOperation::ProjectLogits(&target_states[1]),
+        )
+        .unwrap();
+    assert_eq!(projected.as_array().shape(), [1, 2, 32]);
+}
+
+#[test]
 fn complete_family_adapters_return_final_output_interventions() {
     fn write_qwen(directory: &Path) {
         write_qwen_fixture(directory, "qwen3");
@@ -1735,7 +2013,6 @@ fn complete_family_adapters_return_final_output_interventions() {
             .into_inner();
         let mut session = MlxModelSession::from_model(
             model,
-            None,
             eredu_core::SessionCapabilities::new(true, true, true),
         )
         .unwrap();
@@ -1763,75 +2040,24 @@ fn complete_family_adapters_return_final_output_interventions() {
     }
 }
 
-fn resident_reference(checkpoint: &Path, stream: &Stream) -> (Vec<f32>, Vec<f32>) {
-    resident_reference_quantized(checkpoint, None, stream)
-}
-
-fn resident_reference_quantized(
-    checkpoint: &Path,
-    quantization: Option<WeightQuantization>,
-    stream: &Stream,
-) -> (Vec<f32>, Vec<f32>) {
-    let options = quantization
-        .map(|quantization| match quantization {
-            WeightQuantization::Affine(config) => {
-                MlxLoadRequest::with_quantization(eredu_core::QuantizationRequest::Affine {
-                    group_size: u32::try_from(config.group_size).unwrap(),
-                    bits: u8::try_from(config.bits).unwrap(),
-                })
-            }
-            WeightQuantization::MxFp4 => {
-                MlxLoadRequest::with_quantization(eredu_core::QuantizationRequest::MxFp4)
-            }
-            WeightQuantization::GgufIQuant { .. } => {
-                panic!("checkpoint-native GGUF quantization is not a load-time transform")
-            }
-        })
-        .unwrap_or_default();
-    let backend = crate::native::backend(stream, stream);
-    let model = eredu_core::load_model(&backend, checkpoint, options)
-        .unwrap()
-        .into_inner();
-    let mut session = MlxModelSession::from_model(
-        model,
-        None,
-        eredu_core::SessionCapabilities::new(true, true, true),
-    )
-    .unwrap();
-    let prompt = Array::from_slice(&[1u32, 2], &[1, 2]);
-    let parts = [text_input_part(&prompt)];
-    let prefill = session
-        .prefill(
-            &backend,
-            crate::backend::runtime::media::input::ModelInput::new(&parts).into(),
-        )
-        .unwrap()
-        .wait()
-        .unwrap()
-        .into_logits()
-        .unwrap()
-        .into_array()
-        .evaluated()
-        .unwrap()
-        .as_slice::<f32>()
-        .to_vec();
-    let token = Array::from_slice(&[0u32], &[1, 1]);
-    let decode = session
-        .decode(&backend, token)
-        .unwrap()
-        .wait()
-        .unwrap()
-        .into_logits()
-        .unwrap()
-        .into_array()
-        .evaluated()
-        .unwrap()
-        .as_slice::<f32>()
-        .to_vec();
-    (prefill, decode)
-}
-
 fn resident_reference_for_prepared(
+    checkpoint: &Path,
+    prepared: &PreparedModelInput,
+) -> (Vec<f32>, Vec<f32>) {
+    let checkpoint = checkpoint.to_path_buf();
+    let prepared = prepared.clone();
+    std::thread::Builder::new()
+        .name("resident-reference".into())
+        .spawn(move || {
+            let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+            resident_reference_for_prepared_inner(&checkpoint, &prepared, &stream)
+        })
+        .expect("resident-reference fixture thread")
+        .join()
+        .expect("resident-reference fixture thread panicked")
+}
+
+fn resident_reference_for_prepared_inner(
     checkpoint: &Path,
     prepared: &PreparedModelInput,
     stream: &Stream,
@@ -1842,130 +2068,9 @@ fn resident_reference_for_prepared(
         .into_inner();
     let mut session = MlxModelSession::from_model(
         model,
-        None,
         eredu_core::SessionCapabilities::new(true, true, true),
     )
     .unwrap();
-    let parts = prepared.input_parts();
-    let prefill = session
-        .prefill(
-            &backend,
-            crate::backend::runtime::media::input::ModelInput::new(parts).into(),
-        )
-        .unwrap()
-        .wait()
-        .unwrap()
-        .into_logits()
-        .unwrap()
-        .into_array()
-        .evaluated()
-        .unwrap()
-        .as_slice::<f32>()
-        .to_vec();
-    let token = Array::from_slice(&[0u32], &[1, 1]);
-    let decode = session
-        .decode(&backend, token)
-        .unwrap()
-        .wait()
-        .unwrap()
-        .into_logits()
-        .unwrap()
-        .into_array()
-        .evaluated()
-        .unwrap()
-        .as_slice::<f32>()
-        .to_vec();
-    (prefill, decode)
-}
-
-fn inkling_multimodal_prepared_input() -> PreparedModelInput {
-    use crate::backend::runtime::media::input::ModelInput;
-
-    let text = Array::from_slice(&[1u32, 2], &[1, 2]);
-    let image = Array::from_slice(&[0.01f32; 16], &[1, 1, 16]);
-    let audio = Array::from_slice(&[0u32, 1, 2, 3, 4, 5], &[1, 3, 2]);
-    let audio_mask = Array::from_slice(&[true, true, false], &[1, 3]);
-    let parts = [
-        text_input_part(&text),
-        input_part(
-            InputModality::Image,
-            InputPayload::Embeddings(image),
-            [],
-            [],
-        ),
-        input_part(
-            InputModality::Audio,
-            InputPayload::Tensor(audio),
-            [(InputMetadataKey::AudioMask, audio_mask)],
-            [InputExtent::AudioValidFrames(2)],
-        ),
-    ];
-    PreparedModelInput::from_model_input(ModelInput::new(&parts)).unwrap()
-}
-
-fn qwen35_multimodal_prepared_input() -> PreparedModelInput {
-    use crate::backend::runtime::media::input::ModelInput;
-
-    let text = Array::from_slice(&[1u32, 2], &[1, 2]);
-    let grid = Array::from_slice(&[1i32, 2, 4], &[1, 3]);
-    let pixels = Array::from_slice(&[0.01f32; 96], &[8, 12]);
-    let parts = [
-        text_input_part(&text),
-        input_part(
-            InputModality::Image,
-            InputPayload::Tensor(pixels),
-            [(InputMetadataKey::PatchGrid, grid)],
-            [],
-        ),
-    ];
-    PreparedModelInput::from_model_input(ModelInput::new(&parts)).unwrap()
-}
-
-fn qwen3_vl_prepared_input() -> PreparedModelInput {
-    use crate::backend::runtime::media::input::ModelInput;
-
-    let text = Array::from_slice(&[1u32, 2], &[1, 2]);
-    let grid = Array::from_slice(&[1i32, 2, 4], &[1, 3]);
-    let pixels = Array::from_slice(&[0.01f32; 96], &[8, 12]);
-    let parts = [
-        text_input_part(&text),
-        input_part(
-            InputModality::Image,
-            InputPayload::Tensor(pixels),
-            [(InputMetadataKey::PatchGrid, grid)],
-            [],
-        ),
-    ];
-    PreparedModelInput::from_model_input(ModelInput::new(&parts)).unwrap()
-}
-
-fn multimodal_prepared_input(family: FixtureFamily) -> PreparedModelInput {
-    match family {
-        FixtureFamily::InklingMultimodal => inkling_multimodal_prepared_input(),
-        FixtureFamily::Qwen35Multimodal | FixtureFamily::Qwen35MoeMultimodal => {
-            qwen35_multimodal_prepared_input()
-        }
-        FixtureFamily::Qwen3Vl | FixtureFamily::Qwen3VlMoe => qwen3_vl_prepared_input(),
-        _ => panic!("{family:?} is not a multimodal fixture"),
-    }
-}
-
-fn multimodal_resident_reference(
-    family: FixtureFamily,
-    checkpoint: &Path,
-    stream: &Stream,
-) -> (Vec<f32>, Vec<f32>) {
-    let backend = crate::native::backend(stream, stream);
-    let model = eredu_core::load_model(&backend, checkpoint, MlxLoadRequest::default())
-        .unwrap()
-        .into_inner();
-    let mut session = MlxModelSession::from_model(
-        model,
-        None,
-        eredu_core::SessionCapabilities::new(true, true, true),
-    )
-    .unwrap();
-    let prepared = multimodal_prepared_input(family);
     let parts = prepared.input_parts();
     let prefill = session
         .prefill(
@@ -2010,102 +2115,6 @@ fn assert_final_logits_close(actual: &Array, expected: &[f32], tolerance: f32) {
         .all(|(actual, expected)| (actual - expected).abs() <= tolerance),
         "pipeline logits diverged from the resident reference: actual={actual:?}, expected={expected:?}"
     );
-}
-
-fn forward_pipeline_model(
-    model: &mut crate::composition::mlx::distributed::pipeline::PipelineModel,
-    tokens: Option<&Array>,
-    step: PipelineStep,
-    cache: &mut crate::composition::mlx::distributed::pipeline::PipelineCache,
-    execution: &MlxDistributedSession<'_>,
-) -> Option<Array> {
-    model
-        .forward_distributed(tokens, step, None, cache, execution)
-        .unwrap()
-        .into_logits()
-        .unwrap()
-}
-
-fn assert_family_cache(
-    family: FixtureFamily,
-    rank: usize,
-    cache: &crate::composition::mlx::distributed::pipeline::PipelineCache,
-    expected_offset: i32,
-) {
-    let populated = expected_offset > 0;
-    let assert_slots =
-        |slots: &[crate::composition::mlx::distributed::pipeline::PipelineStateSlot], count| {
-            assert_eq!(slots.len(), count);
-            for slot in slots {
-                assert_eq!(slot.value().is_some(), populated);
-                assert_eq!(slot.offset(), expected_offset);
-            }
-        };
-    match family {
-        FixtureFamily::KimiLinear | FixtureFamily::KimiLinearGguf if rank == 0 => {
-            let PipelineLayerCache::StateSlots { slots, .. } = &cache.layers()[0] else {
-                panic!("Kimi KDA layer did not materialize fixed state")
-            };
-            assert_slots(slots, 4);
-        }
-        FixtureFamily::KimiLinear | FixtureFamily::KimiLinearGguf => {
-            assert!(matches!(
-                &cache.layers()[0],
-                PipelineLayerCache::CompressedLatent { .. }
-            ));
-        }
-        FixtureFamily::NemotronH if rank == 0 => {
-            let PipelineLayerCache::StateSlots { slots, .. } = &cache.layers()[0] else {
-                panic!("Nemotron Mamba layer did not materialize fixed state")
-            };
-            assert_slots(slots, 2);
-            assert!(matches!(
-                &cache.layers()[1],
-                PipelineLayerCache::StateSlots { slots, .. } if slots.is_empty()
-            ));
-        }
-        FixtureFamily::NemotronH => {
-            assert!(matches!(
-                &cache.layers()[0],
-                PipelineLayerCache::StateSlots { slots, .. } if slots.is_empty()
-            ));
-            assert!(matches!(
-                &cache.layers()[1],
-                PipelineLayerCache::KeyValue { slots, .. } if slots.is_empty()
-            ));
-        }
-        FixtureFamily::Qwen3Next
-        | FixtureFamily::Qwen3NextMoe
-        | FixtureFamily::Qwen35
-        | FixtureFamily::Qwen35Moe
-        | FixtureFamily::Qwen35Multimodal
-        | FixtureFamily::Qwen35MoeMultimodal
-            if rank == 0 =>
-        {
-            let PipelineLayerCache::StateSlots { slots, .. } = &cache.layers()[0] else {
-                panic!("Qwen linear-attention layer did not materialize recurrent state")
-            };
-            assert_slots(slots, 2);
-        }
-        FixtureFamily::Qwen3Next
-        | FixtureFamily::Qwen3NextMoe
-        | FixtureFamily::Qwen35
-        | FixtureFamily::Qwen35Moe
-        | FixtureFamily::Qwen35Multimodal
-        | FixtureFamily::Qwen35MoeMultimodal => assert!(matches!(
-            &cache.layers()[0],
-            PipelineLayerCache::KeyValue { slots, .. } if slots.is_empty()
-        )),
-        FixtureFamily::Inkling | FixtureFamily::InklingMultimodal | FixtureFamily::InklingGguf => {
-            for layer in cache.layers() {
-                let PipelineLayerCache::KeyValue { slots, .. } = layer else {
-                    panic!("Inkling layer did not materialize KV plus convolution state")
-                };
-                assert_slots(slots, 4);
-            }
-        }
-        _ => {}
-    }
 }
 
 struct ChildGuard {
@@ -2162,19 +2171,106 @@ fn write_mistral_fixture(directory: &Path) {
     write_llama_compatible_fixture(directory, "mistral");
 }
 
+fn write_unindexed_llama_compatible_fixture(directory: &Path, model_type: &str) {
+    write_llama_compatible_fixture(directory, model_type);
+    let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+    let mut arrays = BTreeMap::new();
+    for shard in [
+        "input.safetensors",
+        "layer-0.safetensors",
+        "layer-1.safetensors",
+        "output.safetensors",
+    ] {
+        arrays.extend(Array::load_safetensors(directory.join(shard), &stream).unwrap());
+    }
+    Array::save_safetensors(
+        arrays.iter().map(|(name, value)| (name.as_str(), value)),
+        None,
+        directory.join("model.safetensors"),
+    )
+    .unwrap();
+    std::fs::remove_file(directory.join("model.safetensors.index.json")).unwrap();
+}
+
+fn write_llama_compatible_gguf(path: &Path, architecture: &str) {
+    let key = |suffix: &str| format!("{architecture}.{suffix}");
+    let metadata = BTreeMap::from([
+        (
+            "general.architecture".into(),
+            GgufMetadataValue::String(architecture.into()),
+        ),
+        ("general.file_type".into(), GgufMetadataValue::Uint32(0)),
+        (key("block_count"), GgufMetadataValue::Uint32(2)),
+        (key("embedding_length"), GgufMetadataValue::Uint32(4)),
+        (key("attention.head_count"), GgufMetadataValue::Uint32(2)),
+        (key("attention.head_count_kv"), GgufMetadataValue::Uint32(2)),
+        (key("feed_forward_length"), GgufMetadataValue::Uint32(4)),
+        (
+            key("attention.layer_norm_rms_epsilon"),
+            GgufMetadataValue::Float32(1e-5),
+        ),
+        (key("vocab_size"), GgufMetadataValue::Uint32(4)),
+        (key("context_length"), GgufMetadataValue::Uint32(32)),
+        (key("rope.freq_base"), GgufMetadataValue::Float32(10_000.0)),
+    ]);
+    let vector = vec![0_u8; 4 * std::mem::size_of::<f32>()];
+    let matrix = vec![0_u8; 16 * std::mem::size_of::<f32>()];
+    let vector_dimensions: &[u64] = &[4];
+    let matrix_dimensions: &[u64] = &[4, 4];
+    let mut names = vec![
+        "token_embd.weight".to_owned(),
+        "output_norm.weight".to_owned(),
+    ];
+    for layer in 0..2 {
+        names.extend(
+            [
+                "attn_norm.weight",
+                "ffn_norm.weight",
+                "attn_q.weight",
+                "attn_k.weight",
+                "attn_v.weight",
+                "attn_output.weight",
+                "ffn_gate.weight",
+                "ffn_up.weight",
+                "ffn_down.weight",
+            ]
+            .map(|suffix| format!("blk.{layer}.{suffix}")),
+        );
+    }
+    let tensors = names
+        .iter()
+        .map(|name| {
+            let vector_tensor = name.ends_with("norm.weight");
+            TensorInput {
+                name,
+                dimensions: if vector_tensor {
+                    vector_dimensions
+                } else {
+                    matrix_dimensions
+                },
+                ggml_type: GgmlType::F32,
+                data: if vector_tensor { &vector } else { &matrix },
+            }
+        })
+        .collect::<Vec<_>>();
+    Writer::default()
+        .write(std::fs::File::create(path).unwrap(), &metadata, &tensors)
+        .unwrap();
+}
+
 fn write_llama_compatible_fixture(directory: &Path, model_type: &str) {
     std::fs::write(
         directory.join("config.json"),
         serde_json::to_vec_pretty(&serde_json::json!({
             "model_type": model_type,
-            "hidden_size": 4,
+            "hidden_size": 64,
             "num_hidden_layers": 2,
-            "intermediate_size": 8,
-            "num_attention_heads": 2,
-            "num_key_value_heads": 2,
-            "head_dim": 2,
+            "intermediate_size": 64,
+            "num_attention_heads": 8,
+            "num_key_value_heads": 8,
+            "head_dim": 8,
             "rms_norm_eps": 0.00001,
-            "vocab_size": 8,
+            "vocab_size": 64,
             "max_position_embeddings": 32,
             "tie_word_embeddings": false,
             "attention_bias": false,
@@ -2186,38 +2282,38 @@ fn write_llama_compatible_fixture(directory: &Path, model_type: &str) {
     .unwrap();
     write_f32_shard(
         &directory.join("input.safetensors"),
-        &[("model.embed_tokens.weight", vec![8, 4], 0.01)],
+        &[("model.embed_tokens.weight", vec![64, 64], 0.01)],
     );
     for layer in 0..2 {
         let prefix = format!("model.layers.{layer}");
         let names = [
             (
                 format!("{prefix}.self_attn.q_proj.weight"),
-                vec![4, 4],
+                vec![64, 64],
                 0.01,
             ),
             (
                 format!("{prefix}.self_attn.k_proj.weight"),
-                vec![4, 4],
+                vec![64, 64],
                 0.01,
             ),
             (
                 format!("{prefix}.self_attn.v_proj.weight"),
-                vec![4, 4],
+                vec![64, 64],
                 0.01,
             ),
             (
                 format!("{prefix}.self_attn.o_proj.weight"),
-                vec![4, 4],
+                vec![64, 64],
                 0.01,
             ),
-            (format!("{prefix}.mlp.gate_proj.weight"), vec![8, 4], 0.01),
-            (format!("{prefix}.mlp.up_proj.weight"), vec![8, 4], 0.01),
-            (format!("{prefix}.mlp.down_proj.weight"), vec![4, 8], 0.01),
-            (format!("{prefix}.input_layernorm.weight"), vec![4], 1.0),
+            (format!("{prefix}.mlp.gate_proj.weight"), vec![64, 64], 0.01),
+            (format!("{prefix}.mlp.up_proj.weight"), vec![64, 64], 0.01),
+            (format!("{prefix}.mlp.down_proj.weight"), vec![64, 64], 0.01),
+            (format!("{prefix}.input_layernorm.weight"), vec![64], 1.0),
             (
                 format!("{prefix}.post_attention_layernorm.weight"),
-                vec![4],
+                vec![64],
                 1.0,
             ),
         ];
@@ -2233,8 +2329,8 @@ fn write_llama_compatible_fixture(directory: &Path, model_type: &str) {
     write_f32_shard(
         &directory.join("output.safetensors"),
         &[
-            ("model.norm.weight", vec![4], 1.0),
-            ("lm_head.weight", vec![8, 4], 0.01),
+            ("model.norm.weight", vec![64], 1.0),
+            ("lm_head.weight", vec![64, 64], 0.01),
         ],
     );
     let mut weight_map = serde_json::Map::new();
@@ -2280,6 +2376,10 @@ fn write_llama_compatible_fixture(directory: &Path, model_type: &str) {
 }
 
 fn write_deepseek_fixture(directory: &Path, layers: i32) {
+    write_deepseek_fixture_with_prediction(directory, layers, 0);
+}
+
+fn write_deepseek_fixture_with_prediction(directory: &Path, layers: i32, prediction_layers: i32) {
     let config = serde_json::json!({
         "model_type": "deepseek_v3",
         "hidden_size": 8,
@@ -2307,7 +2407,7 @@ fn write_deepseek_fixture(directory: &Path, layers: i32) {
         "scoring_func": "sigmoid",
         "norm_topk_prob": true,
         "routed_scaling_factor": 1.0,
-        "num_nextn_predict_layers": 0,
+        "num_nextn_predict_layers": prediction_layers,
         "split_kv_b": false,
         "tie_word_embeddings": false
     });
@@ -2340,8 +2440,13 @@ fn write_deepseek_fixture(directory: &Path, layers: i32) {
     architecture
         .static_modules()
         .visit_parameters(&mut collector);
-    for layer in 0..layers as usize {
+    for layer in 0..usize::try_from(layers).unwrap() {
         eredu_architectures::deepseek::block::V3Block::<Backend>::new(&args, layer, stream)
+            .unwrap()
+            .visit_parameters(&mut collector);
+    }
+    for depth in 0..usize::try_from(prediction_layers).unwrap() {
+        eredu_architectures::deepseek::mtp::V3PredictionLayer::<Backend>::new(&args, depth, stream)
             .unwrap()
             .visit_parameters(&mut collector);
     }
@@ -2376,7 +2481,16 @@ fn write_deepseek_fixture(directory: &Path, layers: i32) {
     Array::save_safetensors(
         arrays.iter().map(|(name, value)| (name.as_str(), value)),
         None,
-        directory.join("model.safetensors"),
+        directory.join("model-00001-of-00001.safetensors"),
+    )
+    .unwrap();
+    let weight_map = arrays
+        .iter()
+        .map(|(name, _)| (name.clone(), "model-00001-of-00001.safetensors".to_owned()))
+        .collect::<BTreeMap<_, _>>();
+    std::fs::write(
+        directory.join("model.safetensors.index.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({ "weight_map": weight_map })).unwrap(),
     )
     .unwrap();
     std::fs::write(
@@ -2389,7 +2503,12 @@ fn write_deepseek_fixture(directory: &Path, layers: i32) {
         .all(|(_, value)| value.dtype() == MlxDtype::Float32));
 }
 
-fn write_deepseek_v4_fixture(directory: &Path) {
+pub(crate) fn write_deepseek_v4_fixture(directory: &Path, prediction_layers: u64) {
+    let compress_ratios = if prediction_layers == 0 {
+        vec![0, 4]
+    } else {
+        vec![0, 4, 0]
+    };
     let config = serde_json::json!({
         "model_type": "deepseek_v4",
         "hidden_size": 16,
@@ -2406,7 +2525,7 @@ fn write_deepseek_v4_fixture(directory: &Path) {
         "rms_norm_eps": 0.000001,
         "max_position_embeddings": 64,
         "sliding_window": 8,
-        "compress_ratios": [0, 4, 0],
+        "compress_ratios": compress_ratios,
         "index_n_heads": 2,
         "index_head_dim": 4,
         "index_topk": 2,
@@ -2419,7 +2538,7 @@ fn write_deepseek_v4_fixture(directory: &Path) {
         "num_hash_layers": 1,
         "norm_topk_prob": true,
         "routed_scaling_factor": 1.0,
-        "num_nextn_predict_layers": 1
+        "num_nextn_predict_layers": prediction_layers
     });
     let args = eredu_architectures::deepseek::parse_v4_config(&config).unwrap();
     let plan = eredu_architectures::deepseek::v4_safetensors_plan(&args).unwrap();
@@ -2603,6 +2722,25 @@ fn write_qwen_fixture(directory: &Path, model_type: &str) {
     write_qwen_fixture_with_tied_head(directory, model_type, false);
 }
 
+fn write_indexed_qwen_fixture(directory: &Path, model_type: &str) {
+    write_qwen_fixture(directory, model_type);
+    let source = directory.join("model.safetensors");
+    let shard = directory.join("model-00001-of-00001.safetensors");
+    std::fs::rename(source, &shard).unwrap();
+    let bytes = std::fs::read(&shard).unwrap();
+    let tensors = safetensors::SafeTensors::deserialize(&bytes).unwrap();
+    let weight_map = tensors
+        .names()
+        .into_iter()
+        .map(|name| (name.to_owned(), "model-00001-of-00001.safetensors"))
+        .collect::<BTreeMap<_, _>>();
+    std::fs::write(
+        directory.join("model.safetensors.index.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({ "weight_map": weight_map })).unwrap(),
+    )
+    .unwrap();
+}
+
 fn write_qwen_fixture_with_tied_head(directory: &Path, model_type: &str, tied: bool) {
     let mut config = qwen_config(model_type);
     config["tie_word_embeddings"] = serde_json::json!(tied);
@@ -2685,7 +2823,11 @@ fn write_qwen_config_fixture(directory: &Path, config: serde_json::Value) {
 }
 
 fn write_qwen3_moe_gguf_fixture(path: &Path) {
-    let config = qwen_config("qwen3_moe");
+    write_qwen_gguf_fixture(path, "qwen3_moe");
+}
+
+fn write_qwen_gguf_fixture(path: &Path, model_type: &str) {
+    let config = qwen_config(model_type);
     std::fs::write(
         path.parent().unwrap().join("config.json"),
         serde_json::to_vec_pretty(&config).unwrap(),
@@ -2737,16 +2879,25 @@ fn write_qwen3_moe_gguf_fixture(path: &Path) {
             .replace("input_layernorm", "attn_norm")
             .replace("post_attention_layernorm", "ffn_norm")
             .replace("mlp.gate.weight", "ffn_gate_inp.weight")
+            .replace("mlp.gate_proj", "ffn_gate")
+            .replace("mlp.up_proj", "ffn_up")
+            .replace("mlp.down_proj", "ffn_down")
             .replace("model.embed_tokens", "token_embd")
             .replace("model.norm", "output_norm")
             .replace("lm_head", "output");
         specs.push(gguf_tensor_from_array(name, value));
     }
-    let key = |suffix: &str| format!("qwen3moe.{suffix}");
-    let metadata = BTreeMap::from([
+    let architecture = match model_type {
+        "qwen2" => "qwen2",
+        "qwen3" => "qwen3",
+        "qwen3_moe" => "qwen3moe",
+        _ => panic!("unsupported Qwen GGUF fixture model type {model_type}"),
+    };
+    let key = |suffix: &str| format!("{architecture}.{suffix}");
+    let mut metadata = BTreeMap::from([
         (
             "general.architecture".into(),
-            GgufMetadataValue::String("qwen3moe".into()),
+            GgufMetadataValue::String(architecture.into()),
         ),
         ("general.file_type".into(), GgufMetadataValue::Uint32(0)),
         (
@@ -2756,18 +2907,6 @@ fn write_qwen3_moe_gguf_fixture(path: &Path) {
         (
             key("block_count"),
             GgufMetadataValue::Uint32(args.num_hidden_layers as u32),
-        ),
-        (
-            key("expert_feed_forward_length"),
-            GgufMetadataValue::Uint32(args.moe_intermediate_size as u32),
-        ),
-        (
-            key("expert_count"),
-            GgufMetadataValue::Uint32(args.num_experts as u32),
-        ),
-        (
-            key("expert_used_count"),
-            GgufMetadataValue::Uint32(args.num_experts_per_tok as u32),
         ),
         (
             key("attention.head_count"),
@@ -2798,6 +2937,25 @@ fn write_qwen3_moe_gguf_fixture(path: &Path) {
             GgufMetadataValue::Uint32(args.vocab_size as u32),
         ),
     ]);
+    if args.is_moe() {
+        metadata.insert(
+            key("expert_feed_forward_length"),
+            GgufMetadataValue::Uint32(args.moe_intermediate_size as u32),
+        );
+        metadata.insert(
+            key("expert_count"),
+            GgufMetadataValue::Uint32(args.num_experts as u32),
+        );
+        metadata.insert(
+            key("expert_used_count"),
+            GgufMetadataValue::Uint32(args.num_experts_per_tok as u32),
+        );
+    } else {
+        metadata.insert(
+            key("feed_forward_length"),
+            GgufMetadataValue::Uint32(args.intermediate_size as u32),
+        );
+    }
     let tensors = specs
         .iter()
         .map(|tensor| TensorInput {
@@ -2913,6 +3071,15 @@ fn replicated_inspection_dispatches_gpt_oss_and_nemotron_h_observers() {
         assert!(
             inspected.observations.get(expected_observation).is_some(),
             "missing {expected_observation:?} in {:?}",
+            inspected.observations
+        );
+        let decode = Array::from_slice(&[3_u32], &[1, 1]);
+        let inspected = runtime
+            .inspect_decode(decode, &ObservationRequest::all())
+            .unwrap();
+        assert!(
+            inspected.observations.get(expected_observation).is_some(),
+            "decode missing {expected_observation:?} in {:?}",
             inspected.observations
         );
     }
@@ -3164,7 +3331,16 @@ fn write_lfm2_pipeline_fixture(directory: &Path, moe: bool) {
     Array::save_safetensors(
         arrays.iter().map(|(name, value)| (name.as_str(), value)),
         None,
-        directory.join("model.safetensors"),
+        directory.join("model-00001-of-00001.safetensors"),
+    )
+    .unwrap();
+    let weight_map = arrays
+        .iter()
+        .map(|(name, _)| (name.clone(), "model-00001-of-00001.safetensors".to_owned()))
+        .collect::<BTreeMap<_, _>>();
+    std::fs::write(
+        directory.join("model.safetensors.index.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({ "weight_map": weight_map })).unwrap(),
     )
     .unwrap();
     std::fs::write(
@@ -3460,7 +3636,16 @@ fn kimi_linear_config() -> serde_json::Value {
 }
 
 fn write_kimi_linear_fixture(directory: &Path) {
-    let config = kimi_linear_config();
+    write_kimi_linear_fixture_from_config(directory, kimi_linear_config());
+}
+
+fn write_kimi_linear_dense_fixture(directory: &Path) {
+    let mut config = kimi_linear_config();
+    config["first_k_dense_replace"] = config["num_hidden_layers"].clone();
+    write_kimi_linear_fixture_from_config(directory, config);
+}
+
+fn write_kimi_linear_fixture_from_config(directory: &Path, config: serde_json::Value) {
     let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = execution.stream();
     let args = eredu_architectures::kimi_linear::model_args_from_config_value(&config).unwrap();
@@ -3496,11 +3681,12 @@ fn write_kimi_linear_fixture(directory: &Path) {
             }
             continue;
         }
-        let checkpoint_name = if name.starts_with("model.layers.1.mlp.") {
-            name.replacen("model.layers.1.mlp.", "model.layers.1.block_sparse_moe.", 1)
-        } else {
-            name.to_string()
-        };
+        let checkpoint_name =
+            if args.has_sparse_moe_layers() && name.starts_with("model.layers.1.mlp.") {
+                name.replacen("model.layers.1.mlp.", "model.layers.1.block_sparse_moe.", 1)
+            } else {
+                name.to_string()
+            };
         let value = if checkpoint_name.ends_with("_conv1d.weight") {
             value
                 .reshape(
@@ -3608,8 +3794,34 @@ fn write_nemotron_fixture(directory: &Path) {
     write_nemotron_fixture_with_config(directory, nemotron_config());
 }
 
+fn write_nemotron_dense_fixture(directory: &Path) {
+    let mut config = nemotron_config();
+    config["hybrid_override_pattern"] = serde_json::json!("M-**");
+    config["intermediate_size"] = 18.into();
+    config["num_key_value_heads"] = 2.into();
+    config["n_groups"] = 2.into();
+    write_nemotron_fixture_with_config(directory, config);
+}
+
+fn write_nemotron_mtp_fixture(directory: &Path) {
+    let mut config = nemotron_config();
+    config["hybrid_override_pattern"] = serde_json::json!("M-**");
+    config["intermediate_size"] = 18.into();
+    config["num_key_value_heads"] = 2.into();
+    config["n_groups"] = 2.into();
+    config["num_nextn_predict_layers"] = 1.into();
+    config["mtp_hybrid_override_pattern"] = serde_json::json!("*");
+    write_nemotron_fixture_with_config(directory, config);
+}
+
 fn write_nemotron_quantizable_fixture(directory: &Path) {
     write_nemotron_fixture_with_config(directory, nemotron_quantizable_config());
+}
+
+fn write_nemotron_dense_quantizable_fixture(directory: &Path) {
+    let mut config = nemotron_quantizable_config();
+    config["hybrid_override_pattern"] = serde_json::json!("M-**");
+    write_nemotron_fixture_with_config(directory, config);
 }
 
 fn write_nemotron_fixture_with_config(directory: &Path, config: serde_json::Value) {
@@ -3841,11 +4053,24 @@ fn write_qwen_hybrid_moe_fixture(directory: &Path, model_type: &str) {
 }
 
 fn write_qwen35_multimodal_fixture(directory: &Path, moe: bool) {
-    let text_config = if moe {
+    write_qwen35_multimodal_fixture_with_prediction(directory, moe, 1);
+}
+
+fn write_qwen35_zero_prediction_fixture(directory: &Path) {
+    write_qwen35_multimodal_fixture_with_prediction(directory, false, 0);
+}
+
+fn write_qwen35_multimodal_fixture_with_prediction(
+    directory: &Path,
+    moe: bool,
+    prediction_layers: usize,
+) {
+    let mut text_config = if moe {
         qwen_hybrid_moe_config("qwen3_5_moe_text")
     } else {
         qwen_hybrid_config("qwen3_5_text")
     };
+    text_config["mtp_num_hidden_layers"] = prediction_layers.into();
     let config = serde_json::json!({
         "architectures": [if moe { "Qwen3_5MoeForConditionalGeneration" } else { "Qwen3_5ForConditionalGeneration" }],
         "model_type": if moe { "qwen3_5_moe" } else { "qwen3_5" },
@@ -4083,6 +4308,18 @@ fn interleave(gate: &Array, up: &Array, axis: i32, stream: &Stream) -> Array {
 
 fn write_inkling_fixture(directory: &Path) {
     write_inkling_fixture_with_config(directory, inkling_config());
+}
+
+fn write_inkling_dense_fixture(directory: &Path) {
+    let mut config = inkling_config();
+    config["text_config"]["dense_mlp_idx"] = config["text_config"]["num_hidden_layers"].clone();
+    write_inkling_fixture_with_config(directory, config);
+}
+
+fn write_inkling_dense_multimodal_fixture(directory: &Path) {
+    let mut config = inkling_multimodal_config();
+    config["text_config"]["dense_mlp_idx"] = config["text_config"]["num_hidden_layers"].clone();
+    write_inkling_fixture_with_config(directory, config);
 }
 
 fn write_inkling_mtp_fixture(directory: &Path) {
@@ -5257,6 +5494,78 @@ fn ring_two_process_llama_tensor_parallel_resident_reference() {
     );
 }
 
+/// Compares a two-rank PP=2 neutral Llama session with the same resident reference.
+#[test]
+#[ignore = "requires the MLX Ring backend, two loopback CPU ranks, and the synthetic Llama fixture"]
+fn ring_two_process_llama_pipeline_parallel_resident_reference() {
+    assert!(distributed::is_available(Backend::Ring));
+    let checkpoint = tempfile::tempdir().unwrap();
+    write_fixture(checkpoint.path());
+    let checkpoint_path = checkpoint.path().to_path_buf();
+    run_ring_pipeline_processes(
+        WorkerResidency::FullyResident,
+        FixtureFamily::Llama,
+        WorkerMode::OpaqueSession,
+        checkpoint,
+        checkpoint_path,
+        None,
+    );
+}
+
+/// Compares a four-rank TP=2, PP=2 neutral session with the same resident reference.
+#[test]
+#[ignore = "requires the MLX Ring backend, four loopback CPU ranks, and the synthetic Llama fixture"]
+fn ring_four_process_llama_tensor_pipeline_parallel_resident_reference() {
+    assert!(distributed::is_available(Backend::Ring));
+    let checkpoint = tempfile::tempdir().unwrap();
+    write_fixture(checkpoint.path());
+    let checkpoint_path = checkpoint.path().to_path_buf();
+    run_ring_pipeline_processes(
+        WorkerResidency::FullyResident,
+        FixtureFamily::Llama,
+        WorkerMode::OpaqueSession,
+        checkpoint,
+        checkpoint_path,
+        Some("tp-pp"),
+    );
+}
+
+/// Proves selected affine transformation stays inside the neutral TP session.
+#[test]
+#[ignore = "requires the MLX Ring backend, two loopback CPU ranks, and the synthetic Llama fixture"]
+fn ring_two_process_llama_transformed_tensor_parallel_resident_reference() {
+    assert!(distributed::is_available(Backend::Ring));
+    let checkpoint = tempfile::tempdir().unwrap();
+    write_fixture(checkpoint.path());
+    let checkpoint_path = checkpoint.path().to_path_buf();
+    run_ring_pipeline_processes(
+        WorkerResidency::FullyResident,
+        FixtureFamily::Llama,
+        WorkerMode::OpaqueSessionRequantize,
+        checkpoint,
+        checkpoint_path,
+        Some("tp"),
+    );
+}
+
+/// Proves a nonzero PP-local source unit is transformed into its exact target unit.
+#[test]
+#[ignore = "requires the MLX Ring backend, two loopback CPU ranks, and the synthetic Llama fixture"]
+fn ring_two_process_llama_transformed_pipeline_parallel_resident_reference() {
+    assert!(distributed::is_available(Backend::Ring));
+    let checkpoint = tempfile::tempdir().unwrap();
+    write_fixture(checkpoint.path());
+    let checkpoint_path = checkpoint.path().to_path_buf();
+    run_ring_pipeline_processes(
+        WorkerResidency::FullyResident,
+        FixtureFamily::Llama,
+        WorkerMode::OpaqueSessionRequantize,
+        checkpoint,
+        checkpoint_path,
+        None,
+    );
+}
+
 /// Runs the same TP=2 resident-reference oracle through the Mistral
 /// specialization of the shared neutral decoder.
 #[test]
@@ -5266,6 +5575,118 @@ fn ring_two_process_mistral_tensor_parallel_resident_reference() {
     let checkpoint = tempfile::tempdir().unwrap();
     write_mistral_fixture(checkpoint.path());
     let checkpoint_path = checkpoint.path().to_path_buf();
+    run_ring_pipeline_processes(
+        WorkerResidency::FullyResident,
+        FixtureFamily::Mistral,
+        WorkerMode::OpaqueSession,
+        checkpoint,
+        checkpoint_path,
+        Some("tp"),
+    );
+}
+
+/// Compares a two-rank PP=2 neutral Mistral session with the same resident reference.
+#[test]
+#[ignore = "requires the MLX Ring backend, two loopback CPU ranks, and the synthetic Mistral fixture"]
+fn ring_two_process_mistral_pipeline_parallel_resident_reference() {
+    assert!(distributed::is_available(Backend::Ring));
+    let checkpoint = tempfile::tempdir().unwrap();
+    write_mistral_fixture(checkpoint.path());
+    let checkpoint_path = checkpoint.path().to_path_buf();
+    run_ring_pipeline_processes(
+        WorkerResidency::FullyResident,
+        FixtureFamily::Mistral,
+        WorkerMode::OpaqueSession,
+        checkpoint,
+        checkpoint_path,
+        None,
+    );
+}
+
+/// Compares a four-rank TP=2, PP=2 neutral Mistral session with the same resident reference.
+#[test]
+#[ignore = "requires the MLX Ring backend, four loopback CPU ranks, and the synthetic Mistral fixture"]
+fn ring_four_process_mistral_tensor_pipeline_parallel_resident_reference() {
+    assert!(distributed::is_available(Backend::Ring));
+    let checkpoint = tempfile::tempdir().unwrap();
+    write_mistral_fixture(checkpoint.path());
+    let checkpoint_path = checkpoint.path().to_path_buf();
+    run_ring_pipeline_processes(
+        WorkerResidency::FullyResident,
+        FixtureFamily::Mistral,
+        WorkerMode::OpaqueSession,
+        checkpoint,
+        checkpoint_path,
+        Some("tp-pp"),
+    );
+}
+
+/// Proves the public neutral TP loader consumes a single unindexed Llama
+/// SafeTensors payload without selecting the complete-model bridge.
+#[test]
+#[ignore = "requires the MLX Ring backend and two loopback CPU ranks"]
+fn ring_two_process_llama_unindexed_safetensors_tensor_parallel_resident_reference() {
+    assert!(distributed::is_available(Backend::Ring));
+    let checkpoint = tempfile::tempdir().unwrap();
+    write_unindexed_llama_compatible_fixture(checkpoint.path(), "llama");
+    let checkpoint_path = checkpoint.path().to_path_buf();
+    run_ring_pipeline_processes(
+        WorkerResidency::FullyResident,
+        FixtureFamily::Llama,
+        WorkerMode::OpaqueSession,
+        checkpoint,
+        checkpoint_path,
+        Some("tp"),
+    );
+}
+
+/// Proves the public neutral PP loader consumes a single unindexed Mistral
+/// SafeTensors payload and matches the same-artifact resident reference.
+#[test]
+#[ignore = "requires the MLX Ring backend and two loopback CPU ranks"]
+fn ring_two_process_mistral_unindexed_safetensors_pipeline_resident_reference() {
+    assert!(distributed::is_available(Backend::Ring));
+    let checkpoint = tempfile::tempdir().unwrap();
+    write_unindexed_llama_compatible_fixture(checkpoint.path(), "mistral");
+    let checkpoint_path = checkpoint.path().to_path_buf();
+    run_ring_pipeline_processes(
+        WorkerResidency::FullyResident,
+        FixtureFamily::Mistral,
+        WorkerMode::OpaqueSession,
+        checkpoint,
+        checkpoint_path,
+        None,
+    );
+}
+
+/// Proves the public neutral PP loader consumes an admitted Llama GGUF store
+/// without instantiating a backend-owned pipeline model.
+#[test]
+#[ignore = "requires the MLX Ring backend and two loopback CPU ranks"]
+fn ring_two_process_llama_gguf_pipeline_resident_reference() {
+    assert!(distributed::is_available(Backend::Ring));
+    let checkpoint = tempfile::tempdir().unwrap();
+    let checkpoint_path = checkpoint.path().join("model.gguf");
+    write_llama_compatible_gguf(&checkpoint_path, "llama");
+    run_ring_pipeline_processes(
+        WorkerResidency::FullyResident,
+        FixtureFamily::Llama,
+        WorkerMode::OpaqueSession,
+        checkpoint,
+        checkpoint_path,
+        None,
+    );
+}
+
+/// Proves the public neutral TP loader consumes an admitted Mistral GGUF store
+/// and matches the same-artifact resident reference.
+#[test]
+#[ignore = "requires the MLX Ring backend and two loopback CPU ranks"]
+fn ring_two_process_mistral_gguf_tensor_parallel_resident_reference() {
+    assert!(distributed::is_available(Backend::Ring));
+    let checkpoint = tempfile::tempdir().unwrap();
+    let checkpoint_path = checkpoint.path().join("model.gguf");
+    write_llama_compatible_gguf(&checkpoint_path, "mistral");
     run_ring_pipeline_processes(
         WorkerResidency::FullyResident,
         FixtureFamily::Mistral,
@@ -5292,11 +5713,31 @@ fn ring_two_process_pipeline_opaque_session_repeated_decode() {
     run_ring_pipeline_mode(false, FixtureFamily::Llama, WorkerMode::OpaqueSession);
 }
 
-/// Verifies the same scheduler and cache isolation over bounded local layers.
+/// Verifies the public Llama PP session genuinely selects disk-streamed local
+/// layers while preserving numeric output, cache isolation, and neutral ownership.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
 fn ring_two_process_dense_stream_opaque_session() {
     run_ring_pipeline_mode(true, FixtureFamily::Llama, WorkerMode::OpaqueSession);
+}
+
+/// Verifies public Mistral TP execution genuinely selects host-layerwise
+/// traversal while retaining the neutral partitioned constructor.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_two_process_mistral_layerwise_host_tensor_parallel_opaque_session() {
+    assert!(distributed::is_available(Backend::Ring));
+    let checkpoint = tempfile::tempdir().unwrap();
+    write_mistral_fixture(checkpoint.path());
+    let checkpoint_path = checkpoint.path().to_path_buf();
+    run_ring_pipeline_processes(
+        WorkerResidency::LayerwiseHost,
+        FixtureFamily::Mistral,
+        WorkerMode::OpaqueSession,
+        checkpoint,
+        checkpoint_path,
+        Some("tp"),
+    );
 }
 
 /// Verifies that divergent rank-local schedules fail before point-to-point
@@ -5354,6 +5795,99 @@ fn ring_two_process_deepseek_pipeline_persistence() {
     run_ring_pipeline(false, FixtureFamily::DeepSeek);
 }
 
+/// Proves prediction-free DeepSeek-V3 pure TP uses one neutral routed session.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_two_process_deepseek_v3_tensor_parallel_opaque_session() {
+    run_ring_cartesian_pipeline_mode(
+        false,
+        FixtureFamily::DeepSeek,
+        "tp",
+        WorkerMode::OpaqueSession,
+    );
+}
+
+/// Proves a public DeepSeek-V3 artifact containing embedded MTP weights builds
+/// one neutral ordinary TP target and retains its typed prediction extension,
+/// without constructing a complete-TP or pipeline target shell.
+#[test]
+#[ignore = "spawns two local processes and opens loopback sockets; run explicitly"]
+fn ring_two_process_deepseek_v3_mtp_target_tensor_parallel_opaque_session() {
+    run_ring_cartesian_pipeline_mode(
+        false,
+        FixtureFamily::DeepSeek,
+        "tp",
+        WorkerMode::OpaqueDeepSeekMtpTarget,
+    );
+}
+
+/// Proves prediction-free DeepSeek-V3 pure PP uses typed MLA boundaries.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_two_process_deepseek_v3_pipeline_opaque_session() {
+    run_ring_pipeline_mode(false, FixtureFamily::DeepSeek, WorkerMode::OpaqueSession);
+}
+
+/// Proves prediction-free DeepSeek-V3 pure EP uses exact compact expert banks.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_two_process_deepseek_v3_expert_parallel_opaque_session() {
+    run_ring_cartesian_pipeline_mode(
+        false,
+        FixtureFamily::DeepSeek,
+        "ep",
+        WorkerMode::OpaqueSession,
+    );
+}
+
+/// Proves prediction-free DeepSeek-V3 TP x PP remains on the neutral driver.
+#[test]
+#[ignore = "spawns four local processes and opens loopback sockets; run explicitly"]
+fn ring_four_process_deepseek_v3_tensor_pipeline_opaque_session() {
+    run_ring_cartesian_pipeline_mode(
+        false,
+        FixtureFamily::DeepSeek,
+        "tp-pp",
+        WorkerMode::OpaqueSession,
+    );
+}
+
+/// Proves prediction-free DeepSeek-V3 TP x EP consumes compound local banks.
+#[test]
+#[ignore = "spawns four local processes and opens loopback sockets; run explicitly"]
+fn ring_four_process_deepseek_v3_tensor_expert_opaque_session() {
+    run_ring_cartesian_pipeline_mode(
+        false,
+        FixtureFamily::DeepSeek,
+        "tp-ep",
+        WorkerMode::OpaqueSession,
+    );
+}
+
+/// Proves prediction-free DeepSeek-V3 PP x EP uses all-stage expert waves.
+#[test]
+#[ignore = "spawns four local processes and opens loopback sockets; run explicitly"]
+fn ring_four_process_deepseek_v3_pipeline_expert_opaque_session() {
+    run_ring_cartesian_pipeline_mode(
+        false,
+        FixtureFamily::DeepSeek,
+        "pp-ep",
+        WorkerMode::OpaqueSession,
+    );
+}
+
+/// Proves prediction-free DeepSeek-V3 TP x PP x EP uses one neutral session.
+#[test]
+#[ignore = "spawns eight local processes and opens loopback sockets; run explicitly"]
+fn ring_eight_process_deepseek_v3_triple_axis_opaque_session() {
+    run_ring_cartesian_pipeline_mode(
+        false,
+        FixtureFamily::DeepSeek,
+        "tp-pp-ep",
+        WorkerMode::OpaqueSession,
+    );
+}
+
 /// Verifies DeepSeek TP=2 + PP=2 across dense and routed-MoE stages with
 /// tensor-sharded MLA, compressed caches, bounded reads, and generation.
 #[test]
@@ -5391,9 +5925,28 @@ fn ring_two_process_deepseek_v4_pipeline_persistence_and_mtp() {
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
 fn ring_two_process_deepseek_v4_prepared_speculative_capability() {
-    run_ring_pipeline_mode(false, FixtureFamily::DeepSeekV4, WorkerMode::OpaqueSession);
+    run_ring_pipeline_mode(
+        false,
+        FixtureFamily::DeepSeekV4,
+        WorkerMode::OpaquePreparedSpeculativeCapability,
+    );
 }
 
+/// Proves sequential DeepSeek-V4 MTP uses the neutral pooling-state target and
+/// extension-only MLX units without a complete-TP or pipeline target shell.
+#[test]
+#[ignore = "spawns two local processes and opens loopback sockets; run explicitly"]
+fn ring_two_process_deepseek_v4_mtp_target_tensor_parallel_opaque_session() {
+    run_ring_cartesian_pipeline_mode(
+        false,
+        FixtureFamily::DeepSeekV4,
+        "tp",
+        WorkerMode::OpaqueDeepSeekMtpTarget,
+    );
+}
+
+/// Proves a prediction-bearing V4 artifact reuses its neutral pure-EP target
+/// when the prepared speculative capability is queried.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
 fn ring_two_process_deepseek_v4_expert_prepared_speculative_capability() {
@@ -5401,7 +5954,7 @@ fn ring_two_process_deepseek_v4_expert_prepared_speculative_capability() {
         false,
         FixtureFamily::DeepSeekV4,
         "ep",
-        WorkerMode::OpaqueSession,
+        WorkerMode::OpaquePreparedSpeculativeCapability,
     );
 }
 
@@ -5417,6 +5970,19 @@ fn ring_four_process_deepseek_v4_tensor_pipeline() {
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
 fn ring_four_process_deepseek_v4_pipeline_expert() {
     run_ring_cartesian_pipeline(true, FixtureFamily::DeepSeekV4, "pp-ep");
+}
+
+/// Proves the prediction-free V4 target takes the neutral pooling-state route
+/// through exact TP and EP manifest groups without constructing a duplicate model.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_four_process_deepseek_v4_prediction_free_tensor_expert_opaque_session() {
+    run_ring_cartesian_pipeline_mode(
+        false,
+        FixtureFamily::DeepSeekV4,
+        "tp-ep",
+        WorkerMode::OpaqueSessionPredictionFree,
+    );
 }
 
 /// Exercises V4 TP, PP, EP, streamed non-experts, and independent expert
@@ -5458,8 +6024,8 @@ fn ring_eight_process_deepseek_streamed_triple_axis_parameter_bank() {
     );
 }
 
-/// Compares the cache-backed DeepSeek V3 model facade under TP=2 x EP=2 with
-/// the replicated model, covering rank-local expert geometry and exact-once TP.
+/// Compares the cache-backed neutral DeepSeek V3 session under TP=2 x EP=2
+/// with the replicated model, covering rank-local expert geometry and exact-once TP.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
 fn ring_four_process_deepseek_cached_tensor_expert_model_parity() {
@@ -5505,7 +6071,7 @@ fn ring_eight_process_deepseek_gguf_triple_axis_parameter_bank() {
         true,
         FixtureFamily::DeepSeekGguf,
         "tp-pp-ep",
-        WorkerMode::AddressableParameterBank,
+        WorkerMode::OpaqueSessionAddressableParameterBank,
     );
 }
 
@@ -5577,6 +6143,31 @@ fn ring_two_process_qwen2_tensor_parallel_resident_reference() {
     );
 }
 
+/// Proves indexed SafeTensors follows the same neutral Qwen2 TP constructor.
+#[test]
+#[ignore = "requires the MLX Ring backend and two loopback CPU ranks"]
+fn ring_two_process_qwen2_indexed_tensor_parallel_resident_reference() {
+    assert!(distributed::is_available(Backend::Ring));
+    let checkpoint = tempfile::tempdir().unwrap();
+    write_indexed_qwen_fixture(checkpoint.path(), "qwen2");
+    let checkpoint_path = checkpoint.path().to_path_buf();
+    run_ring_pipeline_processes(
+        WorkerResidency::FullyResident,
+        FixtureFamily::Qwen2,
+        WorkerMode::OpaqueSession,
+        checkpoint,
+        checkpoint_path,
+        Some("tp"),
+    );
+}
+
+/// Proves Qwen2 pure PP uses one neutral manifest and the public cache lifecycle.
+#[test]
+#[ignore = "requires the MLX Ring backend and two loopback CPU ranks"]
+fn ring_two_process_qwen2_pipeline_resident_reference() {
+    run_ring_pipeline_mode(false, FixtureFamily::Qwen2, WorkerMode::OpaqueSession);
+}
+
 /// Compares dense Qwen3 TP=2 prefill and decode logits with the fully
 /// resident single-rank public-loader result.
 #[test]
@@ -5593,6 +6184,141 @@ fn ring_two_process_qwen3_tensor_parallel_resident_reference() {
         checkpoint,
         checkpoint_path,
         Some("tp"),
+    );
+}
+
+/// Proves one-rank MLX cache preparation failure rolls back the peer shard,
+/// propagates its causal phase, and fences retry before further native work.
+#[test]
+#[ignore = "requires the MLX Ring backend and two loopback CPU ranks"]
+fn ring_two_process_qwen3_prompt_cache_prepare_failure_rolls_back_and_fences() {
+    assert!(distributed::is_available(Backend::Ring));
+    let checkpoint = tempfile::tempdir().unwrap();
+    write_qwen_fixture(checkpoint.path(), "qwen3");
+    let checkpoint_path = checkpoint.path().to_path_buf();
+    run_ring_pipeline_processes(
+        WorkerResidency::FullyResident,
+        FixtureFamily::Qwen3,
+        WorkerMode::PromptCachePrepareFailure,
+        checkpoint,
+        checkpoint_path,
+        Some("tp"),
+    );
+}
+
+/// Proves Qwen3 pure PP uses the family-blind neutral resident driver.
+#[test]
+#[ignore = "requires the MLX Ring backend and two loopback CPU ranks"]
+fn ring_two_process_qwen3_pipeline_resident_reference() {
+    run_ring_pipeline_mode(false, FixtureFamily::Qwen3, WorkerMode::OpaqueSession);
+}
+
+/// Proves dense Qwen2 GGUF enters the neutral TP path without a complete shell.
+#[test]
+#[ignore = "requires the MLX Ring backend and two loopback CPU ranks"]
+fn ring_two_process_qwen2_gguf_tensor_parallel_resident_reference() {
+    run_ring_cartesian_pipeline_mode(
+        false,
+        FixtureFamily::Qwen2Gguf,
+        "tp",
+        WorkerMode::OpaqueSession,
+    );
+}
+
+/// Proves dense Qwen3 GGUF enters the neutral pure-PP path.
+#[test]
+#[ignore = "requires the MLX Ring backend and two loopback CPU ranks"]
+fn ring_two_process_qwen3_gguf_pipeline_resident_reference() {
+    run_ring_pipeline_mode(false, FixtureFamily::Qwen3Gguf, WorkerMode::OpaqueSession);
+}
+
+/// Compares Qwen2 TP=2 x PP=2 prefill, decode, and prompt-cache continuity
+/// with the fully resident single-rank public-loader result.
+#[test]
+#[ignore = "requires the MLX Ring backend, four loopback CPU ranks, and the synthetic Qwen2 fixture"]
+fn ring_four_process_qwen2_tensor_pipeline_resident_reference() {
+    run_ring_cartesian_pipeline_mode(
+        false,
+        FixtureFamily::Qwen2,
+        "tp-pp",
+        WorkerMode::OpaqueSession,
+    );
+}
+
+/// Proves Qwen3 TP=2 x PP=2 numeric/cache parity through neutral construction.
+#[test]
+#[ignore = "requires the MLX Ring backend and four loopback CPU ranks"]
+fn ring_four_process_qwen3_tensor_pipeline_resident_reference() {
+    run_ring_cartesian_pipeline_mode(
+        false,
+        FixtureFamily::Qwen3,
+        "tp-pp",
+        WorkerMode::OpaqueSession,
+    );
+}
+
+/// Proves bounded host-local Qwen2 units retain neutral TP execution.
+#[test]
+#[ignore = "requires the MLX Ring backend and two loopback CPU ranks"]
+fn ring_two_process_qwen2_layerwise_host_tensor_parallel_reference() {
+    run_ring_layerwise_host_cartesian_pipeline_mode(
+        FixtureFamily::Qwen2,
+        "tp",
+        WorkerMode::OpaqueSession,
+    );
+}
+
+/// Proves disk-streamed Qwen3 units retain neutral pure-PP execution.
+#[test]
+#[ignore = "requires the MLX Ring backend and two loopback CPU ranks"]
+fn ring_two_process_qwen3_dense_stream_pipeline_reference() {
+    run_ring_pipeline_mode(true, FixtureFamily::Qwen3, WorkerMode::OpaqueSession);
+}
+
+/// Proves the architecture-selected affine transform materializes once for TP.
+#[test]
+#[ignore = "requires the MLX Ring backend and two loopback CPU ranks"]
+fn ring_two_process_qwen3_transformed_tensor_parallel_reference() {
+    run_ring_cartesian_pipeline_mode(
+        false,
+        FixtureFamily::Qwen3,
+        "tp",
+        WorkerMode::OpaqueSessionRequantize,
+    );
+}
+
+/// Proves the architecture-selected affine transform materializes once for PP.
+#[test]
+#[ignore = "requires the MLX Ring backend and two loopback CPU ranks"]
+fn ring_two_process_qwen3_transformed_pipeline_reference() {
+    run_ring_pipeline_mode(
+        false,
+        FixtureFamily::Qwen3,
+        WorkerMode::OpaqueSessionRequantize,
+    );
+}
+
+/// Proves transformed Qwen3 TP=2 x PP=2 uses one neutral construction.
+#[test]
+#[ignore = "requires the MLX Ring backend and four loopback CPU ranks"]
+fn ring_four_process_qwen3_transformed_tensor_pipeline_reference() {
+    run_ring_cartesian_pipeline_mode(
+        false,
+        FixtureFamily::Qwen3,
+        "tp-pp",
+        WorkerMode::OpaqueSessionRequantize,
+    );
+}
+
+/// Proves routed Qwen3-MoE GGUF uses the neutral partitioned session.
+#[test]
+#[ignore = "requires the MLX Ring backend and two loopback CPU ranks"]
+fn ring_two_process_qwen3_moe_gguf_tensor_parallel_neutral_session() {
+    run_ring_cartesian_pipeline_mode(
+        false,
+        FixtureFamily::Qwen3MoeGguf,
+        "tp",
+        WorkerMode::OpaqueSession,
     );
 }
 
@@ -5617,6 +6343,208 @@ fn ring_two_process_qwen3_moe_pipeline() {
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
 fn ring_two_process_gpt_oss_pipeline() {
     run_ring_pipeline(false, FixtureFamily::GptOss);
+}
+
+/// Proves public Qwen3-MoE TP uses the typed neutral partition constructor.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_two_process_qwen3_moe_tensor_parallel_opaque_session() {
+    run_ring_cartesian_pipeline_mode(
+        false,
+        FixtureFamily::Qwen3Moe,
+        "tp",
+        WorkerMode::OpaqueSession,
+    );
+}
+
+/// Proves Qwen3-MoE pure PP uses routed local units and typed boundaries.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_two_process_qwen3_moe_pipeline_opaque_session() {
+    run_ring_pipeline_mode(false, FixtureFamily::Qwen3Moe, WorkerMode::OpaqueSession);
+}
+
+/// Proves Qwen3-MoE TP=2 x PP=2 stays on the neutral routed driver.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_four_process_qwen3_moe_tensor_pipeline_opaque_session() {
+    run_ring_cartesian_pipeline_mode(
+        false,
+        FixtureFamily::Qwen3Moe,
+        "tp-pp",
+        WorkerMode::OpaqueSession,
+    );
+}
+
+/// Proves public GPT-OSS TP uses the typed neutral partition constructor.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_two_process_gpt_oss_tensor_parallel_opaque_session() {
+    run_ring_cartesian_pipeline_mode(
+        false,
+        FixtureFamily::GptOss,
+        "tp",
+        WorkerMode::OpaqueSession,
+    );
+}
+
+/// Proves GPT-OSS pure PP uses the neutral routed pipeline strategy.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_two_process_gpt_oss_pipeline_opaque_session() {
+    run_ring_pipeline_mode(false, FixtureFamily::GptOss, WorkerMode::OpaqueSession);
+}
+
+/// Proves GPT-OSS TP=2 x PP=2 uses the neutral routed pipeline strategy.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_four_process_gpt_oss_tensor_pipeline_opaque_session() {
+    run_ring_cartesian_pipeline_mode(
+        false,
+        FixtureFamily::GptOss,
+        "tp-pp",
+        WorkerMode::OpaqueSession,
+    );
+}
+
+/// Proves Qwen3-MoE PP=2 x EP=2 follows the architecture-selected collective
+/// wave on inactive pipeline stages through one neutral public session.
+#[test]
+#[ignore = "spawns four local processes and opens loopback sockets; run explicitly"]
+fn ring_four_process_qwen3_moe_pipeline_expert_opaque_session() {
+    run_ring_cartesian_pipeline_mode(
+        false,
+        FixtureFamily::Qwen3Moe,
+        "pp-ep",
+        WorkerMode::OpaqueSession,
+    );
+}
+
+/// Proves GPT-OSS PP=2 x EP=2 preserves its biased reverse wave through one
+/// neutral public session.
+#[test]
+#[ignore = "spawns four local processes and opens loopback sockets; run explicitly"]
+fn ring_four_process_gpt_oss_pipeline_expert_opaque_session() {
+    run_ring_cartesian_pipeline_mode(
+        false,
+        FixtureFamily::GptOss,
+        "pp-ep",
+        WorkerMode::OpaqueSession,
+    );
+}
+
+/// Proves GPT-OSS TP=2 x PP=2 x EP=2 executes the architecture-selected
+/// world-wide expert waves through the neutral public session.
+#[test]
+#[ignore = "spawns eight local processes and opens loopback sockets; run explicitly"]
+fn ring_eight_process_gpt_oss_triple_axis_opaque_session() {
+    run_ring_cartesian_pipeline_mode(
+        false,
+        FixtureFamily::GptOss,
+        "tp-pp-ep",
+        WorkerMode::OpaqueSession,
+    );
+}
+
+/// Proves public Qwen3-MoE EP uses neutral owner/count exchange.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_two_process_qwen3_moe_expert_parallel_opaque_session() {
+    run_ring_cartesian_pipeline_mode(
+        false,
+        FixtureFamily::Qwen3Moe,
+        "ep",
+        WorkerMode::OpaqueSession,
+    );
+}
+
+/// Proves public GPT-OSS EP uses neutral owner/count exchange.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_two_process_gpt_oss_expert_parallel_opaque_session() {
+    run_ring_cartesian_pipeline_mode(
+        false,
+        FixtureFamily::GptOss,
+        "ep",
+        WorkerMode::OpaqueSession,
+    );
+}
+
+/// Proves public Qwen3-MoE TP=2 x EP=2 uses one neutral manifest and the
+/// consensus-proven overlapping logical-subgroup exchange wave.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_four_process_qwen3_moe_tensor_expert_opaque_session() {
+    run_ring_cartesian_pipeline_mode(
+        false,
+        FixtureFamily::Qwen3Moe,
+        "tp-ep",
+        WorkerMode::OpaqueSession,
+    );
+}
+
+/// Proves public GPT-OSS TP=2 x EP=2 retains its biased expert semantics over
+/// one neutral manifest and the consensus-proven logical-subgroup wave.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_four_process_gpt_oss_tensor_expert_opaque_session() {
+    run_ring_cartesian_pipeline_mode(
+        false,
+        FixtureFamily::GptOss,
+        "tp-ep",
+        WorkerMode::OpaqueSession,
+    );
+}
+
+/// Proves TP+EP uses the selected rank-local addressable Qwen bank and exposes
+/// eviction/reload telemetry through the neutral public session.
+#[test]
+#[ignore = "spawns four local processes and opens loopback sockets; run explicitly"]
+fn ring_four_process_qwen3_moe_tensor_expert_addressable_opaque_session() {
+    run_ring_cartesian_pipeline_mode(
+        false,
+        FixtureFamily::Qwen3Moe,
+        "tp-ep",
+        WorkerMode::OpaqueSessionEvictingAddressableParameterBank,
+    );
+}
+
+/// Proves PP+EP uses one neutral session with independent Qwen expert banks.
+#[test]
+#[ignore = "spawns four local processes and opens loopback sockets; run explicitly"]
+fn ring_four_process_qwen3_moe_pipeline_expert_addressable_opaque_session() {
+    run_ring_cartesian_pipeline_mode(
+        false,
+        FixtureFamily::Qwen3Moe,
+        "pp-ep",
+        WorkerMode::OpaqueSessionAddressableParameterBank,
+    );
+}
+
+/// Proves GPT-OSS TP+PP+EP composes bounded ordinary storage with independent
+/// expert banks while preserving post-reduction bias exactly once.
+#[test]
+#[ignore = "spawns eight local processes and opens loopback sockets; run explicitly"]
+fn ring_eight_process_gpt_oss_streamed_triple_axis_addressable_opaque_session() {
+    run_ring_cartesian_pipeline_mode(
+        true,
+        FixtureFamily::GptOss,
+        "tp-pp-ep",
+        WorkerMode::OpaqueSessionAddressableParameterBank,
+    );
+}
+
+/// Proves the ReLU-squared routed equation uses the same exact addressable
+/// session while inactive PP stages retain an empty local bank catalog.
+#[test]
+#[ignore = "spawns eight local processes and opens loopback sockets; run explicitly"]
+fn ring_eight_process_nemotron_h_streamed_triple_axis_addressable_opaque_session() {
+    run_ring_cartesian_pipeline_mode(
+        true,
+        FixtureFamily::NemotronH,
+        "tp-pp-ep",
+        WorkerMode::OpaqueSessionAddressableParameterBank,
+    );
 }
 
 /// Proves GPT-OSS resident TP+PP+EP execution against the single-rank model.
@@ -5658,7 +6586,7 @@ fn ring_eight_process_gpt_oss_gguf_triple_axis_parameter_bank() {
         true,
         FixtureFamily::GptOssGguf,
         "tp-pp-ep",
-        WorkerMode::AddressableParameterBank,
+        WorkerMode::OpaqueSessionAddressableParameterBank,
     );
 }
 
@@ -5691,6 +6619,82 @@ fn ring_four_process_gpt_oss_pipeline_parameter_bank_session() {
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
 fn ring_two_process_lfm2_pipeline() {
     run_ring_pipeline(false, FixtureFamily::Lfm2);
+}
+
+/// Compares dense indexed LFM2 TP=2 prefill, repeated decode, and prompt-cache
+/// restoration with the fully resident single-rank public-loader result.
+#[test]
+#[ignore = "requires the MLX Ring backend, two loopback CPU ranks, and the synthetic LFM2 fixture"]
+fn ring_two_process_lfm2_tensor_parallel_resident_reference() {
+    assert!(distributed::is_available(Backend::Ring));
+    let checkpoint = tempfile::tempdir().unwrap();
+    write_lfm2_pipeline_fixture(checkpoint.path(), false);
+    let checkpoint_path = checkpoint.path().to_path_buf();
+    run_ring_pipeline_processes(
+        WorkerResidency::FullyResident,
+        FixtureFamily::Lfm2,
+        WorkerMode::OpaqueSession,
+        checkpoint,
+        checkpoint_path,
+        Some("tp"),
+    );
+}
+
+/// Compares dense indexed LFM2 PP=2 through the neutral resident runtime with
+/// the fully resident single-rank public-loader result.
+#[test]
+#[ignore = "requires the MLX Ring backend, two loopback CPU ranks, and the synthetic LFM2 fixture"]
+fn ring_two_process_lfm2_pipeline_parallel_resident_reference() {
+    assert!(distributed::is_available(Backend::Ring));
+    let checkpoint = tempfile::tempdir().unwrap();
+    write_lfm2_pipeline_fixture(checkpoint.path(), false);
+    let checkpoint_path = checkpoint.path().to_path_buf();
+    run_ring_pipeline_processes(
+        WorkerResidency::FullyResident,
+        FixtureFamily::Lfm2,
+        WorkerMode::OpaqueSession,
+        checkpoint,
+        checkpoint_path,
+        None,
+    );
+}
+
+/// Compares dense indexed LFM2 TP=2 x PP=2 through exact heterogeneous local
+/// state and architecture-owned publication with the resident reference.
+#[test]
+#[ignore = "requires the MLX Ring backend, four loopback CPU ranks, and the synthetic LFM2 fixture"]
+fn ring_four_process_lfm2_tensor_pipeline_resident_reference() {
+    assert!(distributed::is_available(Backend::Ring));
+    let checkpoint = tempfile::tempdir().unwrap();
+    write_lfm2_pipeline_fixture(checkpoint.path(), false);
+    let checkpoint_path = checkpoint.path().to_path_buf();
+    run_ring_pipeline_processes(
+        WorkerResidency::FullyResident,
+        FixtureFamily::Lfm2,
+        WorkerMode::OpaqueSession,
+        checkpoint,
+        checkpoint_path,
+        Some("tp-pp"),
+    );
+}
+
+/// Proves the public opaque preparation retains LFM2's bounded disk-resident
+/// parameter policy while using the neutral heterogeneous-state partition.
+#[test]
+#[ignore = "requires the MLX Ring backend and two loopback CPU ranks"]
+fn ring_two_process_lfm2_neutral_bounded_pipeline() {
+    assert!(distributed::is_available(Backend::Ring));
+    let checkpoint = tempfile::tempdir().unwrap();
+    write_lfm2_pipeline_fixture(checkpoint.path(), false);
+    let checkpoint_path = checkpoint.path().to_path_buf();
+    run_ring_pipeline_processes(
+        WorkerResidency::DenseDiskStream,
+        FixtureFamily::Lfm2,
+        WorkerMode::OpaqueSession,
+        checkpoint,
+        checkpoint_path,
+        None,
+    );
 }
 
 /// Verifies LFM2's heterogeneous operators through bounded local-layer reads.
@@ -5765,7 +6769,7 @@ fn ring_eight_process_lfm2_moe_gguf_triple_axis_parameter_bank() {
         true,
         FixtureFamily::Lfm2MoeGguf,
         "tp-pp-ep",
-        WorkerMode::AddressableParameterBank,
+        WorkerMode::OpaqueSessionAddressableParameterBank,
     );
 }
 
@@ -5800,12 +6804,184 @@ fn ring_two_process_kimi_linear_dense_stream_pipeline() {
     run_ring_pipeline(true, FixtureFamily::KimiLinear);
 }
 
+/// Compares dense indexed Kimi Linear TP=2 prefill, repeated decode, and the
+/// exact mixed KDA/MLA prompt-cache round trip with a resident single-rank run.
+#[test]
+#[ignore = "requires the MLX Ring backend, two loopback CPU ranks, and the synthetic Kimi Linear fixture"]
+fn ring_two_process_kimi_linear_tensor_parallel_resident_reference() {
+    assert!(distributed::is_available(Backend::Ring));
+    let checkpoint = tempfile::tempdir().unwrap();
+    write_kimi_linear_dense_fixture(checkpoint.path());
+    let checkpoint_path = checkpoint.path().to_path_buf();
+    run_ring_pipeline_processes(
+        WorkerResidency::FullyResident,
+        FixtureFamily::KimiLinear,
+        WorkerMode::OpaqueSession,
+        checkpoint,
+        checkpoint_path,
+        Some("tp"),
+    );
+}
+
+/// Compares dense indexed Kimi Linear PP=2 through the neutral resident
+/// boundary and mixed-state persistence with a resident single-rank run.
+#[test]
+#[ignore = "requires the MLX Ring backend, two loopback CPU ranks, and the synthetic Kimi Linear fixture"]
+fn ring_two_process_kimi_linear_pipeline_parallel_resident_reference() {
+    assert!(distributed::is_available(Backend::Ring));
+    let checkpoint = tempfile::tempdir().unwrap();
+    write_kimi_linear_dense_fixture(checkpoint.path());
+    let checkpoint_path = checkpoint.path().to_path_buf();
+    run_ring_pipeline_processes(
+        WorkerResidency::FullyResident,
+        FixtureFamily::KimiLinear,
+        WorkerMode::OpaqueSession,
+        checkpoint,
+        checkpoint_path,
+        None,
+    );
+}
+
+/// Compares dense indexed Kimi Linear TP=2 x PP=2 with TP-local KDA state,
+/// head-independent MLA state, publication authority, and cache restoration.
+#[test]
+#[ignore = "requires the MLX Ring backend, four loopback CPU ranks, and the synthetic Kimi Linear fixture"]
+fn ring_four_process_kimi_linear_tensor_pipeline_resident_reference() {
+    assert!(distributed::is_available(Backend::Ring));
+    let checkpoint = tempfile::tempdir().unwrap();
+    write_kimi_linear_dense_fixture(checkpoint.path());
+    let checkpoint_path = checkpoint.path().to_path_buf();
+    run_ring_pipeline_processes(
+        WorkerResidency::FullyResident,
+        FixtureFamily::KimiLinear,
+        WorkerMode::OpaqueSession,
+        checkpoint,
+        checkpoint_path,
+        Some("tp-pp"),
+    );
+}
+
+/// Compares dense prediction-free Nemotron-H TP=2 with exact TP-local Mamba
+/// state and owner-only publication against a resident reference.
+#[test]
+#[ignore = "requires the MLX Ring backend and two loopback CPU ranks"]
+fn ring_two_process_nemotron_h_tensor_parallel_neutral_reference() {
+    assert!(distributed::is_available(Backend::Ring));
+    let checkpoint = tempfile::tempdir().unwrap();
+    write_nemotron_dense_fixture(checkpoint.path());
+    let checkpoint_path = checkpoint.path().to_path_buf();
+    run_ring_pipeline_processes(
+        WorkerResidency::FullyResident,
+        FixtureFamily::NemotronH,
+        WorkerMode::OpaqueSession,
+        checkpoint,
+        checkpoint_path,
+        Some("tp"),
+    );
+}
+
+/// Compares dense prediction-free Nemotron-H PP=2 with role-exact hidden,
+/// token, and embedded boundary provenance plus prompt-cache restoration.
+#[test]
+#[ignore = "requires the MLX Ring backend and two loopback CPU ranks"]
+fn ring_two_process_nemotron_h_pipeline_neutral_reference() {
+    assert!(distributed::is_available(Backend::Ring));
+    let checkpoint = tempfile::tempdir().unwrap();
+    write_nemotron_dense_fixture(checkpoint.path());
+    let checkpoint_path = checkpoint.path().to_path_buf();
+    run_ring_pipeline_processes(
+        WorkerResidency::FullyResident,
+        FixtureFamily::NemotronH,
+        WorkerMode::OpaqueSession,
+        checkpoint,
+        checkpoint_path,
+        None,
+    );
+}
+
+/// Compares dense prediction-free Nemotron-H TP=2 x PP=2 with TP-local mixed
+/// state, role-exact auxiliary transport, publication authority, and cache reload.
+#[test]
+#[ignore = "requires the MLX Ring backend and four loopback CPU ranks"]
+fn ring_four_process_nemotron_h_tensor_pipeline_neutral_reference() {
+    assert!(distributed::is_available(Backend::Ring));
+    let checkpoint = tempfile::tempdir().unwrap();
+    write_nemotron_dense_fixture(checkpoint.path());
+    let checkpoint_path = checkpoint.path().to_path_buf();
+    run_ring_pipeline_processes(
+        WorkerResidency::FullyResident,
+        FixtureFamily::NemotronH,
+        WorkerMode::OpaqueSession,
+        checkpoint,
+        checkpoint_path,
+        Some("tp-pp"),
+    );
+}
+
+/// Proves the public opaque preparation retains bounded parameter reads for
+/// the neutral mixed Mamba/attention Nemotron-H pipeline.
+#[test]
+#[ignore = "requires the MLX Ring backend and two loopback CPU ranks"]
+fn ring_two_process_nemotron_h_neutral_bounded_pipeline() {
+    assert!(distributed::is_available(Backend::Ring));
+    let checkpoint = tempfile::tempdir().unwrap();
+    write_nemotron_dense_fixture(checkpoint.path());
+    let checkpoint_path = checkpoint.path().to_path_buf();
+    run_ring_pipeline_processes(
+        WorkerResidency::DenseDiskStream,
+        FixtureFamily::NemotronH,
+        WorkerMode::OpaqueSession,
+        checkpoint,
+        checkpoint_path,
+        None,
+    );
+}
+
+/// Proves load-time MXFP4 conversion consumes the architecture-retained source
+/// partition before constructing the neutral dense Nemotron-H target.
+#[test]
+#[ignore = "requires the MLX Ring backend and two loopback CPU ranks"]
+fn ring_two_process_nemotron_h_neutral_transformed_pipeline() {
+    assert!(distributed::is_available(Backend::Ring));
+    let checkpoint = tempfile::tempdir().unwrap();
+    write_nemotron_dense_quantizable_fixture(checkpoint.path());
+    let checkpoint_path = checkpoint.path().to_path_buf();
+    run_ring_pipeline_processes(
+        WorkerResidency::FullyResident,
+        FixtureFamily::NemotronH,
+        WorkerMode::OpaqueSessionRequantize,
+        checkpoint,
+        checkpoint_path,
+        None,
+    );
+}
+
 /// Exercises the same Kimi stage adapter and heterogeneous cache contract from
 /// a real GGUF artifact rather than a SafeTensors directory.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
 fn ring_two_process_kimi_linear_gguf_pipeline() {
     run_ring_pipeline(true, FixtureFamily::KimiLinearGguf);
+}
+
+/// Proves the public opaque preparation routes a bounded dense Kimi Linear
+/// pipeline through the neutral partitioned session without a backend-owned
+/// family stage adapter.
+#[test]
+#[ignore = "requires the MLX Ring backend and two loopback CPU ranks"]
+fn ring_two_process_kimi_linear_neutral_bounded_pipeline() {
+    assert!(distributed::is_available(Backend::Ring));
+    let checkpoint = tempfile::tempdir().unwrap();
+    write_kimi_linear_dense_fixture(checkpoint.path());
+    let checkpoint_path = checkpoint.path().to_path_buf();
+    run_ring_pipeline_processes(
+        WorkerResidency::DenseDiskStream,
+        FixtureFamily::KimiLinear,
+        WorkerMode::OpaqueSession,
+        checkpoint,
+        checkpoint_path,
+        None,
+    );
 }
 
 /// Verifies Kimi Linear TP=2 + PP=2 across KDA and MLA stages with TP-local
@@ -5882,7 +7058,7 @@ fn ring_eight_process_kimi_linear_gguf_triple_axis_parameter_bank() {
         true,
         FixtureFamily::KimiLinearGguf,
         "tp-pp-ep",
-        WorkerMode::AddressableParameterBank,
+        WorkerMode::OpaqueSessionAddressableParameterBank,
     );
 }
 
@@ -5977,7 +7153,7 @@ fn ring_eight_process_nemotron_h_moe_gguf_triple_axis_parameter_bank() {
         true,
         FixtureFamily::NemotronHGguf,
         "tp-pp-ep",
-        WorkerMode::AddressableParameterBank,
+        WorkerMode::OpaqueSessionAddressableParameterBank,
     );
 }
 
@@ -6066,8 +7242,8 @@ fn ring_four_process_qwen3_next_tensor_pipeline() {
     run_ring_cartesian_pipeline(true, FixtureFamily::Qwen3Next, "tp-pp");
 }
 
-/// Compares Qwen3-Next TP=2 prefill and decode with the replicated public
-/// loader, covering the placed-stage route without a pipeline or expert axis.
+/// Proves the unsupported direct Qwen3-Next prediction route is rejected at
+/// neutral TP admission; embedded prediction requires its selected adapter.
 #[test]
 #[ignore = "requires the MLX Ring backend, two loopback CPU ranks, and the synthetic Qwen3-Next fixture"]
 fn ring_two_process_qwen3_next_tensor_parallel_opaque_session() {
@@ -6075,11 +7251,12 @@ fn ring_two_process_qwen3_next_tensor_parallel_opaque_session() {
         false,
         FixtureFamily::Qwen3Next,
         "tp",
-        WorkerMode::OpaqueSession,
+        WorkerMode::OpaqueUnsupportedDirectPartition,
     );
 }
 
-/// Covers pure TP loading and execution for the Qwen3.5 hybrid architecture.
+/// Proves the unsupported direct Qwen3.5 prediction route is rejected at
+/// neutral TP admission; embedded prediction requires its selected adapter.
 #[test]
 #[ignore = "requires the MLX Ring backend, two loopback CPU ranks, and the synthetic Qwen3.5 fixture"]
 fn ring_two_process_qwen35_tensor_parallel_opaque_session() {
@@ -6087,7 +7264,7 @@ fn ring_two_process_qwen35_tensor_parallel_opaque_session() {
         false,
         FixtureFamily::Qwen35,
         "tp",
-        WorkerMode::OpaqueSession,
+        WorkerMode::OpaqueUnsupportedDirectPartition,
     );
 }
 
@@ -6104,15 +7281,53 @@ fn ring_two_process_qwen35_multimodal_tensor_parallel_opaque_session() {
     );
 }
 
-/// Covers pure TP loading and text execution for the Qwen3-VL architecture.
+/// Covers the prediction-free conditional Qwen graph through the generic
+/// composite partition binder. Prediction-bearing variants are classified as
+/// separate neutral prediction targets before composite admission.
+#[test]
+#[ignore = "requires the MLX Ring backend, two loopback CPU ranks, and the synthetic conditional Qwen fixture"]
+fn ring_two_process_qwen35_zero_prediction_tensor_parallel_opaque_session() {
+    run_ring_cartesian_pipeline_mode(
+        false,
+        FixtureFamily::Qwen35ZeroPrediction,
+        "tp",
+        WorkerMode::OpaqueQwenConditionalMedia,
+    );
+}
+
+/// Covers the prediction-free conditional Qwen media graph across two neutral
+/// pipeline owners without constructing a family pipeline shell.
+#[test]
+#[ignore = "requires the MLX Ring backend, two loopback CPU ranks, and the synthetic conditional Qwen fixture"]
+fn ring_two_process_qwen35_zero_prediction_pipeline_neutral_composite_session() {
+    run_ring_pipeline_mode(
+        false,
+        FixtureFamily::Qwen35ZeroPrediction,
+        WorkerMode::OpaqueQwenConditionalMedia,
+    );
+}
+
+/// Covers pure TP loading and multimodal execution for Qwen3-VL through the
+/// neutral composite partition binder.
 #[test]
 #[ignore = "requires the MLX Ring backend, two loopback CPU ranks, and the synthetic Qwen3-VL fixture"]
-fn ring_two_process_qwen3_vl_tensor_parallel_opaque_session() {
+fn ring_two_process_qwen3_vl_multimodal_tensor_parallel_opaque_session() {
     run_ring_cartesian_pipeline_mode(
         false,
         FixtureFamily::Qwen3Vl,
         "tp",
-        WorkerMode::OpaqueSession,
+        WorkerMode::OpaqueQwen3VlMedia,
+    );
+}
+
+/// Proves Qwen3-VL media continuation traverses the ordinary neutral PP session.
+#[test]
+#[ignore = "requires the MLX Ring backend and two loopback CPU ranks"]
+fn ring_two_process_qwen3_vl_pipeline_neutral_composite_session() {
+    run_ring_pipeline_mode(
+        false,
+        FixtureFamily::Qwen3Vl,
+        WorkerMode::OpaqueQwen3VlMedia,
     );
 }
 
@@ -6165,7 +7380,12 @@ fn ring_four_process_qwen3_vl_layerwise_host_tensor_pipeline() {
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
 fn ring_eight_process_qwen3_vl_moe_triple_axis() {
-    run_ring_cartesian_pipeline(false, FixtureFamily::Qwen3VlMoe, "tp-pp-ep");
+    run_ring_cartesian_pipeline_mode(
+        false,
+        FixtureFamily::Qwen3VlMoe,
+        "tp-pp-ep",
+        WorkerMode::OpaqueQwen3VlMedia,
+    );
 }
 
 /// Combines bounded Qwen3-VL media/decoder streaming with independent cached
@@ -6385,7 +7605,7 @@ fn ring_qwen3_moe_gguf_pipeline_parameter_bank() {
         true,
         FixtureFamily::Qwen3MoeGguf,
         "pp-ep",
-        WorkerMode::AddressableParameterBank,
+        WorkerMode::OpaqueSessionAddressableParameterBank,
     );
 }
 
@@ -6466,7 +7686,7 @@ fn ring_qwen3_moe_tensor_pipeline_opaque_session() {
 }
 
 /// Exercises the public complete-model loader and opaque session through the
-/// neutral Inkling tensor-parallel composition without pipeline partitioning.
+/// explicit Inkling tensor-parallel bridge without realizing a neutral manifest.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
 fn ring_two_process_inkling_tensor_parallel_opaque_session() {
@@ -6475,6 +7695,32 @@ fn ring_two_process_inkling_tensor_parallel_opaque_session() {
         FixtureFamily::Inkling,
         "tp",
         WorkerMode::OpaqueSession,
+    );
+}
+
+/// Exercises an admitted dense, prediction-free Inkling through the generic
+/// composite partition binder without constructing a duplicate model shell.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_two_process_inkling_dense_tensor_parallel_opaque_session() {
+    run_ring_cartesian_pipeline_mode(
+        false,
+        FixtureFamily::InklingDense,
+        "tp",
+        WorkerMode::OpaqueSession,
+    );
+}
+
+/// Proves dense Inkling's active image and audio roots traverse the same
+/// neutral composite TP session used by routed Inkling variants.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_two_process_inkling_dense_multimodal_tensor_parallel_opaque_session() {
+    run_ring_cartesian_pipeline_mode(
+        false,
+        FixtureFamily::InklingDenseMultimodal,
+        "tp",
+        WorkerMode::OpaqueInklingMedia,
     );
 }
 
@@ -6525,8 +7771,44 @@ fn ring_two_process_inkling_mtp_pipeline_neutral_visitor() {
     run_ring_pipeline_mode(false, FixtureFamily::Inkling, WorkerMode::OpaqueInklingMtp);
 }
 
-/// Exercises the neutral Gemma 4 text binder through the public loader and
-/// opaque session on a pure two-rank tensor-parallel topology.
+/// Exercises conditional Qwen hybrid MTP over one neutral TP target and extension-only state.
+#[test]
+#[ignore = "spawns local processes, opens loopback sockets, and initializes MLX; run explicitly"]
+fn ring_two_process_qwen35_mtp_tensor_parallel_neutral_visitor() {
+    run_ring_cartesian_pipeline_mode(
+        false,
+        FixtureFamily::Qwen35Multimodal,
+        "tp",
+        WorkerMode::OpaqueQwenHybridMtp,
+    );
+}
+
+/// Exercises conditional Qwen hybrid MTP over the neutral two-stage target session.
+#[test]
+#[ignore = "spawns local processes, opens loopback sockets, and initializes MLX; run explicitly"]
+fn ring_two_process_qwen35_mtp_pipeline_neutral_visitor() {
+    run_ring_pipeline_mode(
+        false,
+        FixtureFamily::Qwen35Multimodal,
+        WorkerMode::OpaqueQwenHybridMtp,
+    );
+}
+
+/// Exercises patterned Nemotron-H MTP over one neutral TP target and
+/// extension-only state, with no family model/session fallback.
+#[test]
+#[ignore = "spawns local processes, opens loopback sockets, and initializes MLX; run explicitly"]
+fn ring_two_process_nemotron_h_mtp_tensor_parallel_neutral_visitor() {
+    run_ring_cartesian_pipeline_mode(
+        false,
+        FixtureFamily::NemotronH,
+        "tp",
+        WorkerMode::OpaqueNemotronHMtp,
+    );
+}
+
+/// Exercises the architecture-owned Gemma 4 composite TP partition through
+/// the public loader and neutral manifest runtime.
 #[test]
 #[ignore = "requires the MLX Ring backend, two loopback CPU ranks, and the synthetic untied Gemma 4 text fixture"]
 fn ring_two_process_gemma4_tensor_parallel_opaque_session() {
@@ -6541,6 +7823,29 @@ fn ring_two_process_gemma4_tensor_parallel_opaque_session() {
         checkpoint,
         checkpoint_path,
         Some("tp"),
+    );
+}
+
+/// Exercises the architecture-owned Gemma 4 composite across two pipeline
+/// stages with public-session cache continuation and publication.
+#[test]
+#[ignore = "requires the MLX Ring backend, two loopback CPU ranks, and the synthetic untied Gemma 4 text fixture"]
+fn ring_two_process_gemma4_pipeline_neutral_composite_session() {
+    assert!(distributed::is_available(Backend::Ring));
+    let checkpoint = tempfile::tempdir().unwrap();
+    // This exact PP proof uses independent per-layer KV state. Gemma 4
+    // checkpoints whose later layers consume a pass-local shared KV
+    // publication still require that typed publication in the neutral wire
+    // boundary and therefore remain outside this first production slice.
+    write_gemma4_tensor_parallel_fixture(checkpoint.path());
+    let checkpoint_path = checkpoint.path().to_path_buf();
+    run_ring_pipeline_processes(
+        WorkerResidency::FullyResident,
+        FixtureFamily::Gemma,
+        WorkerMode::OpaqueSession,
+        checkpoint,
+        checkpoint_path,
+        None,
     );
 }
 
@@ -6560,6 +7865,25 @@ fn ring_two_process_gemma4_multimodal_tensor_parallel_opaque_session() {
         checkpoint,
         checkpoint_path,
         Some("tp"),
+    );
+}
+
+/// Exercises Gemma 4 Unified media ingress, optional roots, merge, and decoder
+/// continuation across two neutral pipeline owners.
+#[test]
+#[ignore = "requires the MLX Ring backend, two loopback CPU ranks, and the synthetic untied Gemma 4 Unified media fixture"]
+fn ring_two_process_gemma4_multimodal_pipeline_neutral_composite_session() {
+    assert!(distributed::is_available(Backend::Ring));
+    let checkpoint = tempfile::tempdir().unwrap();
+    write_gemma4_multimodal_tensor_parallel_fixture(checkpoint.path());
+    let checkpoint_path = checkpoint.path().to_path_buf();
+    run_ring_pipeline_processes(
+        WorkerResidency::FullyResident,
+        FixtureFamily::Gemma,
+        WorkerMode::OpaqueGemma4Media,
+        checkpoint,
+        checkpoint_path,
+        None,
     );
 }
 
@@ -6654,6 +7978,25 @@ fn ring_two_process_muse_glimmer_image_tensor_parallel_opaque_session() {
         checkpoint,
         checkpoint_path,
         Some("tp"),
+    );
+}
+
+/// Exercises Muse-Glimmer's image root and decoder continuation across two
+/// neutral pipeline owners without constructing a family pipeline shell.
+#[test]
+#[ignore = "requires the MLX Ring backend, two loopback CPU ranks, and the synthetic Muse-Glimmer image fixture"]
+fn ring_two_process_muse_glimmer_image_pipeline_neutral_composite_session() {
+    assert!(distributed::is_available(Backend::Ring));
+    let checkpoint = tempfile::tempdir().unwrap();
+    write_muse_glimmer_tensor_parallel_fixture(checkpoint.path());
+    let checkpoint_path = checkpoint.path().to_path_buf();
+    run_ring_pipeline_processes(
+        WorkerResidency::FullyResident,
+        FixtureFamily::MuseGlimmer,
+        WorkerMode::OpaqueMuseImage,
+        checkpoint,
+        checkpoint_path,
+        None,
     );
 }
 
@@ -6823,7 +8166,12 @@ fn ring_four_process_inkling_multimodal_pipeline_expert() {
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
 fn ring_eight_process_inkling_multimodal_triple_axis() {
-    run_ring_cartesian_pipeline(false, FixtureFamily::InklingMultimodal, "tp-pp-ep");
+    run_ring_cartesian_pipeline_mode(
+        false,
+        FixtureFamily::InklingMultimodal,
+        "tp-pp-ep",
+        WorkerMode::OpaqueInklingMedia,
+    );
 }
 
 /// Proves multimodal ingress composes with streamed non-experts and stage-local
@@ -6871,6 +8219,17 @@ fn run_ring_cartesian_pipeline_mode(
         let path = checkpoint.path().join("model.gguf");
         write_deepseek_gguf_fixture(&path);
         path
+    } else if matches!(family, FixtureFamily::Qwen2Gguf | FixtureFamily::Qwen3Gguf) {
+        let path = checkpoint.path().join("model.gguf");
+        write_qwen_gguf_fixture(
+            &path,
+            if family == FixtureFamily::Qwen2Gguf {
+                "qwen2"
+            } else {
+                "qwen3"
+            },
+        );
+        path
     } else if family == FixtureFamily::Qwen3MoeGguf {
         let path = checkpoint.path().join("model.gguf");
         write_qwen3_moe_gguf_fixture(&path);
@@ -6897,7 +8256,13 @@ fn run_ring_cartesian_pipeline_mode(
         path
     } else {
         match family {
-            FixtureFamily::Qwen3 if mode == WorkerMode::Requantize => {
+            FixtureFamily::Qwen2 => write_qwen_fixture(checkpoint.path(), "qwen2"),
+            FixtureFamily::Qwen3
+                if matches!(
+                    mode,
+                    WorkerMode::Requantize | WorkerMode::OpaqueSessionRequantize
+                ) =>
+            {
                 write_qwen_requantized_tp_fixture(checkpoint.path())
             }
             FixtureFamily::Qwen3 => write_qwen_fixture(checkpoint.path(), "qwen3"),
@@ -6905,8 +8270,22 @@ fn run_ring_cartesian_pipeline_mode(
             FixtureFamily::Qwen3MoeTied => {
                 write_qwen_fixture_with_tied_head(checkpoint.path(), "qwen3_moe", true)
             }
+            FixtureFamily::DeepSeek if mode == WorkerMode::OpaqueDeepSeekMtpTarget => {
+                write_deepseek_fixture_with_prediction(checkpoint.path(), 2, 1)
+            }
             FixtureFamily::DeepSeek => write_deepseek_fixture(checkpoint.path(), 2),
-            FixtureFamily::DeepSeekV4 => write_deepseek_v4_fixture(checkpoint.path()),
+            FixtureFamily::DeepSeekV4 => write_deepseek_v4_fixture(
+                checkpoint.path(),
+                if matches!(
+                    mode,
+                    WorkerMode::OpaqueSessionPredictionFree
+                        | WorkerMode::OpaqueSessionAddressableParameterBank
+                ) {
+                    0
+                } else {
+                    1
+                },
+            ),
             FixtureFamily::Lfm2 => write_lfm2_pipeline_fixture(checkpoint.path(), false),
             FixtureFamily::Lfm2Moe => write_lfm2_pipeline_fixture(checkpoint.path(), true),
             FixtureFamily::KimiLinear => write_kimi_linear_fixture(checkpoint.path()),
@@ -6917,6 +8296,9 @@ fn run_ring_cartesian_pipeline_mode(
                 ) =>
             {
                 write_nemotron_quantizable_fixture(checkpoint.path())
+            }
+            FixtureFamily::NemotronH if mode == WorkerMode::OpaqueNemotronHMtp => {
+                write_nemotron_mtp_fixture(checkpoint.path())
             }
             FixtureFamily::NemotronH => write_nemotron_fixture(checkpoint.path()),
             FixtureFamily::Qwen3Next => write_qwen_hybrid_fixture(checkpoint.path(), "qwen3_next"),
@@ -6929,6 +8311,9 @@ fn run_ring_cartesian_pipeline_mode(
             }
             FixtureFamily::Qwen35Multimodal => {
                 write_qwen35_multimodal_fixture(checkpoint.path(), false)
+            }
+            FixtureFamily::Qwen35ZeroPrediction => {
+                write_qwen35_zero_prediction_fixture(checkpoint.path())
             }
             FixtureFamily::Qwen35MoeMultimodal => {
                 write_qwen35_multimodal_fixture(checkpoint.path(), true)
@@ -6947,6 +8332,10 @@ fn run_ring_cartesian_pipeline_mode(
                 write_inkling_mtp_fixture(checkpoint.path())
             }
             FixtureFamily::Inkling => write_inkling_fixture(checkpoint.path()),
+            FixtureFamily::InklingDense => write_inkling_dense_fixture(checkpoint.path()),
+            FixtureFamily::InklingDenseMultimodal => {
+                write_inkling_dense_multimodal_fixture(checkpoint.path())
+            }
             FixtureFamily::InklingMultimodal => write_inkling_multimodal_fixture(checkpoint.path()),
             FixtureFamily::GptOss => write_gpt_oss_fixture(checkpoint.path()),
             _ => panic!("Cartesian pipeline helper received unsupported {family:?}"),
@@ -6974,24 +8363,45 @@ fn run_ring_layerwise_host_cartesian_pipeline_mode(
         let path = checkpoint.path().join("model.gguf");
         write_deepseek_gguf_fixture(&path);
         path
+    } else if matches!(family, FixtureFamily::Qwen2Gguf | FixtureFamily::Qwen3Gguf) {
+        let path = checkpoint.path().join("model.gguf");
+        write_qwen_gguf_fixture(
+            &path,
+            if family == FixtureFamily::Qwen2Gguf {
+                "qwen2"
+            } else {
+                "qwen3"
+            },
+        );
+        path
     } else if family == FixtureFamily::Qwen3MoeGguf {
         let path = checkpoint.path().join("model.gguf");
         write_qwen3_moe_gguf_fixture(&path);
         path
     } else {
         match family {
-            FixtureFamily::Qwen3 if mode == WorkerMode::Requantize => {
+            FixtureFamily::Qwen2 => write_qwen_fixture(checkpoint.path(), "qwen2"),
+            FixtureFamily::Qwen3
+                if matches!(
+                    mode,
+                    WorkerMode::Requantize | WorkerMode::OpaqueSessionRequantize
+                ) =>
+            {
                 write_qwen_requantized_tp_fixture(checkpoint.path())
             }
             FixtureFamily::Qwen3 => write_qwen_fixture(checkpoint.path(), "qwen3"),
             FixtureFamily::DeepSeek => write_deepseek_fixture(checkpoint.path(), 2),
-            FixtureFamily::DeepSeekV4 => write_deepseek_v4_fixture(checkpoint.path()),
+            FixtureFamily::DeepSeekV4 => write_deepseek_v4_fixture(checkpoint.path(), 1),
             FixtureFamily::Qwen3Moe => write_qwen_fixture(checkpoint.path(), "qwen3_moe"),
             FixtureFamily::GptOss => write_gpt_oss_fixture(checkpoint.path()),
             FixtureFamily::Lfm2Moe => write_lfm2_pipeline_fixture(checkpoint.path(), true),
             FixtureFamily::KimiLinear => write_kimi_linear_fixture(checkpoint.path()),
             FixtureFamily::NemotronH => write_nemotron_fixture(checkpoint.path()),
             FixtureFamily::Inkling => write_inkling_fixture(checkpoint.path()),
+            FixtureFamily::InklingDense => write_inkling_dense_fixture(checkpoint.path()),
+            FixtureFamily::InklingDenseMultimodal => {
+                write_inkling_dense_multimodal_fixture(checkpoint.path())
+            }
             FixtureFamily::InklingMultimodal => write_inkling_multimodal_fixture(checkpoint.path()),
             FixtureFamily::Qwen3NextMoe => {
                 write_qwen_hybrid_moe_fixture(checkpoint.path(), "qwen3_next")
@@ -7001,6 +8411,9 @@ fn run_ring_layerwise_host_cartesian_pipeline_mode(
             }
             FixtureFamily::Qwen35Multimodal => {
                 write_qwen35_multimodal_fixture(checkpoint.path(), false)
+            }
+            FixtureFamily::Qwen35ZeroPrediction => {
+                write_qwen35_zero_prediction_fixture(checkpoint.path())
             }
             FixtureFamily::Qwen35MoeMultimodal => {
                 write_qwen35_multimodal_fixture(checkpoint.path(), true)
@@ -7029,15 +8442,26 @@ enum WorkerMode {
     AddressableParameterBankRequantize,
     Requantize,
     OpaqueSession,
+    OpaqueSessionPredictionFree,
+    OpaquePreparedSpeculativeCapability,
+    OpaqueUnsupportedDirectPartition,
+    OpaqueSessionRequantize,
     OpaqueInspection,
     OpaqueTextGeneration,
     OpaqueSessionAddressableParameterBank,
+    OpaqueSessionEvictingAddressableParameterBank,
     OpaqueMuseImage,
     OpaqueInklingMedia,
     OpaqueInklingMtp,
+    OpaqueQwenHybridMtp,
+    OpaqueNemotronHMtp,
+    OpaqueDeepSeekMtpTarget,
     OpaqueGemma4Media,
     OpaqueGemma4MediaInspection,
+    OpaqueQwen3VlMedia,
+    OpaqueQwenConditionalMedia,
     QwenHybridPromptCache,
+    PromptCachePrepareFailure,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -7063,6 +8487,17 @@ fn run_ring_pipeline_mode(dense_stream: bool, family: FixtureFamily, mode: Worke
     let checkpoint_path = if family == FixtureFamily::DeepSeekGguf {
         let path = checkpoint.path().join("model.gguf");
         write_deepseek_gguf_fixture(&path);
+        path
+    } else if matches!(family, FixtureFamily::Qwen2Gguf | FixtureFamily::Qwen3Gguf) {
+        let path = checkpoint.path().join("model.gguf");
+        write_qwen_gguf_fixture(
+            &path,
+            if family == FixtureFamily::Qwen2Gguf {
+                "qwen2"
+            } else {
+                "qwen3"
+            },
+        );
         path
     } else if family == FixtureFamily::Qwen3MoeGguf {
         let path = checkpoint.path().join("model.gguf");
@@ -7092,10 +8527,21 @@ fn run_ring_pipeline_mode(dense_stream: bool, family: FixtureFamily, mode: Worke
         match family {
             FixtureFamily::Llama => write_fixture(checkpoint.path()),
             FixtureFamily::Mistral => write_mistral_fixture(checkpoint.path()),
+            FixtureFamily::DeepSeek if mode == WorkerMode::OpaqueDeepSeekMtpTarget => {
+                write_deepseek_fixture_with_prediction(checkpoint.path(), 2, 1)
+            }
             FixtureFamily::DeepSeek => write_deepseek_fixture(checkpoint.path(), 2),
-            FixtureFamily::DeepSeekV4 => write_deepseek_v4_fixture(checkpoint.path()),
+            FixtureFamily::DeepSeekV4 => write_deepseek_v4_fixture(checkpoint.path(), 1),
             FixtureFamily::Gemma => write_gemma_fixture(checkpoint.path()),
             FixtureFamily::Qwen2 => write_qwen_fixture(checkpoint.path(), "qwen2"),
+            FixtureFamily::Qwen3
+                if matches!(
+                    mode,
+                    WorkerMode::Requantize | WorkerMode::OpaqueSessionRequantize
+                ) =>
+            {
+                write_qwen_requantized_tp_fixture(checkpoint.path())
+            }
             FixtureFamily::Qwen3 => write_qwen_fixture(checkpoint.path(), "qwen3"),
             FixtureFamily::Qwen3Moe => write_qwen_fixture(checkpoint.path(), "qwen3_moe"),
             FixtureFamily::Qwen3MoeTied => {
@@ -7117,6 +8563,9 @@ fn run_ring_pipeline_mode(dense_stream: bool, family: FixtureFamily, mode: Worke
             FixtureFamily::Qwen35Multimodal => {
                 write_qwen35_multimodal_fixture(checkpoint.path(), false)
             }
+            FixtureFamily::Qwen35ZeroPrediction => {
+                write_qwen35_zero_prediction_fixture(checkpoint.path())
+            }
             FixtureFamily::Qwen35MoeMultimodal => {
                 write_qwen35_multimodal_fixture(checkpoint.path(), true)
             }
@@ -7126,11 +8575,17 @@ fn run_ring_pipeline_mode(dense_stream: bool, family: FixtureFamily, mode: Worke
                 write_inkling_pipeline_mtp_fixture(checkpoint.path())
             }
             FixtureFamily::Inkling => write_inkling_fixture(checkpoint.path()),
+            FixtureFamily::InklingDense => write_inkling_dense_fixture(checkpoint.path()),
+            FixtureFamily::InklingDenseMultimodal => {
+                write_inkling_dense_multimodal_fixture(checkpoint.path())
+            }
             FixtureFamily::InklingMultimodal => write_inkling_multimodal_fixture(checkpoint.path()),
             FixtureFamily::MuseGlimmer => {
                 write_muse_glimmer_tensor_parallel_fixture(checkpoint.path())
             }
             FixtureFamily::DeepSeekGguf
+            | FixtureFamily::Qwen2Gguf
+            | FixtureFamily::Qwen3Gguf
             | FixtureFamily::Qwen3MoeGguf
             | FixtureFamily::GptOssGguf
             | FixtureFamily::Lfm2MoeGguf
@@ -7196,6 +8651,9 @@ fn run_ring_pipeline_processes(
             .env("MLX_HOSTFILE", &hostfile)
             .env_remove("MLX_RING_VERBOSE")
             .stdout(Stdio::piped());
+        if family == FixtureFamily::Qwen3VlMoe && cartesian_axes == Some("tp-pp-ep") {
+            command.env("EREDU_TEST_PARTITION_COLLECTIVE_TRACE", "1");
+        }
         command.stderr(Stdio::piped());
         if let Some(axes) = cartesian_axes {
             command.env(CARTESIAN_AXES, axes);
@@ -7227,6 +8685,22 @@ fn run_ring_pipeline_processes(
             WorkerMode::OpaqueSession => {
                 command.env(OPAQUE_SESSION, "1");
             }
+            WorkerMode::OpaqueSessionPredictionFree => {
+                command.env(OPAQUE_SESSION, "1");
+                command.env(PREDICTION_FREE_TARGET, "1");
+            }
+            WorkerMode::OpaquePreparedSpeculativeCapability => {
+                command.env(OPAQUE_SESSION, "1");
+                command.env(PREPARED_SPECULATIVE_CAPABILITY, "1");
+            }
+            WorkerMode::OpaqueUnsupportedDirectPartition => {
+                command.env(OPAQUE_SESSION, "1");
+                command.env(EXPECTED_UNSUPPORTED_DIRECT_PARTITION, "1");
+            }
+            WorkerMode::OpaqueSessionRequantize => {
+                command.env(OPAQUE_SESSION, "1");
+                command.env(REQUANTIZE, "1");
+            }
             WorkerMode::OpaqueInspection => {
                 command.env(OPAQUE_SESSION, "1");
                 command.env(OPAQUE_INSPECTION, "1");
@@ -7238,6 +8712,11 @@ fn run_ring_pipeline_processes(
             WorkerMode::OpaqueSessionAddressableParameterBank => {
                 command.env(OPAQUE_SESSION, "1");
                 command.env(EXPERT_CACHE, "1");
+            }
+            WorkerMode::OpaqueSessionEvictingAddressableParameterBank => {
+                command.env(OPAQUE_SESSION, "1");
+                command.env(EXPERT_CACHE, "1");
+                command.env(EXPERT_CACHE_EVICTION, "1");
             }
             WorkerMode::OpaqueMuseImage => {
                 command.env(OPAQUE_SESSION, "1");
@@ -7251,6 +8730,18 @@ fn run_ring_pipeline_processes(
                 command.env(OPAQUE_SESSION, "1");
                 command.env(OPAQUE_INKLING_MTP, "1");
             }
+            WorkerMode::OpaqueQwenHybridMtp => {
+                command.env(OPAQUE_SESSION, "1");
+                command.env(OPAQUE_QWEN_HYBRID_MTP, "1");
+            }
+            WorkerMode::OpaqueNemotronHMtp => {
+                command.env(OPAQUE_SESSION, "1");
+                command.env(OPAQUE_NEMOTRON_H_MTP, "1");
+            }
+            WorkerMode::OpaqueDeepSeekMtpTarget => {
+                command.env(OPAQUE_SESSION, "1");
+                command.env(OPAQUE_DEEPSEEK_MTP_TARGET, "1");
+            }
             WorkerMode::OpaqueGemma4Media => {
                 command.env(OPAQUE_SESSION, "1");
                 command.env(OPAQUE_GEMMA4_MEDIA, "1");
@@ -7260,8 +8751,20 @@ fn run_ring_pipeline_processes(
                 command.env(OPAQUE_GEMMA4_MEDIA, "1");
                 command.env(OPAQUE_INSPECTION, "1");
             }
+            WorkerMode::OpaqueQwen3VlMedia => {
+                command.env(OPAQUE_SESSION, "1");
+                command.env(OPAQUE_QWEN3_VL_MEDIA, "1");
+            }
+            WorkerMode::OpaqueQwenConditionalMedia => {
+                command.env(OPAQUE_SESSION, "1");
+                command.env(OPAQUE_QWEN_CONDITIONAL_MEDIA, "1");
+            }
             WorkerMode::QwenHybridPromptCache => {
                 command.env(QWEN_HYBRID_PROMPT_CACHE, "1");
+            }
+            WorkerMode::PromptCachePrepareFailure => {
+                command.env(OPAQUE_SESSION, "1");
+                command.env(PROMPT_CACHE_PREPARE_FAILURE, "1");
             }
         }
         children.children.push(command.spawn().unwrap());
@@ -7283,7 +8786,15 @@ fn run_ring_pipeline_processes(
             break;
         }
         timed_out = Instant::now() >= deadline;
-        if timed_out || statuses.iter().flatten().any(|status| !status.success()) {
+        let peer_failed = statuses.iter().flatten().any(|status| !status.success());
+        if timed_out || peer_failed {
+            // A peer often reports the global failure agreement before the
+            // originating worker has flushed its local architecture error.
+            // Preserve that causal diagnostic without waiting for the full Ring
+            // deadline or allowing a failed process set to run unbounded.
+            if peer_failed && !timed_out {
+                thread::sleep(Duration::from_millis(500));
+            }
             for child in &mut children.children {
                 if child.try_wait().unwrap().is_none() {
                     let _ = child.kill();

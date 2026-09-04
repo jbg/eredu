@@ -65,7 +65,7 @@ struct Args {
 fn prefill_tokens(
     tokens: &Array,
     backend: &MlxBackend<'static>,
-    session: &mut MlxModelSession<'static>,
+    session: &mut MlxModelSession,
 ) -> anyhow::Result<Array> {
     let parts = [token_ids_part(tokens)?];
     let input = MlxModelInput::from(ModelInput::new(&parts));
@@ -80,7 +80,7 @@ fn prefill_tokens(
 fn decode_tokens(
     tokens: &Array,
     backend: &MlxBackend<'static>,
-    session: &mut MlxModelSession<'static>,
+    session: &mut MlxModelSession,
 ) -> anyhow::Result<Array> {
     session
         .decode(backend, tokens.clone())?

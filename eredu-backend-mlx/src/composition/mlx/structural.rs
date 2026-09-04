@@ -9,9 +9,7 @@ use serde_json::Value;
 
 use eredu_architectures::{GgufArchitecture, ModelKind};
 
-use super::realization::{
-    requires_distributed_stage, AddressableParameterBankBinding, FamilyBinding, GgufBinding,
-};
+use super::realization::{AddressableParameterBankBinding, FamilyBinding, GgufBinding};
 #[cfg(test)]
 use super::MlxLoadRequest;
 use crate::backend::error::Error;
@@ -137,19 +135,13 @@ fn validate_quantization_capability(
     if policy.quantization().is_none() {
         return Ok(());
     }
-    if let Some(topology) = policy
+    if policy
         .topology()
-        .filter(|topology| !topology.is_replicated())
+        .is_some_and(|topology| !topology.is_replicated())
     {
-        if requires_distributed_stage(kind, topology) {
-            return Ok(());
-        }
-        return Err(Error::Artifact(
-            eredu_core::artifact::ArtifactError::UnsupportedQuantizationPolicy(format!(
-                "load-time quantization is unavailable for complete tensor-parallel {} materialization on MLX",
-                kind.canonical_name()
-            )),
-        ));
+        // Exact distributed quantization support is selected by the neutral
+        // partitioned realization before payload materialization.
+        return Ok(());
     }
     if format == eredu_core::ArtifactFormat::Gguf {
         return validate_complete_gguf_quantization(kind, true);
@@ -192,18 +184,6 @@ fn validate_preparation_capability_intersection(
     policy: eredu_core::PreparationPolicy,
     capabilities: eredu_architectures::preparation::ArchitectureCapabilities,
 ) -> Result<(), Error> {
-    if let Some(topology) = policy.topology() {
-        let format_name = match format {
-            eredu_core::ArtifactFormat::SafeTensors => "SafeTensors",
-            eredu_core::ArtifactFormat::Gguf => "GGUF",
-            _ => {
-                return Err(Error::ArchitectureModel(
-                    "unsupported artifact format selected for parallel validation".into(),
-                ));
-            }
-        };
-        validate_parallel_capabilities(capabilities, topology, format_name, kind.canonical_name())?;
-    }
     validate_quantization_capability(kind, format, policy, capabilities)?;
     if policy.residency() == eredu_core::ResidencyRequest::AddressableParameterBanks {
         validate_parameter_bank_capability(kind, capabilities)?;
@@ -212,35 +192,8 @@ fn validate_preparation_capability_intersection(
 }
 
 fn requires_architecture_capabilities(policy: eredu_core::PreparationPolicy) -> bool {
-    policy
-        .topology()
-        .is_some_and(|topology| !topology.is_replicated())
-        || policy.residency() == eredu_core::ResidencyRequest::AddressableParameterBanks
+    policy.residency() == eredu_core::ResidencyRequest::AddressableParameterBanks
         || policy.quantization().is_some()
-}
-
-pub(crate) fn validate_parallel_capabilities(
-    capabilities: eredu_architectures::preparation::ArchitectureCapabilities,
-    topology: eredu_core::ParallelTopology,
-    artifact: &str,
-    architecture: &str,
-) -> Result<(), Error> {
-    let plan = capabilities.parallel_plan();
-    let unsupported = |capability: &str| {
-        Error::Parallel(format!(
-            "{artifact} architecture {architecture:?} has no architecture-owned {capability} plan; no checkpoint payload was materialized"
-        ))
-    };
-    if topology.is_axis_active(eredu_core::ParallelAxis::Pipeline) && !plan.pipeline_parallel() {
-        return Err(unsupported("pipeline-parallel"));
-    }
-    if topology.is_axis_active(eredu_core::ParallelAxis::Tensor) && !plan.tensor_parallel() {
-        return Err(unsupported("tensor-parallel"));
-    }
-    if topology.is_axis_active(eredu_core::ParallelAxis::Expert) && !plan.expert_parallel() {
-        return Err(unsupported("expert-parallel"));
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -514,54 +467,37 @@ mod admission_policy_tests {
     }
 
     #[test]
-    fn complete_tensor_parallel_quantization_is_rejected_during_preflight() {
-        let topology = crate::composition::mlx::distributed::topology::MlxParallelPlan::for_rank(
-            0,
-            2,
-            1,
-            1,
-            crate::backend::DeviceAssignment::new(safemlx::DeviceType::Cpu, 0),
-        )
-        .unwrap();
+    fn neutral_dense_qwen_tensor_parallel_quantization_is_admitted_during_preflight() {
+        let topology = crate::test_parallel_rank(0, 2, 1, 1);
         let options = MlxLoadRequest::with_quantization(eredu_core::QuantizationRequest::MxFp4)
             .with_parallel_topology(
                 topology,
+                crate::backend::DeviceAssignment::new(safemlx::DeviceType::Cpu, 0),
                 eredu_runtime::PipelineWireContract::new(
                     eredu_runtime::PipelineActivationDtype::Float32,
                 ),
+                1,
+                128,
+                MlxLoadRequest::test_communication_completion_policy(),
             );
 
-        let error = validate_safetensors_preparation_for_test(
-            ModelKind::Qwen3,
-            &dense_qwen3_config(),
-            options,
-        )
-        .unwrap_err();
-
-        assert!(matches!(
-            error,
-            Error::Artifact(
-                eredu_core::artifact::ArtifactError::UnsupportedQuantizationPolicy(message)
-            ) if message.contains("complete tensor-parallel")
-        ));
+        validate_safetensors_preparation_for_test(ModelKind::Qwen3, &dense_qwen3_config(), options)
+            .unwrap();
     }
 
     #[test]
     fn distributed_stage_quantization_is_admitted_during_preflight() {
-        let topology = crate::composition::mlx::distributed::topology::MlxParallelPlan::for_rank(
-            0,
-            1,
-            2,
-            1,
-            crate::backend::DeviceAssignment::new(safemlx::DeviceType::Cpu, 0),
-        )
-        .unwrap();
+        let topology = crate::test_parallel_rank(0, 1, 2, 1);
         let options = MlxLoadRequest::with_quantization(eredu_core::QuantizationRequest::MxFp4)
             .with_parallel_topology(
                 topology,
+                crate::backend::DeviceAssignment::new(safemlx::DeviceType::Cpu, 0),
                 eredu_runtime::PipelineWireContract::new(
                     eredu_runtime::PipelineActivationDtype::Float32,
                 ),
+                1,
+                128,
+                MlxLoadRequest::test_communication_completion_policy(),
             );
 
         validate_safetensors_preparation_for_test(ModelKind::Qwen3, &dense_qwen3_config(), options)
@@ -615,55 +551,6 @@ mod admission_policy_tests {
                 ))
             ));
         }
-    }
-
-    #[test]
-    fn preparation_rejects_an_unsupported_exact_parallel_axis() {
-        let topology = crate::composition::mlx::distributed::topology::MlxParallelPlan::for_rank(
-            0,
-            1,
-            1,
-            2,
-            crate::backend::DeviceAssignment::new(safemlx::DeviceType::Cpu, 0),
-        )
-        .unwrap();
-        let error = validate_safetensors_preparation_for_test(
-            ModelKind::Qwen3,
-            &dense_qwen3_config(),
-            MlxLoadRequest::with_parallel(
-                topology,
-                eredu_runtime::PipelineWireContract::new(
-                    eredu_runtime::PipelineActivationDtype::Float32,
-                ),
-            ),
-        )
-        .unwrap_err();
-
-        assert!(matches!(error, Error::Parallel(message) if message.contains("expert-parallel")));
-    }
-
-    #[test]
-    fn preparation_accepts_supported_exact_parallel_axes() {
-        let topology = crate::composition::mlx::distributed::topology::MlxParallelPlan::for_rank(
-            0,
-            2,
-            3,
-            1,
-            crate::backend::DeviceAssignment::new(safemlx::DeviceType::Cpu, 0),
-        )
-        .unwrap();
-
-        validate_safetensors_preparation_for_test(
-            ModelKind::Qwen3,
-            &dense_qwen3_config(),
-            MlxLoadRequest::with_parallel(
-                topology,
-                eredu_runtime::PipelineWireContract::new(
-                    eredu_runtime::PipelineActivationDtype::Float32,
-                ),
-            ),
-        )
-        .unwrap();
     }
 }
 

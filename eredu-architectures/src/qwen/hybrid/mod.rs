@@ -35,9 +35,11 @@ pub use config::{
 pub use linear_attention::LinearAttention;
 pub use model::{state_identity, ForwardContext, LayeredModel, TargetPartitionInput, Unit};
 pub use mtp::{prompt_token_identity, EmbeddedInput, ForwardMode, PredictionUnit};
+pub(crate) use parallel::routed_conditional_partition_local_geometry;
 pub use parallel::{
-    conditional_local_geometry, local_block_config, local_geometry, local_unit_config,
-    unit_parallel_parameter_groups, ConditionalLocalGeometry, LocalGeometry,
+    conditional_local_geometry, conditional_partition_local_geometry, local_block_config,
+    local_geometry, local_unit_config, unit_parallel_parameter_groups, ConditionalLocalGeometry,
+    ConditionalPartitionLocalFoundation, ConditionalPartitionLocalGeometry, LocalGeometry,
 };
 
 /// Derives complete expert ownership and local bank geometry for Qwen hybrid text/MTP units.

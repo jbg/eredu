@@ -241,6 +241,16 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Block<B> {
         geometry: BlockGeometry,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
+        Self::new_with_geometry_and_routed_spec(args, layer, geometry, None, context)
+    }
+
+    pub(crate) fn new_with_geometry_and_routed_spec(
+        args: &ModelArgs,
+        layer: usize,
+        geometry: BlockGeometry,
+        routed_spec: Option<eredu_nn::GroupedGatedProductSpec>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
         let policy = args
             .layer_policy(layer)
             .ok_or_else(|| Error::backend(format!("LFM2 has no layer {layer}")))?;
@@ -330,11 +340,12 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Block<B> {
         };
         Ok(Self {
             mixer,
-            feed_forward: FeedForward::new_with_geometry(
+            feed_forward: FeedForward::new_with_geometry_and_routed_spec(
                 args,
                 layer,
                 geometry.dense_intermediate,
                 geometry.expert_intermediate,
+                routed_spec,
                 context,
             )?,
             operator_norm: normalization("operator_norm")?,

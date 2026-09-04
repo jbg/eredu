@@ -52,6 +52,37 @@ where
         })
     }
 
+    fn build_partitioned(
+        global: &ModelArgs,
+        local: &ModelArgs,
+        layer: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<TransformerBlock<B>, Error> {
+        let prefix = format!("{}.layers.{layer}", global.parameter_root);
+        Ok(crate::decoder::TransformerBlock {
+            self_attention: Attention::new(local, layer, context)?,
+            mlp: RoutedMlp::new_partitioned(global, local, layer, context)?,
+            input_norm: B::normalization(
+                NormalizationConstructionSpec::learned(
+                    global.hidden_size,
+                    global.rms_norm_eps,
+                    ParameterSpec::trainable(format!("{prefix}.input_layernorm.weight"))
+                        .map_err(Error::backend)?,
+                ),
+                context,
+            )?,
+            post_attention_norm: B::normalization(
+                NormalizationConstructionSpec::learned(
+                    global.hidden_size,
+                    global.rms_norm_eps,
+                    ParameterSpec::trainable(format!("{prefix}.post_attention_layernorm.weight"))
+                        .map_err(Error::backend)?,
+                ),
+                context,
+            )?,
+        })
+    }
+
     fn parameter_groups(
         block: &crate::decoder::TransformerBlock<B, Self::FeedForward>,
         args: &ModelArgs,

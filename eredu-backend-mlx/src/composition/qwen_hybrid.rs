@@ -17,7 +17,6 @@ use eredu_nn::Tensor;
 use eredu_runtime::{
     ArchitectureParameters, CacheResidencyPolicy, CausalModel, LayerWeightResidency,
     LayeredArchitecture, LayerwiseRuntime, PagedCacheOptions, ParameterRole, ResidencyReport,
-    WeightBinding,
 };
 use safemlx::{error::Exception, ops::indexing::TryIndexOp, Array, Stream};
 
@@ -41,44 +40,6 @@ fn prepare_conditional_input(
         .map_err(|error| Exception::custom(error.to_string()))
 }
 
-pub(crate) fn prompt_token_ids(
-    parsed: &ParsedHybridConfig,
-    input: input::ModelInput<'_>,
-    stream: &Stream,
-) -> Result<Array, Exception> {
-    let tokens = prepare_conditional_input(parsed, input, stream)?
-        .token_ids(stream)
-        .map(crate::MlxTensor::into_array)
-        .map_err(|error| Exception::custom(error.to_string()))?;
-    tokens.as_type::<i32>(stream)
-}
-
-pub(crate) fn text_prompt_token_ids(
-    input: input::ModelInput<'_>,
-    stream: &Stream,
-) -> Result<Array, Exception> {
-    input::validate(input)?;
-    let tokens = input
-        .parts
-        .iter()
-        .map(|part| match (part.modality(), part.payload()) {
-            (eredu_core::InputModality::Text, input::InputPayload::TokenIds(tokens)) => {
-                Ok(crate::MlxTensor::from_array(tokens.clone()))
-            }
-            (eredu_core::InputModality::Text, _) => Err(Exception::custom(
-                "Qwen hybrid embedded prediction requires token-id text ingress",
-            )),
-            (modality, _) => Err(Exception::custom(format!(
-                "Qwen hybrid text execution does not admit {} input",
-                modality.as_str()
-            ))),
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    eredu_architectures::qwen::hybrid::prompt_token_identity(&tokens, stream)
-        .map(crate::MlxTensor::into_array)
-        .map_err(|error| Exception::custom(error.to_string()))
-}
-
 use crate::composition::grouped_provider::*;
 
 use crate::backend::{
@@ -93,8 +54,7 @@ use crate::backend::{
         },
         checkpoint::binding::{
             build_module_bindings_with_recipes, build_module_bindings_with_recipes_excluding,
-            parameter_name_in_targets, parameter_role_targets,
-            populate_module_from_lease_excluding,
+            parameter_name_in_targets, populate_module_from_lease_excluding,
         },
         checkpoint::{
             load::gguf_quantization_configs, quantization::should_quantize_on_load,
@@ -104,7 +64,7 @@ use crate::backend::{
             construct_architecture_unit, prepare_layerwise_policy_with_bindings,
             MlxLayerwisePolicy, MlxResidentPolicy, MlxUnitPopulator,
         },
-        execution::layerwise::{quantize_parameterized_store, shard_layer_bindings},
+        execution::layerwise::quantize_parameterized_store,
         media::input,
         residency::parameter_bank::{AddressableParameterBank, ParameterBankEntry},
     },
@@ -211,264 +171,6 @@ impl MlxUnitPopulator<ConditionalUnit<MlxNeuralBackend>> for ConditionalUnitPopu
     }
 }
 
-/// Pipeline/loading adapter over the neutral Qwen hybrid units.
-#[derive(Default)]
-pub struct QwenHybridPipelineBindings {
-    external_experts: bool,
-}
-
-/// Pipeline/loading adapter over the neutral conditional Qwen3.5 graph.
-#[derive(Default)]
-pub struct QwenConditionalPipelineBindings {
-    external_experts: bool,
-}
-
-fn conditional_expert_targets(
-    architecture: &ConditionalArchitecture,
-    group: usize,
-    index: usize,
-    unit: &MlxModule<ConditionalUnit<MlxNeuralBackend>>,
-) -> Result<BTreeSet<String>, Error> {
-    let groups = match &unit.inner {
-        ConditionalUnit::Vision(_) => return Ok(BTreeSet::new()),
-        ConditionalUnit::Target(block) => hybrid::unit_parallel_parameter_groups(
-            &Unit::Target(block.clone()),
-            &architecture.parsed().text,
-            0,
-            index,
-        ),
-        ConditionalUnit::Prediction(prediction) => hybrid::unit_parallel_parameter_groups(
-            &Unit::Prediction(prediction.clone()),
-            &architecture.parsed().text,
-            group.checked_sub(1).ok_or_else(|| {
-                Error::Parallel("conditional Qwen prediction unit has no text group".into())
-            })?,
-            index,
-        ),
-    }?;
-    Ok(parameter_role_targets(
-        &groups,
-        ParameterRole::ExpertIntermediate,
-    ))
-}
-
-impl QwenConditionalPipelineBindings {
-    pub const fn new() -> Self {
-        Self {
-            external_experts: false,
-        }
-    }
-
-    pub const fn new_external_experts() -> Self {
-        Self {
-            external_experts: true,
-        }
-    }
-
-    pub fn model_type<'a>(&self, architecture: &'a ConditionalArchitecture) -> &'a str {
-        &architecture.parsed().text.model_type
-    }
-
-    pub fn begin_pipeline_ingress(
-        &self,
-        architecture: &mut ConditionalArchitecture,
-        typed: input::ModelInput<'_>,
-        offset: i32,
-        parallel: Option<&crate::backend::runtime::distributed::Group>,
-        stream: &Stream,
-    ) -> Result<hybrid::ConditionalPipelineVisionState<crate::MlxTensor>, Error> {
-        let prepared = prepare_conditional_input(architecture.parsed(), typed, stream)?;
-        prepared.with_target_input(|input| match input {
-            hybrid::ConditionalInput::Target { parts, pixels, mask } => match parallel {
-                Some(parallel) => architecture.begin_pipeline_target_parallel(
-                    parts, pixels, mask, offset, parallel, stream,
-                ),
-                None => architecture.begin_pipeline_target(parts, pixels, mask, offset, stream),
-            },
-            hybrid::ConditionalInput::Draft { .. } => unreachable!("prepared target input"),
-        })
-        .map_err(|error| Error::Parallel(error.to_string()))
-    }
-
-    pub fn quantizes_static_binding(&self, _binding: &WeightBinding) -> bool {
-        true
-    }
-
-    pub fn layer_bindings(
-        &self,
-        architecture: &ConditionalArchitecture,
-        group: usize,
-        index: usize,
-        layer: &MlxModule<ConditionalUnit<MlxNeuralBackend>>,
-        store: &dyn CheckpointSource,
-    ) -> Result<Vec<WeightBinding>, Error> {
-        let expert_targets = conditional_expert_targets(architecture, group, index, layer)?;
-        let ordinal = conditional_unit_ordinal(architecture, group, index)?;
-        let recipes = hybrid::conditional_unit_recipes(store, architecture.parsed(), ordinal)
-            .map_err(Error::ArchitectureModel)?;
-        build_module_bindings_with_recipes_excluding(layer, "", store, recipes, |name| {
-            self.external_experts && parameter_name_in_targets(name, &expert_targets)
-        })
-        .map_err(Into::into)
-    }
-
-    pub fn cartesian_layer_bindings(
-        &self,
-        architecture: &ConditionalArchitecture,
-        group: usize,
-        index: usize,
-        global_layer: &MlxModule<ConditionalUnit<MlxNeuralBackend>>,
-        store: &dyn CheckpointSource,
-        layout: Option<&eredu_runtime::LocalModelLayout>,
-    ) -> Result<Vec<WeightBinding>, Error> {
-        let expert_targets = conditional_expert_targets(architecture, group, index, global_layer)?;
-        let ordinal = conditional_unit_ordinal(architecture, group, index)?;
-        let recipes = hybrid::conditional_unit_recipes(store, architecture.parsed(), ordinal)
-            .map_err(Error::ArchitectureModel)?;
-        let bindings = build_module_bindings_with_recipes_excluding(
-            global_layer,
-            "",
-            store,
-            recipes,
-            |name| self.external_experts && parameter_name_in_targets(name, &expert_targets),
-        )?;
-        match layout {
-            Some(layout) => shard_layer_bindings(bindings, store, layout),
-            None => Ok(bindings),
-        }
-    }
-
-    pub fn expert_parallel_assignment(
-        &self,
-        realization: Option<
-            &eredu_architectures::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>,
-        >,
-    ) -> Result<Option<crate::composition::expert_dispatch::ExpertAssignment>, Error> {
-        match realization {
-            None if self.external_experts => Err(Error::Parallel(
-                "conditional Qwen3.5 has no architecture expert realization".into(),
-            )),
-            None => Ok(None),
-            Some(plan) if plan.expert_parallel_size() == 1 && !self.external_experts => Ok(None),
-            Some(plan) => {
-                crate::composition::expert_dispatch::ExpertAssignment::from_realization(plan)
-                    .map(Some)
-            }
-        }
-    }
-}
-
-impl QwenHybridPipelineBindings {
-    pub const fn new() -> Self {
-        Self {
-            external_experts: false,
-        }
-    }
-
-    pub const fn new_external_experts() -> Self {
-        Self {
-            external_experts: true,
-        }
-    }
-
-    pub fn model_type<'a>(&self, architecture: &'a Architecture) -> &'a str {
-        &architecture.config().model_type
-    }
-
-    pub fn layer_count(&self, architecture: &Architecture, group: usize) -> Result<usize, Error> {
-        <Architecture as LayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::group_unit_count(
-            architecture,
-            group,
-        )
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))
-    }
-
-    fn flat_index(
-        &self,
-        architecture: &Architecture,
-        group: usize,
-        index: usize,
-    ) -> Result<usize, Error> {
-        if index >= self.layer_count(architecture, group)? {
-            return Err(Error::Parallel(format!(
-                "Qwen hybrid has no unit {index} in group {group}"
-            )));
-        }
-        architecture
-            .unit_layout()
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?
-            .ordinal(group, index)
-            .ok_or_else(|| {
-                Error::Parallel(format!("Qwen hybrid has no unit {index} in group {group}"))
-            })
-    }
-
-    pub fn layer_bindings(
-        &self,
-        architecture: &Architecture,
-        group: usize,
-        index: usize,
-        layer: &MlxModule<Block>,
-        store: &dyn CheckpointSource,
-    ) -> Result<Vec<WeightBinding>, Error> {
-        let expert_targets = parameter_role_targets(
-            &hybrid::unit_parallel_parameter_groups(layer, architecture.config(), group, index)?,
-            ParameterRole::ExpertIntermediate,
-        );
-        let recipes = hybrid::unit_recipes(
-            store,
-            architecture.config(),
-            self.flat_index(architecture, group, index)?,
-        )
-        .map_err(Error::ArchitectureModel)?;
-        build_module_bindings_with_recipes_excluding(layer, "", store, recipes, |name| {
-            self.external_experts && parameter_name_in_targets(name, &expert_targets)
-        })
-        .map_err(Into::into)
-    }
-
-    pub fn quantizes_static_binding(&self, _binding: &WeightBinding) -> bool {
-        true
-    }
-
-    pub fn expert_parallel_assignment(
-        &self,
-        realization: Option<
-            &eredu_architectures::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>,
-        >,
-    ) -> Result<Option<crate::composition::expert_dispatch::ExpertAssignment>, Error> {
-        match realization {
-            None if self.external_experts => Err(Error::Parallel(
-                "Qwen hybrid has no architecture expert realization".into(),
-            )),
-            None => Ok(None),
-            Some(plan) if plan.expert_parallel_size() == 1 && !self.external_experts => Ok(None),
-            Some(plan) => {
-                crate::composition::expert_dispatch::ExpertAssignment::from_realization(plan)
-                    .map(Some)
-            }
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn cartesian_layer_bindings(
-        &self,
-        architecture: &Architecture,
-        group: usize,
-        index: usize,
-        global_layer: &MlxModule<Block>,
-        store: &dyn CheckpointSource,
-        layout: Option<&eredu_runtime::LocalModelLayout>,
-        _assignment: Option<&crate::composition::expert_dispatch::ExpertAssignment>,
-    ) -> Result<Vec<WeightBinding>, Error> {
-        let bindings = self.layer_bindings(architecture, group, index, global_layer, store)?;
-        match layout {
-            Some(layout) => shard_layer_bindings(bindings, store, layout),
-            None => Ok(bindings),
-        }
-    }
-}
-
 /// Canonical independent-expert catalog for selected architecture-owned units.
 pub fn expert_catalog_selected(
     config: &HybridConfig,
@@ -549,14 +251,6 @@ fn prepare_hybrid_gguf_store(
         parsed,
         Arc::new(CompositeCheckpointSource::new([text, vision_source])?),
     ))
-}
-
-pub fn prepare_gguf_pipeline(
-    source: &crate::composition::mlx::structural::AdmittedGguf,
-    projector: Option<&crate::composition::mlx::structural::AdmittedGgufProjector>,
-    max_cached_shards: usize,
-) -> Result<(ParsedHybridConfig, Arc<dyn CheckpointSource>), Error> {
-    prepare_hybrid_gguf_store(source, projector, max_cached_shards)
 }
 
 /// Loads a llama.cpp Qwen3-Next/Qwen3.5 text artifact through the same
@@ -718,16 +412,6 @@ impl QwenHybridModel {
             Execution::ConditionalResident(runtime) => runtime.architecture().mtp_len(),
             Execution::ConditionalBounded(runtime) => runtime.architecture().mtp_len(),
         }
-    }
-    /// This initial binder is replicated; distributed construction installs topology separately.
-    pub fn parallel_info(
-        &self,
-    ) -> Option<
-        &eredu_runtime::ParallelModelInfo<
-            crate::composition::mlx::distributed::topology::MlxParallelPlan,
-        >,
-    > {
-        None
     }
     /// Allocates the declared recurrent, convolution, KV, and MTP state.
     pub fn new_cache(&self) -> MlxHybridState {
@@ -1534,22 +1218,6 @@ impl crate::composition::mlx::speculative::embedded::EmbeddedMtpTarget for QwenH
     fn max_draft_tokens(&self) -> usize {
         self.mtp_len()
     }
-}
-
-fn conditional_unit_ordinal(
-    architecture: &ConditionalArchitecture,
-    group: usize,
-    index: usize,
-) -> Result<usize, Error> {
-    architecture
-        .unit_layout()
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?
-        .ordinal(group, index)
-        .ok_or_else(|| {
-            Error::Parallel(format!(
-                "conditional Qwen has no unit {index} in group {group}"
-            ))
-        })
 }
 
 fn quantize_store(

@@ -193,6 +193,33 @@ impl ResolvedCheckpointPlan {
     pub fn unclaimed_keys(&self) -> &BTreeSet<String> {
         &self.unclaimed_keys
     }
+
+    /// Projects an admitted resolution onto an exact subset of its claimed sources.
+    ///
+    /// This is used when an architecture splits one already-admitted artifact into
+    /// independently owned components. The projection cannot introduce a source
+    /// that was not selected by the original header admission. Catalog keys that
+    /// were already unclaimed remain unclaimed; ownership of omitted claimed keys
+    /// must be retained by another typed component of the split artifact.
+    pub fn project_claimed_sources(
+        &self,
+        identity: impl Into<String>,
+        source_keys: BTreeSet<String>,
+    ) -> Result<Self, String> {
+        if let Some(source) = source_keys
+            .iter()
+            .find(|source| !self.source_keys.contains(*source))
+        {
+            return Err(format!(
+                "checkpoint projection introduced unadmitted source {source:?}"
+            ));
+        }
+        Ok(Self {
+            identity: identity.into(),
+            source_keys,
+            unclaimed_keys: self.unclaimed_keys.clone(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -962,6 +989,28 @@ mod tests {
             resolved.unclaimed_keys(),
             &BTreeSet::from(["unexpected".into()])
         );
+    }
+
+    #[test]
+    fn admitted_resolution_projection_cannot_introduce_sources() {
+        let admitted = ResolvedCheckpointPlan {
+            identity: "complete".into(),
+            source_keys: BTreeSet::from(["target".into(), "extension".into()]),
+            unclaimed_keys: BTreeSet::from(["metadata".into()]),
+        };
+        let target = admitted
+            .project_claimed_sources("target", BTreeSet::from(["target".into()]))
+            .unwrap();
+
+        assert_eq!(target.identity(), "target");
+        assert_eq!(target.source_keys(), &BTreeSet::from(["target".into()]));
+        assert_eq!(
+            target.unclaimed_keys(),
+            &BTreeSet::from(["metadata".into()])
+        );
+        assert!(admitted
+            .project_claimed_sources("target", BTreeSet::from(["not-admitted".into()]))
+            .is_err());
     }
 
     #[test]

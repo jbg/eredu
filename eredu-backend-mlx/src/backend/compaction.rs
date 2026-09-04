@@ -1,13 +1,15 @@
 //! Device-side compaction used by MLX distributed selection.
 
+#[cfg(test)]
 use safemlx::{
-    error::{Exception, Result},
+    error::Exception,
     ops::{indexing::scatter_max_single, r#where},
-    Array, Dtype, Stream,
 };
+use safemlx::{error::Result, Array, Dtype, Stream};
 
 /// Padded compact indices plus the device-side number of valid entries.
 #[derive(Clone, Debug)]
+#[cfg(test)]
 pub(crate) struct CompactIndices {
     pub(crate) indices: Array,
     pub(crate) count: Array,
@@ -29,6 +31,7 @@ pub(crate) fn count_nonzero(value: &Array, stream: &Stream) -> Result<Array> {
 }
 
 /// Compacts flattened nonzero indices into a fixed-capacity device buffer.
+#[cfg(test)]
 pub(crate) fn compact_indices(mask: &Array, stream: &Stream) -> Result<CompactIndices> {
     let flat = bool_condition(mask, stream)?.reshape(&[-1], stream)?;
     let n = i32::try_from(flat.size())

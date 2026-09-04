@@ -318,7 +318,7 @@ fn validate_realtime_input(
 pub struct MlxRealtimeBackend {
     stream: Stream,
     weights_stream: Stream,
-    tensor_parallel_group: Option<Arc<Group>>,
+    world_group: Option<Arc<Group>>,
 }
 
 impl MlxRealtimeBackend {
@@ -327,13 +327,13 @@ impl MlxRealtimeBackend {
         Self {
             stream: stream.clone(),
             weights_stream: weights_stream.clone(),
-            tensor_parallel_group: None,
+            world_group: None,
         }
     }
 
-    /// Supplies the rank-local tensor-parallel collective group.
+    /// Supplies the native world group used to realize architecture-selected resources.
     pub fn with_tensor_parallel_group(mut self, group: Arc<Group>) -> Self {
-        self.tensor_parallel_group = Some(group);
+        self.world_group = Some(group);
         self
     }
 
@@ -358,27 +358,13 @@ impl RealtimeModelLoadingBackend for MlxRealtimeBackend {
         options: Self::LoadOptions,
     ) -> Result<Self::Model, Self::Error> {
         validate_realtime_session_requirements(&options)?;
-        let model =
-            materialize_realtime_model(preparation, options, &self.stream, &self.weights_stream)?;
-        if let Some(topology) = model.model.topology() {
-            let group = self.tensor_parallel_group.as_deref().ok_or_else(|| {
-                Error::Parallel(
-                    "tensor-parallel realtime loading requires a TP collective group".into(),
-                )
-            })?;
-            if group.rank() != topology.tensor_parallel_rank()
-                || group.size() != topology.tensor_parallel_size()
-            {
-                return Err(Error::Parallel(format!(
-                    "realtime TP group rank/size {}/{} does not match model topology {}/{}",
-                    group.rank(),
-                    group.size(),
-                    topology.tensor_parallel_rank(),
-                    topology.tensor_parallel_size()
-                )));
-            }
-        }
-        Ok(model)
+        materialize_realtime_model(
+            preparation,
+            options,
+            self.world_group.as_deref(),
+            &self.stream,
+            &self.weights_stream,
+        )
     }
 }
 
@@ -417,6 +403,7 @@ fn realtime_samplers(
 fn materialize_realtime_model(
     preparation: RealtimePreparationPlan,
     options: MlxLoadRequest,
+    world: Option<&Group>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<MlxRealtimeModel, Error> {
@@ -425,7 +412,7 @@ fn materialize_realtime_model(
             "Moshi does not contain routed experts".into(),
         ));
     }
-    neutral_moshi::load(preparation, options, stream, weights_stream)
+    neutral_moshi::load(preparation, options, world, stream, weights_stream)
         .map(|model| MlxRealtimeModel { model })
 }
 
@@ -782,7 +769,6 @@ fn submit_neutral_step(
     branch: &mut MlxRealtimeSessionBranch,
     input: &MlxRealtimeInput,
     stream: &Stream,
-    tensor_parallel_group: Option<&Group>,
 ) -> Result<Submission<MlxRealtimeOutput, MlxRealtimeCompletion>, Error> {
     let token_validation_scope = TokenValidationScope::begin()?;
     let config = model.config().clone();
@@ -923,25 +909,9 @@ fn submit_neutral_step(
             audio: &audio_inputs,
             mask: None,
         };
-        match (model.model.topology(), tensor_parallel_group) {
-            (Some(_), Some(group)) => model.model.forward_realtime_parallel(
-                temporal,
-                &mut state.cache,
-                &mut driver,
-                group,
-                stream,
-            )?,
-            (Some(_), None) => {
-                return Err(Error::Parallel(
-                    "tensor-parallel realtime execution has no TP collective group".into(),
-                ))
-            }
-            (None, _) => {
-                model
-                    .model
-                    .forward_realtime(temporal, &mut state.cache, &mut driver, stream)?
-            }
-        };
+        model
+            .model
+            .forward_realtime(temporal, &mut state.cache, &mut driver, stream)?;
     }
     let decisions = driver
         .decisions()
@@ -1251,13 +1221,7 @@ impl RealtimeBackend for MlxRealtimeBackend {
         session: &mut <Self::Session as SemanticStateTransaction>::Branch,
         input: &Self::Input,
     ) -> Result<Submission<Self::Output, Self::Completion>, Self::Error> {
-        submit_neutral_step(
-            model,
-            session,
-            input,
-            &self.stream,
-            self.tensor_parallel_group.as_deref(),
-        )
+        submit_neutral_step(model, session, input, &self.stream)
     }
 
     fn retained_resources(&self, completion: &Self::Completion) -> usize {

@@ -503,6 +503,14 @@ pub trait RuntimeState<B: NeuralBackend> {
     /// Returns the exact layout used to create this realization.
     fn layout(&self) -> &StateLayout;
 
+    /// Returns state geometry, or `None` for an explicit rank with no mutable state.
+    ///
+    /// Existing stateful realizations inherit the strict layout. Stateless implementations
+    /// override this method so generic session control never invents sentinel state geometry.
+    fn optional_layout(&self) -> Option<&StateLayout> {
+        Some(self.layout())
+    }
+
     /// Borrows tensors retained by one execution unit without cloning handles.
     ///
     /// The flat ordinal addresses policy storage while `address` preserves
@@ -585,7 +593,7 @@ pub trait LayerRuntimeState<B: NeuralBackend>: RuntimeState<B> {
 /// Fully device-resident state with one concrete value per architecture layer.
 #[derive(Debug)]
 pub struct DeviceState<B: NeuralBackend, L> {
-    layout: StateLayout,
+    layout: Option<StateLayout>,
     layers: Vec<L>,
     backend: PhantomData<fn() -> B>,
 }
@@ -618,10 +626,19 @@ impl<B: NeuralBackend, L> DeviceState<B, L> {
             .map(|(layer, policy)| create(layer, policy))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
-            layout,
+            layout: Some(layout),
             layers,
             backend: PhantomData,
         })
+    }
+
+    /// Creates an explicit rank-local realization with no mutable state slots.
+    pub const fn stateless() -> Self {
+        Self {
+            layout: None,
+            layers: Vec::new(),
+            backend: PhantomData,
+        }
     }
 }
 
@@ -637,15 +654,21 @@ where
         B::Tensor: 'a;
 
     fn layout(&self) -> &StateLayout {
-        &self.layout
+        self.layout
+            .as_ref()
+            .expect("layout requires a stateful DeviceState")
+    }
+
+    fn optional_layout(&self) -> Option<&StateLayout> {
+        self.layout.as_ref()
     }
 
     fn retained_values(
         &self,
-        _ordinal: usize,
-        address: crate::ExecutionUnitAddress,
+        ordinal: usize,
+        _address: crate::ExecutionUnitAddress,
     ) -> Result<Self::RetainedValues<'_>, StateError> {
-        let layer = address.index();
+        let layer = ordinal;
         self.layers
             .get(layer)
             .map(|layer| layer.retained_values())
@@ -679,6 +702,8 @@ where
     fn reset_segment(&mut self, segment: &StateSegmentId) -> Result<(), StateError> {
         let range = self
             .layout
+            .as_ref()
+            .expect("stateful reset requires DeviceState layout")
             .segment(segment)
             .map(StateSegmentSpec::layers)
             .ok_or_else(|| StateError::UnknownSegment {

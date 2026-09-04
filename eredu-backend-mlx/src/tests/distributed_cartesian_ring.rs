@@ -7,13 +7,18 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::composition::expert_dispatch::{AllToAllVPlan, RoutedTransport};
 use crate::MlxTensor;
-use crate::{
-    backend::DeviceAssignment,
-    composition::expert_dispatch::{AllToAllVPlan, RoutedTransport},
-    native::MlxParallelPlan,
+use eredu_core::{
+    checkpoint::TensorDtype, BoundedSubmissionOutcome, CollectiveScope, CompletionCancellationMode,
+    DistributedSession, ParallelAxis,
 };
-use eredu_core::{CollectiveScope, DistributedSession};
+use eredu_runtime::{
+    project_all_communication_manifests, CommunicationCompletionPolicy,
+    CommunicationGroupRequirements, CommunicationOperation, CommunicationOperationRequirement,
+    CommunicationPeerCounts, CommunicationTensorLimits, FailureAgreementBackend,
+    TopologyCommunicationPlan, VariableAllToAllBackend,
+};
 use safemlx::{
     distributed::{self, Backend},
     Array, Device, DeviceType, Stream,
@@ -22,16 +27,131 @@ use safemlx::{
 const WORKER_ENV: &str = "EREDU_CARTESIAN_RING_WORKER";
 const TRIPLE_WORKER_ENV: &str = "EREDU_CARTESIAN_TRIPLE_RING_WORKER";
 
-fn topology(rank: usize, tp: usize, pp: usize, ep: usize) -> MlxParallelPlan {
-    MlxParallelPlan::for_rank(rank, tp, pp, ep, DeviceAssignment::new(DeviceType::Cpu, 0)).unwrap()
+fn topology(rank: usize, tp: usize, pp: usize, ep: usize) -> eredu_core::ParallelRankTopology {
+    crate::test_parallel_rank(rank, tp, pp, ep)
+}
+
+fn requirement(operation: CommunicationOperation) -> CommunicationOperationRequirement {
+    let max_count_per_peer =
+        (operation == CommunicationOperation::VariableAllToAll).then_some(4096);
+    let dtypes = match operation {
+        CommunicationOperation::AllReduceSum => vec![TensorDtype::F32],
+        CommunicationOperation::SendReceive => vec![TensorDtype::I32],
+        CommunicationOperation::VariableAllToAll => {
+            vec![TensorDtype::I32, TensorDtype::F32]
+        }
+        _ => unreachable!("Cartesian fixture requests only tensor-carrying operations"),
+    };
+    CommunicationOperationRequirement::tensors(
+        operation,
+        dtypes,
+        CommunicationTensorLimits::new(1, 4, 16_384, max_count_per_peer).unwrap(),
+        true,
+    )
+    .unwrap()
+}
+
+fn requirements(
+    operations: impl IntoIterator<Item = CommunicationOperation>,
+) -> CommunicationGroupRequirements {
+    CommunicationGroupRequirements::new(operations.into_iter().map(requirement)).unwrap()
+}
+
+fn completion_policy() -> CommunicationCompletionPolicy {
+    CommunicationCompletionPolicy::new(
+        Duration::from_secs(5),
+        CompletionCancellationMode::QuarantineUntilComplete,
+    )
+    .unwrap()
+}
+
+fn manifest_execution(
+    topology: eredu_core::ParallelRankTopology,
+    world: &safemlx::distributed::Group,
+    stream: &Stream,
+) -> (
+    crate::backend::distributed::MlxDistributedSession,
+    Option<eredu_core::CollectiveGroupId>,
+    Option<eredu_core::CollectiveGroupId>,
+    Option<eredu_core::CollectiveGroupId>,
+    eredu_core::CollectiveGroupId,
+) {
+    let plan = TopologyCommunicationPlan::new()
+        .with_completion_policy(completion_policy())
+        .with_session_group(
+            CommunicationGroupRequirements::new([
+                CommunicationOperationRequirement::failure_agreement(true),
+            ])
+            .unwrap(),
+        )
+        .with_tensor_groups(requirements([CommunicationOperation::AllReduceSum]))
+        .with_pipeline_groups(requirements([CommunicationOperation::SendReceive]))
+        .with_expert_groups(requirements([
+            CommunicationOperation::AllReduceSum,
+            CommunicationOperation::VariableAllToAll,
+        ]));
+    let session_group = plan.session_group_id().unwrap();
+    let manifest = project_all_communication_manifests(topology.topology(), &plan)
+        .unwrap()
+        .swap_remove(topology.global_rank());
+    let find = |axis| {
+        let members = topology.subgroup(axis).unwrap().global_ranks().to_vec();
+        manifest
+            .groups()
+            .iter()
+            .find(|descriptor| descriptor.members() == members)
+            .map(|descriptor| descriptor.id())
+    };
+    let tensor = find(ParallelAxis::Tensor);
+    let pipeline = find(ParallelAxis::Pipeline);
+    let expert = find(ParallelAxis::Expert);
+    let execution =
+        crate::backend::distributed::MlxDistributedSession::from_manifest(&manifest, world, stream)
+            .unwrap();
+    (execution, tensor, pipeline, expert, session_group)
+}
+
+fn operation_consensus(
+    execution: &crate::backend::distributed::MlxDistributedSession,
+    group_id: eredu_core::CollectiveGroupId,
+    local_failed: bool,
+    local_cancelled: bool,
+    stream: &Stream,
+) -> (bool, bool) {
+    let group = execution.selected_group(group_id).unwrap();
+    let agree_any = |local: bool| {
+        let submission = <crate::backend::nn::shared::MlxNeuralBackend as FailureAgreementBackend>::agree_success(
+            !local,
+            group,
+            stream,
+        )
+        .unwrap();
+        let BoundedSubmissionOutcome::Completed(output) = submission
+            .wait_bounded(completion_policy().bounded_wait())
+            .unwrap()
+        else {
+            panic!("Cartesian failure agreement exceeded its selected completion deadline")
+        };
+        !<crate::backend::nn::shared::MlxNeuralBackend as FailureAgreementBackend>::resolve_failure_agreement(output)
+            .unwrap()
+    };
+    (agree_any(local_failed), agree_any(local_cancelled))
 }
 
 fn scalar(value: i32) -> Array {
     Array::from_slice(&[value], &[1])
 }
 
+fn scalar_f32(value: f32) -> Array {
+    Array::from_slice(&[value], &[1])
+}
+
 fn values(value: &Array) -> Vec<i32> {
     value.evaluated().unwrap().as_slice::<i32>().to_vec()
+}
+
+fn float_values(value: &Array) -> Vec<f32> {
+    value.evaluated().unwrap().as_slice::<f32>().to_vec()
 }
 
 fn native_all_to_all_counts() -> [[usize; 4]; 4] {
@@ -68,7 +188,7 @@ fn cartesian_ring_worker() {
         return;
     };
     let expected_rank: usize = expected_rank.to_string_lossy().parse().unwrap();
-    let world = crate::backend::runtime::distributed::Group::native(
+    let world = crate::backend::runtime::distributed::Group::uncontracted(
         &distributed::init(true, Backend::Ring).unwrap(),
     );
     assert_eq!(world.rank(), expected_rank);
@@ -94,13 +214,55 @@ fn cartesian_ring_worker() {
             exchange.statistics.routed_transport,
             RoutedTransport::Native
         );
-        let legacy_padded_bytes = 4 * 4 * 2 * 2 * std::mem::size_of::<i32>();
+        let full_matrix_padded_bytes = 4 * 4 * 2 * 2 * std::mem::size_of::<i32>();
         assert!(
-            exchange.statistics.payload_allocation_upper_bound_bytes < legacy_padded_bytes,
-            "rank {expected_rank} compact bound {} was not below legacy {legacy_padded_bytes}",
+            exchange.statistics.payload_allocation_upper_bound_bytes < full_matrix_padded_bytes,
+            "rank {expected_rank} compact bound {} was not below the full-matrix padded bound {full_matrix_padded_bytes}",
             exchange.statistics.payload_allocation_upper_bound_bytes
         );
     }
+    let peer_counts =
+        CommunicationPeerCounts::new(send_counts.to_vec(), recv_counts.to_vec(), world.size())
+            .unwrap();
+    let integer =
+        <crate::backend::nn::shared::MlxNeuralBackend as VariableAllToAllBackend>::variable_all_to_all(
+            MlxTensor::from_array(compact_rows(expected_rank, &send_counts, 2, &stream)),
+            &peer_counts,
+            0,
+            &world,
+            &stream,
+        )
+        .unwrap();
+    assert_eq!(integer.completion.retained_arrays(), 2);
+    assert_eq!(integer.completion.retained_count_buffers(), 2);
+    assert_eq!(integer.completion.retained_groups(), 1);
+    assert_eq!(integer.completion.retained_streams(), 1);
+    assert_eq!(
+        values(integer.wait().unwrap().as_array()),
+        expected_rows(&count_matrix, expected_rank)
+    );
+    let floating_input = compact_rows(expected_rank, &send_counts, 2, &stream)
+        .as_dtype(safemlx::Dtype::Float32, &stream)
+        .unwrap();
+    let floating =
+        <crate::backend::nn::shared::MlxNeuralBackend as VariableAllToAllBackend>::variable_all_to_all(
+            MlxTensor::from_array(floating_input),
+            &peer_counts,
+            0,
+            &world,
+            &stream,
+        )
+        .unwrap()
+        .wait()
+        .unwrap();
+    let expected_floating = expected_rows(&count_matrix, expected_rank)
+        .into_iter()
+        .map(|value| value as f32)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        floating.as_array().evaluated().unwrap().as_slice::<f32>(),
+        expected_floating
+    );
     let empty = safemlx::ops::zeros_dtype(&[0, 3], safemlx::Dtype::Float32, &stream).unwrap();
     let empty_counts = [0usize; 4];
     let empty = crate::backend::runtime::distributed::all_to_all_v(
@@ -124,33 +286,35 @@ fn cartesian_ring_worker() {
     // TP+PP: TP groups are [0, 1] and [2, 3]; pipeline lanes are [0, 2]
     // and [1, 3]. Both axes are logical subgroups under Ring.
     {
-        let execution = crate::native::backend(&stream, &stream)
-            .communication_for_topology(topology(expected_rank, 2, 2, 1), world.native_group())
-            .unwrap();
-        let input = MlxTensor::from_array(scalar(expected_rank as i32 + 1));
+        let (execution, tensor_group, pipeline_group, _, _) = manifest_execution(
+            topology(expected_rank, 2, 2, 1),
+            world.native_group(),
+            &stream,
+        );
+        let input = MlxTensor::from_array(scalar_f32(expected_rank as f32 + 1.0));
         let reduced = DistributedSession::all_reduce_sum(
             &execution,
-            CollectiveScope::Group(eredu_core::CollectiveGroupId::new(1)),
+            CollectiveScope::Group(tensor_group.unwrap()),
             &input,
         )
         .unwrap()
         .wait()
         .unwrap();
         assert_eq!(
-            values(reduced.as_array()),
-            vec![if expected_rank < 2 { 3 } else { 7 }]
+            float_values(reduced.as_array()),
+            vec![if expected_rank < 2 { 3.0 } else { 7.0 }]
         );
         if expected_rank < 2 {
             let value = MlxTensor::from_array(scalar(expected_rank as i32 + 10));
             execution
-                .send_selected(eredu_core::CollectiveGroupId::new(2), 1, &value)
+                .send_selected(pipeline_group.unwrap(), 1, &value)
                 .unwrap()
                 .synchronize()
                 .unwrap();
         } else {
             let received = execution
                 .receive_selected(
-                    eredu_core::CollectiveGroupId::new(2),
+                    pipeline_group.unwrap(),
                     0,
                     &[1],
                     eredu_core::checkpoint::TensorDtype::I32,
@@ -164,42 +328,44 @@ fn cartesian_ring_worker() {
 
     // TP+EP: TP groups are [0, 2] and [1, 3]; EP groups are [0, 1] and [2, 3].
     {
-        let execution = crate::native::backend(&stream, &stream)
-            .communication_for_topology(topology(expected_rank, 2, 1, 2), world.native_group())
-            .unwrap();
-        let input = MlxTensor::from_array(scalar(expected_rank as i32 + 1));
+        let (execution, tensor_group, _, expert_group, _) = manifest_execution(
+            topology(expected_rank, 2, 1, 2),
+            world.native_group(),
+            &stream,
+        );
+        let input = MlxTensor::from_array(scalar_f32(expected_rank as f32 + 1.0));
         let reduced = DistributedSession::all_reduce_sum(
             &execution,
-            CollectiveScope::Group(eredu_core::CollectiveGroupId::new(1)),
+            CollectiveScope::Group(tensor_group.unwrap()),
             &input,
         )
         .unwrap()
         .wait()
         .unwrap();
         assert_eq!(
-            values(reduced.as_array()),
+            float_values(reduced.as_array()),
             vec![if expected_rank.is_multiple_of(2) {
-                4
+                4.0
             } else {
-                6
+                6.0
             }]
         );
         let reduced = DistributedSession::all_reduce_sum(
             &execution,
-            CollectiveScope::Group(eredu_core::CollectiveGroupId::new(3)),
+            CollectiveScope::Group(expert_group.unwrap()),
             &input,
         )
         .unwrap()
         .wait()
         .unwrap();
         assert_eq!(
-            values(reduced.as_array()),
-            vec![if expected_rank < 2 { 3 } else { 7 }]
+            float_values(reduced.as_array()),
+            vec![if expected_rank < 2 { 3.0 } else { 7.0 }]
         );
 
         // Ring cannot split these EP pairs natively. Exercise the topology-
         // planned logical route with asymmetric counts in both directions.
-        let expert_scope = CollectiveScope::Group(eredu_core::CollectiveGroupId::new(3));
+        let expert_scope = CollectiveScope::Group(expert_group.unwrap());
         assert!(execution.scope_is_logical(expert_scope).unwrap());
         let local_rank = expected_rank % 2;
         let logical_send = if local_rank == 0 { [0, 2] } else { [1, 0] };
@@ -229,33 +395,35 @@ fn cartesian_ring_worker() {
 
     // PP+EP: stage-local EP reduction followed by matching-EP pipeline transport.
     {
-        let execution = crate::native::backend(&stream, &stream)
-            .communication_for_topology(topology(expected_rank, 1, 2, 2), world.native_group())
-            .unwrap();
-        let input = MlxTensor::from_array(scalar(expected_rank as i32 + 1));
+        let (execution, _, pipeline_group, expert_group, session_group) = manifest_execution(
+            topology(expected_rank, 1, 2, 2),
+            world.native_group(),
+            &stream,
+        );
+        let input = MlxTensor::from_array(scalar_f32(expected_rank as f32 + 1.0));
         let reduced = DistributedSession::all_reduce_sum(
             &execution,
-            CollectiveScope::Group(eredu_core::CollectiveGroupId::new(3)),
+            CollectiveScope::Group(expert_group.unwrap()),
             &input,
         )
         .unwrap()
         .wait()
         .unwrap();
         assert_eq!(
-            values(reduced.as_array()),
-            vec![if expected_rank < 2 { 3 } else { 7 }]
+            float_values(reduced.as_array()),
+            vec![if expected_rank < 2 { 3.0 } else { 7.0 }]
         );
         if expected_rank < 2 {
             let value = MlxTensor::from_array(scalar(expected_rank as i32 + 20));
             execution
-                .send_selected(eredu_core::CollectiveGroupId::new(2), 1, &value)
+                .send_selected(pipeline_group.unwrap(), 1, &value)
                 .unwrap()
                 .synchronize()
                 .unwrap();
         } else {
             let received = execution
                 .receive_selected(
-                    eredu_core::CollectiveGroupId::new(2),
+                    pipeline_group.unwrap(),
                     0,
                     &[1],
                     eredu_core::checkpoint::TensorDtype::I32,
@@ -265,9 +433,13 @@ fn cartesian_ring_worker() {
                 .unwrap();
             assert_eq!(values(received.as_array()), vec![expected_rank as i32 + 18]);
         }
-        let (failed, cancelled) = execution
-            .operation_consensus(expected_rank == 1, expected_rank == 2)
-            .unwrap();
+        let (failed, cancelled) = operation_consensus(
+            &execution,
+            session_group,
+            expected_rank == 1,
+            expected_rank == 2,
+            &stream,
+        );
         assert!(failed);
         assert!(cancelled);
     }
@@ -279,27 +451,19 @@ fn cartesian_triple_ring_worker() {
         return;
     };
     let expected_rank: usize = expected_rank.to_string_lossy().parse().unwrap();
-    let world = crate::backend::runtime::distributed::Group::native(
+    let world = crate::backend::runtime::distributed::Group::uncontracted(
         &distributed::init(true, Backend::Ring).unwrap(),
     );
     assert_eq!((world.rank(), world.size()), (expected_rank, 8));
-    let topology = MlxParallelPlan::for_rank(
-        expected_rank,
-        2,
-        2,
-        2,
-        DeviceAssignment::new(DeviceType::Cpu, 0),
-    )
-    .unwrap();
+    let topology = topology(expected_rank, 2, 2, 2);
     let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
-    let execution = crate::native::backend(&stream, &stream)
-        .communication_for_topology(topology, world.native_group())
-        .unwrap();
-    let input = MlxTensor::from_array(scalar(expected_rank as i32 + 1));
+    let (execution, tensor_group, pipeline_group, expert_group, session_group) =
+        manifest_execution(topology, world.native_group(), &stream);
+    let input = MlxTensor::from_array(scalar_f32(expected_rank as f32 + 1.0));
 
     let tp = DistributedSession::all_reduce_sum(
         &execution,
-        CollectiveScope::Group(eredu_core::CollectiveGroupId::new(1)),
+        CollectiveScope::Group(tensor_group.unwrap()),
         &input,
     )
     .unwrap()
@@ -311,12 +475,13 @@ fn cartesian_triple_ring_worker() {
         .global_ranks()
         .iter()
         .map(|rank| *rank as i32 + 1)
-        .sum::<i32>();
-    assert_eq!(values(tp.as_array()), vec![expected_tp]);
+        .map(|value| value as f32)
+        .sum::<f32>();
+    assert_eq!(float_values(tp.as_array()), vec![expected_tp]);
 
     let ep = DistributedSession::all_reduce_sum(
         &execution,
-        CollectiveScope::Group(eredu_core::CollectiveGroupId::new(3)),
+        CollectiveScope::Group(expert_group.unwrap()),
         &input,
     )
     .unwrap()
@@ -328,20 +493,21 @@ fn cartesian_triple_ring_worker() {
         .global_ranks()
         .iter()
         .map(|rank| *rank as i32 + 1)
-        .sum::<i32>();
-    assert_eq!(values(ep.as_array()), vec![expected_ep]);
+        .map(|value| value as f32)
+        .sum::<f32>();
+    assert_eq!(float_values(ep.as_array()), vec![expected_ep]);
 
     if topology.pipeline_parallel_rank() == 0 {
         let value = MlxTensor::from_array(scalar(expected_rank as i32 + 100));
         execution
-            .send_selected(eredu_core::CollectiveGroupId::new(2), 1, &value)
+            .send_selected(pipeline_group.unwrap(), 1, &value)
             .unwrap()
             .synchronize()
             .unwrap();
     } else {
         let received = execution
             .receive_selected(
-                eredu_core::CollectiveGroupId::new(2),
+                pipeline_group.unwrap(),
                 0,
                 &[1],
                 eredu_core::checkpoint::TensorDtype::I32,
@@ -351,9 +517,13 @@ fn cartesian_triple_ring_worker() {
             .unwrap();
         assert_eq!(values(received.as_array()), vec![expected_rank as i32 + 96]);
     }
-    let consensus = execution
-        .operation_consensus(expected_rank == 1, expected_rank == 6)
-        .unwrap();
+    let consensus = operation_consensus(
+        &execution,
+        session_group,
+        expected_rank == 1,
+        expected_rank == 6,
+        &stream,
+    );
     assert_eq!(consensus, (true, true));
 }
 

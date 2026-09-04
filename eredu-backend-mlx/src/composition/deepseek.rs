@@ -7,7 +7,7 @@ use eredu_checkpoint::WeightQuantization;
 use eredu_runtime::{
     ArchitectureParameters, CacheResidencyPolicy, CausalModel, DeviceState, ExecutionUnitLayout,
     LayerWeightResidency, LayeredArchitecture, LayerwiseRuntime, PagedCacheOptions, ParameterRole,
-    RuntimeLayerState, RuntimeState, StateSegmentId, WeightResidency,
+    RoutedLayeredArchitecture, RuntimeLayerState, RuntimeState, StateSegmentId, WeightResidency,
 };
 use safemlx::{error::Exception, ops::indexing::TryIndexOp, Array, Stream};
 
@@ -25,8 +25,7 @@ use crate::backend::{
         },
         checkpoint::binding::{
             build_module_bindings, build_module_bindings_with_recipes_excluding,
-            parameter_name_in_targets, parameter_role_targets,
-            populate_module_from_lease_excluding,
+            parameter_name_in_targets, populate_module_from_lease_excluding,
         },
         checkpoint::load::gguf_quantization_configs,
         checkpoint::store::open_gguf_checkpoint_source,
@@ -236,18 +235,6 @@ impl DeepSeekState {
             }
         }
         Ok(())
-    }
-
-    #[cfg(test)]
-    pub fn offset(&self) -> i32 {
-        match &self.inner {
-            DeepSeekStateInner::V3(state) => {
-                state.as_ref().first().map_or(0, |cache| cache.offset())
-            }
-            DeepSeekStateInner::V4(state) => {
-                state.as_ref().first().map_or(0, |cache| cache.offset())
-            }
-        }
     }
 
     fn commit_prediction_layers_from(&mut self, draft: &Self) -> Result<(), Exception> {
@@ -552,7 +539,6 @@ impl DeepSeekModel {
         parameter_bank: Option<&AddressableParameterBank>,
         input: deepseek::mtp::EmbeddedInput<'a, crate::MlxTensor>,
         state: &mut V3State,
-        pass: eredu_runtime::ExpertPass,
         stream: &Stream,
     ) -> Result<
         (
@@ -577,14 +563,13 @@ impl DeepSeekModel {
                          state: &mut V3State,
                          forward,
                          context| {
-                            architecture.forward_unit_with_provider(
+                            architecture.forward_unit_with_inferred_provider(
                                 group,
                                 index,
                                 unit,
                                 hidden,
                                 state,
                                 forward,
-                                pass,
                                 &mut provider,
                                 context,
                             )
@@ -605,14 +590,13 @@ impl DeepSeekModel {
                          state: &mut V3State,
                          forward,
                          context| {
-                            architecture.forward_unit_with_provider(
+                            architecture.forward_unit_with_inferred_provider(
                                 group,
                                 index,
                                 unit,
                                 hidden,
                                 state,
                                 forward,
-                                pass,
                                 &mut provider,
                                 context,
                             )
@@ -639,7 +623,6 @@ impl DeepSeekModel {
         parameter_bank: Option<&AddressableParameterBank>,
         input: deepseek::mtp::EmbeddedInput<'a, crate::MlxTensor>,
         state: &mut V4State,
-        pass: eredu_runtime::ExpertPass,
         stream: &Stream,
     ) -> Result<
         (
@@ -664,14 +647,13 @@ impl DeepSeekModel {
                          state: &mut V4State,
                          forward,
                          context| {
-                            architecture.forward_unit_with_provider(
+                            architecture.forward_unit_with_inferred_provider(
                                 group,
                                 index,
                                 unit,
                                 hidden,
                                 state,
                                 forward,
-                                pass,
                                 &mut provider,
                                 context,
                             )
@@ -692,14 +674,13 @@ impl DeepSeekModel {
                          state: &mut V4State,
                          forward,
                          context| {
-                            architecture.forward_unit_with_provider(
+                            architecture.forward_unit_with_inferred_provider(
                                 group,
                                 index,
                                 unit,
                                 hidden,
                                 state,
                                 forward,
-                                pass,
                                 &mut provider,
                                 context,
                             )
@@ -727,11 +708,6 @@ impl DeepSeekModel {
         state: &mut DeepSeekState,
         stream: &Stream,
     ) -> Result<Array, Error> {
-        let pass = if tokens.dim(1) > 1 {
-            eredu_runtime::ExpertPass::Prefill
-        } else {
-            eredu_runtime::ExpertPass::Decode
-        };
         match (&mut self.inner, &mut state.inner) {
             (
                 DeepSeekModelInner::V3 {
@@ -747,7 +723,6 @@ impl DeepSeekModel {
                 parameter_bank.as_ref(),
                 deepseek::mtp::EmbeddedInput::target(crate::composition::tensor_ref(tokens), None),
                 state,
-                pass,
                 stream,
             )
             .map(|(logits, _)| logits.into_array()),
@@ -765,7 +740,6 @@ impl DeepSeekModel {
                 parameter_bank.as_ref(),
                 deepseek::mtp::EmbeddedInput::target(crate::composition::tensor_ref(tokens), None),
                 state,
-                pass,
                 stream,
             )
             .map(|(logits, _)| logits.into_array()),
@@ -783,11 +757,6 @@ impl DeepSeekModel {
         stream: &Stream,
         observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
     ) -> Result<Array, Error> {
-        let pass = if tokens.dim(1) > 1 {
-            eredu_runtime::ExpertPass::Prefill
-        } else {
-            eredu_runtime::ExpertPass::Decode
-        };
         let mut observer = crate::composition::NeutralActivationObserver::new(observer);
         let output = match (&mut self.inner, &mut state.inner) {
             (
@@ -816,14 +785,13 @@ impl DeepSeekModel {
                          state: &mut V3State,
                          forward,
                          context| {
-                            architecture.forward_unit_observed_with_provider(
+                            architecture.forward_unit_observed_with_inferred_provider(
                                 group,
                                 index,
                                 unit,
                                 hidden,
                                 state,
                                 forward,
-                                pass,
                                 &mut provider,
                                 context,
                                 &mut observer,
@@ -845,14 +813,13 @@ impl DeepSeekModel {
                          state: &mut V3State,
                          forward,
                          context| {
-                            architecture.forward_unit_observed_with_provider(
+                            architecture.forward_unit_observed_with_inferred_provider(
                                 group,
                                 index,
                                 unit,
                                 hidden,
                                 state,
                                 forward,
-                                pass,
                                 &mut provider,
                                 context,
                                 &mut observer,
@@ -945,14 +912,13 @@ impl DeepSeekModel {
                          state: &mut V4State,
                          forward,
                          context| {
-                            architecture.forward_unit_observed_with_provider(
+                            architecture.forward_unit_observed_with_inferred_provider(
                                 group,
                                 index,
                                 unit,
                                 hidden,
                                 state,
                                 forward,
-                                pass,
                                 &mut provider,
                                 context,
                                 &mut observer,
@@ -974,14 +940,13 @@ impl DeepSeekModel {
                          state: &mut V4State,
                          forward,
                          context| {
-                            architecture.forward_unit_observed_with_provider(
+                            architecture.forward_unit_observed_with_inferred_provider(
                                 group,
                                 index,
                                 unit,
                                 hidden,
                                 state,
                                 forward,
-                                pass,
                                 &mut provider,
                                 context,
                                 &mut observer,
@@ -1077,26 +1042,6 @@ impl DeepSeekModel {
         state: &mut DeepSeekState,
         stream: &Stream,
     ) -> Result<(Array, Array), Exception> {
-        let pass = match &input {
-            deepseek::mtp::EmbeddedInput::Target { tokens, .. }
-            | deepseek::mtp::EmbeddedInput::Draft { tokens, .. } => {
-                if tokens.dim(1) > 1 {
-                    eredu_runtime::ExpertPass::Prefill
-                } else {
-                    eredu_runtime::ExpertPass::Decode
-                }
-            }
-            deepseek::mtp::EmbeddedInput::DsparkContext { .. } => {
-                eredu_runtime::ExpertPass::Prefill
-            }
-            deepseek::mtp::EmbeddedInput::DsparkProposal { capacity, .. } => {
-                if *capacity > 1 {
-                    eredu_runtime::ExpertPass::Prefill
-                } else {
-                    eredu_runtime::ExpertPass::Decode
-                }
-            }
-        };
         let input = neutral_embedded_input(input);
         match (&mut self.inner, &mut state.inner) {
             (
@@ -1114,7 +1059,6 @@ impl DeepSeekModel {
                     parameter_bank.as_ref(),
                     input,
                     state,
-                    pass,
                     stream,
                 )
                 .map_err(|error| Exception::custom(error.to_string()))?;
@@ -1140,7 +1084,6 @@ impl DeepSeekModel {
                     parameter_bank.as_ref(),
                     input,
                     state,
-                    pass,
                     stream,
                 )
                 .map_err(|error| Exception::custom(error.to_string()))?;
@@ -1943,72 +1886,6 @@ fn v4_unit_recipes(
         (expert.target_gate_up, expert.gate_up),
         (expert.target_down, expert.down),
     ]))
-}
-
-/// Builds one unloaded neutral V3 target or prediction unit for a placement
-/// owned by a higher-level composition.
-pub fn new_v3_unit(
-    args: &V3Args,
-    ordinal: usize,
-    _external_experts: bool,
-    stream: &Stream,
-) -> Result<MlxModule<V3Unit>, Error> {
-    let architecture = V3Architecture::new(args.clone(), stream).map_err(neutral_error)?;
-    construct_v3_unit(&architecture, ordinal, stream).map(MlxModule::new)
-}
-
-/// Builds exact checkpoint bindings for one neutral V3 execution unit.
-pub fn v3_unit_bindings(
-    args: &V3Args,
-    ordinal: usize,
-    unit: &MlxModule<V3Unit>,
-    store: &dyn eredu_checkpoint::store::CheckpointSource,
-    external_experts: bool,
-) -> Result<Vec<eredu_runtime::WeightBinding>, Error> {
-    let expert_targets = parameter_role_targets(
-        &deepseek::parallel::v3_layer_parameter_groups(args, ordinal)?,
-        ParameterRole::ExpertIntermediate,
-    );
-    let recipes = v3_unit_recipes(store, args, ordinal, external_experts)?;
-    build_module_bindings_with_recipes_excluding(unit, "", store, recipes, |name| {
-        external_experts && parameter_name_in_targets(name, &expert_targets)
-    })
-    .map_err(Into::into)
-}
-
-/// Builds one unloaded neutral V4 target or prediction unit for a placement
-/// owned by a higher-level composition.
-pub fn new_v4_unit(
-    args: &V4Args,
-    ordinal: usize,
-    _external_experts: bool,
-    stream: &Stream,
-) -> Result<MlxModule<V4Unit>, Error> {
-    let architecture = V4Architecture::new(args.clone(), stream).map_err(neutral_error)?;
-    construct_v4_unit(&architecture, ordinal, stream).map(MlxModule::new)
-}
-
-/// Builds exact checkpoint bindings for one neutral V4 execution unit.
-pub fn v4_unit_bindings(
-    args: &V4Args,
-    ordinal: usize,
-    unit: &MlxModule<V4Unit>,
-    store: &dyn eredu_checkpoint::store::CheckpointSource,
-    external_experts: bool,
-) -> Result<Vec<eredu_runtime::WeightBinding>, Error> {
-    let expert_targets = parameter_role_targets(
-        &deepseek::parallel::v4_layer_parameter_groups(args, ordinal)?,
-        ParameterRole::ExpertIntermediate,
-    );
-    let recipes = if external_experts {
-        BTreeMap::new()
-    } else {
-        v4_unit_recipes(store, args, ordinal)?
-    };
-    build_module_bindings_with_recipes_excluding(unit, "", store, recipes, |name| {
-        external_experts && parameter_name_in_targets(name, &expert_targets)
-    })
-    .map_err(Into::into)
 }
 
 fn neutral_error(error: eredu_nn::Error) -> Error {

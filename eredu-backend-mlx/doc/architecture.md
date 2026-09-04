@@ -50,12 +50,13 @@ then validates only native encoding, operator, placement, and device
 compatibility. Resident, tensor-parallel, pipeline, and expert-parallel paths
 therefore share the same architecture declarations.
 
-One exhaustive MLX realization descriptor per normalized family binds GGUF
-availability, complete and distributed-stage tensor parallelism, independent
-expert-cache loading, load-time quantization, and the applicable composition.
-Preflight and materialization consume that descriptor instead of maintaining a
-second family dispatch matrix. Every active expert-parallel combination uses
-the shared distributed-stage loader.
+Architecture-owned typed dispatch selects direct, routed, composite, or narrow
+extension construction before MLX materialization. The MLX binder receives the
+selected rank-local tasks, parameter recipes, state factory, opaque
+communication manifest, and generic residency requirements; it does not carry
+an exhaustive family realization matrix. Every active expert-parallel
+combination uses the same neutral routed provider and addressable-bank
+mechanisms.
 
 Strict module loading performs no prefix rewriting, unused-prefix exemptions,
 or implicit parameter-name expansion. Selective and distributed loading use
@@ -82,11 +83,13 @@ for the corresponding processor support and `codec` for the MLX Mimi binding.
 
 Application clients should use portable `ExecutionPlan`, `LocalLoadOptions`,
 and `LocalInspectionOptions` values through `eredu::api`. Backend tooling may
-instead bind a `ParallelRankTopology` to a process-local MLX device with the
-composition-owned `native::MlxParallelPlan` and pass it through the root
-`MlxLoadRequest` adapter. Selection consumes that request before payload access;
-materialization receives only the opaque selected preparation and resolved
-composition-owned construction values.
+instead pass a checked neutral `ParallelRankTopology` and a process-local
+`native::DeviceAssignment` through the root `MlxLoadRequest` adapter. Selection
+projects the architecture's exact groups and routes into an opaque manifest
+before payload access. MLX binds that manifest to the local rank/device context;
+materialization receives only the selected preparation and resolved
+composition-owned construction values. No public MLX parallel-plan or
+family-pipeline construction surface remains.
 
 Use `safemlx::distributed::device_for_local_rank` for the process-local device.
 A global rank is not a local GPU index: launchers commonly restrict each
@@ -106,6 +109,6 @@ only the logits-owning rank reports `model.logits`. Comparison policy,
 statistics, and evaluation drivers remain in `eredu-evaluation`.
 
 Collective support is reported only when the backend instance has an attached
-world communicator. Realtime Moshi and PersonaPlex routes currently report
+world communicator. Realtime Moshi and PersonaPlex routes report
 persistent request caches and portable output observation, but not named
 activation inspection.

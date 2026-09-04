@@ -3,9 +3,11 @@
 use eredu_core::{cache::LayerCachePolicy, LayerSchedule};
 use eredu_nn::VocabularyParallelRange;
 use eredu_runtime::{
-    expand_linear_format_parameter_groups, LocalModelLayout, MemberSharding, ParallelPlanError,
-    ParameterGroupSpec, ParameterMemberSpec, ParameterRole, StateLayout, TensorPlacement,
+    expand_linear_format_parameter_groups, ArchitecturePartition, LocalModelLayout, MemberSharding,
+    ParallelPlanError, ParameterGroupSpec, ParameterMemberSpec, ParameterRole, PartitionOwnership,
+    StateLayout, TensorPlacement,
 };
+use std::ops::Range;
 
 use crate::linear_format::standard_parallel_linear_format;
 
@@ -20,6 +22,203 @@ pub struct LocalGeometry {
     state_layout: StateLayout,
     vision_layers: usize,
     architecture_fingerprint: String,
+}
+
+/// Exact TP-local and PP-local geometry for one Muse-Glimmer composite partition.
+#[derive(Debug, Clone)]
+pub struct PartitionLocalGeometry {
+    vision_units: Option<Range<usize>>,
+    text_units: Range<usize>,
+    text_blocks: Vec<DecoderConfig>,
+    embedding_range: VocabularyParallelRange,
+    output_range: Option<VocabularyParallelRange>,
+    complete_state_layout: StateLayout,
+    static_roles: Vec<String>,
+    architecture_fingerprint: String,
+}
+
+/// Validated architecture-owned handoff for one Muse-Glimmer composite partition.
+#[derive(Debug, Clone)]
+pub struct PartitionLocalFoundation {
+    geometry: PartitionLocalGeometry,
+    parameter_targets: Vec<String>,
+}
+
+impl PartitionLocalFoundation {
+    /// Validates group ownership, state offset, boundary schema, and selected tasks together.
+    pub fn from_partition(
+        args: &DecoderConfig,
+        partition: &ArchitecturePartition<
+            PartitionLocalGeometry,
+            eredu_runtime::NoAuxiliaryBoundarySchema,
+        >,
+    ) -> Result<Self, ParallelPlanError> {
+        let geometry = partition.local_geometry();
+        geometry.validate_for(args)?;
+        let expected_groups = [
+            geometry
+                .vision_units()
+                .map(|range| (super::VISION_EXECUTION_GROUP, range)),
+            Some((super::TEXT_EXECUTION_GROUP, geometry.text_units())),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        let actual_groups = partition
+            .groups()
+            .iter()
+            .map(|group| (group.group().as_str(), group.global_units()))
+            .collect::<Vec<_>>();
+        if actual_groups != expected_groups {
+            return Err(invalid(
+                "Muse-Glimmer partition groups differ from family-local geometry",
+            ));
+        }
+        let state = partition
+            .state()
+            .ok_or_else(|| invalid("Muse-Glimmer text partition has no selected state"))?;
+        if state.global_layer_offset() != geometry.text_units.start
+            || state.layout() != &geometry.local_state_layout()?
+        {
+            return Err(invalid(
+                "Muse-Glimmer partition state differs from its text unit range",
+            ));
+        }
+        if partition.boundary_schema()
+            != &eredu_runtime::NoAuxiliaryBoundarySchema::new(args.hidden_size)
+        {
+            return Err(invalid(
+                "Muse-Glimmer partition boundary differs from its decoder width",
+            ));
+        }
+        let parameter_targets = partition
+            .parameter_bindings()
+            .iter()
+            .flat_map(|binding| binding.members())
+            .map(|member| member.target().to_owned())
+            .collect::<Vec<_>>();
+        Ok(Self {
+            geometry: geometry.clone(),
+            parameter_targets,
+        })
+    }
+
+    /// Exact family-local construction geometry.
+    pub const fn geometry(&self) -> &PartitionLocalGeometry {
+        &self.geometry
+    }
+
+    /// Canonical materialization targets selected for this rank.
+    pub fn parameter_targets(&self) -> &[String] {
+        &self.parameter_targets
+    }
+}
+
+impl PartitionLocalGeometry {
+    /// Architecture-global units owned from the optional vision root.
+    pub fn vision_units(&self) -> Option<Range<usize>> {
+        self.vision_units.clone()
+    }
+
+    /// Architecture-global text units owned by this pipeline coordinate.
+    pub fn text_units(&self) -> Range<usize> {
+        self.text_units.clone()
+    }
+
+    /// TP-local configuration for one owned architecture-global text unit.
+    pub fn text_block(&self, global_unit: usize) -> Option<&DecoderConfig> {
+        self.text_units
+            .contains(&global_unit)
+            .then(|| &self.text_blocks[global_unit - self.text_units.start])
+    }
+
+    /// Complete TP-local state geometry before PP slicing.
+    pub const fn complete_state_layout(&self) -> &StateLayout {
+        &self.complete_state_layout
+    }
+
+    /// Exact local state slice and its architecture-global offset.
+    pub fn local_state_layout(&self) -> Result<StateLayout, ParallelPlanError> {
+        self.complete_state_layout
+            .slice(self.text_units.clone())
+            .map_err(|error| invalid(error.to_string()))
+    }
+
+    /// Static roles selected for this pipeline coordinate.
+    pub fn static_roles(&self) -> &[String] {
+        &self.static_roles
+    }
+
+    /// Input-embedding vocabulary ownership for this tensor coordinate.
+    pub const fn embedding_range(&self) -> &VocabularyParallelRange {
+        &self.embedding_range
+    }
+
+    /// Untied output-head vocabulary ownership for this tensor coordinate.
+    pub const fn output_range(&self) -> Option<&VocabularyParallelRange> {
+        self.output_range.as_ref()
+    }
+
+    pub(super) fn validate_for(&self, args: &DecoderConfig) -> Result<(), ParallelPlanError> {
+        let text_count = args.num_hidden_layers as usize;
+        let vision_count = args
+            .vision_config
+            .as_ref()
+            .map_or(0, |vision| vision.layer_count());
+        if self.text_units.is_empty()
+            || self.text_units.end > text_count
+            || self.text_blocks.len() != self.text_units.len()
+            || self.architecture_fingerprint != args.architecture_fingerprint()
+        {
+            return Err(invalid(
+                "partition-local Muse-Glimmer geometry belongs to a different model or text range",
+            ));
+        }
+        if self
+            .vision_units
+            .as_ref()
+            .is_some_and(|range| range.is_empty() || range.end > vision_count)
+            || (vision_count == 0 && self.vision_units.is_some())
+        {
+            return Err(invalid(
+                "partition-local Muse-Glimmer vision range is invalid",
+            ));
+        }
+        let mut expected_roles: Vec<String> = Vec::new();
+        if self
+            .vision_units
+            .as_ref()
+            .is_some_and(|range| range.start == 0)
+        {
+            expected_roles.push("vision".into());
+        }
+        if self.text_units.start == 0 {
+            expected_roles.push("embedding".into());
+        }
+        if self.text_units.end == text_count {
+            expected_roles.push("norm".into());
+            if args.tie_word_embeddings {
+                if !expected_roles.iter().any(|role| role == "embedding") {
+                    expected_roles.push("embedding".into());
+                }
+            } else {
+                expected_roles.push("output".into());
+            }
+        }
+        if self.static_roles != expected_roles {
+            return Err(invalid(format!(
+                "partition-local Muse-Glimmer static roles {:?} differ from {:?}",
+                self.static_roles, expected_roles
+            )));
+        }
+        if self.complete_state_layout.len() != text_count {
+            return Err(invalid(
+                "partition-local Muse-Glimmer complete state length is invalid",
+            ));
+        }
+        self.local_state_layout()?;
+        Ok(())
+    }
 }
 
 impl LocalGeometry {
@@ -124,6 +323,88 @@ pub fn local_geometry(
             .as_ref()
             .map_or(0, |vision| vision.layer_count()),
         architecture_fingerprint: args.architecture_fingerprint(),
+    };
+    geometry.validate_for(args)?;
+    Ok(geometry)
+}
+
+/// Derives exact TP-local and PP-local Muse-Glimmer composite geometry.
+pub fn partition_local_geometry(
+    args: &DecoderConfig,
+    layout: &LocalModelLayout,
+    group_ranges: impl IntoIterator<Item = (impl AsRef<str>, Range<usize>)>,
+    ownership: &PartitionOwnership,
+) -> Result<PartitionLocalGeometry, ParallelPlanError> {
+    if args.is_moe() {
+        return Err(invalid(
+            "partition-local Muse-Glimmer foundation does not admit routed text blocks",
+        ));
+    }
+    partition_local_geometry_impl(args, layout, group_ranges, ownership)
+}
+
+pub(crate) fn routed_partition_local_geometry(
+    args: &DecoderConfig,
+    layout: &LocalModelLayout,
+    group_ranges: impl IntoIterator<Item = (impl AsRef<str>, Range<usize>)>,
+    ownership: &PartitionOwnership,
+) -> Result<PartitionLocalGeometry, ParallelPlanError> {
+    if !args.is_moe() {
+        return Err(invalid(
+            "routed Muse-Glimmer partition has no sparse text blocks",
+        ));
+    }
+    partition_local_geometry_impl(args, layout, group_ranges, ownership)
+}
+
+fn partition_local_geometry_impl(
+    args: &DecoderConfig,
+    layout: &LocalModelLayout,
+    group_ranges: impl IntoIterator<Item = (impl AsRef<str>, Range<usize>)>,
+    ownership: &PartitionOwnership,
+) -> Result<PartitionLocalGeometry, ParallelPlanError> {
+    let mut vision_units = None;
+    let mut text_units = None;
+    for (group, range) in group_ranges {
+        if range.is_empty() {
+            return Err(invalid(
+                "Muse-Glimmer partition group range cannot be empty",
+            ));
+        }
+        let slot = match group.as_ref() {
+            super::VISION_EXECUTION_GROUP => &mut vision_units,
+            super::TEXT_EXECUTION_GROUP => &mut text_units,
+            other => {
+                return Err(invalid(format!(
+                    "unknown Muse-Glimmer partition group {other:?}"
+                )))
+            }
+        };
+        if slot.replace(range).is_some() {
+            return Err(invalid("duplicate Muse-Glimmer partition group"));
+        }
+    }
+    let text_units = text_units
+        .ok_or_else(|| invalid("Muse-Glimmer partition must own a non-empty text decoder range"))?;
+    let complete = local_geometry(args, layout)?;
+    let text_blocks = text_units
+        .clone()
+        .map(|global| {
+            complete
+                .text_block(global)
+                .cloned()
+                .ok_or_else(|| invalid(format!("Muse-Glimmer has no local text block {global}")))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let geometry = PartitionLocalGeometry {
+        vision_units,
+        text_units,
+        text_blocks,
+        embedding_range: complete.embedding_range.clone(),
+        output_range: complete.output_range.clone(),
+        complete_state_layout: complete.state_layout.clone(),
+        static_roles: ownership.static_roles().to_vec(),
+        architecture_fingerprint: complete.architecture_fingerprint.clone(),
     };
     geometry.validate_for(args)?;
     Ok(geometry)
@@ -884,6 +1165,155 @@ mod tests {
             &crate::muse_glimmer::state_layout(&args).unwrap()
         );
         geometry.validate_for(&args).unwrap();
+    }
+
+    fn partition_args_and_layout() -> (DecoderConfig, LocalModelLayout) {
+        let args = DecoderConfig::from_hf_value(&serde_json::json!({
+          "architectures":["MuseGlimmerForConditionalGeneration"],
+          "model_type":"muse_glimmer",
+          "image_token_id":22,"video_token_id":23,"out_hidden_size":32,"projector_hidden_size":16,
+          "text_config":{"model_type":"muse_glimmer_text","hidden_size":16,"num_hidden_layers":2,
+            "intermediate_size":24,"moe_intermediate_size":0,"num_experts":0,"num_experts_per_tok":0,
+            "norm_topk_prob":false,"num_attention_heads":4,"num_key_value_heads":2,"head_dim":4,
+            "rms_norm_eps":0.00001,"post_norm_eps":0.00001,"vocab_size":24,"max_position_embeddings":64,
+            "rope_theta":10000.0,"layer_types":["sliding_attention","full_attention"],
+            "layer_rope_theta":[10000.0,0.0],"sliding_window":8,"tie_word_embeddings":false,
+            "hidden_act":"silu","attention_dropout":0.0,"qk_scale_factor":1.0,
+            "output_multiplier":1.0,"final_logit_softcapping":30.0},
+          "vision_config":{"model_type":"muse_glimmer_vision","hidden_size":8,"intermediate_size":12,
+            "num_attention_heads":2,"num_hidden_layers":1,"patch_size":2,"patch_temporal":1,"merge_size":2,
+            "pos_emb_height":2,"pos_emb_width":2,"max_position_embeddings":4,"layer_norm_eps":0.00001,
+            "hidden_act":"gelu","layer_types":["full_attention"],
+            "rope_parameters":{"rope_theta":10000.0,"rope_type":"default"}}
+        }))
+        .unwrap();
+        let mut layout = valid_layout(true);
+        layout.insert(
+            "model.layers.0.mlp.gate_proj.weight".into(),
+            LocalTensorLayout::new(
+                "model.layers.0.mlp.intermediate",
+                ParameterRole::FeedForwardIntermediate,
+                vec![24, 16],
+                vec![12, 16],
+                TensorPlacement::Range {
+                    axis: 0,
+                    start: 0,
+                    end: 12,
+                },
+                None,
+                None,
+                false,
+            ),
+        );
+        for (suffix, logical, global, local, placement) in [
+            (
+                "self_attn.q_proj.weight",
+                "query_heads",
+                vec![16, 16],
+                vec![8, 16],
+                row_range(8),
+            ),
+            (
+                "self_attn.k_proj.weight",
+                "key_value_heads",
+                vec![8, 16],
+                vec![4, 16],
+                row_range(4),
+            ),
+            (
+                "mlp.gate_proj.weight",
+                "mlp.intermediate",
+                vec![24, 16],
+                vec![12, 16],
+                TensorPlacement::Range {
+                    axis: 0,
+                    start: 0,
+                    end: 12,
+                },
+            ),
+        ] {
+            insert(
+                &mut layout,
+                &format!("model.layers.1.{suffix}"),
+                &format!("model.layers.1.{logical}"),
+                global,
+                local,
+                placement,
+            );
+        }
+        (args, layout)
+    }
+
+    #[test]
+    fn partition_geometry_preserves_dense_text_and_optional_root_ownership() {
+        let (partition_args, layout) = partition_args_and_layout();
+        let first = PartitionOwnership::new(true, false, ["vision", "embedding"]).unwrap();
+        let first = partition_local_geometry(
+            &partition_args,
+            &layout,
+            [
+                (super::super::VISION_EXECUTION_GROUP, 0..1),
+                (super::super::TEXT_EXECUTION_GROUP, 0..1),
+            ],
+            &first,
+        )
+        .unwrap();
+        assert_eq!(first.vision_units(), Some(0..1));
+        assert_eq!(first.text_units(), 0..1);
+        assert_eq!(first.text_block(0).unwrap().num_experts, 0);
+        assert_eq!(first.text_block(0).unwrap().intermediate_size, 12);
+        assert_eq!(first.local_state_layout().unwrap().len(), 1);
+
+        let last = PartitionOwnership::new(false, true, ["norm", "output"]).unwrap();
+        let last = partition_local_geometry(
+            &partition_args,
+            &layout,
+            [(super::super::TEXT_EXECUTION_GROUP, 1..2)],
+            &last,
+        )
+        .unwrap();
+        assert_eq!(last.text_units(), 1..2);
+        assert_eq!(last.static_roles(), ["norm", "output"]);
+        assert_eq!(last.complete_state_layout().len(), 2);
+        assert_eq!(last.local_state_layout().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn partition_geometry_rejects_wrong_optional_root_and_static_placement() {
+        let (partition_args, layout) = partition_args_and_layout();
+        let wrong = PartitionOwnership::new(false, true, ["vision"]).unwrap();
+        assert!(partition_local_geometry(
+            &partition_args,
+            &layout,
+            [(super::super::TEXT_EXECUTION_GROUP, 1..2)],
+            &wrong,
+        )
+        .is_err());
+        let roles = PartitionOwnership::new(false, true, ["norm", "output"]).unwrap();
+        assert!(partition_local_geometry(
+            &partition_args,
+            &layout,
+            [
+                (super::super::VISION_EXECUTION_GROUP, 1..2),
+                (super::super::TEXT_EXECUTION_GROUP, 1..2),
+            ],
+            &roles,
+        )
+        .is_err());
+        let routed = args();
+        let routed_roles =
+            PartitionOwnership::new(true, true, ["vision", "embedding", "norm", "output"]).unwrap();
+        let error = partition_local_geometry(
+            &routed,
+            &valid_layout(true),
+            [
+                (super::super::VISION_EXECUTION_GROUP, 0..1),
+                (super::super::TEXT_EXECUTION_GROUP, 0..1),
+            ],
+            &routed_roles,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("does not admit routed"));
     }
 
     #[test]

@@ -30,9 +30,10 @@ pub use model::{
     VISION_EXECUTION_GROUP,
 };
 pub use parallel::{
-    layer_parameter_groups, local_decoder_config, local_geometry, static_parameter_groups,
-    vision_layer_parameter_groups, vision_parameter_groups, vision_static_parameter_groups,
-    LocalGeometry,
+    layer_parameter_groups, local_decoder_config, local_geometry, partition_local_geometry,
+    static_parameter_groups, vision_layer_parameter_groups, vision_parameter_groups,
+    vision_static_parameter_groups, LocalGeometry, PartitionLocalFoundation,
+    PartitionLocalGeometry,
 };
 pub use text::{
     Attention, CenteredRmsNorm, FeedForward, Mlp, SparseMoe, StaticModules, TransformerBlock,

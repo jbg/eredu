@@ -1,13 +1,13 @@
 //! Semantic tensor-parallel placement for Inkling text and media components.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, ops::Range};
 
 use eredu_checkpoint::LinearFormat;
 use eredu_nn::{NeuralBackend, VocabularyParallelRange};
 use eredu_runtime::{
-    expand_linear_format_parameter_groups, module_parameter_group, LocalModelLayout,
-    MemberSharding, ParallelPlanError, ParameterGroupSpec, ParameterMemberSpec, ParameterRole,
-    PartitionState, StateLayout, TensorPlacement,
+    expand_linear_format_parameter_groups, module_parameter_group, ArchitecturePartition,
+    LocalModelLayout, MemberSharding, ParallelPlanError, ParameterGroupSpec, ParameterMemberSpec,
+    ParameterRole, PartitionOwnership, PartitionState, StateLayout, TensorPlacement,
 };
 
 use crate::linear_format::standard_parallel_linear_format;
@@ -24,6 +24,203 @@ pub struct LocalGeometry {
     prediction_state: Option<PartitionState>,
     vision_layers: usize,
     architecture_fingerprint: String,
+}
+
+/// Exact prediction-free dense Inkling geometry owned by one TP/PP rank.
+#[derive(Debug, Clone)]
+pub struct PartitionLocalGeometry {
+    vision_units: Option<Range<usize>>,
+    text_units: Range<usize>,
+    text_layers: Vec<super::TextArgs>,
+    embedding_range: VocabularyParallelRange,
+    output_range: VocabularyParallelRange,
+    complete_state_layout: StateLayout,
+    static_roles: Vec<String>,
+    owns_input: bool,
+    owns_output: bool,
+    architecture_fingerprint: String,
+}
+
+/// Validated architecture-owned handoff for one dense Inkling partition.
+#[derive(Debug, Clone)]
+pub struct PartitionLocalFoundation {
+    geometry: PartitionLocalGeometry,
+    parameter_targets: Vec<String>,
+}
+
+impl PartitionLocalGeometry {
+    /// Architecture-global optional vision units owned here.
+    pub fn vision_units(&self) -> Option<Range<usize>> {
+        self.vision_units.clone()
+    }
+
+    /// Architecture-global decoder units owned here.
+    pub fn text_units(&self) -> Range<usize> {
+        self.text_units.clone()
+    }
+
+    /// Returns one TP-local owned decoder configuration by global unit index.
+    pub fn text_layer(&self, global_unit: usize) -> Option<&super::TextArgs> {
+        self.text_units
+            .contains(&global_unit)
+            .then(|| &self.text_layers[global_unit - self.text_units.start])
+    }
+
+    /// Input-embedding vocabulary rows owned by this TP rank.
+    pub const fn embedding_range(&self) -> &VocabularyParallelRange {
+        &self.embedding_range
+    }
+
+    /// Output vocabulary rows owned by this TP rank.
+    pub const fn output_range(&self) -> &VocabularyParallelRange {
+        &self.output_range
+    }
+
+    /// Complete TP-local target state before PP slicing.
+    pub const fn complete_state_layout(&self) -> &StateLayout {
+        &self.complete_state_layout
+    }
+
+    /// Exact target-state slice owned by this PP rank.
+    pub fn local_state_layout(&self) -> Result<StateLayout, ParallelPlanError> {
+        self.complete_state_layout
+            .slice(self.text_units.clone())
+            .map_err(|error| invalid(error.to_string()))
+    }
+
+    /// Selected static roles in canonical vision/audio/text graph order.
+    pub fn static_roles(&self) -> &[String] {
+        &self.static_roles
+    }
+
+    fn validate_for(&self, args: &ModelArgs) -> Result<(), ParallelPlanError> {
+        require_prediction_free(args)?;
+        let text_count = usize::try_from(args.text_config.num_hidden_layers)
+            .map_err(|_| invalid("Inkling text-layer count exceeds usize"))?;
+        let vision_count = args
+            .vision_config
+            .as_ref()
+            .map_or(0, |vision| vision.num_hidden_layers as usize);
+        if self.architecture_fingerprint != args.architecture_fingerprint()
+            || self.text_units.is_empty()
+            || self.text_units.end > text_count
+            || self.text_layers.len() != self.text_units.len()
+            || self.complete_state_layout.len() != text_count
+            || self.owns_input != (self.text_units.start == 0)
+            || self.owns_output != (self.text_units.end == text_count)
+        {
+            return Err(invalid(
+                "partition-local Inkling geometry belongs to another model or partition",
+            ));
+        }
+        match &self.vision_units {
+            Some(range)
+                if args.vision_config.is_some()
+                    && !range.is_empty()
+                    && range.end <= vision_count => {}
+            None => {}
+            _ => return Err(invalid("partition-local Inkling vision range is invalid")),
+        }
+        self.embedding_range
+            .validate_global_rows(args.text_config.vocab_size)
+            .map_err(|error| invalid(error.to_string()))?;
+        self.output_range
+            .validate_global_rows(args.text_config.vocab_size)
+            .map_err(|error| invalid(error.to_string()))?;
+        let mut expected_roles = Vec::<String>::new();
+        if self.owns_input {
+            expected_roles.push("vision".into());
+            expected_roles.push("audio".into());
+        }
+        if self.text_units.start == 0 {
+            expected_roles.extend(["embedding".into(), "embedding_norm".into()]);
+        }
+        if self.text_units.end == text_count {
+            expected_roles.extend([
+                "norm".into(),
+                "output".into(),
+                super::MTP_STATIC_ROLE.into(),
+            ]);
+        }
+        if self.static_roles != expected_roles {
+            return Err(invalid(format!(
+                "partition-local Inkling static roles {:?} differ from {:?}",
+                self.static_roles, expected_roles
+            )));
+        }
+        self.local_state_layout()?;
+        Ok(())
+    }
+}
+
+impl PartitionLocalFoundation {
+    /// Validates graph ranges, target state, boundary, and selected parameters together.
+    pub fn from_partition(
+        args: &ModelArgs,
+        partition: &ArchitecturePartition<
+            PartitionLocalGeometry,
+            eredu_runtime::NoAuxiliaryBoundarySchema,
+        >,
+    ) -> Result<Self, ParallelPlanError> {
+        let geometry = partition.local_geometry();
+        geometry.validate_for(args)?;
+        let expected_groups = [
+            geometry
+                .vision_units()
+                .map(|range| (super::VISION_EXECUTION_GROUP, range)),
+            Some((super::TEXT_EXECUTION_GROUP, geometry.text_units())),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        let actual_groups = partition
+            .groups()
+            .iter()
+            .map(|group| (group.group().as_str(), group.global_units()))
+            .collect::<Vec<_>>();
+        if actual_groups != expected_groups {
+            return Err(invalid(
+                "Inkling partition groups differ from family-local geometry",
+            ));
+        }
+        let state = partition
+            .state()
+            .ok_or_else(|| invalid("Inkling decoder partition has no target state"))?;
+        if state.global_layer_offset() != geometry.text_units.start
+            || state.layout() != &geometry.local_state_layout()?
+        {
+            return Err(invalid(
+                "Inkling partition state differs from its decoder range",
+            ));
+        }
+        if partition.boundary_schema()
+            != &eredu_runtime::NoAuxiliaryBoundarySchema::new(args.text_config.hidden_size)
+        {
+            return Err(invalid(
+                "Inkling partition boundary differs from decoder hidden width",
+            ));
+        }
+        let parameter_targets = partition
+            .parameter_bindings()
+            .iter()
+            .flat_map(|binding| binding.members())
+            .map(|member| member.target().to_owned())
+            .collect();
+        Ok(Self {
+            geometry: geometry.clone(),
+            parameter_targets,
+        })
+    }
+
+    /// Exact family-local construction geometry.
+    pub const fn geometry(&self) -> &PartitionLocalGeometry {
+        &self.geometry
+    }
+
+    /// Canonical selected materialization targets.
+    pub fn parameter_targets(&self) -> &[String] {
+        &self.parameter_targets
+    }
 }
 
 impl LocalGeometry {
@@ -123,6 +320,128 @@ pub fn local_geometry(
             .as_ref()
             .map_or(0, |vision| vision.num_hidden_layers as usize),
         architecture_fingerprint: args.architecture_fingerprint(),
+    };
+    geometry.validate_for(args)?;
+    Ok(geometry)
+}
+
+fn require_prediction_free_dense(args: &ModelArgs) -> Result<(), ParallelPlanError> {
+    if args.text_config.has_sparse_moe_layers() {
+        return Err(invalid(
+            "partition-local routed Inkling requires a selected expert realization",
+        ));
+    }
+    require_prediction_free(args)
+}
+
+fn require_prediction_free(args: &ModelArgs) -> Result<(), ParallelPlanError> {
+    if args
+        .mtp_config
+        .as_ref()
+        .is_some_and(|mtp| mtp.num_nextn_predict_layers > 0)
+    {
+        return Err(invalid(
+            "partition-local prediction Inkling requires an explicit prediction bridge",
+        ));
+    }
+    Ok(())
+}
+
+fn partition_ranges(
+    group_ranges: impl IntoIterator<Item = (impl AsRef<str>, Range<usize>)>,
+) -> Result<(Option<Range<usize>>, Range<usize>), ParallelPlanError> {
+    let mut vision = None;
+    let mut text = None;
+    for (group, range) in group_ranges {
+        if range.is_empty() {
+            return Err(invalid("Inkling partition group range cannot be empty"));
+        }
+        let slot = match group.as_ref() {
+            super::VISION_EXECUTION_GROUP => &mut vision,
+            super::TEXT_EXECUTION_GROUP => &mut text,
+            super::AUDIO_EXECUTION_GROUP => {
+                return Err(invalid(
+                    "Inkling audio is an optional static root and has no execution-unit range",
+                ))
+            }
+            other => {
+                return Err(invalid(format!(
+                    "unknown Inkling partition group {other:?}"
+                )))
+            }
+        };
+        if slot.replace(range).is_some() {
+            return Err(invalid("duplicate Inkling partition group"));
+        }
+    }
+    Ok((
+        vision,
+        text.ok_or_else(|| invalid("Inkling partition has no text decoder range"))?,
+    ))
+}
+
+/// Derives exact dense prediction-free TP/PP-local Inkling geometry.
+pub fn partition_local_geometry(
+    args: &ModelArgs,
+    layout: &LocalModelLayout,
+    group_ranges: impl IntoIterator<Item = (impl AsRef<str>, Range<usize>)>,
+    ownership: &PartitionOwnership,
+) -> Result<PartitionLocalGeometry, ParallelPlanError> {
+    require_prediction_free_dense(args)?;
+    partition_local_geometry_impl(args, layout, group_ranges, ownership)
+}
+
+pub(crate) fn routed_partition_local_geometry(
+    args: &ModelArgs,
+    layout: &LocalModelLayout,
+    group_ranges: impl IntoIterator<Item = (impl AsRef<str>, Range<usize>)>,
+    ownership: &PartitionOwnership,
+) -> Result<PartitionLocalGeometry, ParallelPlanError> {
+    require_prediction_free(args)?;
+    if !args.text_config.has_sparse_moe_layers() {
+        return Err(invalid(
+            "routed Inkling partition has no sparse text blocks",
+        ));
+    }
+    partition_local_geometry_impl(args, layout, group_ranges, ownership)
+}
+
+fn partition_local_geometry_impl(
+    args: &ModelArgs,
+    layout: &LocalModelLayout,
+    group_ranges: impl IntoIterator<Item = (impl AsRef<str>, Range<usize>)>,
+    ownership: &PartitionOwnership,
+) -> Result<PartitionLocalGeometry, ParallelPlanError> {
+    let (vision_units, text_units) = partition_ranges(group_ranges)?;
+    let complete = local_geometry(args, layout)?;
+    let text_count = complete.text_layers.len();
+    if text_units.is_empty() || text_units.end > text_count {
+        return Err(invalid(format!(
+            "Inkling text range {text_units:?} is outside {text_count} layers"
+        )));
+    }
+    let vision_count = complete.vision_layers;
+    if vision_units
+        .as_ref()
+        .is_some_and(|range| range.is_empty() || range.end > vision_count)
+    {
+        return Err(invalid(format!(
+            "Inkling vision range {vision_units:?} is outside {vision_count} layers"
+        )));
+    }
+    let complete_state_layout = super::composite_state_layout(&complete.state_layout, None)
+        .map_err(|error| invalid(error.to_string()))?;
+    let geometry = PartitionLocalGeometry {
+        vision_units,
+        text_layers: complete.text_layers[text_units.clone()].to_vec(),
+        text_units,
+        embedding_range: complete.embedding_range,
+        output_range: complete.output_range,
+        complete_state_layout,
+        static_roles: ownership.static_roles().to_vec(),
+        owns_input: ownership.owns_input(),
+        owns_output: ownership.owns_output(),
+        architecture_fingerprint: complete.architecture_fingerprint,
     };
     geometry.validate_for(args)?;
     Ok(geometry)
@@ -537,10 +856,17 @@ pub fn layer_parameter_groups(
             let intermediate = dim(text.moe_intermediate_size())?;
             let routed = dim(text.n_routed_experts)?;
             let shared = dim(text.n_shared_experts)?;
-            for (name, count) in [("experts", routed), ("shared_experts", shared)] {
+            for (name, count, role) in [
+                ("experts", routed, ParameterRole::ExpertIntermediate),
+                (
+                    "shared_experts",
+                    shared,
+                    ParameterRole::SharedExpertIntermediate,
+                ),
+            ] {
                 groups.push(ParameterGroupSpec::partitioned(
                     format!("{root}.moe.{name}.intermediate"),
-                    ParameterRole::ExpertIntermediate,
+                    role,
                     intermediate,
                     [
                         member(
@@ -717,7 +1043,14 @@ mod tests {
                 .iter()
                 .filter(|group| group.role() == ParameterRole::ExpertIntermediate)
                 .count(),
-            2
+            1
+        );
+        assert_eq!(
+            groups
+                .iter()
+                .filter(|group| group.role() == ParameterRole::SharedExpertIntermediate)
+                .count(),
+            1
         );
         assert!(groups
             .iter()

@@ -575,14 +575,42 @@ impl BoundaryWireSchema {
         batch_size: i32,
         sequence_length: i32,
     ) -> Result<ResolvedBoundaryWireSchema, ArchitectureBoundaryError> {
-        if batch_size <= 0 || sequence_length <= 0 {
+        self.resolve_each(
+            batch_size,
+            std::iter::repeat_n(sequence_length, 1 + self.auxiliary.len()),
+        )
+    }
+
+    /// Resolves one exact sequence extent per primary/auxiliary tensor.
+    ///
+    /// This is used by composite boundaries whose evolving internal activation
+    /// and learned side outputs have different sequence geometries. The family
+    /// supplies values in canonical schema order; the runtime only validates and
+    /// substitutes the declared symbolic dimensions.
+    pub fn resolve_each(
+        &self,
+        batch_size: i32,
+        sequence_lengths: impl IntoIterator<Item = i32>,
+    ) -> Result<ResolvedBoundaryWireSchema, ArchitectureBoundaryError> {
+        let sequence_lengths = sequence_lengths.into_iter().collect::<Vec<_>>();
+        if sequence_lengths.len() != 1 + self.auxiliary.len() {
+            return Err(ArchitectureBoundaryError::TensorCount {
+                boundary: self.identity,
+                expected: 1 + self.auxiliary.len(),
+                actual: sequence_lengths.len(),
+            });
+        }
+        if batch_size <= 0 || sequence_lengths.iter().any(|sequence| *sequence <= 0) {
             return Err(ArchitectureBoundaryError::InvalidInvocationGeometry {
                 boundary: self.identity,
                 batch_size,
-                sequence_length,
+                sequence_length: sequence_lengths
+                    .into_iter()
+                    .find(|value| *value <= 0)
+                    .unwrap_or(0),
             });
         }
-        let resolve = |tensor: &BoundaryTensorSpec| ResolvedBoundaryTensorSpec {
+        let resolve = |tensor: &BoundaryTensorSpec, sequence_length| ResolvedBoundaryTensorSpec {
             role: tensor.role.clone(),
             shape: tensor
                 .shape
@@ -595,10 +623,19 @@ impl BoundaryWireSchema {
                 .collect(),
             dtype: tensor.dtype,
         };
+        let mut sequences = sequence_lengths.into_iter();
         Ok(ResolvedBoundaryWireSchema {
             identity: self.identity,
-            primary: resolve(&self.primary),
-            auxiliary: self.auxiliary.iter().map(resolve).collect(),
+            primary: resolve(
+                &self.primary,
+                sequences.next().expect("validated primary sequence"),
+            ),
+            auxiliary: self
+                .auxiliary
+                .iter()
+                .zip(sequences)
+                .map(|(tensor, sequence)| resolve(tensor, sequence))
+                .collect(),
         })
     }
 }
@@ -648,8 +685,14 @@ pub trait ArchitectureBoundary: Sized {
     /// Auxiliary tensor declarations in exact encoded order.
     fn auxiliary_tensor_specs(&self) -> Vec<BoundaryTensorSpec>;
 
-    /// Consumes this typed value into transport-order tensors.
-    fn encode<T>(&self, boundary: Self::Boundary<T>) -> Result<Vec<T>, ArchitectureBoundaryError>;
+    /// Consumes this typed value into exact role-tagged transport tensors.
+    ///
+    /// Roles are assigned while the architecture-owned typed value is
+    /// decomposed; neutral execution must never reconstruct them positionally.
+    fn encode<T>(
+        &self,
+        boundary: Self::Boundary<T>,
+    ) -> Result<Vec<ArchitectureBoundaryValue<T>>, ArchitectureBoundaryError>;
 
     /// Reconstructs the typed value from transport-order tensors.
     fn decode<T>(&self, tensors: Vec<T>) -> Result<Self::Boundary<T>, ArchitectureBoundaryError>;
@@ -661,6 +704,43 @@ pub trait ArchitectureBoundary: Sized {
             self.primary_tensor_spec(),
             self.auxiliary_tensor_specs(),
         )
+    }
+}
+
+/// One architecture-tagged auxiliary boundary value.
+///
+/// The semantic role is assigned while the family-owned typed boundary is
+/// decomposed. Keeping it coupled to the tensor prevents a neutral executor
+/// from silently reassigning roles by positional zipping.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ArchitectureBoundaryValue<T> {
+    role: String,
+    tensor: T,
+}
+
+impl<T> ArchitectureBoundaryValue<T> {
+    /// Couples a non-empty architecture role to its exact tensor value.
+    pub fn new(role: impl Into<String>, tensor: T) -> Result<Self, ArchitectureBoundaryError> {
+        let role = role.into();
+        if role.trim().is_empty() {
+            return Err(ArchitectureBoundaryError::EmptyTaggedTensorRole);
+        }
+        Ok(Self { role, tensor })
+    }
+
+    /// Architecture-owned semantic role.
+    pub fn role(&self) -> &str {
+        &self.role
+    }
+
+    /// Borrows the exact tensor assigned to this role.
+    pub const fn tensor(&self) -> &T {
+        &self.tensor
+    }
+
+    /// Decomposes this value without cloning the tensor.
+    pub fn into_parts(self) -> (String, T) {
+        (self.role, self.tensor)
     }
 }
 
@@ -698,7 +778,10 @@ impl ArchitectureBoundary for NoAuxiliaryBoundarySchema {
         Vec::new()
     }
 
-    fn encode<T>(&self, _boundary: Self::Boundary<T>) -> Result<Vec<T>, ArchitectureBoundaryError> {
+    fn encode<T>(
+        &self,
+        _boundary: Self::Boundary<T>,
+    ) -> Result<Vec<ArchitectureBoundaryValue<T>>, ArchitectureBoundaryError> {
         Ok(Vec::new())
     }
 
@@ -736,6 +819,9 @@ pub enum ArchitectureBoundaryError {
     /// A family boundary omitted its stable identity.
     #[error("architecture boundary identity must not be empty")]
     EmptyIdentity,
+    /// A role-tagged family value omitted its semantic identity.
+    #[error("architecture boundary value contains an empty tensor role")]
+    EmptyTaggedTensorRole,
     /// A family boundary assigned a non-activation dtype to its primary tensor.
     #[error("architecture boundary {boundary:?} primary tensor must use activation dtype")]
     InvalidPrimaryDtype {
@@ -970,10 +1056,11 @@ impl<G, A> ArchitecturePartition<G, A> {
     /// Creates a partition from the topology declared by one concrete neutral
     /// architecture.
     ///
-    /// This is the only public constructor: it derives the graph and unit
-    /// layout from `architecture`, preventing a backend realization from
-    /// publishing a parallel topology that merely resembles, but is not the
-    /// canonical topology of, the architecture it will execute.
+    /// This constructor derives the graph and unit layout from `architecture`,
+    /// preventing a backend realization from publishing a parallel topology
+    /// that merely resembles, but is not the canonical topology of, the
+    /// architecture it will execute. Pre-allocation selection should use
+    /// [`Self::from_description`] with the architecture-authored declaration.
     #[allow(clippy::too_many_arguments)]
     pub fn from_architecture<B, S, M, N>(
         architecture: &M,
@@ -1015,6 +1102,47 @@ impl<G, A> ArchitecturePartition<G, A> {
         )?;
         partition.state = partition
             .resolve_state_partition(&complete_state, &plan)
+            .map_err(|error| ArchitecturePartitionError::ArchitectureState(error.to_string()))?;
+        partition.parameter_bindings = parameters.select_owned(&partition);
+        Ok(partition)
+    }
+
+    /// Creates an authoritative partition from architecture-authored static declarations.
+    ///
+    /// This path exists for pre-materialization selection: it validates and consumes the
+    /// canonical graph/unit declaration, state plan, boundary schema, local geometry, and
+    /// parameter topology without constructing a backend module merely to rediscover those
+    /// facts. Concrete backends must not synthesize any of these inputs.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_description<N>(
+        parameters: &ArchitectureParameterDescription,
+        group_ranges: impl IntoIterator<Item = (N, Range<usize>)>,
+        ownership: PartitionOwnership,
+        complete_state: &StateLayout,
+        state_plan: &ArchitectureStatePartitionPlan,
+        local_geometry: G,
+        boundary_schema: A,
+    ) -> Result<Self, ArchitecturePartitionError>
+    where
+        N: Into<String>,
+        A: ArchitectureBoundary,
+    {
+        let graph = parameters.graph().clone();
+        let unit_layout = parameters.unit_layout().clone();
+        validate_canonical_layout(&graph, &unit_layout)?;
+        boundary_schema.wire_schema()?;
+        let mut partition = Self::new(
+            graph,
+            unit_layout,
+            group_ranges,
+            ownership,
+            None,
+            local_geometry,
+            boundary_schema,
+            std::iter::empty(),
+        )?;
+        partition.state = partition
+            .resolve_state_partition(complete_state, state_plan)
             .map_err(|error| ArchitecturePartitionError::ArchitectureState(error.to_string()))?;
         partition.parameter_bindings = parameters.select_owned(&partition);
         Ok(partition)
@@ -1345,7 +1473,7 @@ impl<G, A> ArchitecturePartition<G, A> {
 pub struct LayeredPartitionDriver {
     group: usize,
     range: Range<usize>,
-    state_layout: StateLayout,
+    state_layout: Option<StateLayout>,
     owns_input: bool,
     owns_output: bool,
 }
@@ -1356,6 +1484,20 @@ impl LayeredPartitionDriver {
         partition: &ArchitecturePartition<G, A>,
         group_index: usize,
         storage_range: Range<usize>,
+    ) -> Result<Self, LayeredPartitionError> {
+        Self::new_with_state_ownership(partition, group_index, storage_range, true)
+    }
+
+    /// Validates a partition while explicitly declaring whether this group owns state slots.
+    ///
+    /// Architecture selection must pass `false` for parameter-only composite roots. A rank can
+    /// still own decoder state for another local group without falsely comparing that state range
+    /// with this group's unrelated unit indices.
+    pub fn new_with_state_ownership<G, A>(
+        partition: &ArchitecturePartition<G, A>,
+        group_index: usize,
+        storage_range: Range<usize>,
+        group_owns_state: bool,
     ) -> Result<Self, LayeredPartitionError> {
         let group = partition
             .groups()
@@ -1369,19 +1511,23 @@ impl LayeredPartitionDriver {
                 partition: range,
             });
         }
-        let state = partition
-            .state()
-            .ok_or(LayeredPartitionError::MissingState)?;
-        if state.global_layers().start > range.start || state.global_layers().end < range.end {
-            return Err(LayeredPartitionError::StateRange {
-                state: state.global_layers(),
-                partition: range,
-            });
+        if group_owns_state {
+            let state = partition
+                .state()
+                .ok_or(LayeredPartitionError::MissingState)?;
+            if state.global_layers().start > range.start || state.global_layers().end < range.end {
+                return Err(LayeredPartitionError::StateRange {
+                    state: state.global_layers(),
+                    partition: range,
+                });
+            }
         }
         Ok(Self {
             group: group.group_index(),
             range,
-            state_layout: state.layout().clone(),
+            state_layout: group_owns_state
+                .then(|| partition.state().map(|state| state.layout().clone()))
+                .flatten(),
             owns_input: partition.ownership().owns_input(),
             owns_output: partition.ownership().owns_output(),
         })
@@ -1397,9 +1543,26 @@ impl LayeredPartitionDriver {
         self.group
     }
 
-    /// Returns the architecture-global state layout for this partition.
-    pub const fn state_layout(&self) -> &StateLayout {
-        &self.state_layout
+    /// Returns state geometry for a driver created through the strict stateful constructor.
+    pub fn state_layout(&self) -> &StateLayout {
+        self.state_layout
+            .as_ref()
+            .expect("state_layout requires a state-owning layered partition driver")
+    }
+
+    /// Returns rank-local state geometry, or `None` for stateless roots and ranks.
+    pub const fn optional_state_layout(&self) -> Option<&StateLayout> {
+        self.state_layout.as_ref()
+    }
+
+    /// Returns whether this partition receives request ingress directly.
+    pub const fn owns_input(&self) -> bool {
+        self.owns_input
+    }
+
+    /// Returns whether this partition owns architecture output projection.
+    pub const fn owns_output(&self) -> bool {
+        self.owns_output
     }
 
     /// Validates input form against architecture boundary ownership.
@@ -1434,7 +1597,11 @@ impl LayeredPartitionDriver {
     }
 
     /// Prepares the partition and starts its canonical execution group.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::type_complexity,
+        reason = "the result preserves the concrete architecture error without erased dispatch"
+    )]
     pub fn begin<'a, B, S, M>(
         &self,
         architecture: &mut M,
@@ -1447,39 +1614,39 @@ impl LayeredPartitionDriver {
         state: &mut S,
         parallel: Option<&B::ParallelContext>,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
-    ) -> Result<LayeredForwardState<B::Tensor, M::ForwardContext>, M::Error>
+    ) -> Result<
+        LayeredForwardState<B::Tensor, M::ForwardContext>,
+        LayeredPartitionBeginError<M::Error>,
+    >
     where
         B: eredu_nn::NeuralBackend,
         S: RuntimeState<B>,
         M: PartitionedLayeredArchitecture<B, S>,
+        M::Error: std::fmt::Display,
     {
+        let expected = self
+            .state_layout
+            .as_ref()
+            .ok_or(LayeredPartitionBeginError::MissingState { group: self.group })?;
+        // `state` is the partition-local allocation selected by `PartitionState`.
+        // Global ownership is carried separately by that partition's offset, so
+        // architecture code must index this allocation from local ordinal zero.
         let mut forward = match parallel {
-            Some(parallel) => architecture.begin_partition_parallel(
-                input,
-                mask,
+            Some(parallel) => architecture
+                .begin_partition_parallel(input, mask, state, expected, 0, parallel, context),
+            None => architecture.begin_partition(input, mask, state, expected, 0, context),
+        }
+        .map_err(LayeredPartitionBeginError::Architecture)?;
+        forward.hidden = architecture
+            .enter_partition_group(
+                self.group,
+                &forward.hidden,
                 state,
-                &self.state_layout,
-                self.range.start,
+                &mut forward.context,
                 parallel,
                 context,
-            ),
-            None => architecture.begin_partition(
-                input,
-                mask,
-                state,
-                &self.state_layout,
-                self.range.start,
-                context,
-            ),
-        }?;
-        forward.hidden = architecture.enter_partition_group(
-            self.group,
-            &forward.hidden,
-            state,
-            &mut forward.context,
-            parallel,
-            context,
-        )?;
+            )
+            .map_err(LayeredPartitionBeginError::Architecture)?;
         Ok(forward)
     }
 
@@ -1513,6 +1680,23 @@ impl LayeredPartitionDriver {
             .leave_partition_group(self.group, hidden, state, forward, parallel, context)?;
         architecture.finish_partition(&hidden, state, forward, self.owns_output, parallel, context)
     }
+}
+
+/// Failure to enter one concrete rank-local partition group.
+#[derive(Debug, thiserror::Error)]
+pub enum LayeredPartitionBeginError<E>
+where
+    E: std::fmt::Display,
+{
+    /// This group was declared stateless and cannot use the stateful partition entry API.
+    #[error("stateless partition group {group} requires an architecture stateless entry strategy")]
+    MissingState {
+        /// Canonical architecture group slot.
+        group: usize,
+    },
+    /// Architecture-owned partition entry failed.
+    #[error("partition architecture entry failed: {0}")]
+    Architecture(E),
 }
 
 /// Invalid concrete realization or boundary use of a layered partition.
@@ -1807,8 +1991,11 @@ mod tests {
         fn encode<T>(
             &self,
             boundary: Self::Boundary<T>,
-        ) -> Result<Vec<T>, ArchitectureBoundaryError> {
-            Ok(vec![boundary.tokens, boundary.embedded])
+        ) -> Result<Vec<ArchitectureBoundaryValue<T>>, ArchitectureBoundaryError> {
+            Ok(vec![
+                ArchitectureBoundaryValue::new("tokens", boundary.tokens)?,
+                ArchitectureBoundaryValue::new("embedded", boundary.embedded)?,
+            ])
         }
 
         fn decode<T>(
@@ -1957,6 +2144,62 @@ mod tests {
     ) -> Result<ArchitectureParameterDescription, ArchitectureParameterError> {
         let graph = graph();
         ArchitectureParameterDescription::new(&graph, &layout(&graph), expected, groups)
+    }
+
+    #[test]
+    fn description_driven_partition_selects_state_and_parameters_before_construction() {
+        let embedding = parameter("embedding", "model.embed_tokens.weight");
+        let layer = parameter("layer", "model.layers.1.weight");
+        let description = parameter_description(
+            vec![embedding.clone(), layer.clone()],
+            vec![
+                OwnedParameterGroupSpec::new(
+                    ParameterGroupOwner::static_role("embedding"),
+                    embedding,
+                ),
+                OwnedParameterGroupSpec::new(
+                    ParameterGroupOwner::execution_unit(
+                        ExecutionGroupId::new("primary").unwrap(),
+                        1,
+                    ),
+                    layer,
+                ),
+            ],
+        )
+        .unwrap();
+        let ownership = PartitionOwnership::new(true, false, ["embedding"]).unwrap();
+        let state = state_layout(4);
+        let state_plan = ArchitectureStatePartitionPlan::new([
+            crate::ArchitectureStatePartitionRule::group_units(0, 0..4),
+        ]);
+
+        let partition = ArchitecturePartition::from_description(
+            &description,
+            [("primary", 1..3)],
+            ownership,
+            &state,
+            &state_plan,
+            Geometry("selected-before-allocation"),
+            PairBoundarySchema,
+        )
+        .unwrap();
+
+        assert_eq!(partition.groups()[0].global_units(), 1..3);
+        assert_eq!(partition.state().unwrap().global_layers(), 1..3);
+        assert_eq!(
+            partition.local_geometry(),
+            &Geometry("selected-before-allocation")
+        );
+        assert_eq!(partition.parameter_bindings().len(), 2);
+        assert_eq!(
+            partition
+                .parameter_bindings()
+                .iter()
+                .flat_map(|group| group.members())
+                .map(ParameterMemberSpec::target)
+                .collect::<Vec<_>>(),
+            ["model.embed_tokens.weight", "model.layers.1.weight"]
+        );
     }
 
     #[test]
@@ -2184,8 +2427,14 @@ mod tests {
             embedded: 7,
         };
         let schema = PairBoundarySchema;
-        let tensors = schema.encode(boundary).unwrap();
-        assert_eq!(tensors, [3, 7]);
+        let values = schema.encode(boundary).unwrap();
+        assert_eq!(values[0].role(), "tokens");
+        assert_eq!(values[1].role(), "embedded");
+        let tensors = values
+            .into_iter()
+            .map(ArchitectureBoundaryValue::into_parts)
+            .map(|(_, tensor)| tensor)
+            .collect();
         assert_eq!(
             schema.decode(tensors).unwrap(),
             PairBoundary {
@@ -2451,6 +2700,50 @@ mod tests {
                 state: 0..2,
                 partition: 1..3,
             }
+        );
+    }
+
+    #[test]
+    fn layered_driver_represents_stateless_root_without_borrowing_decoder_state() {
+        let graph = ExecutionGraph::chain(["vision", "decoder"]).unwrap();
+        let layout = ExecutionUnitLayout::new(&graph, [1, 2]).unwrap();
+        let partition = ArchitecturePartition::new(
+            graph,
+            layout,
+            [("vision", 0..1), ("decoder", 0..2)],
+            PartitionOwnership::new(true, true, std::iter::empty::<String>()).unwrap(),
+            Some(PartitionState::new(state_layout(1), 1).unwrap()),
+            (),
+            (),
+            std::iter::empty(),
+        )
+        .unwrap();
+
+        let vision =
+            LayeredPartitionDriver::new_with_state_ownership(&partition, 0, 0..1, false).unwrap();
+        assert!(vision.optional_state_layout().is_none());
+        assert_eq!(vision.group_index(), 0);
+
+        let without_state = ArchitecturePartition::new(
+            ExecutionGraph::chain(["vision"]).unwrap(),
+            ExecutionUnitLayout::new(&ExecutionGraph::chain(["vision"]).unwrap(), [1]).unwrap(),
+            [("vision", 0..1)],
+            PartitionOwnership::new(true, false, std::iter::empty::<String>()).unwrap(),
+            None,
+            (),
+            (),
+            std::iter::empty(),
+        )
+        .unwrap();
+        assert_eq!(
+            LayeredPartitionDriver::new(&without_state, 0, 0..1).unwrap_err(),
+            LayeredPartitionError::MissingState
+        );
+        assert!(
+            LayeredPartitionDriver::new_with_state_ownership(&without_state, 0, 0..1, false)
+                .unwrap()
+                .optional_state_layout()
+                .is_none()
         );
     }
 

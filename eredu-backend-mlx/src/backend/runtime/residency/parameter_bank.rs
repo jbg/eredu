@@ -658,6 +658,37 @@ pub struct AddressableParameterBank {
     materialization: Option<WeightMaterializationReport>,
 }
 
+/// Cloneable handle to one independently addressable parameter bank.
+///
+/// Partitioned execution retains this handle outside the monomorphized routed
+/// provider so generic session telemetry can observe the same live cache. The
+/// handle adds no routing or architecture policy; it only serializes access to
+/// the native storage mechanism.
+#[derive(Clone)]
+pub struct SharedAddressableParameterBank {
+    inner: Arc<Mutex<AddressableParameterBank>>,
+}
+
+impl SharedAddressableParameterBank {
+    /// Wraps one selected native bank for shared provider/telemetry ownership.
+    pub fn new(bank: AddressableParameterBank) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(bank)),
+        }
+    }
+
+    /// Returns current telemetry for the shared native bank.
+    pub fn report(&self) -> Result<ParameterBankResidencyReport, Error> {
+        self.inner
+            .lock()
+            .map_err(|_| {
+                Error::ArchitectureModel("addressable parameter bank lock was poisoned".into())
+            })?
+            .report()
+            .map_err(Into::into)
+    }
+}
+
 impl AddressableParameterBank {
     /// Creates a disk-planned cache over exactly the supplied owned entries.
     pub fn new<S, O>(
@@ -1530,6 +1561,75 @@ impl AddressableGroupedBank<MlxNeuralBackend> for AddressableParameterBank {
 
     fn report(&self) -> Result<Self::Report, Self::Error> {
         AddressableParameterBank::report(self).map_err(Into::into)
+    }
+}
+
+impl AddressableGroupedBank<MlxNeuralBackend> for SharedAddressableParameterBank {
+    type Acquisition = AcquiredParameterGroups;
+    type Report = ParameterBankResidencyReport;
+    type Error = Error;
+
+    fn member_bytes(&self, key: NeutralParameterBankKey) -> Option<u64> {
+        self.inner.lock().ok()?.member_bytes(key)
+    }
+
+    fn acquire(
+        &mut self,
+        request: ParameterBankAcquisition<'_>,
+        stream: &Stream,
+    ) -> Result<Self::Acquisition, Self::Error> {
+        self.inner
+            .lock()
+            .map_err(|_| {
+                Error::ArchitectureModel("addressable parameter bank lock was poisoned".into())
+            })?
+            .acquire(request, stream)
+    }
+
+    fn gated_product_groups(
+        &mut self,
+        acquisition: &Self::Acquisition,
+        spec: &eredu_nn::GroupedGatedProductSpec,
+        stream: &Stream,
+    ) -> Result<<MlxNeuralBackend as GroupedNeuralBackend>::GatedProductGroups, Self::Error> {
+        self.inner
+            .lock()
+            .map_err(|_| {
+                Error::ArchitectureModel("addressable parameter bank lock was poisoned".into())
+            })?
+            .gated_product_groups(acquisition, spec, stream)
+    }
+
+    fn relu2_groups(
+        &mut self,
+        acquisition: &Self::Acquisition,
+        spec: &eredu_nn::GroupedRelu2Spec,
+        stream: &Stream,
+    ) -> Result<<MlxNeuralBackend as GroupedNeuralBackend>::Relu2Groups, Self::Error> {
+        self.inner
+            .lock()
+            .map_err(|_| {
+                Error::ArchitectureModel("addressable parameter bank lock was poisoned".into())
+            })?
+            .relu2_groups(acquisition, spec, stream)
+    }
+
+    fn complete(
+        &mut self,
+        acquisition: Self::Acquisition,
+        output: &MlxTensor,
+        stream: &Stream,
+    ) -> Result<(), Self::Error> {
+        self.inner
+            .lock()
+            .map_err(|_| {
+                Error::ArchitectureModel("addressable parameter bank lock was poisoned".into())
+            })?
+            .complete(acquisition, output, stream)
+    }
+
+    fn report(&self) -> Result<Self::Report, Self::Error> {
+        SharedAddressableParameterBank::report(self)
     }
 }
 

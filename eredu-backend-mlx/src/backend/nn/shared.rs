@@ -8,7 +8,7 @@ use std::{
 };
 
 use eredu_checkpoint::LinearFormat;
-use eredu_core::Completion;
+use eredu_core::{checkpoint::TensorDtype, Completion, Submission};
 use eredu_nn::{
     validate_parameter_topology, AttentionCache, AttentionRequest, BlockwiseAttentionBackend,
     BlockwiseAttentionSpec, EmbeddingLookupPolicy, EmbeddingOperator, EmbeddingSpec,
@@ -26,19 +26,29 @@ use eredu_nn::{
     TensorParallelGroupedGatedProductOperator, TensorParallelGroupedOutput,
     TensorParallelGroupedRelu2Operator, TopKGroupSelectorSpec, VocabularyParallelRange,
 };
-use eredu_runtime::{ParameterBackend, SubmissionBackend, TransferBackend};
+use eredu_runtime::{
+    BarrierBackend, BroadcastBackend, CommunicationBackend, CommunicationPeerCounts,
+    EvenGatherBackend, FailureAgreementBackend, ParameterBackend, PointToPointBackend,
+    RoleExactBoundaryValue, SubmissionBackend, SumReductionBackend, TransferBackend,
+    UnevenGatherBackend, VariableAllToAllBackend,
+};
 use ref_cast::RefCast;
 use safemlx::ops::{
     arange, argpartition_axis, broadcast_to, clip, concatenate_axis, einsum,
     indexing::{take_along_axis, NewAxis, TryIndexOp},
-    matmul, maximum, r#where, sigmoid, softmax_axis,
+    matmul, maximum, r#where, sigmoid, softmax_axis, zeros_dtype,
 };
 use safemlx::{
     fast::ScaledDotProductAttentionMask, Array, Dtype, Event, HostTransferBuffer,
     HostTransferPolicy, ImmutableHostTransferBuffer, Stream,
 };
 
-use crate::backend::runtime::distributed::Group;
+use crate::backend::runtime::distributed::{
+    completion::{MlxCommunicationCompletion, MlxFailureAgreement},
+    recv_like, send,
+    topology::CommunicationRouteRealization,
+    Group,
+};
 use crate::backend::{
     nn::{
         self as common,
@@ -56,6 +66,24 @@ use crate::{
     nested::NestedValue,
     nn,
 };
+
+#[cfg(test)]
+fn trace_partition_collective(operation: &str, input: &Array, group: &Group, detail: &str) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    if std::env::var_os("EREDU_TEST_PARTITION_COLLECTIVE_TRACE").is_some() {
+        static ORDINAL: AtomicUsize = AtomicUsize::new(0);
+        eprintln!(
+            "partition-schedule rank={} ordinal={} operation={} subgroup={}/{} shape={:?} {}",
+            std::env::var("MLX_RANK").unwrap_or_else(|_| "?".into()),
+            ORDINAL.fetch_add(1, Ordering::Relaxed),
+            operation,
+            group.rank(),
+            group.size(),
+            input.shape(),
+            detail,
+        );
+    }
+}
 
 fn bind_linear_companion(weight: &ParameterSpec, mut companion: ParameterSpec) -> ParameterSpec {
     companion.linear_companion_of = Some(weight.id.clone());
@@ -1154,6 +1182,598 @@ impl SubmissionBackend for MlxNeuralBackend {
     }
 }
 
+const MLX_COMMUNICATION_MAX_ELEMENTS: usize = i32::MAX as usize;
+
+fn communication_dtype(dtype: Dtype) -> TensorDtype {
+    match dtype {
+        Dtype::Bool => TensorDtype::Bool,
+        Dtype::Uint8 => TensorDtype::U8,
+        Dtype::Uint16 => TensorDtype::U16,
+        Dtype::Uint32 => TensorDtype::U32,
+        Dtype::Uint64 => TensorDtype::U64,
+        Dtype::Int8 => TensorDtype::I8,
+        Dtype::Int16 => TensorDtype::I16,
+        Dtype::Int32 => TensorDtype::I32,
+        Dtype::Int64 => TensorDtype::I64,
+        Dtype::Float16 => TensorDtype::F16,
+        Dtype::Float32 => TensorDtype::F32,
+        Dtype::Float64 => TensorDtype::F64,
+        Dtype::Bfloat16 => TensorDtype::Bf16,
+        Dtype::Complex64 => TensorDtype::Complex64,
+    }
+}
+
+#[derive(Clone, Copy)]
+enum MlxCommunicationDtypes {
+    Floating,
+    FloatingAndI32,
+    FloatingI32AndU32,
+}
+
+impl MlxCommunicationDtypes {
+    fn admits(self, dtype: Dtype) -> bool {
+        let floating = matches!(dtype, Dtype::Float32 | Dtype::Float16 | Dtype::Bfloat16);
+        match self {
+            Self::Floating => floating,
+            Self::FloatingAndI32 => floating || dtype == Dtype::Int32,
+            Self::FloatingI32AndU32 => floating || matches!(dtype, Dtype::Int32 | Dtype::Uint32),
+        }
+    }
+}
+
+fn validate_communication_tensor(
+    value: &Array,
+    dtypes: MlxCommunicationDtypes,
+) -> Result<(), safemlx::error::Exception> {
+    if !dtypes.admits(value.dtype()) {
+        return Err(safemlx::error::Exception::custom(format!(
+            "MLX communication does not advertise dtype {:?}",
+            value.dtype()
+        )));
+    }
+    if value.ndim() > i32::MAX as usize || value.size() > MLX_COMMUNICATION_MAX_ELEMENTS {
+        return Err(safemlx::error::Exception::custom(
+            "MLX communication tensor exceeds advertised rank or element limits",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_route_bundle(
+    values: &[MlxTensor],
+    route: &CommunicationRouteRealization,
+) -> Result<(), safemlx::error::Exception> {
+    let requirement = route.descriptor().requirement();
+    let limits = requirement.limits().ok_or_else(|| {
+        safemlx::error::Exception::custom("point-to-point route has no tensor limits")
+    })?;
+    if values.is_empty() || values.len() > limits.max_tensors() {
+        return Err(safemlx::error::Exception::custom(format!(
+            "point-to-point route bundle has {} tensors, expected 1..={}",
+            values.len(),
+            limits.max_tensors()
+        )));
+    }
+    for value in values {
+        let array = value.as_array();
+        validate_communication_tensor(array, MlxCommunicationDtypes::FloatingI32AndU32)?;
+        let dtype = communication_dtype(array.dtype());
+        if !requirement.dtypes().contains(&dtype) {
+            return Err(safemlx::error::Exception::custom(format!(
+                "point-to-point route does not admit dtype {dtype:?}"
+            )));
+        }
+        if array.ndim() > limits.max_tensor_rank() || array.size() > limits.max_tensor_elements() {
+            return Err(safemlx::error::Exception::custom(format!(
+                "point-to-point placeholder shape {:?} exceeds route limits",
+                array.shape()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn collective_completion(
+    input: Array,
+    output: &Array,
+    group: &Group,
+    executor: &Stream,
+    count_buffers: Vec<Vec<usize>>,
+) -> Result<MlxCommunicationCompletion, safemlx::error::Exception> {
+    MlxCommunicationCompletion::submit(
+        [output],
+        vec![input, output.clone()],
+        count_buffers,
+        vec![group.clone()],
+        Vec::new(),
+        vec![executor.clone()],
+    )
+}
+
+impl CommunicationBackend for MlxNeuralBackend {
+    type CommunicationGroup = Group;
+    type CommunicationRoute = CommunicationRouteRealization;
+    type CommunicationCompletion = MlxCommunicationCompletion;
+    type CommunicationError = safemlx::error::Exception;
+
+    fn submit_local_dependencies<'a, I>(
+        values: I,
+        executor: &Self::Executor,
+    ) -> Result<Submission<(), Self::CommunicationCompletion>, Self::CommunicationError>
+    where
+        Self::Tensor: 'a,
+        I: IntoIterator<Item = &'a Self::Tensor>,
+    {
+        let outputs = values
+            .into_iter()
+            .map(|value| value.as_array().clone())
+            .collect::<Vec<_>>();
+        #[cfg(test)]
+        if std::env::var_os("EREDU_TEST_PARTITION_COLLECTIVE_TRACE").is_some() {
+            eprintln!(
+                "partition-schedule rank={} operation=local-dependencies shapes={:?}",
+                std::env::var("MLX_RANK").unwrap_or_else(|_| "?".into()),
+                outputs.iter().map(Array::shape).collect::<Vec<_>>(),
+            );
+        }
+        let retained = outputs.clone();
+        let completion = MlxCommunicationCompletion::submit(
+            outputs.iter(),
+            retained,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![executor.clone()],
+        )?;
+        Ok(Submission {
+            output: (),
+            completion,
+        })
+    }
+}
+
+/// Mechanical tensor metadata used by the backend-neutral partition driver.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct MlxCommunicationTensorMetadata;
+
+impl eredu_runtime::CommunicationTensorMetadata<MlxNeuralBackend>
+    for MlxCommunicationTensorMetadata
+{
+    fn dtype(&self, tensor: &MlxTensor) -> TensorDtype {
+        communication_dtype(tensor.as_array().dtype())
+    }
+
+    fn shape(&self, tensor: &MlxTensor) -> Vec<usize> {
+        tensor
+            .as_array()
+            .shape()
+            .iter()
+            .map(|dimension| usize::try_from(*dimension).unwrap_or(usize::MAX))
+            .collect()
+    }
+}
+
+impl SumReductionBackend for MlxNeuralBackend {
+    fn all_reduce_sum(
+        value: MlxTensor,
+        group: &Group,
+        executor: &Stream,
+    ) -> Result<Submission<MlxTensor, MlxCommunicationCompletion>, Self::CommunicationError> {
+        let _setup = group.begin_bounded_setup()?;
+        if let Some(setup) = &_setup {
+            setup.check()?;
+        }
+        let input = value.into_array();
+        #[cfg(test)]
+        trace_partition_collective("sum", &input, group, "");
+        validate_communication_tensor(&input, MlxCommunicationDtypes::Floating)?;
+        let output = crate::backend::runtime::distributed::all_sum(&input, group, executor)?;
+        let completion = collective_completion(input, &output, group, executor, Vec::new())?;
+        Ok(Submission {
+            output: MlxTensor::from_array(output),
+            completion,
+        })
+    }
+}
+
+impl EvenGatherBackend for MlxNeuralBackend {
+    fn all_gather_even(
+        value: MlxTensor,
+        axis: usize,
+        group: &Group,
+        executor: &Stream,
+    ) -> Result<Submission<MlxTensor, MlxCommunicationCompletion>, Self::CommunicationError> {
+        let _setup = group.begin_bounded_setup()?;
+        if let Some(setup) = &_setup {
+            setup.check()?;
+        }
+        let input = value.into_array();
+        #[cfg(test)]
+        trace_partition_collective("gather", &input, group, &format!("axis={axis}"));
+        validate_communication_tensor(&input, MlxCommunicationDtypes::FloatingAndI32)?;
+        let axis = i32::try_from(axis).map_err(|_| {
+            safemlx::error::Exception::custom("all-gather axis does not fit in i32")
+        })?;
+        let output = crate::backend::distributed::all_gather_axis(&input, axis, group, executor)?;
+        let completion = collective_completion(input, &output, group, executor, Vec::new())?;
+        Ok(Submission {
+            output: MlxTensor::from_array(output),
+            completion,
+        })
+    }
+}
+
+impl UnevenGatherBackend for MlxNeuralBackend {
+    fn all_gather_uneven(
+        value: MlxTensor,
+        counts: &[usize],
+        axis: usize,
+        group: &Group,
+        executor: &Stream,
+    ) -> Result<Submission<MlxTensor, MlxCommunicationCompletion>, Self::CommunicationError> {
+        let _setup = group.begin_bounded_setup()?;
+        if let Some(setup) = &_setup {
+            setup.check()?;
+        }
+        let input = value.into_array();
+        #[cfg(test)]
+        trace_partition_collective(
+            "gather_uneven",
+            &input,
+            group,
+            &format!("axis={axis} counts={counts:?}"),
+        );
+        validate_communication_tensor(&input, MlxCommunicationDtypes::Floating)?;
+        let axis = i32::try_from(axis).map_err(|_| {
+            safemlx::error::Exception::custom("uneven all-gather axis does not fit in i32")
+        })?;
+        let output = crate::backend::distributed::all_gather_uneven_axis(
+            &input, axis, counts, group, executor,
+        )?;
+        let completion =
+            collective_completion(input, &output, group, executor, vec![counts.to_vec()])?;
+        Ok(Submission {
+            output: MlxTensor::from_array(output),
+            completion,
+        })
+    }
+}
+
+impl VariableAllToAllBackend for MlxNeuralBackend {
+    fn variable_all_to_all(
+        value: MlxTensor,
+        counts: &CommunicationPeerCounts,
+        axis: usize,
+        group: &Group,
+        executor: &Stream,
+    ) -> Result<Submission<MlxTensor, MlxCommunicationCompletion>, Self::CommunicationError> {
+        #[cfg(test)]
+        crate::composition::mlx::path_instrumentation::variable_all_to_all_submission();
+        let _setup = group.begin_bounded_setup()?;
+        if let Some(setup) = &_setup {
+            setup.check()?;
+        }
+        let input = value.into_array();
+        #[cfg(test)]
+        trace_partition_collective(
+            "exchange",
+            &input,
+            group,
+            &format!(
+                "axis={axis} send={:?} receive={:?}",
+                counts.send(),
+                counts.receive()
+            ),
+        );
+        validate_communication_tensor(&input, MlxCommunicationDtypes::FloatingAndI32)?;
+        if counts.group_size() != group.size() {
+            return Err(safemlx::error::Exception::custom(format!(
+                "variable all-to-all has {} peer counts for group size {}",
+                counts.group_size(),
+                group.size()
+            )));
+        }
+        if counts
+            .send()
+            .iter()
+            .chain(counts.receive())
+            .any(|count| *count > i32::MAX as usize)
+        {
+            return Err(safemlx::error::Exception::custom(
+                "variable all-to-all peer count exceeds advertised i32 limit",
+            ));
+        }
+        let all_zero = counts
+            .send()
+            .iter()
+            .chain(counts.receive())
+            .all(|count| *count == 0);
+        if all_zero && group.size() > 1 {
+            // A zero-element MLX result may be considered already evaluated,
+            // which would omit the native collective and let this subgroup
+            // advance ahead of non-empty subgroups in the same world wave.
+            // Submit one private self-directed sentinel per member while
+            // preserving the selected logical zero-count result exactly.
+            let mut sentinel_shape = input.shape().to_vec();
+            sentinel_shape[axis] = 1;
+            let sentinel = zeros_dtype(&sentinel_shape, input.dtype(), executor)?;
+            let mut sentinel_counts = vec![0usize; group.size()];
+            sentinel_counts[group.rank()] = 1;
+            let sentinel_output = crate::backend::distributed::all_to_all_v_axis(
+                &sentinel,
+                axis,
+                &sentinel_counts,
+                &sentinel_counts,
+                group,
+                executor,
+            )?;
+            let completion = collective_completion(
+                sentinel,
+                &sentinel_output,
+                group,
+                executor,
+                vec![sentinel_counts],
+            )?;
+            return Ok(Submission {
+                output: MlxTensor::from_array(input),
+                completion,
+            });
+        }
+        let output = crate::backend::distributed::all_to_all_v_axis(
+            &input,
+            axis,
+            counts.send(),
+            counts.receive(),
+            group,
+            executor,
+        )?;
+        let completion = collective_completion(
+            input,
+            &output,
+            group,
+            executor,
+            vec![counts.send().to_vec(), counts.receive().to_vec()],
+        )?;
+        Ok(Submission {
+            output: MlxTensor::from_array(output),
+            completion,
+        })
+    }
+}
+
+impl BroadcastBackend for MlxNeuralBackend {
+    fn broadcast(
+        value: MlxTensor,
+        root: usize,
+        group: &Group,
+        executor: &Stream,
+    ) -> Result<Submission<MlxTensor, MlxCommunicationCompletion>, Self::CommunicationError> {
+        let _setup = group.begin_bounded_setup()?;
+        if let Some(setup) = &_setup {
+            setup.check()?;
+        }
+        if root >= group.size() {
+            return Err(safemlx::error::Exception::custom(format!(
+                "broadcast root {root} is outside group size {}",
+                group.size()
+            )));
+        }
+        let input = value.into_array();
+        #[cfg(test)]
+        trace_partition_collective("broadcast", &input, group, &format!("root={root}"));
+        validate_communication_tensor(&input, MlxCommunicationDtypes::Floating)?;
+        // Preserve every rank's lazy predecessor graph in the submitted event.
+        // A zero-valued expression keeps non-roots in the same dependency order
+        // without performing an unbounded host synchronization before returning
+        // the exact communication completion.
+        let contribution = if group.rank() == root {
+            input.clone()
+        } else {
+            input.multiply(Array::from_f32(0.0), executor)?
+        };
+        let output = crate::backend::runtime::distributed::all_sum_for(
+            eredu_runtime::CommunicationOperation::Broadcast,
+            &contribution,
+            group,
+            executor,
+        )?;
+        let completion = MlxCommunicationCompletion::submit(
+            [&output],
+            vec![input, contribution, output.clone()],
+            Vec::new(),
+            vec![group.clone()],
+            Vec::new(),
+            vec![executor.clone()],
+        )?;
+        Ok(Submission {
+            output: MlxTensor::from_array(output),
+            completion,
+        })
+    }
+}
+
+impl BarrierBackend for MlxNeuralBackend {
+    fn barrier(
+        group: &Group,
+        executor: &Stream,
+    ) -> Result<MlxCommunicationCompletion, Self::CommunicationError> {
+        let _setup = group.begin_bounded_setup()?;
+        if let Some(setup) = &_setup {
+            setup.check()?;
+        }
+        let token = zeros_dtype(&[], Dtype::Float32, executor)?;
+        let completed = crate::backend::runtime::distributed::payload_free_all_sum_for(
+            eredu_runtime::CommunicationOperation::Barrier,
+            &token,
+            group,
+            executor,
+        )?;
+        MlxCommunicationCompletion::submit(
+            [&completed],
+            vec![token, completed.clone()],
+            Vec::new(),
+            vec![group.clone()],
+            Vec::new(),
+            vec![executor.clone()],
+        )
+    }
+}
+
+impl FailureAgreementBackend for MlxNeuralBackend {
+    type FailureAgreementOutput = MlxFailureAgreement;
+
+    fn agree_success(
+        local_success: bool,
+        group: &Group,
+        executor: &Stream,
+    ) -> Result<Submission<MlxFailureAgreement, MlxCommunicationCompletion>, Self::CommunicationError>
+    {
+        let _setup = group.begin_bounded_setup()?;
+        if let Some(setup) = &_setup {
+            setup.check()?;
+        }
+        let member_count = i32::try_from(group.size()).map_err(|_| {
+            safemlx::error::Exception::custom(
+                "failure-agreement group size exceeds the advertised i32 status count",
+            )
+        })?;
+        let input = Array::from_slice(&[i32::from(local_success)], &[1]);
+        #[cfg(test)]
+        trace_partition_collective(
+            "agreement",
+            &input,
+            group,
+            &format!("success={local_success}"),
+        );
+        let output = crate::backend::runtime::distributed::payload_free_all_sum_for(
+            eredu_runtime::CommunicationOperation::FailureAgreement,
+            &input,
+            group,
+            executor,
+        )?;
+        let completion = collective_completion(input, &output, group, executor, Vec::new())?;
+        let (agreement, completion) = completion.with_failure_agreement(output, member_count);
+        Ok(Submission {
+            output: agreement,
+            completion,
+        })
+    }
+
+    fn resolve_failure_agreement(
+        output: Self::FailureAgreementOutput,
+    ) -> Result<bool, Self::CommunicationError> {
+        output.resolve()
+    }
+}
+
+impl PointToPointBackend for MlxNeuralBackend {
+    fn send_receive(
+        values: Vec<RoleExactBoundaryValue<MlxTensor>>,
+        route: &CommunicationRouteRealization,
+        executor: &Stream,
+    ) -> Result<Submission<Vec<MlxTensor>, MlxCommunicationCompletion>, Self::CommunicationError>
+    {
+        let group = route.group().ok_or_else(|| {
+            safemlx::error::Exception::custom(format!(
+                "world rank is not an endpoint of communication route {}",
+                route.descriptor().id().value()
+            ))
+        })?;
+        let _setup = group.begin_bounded_setup()?;
+        if let Some(setup) = &_setup {
+            setup.check()?;
+        }
+        let descriptor = route.descriptor();
+        let receiving = matches!(
+            route.endpoint(),
+            Some(crate::backend::runtime::distributed::topology::CommunicationRouteEndpoint::Destination)
+        );
+        let peer_rank = route.peer_rank().ok_or_else(|| {
+            safemlx::error::Exception::custom(format!(
+                "communication route {} endpoint has no local peer rank",
+                descriptor.id().value()
+            ))
+        })?;
+        let logical = values
+            .iter()
+            .map(|value| value.tensor().clone())
+            .collect::<Vec<_>>();
+        validate_route_bundle(&logical, route)?;
+        let mut inputs = Vec::with_capacity(values.len());
+        let mut frames = Vec::with_capacity(values.len());
+        let mut expected_headers = Vec::with_capacity(values.len());
+        for value in values {
+            let (header, tensor) = value.into_parts();
+            let input = tensor.into_array();
+            let bytes = input
+                .view_dtype(Dtype::Uint8, executor)?
+                .reshape(&[-1], executor)?;
+            let header_len = i32::try_from(header.len()).map_err(|_| {
+                safemlx::error::Exception::custom(
+                    "boundary frame header length exceeds MLX dimensions",
+                )
+            })?;
+            let header_array = Array::from_slice(&header, &[header_len]);
+            let frame = safemlx::ops::concatenate(&[&header_array, &bytes], executor)?;
+            inputs.push(input);
+            frames.push(frame);
+            expected_headers.push(header);
+        }
+        let (submitted, outputs, received_headers) = if !receiving {
+            let submitted = frames
+                .iter()
+                .map(|frame| send(frame, peer_rank, group, executor))
+                .collect::<Result<Vec<_>, _>>()?;
+            (submitted, inputs.clone(), Vec::new())
+        } else {
+            let received = frames
+                .iter()
+                .map(|placeholder| recv_like(placeholder, peer_rank, group, executor))
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut outputs = Vec::with_capacity(received.len());
+            let mut received_headers = Vec::with_capacity(received.len());
+            for ((input, expected), received) in inputs.iter().zip(&expected_headers).zip(&received)
+            {
+                let header_len = i32::try_from(expected.len()).map_err(|_| {
+                    safemlx::error::Exception::custom(
+                        "boundary frame header length exceeds MLX indexing",
+                    )
+                })?;
+                let received_header = received.try_index_device(0..header_len, executor)?;
+                let received_payload = received.try_index_device(header_len.., executor)?;
+                let payload = received_payload
+                    .view_dtype(input.dtype(), executor)?
+                    .reshape(input.shape(), executor)?;
+                outputs.push(payload);
+                received_headers.push((received_header, expected.clone()));
+            }
+            (received.clone(), outputs, received_headers)
+        };
+        let mut retained = inputs;
+        retained.extend(frames);
+        retained.extend(outputs.iter().cloned());
+        retained.extend(submitted.iter().cloned());
+        let completion_outputs = submitted
+            .iter()
+            .chain(outputs.iter())
+            .chain(received_headers.iter().map(|(header, _)| header))
+            .collect::<Vec<_>>();
+        let completion = MlxCommunicationCompletion::submit(
+            completion_outputs,
+            retained,
+            Vec::new(),
+            vec![group.clone()],
+            vec![route.clone()],
+            vec![executor.clone()],
+        )?
+        .with_boundary_headers(received_headers);
+        Ok(Submission {
+            output: outputs.into_iter().map(MlxTensor::from_array).collect(),
+            completion,
+        })
+    }
+}
+
 impl TransferBackend for MlxNeuralBackend {
     type HostBuffer = Arc<ImmutableHostTransferBuffer>;
     type Transfer = MlxSubmissionCompletion;
@@ -2234,18 +2854,9 @@ impl eredu_nn::DistributedNeuralBackend for MlxNeuralBackend {
             .as_ref()
             .ok_or_else(|| ComputeError::backend("projection has no vocabulary ownership"))?;
         let local = compute(linear.module.forward(input.as_array(), context))?;
-        let widths = (0..parallel.size())
-            .map(|rank| {
-                eredu_core::balanced_contiguous_range(
-                    range.global_vocabulary,
-                    parallel.size(),
-                    rank,
-                    false,
-                )
-                .map(|range| range.len())
-                .map_err(ComputeError::backend)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let widths = range
+            .balanced_peer_widths(parallel.size(), parallel.rank())
+            .map_err(ComputeError::backend)?;
         compute_tensor(
             crate::backend::distributed::all_gather_uneven_axis(
                 &local, -1, &widths, parallel, context,
@@ -2271,18 +2882,9 @@ impl eredu_nn::DistributedNeuralBackend for MlxNeuralBackend {
             .clone()
             .ok_or_else(|| ComputeError::backend("embedding has no vocabulary ownership"))?;
         let local = compute(embedding.module.as_linear(input.as_array(), context))?;
-        let widths = (0..parallel.size())
-            .map(|rank| {
-                eredu_core::balanced_contiguous_range(
-                    range.global_vocabulary,
-                    parallel.size(),
-                    rank,
-                    false,
-                )
-                .map(|range| range.len())
-                .map_err(ComputeError::backend)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let widths = range
+            .balanced_peer_widths(parallel.size(), parallel.rank())
+            .map_err(ComputeError::backend)?;
         compute_tensor(
             crate::backend::distributed::all_gather_uneven_axis(
                 &local, -1, &widths, parallel, context,
@@ -2726,6 +3328,7 @@ mod neutral_semantic_operator_tests {
     use eredu_architectures::decoder::{MultiTableEmbedding, NamedEmbeddingSpec};
     use eredu_architectures::operator_requirements;
     use eredu_checkpoint::{AffineQuantization, LinearFormat, WeightQuantization};
+    use eredu_core::Completion as _;
     use eredu_nn::{
         reference_expand_heads, reference_segmented_attention, EmbeddingLookupPolicy,
         EmbeddingOperator, EmbeddingSpec, FusedProjectionLayout, FusedProjectionSegment,
@@ -2734,6 +3337,10 @@ mod neutral_semantic_operator_tests {
         JointGroupSelectionSpec, LinearOperator, LinearSpec, NeuralBackend,
         NormalizationConstructionSpec, NormalizationScale, ParameterSpec, RelativeAttentionInput,
         SegmentedAttentionInput, Tensor,
+    };
+    use eredu_runtime::{
+        BarrierBackend, BroadcastBackend, CommunicationBackend, CommunicationPeerCounts,
+        EvenGatherBackend, SumReductionBackend, UnevenGatherBackend, VariableAllToAllBackend,
     };
     use safemlx::{
         ops::{quantize_with_mode, QuantizationMode},
@@ -2747,6 +3354,234 @@ mod neutral_semantic_operator_tests {
     };
 
     use super::{MlxEmbedding, MlxLinear, MlxNeuralBackend, MlxTensor};
+
+    fn singleton_communication() -> (crate::backend::runtime::distributed::Group, safemlx::Stream) {
+        let native =
+            safemlx::distributed::init(false, safemlx::distributed::Backend::Ring).unwrap();
+        let group = crate::backend::runtime::distributed::Group::uncontracted(&native);
+        let stream = safemlx::Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+        (group, stream)
+    }
+
+    #[test]
+    fn local_dependency_submission_retains_exact_outputs_and_executor_under_bound() {
+        use eredu_core::BoundedCompletion as _;
+
+        let (_, stream) = singleton_communication();
+        let values = [
+            MlxTensor::from_array(Array::from_slice(&[1.0_f32, 2.0], &[1, 2])),
+            MlxTensor::from_array(Array::from_slice(&[3.0_f32], &[1, 1])),
+        ];
+        crate::backend::runtime::distributed::completion::force_next_communication_pending();
+        let submission = <MlxNeuralBackend as CommunicationBackend>::submit_local_dependencies(
+            values.iter(),
+            &stream,
+        )
+        .unwrap();
+        assert_eq!(submission.completion.submitted_outputs(), values.len());
+        assert_eq!(submission.completion.retained_arrays(), values.len());
+        assert_eq!(submission.completion.retained_streams(), 1);
+        assert_eq!(submission.completion.retained_groups(), 0);
+        assert_eq!(submission.completion.retained_routes(), 0);
+        let policy = eredu_core::BoundedCompletionWait::new(
+            std::time::Duration::from_millis(1),
+            eredu_core::CompletionCancellationMode::QuarantineUntilComplete,
+        )
+        .unwrap();
+        assert_eq!(
+            submission.completion.wait_bounded(policy).unwrap(),
+            eredu_core::BoundedCompletionOutcome::DeadlineExceeded {
+                cancellation: eredu_core::CompletionCancellationMode::QuarantineUntilComplete,
+            }
+        );
+        crate::backend::runtime::distributed::completion::release_forced_pending_orphans();
+    }
+
+    #[test]
+    fn fine_grained_collectives_retain_exact_singleton_resources() {
+        let (group, stream) = singleton_communication();
+
+        let reduced = <MlxNeuralBackend as SumReductionBackend>::all_reduce_sum(
+            MlxTensor::from_array(Array::from_slice(&[1.0_f32, 2.0], &[1, 2])),
+            &group,
+            &stream,
+        )
+        .unwrap();
+        assert_eq!(reduced.completion.retained_arrays(), 2);
+        assert_eq!(reduced.completion.retained_count_buffers(), 0);
+        assert_eq!(reduced.completion.retained_groups(), 1);
+        assert_eq!(reduced.completion.retained_routes(), 0);
+        assert_eq!(reduced.completion.retained_streams(), 1);
+        assert_eq!(
+            reduced
+                .wait()
+                .unwrap()
+                .as_array()
+                .evaluated()
+                .unwrap()
+                .as_slice::<f32>(),
+            &[1.0, 2.0]
+        );
+
+        let gathered = <MlxNeuralBackend as EvenGatherBackend>::all_gather_even(
+            MlxTensor::from_array(Array::from_slice(&[3.0_f32, 4.0], &[1, 2])),
+            1,
+            &group,
+            &stream,
+        )
+        .unwrap();
+        assert_eq!(gathered.completion.retained_arrays(), 2);
+        let gathered = gathered.wait().unwrap();
+        assert_eq!(gathered.as_array().shape(), &[1, 2]);
+
+        let uneven = <MlxNeuralBackend as UnevenGatherBackend>::all_gather_uneven(
+            MlxTensor::from_array(Array::from_slice(&[5.0_f32, 6.0], &[1, 2])),
+            &[2],
+            1,
+            &group,
+            &stream,
+        )
+        .unwrap();
+        assert_eq!(uneven.completion.retained_count_buffers(), 1);
+        let uneven = uneven.wait().unwrap();
+        assert_eq!(uneven.as_array().shape(), &[1, 2]);
+
+        let counts = CommunicationPeerCounts::new(vec![2], vec![2], 1).unwrap();
+        let exchanged = <MlxNeuralBackend as VariableAllToAllBackend>::variable_all_to_all(
+            MlxTensor::from_array(Array::from_slice(&[7.0_f32, 8.0, 9.0, 10.0], &[2, 2])),
+            &counts,
+            1,
+            &group,
+            &stream,
+        )
+        .unwrap();
+        assert_eq!(exchanged.completion.retained_arrays(), 2);
+        assert_eq!(exchanged.completion.retained_count_buffers(), 2);
+        assert_eq!(
+            exchanged
+                .wait()
+                .unwrap()
+                .as_array()
+                .evaluated()
+                .unwrap()
+                .as_slice::<f32>(),
+            &[7.0, 8.0, 9.0, 10.0]
+        );
+
+        let broadcast = <MlxNeuralBackend as BroadcastBackend>::broadcast(
+            MlxTensor::from_array(Array::from_slice(&[11.0_f32, 12.0], &[2])),
+            0,
+            &group,
+            &stream,
+        )
+        .unwrap();
+        assert_eq!(broadcast.completion.retained_arrays(), 3);
+        assert_eq!(broadcast.completion.retained_groups(), 1);
+        assert_eq!(broadcast.completion.retained_streams(), 1);
+        assert_eq!(
+            broadcast
+                .wait()
+                .unwrap()
+                .as_array()
+                .evaluated()
+                .unwrap()
+                .as_slice::<f32>(),
+            &[11.0, 12.0]
+        );
+
+        let barrier = <MlxNeuralBackend as BarrierBackend>::barrier(&group, &stream).unwrap();
+        assert_eq!(barrier.retained_arrays(), 2);
+        assert_eq!(barrier.retained_groups(), 1);
+        assert_eq!(barrier.retained_streams(), 1);
+        barrier.wait().unwrap();
+    }
+
+    #[test]
+    fn fine_grained_collectives_admit_i32_only_for_count_gather_and_variable_exchange() {
+        let (group, stream) = singleton_communication();
+
+        let gathered = <MlxNeuralBackend as EvenGatherBackend>::all_gather_even(
+            MlxTensor::from_array(Array::from_slice(&[2_i32, 0, 3], &[3])),
+            0,
+            &group,
+            &stream,
+        )
+        .unwrap();
+        assert_eq!(gathered.completion.retained_arrays(), 2);
+        assert_eq!(
+            gathered
+                .wait()
+                .unwrap()
+                .as_array()
+                .evaluated()
+                .unwrap()
+                .as_slice::<i32>(),
+            &[2, 0, 3]
+        );
+
+        let reduction_error = <MlxNeuralBackend as SumReductionBackend>::all_reduce_sum(
+            MlxTensor::from_array(Array::from_slice(&[1_i32], &[1])),
+            &group,
+            &stream,
+        )
+        .expect_err("integer reduction is not advertised");
+        assert!(reduction_error.what().contains("does not advertise dtype"));
+
+        let uneven_error = <MlxNeuralBackend as UnevenGatherBackend>::all_gather_uneven(
+            MlxTensor::from_array(Array::from_slice(&[1_i32], &[1])),
+            &[1],
+            0,
+            &group,
+            &stream,
+        )
+        .expect_err("integer uneven gather is not advertised");
+        assert!(uneven_error.what().contains("does not advertise dtype"));
+
+        let counts = CommunicationPeerCounts::new(vec![1], vec![1], 1).unwrap();
+        let exchanged = <MlxNeuralBackend as VariableAllToAllBackend>::variable_all_to_all(
+            MlxTensor::from_array(Array::from_slice(&[1_i32], &[1])),
+            &counts,
+            0,
+            &group,
+            &stream,
+        )
+        .unwrap();
+        assert_eq!(exchanged.completion.retained_arrays(), 2);
+        assert_eq!(exchanged.completion.retained_count_buffers(), 2);
+        assert_eq!(exchanged.completion.retained_groups(), 1);
+        assert_eq!(exchanged.completion.retained_streams(), 1);
+        assert_eq!(
+            exchanged
+                .wait()
+                .unwrap()
+                .as_array()
+                .evaluated()
+                .unwrap()
+                .as_slice::<i32>(),
+            &[1]
+        );
+
+        let unsigned_error = <MlxNeuralBackend as EvenGatherBackend>::all_gather_even(
+            MlxTensor::from_array(Array::from_slice(&[1_u32], &[1])),
+            0,
+            &group,
+            &stream,
+        )
+        .expect_err("unsigned count gather is outside the exact admitted set");
+        assert!(unsigned_error.what().contains("does not advertise dtype"));
+
+        let unsigned_exchange = <MlxNeuralBackend as VariableAllToAllBackend>::variable_all_to_all(
+            MlxTensor::from_array(Array::from_slice(&[1_u32], &[1])),
+            &counts,
+            0,
+            &group,
+            &stream,
+        )
+        .expect_err("unsigned variable exchange is outside the exact admitted set");
+        assert!(unsigned_exchange
+            .what()
+            .contains("does not advertise dtype"));
+    }
 
     #[test]
     fn mlx_declares_every_supported_architecture_operator_set() {

@@ -594,6 +594,12 @@ impl<'a> EvaluatedArray<'a> {
             if data.is_null() || size == 0 {
                 return Err(AsSliceError::Null);
             }
+            if !data.is_aligned() {
+                return Err(AsSliceError::Misaligned);
+            }
+            if size > isize::MAX as usize / std::mem::size_of::<T>() {
+                return Err(AsSliceError::TooLarge);
+            }
 
             Ok(std::slice::from_raw_parts(data, size))
         }
@@ -619,6 +625,42 @@ impl<'a> EvaluatedArray<'a> {
     /// ```
     pub fn as_slice<T: ArrayElement>(&self) -> &[T] {
         self.try_as_slice().unwrap()
+    }
+
+    /// Copies evaluated array data into an owned vector.
+    ///
+    /// Unlike [`Self::try_as_slice`], this accepts MLX views whose data pointer
+    /// is not aligned for a Rust slice. Each element is copied with an
+    /// unaligned read instead of constructing a reference to that storage.
+    pub fn try_to_vec<T: ArrayElement + Copy>(&self) -> Result<Vec<T>, AsSliceError> {
+        let array = self.as_array();
+        if array.dtype() != T::DTYPE {
+            return Err(AsSliceError::DtypeMismatch {
+                expecting: T::DTYPE,
+                found: array.dtype(),
+            });
+        }
+
+        let size = array.size();
+        if size == 0 {
+            return Ok(Vec::new());
+        }
+        if size > isize::MAX as usize / std::mem::size_of::<T>() {
+            return Err(AsSliceError::TooLarge);
+        }
+        let data = T::array_data(array);
+        if data.is_null() {
+            return Err(AsSliceError::Null);
+        }
+
+        let mut values = Vec::with_capacity(size);
+        for index in 0..size {
+            // SAFETY: MLX reports `size` initialized elements at `data` after
+            // evaluation. `read_unaligned` does not create a reference to the
+            // possibly unaligned foreign storage.
+            values.push(unsafe { std::ptr::read_unaligned(data.add(index)) });
+        }
+        Ok(values)
     }
 
     /// Clone the array by copying the data.
@@ -1353,6 +1395,16 @@ mod tests {
         assert_eq!(array.shape(), &[5]);
         assert_eq!(array.dtype(), Dtype::Int32);
         assert_eq!(array.evaluated().unwrap().as_slice::<i32>(), &data[..]);
+    }
+
+    #[test]
+    fn evaluated_array_copies_to_owned_vector() {
+        let data = [1.25f32, -2.5, 3.75];
+        let array = Array::from_slice(&data, &[3]);
+        assert_eq!(
+            array.evaluated().unwrap().try_to_vec::<f32>(),
+            Ok(data.to_vec())
+        );
     }
 
     #[test]

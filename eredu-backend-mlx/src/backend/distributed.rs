@@ -5,7 +5,6 @@ use eredu_core::{
     BackendError, CollectiveGroupId, CollectiveScope, DistributedBackend, DistributedCapabilities,
     DistributedSession, DistributedSessionDescriptor, Submission, ValueDescriptor,
 };
-use eredu_runtime::Sampler;
 use safemlx::{
     distributed::Group as NativeGroup,
     error::Exception,
@@ -15,24 +14,16 @@ use safemlx::{
 
 use crate::{
     backend::error::Error,
-    backend::runtime::{
-        distributed::{
-            self,
-            completion::DistributedCompletion,
-            parallel::{sample_and_synchronize, ParallelExecutionContext, SynchronizedToken},
-            topology::{CollectiveRealization, ParallelCommunicators},
-            Group,
-        },
-        generation::MlxSamplingBackend,
+    backend::runtime::distributed::{
+        self,
+        completion::{DistributedCompletion, MlxCommunicationCompletion},
+        topology::ParallelCommunicators,
+        Group,
     },
 };
 
 use super::MlxBackend;
 use crate::MlxTensor;
-
-pub(crate) const SHARD_GROUP_ID: CollectiveGroupId = CollectiveGroupId::new(1);
-pub(crate) const STAGE_GROUP_ID: CollectiveGroupId = CollectiveGroupId::new(2);
-pub(crate) const ADDRESSABLE_GROUP_ID: CollectiveGroupId = CollectiveGroupId::new(3);
 
 /// Gathers equal-shaped shards along an arbitrary existing tensor axis.
 pub fn all_gather_axis(
@@ -41,6 +32,26 @@ pub fn all_gather_axis(
     group: &Group,
     stream: impl AsRef<Stream>,
 ) -> Result<Array, Exception> {
+    all_gather_axis_for(
+        eredu_runtime::CommunicationOperation::AllGatherEven,
+        input,
+        axis,
+        group,
+        stream,
+    )
+}
+
+fn all_gather_axis_for(
+    operation: eredu_runtime::CommunicationOperation,
+    input: &Array,
+    axis: i32,
+    group: &Group,
+    stream: impl AsRef<Stream>,
+) -> Result<Array, Exception> {
+    let _setup = group.begin_bounded_setup()?;
+    if let Some(setup) = &_setup {
+        setup.check()?;
+    }
     let stream = stream.as_ref();
     let ndim = input.ndim();
     if ndim == 0 {
@@ -57,9 +68,49 @@ pub fn all_gather_axis(
         )));
     }
     if axis == 0 {
-        return distributed::all_gather(input, group, stream);
+        return distributed::all_gather_for(operation, input, group, stream);
     }
-    let gathered = distributed::all_gather(input, group, stream)?;
+    let gathered = distributed::all_gather_for(operation, input, group, stream)?;
+    let rank_height = input.shape()[0];
+    let mut shards = Vec::with_capacity(group.size());
+    for rank in 0..group.size() {
+        let start = i32::try_from(rank)
+            .ok()
+            .and_then(|rank| rank.checked_mul(rank_height))
+            .ok_or_else(|| Exception::custom("gathered rank offset exceeds i32"))?;
+        let end = start
+            .checked_add(rank_height)
+            .ok_or_else(|| Exception::custom("gathered rank end exceeds i32"))?;
+        shards.push(gathered.try_index_device(start..end, stream)?);
+    }
+    let shard_refs = shards.iter().collect::<Vec<_>>();
+    let output = concatenate_axis(&shard_refs, axis, stream)?;
+    let mut expected = input.shape().to_vec();
+    expected[axis as usize] = expected[axis as usize]
+        .checked_mul(
+            i32::try_from(group.size())
+                .map_err(|_| Exception::custom("group size does not fit in i32"))?,
+        )
+        .ok_or_else(|| Exception::custom("axis all-gather output shape exceeds i32"))?;
+    if output.shape() != expected {
+        return Err(Exception::custom(format!(
+            "axis all-gather completed with shape {:?}, expected {expected:?}",
+            output.shape()
+        )));
+    }
+    Ok(output)
+}
+
+fn all_gather_axis_unchecked(
+    input: &Array,
+    axis: i32,
+    group: &Group,
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    if axis == 0 {
+        return distributed::all_gather_unchecked(input, group, stream);
+    }
+    let gathered = distributed::all_gather_unchecked(input, group, stream)?;
     let rank_height = input.shape()[0];
     let mut shards = Vec::with_capacity(group.size());
     for rank in 0..group.size() {
@@ -84,6 +135,10 @@ pub fn all_gather_uneven_axis(
     group: &Group,
     stream: impl AsRef<Stream>,
 ) -> Result<Array, Exception> {
+    let _setup = group.begin_bounded_setup()?;
+    if let Some(setup) = &_setup {
+        setup.check()?;
+    }
     let stream = stream.as_ref();
     if widths.len() != group.size() {
         return Err(Exception::custom(format!(
@@ -121,6 +176,29 @@ pub fn all_gather_uneven_axis(
             "uneven all-gather requires at least one non-empty shard",
         ));
     }
+    let operation = eredu_runtime::CommunicationOperation::AllGatherUneven;
+    group.validate_tensor(operation, input, false)?;
+    let output_width = widths.iter().try_fold(0usize, |total, width| {
+        total
+            .checked_add(*width)
+            .ok_or_else(|| Exception::custom("uneven all-gather output width overflowed usize"))
+    })?;
+    let non_axis_elements = input
+        .shape()
+        .iter()
+        .enumerate()
+        .filter(|(dimension, _)| *dimension != axis as usize)
+        .try_fold(1usize, |total, (_, dimension)| {
+            let dimension = usize::try_from(*dimension)
+                .map_err(|_| Exception::custom("input shape contains a negative dimension"))?;
+            total.checked_mul(dimension).ok_or_else(|| {
+                Exception::custom("uneven all-gather output elements overflowed usize")
+            })
+        })?;
+    let output_elements = non_axis_elements
+        .checked_mul(output_width)
+        .ok_or_else(|| Exception::custom("uneven all-gather output elements overflowed usize"))?;
+    group.validate_expected_output(operation, input.dtype(), input.ndim(), output_elements)?;
     let padded = if local_width == max_width {
         input.clone()
     } else {
@@ -130,7 +208,7 @@ pub fn all_gather_uneven_axis(
         let padding = zeros_dtype(&padding_shape, input.dtype(), stream)?;
         concatenate_axis(&[input, &padding], axis, stream)?
     };
-    let gathered = all_gather_axis(&padded, axis, group, stream)?;
+    let gathered = all_gather_axis_unchecked(&padded, axis, group, stream)?;
     let group_size = i32::try_from(group.size())
         .map_err(|_| Exception::custom("distributed group size does not fit in i32"))?;
     let padded_shards = gathered.split(group_size, Some(axis), stream)?;
@@ -151,19 +229,70 @@ pub fn all_gather_uneven_axis(
         }
     }
     let shard_refs = shards.iter().collect::<Vec<_>>();
-    concatenate_axis(&shard_refs, axis, stream)
-}
-
-/// Inputs needed to attach MLX communication to one selected backend session.
-pub(crate) struct MlxDistributedConfig<'a> {
-    realization: CollectiveRealization,
-    world: &'a NativeGroup,
-}
-
-impl<'a> MlxDistributedConfig<'a> {
-    pub(crate) const fn new(realization: CollectiveRealization, world: &'a NativeGroup) -> Self {
-        Self { realization, world }
+    let output = concatenate_axis(&shard_refs, axis, stream)?;
+    group.validate_tensor(operation, &output, true)?;
+    let mut expected = input.shape().to_vec();
+    expected[axis as usize] = i32::try_from(output_width)
+        .map_err(|_| Exception::custom("uneven all-gather output width exceeds i32"))?;
+    if output.shape() != expected {
+        return Err(Exception::custom(format!(
+            "uneven all-gather completed with shape {:?}, expected {expected:?}",
+            output.shape()
+        )));
     }
+    Ok(output)
+}
+
+/// Exchanges variable-sized blocks along an arbitrary existing tensor axis.
+pub fn all_to_all_v_axis(
+    input: &Array,
+    axis: usize,
+    send_counts: &[usize],
+    receive_counts: &[usize],
+    group: &Group,
+    stream: impl AsRef<Stream>,
+) -> Result<Array, Exception> {
+    let _setup = group.begin_bounded_setup()?;
+    if let Some(setup) = &_setup {
+        setup.check()?;
+    }
+    let stream = stream.as_ref();
+    if input.ndim() == 0 {
+        return Err(Exception::custom(
+            "variable all-to-all requires a non-scalar input",
+        ));
+    }
+    if axis >= input.ndim() {
+        return Err(Exception::custom(format!(
+            "variable all-to-all axis {axis} is outside input rank {}",
+            input.ndim()
+        )));
+    }
+    if axis == 0 {
+        return distributed::all_to_all_v(input, send_counts, receive_counts, group, stream);
+    }
+
+    let ndim = input.ndim();
+    let axis = i32::try_from(axis)
+        .map_err(|_| Exception::custom("variable all-to-all axis exceeds i32"))?;
+    let mut to_front = Vec::with_capacity(ndim);
+    to_front.push(axis);
+    for current in 0..ndim {
+        let current = i32::try_from(current)
+            .map_err(|_| Exception::custom("variable all-to-all rank exceeds i32"))?;
+        if current != axis {
+            to_front.push(current);
+        }
+    }
+    let transposed = input.transpose_axes(&to_front, stream)?;
+    let exchanged =
+        distributed::all_to_all_v(&transposed, send_counts, receive_counts, group, stream)?;
+    let mut restore = vec![0i32; ndim];
+    for (position, original_axis) in to_front.into_iter().enumerate() {
+        restore[original_axis as usize] = i32::try_from(position)
+            .map_err(|_| Exception::custom("variable all-to-all rank exceeds i32"))?;
+    }
+    exchanged.transpose_axes(&restore, stream)
 }
 
 /// MLX communication capability attached to one complete model/session.
@@ -173,90 +302,87 @@ impl<'a> MlxDistributedConfig<'a> {
 /// construct or route around those groups independently of the selected
 /// backend session.
 #[derive(Debug)]
-pub struct MlxDistributedSession<'a> {
-    communicators: ParallelCommunicators<'a>,
+pub struct MlxDistributedSession {
+    communicators: ParallelCommunicators,
     stream: Stream,
 }
 
-impl<'a> MlxDistributedSession<'a> {
-    /// Creates a distributed session and validates its execution stream.
-    pub(crate) fn new(config: MlxDistributedConfig<'a>, stream: &Stream) -> Result<Self, Error> {
-        let communicators = ParallelCommunicators::new(config.realization, config.world)?;
+impl MlxDistributedSession {
+    /// Creates a session from one already selected architecture-owned manifest.
+    pub(crate) fn from_manifest(
+        manifest: &eredu_runtime::CommunicationManifest,
+        world: &NativeGroup,
+        stream: &Stream,
+    ) -> Result<Self, Error> {
+        let communicators = ParallelCommunicators::from_manifest(manifest, world, stream)?;
         Ok(Self {
             communicators,
             stream: stream.clone(),
         })
     }
 
-    /// Returns the execution stream selected for this session.
-    pub(crate) const fn stream(&self) -> &Stream {
-        &self.stream
-    }
-
-    /// Returns the world communicator for the session.
-    pub(crate) const fn world(&self) -> &Group {
-        self.communicators.world()
-    }
-
-    /// Creates the tensor-parallel execution context, or a replicated context.
-    pub(crate) fn partitioned_context(
-        &self,
-        id: CollectiveGroupId,
-    ) -> Result<ParallelExecutionContext<'_>, Error> {
-        match self.communicators.group(id) {
-            Some(group) => ParallelExecutionContext::partitioned(group, &self.stream),
-            None => Ok(ParallelExecutionContext::replicated(&self.stream)),
-        }
-    }
-
     /// Returns the communicator for an active opaque group identity.
+    #[cfg(test)]
     pub(crate) fn selected_group(&self, id: CollectiveGroupId) -> Option<&Group> {
         self.communicators.group(id)
     }
 
-    #[cfg(test)]
-    fn world_control_consensus(&self, local: [i32; 2]) -> Result<[i32; 2], Error> {
-        let world = self.world();
-        if world.size() == 1 {
-            return Ok(local);
-        }
-        let rank = world.rank();
-        let last = world.size() - 1;
-        let mut result = local;
-        if rank < last {
-            let received = distributed::recv(&[2], Dtype::Int32, rank + 1, world, &self.stream)?;
-            let evaluated = received.evaluated()?;
-            let values = evaluated
-                .try_as_slice::<i32>()
-                .map_err(|error| Error::Parallel(error.to_string()))?;
-            result[0] |= i32::from(values[0] != 0);
-            result[1] |= i32::from(values[1] != 0);
-        }
-        if rank > 0 {
-            let result_array = Array::from_slice(&result, &[2]);
-            distributed::send(&result_array, rank - 1, world, &self.stream)?.evaluated()?;
-        }
-
-        // Broadcast around the same descending ring direction. Rank zero and
-        // the final rank are direct neighbors, so this never requires the
-        // unsupported non-neighbor Ring sends used by a star gather.
-        if rank == 0 {
-            let result_array = Array::from_slice(&result, &[2]);
-            distributed::send(&result_array, last, world, &self.stream)?.evaluated()?;
-        } else {
-            let successor = if rank == last { 0 } else { rank + 1 };
-            let received = distributed::recv(&[2], Dtype::Int32, successor, world, &self.stream)?;
-            let evaluated = received.evaluated()?;
-            let values = evaluated
-                .try_as_slice::<i32>()
-                .map_err(|error| Error::Parallel(error.to_string()))?;
-            result = [values[0], values[1]];
-            if rank > 1 {
-                let result_array = Array::from_slice(&result, &[2]);
-                distributed::send(&result_array, rank - 1, world, &self.stream)?.evaluated()?;
-            }
-        }
-        Ok(result)
+    /// Consumes architecture-selected communication into the neutral partition runtime.
+    pub(crate) fn into_partition_communication(
+        self,
+        manifest: eredu_runtime::CommunicationManifest,
+        tensor_group: Option<CollectiveGroupId>,
+        sampling_group: CollectiveGroupId,
+    ) -> Result<
+        (
+            eredu_runtime::PartitionCommunication<
+                crate::backend::nn::shared::MlxNeuralBackend,
+                Group,
+                crate::backend::runtime::distributed::topology::CommunicationRouteRealization,
+                crate::backend::nn::shared::MlxCommunicationTensorMetadata,
+            >,
+            Option<Group>,
+            Group,
+            Stream,
+        ),
+        Error,
+    > {
+        let parallel = tensor_group
+            .map(|tensor_group| {
+                self.communicators
+                    .communication_group(tensor_group)
+                    .cloned()
+                    .ok_or_else(|| {
+                        Error::Parallel(format!(
+                            "selected tensor group {} was not realized",
+                            tensor_group.value()
+                        ))
+                    })
+            })
+            .transpose()?;
+        let sampling = self
+            .communicators
+            .communication_group(sampling_group)
+            .cloned()
+            .ok_or_else(|| {
+                Error::Parallel(format!(
+                    "selected sampling group {} was not realized",
+                    sampling_group.value()
+                ))
+            })?;
+        let Self {
+            communicators,
+            stream,
+        } = self;
+        let (groups, routes) = communicators.into_partition_resources(&manifest)?;
+        let communication = eredu_runtime::PartitionCommunication::new(
+            manifest,
+            groups,
+            routes,
+            crate::backend::nn::shared::MlxCommunicationTensorMetadata,
+        )
+        .map_err(|error| Error::Parallel(error.to_string()))?;
+        Ok((communication, parallel, sampling, stream))
     }
 
     #[cfg(test)]
@@ -289,7 +415,11 @@ impl<'a> MlxDistributedSession<'a> {
     /// Submits hidden activations to the succeeding pipeline coordinate.
     fn group(&self, scope: CollectiveScope) -> Result<&Group, Error> {
         match scope {
-            CollectiveScope::World => Ok(self.world()),
+            CollectiveScope::World => Err(Error::Backend(BackendError::Unsupported {
+                backend: "mlx".into(),
+                capability: "manifest-realized sessions have no uncontracted world data plane"
+                    .into(),
+            })),
             CollectiveScope::Group(id) => self.communicators.group(id).ok_or_else(|| {
                 Error::Backend(BackendError::Unsupported {
                     backend: "mlx".into(),
@@ -307,43 +437,6 @@ impl<'a> MlxDistributedSession<'a> {
     #[cfg(test)]
     pub(crate) fn scope_is_logical(&self, scope: CollectiveScope) -> Result<bool, Error> {
         Ok(self.group(scope)?.is_logical())
-    }
-
-    /// Samples on an explicitly selected world rank and synchronizes globally.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn sample_and_synchronize_on_rank<S: Sampler<MlxSamplingBackend>>(
-        &self,
-        logits: Option<&MlxTensor>,
-        batch_size: i32,
-        sampler: &mut S,
-        temperature: f32,
-        prng_state: Option<&mut crate::backend::random::RandomState>,
-        finished: bool,
-        sampling_rank: usize,
-    ) -> Result<SynchronizedToken, Error> {
-        sample_and_synchronize(
-            logits,
-            batch_size,
-            sampler,
-            temperature,
-            prng_state,
-            finished,
-            sampling_rank,
-            self.world(),
-            &self.stream,
-        )
-    }
-
-    /// Reaches global failure or cancellation consensus in a fixed order.
-    #[cfg(test)]
-    pub(crate) fn operation_consensus(
-        &self,
-        local_failed: bool,
-        local_cancelled: bool,
-    ) -> Result<(bool, bool), Error> {
-        let consensus =
-            self.world_control_consensus([i32::from(local_failed), i32::from(local_cancelled)])?;
-        Ok((consensus[0] != 0, consensus[1] != 0))
     }
 
     fn value_dtype(value: &ValueDescriptor) -> Result<Dtype, Error> {
@@ -385,16 +478,16 @@ impl<'a> MlxDistributedSession<'a> {
 }
 
 impl<'a> DistributedBackend for MlxBackend<'a> {
-    type DistributedSession = MlxDistributedSession<'a>;
+    type DistributedSession = MlxDistributedSession;
 
-    fn distributed_session<'session>(
-        session: &'session crate::composition::mlx::MlxModelSession<'a>,
-    ) -> Option<&'session Self::DistributedSession> {
+    fn distributed_session(
+        session: &crate::composition::mlx::MlxModelSession,
+    ) -> Option<&Self::DistributedSession> {
         session.distributed()
     }
 }
 
-impl DistributedSession for MlxDistributedSession<'_> {
+impl DistributedSession for MlxDistributedSession {
     type Value = MlxTensor;
     type Completion = DistributedCompletion<MlxTensor>;
     type Error = Error;
@@ -409,7 +502,7 @@ impl DistributedSession for MlxDistributedSession<'_> {
     }
 
     fn capabilities(&self) -> DistributedCapabilities {
-        DistributedCapabilities::new(true, self.communicators.group_ids(), true, true, true)
+        DistributedCapabilities::new(false, self.communicators.group_ids(), true, true, true)
     }
 
     fn all_reduce_sum(
@@ -500,20 +593,18 @@ impl DistributedSession for MlxDistributedSession<'_> {
     }
 
     fn all_gather_words(&self, local: &[u32]) -> Result<Vec<u32>, Error> {
-        let length = i32::try_from(local.len())
-            .map_err(|_| Error::Parallel("distributed metadata exceeds i32".into()))?;
-        let local = MlxTensor::from_array(Array::from_slice(local, &[length]));
-        let gathered = DistributedSession::all_gather(self, CollectiveScope::World, &local)?;
-        Ok(gathered
-            .wait()?
-            .as_array()
-            .evaluated()?
-            .as_slice::<u32>()
-            .to_vec())
+        let output =
+            <Self as eredu_core::consensus::BoundedConsensusTransport>::submit_all_gather_words(
+                self, local,
+            )?
+            .wait()?;
+        <Self as eredu_core::consensus::BoundedConsensusTransport>::resolve_all_gather_words(
+            self, output,
+        )
     }
 }
 
-impl eredu_core::consensus::ConsensusTransport for MlxDistributedSession<'_> {
+impl eredu_core::consensus::ConsensusTransport for MlxDistributedSession {
     type Error = Error;
 
     fn participant_count(&self) -> usize {
@@ -522,5 +613,116 @@ impl eredu_core::consensus::ConsensusTransport for MlxDistributedSession<'_> {
 
     fn all_gather_words(&self, local: &[u32]) -> Result<Vec<u32>, Self::Error> {
         DistributedSession::all_gather_words(self, local)
+    }
+}
+
+impl eredu_core::consensus::BoundedConsensusTransport for MlxDistributedSession {
+    type Completion = MlxCommunicationCompletion;
+    type GatherOutput = MlxTensor;
+
+    fn submit_all_gather_words(
+        &self,
+        local: &[u32],
+    ) -> Result<Submission<Self::GatherOutput, Self::Completion>, Self::Error> {
+        let length = i32::try_from(local.len())
+            .map_err(|_| Error::Parallel("distributed metadata exceeds i32".into()))?;
+        let local = Array::from_slice(local, &[length]);
+        let group = self.communicators.control_world().clone();
+        let gathered = distributed::all_gather(&local, &group, &self.stream)?;
+        let completion = MlxCommunicationCompletion::submit(
+            [&gathered],
+            vec![local, gathered.clone()],
+            Vec::new(),
+            vec![group],
+            Vec::new(),
+            vec![self.stream.clone()],
+        )?;
+        Ok(Submission {
+            output: MlxTensor::from_array(gathered),
+            completion,
+        })
+    }
+
+    fn resolve_all_gather_words(
+        &self,
+        output: Self::GatherOutput,
+    ) -> Result<Vec<u32>, Self::Error> {
+        Ok(output.as_array().evaluated()?.as_slice::<u32>().to_vec())
+    }
+}
+
+#[cfg(test)]
+mod bounded_consensus_tests {
+    use super::*;
+    use eredu_core::{
+        consensus::BoundedConsensusTransport as _, BoundedCompletionWait, BoundedSubmissionOutcome,
+        CompletionCancellationMode,
+    };
+    use safemlx::{Device, DeviceType};
+
+    #[test]
+    fn bounded_consensus_submission_retains_exact_native_work_until_resolution() {
+        let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+        let world = safemlx::distributed::init(false, safemlx::distributed::Backend::Ring)
+            .expect("singleton Ring world should initialize");
+        let manifest = eredu_runtime::CommunicationManifest::new(1, 0, Vec::new(), Vec::new())
+            .unwrap()
+            .with_completion_policy(
+                eredu_runtime::CommunicationCompletionPolicy::new(
+                    std::time::Duration::from_secs(1),
+                    CompletionCancellationMode::QuarantineUntilComplete,
+                )
+                .unwrap(),
+            );
+        let session = MlxDistributedSession::from_manifest(&manifest, &world, &stream).unwrap();
+        let submission = session
+            .submit_all_gather_words(&[0, 1, u32::MAX, 0x8000_0000])
+            .unwrap();
+        assert_eq!(submission.completion.retained_arrays(), 2);
+        assert_eq!(submission.completion.retained_groups(), 1);
+        assert_eq!(submission.completion.retained_streams(), 1);
+        let wait = BoundedCompletionWait::new(
+            std::time::Duration::from_secs(1),
+            CompletionCancellationMode::QuarantineUntilComplete,
+        )
+        .unwrap();
+        let output = match submission.wait_bounded(wait).unwrap() {
+            BoundedSubmissionOutcome::Completed(output) => output,
+            BoundedSubmissionOutcome::DeadlineExceeded { cancellation } => {
+                panic!("singleton consensus timed out with {cancellation:?}")
+            }
+        };
+        assert_eq!(
+            session.resolve_all_gather_words(output).unwrap(),
+            [0, 1, u32::MAX, 0x8000_0000]
+        );
+
+        let completion = eredu_runtime::CommunicationCompletionPolicy::new(
+            std::time::Duration::from_secs(1),
+            CompletionCancellationMode::QuarantineUntilComplete,
+        )
+        .unwrap();
+        let manifest = eredu_runtime::CommunicationManifest::new(1, 0, Vec::new(), Vec::new())
+            .unwrap()
+            .with_completion_policy(completion);
+        let manifest_session = MlxDistributedSession::from_manifest(&manifest, &world, &stream)
+            .expect("manifest session should retain a control-only world handle");
+        assert!(!DistributedSession::capabilities(&manifest_session).world_collectives());
+        assert!(manifest_session.group(CollectiveScope::World).is_err());
+        let output = manifest_session
+            .submit_all_gather_words(&[17, u32::MAX])
+            .unwrap()
+            .wait_bounded(wait)
+            .unwrap();
+        let output = match output {
+            BoundedSubmissionOutcome::Completed(output) => output,
+            BoundedSubmissionOutcome::DeadlineExceeded { cancellation } => {
+                panic!("manifest consensus timed out with {cancellation:?}")
+            }
+        };
+        assert_eq!(
+            manifest_session.resolve_all_gather_words(output).unwrap(),
+            [17, u32::MAX]
+        );
     }
 }

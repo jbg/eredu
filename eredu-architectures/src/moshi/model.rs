@@ -8,11 +8,10 @@ use eredu_nn::{
     VocabularyParallelRange,
 };
 use eredu_runtime::{
-    ArchitectureParameterDescription, ExecutionGraph, ExecutionUnitLayout, LayerRuntimeState,
-    LayeredArchitecture, LayeredForwardState, LayeredTraversalPoint, OwnedParameterGroupSpec,
-    ParallelLayeredArchitecture, ParameterGroupOwner, ResettableRuntimeState, SamplingBackend,
-    SequentialDecisionBoundary, SequentialDecisionError, StateLayout, StateSegmentId,
-    StateSegmentLifetime, StateSegmentSpec, TokenDomain,
+    ArchitectureParameterDescription, ExecutionGraph, LayerRuntimeState, LayeredArchitecture,
+    LayeredForwardState, LayeredTraversalPoint, ParallelLayeredArchitecture,
+    ResettableRuntimeState, SamplingBackend, SequentialDecisionBoundary, SequentialDecisionError,
+    StateLayout, StateSegmentId, StateSegmentLifetime, StateSegmentSpec, TokenDomain,
 };
 
 use super::{block, depth::DepthSlice, MoshiConfig};
@@ -369,54 +368,9 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> eredu_runtime::Archi
 
     fn parameter_description(
         &self,
-        context: &<B::Tensor as Tensor>::Context,
+        _context: &<B::Tensor as Tensor>::Context,
     ) -> Result<ArchitectureParameterDescription, Self::DefinitionError> {
-        let graph = ExecutionGraph::chain(["temporal_transformer", "depth_codebook_slices"])
-            .map_err(Error::backend)?;
-        let counts = [
-            usize::try_from(self.config.temporal().num_hidden_layers()).map_err(Error::backend)?,
-            self.config.frame_schedule().depth_audio_codebooks(),
-        ];
-        let layout = ExecutionUnitLayout::new(&graph, counts).map_err(Error::backend)?;
-        let static_groups = super::parallel::static_parameter_groups(&self.static_modules)
-            .map_err(Error::backend)?;
-        let embedding_count = self.static_modules.embeddings.tables.len();
-        let mut expected = static_groups.clone();
-        let mut owned = static_groups
-            .into_iter()
-            .enumerate()
-            .map(|(index, group)| {
-                let role = if index < embedding_count {
-                    "embedding"
-                } else if index == embedding_count {
-                    "norm"
-                } else {
-                    "output"
-                };
-                OwnedParameterGroupSpec::new(ParameterGroupOwner::static_role(role), group)
-            })
-            .collect::<Vec<_>>();
-        for (group, count) in counts.into_iter().enumerate() {
-            let owner_group = layout
-                .group_id(group)
-                .expect("Moshi layout contains both execution groups")
-                .clone();
-            for index in 0..count {
-                let unit = self.build_unit_impl(group, index, context)?;
-                let groups =
-                    super::parallel::unit_parameter_groups(&unit, &self.config, group, index)
-                        .map_err(Error::backend)?;
-                expected.extend(groups.iter().cloned());
-                owned.extend(groups.into_iter().map(|group| {
-                    OwnedParameterGroupSpec::new(
-                        ParameterGroupOwner::execution_unit(owner_group.clone(), index),
-                        group,
-                    )
-                }));
-            }
-        }
-        ArchitectureParameterDescription::new(&graph, &layout, expected, owned)
-            .map_err(Error::backend)
+        super::parallel::parameter_description(&self.config).map_err(Error::backend)
     }
 
     fn static_parameter_recipes(

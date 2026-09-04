@@ -169,6 +169,16 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Block<B> {
         geometry: LayerGeometry,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
+        Self::new_with_geometry_and_routed_spec(args, layer, geometry, None, context)
+    }
+
+    pub(crate) fn new_with_geometry_and_routed_spec(
+        args: &ModelArgs,
+        layer: usize,
+        geometry: LayerGeometry,
+        routed_spec: Option<eredu_nn::GroupedRelu2Spec>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
         let policy = args
             .layer_schedule
             .get(layer)
@@ -194,7 +204,18 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Block<B> {
                 )?)
             }
             (LayerPolicy::SparseMoe, LayerGeometry::SparseMoe { routed, shared }) => {
-                Operator::Sparse(SparseMoe::new(args, layer, routed, shared, context)?)
+                let sparse = match routed_spec {
+                    Some(spec) => SparseMoe::new_at_with_spec(
+                        args,
+                        layer,
+                        &format!("model.layers.{layer}.moe"),
+                        spec,
+                        shared,
+                        context,
+                    ),
+                    None => SparseMoe::new(args, layer, routed, shared, context),
+                }?;
+                Operator::Sparse(sparse)
             }
             _ => {
                 return Err(Error::backend(format!(

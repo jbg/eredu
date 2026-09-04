@@ -20,6 +20,8 @@ pub mod capability;
 pub mod checkpoint_conversion;
 /// Shared typed prepared-input ingress for replicated composite graphs.
 pub mod composite_execution;
+/// Architecture-owned typed preparation for dense partitioned composite models.
+pub mod composite_partitioned;
 /// Authoritative model-family identity and Hugging Face/GGUF configuration parsing.
 pub mod configuration;
 pub use configuration::{GgufArchitecture, ModelKind};
@@ -41,6 +43,10 @@ mod linear_format;
 pub mod media_plan;
 /// Optional backend operators required by each architecture family.
 pub mod operator_requirements;
+/// Architecture-owned admission and typed handoff for partitioned execution.
+pub mod partitioned_execution;
+/// Architecture-owned construction and local geometry for embedded prediction extensions.
+pub mod prediction_extension;
 /// Architecture-derived capabilities used before backend materialization.
 pub mod preparation;
 /// Architecture-owned execution of retained media processor plans.
@@ -57,21 +63,24 @@ pub mod routed_text;
 mod static_parameters;
 mod transport;
 pub use expert_residency::{
-    execute_routed_gated_product, ExpertParameterRecipe, ExpertParameterRole,
-    ExpertRealizationPlan, ExpertRealizationPlanError, ExpertResidencyCatalog,
-    ExpertResidencyCatalogError, ExpertResidencyDistribution, ExpertResidencyUnit,
-    RoutedMechanismExecutionError,
+    agree_expert_route_counts, exchange_expert_rows, execute_expert_route_exchange,
+    execute_expert_route_exchange_tensor_parallel, execute_routed_gated_product,
+    ExpertParameterRecipe, ExpertParameterRole, ExpertRealizationPlan, ExpertRealizationPlanError,
+    ExpertResidencyCatalog, ExpertResidencyCatalogError, ExpertResidencyDistribution,
+    ExpertResidencyUnit, ExpertRouteCountPlan, ExpertRouteExchangeDirection,
+    ExpertRoutePackingPlan, PartitionExpertRouteExchange, RoutedMechanismExecutionError,
 };
 pub use routed_text::{
     routed_text_requirements, select_routed_text_realization, visit_gated_routed_text_architecture,
     visit_pooling_routed_text_architecture, visit_relu2_routed_text_architecture,
-    GatedProductOperation, GatedRoutedTextArchitectureVisitor, PlannedAddressableGatedProduct,
-    PlannedAddressableRelu2, PlannedResidentGatedProduct, PlannedResidentRelu2,
-    PreparedRelu2RoutedTextArchitecture, PreparedRoutedTextArchitecture, Relu2Operation,
-    Relu2RoutedTextArchitectureVisitor, RoutedGroupedOperation, RoutedGroupedOperationValidation,
-    RoutedGroupedPlan, RoutedTextDispatchError, RoutedTextExecutionError,
-    RoutedTextPreparationError, RoutedTextRequirements, RoutedTextRequirementsError,
-    RoutedTextSelectionError, RoutedTextSelectionRequest, SelectedRoutedTextRealization,
+    EmptyPartitionRoutedExpertProvider, GatedProductOperation, GatedRoutedTextArchitectureVisitor,
+    PlannedAddressableGatedProduct, PlannedAddressableRelu2, PlannedResidentGatedProduct,
+    PlannedResidentRelu2, PreparedRelu2RoutedTextArchitecture, PreparedRoutedTextArchitecture,
+    Relu2Operation, Relu2RoutedTextArchitectureVisitor, RoutedGroupedOperation,
+    RoutedGroupedOperationValidation, RoutedGroupedPlan, RoutedTextDispatchError,
+    RoutedTextExecutionError, RoutedTextPreparationError, RoutedTextRequirements,
+    RoutedTextRequirementsError, RoutedTextSelectionError, RoutedTextSelectionRequest,
+    SelectedRoutedTextRealization,
 };
 
 /// Shared decoder mechanics used by backend-neutral text architectures.

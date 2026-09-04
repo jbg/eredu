@@ -41,8 +41,9 @@ pub use model::{
 pub use parallel::{
     audio_layer_parameter_groups, audio_static_parameter_groups, layer_parameter_groups,
     local_block_args, local_geometry, modality_projection_parameter_groups,
-    static_parameter_groups, vision_layer_parameter_groups, vision_static_parameter_groups,
-    LocalGeometry,
+    partition_local_geometry, static_parameter_groups, vision_layer_parameter_groups,
+    vision_static_parameter_groups, LocalGeometry, PartitionLocalFoundation,
+    PartitionLocalGeometry,
 };
 pub use projector::{
     family_from_gguf_metadata, translate_mmproj_weight_name, validate_projector_identity,

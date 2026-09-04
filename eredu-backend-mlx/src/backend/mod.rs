@@ -18,7 +18,6 @@ pub mod residency;
 pub mod runtime;
 /// MLX process-local device binding for composition-owned rank topology.
 pub(crate) mod topology;
-pub(crate) use distributed::MlxDistributedConfig;
 pub(crate) use distributed::MlxDistributedSession;
 pub use execution::ExecutionContext;
 pub use topology::{DeviceAssignment, MlxRankContext};
@@ -35,7 +34,7 @@ use safemlx::{transforms::async_eval_with_event, Array, Device, DeviceType, Even
 use crate::composition::mlx::ModelProcessor;
 use crate::{
     backend::error::Error,
-    composition::mlx::{distributed::pipeline::PipelineModel, Executable, MlxModelSession},
+    composition::mlx::{Executable, MlxModelSession},
     MlxLoadRequest,
 };
 
@@ -188,7 +187,6 @@ pub struct MlxModel {
 
 pub(crate) enum MlxModelKind {
     Complete(Executable),
-    Pipeline(PipelineModel),
 }
 
 impl MlxModel {
@@ -206,30 +204,6 @@ impl MlxModel {
         }
     }
 
-    pub(crate) fn pipeline(
-        model: PipelineModel,
-        floating_state_dtype_bytes: NonZeroU8,
-        state_residency: eredu_runtime::CacheResidencyPolicy,
-    ) -> Self {
-        Self {
-            inner: MlxModelKind::Pipeline(model),
-            floating_state_dtype_bytes,
-            state_residency,
-            #[cfg(any(feature = "image", feature = "audio"))]
-            processor: None,
-        }
-    }
-
-    /// Wraps a directly constructed replicated model for backend integration tests.
-    #[cfg(test)]
-    pub fn complete_for_test(model: Executable, floating_state_dtype_bytes: NonZeroU8) -> Self {
-        Self::complete(
-            model,
-            floating_state_dtype_bytes,
-            eredu_runtime::CacheResidencyPolicy::Device,
-        )
-    }
-
     pub(crate) const fn floating_state_dtype_bytes(&self) -> NonZeroU8 {
         self.floating_state_dtype_bytes
     }
@@ -243,7 +217,6 @@ impl MlxModel {
     pub fn speculative_capability_for_test(&self) -> eredu_core::SpeculativeCapability {
         match &self.inner {
             MlxModelKind::Complete(model) => model.speculative_capability(),
-            MlxModelKind::Pipeline(model) => model.speculative_capability(),
         }
     }
 
@@ -263,14 +236,10 @@ impl MlxModel {
     }
 
     #[cfg(test)]
-    /// Extracts a complete executable, rejecting a pipeline model.
-    pub fn into_complete(self) -> Result<Executable, Error> {
+    /// Extracts the complete executable.
+    pub(crate) fn into_complete(self) -> Result<Executable, Error> {
         match self.inner {
             MlxModelKind::Complete(model) => Ok(model),
-            MlxModelKind::Pipeline(_) => Err(Error::Parallel(
-                "the tokenizer/generation facade requires a replicated model; execute distributed models through MlxModelSession"
-                    .into(),
-            )),
         }
     }
 
@@ -279,7 +248,6 @@ impl MlxModel {
     pub(crate) fn model_family(&self) -> eredu_architectures::ModelKind {
         match &self.inner {
             MlxModelKind::Complete(model) => model.model_family(),
-            MlxModelKind::Pipeline(model) => model.model_family(),
         }
     }
 
@@ -287,26 +255,13 @@ impl MlxModel {
     pub(crate) fn effective_model_type(&self) -> &str {
         match &self.inner {
             MlxModelKind::Complete(model) => model.effective_model_type(),
-            MlxModelKind::Pipeline(model) => model.effective_model_type(),
         }
-    }
-
-    /// Returns the rank-local topology for a distributed executable.
-    pub(crate) fn topology(
-        &self,
-    ) -> Option<crate::composition::mlx::distributed::topology::MlxParallelPlan> {
-        match &self.inner {
-            MlxModelKind::Complete(model) => model.parallel_info().map(|info| info.topology()),
-            MlxModelKind::Pipeline(model) => Some(model.stage_info().topology()),
-        }
-        .filter(|topology| !topology.is_replicated())
     }
 
     /// Returns bounded parameter-residency telemetry when available.
     pub fn residency_report(&self) -> Result<Option<eredu_runtime::ResidencyReport>, Error> {
         match &self.inner {
             MlxModelKind::Complete(model) => model.residency_report(),
-            MlxModelKind::Pipeline(model) => model.parameter_residency_report(),
         }
     }
 
@@ -316,7 +271,6 @@ impl MlxModel {
     ) -> Result<Option<eredu_runtime::DenseDiskStreamReport>, Error> {
         match &self.inner {
             MlxModelKind::Complete(model) => model.dense_stream_report(),
-            MlxModelKind::Pipeline(model) => model.dense_stream_report(),
         }
     }
 
@@ -324,7 +278,6 @@ impl MlxModel {
     pub fn materialization_report(&self) -> Option<&eredu_runtime::WeightMaterializationReport> {
         match &self.inner {
             MlxModelKind::Complete(model) => model.materialization_report(),
-            MlxModelKind::Pipeline(_) => None,
         }
     }
 
@@ -337,7 +290,6 @@ impl MlxModel {
     > {
         match &self.inner {
             MlxModelKind::Complete(model) => model.parameter_bank_report(),
-            MlxModelKind::Pipeline(model) => model.parameter_bank_report(),
         }
     }
 }
@@ -395,29 +347,56 @@ impl<'a> MlxBackend<'a> {
         &self.weights_stream
     }
 
+    fn realize_selected_communication(
+        &self,
+        manifest: Option<&eredu_runtime::CommunicationManifest>,
+        rank: Option<crate::backend::MlxRankContext>,
+    ) -> Result<Option<MlxDistributedSession>, Error> {
+        let Some(manifest) = manifest else {
+            return match rank {
+                None => Ok(None),
+                Some(_) => Err(Error::Parallel(
+                    "distributed MLX preparation has no architecture communication manifest".into(),
+                )),
+            };
+        };
+        let rank = rank.ok_or_else(|| {
+            Error::Parallel("communication manifest has no MLX rank/device context".into())
+        })?;
+        #[cfg(test)]
+        crate::composition::mlx::path_instrumentation::communication_realization_attempt();
+        let world = self.world.ok_or_else(|| {
+            Error::Parallel(
+                "distributed model preparation requires native::distributed_backend".into(),
+            )
+        })?;
+        rank.validate_execution_stream(&self.stream)?;
+        #[cfg(test)]
+        crate::composition::mlx::path_instrumentation::manifest_communication_realization_attempt();
+        MlxDistributedSession::from_manifest(manifest, world, &self.stream).map(Some)
+    }
+
+    fn materialize_after_communication(
+        &self,
+        capabilities: SessionCapabilities,
+        manifest: Option<&eredu_runtime::CommunicationManifest>,
+        rank: Option<crate::backend::MlxRankContext>,
+        materialize: impl FnOnce(Option<MlxDistributedSession>) -> Result<MlxModel, Error>,
+    ) -> Result<PreparedModel<MlxModel>, Error> {
+        let distributed = self.realize_selected_communication(manifest, rank)?;
+        materialize(distributed).map(|model| PreparedModel::new(model, capabilities))
+    }
+
     /// Waits for all work submitted to this backend's execution queue.
     pub fn synchronize(&self) -> Result<(), Error> {
         self.stream.synchronize().map_err(Into::into)
-    }
-
-    #[cfg(test)]
-    /// Creates test communication for a topology using the backend stream.
-    pub(crate) fn communication_for_topology(
-        &self,
-        topology: crate::composition::mlx::distributed::topology::MlxParallelPlan,
-        world: &'a safemlx::distributed::Group,
-    ) -> Result<MlxDistributedSession<'a>, Error> {
-        let realization =
-            crate::composition::mlx::distributed::topology::collective_realization(topology)?;
-        topology.validate_execution_stream(&self.stream)?;
-        MlxDistributedSession::new(MlxDistributedConfig::new(realization, world), &self.stream)
     }
 }
 
 impl<'a> BackendProvider for MlxBackend<'a> {
     type ModelConfig = crate::composition::mlx::loading::MlxModelConfig;
     type Model = MlxModel;
-    type Session = MlxModelSession<'a>;
+    type Session = MlxModelSession;
     type Error = Error;
 
     fn descriptor(&self) -> BackendDescriptor {
@@ -449,13 +428,17 @@ impl<'a> BackendProvider for MlxBackend<'a> {
                 "selected session facilities differ from the admitted preparation plan".into(),
             ));
         }
-        crate::composition::mlx::loading::materialize_model_plan(
-            config.plan,
-            config.selected,
-            &self.stream,
-            &self.weights_stream,
-        )
-        .map(|model| PreparedModel::new(model, capabilities))
+        let rank = config.selected.rank_context();
+        let manifest = config.selected.realized_communication_manifest().cloned();
+        self.materialize_after_communication(capabilities, manifest.as_ref(), rank, |distributed| {
+            crate::composition::mlx::loading::materialize_model_plan(
+                config.plan,
+                config.selected,
+                distributed,
+                &self.stream,
+                &self.weights_stream,
+            )
+        })
     }
 
     fn create_session(
@@ -463,27 +446,7 @@ impl<'a> BackendProvider for MlxBackend<'a> {
         model: PreparedModel<Self::Model>,
     ) -> Result<Self::Session, Self::Error> {
         let admitted = model.capabilities();
-        let distributed = match model.topology() {
-            Some(topology) => {
-                let world = self.world.ok_or_else(|| {
-                    Error::Parallel(
-                        "distributed model session creation requires native::distributed_backend"
-                            .into(),
-                    )
-                })?;
-                let realization =
-                    crate::composition::mlx::distributed::topology::collective_realization(
-                        topology,
-                    )?;
-                topology.validate_execution_stream(&self.stream)?;
-                Some(MlxDistributedSession::new(
-                    MlxDistributedConfig::new(realization, world),
-                    &self.stream,
-                )?)
-            }
-            None => None,
-        };
-        MlxModelSession::from_model(model.into_inner(), distributed, admitted)
+        MlxModelSession::from_model(model.into_inner(), admitted)
     }
 
     fn session_capability_mismatch(
@@ -503,8 +466,9 @@ impl<'a> BackendProvider for MlxBackend<'a> {
     reason = "backend-selection tests stay adjacent to the selection implementation"
 )]
 mod tests {
-    use super::{device_capabilities, MlxBackend, MlxDeviceIdentity};
+    use super::{device_capabilities, MlxBackend, MlxDeviceIdentity, MlxModel};
     use crate::backend::ExecutionContext;
+    use crate::composition::mlx::path_instrumentation;
     use eredu_core::BackendProvider as _;
     use safemlx::{Device, DeviceType};
 
@@ -534,6 +498,138 @@ mod tests {
         assert!(error
             .to_string()
             .contains("does not match backend stream device"));
+    }
+
+    #[test]
+    fn missing_world_rejects_before_payload_or_architecture_construction() {
+        path_instrumentation::reset();
+        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let backend = MlxBackend::new(execution.stream(), execution.stream());
+        let manifest = eredu_runtime::CommunicationManifest::new(2, 0, Vec::new(), Vec::new())
+            .unwrap()
+            .with_completion_policy(
+                eredu_runtime::CommunicationCompletionPolicy::new(
+                    std::time::Duration::from_secs(1),
+                    eredu_core::CompletionCancellationMode::QuarantineUntilComplete,
+                )
+                .unwrap(),
+            );
+        let rank =
+            super::MlxRankContext::new(2, 0, super::DeviceAssignment::new(DeviceType::Cpu, 0))
+                .unwrap();
+
+        let error = match backend.materialize_after_communication(
+            eredu_core::SessionCapabilities::default(),
+            Some(&manifest),
+            Some(rank),
+            |_| -> Result<MlxModel, super::Error> {
+                path_instrumentation::payload_open();
+                path_instrumentation::architecture_construction();
+                unreachable!("missing world must reject before materialization")
+            },
+        ) {
+            Ok(_) => panic!("missing world unexpectedly reached materialization"),
+            Err(error) => error,
+        };
+
+        assert!(error
+            .to_string()
+            .contains("distributed model preparation requires native::distributed_backend"));
+        assert_eq!(
+            path_instrumentation::communication_realization_attempts(),
+            1
+        );
+        assert_eq!(path_instrumentation::snapshot(), Default::default());
+    }
+
+    #[test]
+    fn mismatched_world_rejects_before_payload_or_architecture_construction() {
+        path_instrumentation::reset();
+        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let world = safemlx::distributed::init(false, safemlx::distributed::Backend::Ring).unwrap();
+        assert_eq!(world.size(), 1);
+        let backend =
+            MlxBackend::with_distributed_world(execution.stream(), execution.stream(), &world);
+        let manifest = eredu_runtime::CommunicationManifest::new(2, 0, Vec::new(), Vec::new())
+            .unwrap()
+            .with_completion_policy(
+                eredu_runtime::CommunicationCompletionPolicy::new(
+                    std::time::Duration::from_secs(1),
+                    eredu_core::CompletionCancellationMode::QuarantineUntilComplete,
+                )
+                .unwrap(),
+            );
+        let rank =
+            super::MlxRankContext::new(2, 0, super::DeviceAssignment::new(DeviceType::Cpu, 0))
+                .unwrap();
+
+        let error = match backend.materialize_after_communication(
+            eredu_core::SessionCapabilities::default(),
+            Some(&manifest),
+            Some(rank),
+            |_| -> Result<MlxModel, super::Error> {
+                path_instrumentation::payload_open();
+                path_instrumentation::architecture_construction();
+                unreachable!("mismatched world must reject before materialization")
+            },
+        ) {
+            Ok(_) => panic!("mismatched world unexpectedly reached materialization"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("communication projection has 1 manifests, expected 2"),
+            "unexpected world mismatch: {error}"
+        );
+        assert_eq!(
+            path_instrumentation::communication_realization_attempts(),
+            1
+        );
+        assert_eq!(path_instrumentation::snapshot(), Default::default());
+    }
+
+    #[test]
+    fn selected_manifest_rejects_before_payload_or_architecture_construction() {
+        path_instrumentation::reset();
+        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let world = safemlx::distributed::init(false, safemlx::distributed::Backend::Ring).unwrap();
+        assert_eq!(world.size(), 1);
+        let backend =
+            MlxBackend::with_distributed_world(execution.stream(), execution.stream(), &world);
+        let manifest = eredu_runtime::CommunicationManifest::new(2, 0, Vec::new(), Vec::new())
+            .unwrap()
+            .with_completion_policy(
+                eredu_runtime::CommunicationCompletionPolicy::new(
+                    std::time::Duration::from_secs(1),
+                    eredu_core::CompletionCancellationMode::QuarantineUntilComplete,
+                )
+                .unwrap(),
+            );
+
+        let error = match backend.materialize_after_communication(
+            eredu_core::SessionCapabilities::default(),
+            Some(&manifest),
+            None,
+            |_| -> Result<MlxModel, super::Error> {
+                path_instrumentation::payload_open();
+                path_instrumentation::architecture_construction();
+                unreachable!("mismatched manifest world must reject before materialization")
+            },
+        ) {
+            Ok(_) => panic!("mismatched manifest world unexpectedly reached materialization"),
+            Err(error) => error,
+        };
+
+        assert!(error
+            .to_string()
+            .contains("communication manifest has no MLX rank/device context"));
+        assert_eq!(
+            path_instrumentation::communication_realization_attempts(),
+            0
+        );
+        assert_eq!(path_instrumentation::snapshot(), Default::default());
     }
 }
 

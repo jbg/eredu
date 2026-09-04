@@ -12,7 +12,6 @@ use eredu_runtime::{
     ArchitectureParameters, DenseDiskStreamReport, ExecutionUnitLayout, LayeredArchitecture,
     LayeredTraversalHook, LayerwiseModelMetadata, LayerwiseRuntime, ResidencyReport,
     ResidentLayerGroupReport, Sampler, SequentialDecisionDriver, SequentialDecisionTraversal,
-    ShardingPolicy,
 };
 use safemlx::{Array, Stream};
 
@@ -54,11 +53,51 @@ type BoundedRuntime = LayerwiseRuntime<
     MlxKeyValueState,
     MlxLayerwisePolicy<MoshiUnit>,
 >;
+type ResidentPartitionExecutor = eredu_runtime::LayerwiseTraversalPartitionExecutor<
+    Architecture,
+    MlxNeuralBackend,
+    MlxKeyValueState,
+    MlxResidentPolicy<MoshiUnit>,
+>;
+type BoundedPartitionExecutor = eredu_runtime::LayerwiseTraversalPartitionExecutor<
+    Architecture,
+    MlxNeuralBackend,
+    MlxKeyValueState,
+    MlxLayerwisePolicy<MoshiUnit>,
+>;
+type ResidentPartitionRuntime = eredu_runtime::PartitionedTextRuntime<
+    Architecture,
+    MlxNeuralBackend,
+    MlxKeyValueState,
+    (),
+    ResidentPartitionExecutor,
+    crate::backend::runtime::distributed::Group,
+    crate::backend::runtime::distributed::topology::CommunicationRouteRealization,
+    crate::backend::nn::shared::MlxCommunicationTensorMetadata,
+    eredu_runtime::NoBoundaryTransport,
+    eredu_runtime::NoOutputPublisher,
+    eredu_runtime::NoCommitAgreement,
+>;
+type BoundedPartitionRuntime = eredu_runtime::PartitionedTextRuntime<
+    Architecture,
+    MlxNeuralBackend,
+    MlxKeyValueState,
+    (),
+    BoundedPartitionExecutor,
+    crate::backend::runtime::distributed::Group,
+    crate::backend::runtime::distributed::topology::CommunicationRouteRealization,
+    crate::backend::nn::shared::MlxCommunicationTensorMetadata,
+    eredu_runtime::NoBoundaryTransport,
+    eredu_runtime::NoOutputPublisher,
+    eredu_runtime::NoCommitAgreement,
+>;
+type ResidentTraversalRuntime =
+    eredu_runtime::LayerwiseTraversalRuntime<ResidentRuntime, Box<ResidentPartitionRuntime>>;
+type BoundedTraversalRuntime =
+    eredu_runtime::LayerwiseTraversalRuntime<BoundedRuntime, Box<BoundedPartitionRuntime>>;
 enum Execution {
-    Resident(ResidentRuntime),
-    Bounded(BoundedRuntime),
-    ParallelResident(Box<ResidentRuntime>),
-    ParallelBounded(Box<BoundedRuntime>),
+    Resident(ResidentTraversalRuntime),
+    Bounded(BoundedTraversalRuntime),
 }
 
 #[derive(Clone)]
@@ -94,7 +133,6 @@ pub struct MoshiModel {
     artifact_identity: LoadedArtifactIdentity,
     state_layout: eredu_runtime::StateLayout,
     metadata: LayerwiseModelMetadata,
-    topology: Option<crate::composition::mlx::distributed::topology::MlxParallelPlan>,
     execution: Execution,
 }
 
@@ -124,20 +162,11 @@ impl MoshiModel {
         &self.metadata
     }
 
-    /// Rank-local topology when this instance owns tensor-parallel parameters.
-    pub fn topology(
-        &self,
-    ) -> Option<crate::composition::mlx::distributed::topology::MlxParallelPlan> {
-        self.topology
-    }
-
     /// Logical residency and transfer telemetry.
     pub fn residency_report(&self) -> Result<ResidencyReport, Error> {
         match &self.execution {
             Execution::Resident(runtime) => runtime.policy().residency_report(),
             Execution::Bounded(runtime) => runtime.policy().residency_report(),
-            Execution::ParallelResident(runtime) => runtime.policy().residency_report(),
-            Execution::ParallelBounded(runtime) => runtime.policy().residency_report(),
         }
     }
 
@@ -146,8 +175,6 @@ impl MoshiModel {
         match &self.execution {
             Execution::Resident(_) => Ok(None),
             Execution::Bounded(runtime) => runtime.policy().dense_stream_report(),
-            Execution::ParallelResident(_) => Ok(None),
-            Execution::ParallelBounded(runtime) => runtime.policy().dense_stream_report(),
         }
     }
 
@@ -156,8 +183,6 @@ impl MoshiModel {
         match &self.execution {
             Execution::Resident(runtime) => runtime.policy().execution_group_reports(),
             Execution::Bounded(runtime) => runtime.policy().execution_group_reports(),
-            Execution::ParallelResident(runtime) => runtime.policy().execution_group_reports(),
-            Execution::ParallelBounded(runtime) => runtime.policy().execution_group_reports(),
         }
     }
 
@@ -223,52 +248,6 @@ impl MoshiModel {
                 .forward_with_traversal_hook(input, state, stream, hook)
                 .map(|(output, context)| (output.into_array(), context))
                 .map_err(|error| Error::ArchitectureModel(error.to_string())),
-            Execution::ParallelResident(_) | Execution::ParallelBounded(_) => Err(Error::Parallel(
-                "tensor-parallel Moshi execution requires the rank's TP collective group".into(),
-            )),
-        }
-    }
-
-    /// Runs one rank-local tensor-parallel temporal/depth pass.
-    pub fn forward_realtime_parallel<'a, S>(
-        &mut self,
-        input: moshi::Input<'a, Array>,
-        state: &mut MlxKeyValueState,
-        driver: &mut SequentialDecisionDriver<MlxSamplingBackend, S>,
-        group: &crate::backend::runtime::distributed::Group,
-        stream: &Stream,
-    ) -> Result<(Array, moshi::ForwardContext<crate::MlxTensor>), Error>
-    where
-        S: Sampler<MlxSamplingBackend>,
-    {
-        let mut boundary = moshi::DecisionBoundary::new(&self.target_config)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        let mut traversal = SequentialDecisionTraversal::new(driver, &mut boundary);
-        let text = crate::MlxTensor::from_array(input.text.clone());
-        let audio = input
-            .audio
-            .iter()
-            .map(|token| crate::MlxTensor::from_array((*token).clone()))
-            .collect::<Vec<_>>();
-        let audio = audio.iter().collect::<Vec<_>>();
-        let mask = input.mask.cloned().map(crate::MlxTensor::from_array);
-        let input = moshi::Input {
-            text: &text,
-            audio: &audio,
-            mask: mask.as_ref(),
-        };
-        match &mut self.execution {
-            Execution::ParallelResident(runtime) => runtime
-                .forward_parallel_with_traversal_hook(input, state, group, stream, &mut traversal)
-                .map(|(output, context)| (output.into_array(), context))
-                .map_err(|error| Error::Parallel(error.to_string())),
-            Execution::ParallelBounded(runtime) => runtime
-                .forward_parallel_with_traversal_hook(input, state, group, stream, &mut traversal)
-                .map(|(output, context)| (output.into_array(), context))
-                .map_err(|error| Error::Parallel(error.to_string())),
-            Execution::Resident(_) | Execution::Bounded(_) => Err(Error::Parallel(
-                "model was not loaded for tensor-parallel Moshi execution".into(),
-            )),
         }
     }
 }
@@ -277,6 +256,7 @@ impl MoshiModel {
 pub fn load(
     preparation: RealtimePreparationPlan,
     options: MlxLoadRequest,
+    world: Option<&crate::backend::runtime::distributed::Group>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<MoshiModel, Error> {
@@ -286,24 +266,6 @@ pub fn load(
     let source_config = preparation.take_config();
     let checkpoint_plan = preparation.take_checkpoint_plan();
     let source_recipes = preparation.take_recipes();
-    let artifact_identity = artifact_identity(&model_dir, &source_path, &source_config)?;
-    let source_store = open_safetensors_weight_store(
-        &source_path,
-        options.weight_residency.layers().max_cached_shards(),
-    )?;
-    let checkpoint_contract = eredu_checkpoint::validation::resolve_safetensors_plan(
-        source_store.as_ref(),
-        &checkpoint_plan,
-    )
-    .map_err(|validation| {
-        Error::ArchitectureModel(format!(
-            "prepared Moshi checkpoint contract no longer resolves: {validation:?}"
-        ))
-    })?;
-    let source_store: SharedCheckpointSource = Arc::new(ResolvedCheckpointSource::new(
-        source_store,
-        checkpoint_contract,
-    ));
     let (source_outputs, source_aliases) = source_recipes.into_parts();
     let source_recipes = Arc::new(CanonicalBindingRecipes {
         outputs: source_outputs,
@@ -328,6 +290,76 @@ pub fn load(
             .map_err(|error| Error::ArchitectureModel(error.to_string()))?,
         None => source_config.clone(),
     };
+
+    let selected_partition = options
+        .parallel_topology()
+        .filter(|topology| !topology.is_replicated())
+        .map(|topology| {
+            let rank_context = options.parallel_rank_context()?.ok_or_else(|| {
+                Error::Parallel("parallel Moshi has no MLX rank/device context".into())
+            })?;
+            rank_context.validate_execution_stream(stream)?;
+            let (maximum_batch_size, maximum_sequence_length) =
+                options.partitioned_invocation_limits()?.ok_or_else(|| {
+                    Error::Parallel("parallel Moshi invocation limits are missing".into())
+                })?;
+            let activation_dtype = options
+                .pipeline_wire_contract()
+                .ok_or_else(|| Error::Parallel("parallel Moshi wire contract is missing".into()))?
+                .activation_dtype();
+            let completion = options.communication_completion_policy()?.ok_or_else(|| {
+                Error::Parallel("parallel Moshi completion policy is missing".into())
+            })?;
+            let parameter_description = moshi::parameter_description(&target_config)
+                .map_err(|error| Error::Parallel(error.to_string()))?;
+            let selection = moshi::select_parallel_execution(
+                &target_config,
+                &parameter_description,
+                topology,
+                maximum_batch_size,
+                maximum_sequence_length,
+                activation_dtype,
+                completion,
+                source_recipes
+                    .aliases
+                    .iter()
+                    .map(|(alias, owner)| (alias.as_str(), owner.as_str())),
+            )
+            .map_err(|error| Error::Parallel(error.to_string()))?;
+            let world = world.ok_or_else(|| {
+                Error::Parallel("partitioned realtime loading requires a native world group".into())
+            })?;
+            let distributed = crate::backend::MlxDistributedSession::from_manifest(
+                selection.communication(),
+                world.native_group(),
+                stream,
+            )?;
+            let global = Architecture::new(target_config.clone(), stream)?;
+            Ok::<_, Error>((selection, distributed, global))
+        })
+        .transpose()?;
+    if selected_partition.is_none() {
+        options.validate_replicated()?;
+    }
+
+    let artifact_identity = artifact_identity(&model_dir, &source_path, &source_config)?;
+    let source_store = open_safetensors_weight_store(
+        &source_path,
+        options.weight_residency.layers().max_cached_shards(),
+    )?;
+    let checkpoint_contract = eredu_checkpoint::validation::resolve_safetensors_plan(
+        source_store.as_ref(),
+        &checkpoint_plan,
+    )
+    .map_err(|validation| {
+        Error::ArchitectureModel(format!(
+            "prepared Moshi checkpoint contract no longer resolves: {validation:?}"
+        ))
+    })?;
+    let source_store: SharedCheckpointSource = Arc::new(ResolvedCheckpointSource::new(
+        source_store,
+        checkpoint_contract,
+    ));
 
     let (store, materialization) = match quantize {
         Some(quantization) => {
@@ -363,10 +395,7 @@ pub fn load(
         None => (source_store, None),
     };
 
-    if let Some(topology) = options
-        .parallel_topology()
-        .filter(|topology| !topology.is_replicated())
-    {
+    if let Some((selection, distributed, global)) = selected_partition {
         return load_parallel(
             store,
             source_config,
@@ -375,12 +404,13 @@ pub fn load(
             artifact_identity,
             materialization,
             options.weight_residency.layers(),
-            topology,
+            selection,
+            distributed,
+            global,
             stream,
             weights_stream,
         );
     }
-    options.validate_replicated()?;
 
     let mut architecture = Architecture::new(target_config.clone(), stream)?;
     let static_recipes = Arc::clone(&source_recipes);
@@ -404,16 +434,20 @@ pub fn load(
     metadata.set_materialization(materialization);
     let state_layout = architecture.state_layout()?;
     let execution = if options.weight_residency.layers().is_fully_resident() {
-        Execution::Resident(LayerwiseRuntime::new_policy_first(
-            policy.into_resident(
-                &architecture,
-                stream,
-                std::marker::PhantomData::<MlxKeyValueState>,
-            )?,
-            architecture,
+        Execution::Resident(eredu_runtime::LayerwiseTraversalRuntime::direct(
+            LayerwiseRuntime::new_policy_first(
+                policy.into_resident(
+                    &architecture,
+                    stream,
+                    std::marker::PhantomData::<MlxKeyValueState>,
+                )?,
+                architecture,
+            ),
         ))
     } else {
-        Execution::Bounded(LayerwiseRuntime::new(architecture, policy))
+        Execution::Bounded(eredu_runtime::LayerwiseTraversalRuntime::direct(
+            LayerwiseRuntime::new(architecture, policy),
+        ))
     };
     let identity = MoshiModelIdentity {
         source_architecture: source_config.architecture_fingerprint().to_owned(),
@@ -426,7 +460,6 @@ pub fn load(
         artifact_identity,
         state_layout,
         metadata,
-        topology: None,
         execution,
     })
 }
@@ -440,43 +473,15 @@ fn load_parallel(
     artifact_identity: LoadedArtifactIdentity,
     materialization: Option<eredu_runtime::WeightMaterializationReport>,
     residency: eredu_runtime::LayerWeightResidency,
-    topology: crate::composition::mlx::distributed::topology::MlxParallelPlan,
+    selection: moshi::MoshiParallelSelection,
+    distributed: crate::backend::MlxDistributedSession,
+    global: Architecture,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<MoshiModel, Error> {
-    if topology.pipeline_parallel_size() != 1 || topology.expert_parallel_size() != 1 {
-        return Err(Error::Parallel(format!(
-            "neutral Moshi supports tensor parallelism only, got TP/PP/EP={}/{}/{}",
-            topology.tensor_parallel_size(),
-            topology.pipeline_parallel_size(),
-            topology.expert_parallel_size()
-        )));
-    }
-    topology.validate_execution_stream(stream)?;
-    let build = crate::composition::mlx::distributed::topology::ParallelBuildContext::new(
-        topology,
-        ShardingPolicy::Require,
-    );
-    let global = Architecture::new(target_config.clone(), stream)?;
-    let parameter_description = global
-        .parameter_description(stream)
-        .map_err(|error| Error::Parallel(error.to_string()))?;
-    let local_layout =
-        crate::composition::parallel_layout_from_description(build, &parameter_description)?;
-    if local_layout.is_empty() {
-        return Err(Error::Parallel(
-            "Moshi declared no tensor-parallel parameters".into(),
-        ));
-    }
-    let geometry = moshi::local_geometry(
-        &target_config,
-        &local_layout,
-        source_recipes
-            .aliases
-            .iter()
-            .map(|(alias, owner)| (alias.as_str(), owner.as_str())),
-    )
-    .map_err(|error| Error::Parallel(error.to_string()))?;
+    let execution_architecture = selection.execution_identity().to_owned();
+    let (local_layout, geometry, communication, tensor_group, execution_plan) =
+        selection.into_parts();
     let mut composition = Architecture::new_parallel(target_config.clone(), geometry, stream)?;
     let state_layout = composition.state_layout()?;
     let local_layout = Arc::new(local_layout);
@@ -514,26 +519,60 @@ fn load_parallel(
     metadata.set_effective_model_type(target_config.effective_model_type().as_str());
     metadata.set_quantization(target_config.native_quantization());
     metadata.set_materialization(materialization);
+    let selected_residency = residency.execution_residency();
+    let (partition_communication, parallel, _sampling, communication_executor) = distributed
+        .into_partition_communication(communication.clone(), Some(tensor_group), tensor_group)?;
+    let parallel = parallel
+        .ok_or_else(|| Error::Parallel("Moshi partition has no realized tensor group".into()))?;
     let execution = if residency.is_fully_resident() {
-        Execution::ParallelResident(Box::new(LayerwiseRuntime::new_policy_first(
+        let layerwise = LayerwiseRuntime::new_policy_first(
             policy.into_resident(
                 &composition,
                 stream,
                 std::marker::PhantomData::<MlxKeyValueState>,
             )?,
             composition,
-        )))
+        );
+        let executor = ResidentPartitionExecutor::new(layerwise, parallel);
+        Execution::Resident(eredu_runtime::LayerwiseTraversalRuntime::partitioned(
+            Box::new(
+                eredu_runtime::PartitionedTextRuntime::new(
+                    execution_plan,
+                    executor,
+                    partition_communication,
+                    communication_executor,
+                    eredu_runtime::NoBoundaryTransport,
+                    eredu_runtime::NoOutputPublisher,
+                    eredu_runtime::NoCommitAgreement,
+                    selected_residency,
+                    None,
+                )
+                .map_err(|error| Error::Parallel(error.to_string()))?,
+            ),
+        ))
     } else {
-        Execution::ParallelBounded(Box::new(LayerwiseRuntime::new(composition, policy)))
+        let layerwise = LayerwiseRuntime::new(composition, policy);
+        let executor = BoundedPartitionExecutor::new(layerwise, parallel);
+        Execution::Bounded(eredu_runtime::LayerwiseTraversalRuntime::partitioned(
+            Box::new(
+                eredu_runtime::PartitionedTextRuntime::new(
+                    execution_plan,
+                    executor,
+                    partition_communication,
+                    communication_executor,
+                    eredu_runtime::NoBoundaryTransport,
+                    eredu_runtime::NoOutputPublisher,
+                    eredu_runtime::NoCommitAgreement,
+                    selected_residency,
+                    Some(()),
+                )
+                .map_err(|error| Error::Parallel(error.to_string()))?,
+            ),
+        ))
     };
     let identity = MoshiModelIdentity {
         source_architecture: source_config.architecture_fingerprint().to_owned(),
-        execution_architecture: format!(
-            "{};tp-rank={}/{}",
-            target_config.architecture_fingerprint(),
-            topology.tensor_parallel_rank(),
-            topology.tensor_parallel_size()
-        ),
+        execution_architecture,
     };
     Ok(MoshiModel {
         source_config,
@@ -542,7 +581,6 @@ fn load_parallel(
         artifact_identity,
         state_layout,
         metadata,
-        topology: Some(topology),
         execution,
     })
 }
@@ -717,6 +755,7 @@ mod tests {
         let model = load(
             preparation,
             MlxLoadRequest::default(),
+            None,
             &stream,
             &weights_stream,
         )

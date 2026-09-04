@@ -77,6 +77,16 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> RoutedPlusSha
         policy: &MoePolicy,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
+        let expert_spec = expert_bank_spec(policy)?;
+        Self::new_with_expert_spec(policy, expert_spec, context)
+    }
+
+    /// Builds the routed block with an already-selected rank-local expert bank.
+    pub(crate) fn new_with_expert_spec(
+        policy: &MoePolicy,
+        expert_spec: eredu_nn::GroupedGatedProductSpec,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
         let routing = TopKGroupSelectionSpec::new(
             policy.expert_count,
             policy.routes_per_token,
@@ -103,7 +113,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> RoutedPlusSha
             selector = selector.with_correction_bias(correction_bias)?;
         }
         let router = B::top_k_group_selector(selector, context)?;
-        let experts = B::grouped_gated_product(expert_bank_spec(policy)?, context)?;
+        let experts = B::grouped_gated_product(expert_spec, context)?;
         let shared = |weight: &str, input, output, format| {
             B::linear(
                 LinearSpec {

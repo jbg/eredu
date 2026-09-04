@@ -346,7 +346,10 @@ impl eredu_runtime::ArchitectureBoundary for TargetBoundarySchema {
     fn encode<T>(
         &self,
         boundary: TargetBoundary<T>,
-    ) -> Result<Vec<T>, eredu_runtime::ArchitectureBoundaryError> {
+    ) -> Result<
+        Vec<eredu_runtime::ArchitectureBoundaryValue<T>>,
+        eredu_runtime::ArchitectureBoundaryError,
+    > {
         if boundary.captures.len() != self.capture_count {
             return Err(eredu_runtime::ArchitectureBoundaryError::TensorCount {
                 boundary: "deepseek_v4.target.captures",
@@ -354,9 +357,18 @@ impl eredu_runtime::ArchitectureBoundary for TargetBoundarySchema {
                 actual: boundary.captures.len(),
             });
         }
-        Ok(std::iter::once(boundary.input_ids)
-            .chain(boundary.captures)
-            .collect())
+        let mut values = Vec::with_capacity(1 + boundary.captures.len());
+        values.push(eredu_runtime::ArchitectureBoundaryValue::new(
+            "tokens",
+            boundary.input_ids,
+        )?);
+        for (index, capture) in boundary.captures.into_iter().enumerate() {
+            values.push(eredu_runtime::ArchitectureBoundaryValue::new(
+                format!("capture.{index}"),
+                capture,
+            )?);
+        }
+        Ok(values)
     }
 }
 
@@ -418,6 +430,11 @@ pub enum TargetPartitionOutput<T> {
 }
 
 impl<T> ForwardContext<T> {
+    /// Borrows the token identity retained on every target pipeline rank.
+    pub const fn input_ids(&self) -> &T {
+        &self.input_ids
+    }
+
     /// Borrows the final target hidden state or configured DSpark captures.
     pub const fn target_capture(&self) -> Option<&T> {
         self.target_capture.as_ref()
@@ -444,6 +461,7 @@ where
     groups: SequentialPredictionGroups,
     parallel_geometry: Option<Arc<super::parallel::V4LocalGeometry>>,
     expert_realization: Option<crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>>,
+    partition_target_start: usize,
 }
 
 impl<B> eredu_runtime::ArchitectureParameters<B> for Model<B>
@@ -678,6 +696,7 @@ where
             args,
             parallel_geometry: None,
             expert_realization: None,
+            partition_target_start: 0,
         })
     }
 
@@ -706,6 +725,7 @@ where
             args,
             parallel_geometry: Some(Arc::new(geometry)),
             expert_realization: None,
+            partition_target_start: 0,
         })
     }
 
@@ -728,6 +748,19 @@ where
         realization: crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>,
     ) {
         self.expert_realization = Some(realization);
+    }
+
+    /// Selects the architecture-global target-unit origin of a rank-local PP slice.
+    pub fn set_partition_target_start(&mut self, start: usize) {
+        self.partition_target_start = start;
+    }
+
+    fn target_state_ordinal(&self, index: usize) -> Result<usize, Error> {
+        index
+            .checked_sub(self.partition_target_start)
+            .ok_or_else(|| {
+                Error::backend("V4 target unit precedes the selected partition state slice")
+            })
     }
 
     /// Returns the normalized V4 arguments.
@@ -777,8 +810,27 @@ where
             .parallel_geometry
             .as_ref()
             .map_or(&self.args, |geometry| geometry.args());
+        let owner_group = if group == 0 {
+            "target".to_owned()
+        } else {
+            format!("mtp.{}", group - 1)
+        };
+        let selected_spec = self
+            .expert_realization
+            .as_ref()
+            .and_then(|realization| realization.unit_spec(&owner_group, index))
+            .cloned();
+        if group == 0 && self.expert_realization.is_some() && selected_spec.is_none() {
+            return Err(Error::backend(format!(
+                "V4 expert realization has no bank for {owner_group}.{index}"
+            )));
+        }
         let mut unit = if group == 0 {
-            Unit::Target(V4Block::new(args, index, context)?)
+            let block = match selected_spec.clone() {
+                Some(spec) => V4Block::new_with_expert_spec(args, index, spec, context)?,
+                None => V4Block::new(args, index, context)?,
+            };
+            Unit::Target(block)
         } else if self.args.dspark.is_some() {
             let global =
                 usize::try_from(self.args.num_hidden_layers).map_err(Error::backend)? + group - 1;
@@ -786,27 +838,25 @@ where
                 args,
                 global,
                 &format!("mtp.{}", group - 1),
+                None,
                 context,
             )?)
         } else {
             Unit::Prediction(V4PredictionLayer::new(args, group - 1, context)?)
         };
-        if let Some(realization) = &self.expert_realization {
-            let owner_group = if group == 0 {
-                "target".to_owned()
-            } else {
-                format!("mtp.{}", group - 1)
-            };
-            let spec = realization.unit_spec(&owner_group, index).ok_or_else(|| {
-                Error::backend(format!(
-                    "V4 expert realization has no bank for {owner_group}.{index}"
-                ))
-            })?;
-            let feed_forward = match &mut unit {
-                Unit::Target(block) | Unit::Dspark(block) => &mut block.feed_forward,
-                Unit::Prediction(prediction) => &mut prediction.decoder.feed_forward,
-            };
-            feed_forward.experts = B::grouped_gated_product(spec.clone(), context)?;
+        if group != 0 {
+            if let Some(realization) = &self.expert_realization {
+                let spec = realization.unit_spec(&owner_group, index).ok_or_else(|| {
+                    Error::backend(format!(
+                        "V4 expert realization has no bank for {owner_group}.{index}"
+                    ))
+                })?;
+                let feed_forward = match &mut unit {
+                    Unit::Target(block) | Unit::Dspark(block) => &mut block.feed_forward,
+                    Unit::Prediction(prediction) => &mut prediction.decoder.feed_forward,
+                };
+                feed_forward.experts = B::grouped_gated_product(spec.clone(), context)?;
+            }
         }
         Ok(unit)
     }
@@ -1507,7 +1557,11 @@ where
                     hidden,
                     &forward.input_ids,
                     forward.mask.as_ref(),
-                    Some(state.layer(index).map_err(Error::backend)?),
+                    Some(
+                        state
+                            .layer(self.target_state_ordinal(index)?)
+                            .map_err(Error::backend)?,
+                    ),
                     pass,
                     provider,
                     context,
@@ -1605,7 +1659,11 @@ where
                     hidden,
                     &forward.input_ids,
                     forward.mask.as_ref(),
-                    Some(state.layer(index).map_err(Error::backend)?),
+                    Some(
+                        state
+                            .layer(self.target_state_ordinal(index)?)
+                            .map_err(Error::backend)?,
+                    ),
                     pass,
                     provider,
                     context,
@@ -1702,7 +1760,11 @@ where
                     hidden,
                     &forward.input_ids,
                     forward.mask.as_ref(),
-                    Some(state.layer(index).map_err(Error::backend)?),
+                    Some(
+                        state
+                            .layer(self.target_state_ordinal(index)?)
+                            .map_err(Error::backend)?,
+                    ),
                     context,
                     observer,
                 )?;
@@ -1766,7 +1828,11 @@ where
                     hidden,
                     &forward.input_ids,
                     forward.mask.as_ref(),
-                    Some(state.layer(index).map_err(Error::backend)?),
+                    Some(
+                        state
+                            .layer(self.target_state_ordinal(index)?)
+                            .map_err(Error::backend)?,
+                    ),
                     pass,
                     provider,
                     context,
@@ -2009,6 +2075,29 @@ where
 
     fn prediction_execution_groups(&self) -> Vec<String> {
         self.groups.prediction_execution_groups()
+    }
+
+    fn prediction_target_capture(context: &Self::ForwardContext) -> Option<&B::Tensor> {
+        context.target_capture()
+    }
+
+    fn prediction_target_placeholder_shape(
+        &self,
+        forward: &Self::ForwardContext,
+    ) -> Result<Option<Vec<i32>>, Self::Error> {
+        let input = forward.input_ids();
+        let shape = match &self.args.dspark {
+            Some(dspark) => vec![
+                input.dim(0),
+                input.dim(1),
+                i32::try_from(dspark.target_layer_ids.len())
+                    .map_err(|_| Error::backend("DSpark capture count exceeds i32"))?
+                    .checked_mul(self.args.hidden_size)
+                    .ok_or_else(|| Error::backend("DSpark capture width overflowed"))?,
+            ],
+            None => vec![input.dim(0), input.dim(1), self.args.hidden_size],
+        };
+        Ok(Some(shape))
     }
 
     fn state_partition_plan(
@@ -2809,6 +2898,30 @@ where
                 })
             }
         }
+    }
+}
+
+impl<B, S> crate::partitioned_execution::TextPartitionArchitecture<B, S> for Model<B>
+where
+    B: HyperNeuralBackend
+        + eredu_nn::DistributedNeuralBackend
+        + eredu_nn::TensorParallelGroupedNeuralBackend,
+    S: LayerRuntimeState<B>,
+    S::LayerState: PoolingAttentionCache<B::Tensor>,
+{
+    fn partition_text_input<'a>(input: Self::Input<'a>) -> (&'a B::Tensor, Option<&'a B::Tensor>) {
+        match input {
+            EmbeddedInput::Target { tokens, mask } => (tokens, mask),
+            EmbeddedInput::Draft { .. }
+            | EmbeddedInput::DsparkContext { .. }
+            | EmbeddedInput::DsparkProposal { .. } => {
+                unreachable!("prediction-free V4 partition received prediction input")
+            }
+        }
+    }
+
+    fn partition_output_width(&self) -> i32 {
+        self.args.vocab_size
     }
 }
 

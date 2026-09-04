@@ -366,6 +366,19 @@ impl V3Source {
 }
 
 impl V3Args {
+    /// Projects a complete checkpoint configuration onto its ordinary target decoder.
+    ///
+    /// The returned value deliberately excludes embedded prediction units while
+    /// retaining every target-layer geometry and physical-format decision.  It
+    /// is used only after the complete artifact has passed admission; prediction
+    /// parameters remain owned by the separately typed prediction extension.
+    pub fn prediction_target(&self) -> Result<Self, ConfigError> {
+        let mut target = self.clone();
+        target.num_nextn_predict_layers = 0;
+        target.validate()?;
+        Ok(target)
+    }
+
     /// Returns whether any normalized decoder layer uses routed experts.
     pub fn has_sparse_moe_layers(&self) -> bool {
         self.num_nextn_predict_layers > 0
@@ -786,6 +799,36 @@ impl V4Source {
 }
 
 impl V4Args {
+    /// Projects a complete checkpoint configuration onto its ordinary target decoder.
+    ///
+    /// Prediction-only local-attention entries are retained by the prediction
+    /// extension rather than entering the ordinary target session. DSpark is
+    /// rejected until its architecture-selected target-layer capture set is a
+    /// typed additive target contract; dropping that policy would change its
+    /// verifier semantics.
+    pub fn prediction_target(&self) -> Result<Self, ConfigError> {
+        if self.dspark.is_some() {
+            return Err(invalid_v4(
+                "DSpark target projection requires typed target-layer captures",
+            ));
+        }
+        let target_layers = usize::try_from(self.num_hidden_layers)
+            .map_err(|_| invalid_v4("target layer count exceeds usize"))?;
+        let mut target = self.clone();
+        target.num_nextn_predict_layers = 0;
+        target.attention_schedule = LayerSchedule::new(
+            target_layers,
+            self.attention_schedule
+                .iter()
+                .take(target_layers)
+                .copied()
+                .collect(),
+        )
+        .map_err(|error| invalid_v4(error.to_string()))?;
+        target.validate()?;
+        Ok(target)
+    }
+
     /// Resolves one canonical matrix's physical encoding.
     pub fn linear_format_for(&self, name: &str) -> LinearFormat {
         self.linear_formats
@@ -1362,6 +1405,36 @@ mod tests {
     }
 
     #[test]
+    fn v3_prediction_projection_retains_extension_and_exact_target_capture() {
+        let mut value = fixture();
+        value["num_nextn_predict_layers"] = Value::from(2);
+        let complete = crate::configuration::resolve_model_config(&value)
+            .unwrap()
+            .architecture;
+        let (target, extension) = complete.prediction_target_projection().unwrap().unwrap();
+
+        assert_eq!(
+            extension.kind(),
+            crate::configuration::PredictionExtensionKind::DeepSeekV3Mtp
+        );
+        assert_eq!(extension.depth(), 2);
+        assert_eq!(extension.target_capture_limits(2, 5).unwrap(), (3, 160));
+        let crate::configuration::SafetensorsModelConfig::DeepSeekV3(complete) =
+            extension.complete_architecture().model()
+        else {
+            panic!("prediction extension changed family")
+        };
+        assert_eq!(complete.num_nextn_predict_layers, 2);
+        let crate::configuration::SafetensorsModelConfig::DeepSeekV3(target) = target.model()
+        else {
+            panic!("prediction target projection changed family")
+        };
+        assert_eq!(target.num_nextn_predict_layers, 0);
+        assert_eq!(target.num_hidden_layers, complete.num_hidden_layers);
+        assert_eq!(target.layer_schedule, complete.layer_schedule);
+    }
+
+    #[test]
     fn maps_official_fp8_metadata_to_general_linear_format() {
         let mut fixture = fixture();
         fixture["quantization_config"] = serde_json::json!({
@@ -1431,6 +1504,66 @@ mod tests {
         );
         assert_eq!(args.attention_policy(3), Some(V4AttentionPolicy::Local));
         assert_eq!(args.swiglu_limit.unwrap().gate_upper_bound(), Some(7.0));
+    }
+
+    #[test]
+    fn prediction_target_projection_preserves_target_geometry_and_drops_only_extension_policy() {
+        let fixture = v4_fixture();
+        let complete = parse_v4_config(&fixture).unwrap();
+        let target = complete.prediction_target().unwrap();
+
+        assert_eq!(target.num_nextn_predict_layers, 0);
+        assert!(target.dspark.is_none());
+        assert_eq!(target.attention_schedule.len(), 3);
+        assert_eq!(target.hidden_size, complete.hidden_size);
+        assert_eq!(target.num_hidden_layers, complete.num_hidden_layers);
+        assert_eq!(target.n_routed_experts, complete.n_routed_experts);
+        assert_eq!(target.linear_formats, complete.linear_formats);
+        assert_eq!(crate::deepseek::v4::state_layout(&target).unwrap().len(), 3);
+        assert_eq!(
+            crate::deepseek::v4::state_layout(&complete).unwrap().len(),
+            4
+        );
+
+        let admitted = crate::configuration::resolve_model_config(&fixture)
+            .unwrap()
+            .architecture;
+        let (target_plan, extension) = admitted.prediction_target_projection().unwrap().unwrap();
+        assert_eq!(extension.depth(), 1);
+        assert_eq!(extension.target_capture_limits(2, 5).unwrap(), (4, 320));
+        assert_eq!(
+            extension.kind(),
+            crate::configuration::PredictionExtensionKind::DeepSeekV4Embedded
+        );
+        let crate::configuration::SafetensorsModelConfig::DeepSeekV4(complete_extension) =
+            extension.complete_architecture().model()
+        else {
+            panic!("prediction extension changed family")
+        };
+        assert_eq!(complete_extension.attention_schedule.len(), 4);
+        assert!(complete_extension.dspark.is_none());
+        let crate::configuration::SafetensorsModelConfig::DeepSeekV4(target) = target_plan.model()
+        else {
+            panic!("prediction target projection changed family")
+        };
+        assert_eq!(target.num_nextn_predict_layers, 0);
+        assert!(target_plan
+            .checkpoint()
+            .common_tensors
+            .iter()
+            .all(|tensor| !tensor.key.starts_with("model.layers.3.")));
+
+        let mut dspark = fixture;
+        dspark["dspark_block_size"] = Value::from(4);
+        dspark["dspark_noise_token_id"] = Value::from(0);
+        dspark["dspark_target_layer_ids"] = serde_json::json!([0, 2]);
+        dspark["dspark_markov_rank"] = Value::from(4);
+        let dspark = parse_v4_config(&dspark).unwrap();
+        assert!(dspark
+            .prediction_target()
+            .unwrap_err()
+            .to_string()
+            .contains("typed target-layer captures"));
     }
 
     #[test]

@@ -13,10 +13,11 @@ pub mod vision;
 pub use audio::{AudioInput, AudioTower};
 pub use checkpoint::{
     dense_w13_recipes, expert_residency_catalog, expert_w13_recipe, gguf_plan,
-    load_time_quantization, mmproj_gguf_plan, normalize_gguf_weight_formats, safetensors_aliases,
-    safetensors_plan, safetensors_recipes, static_safetensors_recipes, translate_gguf_weight_name,
-    translate_gguf_weight_name_for_model, translate_mmproj_weight_name, unit_safetensors_recipes,
-    with_checkpoint_formats, DenseW13Recipes, ParameterAlias,
+    load_time_quantization, mmproj_gguf_plan, mtp_safetensors_recipes,
+    normalize_gguf_weight_formats, safetensors_aliases, safetensors_plan, safetensors_recipes,
+    static_safetensors_recipes, translate_gguf_weight_name, translate_gguf_weight_name_for_model,
+    translate_mmproj_weight_name, unit_safetensors_recipes, with_checkpoint_formats,
+    DenseW13Recipes, ParameterAlias,
 };
 pub use config::{
     AudioConfig, ConfigError, FeedForwardPolicy, LayerPolicy, ModelArgs, MtpConfig, TextArgs,
@@ -34,7 +35,8 @@ pub use model::{
 pub use mtp::{MtpDepth, MtpModel, MtpOutput};
 pub use parallel::{
     layer_parameter_groups, local_geometry, local_text_args, mtp_parameter_groups,
-    static_parameter_groups, vision_layer_parameter_groups, LocalGeometry,
+    partition_local_geometry, static_parameter_groups, vision_layer_parameter_groups,
+    LocalGeometry, PartitionLocalFoundation, PartitionLocalGeometry,
 };
 pub use text::{
     convolution_history_shape, Attention, ConvolutionState, DecoderLayer, FeedForward, LayerState,

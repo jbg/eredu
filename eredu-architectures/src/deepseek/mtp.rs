@@ -404,7 +404,7 @@ where
             )?,
             embedding_norm: norm(format!("{root}.enorm.weight"))?,
             hidden_norm: norm(format!("{root}.hnorm.weight"))?,
-            decoder: V4Block::new_at(args, global, &root, context)?,
+            decoder: V4Block::new_at(args, global, &root, None, context)?,
             output_norm: norm(format!("{root}.norm.weight"))?,
             hyper_head: HyperHead::new(
                 HyperHeadSpec {

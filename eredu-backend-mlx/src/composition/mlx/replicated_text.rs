@@ -1,26 +1,150 @@
 //! MLX mechanisms and generic binding for replicated text composition.
 
-use std::{collections::BTreeMap, marker::PhantomData, path::Path, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    marker::PhantomData,
+    ops::{Deref, DerefMut},
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+};
 
 use eredu_checkpoint::{store::CheckpointSource, LinearFormat, SourceTensorEncoding, StoredDtype};
 use eredu_core::cache::{
     PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
-    StateResidencyClass,
+    PromptCacheTopology, StateResidencyClass,
 };
-use eredu_nn::{NeuralBackend, PoolingAttentionCache};
+use eredu_nn::{NeuralBackend, Parameterized, PoolingAttentionCache, Tensor};
 use eredu_runtime::{
     BackendMechanismCapabilities, CacheResidencyPolicy, CacheResidencyReport,
-    DenseDiskStreamReport, GroupedOperationRequirement, LayerRuntimeState,
+    DenseDiskStreamReport, GroupedOperationRequirement, LayerRuntimeState, LayeredArchitecture,
     ReplicatedTextArchitecture, ReplicatedTextMaterializationTask, ReplicatedTextRequirements,
     ReplicatedTextSelectionRequest, ReplicatedTextSession, ReplicatedTextSessionMechanisms,
-    ResidencyReport, RuntimeState, SelectedReplicatedTextRealization, SelectedStateRealization,
-    StateComponentMechanism, StateComponentPlacement, StateMechanismCapabilities, WeightBinding,
+    ResidencyReport, RuntimeState, RuntimeStateComponents, SelectedReplicatedTextRealization,
+    SelectedStateRealization, StateComponentMechanism, StateComponentPlacement,
+    StateMechanismCapabilities, TransactionalPromptCacheMechanisms, WeightBinding,
     WeightLoweringCapability, WeightLoweringDescriptor, WeightLoweringKind,
     WeightResidencyMechanism,
 };
+
+type MlxDirectPartitionExecutor<A> =
+    eredu_architectures::partitioned_execution::DirectPartitionExecutor<
+        A,
+        MlxNeuralBackend,
+        MlxHybridState,
+        MlxArchitectureLayerwisePolicy<A, MlxHybridState>,
+    >;
+
+type MlxDirectPartitionStrategy<A> = eredu_runtime::PartitionedTextExecution<
+    MlxDirectPartitionExecutor<A>,
+    crate::backend::runtime::distributed::Group,
+    crate::backend::runtime::distributed::topology::CommunicationRouteRealization,
+    crate::backend::nn::shared::MlxCommunicationTensorMetadata,
+    eredu_runtime::NoBoundaryTransport,
+    eredu_runtime::OpaqueOutputPublisher,
+    eredu_runtime::OpaqueFailureAgreement,
+>;
+
+type MlxSharedAddressableBank =
+    crate::backend::runtime::residency::parameter_bank::SharedAddressableParameterBank;
 use safemlx::{
-    error::Exception, ops::indexing::TryIndexOp, transforms::async_eval_with_event, Array, Stream,
+    error::Exception, ops::indexing::TryIndexOp, transforms::async_eval_with_event, Array, Dtype,
+    Stream,
 };
+
+#[derive(Clone, Copy, Default)]
+struct MlxPartitionTensorAllocator;
+
+impl eredu_architectures::partitioned_execution::PartitionTensorAllocator<MlxNeuralBackend>
+    for MlxPartitionTensorAllocator
+{
+    fn tensor_to_wire(
+        &mut self,
+        tensor: MlxTensor,
+        logical_dtype: eredu_runtime::BoundaryTensorDtype,
+        activation_dtype: eredu_runtime::PipelineActivationDtype,
+        context: &Stream,
+    ) -> Result<MlxTensor, eredu_nn::Error> {
+        let dtype = mlx_boundary_dtype(logical_dtype, activation_dtype)?;
+        let source = tensor.as_array().dtype();
+        let valid = match logical_dtype {
+            eredu_runtime::BoundaryTensorDtype::Activation => {
+                matches!(source, Dtype::Float16 | Dtype::Bfloat16 | Dtype::Float32)
+            }
+            eredu_runtime::BoundaryTensorDtype::Uint32 => source == Dtype::Uint32,
+            eredu_runtime::BoundaryTensorDtype::Int32 => source == Dtype::Int32,
+            _ => false,
+        };
+        if !valid {
+            return Err(eredu_nn::Error::backend(
+                "MLX pipeline source tensor does not match its logical boundary dtype",
+            ));
+        }
+        tensor
+            .as_array()
+            .as_dtype(dtype, context)
+            .map(MlxTensor::from_array)
+            .map_err(|error| eredu_nn::Error::backend(error.to_string()))
+    }
+
+    fn tensor_placeholder(
+        &mut self,
+        shape: &[i32],
+        logical_dtype: eredu_runtime::BoundaryTensorDtype,
+        activation_dtype: eredu_runtime::PipelineActivationDtype,
+        context: &Stream,
+    ) -> Result<MlxTensor, eredu_nn::Error> {
+        let dtype = mlx_boundary_dtype(logical_dtype, activation_dtype)?;
+        safemlx::ops::zeros_dtype(shape, dtype, context)
+            .map(MlxTensor::from_array)
+            .map_err(|error| eredu_nn::Error::backend(error.to_string()))
+    }
+}
+
+fn mlx_boundary_dtype(
+    logical: eredu_runtime::BoundaryTensorDtype,
+    activation: eredu_runtime::PipelineActivationDtype,
+) -> Result<Dtype, eredu_nn::Error> {
+    match logical {
+        eredu_runtime::BoundaryTensorDtype::Activation => mlx_pipeline_activation_dtype(activation),
+        eredu_runtime::BoundaryTensorDtype::Uint32 => Ok(Dtype::Uint32),
+        eredu_runtime::BoundaryTensorDtype::Int32 => Ok(Dtype::Int32),
+        _ => Err(eredu_nn::Error::backend(
+            "MLX pipeline boundary uses an unsupported logical dtype",
+        )),
+    }
+}
+
+fn mlx_pipeline_activation_dtype(
+    dtype: eredu_runtime::PipelineActivationDtype,
+) -> Result<Dtype, eredu_nn::Error> {
+    match dtype {
+        eredu_runtime::PipelineActivationDtype::Float16 => Ok(Dtype::Float16),
+        eredu_runtime::PipelineActivationDtype::Bfloat16 => Ok(Dtype::Bfloat16),
+        eredu_runtime::PipelineActivationDtype::Float32 => Ok(Dtype::Float32),
+        _ => Err(eredu_nn::Error::backend(
+            "unsupported MLX pipeline wire dtype",
+        )),
+    }
+}
+
+type MlxPipelinePartitionExecutor<A, S> =
+    eredu_architectures::partitioned_execution::PipelinePartitionExecutor<
+        A,
+        MlxNeuralBackend,
+        S,
+        MlxArchitectureLayerwisePolicy<A, S>,
+        MlxPartitionTensorAllocator,
+    >;
+
+type MlxPipelinePartitionStrategy<A, S> = eredu_runtime::PartitionedTextExecution<
+    MlxPipelinePartitionExecutor<A, S>,
+    crate::backend::runtime::distributed::Group,
+    crate::backend::runtime::distributed::topology::CommunicationRouteRealization,
+    crate::backend::nn::shared::MlxCommunicationTensorMetadata,
+    eredu_runtime::OpaqueBoundaryTransport,
+    eredu_runtime::OpaqueOutputPublisher,
+    eredu_runtime::OpaqueFailureAgreement,
+>;
 
 #[cfg(test)]
 use eredu_runtime::PagedCacheOptions;
@@ -40,7 +164,8 @@ use crate::{
                 },
             },
             execution::generic::{
-                MlxLayerwisePolicy, MlxResidentPolicy, MlxSelectiveUnitPopulator,
+                MlxLayerwisePolicy, MlxResidentPolicy, MlxResidentUnit, MlxSelectiveUnitPopulator,
+                MlxUnitLease, MlxUnitPopulator,
             },
             media::input,
         },
@@ -49,21 +174,314 @@ use crate::{
     MlxTensor,
 };
 
-use crate::backend::nn::shared::MlxModule;
-use crate::backend::runtime::checkpoint::binding::build_exact_replicated_text_bindings;
 use crate::backend::runtime::execution::{
     generic::prepare_layerwise_policy_from_bindings,
-    layerwise::quantize_exact_replicated_text_tasks,
+    layerwise::{
+        quantize_exact_replicated_text_tasks, shard_addressable_member_bindings,
+        shard_layer_bindings,
+    },
+};
+use crate::backend::{
+    nn::shared::neutral_parameter_refs,
+    runtime::checkpoint::binding::build_exact_replicated_text_bindings,
 };
 
 use eredu_architectures::composite_execution::{
-    CompositeArchitecture, PreparedCompositeArchitecture, PreparedCompositeInput,
+    CompositeArchitecture, ExternalPredictionCaptureRequest, ExternalPredictionTargetCapture,
+    ExternalPredictionTargetOperation, PreparedCompositeArchitecture, PreparedCompositeInput,
 };
 use eredu_architectures::replicated_text::{
     CompositeTextArchitectureVisitor, PreparedCompositeTextArchitecture,
     PreparedReplicatedTextArchitecture, PreparedRoutedCompositeTextArchitecture,
     ReplicatedTextArchitectureVisitor, ReplicatedTextProfileDispatcher,
 };
+
+enum MlxSelectedLayerwisePolicyInner<U, P> {
+    Resident(MlxResidentPolicy<U>),
+    Bounded {
+        policy: MlxLayerwisePolicy<U, P>,
+        local_addresses: Vec<eredu_runtime::ExecutionUnitAddress>,
+    },
+}
+
+struct MlxSelectedLayerwisePolicy<U, P> {
+    inner: Arc<Mutex<MlxSelectedLayerwisePolicyInner<U, P>>>,
+}
+
+type MlxArchitectureLayerwisePolicy<A, S> = MlxSelectedLayerwisePolicy<
+    <A as LayeredArchitecture<MlxNeuralBackend, S>>::Unit,
+    MlxSelectiveUnitPopulator,
+>;
+
+impl<U, P> Clone for MlxSelectedLayerwisePolicy<U, P> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+impl<U, P> MlxSelectedLayerwisePolicy<U, P> {
+    fn resident(policy: MlxResidentPolicy<U>) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(MlxSelectedLayerwisePolicyInner::Resident(
+                policy,
+            ))),
+        }
+    }
+
+    fn bounded(
+        policy: MlxLayerwisePolicy<U, P>,
+        layout: &eredu_runtime::ExecutionUnitLayout,
+    ) -> Self {
+        let local_addresses = (0..layout.len())
+            .map(|ordinal| {
+                layout
+                    .address(ordinal)
+                    .expect("validated execution layout covers every ordinal")
+            })
+            .collect();
+        Self {
+            inner: Arc::new(Mutex::new(MlxSelectedLayerwisePolicyInner::Bounded {
+                policy,
+                local_addresses,
+            })),
+        }
+    }
+
+    fn residency_report(&self) -> Result<ResidencyReport, Error> {
+        let policy = self.inner.lock().map_err(|_| {
+            Error::ArchitectureModel("selected layerwise policy lock was poisoned".into())
+        })?;
+        match &*policy {
+            MlxSelectedLayerwisePolicyInner::Resident(policy) => policy.residency_report(),
+            MlxSelectedLayerwisePolicyInner::Bounded { policy, .. } => policy.residency_report(),
+        }
+    }
+
+    fn dense_stream_report(&self) -> Result<Option<DenseDiskStreamReport>, Error> {
+        let policy = self.inner.lock().map_err(|_| {
+            Error::ArchitectureModel("selected layerwise policy lock was poisoned".into())
+        })?;
+        match &*policy {
+            MlxSelectedLayerwisePolicyInner::Resident(_) => Ok(None),
+            MlxSelectedLayerwisePolicyInner::Bounded { policy, .. } => policy.dense_stream_report(),
+        }
+    }
+}
+
+enum MlxSelectedUnitLease<U> {
+    Resident(MlxResidentUnit<U>),
+    Bounded(MlxUnitLease<U>),
+}
+
+impl<U> Deref for MlxSelectedUnitLease<U> {
+    type Target = U;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Resident(lease) => lease,
+            Self::Bounded(lease) => lease,
+        }
+    }
+}
+
+impl<U> DerefMut for MlxSelectedUnitLease<U> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self {
+            Self::Resident(lease) => lease,
+            Self::Bounded(lease) => lease,
+        }
+    }
+}
+
+impl<U, P> eredu_runtime::LayerwisePolicy<MlxNeuralBackend, U> for MlxSelectedLayerwisePolicy<U, P>
+where
+    U: eredu_nn::Parameterized<MlxTensor>,
+    P: MlxUnitPopulator<U>,
+{
+    type Lease = MlxSelectedUnitLease<U>;
+    type Error = Error;
+
+    fn begin(&mut self, initial: &MlxTensor, context: &Stream) -> Result<(), Self::Error> {
+        let mut policy = self.inner.lock().map_err(|_| {
+            Error::ArchitectureModel("selected layerwise policy lock was poisoned".into())
+        })?;
+        match &mut *policy {
+            MlxSelectedLayerwisePolicyInner::Resident(policy) => policy.begin(initial, context),
+            MlxSelectedLayerwisePolicyInner::Bounded { policy, .. } => {
+                policy.begin(initial, context)
+            }
+        }
+    }
+
+    fn abort(
+        &mut self,
+        active: Option<(usize, eredu_runtime::ExecutionUnitAddress, Self::Lease)>,
+        context: &Stream,
+    ) {
+        let Ok(mut policy) = self.inner.lock() else {
+            drop(active);
+            return;
+        };
+        match (&mut *policy, active) {
+            (
+                MlxSelectedLayerwisePolicyInner::Resident(policy),
+                Some((ordinal, address, MlxSelectedUnitLease::Resident(lease))),
+            ) => policy.abort(Some((ordinal, address, lease)), context),
+            (
+                MlxSelectedLayerwisePolicyInner::Bounded {
+                    policy,
+                    local_addresses,
+                },
+                Some((ordinal, address, MlxSelectedUnitLease::Bounded(lease))),
+            ) => policy.abort(
+                Some((
+                    ordinal,
+                    local_addresses.get(ordinal).copied().unwrap_or(address),
+                    lease,
+                )),
+                context,
+            ),
+            (MlxSelectedLayerwisePolicyInner::Resident(policy), None) => {
+                policy.abort(None, context)
+            }
+            (MlxSelectedLayerwisePolicyInner::Bounded { policy, .. }, None) => {
+                policy.abort(None, context)
+            }
+            (MlxSelectedLayerwisePolicyInner::Resident(policy), Some(_)) => {
+                policy.abort(None, context)
+            }
+            (MlxSelectedLayerwisePolicyInner::Bounded { policy, .. }, Some(_)) => {
+                policy.abort(None, context)
+            }
+        }
+    }
+
+    fn acquire<E, F>(
+        &mut self,
+        ordinal: usize,
+        address: eredu_runtime::ExecutionUnitAddress,
+        build: F,
+        context: &Stream,
+    ) -> Result<Self::Lease, eredu_runtime::LayerwiseAcquireError<E, Self::Error>>
+    where
+        F: FnOnce(&Stream) -> Result<U, E>,
+    {
+        let mut policy = self.inner.lock().map_err(|_| {
+            eredu_runtime::LayerwiseAcquireError::Policy(Error::ArchitectureModel(
+                "selected layerwise policy lock was poisoned".into(),
+            ))
+        })?;
+        match &mut *policy {
+            MlxSelectedLayerwisePolicyInner::Resident(policy) => policy
+                .acquire(ordinal, address, build, context)
+                .map(MlxSelectedUnitLease::Resident),
+            MlxSelectedLayerwisePolicyInner::Bounded {
+                policy,
+                local_addresses,
+            } => {
+                let local = local_addresses.get(ordinal).copied().ok_or_else(|| {
+                    eredu_runtime::LayerwiseAcquireError::Policy(Error::ArchitectureModel(format!(
+                        "bounded partition unit ordinal {ordinal} has no local slot"
+                    )))
+                })?;
+                if local.group() != address.group() {
+                    return Err(eredu_runtime::LayerwiseAcquireError::Policy(
+                        Error::ArchitectureModel(format!(
+                            "bounded partition unit group {} differs from local group {}",
+                            address.group(),
+                            local.group()
+                        )),
+                    ));
+                }
+                policy.acquire(ordinal, local, build, context).map(|lease| {
+                    #[cfg(test)]
+                    super::path_instrumentation::bounded_unit_acquisition();
+                    MlxSelectedUnitLease::Bounded(lease)
+                })
+            }
+        }
+    }
+
+    fn complete<'a, StateValues, ContextValues>(
+        &mut self,
+        ordinal: usize,
+        address: eredu_runtime::ExecutionUnitAddress,
+        lease: Self::Lease,
+        output: &'a MlxTensor,
+        state_values: StateValues,
+        context_values: ContextValues,
+        context: &Stream,
+    ) -> Result<(), Self::Error>
+    where
+        MlxTensor: 'a,
+        StateValues: Iterator<Item = &'a MlxTensor>,
+        ContextValues: Iterator<Item = &'a MlxTensor>,
+    {
+        let mut policy = self.inner.lock().map_err(|_| {
+            Error::ArchitectureModel("selected layerwise policy lock was poisoned".into())
+        })?;
+        match (&mut *policy, lease) {
+            (
+                MlxSelectedLayerwisePolicyInner::Resident(policy),
+                MlxSelectedUnitLease::Resident(lease),
+            ) => policy.complete(
+                ordinal,
+                address,
+                lease,
+                output,
+                state_values,
+                context_values,
+                context,
+            ),
+            (
+                MlxSelectedLayerwisePolicyInner::Bounded {
+                    policy,
+                    local_addresses,
+                },
+                MlxSelectedUnitLease::Bounded(lease),
+            ) => {
+                let local = local_addresses.get(ordinal).copied().ok_or_else(|| {
+                    Error::ArchitectureModel(format!(
+                        "bounded partition unit ordinal {ordinal} has no local slot"
+                    ))
+                })?;
+                if local.group() != address.group() {
+                    return Err(Error::ArchitectureModel(format!(
+                        "bounded partition unit group {} differs from local group {}",
+                        address.group(),
+                        local.group()
+                    )));
+                }
+                policy.complete(
+                    ordinal,
+                    local,
+                    lease,
+                    output,
+                    state_values,
+                    context_values,
+                    context,
+                )
+            }
+            _ => Err(Error::ArchitectureModel(
+                "selected layerwise policy received a lease from another residency".into(),
+            )),
+        }
+    }
+
+    fn finish(&mut self, output: &MlxTensor, context: &Stream) -> Result<(), Self::Error> {
+        let mut policy = self.inner.lock().map_err(|_| {
+            Error::ArchitectureModel("selected layerwise policy lock was poisoned".into())
+        })?;
+        match &mut *policy {
+            MlxSelectedLayerwisePolicyInner::Resident(policy) => policy.finish(output, context),
+            MlxSelectedLayerwisePolicyInner::Bounded { policy, .. } => {
+                policy.finish(output, context)
+            }
+        }
+    }
+}
 
 /// Reports the exact MLX mechanisms applicable to one neutral requirement set.
 ///
@@ -260,6 +678,19 @@ impl MlxParameterBankTelemetry
     }
 }
 
+impl<E, G, R, I, T, U, V> MlxParameterBankTelemetry
+    for eredu_runtime::PartitionedTextExecution<E, G, R, I, T, U, V>
+{
+    fn parameter_bank_report(
+        &self,
+    ) -> Result<
+        Option<crate::backend::runtime::residency::parameter_bank::ParameterBankResidencyReport>,
+        Error,
+    > {
+        Ok(None)
+    }
+}
+
 type MlxAddressableGated = eredu_architectures::PlannedAddressableGatedProduct<
     MlxNeuralBackend,
     crate::backend::runtime::residency::parameter_bank::AddressableParameterBank,
@@ -296,8 +727,793 @@ macro_rules! addressable_bank_telemetry {
 addressable_bank_telemetry!(MlxAddressableGated);
 addressable_bank_telemetry!(MlxAddressableRelu2);
 
+trait ErasedPredictionTargetState: std::any::Any {
+    fn deep_clone_box(&self) -> Result<Box<dyn ErasedPredictionTargetState>, Exception>;
+    fn restore_box(
+        &mut self,
+        checkpoint: &dyn ErasedPredictionTargetState,
+        stream: &Stream,
+    ) -> Result<(), Exception>;
+    fn as_any(&self) -> &dyn std::any::Any;
+    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any>;
+}
+
+impl<S> ErasedPredictionTargetState for S
+where
+    S: MlxStateMechanisms + 'static,
+{
+    fn deep_clone_box(&self) -> Result<Box<dyn ErasedPredictionTargetState>, Exception> {
+        self.deep_checkpoint()
+            .map(|state| Box::new(state) as Box<dyn ErasedPredictionTargetState>)
+    }
+
+    fn restore_box(
+        &mut self,
+        checkpoint: &dyn ErasedPredictionTargetState,
+        stream: &Stream,
+    ) -> Result<(), Exception> {
+        let checkpoint = checkpoint
+            .as_any()
+            .downcast_ref::<S>()
+            .ok_or_else(|| Exception::custom("prediction target checkpoint state type changed"))?;
+        self.restore_checkpoint(checkpoint, stream)
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
+        self
+    }
+}
+
+pub(crate) struct MlxPredictionTargetCache {
+    state: Option<Box<dyn ErasedPredictionTargetState>>,
+    extension: Option<MlxPredictionExtensionState>,
+}
+
+#[derive(Clone)]
+pub(crate) struct MlxPredictionDraftCache {
+    extension: Option<MlxPredictionExtensionState>,
+}
+
+impl Clone for MlxPredictionTargetCache {
+    fn clone(&self) -> Self {
+        Self {
+            state: self.state.as_ref().map(|state| {
+                state
+                    .deep_clone_box()
+                    .expect("evaluated neutral prediction target state must be forkable")
+            }),
+            extension: self.extension.clone(),
+        }
+    }
+}
+
+impl MlxPredictionTargetCache {
+    pub(crate) fn draft_cache(&self) -> MlxPredictionDraftCache {
+        MlxPredictionDraftCache {
+            extension: self.extension.clone(),
+        }
+    }
+
+    pub(crate) fn commit_draft_cache(&mut self, draft: &MlxPredictionDraftCache) {
+        self.extension.clone_from(&draft.extension);
+    }
+
+    pub(crate) fn offset(&self) -> Result<i32, Error> {
+        self.state
+            .as_ref()
+            .and_then(|state| state.as_any().downcast_ref::<MlxHybridState>())
+            .map(MlxHybridState::offset)
+            .ok_or_else(|| {
+                Error::ArchitectureModel(
+                    "external-assistant lane does not own hybrid target state".into(),
+                )
+            })
+    }
+
+    pub(crate) fn restore_checkpoint(
+        &mut self,
+        checkpoint: &Self,
+        stream: &Stream,
+    ) -> Result<(), Exception> {
+        match (&mut self.state, &checkpoint.state) {
+            (Some(current), Some(previous)) => current.restore_box(previous.as_ref(), stream)?,
+            (None, None) => {}
+            _ => {
+                return Err(Exception::custom(
+                    "prediction target checkpoint state presence changed",
+                ))
+            }
+        }
+        self.extension.clone_from(&checkpoint.extension);
+        Ok(())
+    }
+}
+
+impl MlxPredictionDraftCache {
+    pub(crate) fn with_extension<T, E>(
+        &mut self,
+        operation: impl FnOnce(&mut MlxPredictionTargetCache) -> Result<T, E>,
+    ) -> Result<T, E> {
+        let mut cache = MlxPredictionTargetCache {
+            state: None,
+            extension: self.extension.take(),
+        };
+        let result = operation(&mut cache);
+        self.extension = cache.extension;
+        result
+    }
+}
+
+struct ExactPredictionCaptureObserver {
+    paths: Vec<String>,
+    values: std::rc::Rc<std::cell::RefCell<Vec<Option<MlxTensor>>>>,
+}
+
+impl ExactPredictionCaptureObserver {
+    fn new(paths: Vec<String>) -> Result<Self, Error> {
+        if paths.is_empty() {
+            return Err(Error::ArchitectureModel(
+                "external-assistant capture declares no target paths".into(),
+            ));
+        }
+        let unique = paths.iter().collect::<std::collections::BTreeSet<_>>();
+        if unique.len() != paths.len() {
+            return Err(Error::ArchitectureModel(
+                "external-assistant capture paths are not unique".into(),
+            ));
+        }
+        let values = std::rc::Rc::new(std::cell::RefCell::new(vec![None; paths.len()]));
+        Ok(Self { paths, values })
+    }
+}
+
+impl eredu_runtime::ActivationObserver<MlxTensor, eredu_nn::Error>
+    for ExactPredictionCaptureObserver
+{
+    fn observe(&mut self, path: &str, value: &MlxTensor) -> Result<(), eredu_nn::Error> {
+        if let Some(index) = self.paths.iter().position(|expected| expected == path) {
+            if self.values.borrow_mut()[index]
+                .replace(value.clone())
+                .is_some()
+            {
+                return Err(eredu_nn::Error::backend(format!(
+                    "external-assistant target reached capture path {path} more than once"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+struct CompositePredictionTargetOperation<'a> {
+    operation: ExternalPredictionTargetOperation<'a, MlxTensor>,
+}
+
+impl<A>
+    eredu_runtime::PredictionTargetOperation<
+        PreparedCompositeArchitecture<A>,
+        MlxNeuralBackend,
+        MlxHybridState,
+    > for CompositePredictionTargetOperation<'_>
+where
+    A: CompositeArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error> + 'static,
+    A::InputPartPlan: 'static,
+{
+    type Output = MlxTensor;
+
+    fn apply(
+        self,
+        architecture: &mut PreparedCompositeArchitecture<A>,
+        _state: &mut MlxHybridState,
+        parallel: Option<&<MlxNeuralBackend as NeuralBackend>::ParallelContext>,
+        context: &Stream,
+    ) -> Result<Self::Output, eredu_nn::Error> {
+        if parallel.is_some() {
+            return Err(eredu_nn::Error::backend(
+                "external assistant target operations are unavailable under tensor parallelism",
+            ));
+        }
+        architecture
+            .inner_mut()
+            .external_prediction_target_operation(self.operation, context)?
+            .ok_or_else(|| {
+                eredu_nn::Error::backend(
+                    "architecture does not implement the selected external target operation",
+                )
+            })
+    }
+}
+
+pub(crate) enum MlxPredictionExtension {
+    DeepSeekV3 {
+        units: Vec<
+            crate::backend::nn::shared::MlxModule<
+                eredu_architectures::deepseek::v3::Unit<MlxNeuralBackend>,
+            >,
+        >,
+    },
+    DeepSeekV4 {
+        units: Vec<
+            crate::backend::nn::shared::MlxModule<
+                eredu_architectures::deepseek::v4::Unit<MlxNeuralBackend>,
+            >,
+        >,
+        state: Vec<crate::backend::runtime::cache::state::MlxPoolingAttentionCache>,
+    },
+    Inkling {
+        model: crate::backend::nn::shared::MlxModule<
+            eredu_architectures::inkling::MtpModel<MlxNeuralBackend>,
+        >,
+        state: MlxHybridState,
+    },
+    QwenHybrid {
+        units: Vec<
+            crate::backend::nn::shared::MlxModule<
+                eredu_architectures::qwen::hybrid::PredictionUnit<MlxNeuralBackend>,
+            >,
+        >,
+        state: MlxHybridState,
+    },
+    NemotronH {
+        groups: Vec<
+            Vec<
+                crate::backend::nn::shared::MlxModule<
+                    eredu_architectures::nemotron_h::PredictionUnit<MlxNeuralBackend>,
+                >,
+            >,
+        >,
+        state: MlxHybridState,
+    },
+}
+
+#[derive(Clone)]
+enum MlxPredictionExtensionState {
+    DeepSeekV3(Vec<crate::backend::runtime::cache::kv::CompressedLatentCache>),
+    DeepSeekV4(Vec<crate::backend::runtime::cache::state::MlxPoolingAttentionCache>),
+    Inkling(MlxHybridState),
+    QwenHybrid(MlxHybridState),
+    NemotronH(MlxHybridState),
+}
+
+impl MlxPredictionExtension {
+    fn depth(&self) -> usize {
+        match self {
+            Self::DeepSeekV3 { units } => units.len(),
+            Self::DeepSeekV4 { units, .. } => units.len(),
+            Self::Inkling { model, .. } => model.len(),
+            Self::QwenHybrid { units, .. } => units.len(),
+            Self::NemotronH { groups, .. } => groups.len(),
+        }
+    }
+
+    fn new_state(&self) -> MlxPredictionExtensionState {
+        match self {
+            Self::DeepSeekV3 { units } => MlxPredictionExtensionState::DeepSeekV3(
+                (0..units.len())
+                    .map(|_| crate::backend::runtime::cache::kv::CompressedLatentCache::new())
+                    .collect(),
+            ),
+            Self::DeepSeekV4 { state, .. } => {
+                MlxPredictionExtensionState::DeepSeekV4(state.clone())
+            }
+            Self::Inkling { state, .. } => MlxPredictionExtensionState::Inkling(state.clone()),
+            Self::QwenHybrid { state, .. } => {
+                MlxPredictionExtensionState::QwenHybrid(state.clone())
+            }
+            Self::NemotronH { state, .. } => MlxPredictionExtensionState::NemotronH(state.clone()),
+        }
+    }
+}
+
+struct V3PredictionUnitOperation<'a> {
+    unit: &'a mut crate::backend::nn::shared::MlxModule<
+        eredu_architectures::deepseek::v3::Unit<MlxNeuralBackend>,
+    >,
+    hidden: &'a MlxTensor,
+    tokens: &'a MlxTensor,
+    cache: &'a mut crate::backend::runtime::cache::kv::CompressedLatentCache,
+}
+
+impl<A, S> eredu_runtime::PredictionTargetOperation<A, MlxNeuralBackend, S>
+    for V3PredictionUnitOperation<'_>
+where
+    S: RuntimeState<MlxNeuralBackend>,
+    A: ReplicatedTextArchitecture<MlxNeuralBackend, S, Error = eredu_nn::Error> + 'static,
+{
+    type Output = eredu_architectures::deepseek::mtp::PredictionOutput<MlxTensor>;
+
+    fn apply(
+        self,
+        architecture: &mut A,
+        _state: &mut S,
+        parallel: Option<&<MlxNeuralBackend as NeuralBackend>::ParallelContext>,
+        context: &Stream,
+    ) -> Result<Self::Output, eredu_nn::Error> {
+        let architecture = (architecture as &mut dyn std::any::Any)
+            .downcast_mut::<eredu_architectures::deepseek::v3::Model<MlxNeuralBackend>>()
+            .ok_or_else(|| {
+                eredu_nn::Error::backend(
+                    "DeepSeek-V3 prediction extension received a different target architecture",
+                )
+            })?;
+        let result = if let Some(parallel) = parallel {
+            architecture.pipeline_forward_prediction_neutral_parallel(
+                self.unit,
+                self.hidden,
+                self.tokens,
+                self.cache,
+                parallel,
+                context,
+            )
+        } else {
+            architecture.pipeline_forward_prediction(
+                self.unit,
+                self.hidden,
+                self.tokens,
+                self.cache,
+                context,
+            )
+        };
+        result.map_err(|error| eredu_nn::Error::backend(error.to_string()))
+    }
+}
+
+struct V4PredictionUnitOperation<'a> {
+    unit: &'a mut crate::backend::nn::shared::MlxModule<
+        eredu_architectures::deepseek::v4::Unit<MlxNeuralBackend>,
+    >,
+    hidden: &'a MlxTensor,
+    tokens: &'a MlxTensor,
+    cache: &'a mut crate::backend::runtime::cache::state::MlxPoolingAttentionCache,
+}
+
+impl<A, S> eredu_runtime::PredictionTargetOperation<A, MlxNeuralBackend, S>
+    for V4PredictionUnitOperation<'_>
+where
+    S: RuntimeState<MlxNeuralBackend>,
+    A: ReplicatedTextArchitecture<MlxNeuralBackend, S, Error = eredu_nn::Error> + 'static,
+{
+    type Output = eredu_architectures::deepseek::mtp::PredictionOutput<MlxTensor>;
+
+    fn apply(
+        self,
+        architecture: &mut A,
+        _state: &mut S,
+        parallel: Option<&<MlxNeuralBackend as NeuralBackend>::ParallelContext>,
+        context: &Stream,
+    ) -> Result<Self::Output, eredu_nn::Error> {
+        let architecture = (architecture as &mut dyn std::any::Any)
+            .downcast_mut::<eredu_architectures::deepseek::v4::Model<MlxNeuralBackend>>()
+            .ok_or_else(|| {
+                eredu_nn::Error::backend(
+                    "DeepSeek-V4 prediction extension received a different target architecture",
+                )
+            })?;
+        let hidden = architecture.begin_partition_prediction_hidden(self.hidden, context)?;
+        let output = if let Some(parallel) = parallel {
+            architecture.pipeline_forward_prediction_neutral_parallel(
+                self.unit,
+                &hidden,
+                self.tokens,
+                self.cache,
+                parallel,
+                context,
+            )
+        } else {
+            architecture.pipeline_forward_prediction(
+                self.unit,
+                &hidden,
+                self.tokens,
+                self.cache,
+                context,
+            )
+        }?;
+        architecture.finish_partition_prediction_output(output, context)
+    }
+}
+
+struct InklingPredictionUnitOperation<'a> {
+    model: &'a mut crate::backend::nn::shared::MlxModule<
+        eredu_architectures::inkling::MtpModel<MlxNeuralBackend>,
+    >,
+    hidden: &'a MlxTensor,
+    tokens: &'a MlxTensor,
+    depth: usize,
+    state: &'a mut MlxHybridState,
+}
+
+struct QwenHybridPredictionUnitOperation<'a> {
+    unit: &'a mut crate::backend::nn::shared::MlxModule<
+        eredu_architectures::qwen::hybrid::PredictionUnit<MlxNeuralBackend>,
+    >,
+    hidden: &'a MlxTensor,
+    tokens: &'a MlxTensor,
+    depth: usize,
+    state: &'a mut MlxHybridState,
+}
+
+struct NemotronHPredictionGroupOperation<'a> {
+    units: &'a mut [crate::backend::nn::shared::MlxModule<
+        eredu_architectures::nemotron_h::PredictionUnit<MlxNeuralBackend>,
+    >],
+    hidden: &'a MlxTensor,
+    tokens: &'a MlxTensor,
+    depth: usize,
+    state: &'a mut MlxHybridState,
+}
+
+impl<A, S> eredu_runtime::PredictionTargetOperation<A, MlxNeuralBackend, S>
+    for NemotronHPredictionGroupOperation<'_>
+where
+    S: RuntimeState<MlxNeuralBackend>,
+    A: ReplicatedTextArchitecture<MlxNeuralBackend, S, Error = eredu_nn::Error> + 'static,
+{
+    type Output = crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput;
+
+    fn apply(
+        self,
+        architecture: &mut A,
+        _state: &mut S,
+        parallel: Option<&<MlxNeuralBackend as NeuralBackend>::ParallelContext>,
+        context: &Stream,
+    ) -> Result<Self::Output, eredu_nn::Error> {
+        let architecture = (architecture as &mut dyn std::any::Any)
+            .downcast_mut::<
+                eredu_architectures::nemotron_h::PartitionedLayeredModel<MlxNeuralBackend>,
+            >()
+            .ok_or_else(|| {
+                eredu_nn::Error::backend(
+                    "Nemotron-H prediction extension received a different target architecture",
+                )
+            })?;
+        if self.units.is_empty() {
+            return Err(eredu_nn::Error::backend(
+                "Nemotron-H prediction group has no physical units",
+            ));
+        }
+        let embedded = match parallel {
+            Some(parallel) => {
+                architecture.embed_prediction_parallel(self.tokens, parallel, context)?
+            }
+            None => architecture.embed_prediction(self.tokens, context)?,
+        };
+        let state_start = self
+            .depth
+            .checked_mul(self.units.len())
+            .ok_or_else(|| eredu_nn::Error::backend("Nemotron-H MTP state index overflowed"))?;
+        let sequence = self.tokens.dim(1);
+        let mask = if sequence > 1 {
+            Some(<MlxNeuralBackend as NeuralBackend>::causal_mask(
+                sequence,
+                self.state
+                    .layer(state_start)
+                    .map_err(eredu_nn::Error::backend)?
+                    .position(),
+                None,
+                context,
+            )?)
+        } else {
+            None
+        };
+        let mut hidden = self.hidden.clone();
+        for (relative, unit) in self.units.iter_mut().enumerate() {
+            let state = self
+                .state
+                .layer(state_start + relative)
+                .map_err(eredu_nn::Error::backend)?;
+            hidden = match parallel {
+                Some(parallel) => unit.forward_parallel_with_provider(
+                    &hidden,
+                    &embedded,
+                    mask.as_ref(),
+                    state,
+                    parallel,
+                    context,
+                    &mut eredu_runtime::ResidentExpertProvider,
+                )?,
+                None => unit.forward(&hidden, &embedded, mask.as_ref(), state, context)?,
+            };
+        }
+        let logits = match parallel {
+            Some(parallel) => {
+                architecture.project_prediction_parallel(&hidden, parallel, context)?
+            }
+            None => architecture.project_prediction(&hidden, context)?,
+        };
+        Ok(
+            crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput {
+                logits,
+                hidden,
+                tokens: self.tokens.clone(),
+            },
+        )
+    }
+}
+
+impl<A>
+    eredu_runtime::PredictionTargetOperation<
+        PreparedCompositeArchitecture<A>,
+        MlxNeuralBackend,
+        MlxHybridState,
+    > for QwenHybridPredictionUnitOperation<'_>
+where
+    A: CompositeArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error> + 'static,
+    A::InputPartPlan: 'static,
+{
+    type Output = crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput;
+
+    fn apply(
+        self,
+        architecture: &mut PreparedCompositeArchitecture<A>,
+        _state: &mut MlxHybridState,
+        parallel: Option<&<MlxNeuralBackend as NeuralBackend>::ParallelContext>,
+        context: &Stream,
+    ) -> Result<Self::Output, eredu_nn::Error> {
+        let architecture = (architecture.inner_mut() as &mut dyn std::any::Any)
+            .downcast_mut::<
+                eredu_architectures::qwen::hybrid::ConditionalLayeredModel<MlxNeuralBackend>,
+            >()
+            .ok_or_else(|| {
+                eredu_nn::Error::backend(
+                    "Qwen hybrid prediction extension received a different target architecture",
+                )
+            })?;
+        let embedded = match parallel {
+            Some(parallel) => architecture.begin_partition_prediction_embedding_parallel(
+                self.tokens,
+                parallel,
+                context,
+            )?,
+            None => architecture.begin_partition_prediction_embedding(self.tokens, context)?,
+        };
+        let state = self
+            .state
+            .layer(self.depth)
+            .map_err(eredu_nn::Error::backend)?;
+        let sequence = self.tokens.dim(1);
+        let mask = if sequence > 1 {
+            Some(<MlxNeuralBackend as NeuralBackend>::causal_mask(
+                sequence,
+                state.position(),
+                None,
+                context,
+            )?)
+        } else {
+            None
+        };
+        let hidden = match parallel {
+            Some(parallel) => self.unit.forward_parallel(
+                self.hidden,
+                &embedded,
+                mask.as_ref(),
+                state,
+                parallel,
+                context,
+                &mut eredu_runtime::ResidentExpertProvider,
+            )?,
+            None => self
+                .unit
+                .forward(self.hidden, &embedded, mask.as_ref(), state, context)?,
+        };
+        let logits = match parallel {
+            Some(parallel) => {
+                architecture.finish_partition_prediction_parallel(&hidden, parallel, context)?
+            }
+            None => architecture.finish_partition_prediction(&hidden, context)?,
+        };
+        Ok(
+            crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput {
+                logits,
+                hidden,
+                tokens: self.tokens.clone(),
+            },
+        )
+    }
+}
+
+impl<A>
+    eredu_runtime::PredictionTargetOperation<
+        PreparedCompositeArchitecture<A>,
+        MlxNeuralBackend,
+        MlxHybridState,
+    > for InklingPredictionUnitOperation<'_>
+where
+    A: CompositeArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error> + 'static,
+    A::InputPartPlan: 'static,
+{
+    type Output = crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput;
+
+    fn apply(
+        self,
+        architecture: &mut PreparedCompositeArchitecture<A>,
+        _state: &mut MlxHybridState,
+        parallel: Option<&<MlxNeuralBackend as NeuralBackend>::ParallelContext>,
+        context: &Stream,
+    ) -> Result<Self::Output, eredu_nn::Error> {
+        let architecture = (architecture.inner_mut() as &mut dyn std::any::Any)
+            .downcast_mut::<eredu_architectures::inkling::LayeredModel<MlxNeuralBackend>>()
+            .ok_or_else(|| {
+                eredu_nn::Error::backend(
+                    "Inkling prediction extension received a different target architecture",
+                )
+            })?;
+        let embeddings = match parallel {
+            Some(parallel) => {
+                architecture.mtp_token_embeddings_parallel(self.tokens, parallel, context)?
+            }
+            None => architecture.mtp_token_embeddings(self.tokens, context)?,
+        };
+        let output = self.model.forward_step(
+            self.hidden,
+            &embeddings,
+            self.tokens,
+            self.depth,
+            self.state.layers_mut(),
+            context,
+        )?;
+        let logits = match parallel {
+            Some(parallel) => {
+                architecture.project_mtp_logits_parallel(&output.hidden, parallel, context)?
+            }
+            None => architecture.project_mtp_logits(&output.hidden, context)?,
+        };
+        Ok(
+            crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput {
+                logits,
+                hidden: output.hidden,
+                tokens: output.tokens,
+            },
+        )
+    }
+}
+
+fn materialize_prepared_prediction_unit<M>(
+    prepared: eredu_architectures::prediction_extension::PreparedPredictionUnit<M>,
+    layout: Option<&eredu_runtime::LocalModelLayout>,
+    store: &dyn CheckpointSource,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<crate::backend::nn::shared::MlxModule<M>, Error>
+where
+    M: Parameterized<MlxTensor>,
+{
+    use crate::backend::runtime::checkpoint::binding::{
+        build_module_bindings_with_recipes, materialize_module_bindings,
+        populate_module_from_arrays_excluding,
+    };
+
+    let (source, mut local, recipes) = prepared.into_parts();
+    let bindings = build_module_bindings_with_recipes(&source, "", store, recipes)?;
+    let bindings = match layout {
+        Some(layout) => shard_unmaterialized_bindings(
+            bindings,
+            store,
+            layout,
+            &std::collections::BTreeSet::new(),
+        )?,
+        None => bindings,
+    };
+    let arrays = materialize_module_bindings(store, &bindings, weights_stream, stream)?;
+    populate_module_from_arrays_excluding(&mut local, &arrays, |_| false)?;
+    Ok(crate::backend::nn::shared::MlxModule::new(local))
+}
+
+pub(crate) fn materialize_prediction_extension(
+    prepared: eredu_architectures::prediction_extension::PreparedPredictionExtension<
+        MlxNeuralBackend,
+    >,
+    store: &dyn CheckpointSource,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<MlxPredictionExtension, Error> {
+    use crate::backend::runtime::cache::state::MlxPoolingAttentionCache;
+    match prepared {
+        eredu_architectures::prediction_extension::PreparedPredictionExtension::DeepSeekV3 {
+            layout,
+            units,
+        } => Ok(MlxPredictionExtension::DeepSeekV3 {
+            units: units
+                .into_iter()
+                .map(|unit| {
+                    materialize_prepared_prediction_unit(
+                        unit,
+                        Some(&layout),
+                        store,
+                        stream,
+                        weights_stream,
+                    )
+                })
+                .collect::<Result<_, _>>()?,
+        }),
+        eredu_architectures::prediction_extension::PreparedPredictionExtension::DeepSeekV4 {
+            layout,
+            units,
+            state,
+        } => Ok(MlxPredictionExtension::DeepSeekV4 {
+            units: units
+                .into_iter()
+                .map(|unit| {
+                    materialize_prepared_prediction_unit(
+                        unit,
+                        Some(&layout),
+                        store,
+                        stream,
+                        weights_stream,
+                    )
+                })
+                .collect::<Result<_, _>>()?,
+            state: state
+                .into_iter()
+                .map(|(ordinal, policy)| {
+                    MlxPoolingAttentionCache::resident_from_policy(ordinal, &policy)
+                })
+                .collect::<Result<_, _>>()?,
+        }),
+        eredu_architectures::prediction_extension::PreparedPredictionExtension::Inkling {
+            model,
+            state,
+        } => Ok(MlxPredictionExtension::Inkling {
+            model: materialize_prepared_prediction_unit(
+                model,
+                None,
+                store,
+                stream,
+                weights_stream,
+            )?,
+            state: MlxHybridState::device(state)?,
+        }),
+        eredu_architectures::prediction_extension::PreparedPredictionExtension::QwenHybrid {
+            layout,
+            units,
+            state,
+        } => Ok(MlxPredictionExtension::QwenHybrid {
+            units: units
+                .into_iter()
+                .map(|unit| {
+                    materialize_prepared_prediction_unit(
+                        unit,
+                        Some(&layout),
+                        store,
+                        stream,
+                        weights_stream,
+                    )
+                })
+                .collect::<Result<_, _>>()?,
+            state: MlxHybridState::device(state)?,
+        }),
+        eredu_architectures::prediction_extension::PreparedPredictionExtension::NemotronH {
+            layout,
+            groups,
+            state,
+        } => Ok(MlxPredictionExtension::NemotronH {
+            groups: groups
+                .into_iter()
+                .map(|units| {
+                    units
+                        .into_iter()
+                        .map(|unit| {
+                            materialize_prepared_prediction_unit(
+                                unit,
+                                Some(&layout),
+                                store,
+                                stream,
+                                weights_stream,
+                            )
+                        })
+                        .collect::<Result<_, _>>()
+                })
+                .collect::<Result<_, _>>()?,
+            state: MlxHybridState::device(state)?,
+        }),
+    }
+}
+
 /// Backend-private erased operations for a paired architecture and mutable state.
-pub trait ErasedReplicatedTextExecutable {
+pub(crate) trait ErasedReplicatedTextExecutable {
     fn effective_model_type(&self) -> &str;
     fn capability_estimate(&self) -> &eredu_architectures::capability::CapabilityEstimate;
     #[cfg(test)]
@@ -321,8 +1537,134 @@ pub trait ErasedReplicatedTextExecutable {
         Option<crate::backend::runtime::residency::parameter_bank::ParameterBankResidencyReport>,
         Error,
     >;
+    fn has_partition_control(&self) -> bool {
+        false
+    }
+    fn partition_sampling_context(
+        &self,
+    ) -> Option<(
+        &crate::backend::runtime::distributed::Group,
+        &eredu_runtime::PartitionCommunicationAuthority,
+        &Stream,
+        usize,
+    )> {
+        None
+    }
+    fn partition_public_output(&self) -> bool {
+        true
+    }
+    fn install_prediction_extension_contract(
+        &mut self,
+        _extension: MlxPredictionExtension,
+        _capability: eredu_architectures::capability::CapabilityEstimate,
+    ) -> Result<(), Error> {
+        Err(Error::ArchitectureModel(
+            "the selected neutral executable cannot host a prediction extension".into(),
+        ))
+    }
+    fn prediction_extension_depth(&self) -> Option<usize> {
+        None
+    }
+    fn external_prediction_capture_request(
+        &self,
+        _drafter: &super::speculative::MlxDrafter,
+    ) -> Result<Option<ExternalPredictionCaptureRequest>, Error> {
+        Ok(None)
+    }
+    fn prepare_external_prediction_target_cache(
+        &mut self,
+    ) -> Result<MlxPredictionTargetCache, Error> {
+        Err(Error::ArchitectureModel(
+            "the selected neutral executable has no external-assistant target contract".into(),
+        ))
+    }
+    fn prefill_external_prediction_target(
+        &mut self,
+        _input: input::ModelInput<'_>,
+        _request: &ExternalPredictionCaptureRequest,
+        _cache: &mut MlxPredictionTargetCache,
+    ) -> Result<(MlxTensor, ExternalPredictionTargetCapture<MlxTensor>), Error> {
+        Err(Error::ArchitectureModel(
+            "the selected neutral executable has no external-assistant target contract".into(),
+        ))
+    }
+    fn verify_external_prediction_target(
+        &mut self,
+        _tokens: &MlxTensor,
+        _request: &ExternalPredictionCaptureRequest,
+        _cache: &mut MlxPredictionTargetCache,
+    ) -> Result<(MlxTensor, ExternalPredictionTargetCapture<MlxTensor>), Error> {
+        Err(Error::ArchitectureModel(
+            "the selected neutral executable has no external-assistant target contract".into(),
+        ))
+    }
+    fn apply_external_prediction_target_operation(
+        &mut self,
+        _operation: ExternalPredictionTargetOperation<'_, MlxTensor>,
+    ) -> Result<MlxTensor, Error> {
+        Err(Error::ArchitectureModel(
+            "the selected neutral executable has no external-assistant target contract".into(),
+        ))
+    }
+    fn prepare_prediction_target_cache(&mut self) -> Result<MlxPredictionTargetCache, Error> {
+        Err(Error::ArchitectureModel(
+            "the selected neutral executable has no prediction-target extension".into(),
+        ))
+    }
+    fn prefill_prediction_target(
+        &mut self,
+        input: input::ModelInput<'_>,
+        cache: &mut MlxPredictionTargetCache,
+    ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Error> {
+        let _ = (input, cache);
+        Err(Error::ArchitectureModel(
+            "the selected neutral executable has no prediction-target extension".into(),
+        ))
+    }
+    fn verify_prediction_target(
+        &mut self,
+        tokens: &MlxTensor,
+        cache: &mut MlxPredictionTargetCache,
+    ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Error> {
+        let _ = (tokens, cache);
+        Err(Error::ArchitectureModel(
+            "the selected neutral executable has no prediction-target extension".into(),
+        ))
+    }
+    fn prefill_prediction_extension(
+        &mut self,
+        _output: &crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput,
+        _tokens: &MlxTensor,
+        _cache: &mut MlxPredictionTargetCache,
+    ) -> Result<(), Error> {
+        Err(Error::ArchitectureModel(
+            "the selected neutral executable has no prediction extension".into(),
+        ))
+    }
+    fn prediction_extension_logits(
+        &mut self,
+        _hidden: &MlxTensor,
+        _last_token: u32,
+        _draft_index: usize,
+        _cache: &mut MlxPredictionTargetCache,
+    ) -> Result<(MlxTensor, MlxTensor), Error> {
+        Err(Error::ArchitectureModel(
+            "the selected neutral executable has no prediction extension".into(),
+        ))
+    }
+    fn advance_prediction_extension(
+        &mut self,
+        _hidden: &MlxTensor,
+        _tokens: &MlxTensor,
+        _cache: &mut MlxPredictionTargetCache,
+    ) -> Result<(), Error> {
+        Err(Error::ArchitectureModel(
+            "the selected neutral executable has no prediction extension".into(),
+        ))
+    }
     fn prompt_cache_model_identity(&self) -> &PromptCacheModelIdentity;
     fn reset_cache(&mut self) -> Result<(), Exception>;
+    fn reset_cache_distributed(&mut self) -> Result<(), Error>;
     fn load_prompt_cache(
         &mut self,
         directory: &Path,
@@ -346,6 +1688,34 @@ pub trait ErasedReplicatedTextExecutable {
         prefix_token_ids: &[u32],
         options: &PromptCacheOptions,
     ) -> Result<PromptCacheManifest, Error>;
+    fn load_prompt_cache_distributed(
+        &mut self,
+        directory: &Path,
+        expected: &PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+    ) -> Result<Option<PromptCacheManifest>, Error>;
+    fn load_prompt_cache_for_input_distributed(
+        &mut self,
+        directory: &Path,
+        expected: &PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        input_identity: eredu_runtime::PreparedInputCacheIdentity,
+    ) -> Result<Option<PromptCacheManifest>, Error>;
+    fn save_prompt_cache_distributed(
+        &mut self,
+        destination: &Path,
+        descriptor: PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: &PromptCacheOptions,
+    ) -> Result<Option<PromptCacheManifest>, Error>;
+    fn save_prompt_cache_for_input_distributed(
+        &mut self,
+        destination: &Path,
+        descriptor: PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: &PromptCacheOptions,
+        input_identity: &eredu_runtime::PreparedInputCacheIdentity,
+    ) -> Result<Option<PromptCacheManifest>, Error>;
     fn cache_residency_report(&self) -> Result<Option<CacheResidencyReport>, Exception>;
     fn prefill(&mut self, input: input::ModelInput<'_>, stream: &Stream) -> Result<Array, Error>;
     fn decode(&mut self, tokens: &Array, stream: &Stream) -> Result<Array, Error>;
@@ -414,7 +1784,11 @@ pub(crate) fn prepared_composite_input(
 }
 
 trait MlxStateMechanisms: LayerRuntimeState<MlxNeuralBackend> + Sized {
-    fn realize(selected: &SelectedStateRealization) -> Result<Self, Error>;
+    fn realize(
+        selected: &SelectedStateRealization,
+        rank: Option<eredu_core::cache::CacheRankIdentity>,
+        global_layer_start: usize,
+    ) -> Result<Self, Error>;
     fn load_prompt_cache(
         selected: &SelectedStateRealization,
         directory: &Path,
@@ -460,10 +1834,10 @@ fn selected_state_manager(
         .iter()
         .any(|component| component.placement() == StateComponentPlacement::Paged);
     match (needs_paging, selected.policy()) {
-        (false, _) => Ok(None),
-        (true, CacheResidencyPolicy::Paged(options)) => CacheResidencyManager::new(options.clone())
+        (_, CacheResidencyPolicy::Paged(options)) => CacheResidencyManager::new(options.clone())
             .map(Some)
             .map_err(|error| Error::Parallel(error.to_string())),
+        (false, CacheResidencyPolicy::Device) => Ok(None),
         (true, CacheResidencyPolicy::Device) => Err(Error::Parallel(
             "selected paged state component has no paging policy".into(),
         )),
@@ -471,11 +1845,21 @@ fn selected_state_manager(
 }
 
 impl MlxStateMechanisms for MlxKeyValueState {
-    fn realize(selected: &SelectedStateRealization) -> Result<Self, Error> {
+    fn realize(
+        selected: &SelectedStateRealization,
+        rank: Option<eredu_core::cache::CacheRankIdentity>,
+        global_layer_start: usize,
+    ) -> Result<Self, Error> {
         #[cfg(test)]
         super::path_instrumentation::state_allocation();
         let manager = selected_state_manager(selected)?;
-        MlxKeyValueState::from_selected(selected, manager, None).map_err(Into::into)
+        MlxKeyValueState::from_selected_with_global_layer_start(
+            selected,
+            manager,
+            rank,
+            global_layer_start,
+        )
+        .map_err(Into::into)
     }
 
     fn load_prompt_cache(
@@ -499,7 +1883,12 @@ impl MlxStateMechanisms for MlxKeyValueState {
             options.clone(),
         )
         .map_err(|error| Error::Parallel(error.to_string()))?;
-        let state = MlxKeyValueState::from_selected(selected, Some(manager), None)?;
+        let state = MlxKeyValueState::from_selected_with_global_layer_start(
+            selected,
+            Some(manager),
+            expected.topology().cache_rank_identity(),
+            identity.global_layer_start(),
+        )?;
         Ok((state, manifest))
     }
 
@@ -566,11 +1955,21 @@ impl MlxStateMechanisms for MlxKeyValueState {
 }
 
 impl MlxStateMechanisms for MlxHybridState {
-    fn realize(selected: &SelectedStateRealization) -> Result<Self, Error> {
+    fn realize(
+        selected: &SelectedStateRealization,
+        rank: Option<eredu_core::cache::CacheRankIdentity>,
+        global_layer_start: usize,
+    ) -> Result<Self, Error> {
         #[cfg(test)]
         super::path_instrumentation::state_allocation();
         let manager = selected_state_manager(selected)?;
-        MlxHybridState::from_selected(selected, manager, None).map_err(Into::into)
+        MlxHybridState::from_selected_with_global_layer_start(
+            selected,
+            manager,
+            rank,
+            global_layer_start,
+        )
+        .map_err(Into::into)
     }
 
     fn load_prompt_cache(
@@ -596,7 +1995,12 @@ impl MlxStateMechanisms for MlxHybridState {
         .map_err(|error| Error::Parallel(error.to_string()))?;
         let tensors = load_prompt_cache_state_tensors(directory, &manifest, stream)
             .map_err(|error| Error::Parallel(error.to_string()))?;
-        let mut state = MlxHybridState::from_selected(selected, Some(manager), None)?;
+        let mut state = MlxHybridState::from_selected_with_global_layer_start(
+            selected,
+            Some(manager),
+            expected.topology().cache_rank_identity(),
+            identity.global_layer_start(),
+        )?;
         state.restore_prompt_cache_state(
             tensors,
             i32::try_from(prefix_token_ids.len())
@@ -660,7 +2064,11 @@ impl MlxStateMechanisms for MlxHybridState {
 }
 
 impl MlxStateMechanisms for MlxPoolingAttentionState {
-    fn realize(selected: &SelectedStateRealization) -> Result<Self, Error> {
+    fn realize(
+        selected: &SelectedStateRealization,
+        rank: Option<eredu_core::cache::CacheRankIdentity>,
+        global_layer_start: usize,
+    ) -> Result<Self, Error> {
         #[cfg(test)]
         super::path_instrumentation::state_allocation();
         let manager = selected_state_manager(selected)?;
@@ -668,9 +2076,9 @@ impl MlxStateMechanisms for MlxPoolingAttentionState {
             Some(manager) => MlxPoolingAttentionStateFactory::paged(
                 selected.layout().clone(),
                 manager,
+                global_layer_start,
                 0,
-                0,
-                None,
+                rank,
             ),
             None => MlxPoolingAttentionStateFactory::device(selected.layout().clone()),
         }
@@ -703,9 +2111,9 @@ impl MlxStateMechanisms for MlxPoolingAttentionState {
         let mut state = MlxPoolingAttentionStateFactory::paged(
             selected.layout().clone(),
             manager,
-            0,
+            identity.global_layer_start(),
             prefix,
-            None,
+            expected.topology().cache_rank_identity(),
         )?;
         let mut tensors = load_prompt_cache_state_tensors(directory, &manifest, stream)
             .map_err(|error| Error::Parallel(error.to_string()))?
@@ -716,7 +2124,11 @@ impl MlxStateMechanisms for MlxPoolingAttentionState {
             let processed = prefix
                 .checked_add(identity.layer_prefix_offsets()[layer])
                 .ok_or_else(|| Error::Parallel("prompt-cache layer offset overflowed".into()))?;
-            cache.restore_prompt_cache_state(layer, &mut tensors, processed)?;
+            cache.restore_prompt_cache_state(
+                identity.global_layer_start() + layer,
+                &mut tensors,
+                processed,
+            )?;
         }
         if !tensors.is_empty() {
             return Err(Error::Parallel(
@@ -879,6 +2291,11 @@ where
     materialization: Arc<std::sync::Mutex<Option<eredu_runtime::WeightMaterializationReport>>>,
     stream: Stream,
     weights_stream: Stream,
+    parallel_layout: Option<eredu_runtime::LocalModelLayout>,
+    source_parallel_layout: Option<eredu_runtime::LocalModelLayout>,
+    ignored_checkpoint_sources: std::collections::BTreeSet<String>,
+    state_rank: Option<eredu_core::cache::CacheRankIdentity>,
+    state_global_layer_start: usize,
     state: PhantomData<fn() -> (A, S)>,
 }
 
@@ -886,13 +2303,84 @@ struct PreparedExactBindings {
     layout: eredu_runtime::ExecutionUnitLayout,
     static_bindings: Vec<WeightBinding>,
     unit_bindings: Vec<Vec<WeightBinding>>,
-    addressable_parameters: std::collections::BTreeSet<String>,
+    excluded_parameters: std::collections::BTreeSet<String>,
+    local_parameters: Option<std::collections::BTreeSet<String>>,
+}
+
+fn prompt_cache_storage_directory(root: &Path, topology: &PromptCacheTopology) -> PathBuf {
+    let coordinate = |axis: Option<(usize, usize)>| {
+        axis.map_or_else(|| "x".to_owned(), |(_, rank)| rank.to_string())
+    };
+    if topology.cache_rank_identity().is_none() {
+        root.to_path_buf()
+    } else {
+        root.join(format!(
+            "rank-p{}-t{}-e{}",
+            coordinate(topology.stage()),
+            coordinate(topology.shard()),
+            coordinate(topology.addressable())
+        ))
+    }
+}
+
+struct MlxPromptCacheSaveTransaction {
+    publication: eredu_runtime::ReversiblePromptCachePublication,
+    manifest: PromptCacheManifest,
 }
 
 type ExactTaskPartitions<'a> = (
     Vec<&'a ReplicatedTextMaterializationTask>,
     Vec<Vec<&'a ReplicatedTextMaterializationTask>>,
 );
+
+fn partition_local_materialization_tasks<'a>(
+    tasks: &'a [ReplicatedTextMaterializationTask],
+    global_layout: &eredu_runtime::ExecutionUnitLayout,
+    addresses: &[eredu_runtime::ExecutionUnitAddress],
+) -> Result<ExactTaskPartitions<'a>, Error> {
+    if addresses.is_empty() {
+        return Err(Error::ArchitectureModel(
+            "local partition has no selected execution units".into(),
+        ));
+    }
+    let mut static_tasks = Vec::new();
+    let mut unit_tasks = vec![Vec::new(); addresses.len()];
+    for task in tasks {
+        match task.owner() {
+            eredu_runtime::ReplicatedTextParameterOwner::StaticRole(_) => static_tasks.push(task),
+            eredu_runtime::ReplicatedTextParameterOwner::ExecutionUnit { group, unit } => {
+                let local = addresses
+                    .iter()
+                    .position(|address| {
+                        global_layout
+                            .group_id(address.group())
+                            .is_some_and(|id| id.as_str() == group)
+                            && address.index() == *unit
+                    })
+                    .ok_or_else(|| {
+                        Error::ArchitectureModel(format!(
+                            "local task {:?} has no owned global unit {group}.{unit}",
+                            task.name()
+                        ))
+                    })?;
+                unit_tasks[local].push(task);
+            }
+            _ => {
+                return Err(Error::ArchitectureModel(format!(
+                    "local task {:?} has an unsupported owner",
+                    task.name()
+                )))
+            }
+        }
+    }
+    let consumed = static_tasks.len() + unit_tasks.iter().map(Vec::len).sum::<usize>();
+    if consumed != tasks.len() {
+        return Err(Error::ArchitectureModel(
+            "local partition tasks were not consumed exactly once".into(),
+        ));
+    }
+    Ok((static_tasks, unit_tasks))
+}
 
 fn partition_materialization_tasks<'a>(
     tasks: &'a [ReplicatedTextMaterializationTask],
@@ -943,6 +2431,44 @@ fn partition_materialization_tasks<'a>(
     Ok((static_tasks, unit_tasks))
 }
 
+fn locally_materialized_outputs(
+    tasks: &[ReplicatedTextMaterializationTask],
+) -> std::collections::BTreeSet<String> {
+    tasks
+        .iter()
+        .filter(|task| {
+            matches!(
+                task.lowering(),
+                WeightLoweringKind::Transform | WeightLoweringKind::DerivedTransform
+            )
+        })
+        .flat_map(|task| {
+            std::iter::once(task.name().to_owned()).chain(
+                task.output_companions()
+                    .iter()
+                    .map(|companion| companion.name().to_owned()),
+            )
+        })
+        .collect()
+}
+
+fn shard_unmaterialized_bindings(
+    bindings: Vec<WeightBinding>,
+    store: &dyn CheckpointSource,
+    layout: &eredu_runtime::LocalModelLayout,
+    locally_materialized: &std::collections::BTreeSet<String>,
+) -> Result<Vec<WeightBinding>, Error> {
+    let mut output = Vec::with_capacity(bindings.len());
+    for binding in bindings {
+        if locally_materialized.contains(binding.name()) {
+            output.push(binding);
+        } else {
+            output.extend(shard_layer_bindings(vec![binding], store, layout)?);
+        }
+    }
+    Ok(output)
+}
+
 impl<A, S> MlxReplicatedTextMechanisms<A, S>
 where
     S: MlxStateMechanisms,
@@ -961,24 +2487,318 @@ where
             materialization,
             stream: stream.clone(),
             weights_stream: weights_stream.clone(),
+            parallel_layout: None,
+            source_parallel_layout: None,
+            ignored_checkpoint_sources: std::collections::BTreeSet::new(),
+            state_rank: None,
+            state_global_layer_start: 0,
             state: PhantomData,
         }
+    }
+
+    fn set_parallel_layout(&mut self, layout: eredu_runtime::LocalModelLayout) {
+        self.parallel_layout = Some(layout);
+    }
+
+    fn set_source_parallel_layout(&mut self, layout: Option<eredu_runtime::LocalModelLayout>) {
+        self.source_parallel_layout = layout;
+    }
+
+    fn set_ignored_checkpoint_sources(&mut self, sources: std::collections::BTreeSet<String>) {
+        self.ignored_checkpoint_sources = sources;
+    }
+
+    fn set_state_partition(
+        &mut self,
+        rank: eredu_core::cache::CacheRankIdentity,
+        global_layer_start: usize,
+    ) {
+        self.state_rank = Some(rank);
+        self.state_global_layer_start = global_layer_start;
+    }
+
+    fn apply_selected_transforms(
+        &mut self,
+        target_architecture: &A,
+        target_units: &[A::Unit],
+        source_architecture: Option<&A>,
+        source_units: Option<&[A::Unit]>,
+        source_layout: Option<&eredu_runtime::LocalModelLayout>,
+        tasks: &[ReplicatedTextMaterializationTask],
+    ) -> Result<(), Error> {
+        let transform_tasks = tasks
+            .iter()
+            .filter(|task| {
+                matches!(
+                    task.lowering(),
+                    WeightLoweringKind::Transform | WeightLoweringKind::DerivedTransform
+                )
+            })
+            .collect::<Vec<_>>();
+        if transform_tasks.is_empty() {
+            if source_architecture.is_some() || source_units.is_some() {
+                return Err(Error::Quantization(
+                    "selected source architecture has no materialization tasks".into(),
+                ));
+            }
+            return Ok(());
+        }
+        let source = source_architecture.ok_or_else(|| {
+            Error::Quantization("selected transform tasks have no source architecture".into())
+        })?;
+        let source_units = source_units.ok_or_else(|| {
+            Error::ArchitectureModel(
+                "selected source architecture has no neutral materialization units".into(),
+            )
+        })?;
+        if source_units.len() != target_units.len() {
+            return Err(Error::Quantization(
+                "selected materialization tasks changed the local execution-unit cardinality"
+                    .into(),
+            ));
+        }
+        let mut task_groups = Vec::<(
+            eredu_checkpoint::WeightQuantization,
+            Vec<&ReplicatedTextMaterializationTask>,
+        )>::new();
+        for task in transform_tasks {
+            let format = task.executable().weight_quantization().ok_or_else(|| {
+                Error::Quantization(format!(
+                    "selected materialization task {:?} has no packed output format",
+                    task.name()
+                ))
+            })?;
+            match task_groups
+                .iter_mut()
+                .find(|(selected, _)| *selected == format)
+            {
+                Some((_, tasks)) => tasks.push(task),
+                None => task_groups.push((format, vec![task])),
+            }
+        }
+        let source_static = source.static_modules();
+        let target_static = target_architecture.static_modules();
+        let mut combined = eredu_runtime::WeightMaterializationReport::default();
+        for (quantization, exact_tasks) in task_groups {
+            #[cfg(test)]
+            super::path_instrumentation::materialization();
+            let (store, report) = quantize_exact_replicated_text_tasks(
+                Arc::clone(&self.store),
+                source_static,
+                target_static,
+                source_units,
+                target_units,
+                source_layout,
+                quantization,
+                &exact_tasks,
+                &self.stream,
+            )?;
+            self.store = store;
+            combined.admitted_working_set_bytes = combined
+                .admitted_working_set_bytes
+                .max(report.admitted_working_set_bytes);
+            combined.transformed_weights += report.transformed_weights;
+            combined.source_tiles += report.source_tiles;
+            combined.peak_in_flight_tiles = combined
+                .peak_in_flight_tiles
+                .max(report.peak_in_flight_tiles);
+            combined.source_bytes_read += report.source_bytes_read;
+            combined.output_bytes += report.output_bytes;
+            combined.peak_planned_working_set_bytes = combined
+                .peak_planned_working_set_bytes
+                .max(report.peak_planned_working_set_bytes);
+            combined.largest_source_tile_bytes = combined
+                .largest_source_tile_bytes
+                .max(report.largest_source_tile_bytes);
+            combined.largest_output_tile_bytes = combined
+                .largest_output_tile_bytes
+                .max(report.largest_output_tile_bytes);
+        }
+        *self.materialization.lock().map_err(|_| {
+            Error::ArchitectureModel("materialization report lock was poisoned".into())
+        })? = Some(combined);
+        Ok(())
+    }
+
+    fn prepare_local_partition_materialization(
+        &mut self,
+        architecture: &A,
+        source_architecture: Option<&A>,
+        global_layout: &eredu_runtime::ExecutionUnitLayout,
+        addresses: &[eredu_runtime::ExecutionUnitAddress],
+        units: &[A::Unit],
+        source_units: Option<&[A::Unit]>,
+        source_layout: Option<&eredu_runtime::LocalModelLayout>,
+        tasks: &[ReplicatedTextMaterializationTask],
+    ) -> Result<(), Error> {
+        self.prepare_local_partition_materialization_with_addressable_parameters(
+            architecture,
+            source_architecture,
+            global_layout,
+            addresses,
+            units,
+            source_units,
+            source_layout,
+            tasks,
+            &std::collections::BTreeSet::new(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_local_partition_materialization_with_addressable_parameters(
+        &mut self,
+        architecture: &A,
+        source_architecture: Option<&A>,
+        global_layout: &eredu_runtime::ExecutionUnitLayout,
+        addresses: &[eredu_runtime::ExecutionUnitAddress],
+        units: &[A::Unit],
+        source_units: Option<&[A::Unit]>,
+        source_layout: Option<&eredu_runtime::LocalModelLayout>,
+        tasks: &[ReplicatedTextMaterializationTask],
+        addressable_parameters: &std::collections::BTreeSet<String>,
+    ) -> Result<(), Error> {
+        if addresses.len() != units.len() || addresses.is_empty() {
+            return Err(Error::ArchitectureModel(
+                "local partition addresses and constructed units differ".into(),
+            ));
+        }
+        let (static_tasks, unit_tasks) =
+            partition_local_materialization_tasks(tasks, global_layout, addresses)?;
+        self.apply_selected_transforms(
+            architecture,
+            units,
+            source_architecture,
+            source_units,
+            source_layout,
+            tasks,
+        )?;
+        let locally_materialized = locally_materialized_outputs(tasks);
+        let selected_static_parameters = static_tasks
+            .iter()
+            .flat_map(|task| {
+                std::iter::once(task.name().to_owned()).chain(
+                    task.output_companions()
+                        .iter()
+                        .map(|companion| companion.name().to_owned()),
+                )
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        // Composite family modules may retain lazy handles for pinned roles
+        // owned by another pipeline rank. The architecture-selected tasks are
+        // the sole ownership authority: expose precisely those targets to the
+        // exact binder and keep every selected target mandatory.
+        let mut excluded_parameters = neutral_parameter_refs(architecture.static_modules(), false)
+            .flatten()
+            .into_keys()
+            .map(|name| name.as_ref().to_owned())
+            .filter(|name| !selected_static_parameters.contains(name))
+            .collect::<std::collections::BTreeSet<_>>();
+        excluded_parameters.extend(addressable_parameters.iter().cloned());
+        let mut static_bindings = build_exact_replicated_text_bindings(
+            architecture.static_modules(),
+            self.store.as_ref(),
+            &static_tasks,
+            &excluded_parameters,
+        )?;
+        #[cfg(test)]
+        super::path_instrumentation::local_static_materialization(
+            static_bindings.len(),
+            excluded_parameters.len(),
+        );
+        let mut unit_bindings = units
+            .iter()
+            .zip(&unit_tasks)
+            .map(|(unit, tasks)| {
+                #[cfg(test)]
+                super::path_instrumentation::unit_construction();
+                build_exact_replicated_text_bindings(
+                    unit,
+                    self.store.as_ref(),
+                    tasks,
+                    addressable_parameters,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if let Some(layout) = &self.parallel_layout {
+            static_bindings = shard_unmaterialized_bindings(
+                static_bindings,
+                self.store.as_ref(),
+                layout,
+                &locally_materialized,
+            )?;
+            unit_bindings = unit_bindings
+                .into_iter()
+                .map(|bindings| {
+                    shard_unmaterialized_bindings(
+                        bindings,
+                        self.store.as_ref(),
+                        layout,
+                        &locally_materialized,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+        }
+        let graph = architecture
+            .execution_graph()
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        let counts = (0..graph.groups().len())
+            .map(|group| {
+                addresses
+                    .iter()
+                    .filter(|address| address.group() == group)
+                    .count()
+            })
+            .collect::<Vec<_>>();
+        let layout = eredu_runtime::ExecutionUnitLayout::new(&graph, counts)
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        self.prepared_bindings = Some(PreparedExactBindings {
+            layout,
+            static_bindings,
+            unit_bindings,
+            excluded_parameters,
+            local_parameters: Some(
+                tasks
+                    .iter()
+                    .flat_map(|task| {
+                        std::iter::once(task.name().to_owned()).chain(
+                            task.output_companions()
+                                .iter()
+                                .map(|companion| companion.name().to_owned()),
+                        )
+                    })
+                    .collect(),
+            ),
+        });
+        Ok(())
     }
 
     fn take_prepared_policy(
         &mut self,
         architecture: &mut A,
         selected: &SelectedReplicatedTextRealization,
-    ) -> Result<MlxLayerwisePolicy<A::Unit, MlxSelectiveUnitPopulator>, Error> {
+    ) -> Result<
+        (
+            MlxLayerwisePolicy<A::Unit, MlxSelectiveUnitPopulator>,
+            eredu_runtime::ExecutionUnitLayout,
+        ),
+        Error,
+    > {
         let prepared = self.prepared_bindings.take().ok_or_else(|| {
             Error::ArchitectureModel("execution policy requested before materialization".into())
         })?;
-        let mut ignored_sources = std::collections::BTreeSet::new();
+        let layout = prepared.layout.clone();
+        let mut ignored_sources = self.ignored_checkpoint_sources.clone();
         for parameter in selected
             .requirements()
             .parameters()
             .iter()
-            .filter(|parameter| prepared.addressable_parameters.contains(parameter.name()))
+            .filter(|parameter| {
+                prepared.excluded_parameters.contains(parameter.name())
+                    || prepared
+                        .local_parameters
+                        .as_ref()
+                        .is_some_and(|local| !local.contains(parameter.name()))
+            })
         {
             ignored_sources.extend(parameter.sources().iter().cloned());
             if let Some(recipe) = selected
@@ -992,7 +2812,7 @@ where
         let (policy, _) = prepare_layerwise_policy_from_bindings(
             Arc::clone(&self.store),
             architecture,
-            MlxSelectiveUnitPopulator::new(prepared.addressable_parameters.clone()),
+            MlxSelectiveUnitPopulator::new(prepared.excluded_parameters.clone()),
             PhantomData::<S>,
             selected.residency(),
             &self.stream,
@@ -1002,7 +2822,7 @@ where
             prepared.static_bindings,
             prepared.unit_bindings,
         )?;
-        Ok(policy)
+        Ok((policy, layout))
     }
 }
 
@@ -1011,13 +2831,12 @@ impl<A, S> ReplicatedTextSessionMechanisms<A, MlxNeuralBackend>
 where
     S: MlxStateMechanisms,
     A: eredu_runtime::LayeredArchitecture<MlxNeuralBackend, S, Error = eredu_nn::Error>,
-    A::StaticModules: Clone,
     A::Error: std::fmt::Display,
 {
     type State = S;
     type PolicyError = Error;
-    type ResidentPolicy = MlxResidentPolicy<A::Unit>;
-    type BoundedPolicy = MlxLayerwisePolicy<A::Unit, MlxSelectiveUnitPopulator>;
+    type ResidentPolicy = MlxArchitectureLayerwisePolicy<A, S>;
+    type BoundedPolicy = MlxArchitectureLayerwisePolicy<A, S>;
     type StateCheckpoint = S;
     type StateReport = MlxStateReport;
     type ExecutionReport = MlxExecutionReport;
@@ -1039,109 +2858,37 @@ where
                 "neutral target unit set differs from the selected execution layout".into(),
             ));
         }
-        if let Some(source) = source_architecture {
-            let source_units = source_units.ok_or_else(|| {
-                Error::ArchitectureModel(
-                    "selected source architecture has no neutral materialization units".into(),
-                )
-            })?;
-            let mut task_groups = Vec::<(
-                eredu_checkpoint::WeightQuantization,
-                Vec<&ReplicatedTextMaterializationTask>,
-            )>::new();
-            for task in tasks.iter().filter(|task| {
-                matches!(
-                    task.lowering(),
-                    WeightLoweringKind::Transform | WeightLoweringKind::DerivedTransform
-                )
-            }) {
-                let format = task.executable().weight_quantization().ok_or_else(|| {
-                    Error::Quantization(format!(
-                        "selected materialization task {:?} has no packed output format",
-                        task.name()
-                    ))
-                })?;
-                match task_groups
-                    .iter_mut()
-                    .find(|(selected, _)| *selected == format)
-                {
-                    Some((_, tasks)) => tasks.push(task),
-                    None => task_groups.push((format, vec![task])),
-                }
-            }
-            if task_groups.is_empty() {
-                return Err(Error::Quantization(
-                    "selected source architecture has no materialization tasks".into(),
-                ));
-            }
-            if source_units.len() != target_layout.len() {
-                return Err(Error::Quantization(
-                    "selected materialization tasks changed the execution-unit layout".into(),
-                ));
-            }
-            let source_static = source.static_modules().clone();
-            let target_static = architecture.static_modules().clone();
-            let mut combined = eredu_runtime::WeightMaterializationReport::default();
-            for (quantization, exact_tasks) in task_groups {
-                #[cfg(test)]
-                super::path_instrumentation::materialization();
-                let (store, report) = quantize_exact_replicated_text_tasks(
-                    Arc::clone(&self.store),
-                    &source_static,
-                    &target_static,
-                    source_units,
-                    target_units,
-                    quantization,
-                    &exact_tasks,
-                    &self.stream,
-                )?;
-                self.store = store;
-                combined.admitted_working_set_bytes = combined
-                    .admitted_working_set_bytes
-                    .max(report.admitted_working_set_bytes);
-                combined.transformed_weights += report.transformed_weights;
-                combined.source_tiles += report.source_tiles;
-                combined.peak_in_flight_tiles = combined
-                    .peak_in_flight_tiles
-                    .max(report.peak_in_flight_tiles);
-                combined.source_bytes_read += report.source_bytes_read;
-                combined.output_bytes += report.output_bytes;
-                combined.peak_planned_working_set_bytes = combined
-                    .peak_planned_working_set_bytes
-                    .max(report.peak_planned_working_set_bytes);
-                combined.largest_source_tile_bytes = combined
-                    .largest_source_tile_bytes
-                    .max(report.largest_source_tile_bytes);
-                combined.largest_output_tile_bytes = combined
-                    .largest_output_tile_bytes
-                    .max(report.largest_output_tile_bytes);
-            }
-            *self.materialization.lock().map_err(|_| {
-                Error::ArchitectureModel("materialization report lock was poisoned".into())
-            })? = Some(combined);
-        } else if tasks.iter().any(|task| {
-            matches!(
-                task.lowering(),
-                WeightLoweringKind::Transform | WeightLoweringKind::DerivedTransform
-            )
-        }) {
-            return Err(Error::Quantization(
-                "selected transform tasks have no source architecture".into(),
-            ));
-        }
+        let source_layout = self.source_parallel_layout.clone();
+        self.apply_selected_transforms(
+            architecture,
+            target_units,
+            source_architecture.as_deref(),
+            source_units.as_deref(),
+            source_layout.as_ref(),
+            tasks,
+        )?;
 
         let (static_tasks, unit_tasks) = partition_materialization_tasks(tasks, target_layout)?;
+        let locally_materialized = locally_materialized_outputs(tasks);
         let addressable_parameters = addressable_parameters
             .iter()
             .cloned()
             .collect::<std::collections::BTreeSet<_>>();
-        let static_bindings = build_exact_replicated_text_bindings(
-            &MlxModule::new(architecture.static_modules().clone()),
+        let mut static_bindings = build_exact_replicated_text_bindings(
+            architecture.static_modules(),
             self.store.as_ref(),
             &static_tasks,
             &addressable_parameters,
         )?;
-        let unit_bindings = target_units
+        if let Some(layout) = &self.parallel_layout {
+            static_bindings = shard_unmaterialized_bindings(
+                static_bindings,
+                self.store.as_ref(),
+                layout,
+                &locally_materialized,
+            )?;
+        }
+        let mut unit_bindings = target_units
             .iter()
             .zip(&unit_tasks)
             .enumerate()
@@ -1161,12 +2908,26 @@ where
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
+        if let Some(layout) = &self.parallel_layout {
+            unit_bindings = unit_bindings
+                .into_iter()
+                .map(|bindings| {
+                    shard_unmaterialized_bindings(
+                        bindings,
+                        self.store.as_ref(),
+                        layout,
+                        &locally_materialized,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+        }
 
         self.prepared_bindings = Some(PreparedExactBindings {
             layout: target_layout.clone(),
             static_bindings,
             unit_bindings,
-            addressable_parameters,
+            excluded_parameters: addressable_parameters,
+            local_parameters: None,
         });
         Ok(())
     }
@@ -1176,7 +2937,7 @@ where
         selected: &SelectedStateRealization,
         _context: &Stream,
     ) -> Result<S, Error> {
-        S::realize(selected)
+        S::realize(selected, self.state_rank, self.state_global_layer_start)
     }
 
     fn resident_policy(
@@ -1186,10 +2947,10 @@ where
         selected: &SelectedReplicatedTextRealization,
         context: &Stream,
     ) -> Result<Self::ResidentPolicy, Self::Error> {
-        let policy = self.take_prepared_policy(architecture, selected)?;
+        let (policy, _) = self.take_prepared_policy(architecture, selected)?;
         let resident = policy.into_resident_units(units, context)?;
         self.resident_report = Some(resident.residency_report()?);
-        Ok(resident)
+        Ok(MlxSelectedLayerwisePolicy::resident(resident))
     }
 
     fn bounded_policy(
@@ -1199,6 +2960,7 @@ where
         _context: &Stream,
     ) -> Result<Self::BoundedPolicy, Self::Error> {
         self.take_prepared_policy(architecture, selected)
+            .map(|(policy, layout)| MlxSelectedLayerwisePolicy::bounded(policy, &layout))
     }
 
     fn index_text_output(
@@ -1238,9 +3000,10 @@ where
         selected: &SelectedStateRealization,
         context: &Stream,
     ) -> Result<(S, PromptCacheManifest), Error> {
+        let directory = prompt_cache_storage_directory(directory, expected.topology());
         S::load_prompt_cache(
             selected,
-            directory,
+            &directory,
             expected,
             identity,
             prefix_token_ids,
@@ -1257,7 +3020,8 @@ where
         options: &PromptCacheOptions,
         _context: &Stream,
     ) -> Result<PromptCacheManifest, Error> {
-        S::save_prompt_cache(state, destination, descriptor, prefix_token_ids, options)
+        let destination = prompt_cache_storage_directory(destination, descriptor.topology());
+        S::save_prompt_cache(state, &destination, descriptor, prefix_token_ids, options)
     }
 
     fn state_report(&self, state: &S) -> Result<Self::StateReport, Error> {
@@ -1300,6 +3064,76 @@ where
     }
 }
 
+impl<A, S> TransactionalPromptCacheMechanisms<A, MlxNeuralBackend>
+    for MlxReplicatedTextMechanisms<A, S>
+where
+    S: MlxStateMechanisms,
+    A: eredu_runtime::LayeredArchitecture<MlxNeuralBackend, S, Error = eredu_nn::Error>,
+    A::Error: std::fmt::Display,
+{
+    type PromptCacheSaveTransaction = MlxPromptCacheSaveTransaction;
+
+    fn prepare_prompt_cache_save(
+        &mut self,
+        state: &mut S,
+        destination: &Path,
+        descriptor: PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: &PromptCacheOptions,
+        _context: &Stream,
+    ) -> Result<Self::PromptCacheSaveTransaction, Error> {
+        let destination = prompt_cache_storage_directory(destination, descriptor.topology());
+        let publication = eredu_runtime::ReversiblePromptCachePublication::begin(
+            &destination,
+            options.replace_existing(),
+        )
+        .map_err(|error| Error::Parallel(error.to_string()))?;
+        let staging_options =
+            PromptCacheOptions::new(options.application_namespace().map(str::to_owned), false)
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        let manifest = S::save_prompt_cache(
+            state,
+            publication.staging_destination(),
+            descriptor,
+            prefix_token_ids,
+            &staging_options,
+        )?;
+        Ok(MlxPromptCacheSaveTransaction {
+            publication,
+            manifest,
+        })
+    }
+
+    fn prepared_prompt_cache_manifest(
+        transaction: &Self::PromptCacheSaveTransaction,
+    ) -> &PromptCacheManifest {
+        &transaction.manifest
+    }
+
+    fn publish_prompt_cache_save(
+        &mut self,
+        transaction: &mut Self::PromptCacheSaveTransaction,
+    ) -> Result<(), Error> {
+        transaction
+            .publication
+            .publish()
+            .map_err(|error| Error::Parallel(error.to_string()))
+    }
+
+    fn commit_prompt_cache_save(&mut self, transaction: Self::PromptCacheSaveTransaction) {
+        transaction.publication.commit().unwrap_or_else(|error| {
+            panic!("committed prompt-cache publication cleanup failed: {error}")
+        });
+    }
+
+    fn rollback_prompt_cache_save(&mut self, transaction: Self::PromptCacheSaveTransaction) {
+        transaction
+            .publication
+            .rollback()
+            .unwrap_or_else(|error| panic!("prompt-cache publication rollback failed: {error}"));
+    }
+}
+
 struct CompletedReplicatedText<A, S, D = eredu_runtime::DirectReplicatedTextExecution>
 where
     S: MlxStateMechanisms,
@@ -1309,8 +3143,8 @@ where
         A,
         MlxNeuralBackend,
         S,
-        MlxResidentPolicy<A::Unit>,
-        MlxLayerwisePolicy<A::Unit, MlxSelectiveUnitPopulator>,
+        MlxArchitectureLayerwisePolicy<A, S>,
+        MlxArchitectureLayerwisePolicy<A, S>,
     >,
 {
     session: ReplicatedTextSession<A, MlxNeuralBackend, MlxReplicatedTextMechanisms<A, S>, D>,
@@ -1318,8 +3152,16 @@ where
     capability_estimate: eredu_architectures::capability::CapabilityEstimate,
     effective_model_type: String,
     materialization: Option<eredu_runtime::WeightMaterializationReport>,
+    prediction_extension_depth: Option<usize>,
+    prediction_extension: Option<MlxPredictionExtension>,
+    parameter_bank:
+        Option<crate::backend::runtime::residency::parameter_bank::SharedAddressableParameterBank>,
     #[cfg(test)]
     selected_residency: eredu_runtime::LayerWeightResidency,
+    partition_sampling_group: Option<crate::backend::runtime::distributed::Group>,
+    partition_communication_authority: Option<eredu_runtime::PartitionCommunicationAuthority>,
+    partition_sampling_rank: Option<usize>,
+    partition_public_output: bool,
     stream: Stream,
 }
 
@@ -1374,8 +3216,15 @@ where
             capability_estimate,
             effective_model_type,
             materialization,
+            prediction_extension_depth: None,
+            prediction_extension: None,
+            parameter_bank: None,
             #[cfg(test)]
             selected_residency,
+            partition_sampling_group: None,
+            partition_communication_authority: None,
+            partition_sampling_rank: None,
+            partition_public_output: true,
             stream: stream.clone(),
         })
     }
@@ -1390,8 +3239,8 @@ where
         A,
         MlxNeuralBackend,
         S,
-        MlxResidentPolicy<A::Unit>,
-        MlxLayerwisePolicy<A::Unit, MlxSelectiveUnitPopulator>,
+        MlxArchitectureLayerwisePolicy<A, S>,
+        MlxArchitectureLayerwisePolicy<A, S>,
     >,
 {
     fn from_session(
@@ -1401,6 +3250,10 @@ where
         effective_model_type: String,
         materialization: Option<eredu_runtime::WeightMaterializationReport>,
         selected_residency: eredu_runtime::LayerWeightResidency,
+        partition_sampling_group: Option<crate::backend::runtime::distributed::Group>,
+        partition_communication_authority: Option<eredu_runtime::PartitionCommunicationAuthority>,
+        partition_sampling_rank: Option<usize>,
+        partition_public_output: bool,
         stream: &Stream,
     ) -> Self {
         #[cfg(not(test))]
@@ -1411,9 +3264,16 @@ where
             capability_estimate,
             effective_model_type,
             materialization,
+            prediction_extension_depth: None,
+            prediction_extension: None,
+            parameter_bank: None,
             #[cfg(test)]
             selected_residency,
             stream: stream.clone(),
+            partition_sampling_group,
+            partition_communication_authority,
+            partition_sampling_rank,
+            partition_public_output,
         }
     }
 
@@ -1421,6 +3281,71 @@ where
         #[cfg(test)]
         super::path_instrumentation::state_publication();
         value
+    }
+
+    fn with_parameter_bank(
+        mut self,
+        parameter_bank: crate::backend::runtime::residency::parameter_bank::SharedAddressableParameterBank,
+    ) -> Self {
+        self.parameter_bank = Some(parameter_bank);
+        self
+    }
+
+    fn with_prediction_target_state<T>(
+        &mut self,
+        cache: &mut MlxPredictionTargetCache,
+        operation: impl FnOnce(
+            &mut ReplicatedTextSession<A, MlxNeuralBackend, MlxReplicatedTextMechanisms<A, S>, D>,
+        ) -> Result<T, Error>,
+    ) -> Result<T, Error>
+    where
+        S: 'static,
+    {
+        if !cache
+            .state
+            .as_ref()
+            .is_some_and(|state| state.as_any().is::<S>())
+        {
+            return Err(Error::ArchitectureModel(
+                "prediction target cache state type differs from the neutral session".into(),
+            ));
+        }
+        let erased = cache.state.take().ok_or_else(|| {
+            Error::ArchitectureModel("prediction target cache is already active".into())
+        })?;
+        let mut lane = *erased
+            .into_any()
+            .downcast::<S>()
+            .expect("prediction target cache type checked before ownership transfer");
+        if let Err(error) = self
+            .session
+            .exchange_prediction_target_state(&mut lane, &self.stream)
+        {
+            cache.state = Some(Box::new(lane));
+            return Err(Error::ArchitectureModel(error.to_string()));
+        }
+        let result = operation(&mut self.session);
+        let restored = match self
+            .session
+            .exchange_prediction_target_state(&mut lane, &self.stream)
+        {
+            Ok(()) => Ok(()),
+            Err(error) => self
+                .session
+                .recover_prediction_target_state_after_failure(&mut lane)
+                .map_err(|recovery| {
+                    Error::ArchitectureModel(format!(
+                        "prediction target state exchange failed: {error}; local ownership recovery failed: {recovery}"
+                    ))
+                })
+                .and(Err(Error::ArchitectureModel(error.to_string()))),
+        };
+        cache.state = Some(Box::new(lane));
+        match (result, restored) {
+            (Err(error), _) => Err(error),
+            (Ok(output), Ok(())) => Ok(output),
+            (Ok(_), Err(error)) => Err(error),
+        }
     }
 }
 
@@ -1434,8 +3359,8 @@ where
             A,
             MlxNeuralBackend,
             S,
-            MlxResidentPolicy<A::Unit>,
-            MlxLayerwisePolicy<A::Unit, MlxSelectiveUnitPopulator>,
+            MlxArchitectureLayerwisePolicy<A, S>,
+            MlxArchitectureLayerwisePolicy<A, S>,
         > + MlxParameterBankTelemetry
         + 'static,
 {
@@ -1445,6 +3370,401 @@ where
 
     fn capability_estimate(&self) -> &eredu_architectures::capability::CapabilityEstimate {
         &self.capability_estimate
+    }
+
+    fn has_partition_control(&self) -> bool {
+        self.partition_communication_authority.is_some()
+    }
+
+    fn partition_sampling_context(
+        &self,
+    ) -> Option<(
+        &crate::backend::runtime::distributed::Group,
+        &eredu_runtime::PartitionCommunicationAuthority,
+        &Stream,
+        usize,
+    )> {
+        self.partition_sampling_group.as_ref().map(|group| {
+            (
+                group,
+                self.partition_communication_authority
+                    .as_ref()
+                    .expect("partition sampling group has communication authority"),
+                &self.stream,
+                self.partition_sampling_rank
+                    .expect("partition sampling group has selected owner rank"),
+            )
+        })
+    }
+
+    fn partition_public_output(&self) -> bool {
+        self.partition_public_output
+    }
+
+    fn install_prediction_extension_contract(
+        &mut self,
+        extension: MlxPredictionExtension,
+        capability: eredu_architectures::capability::CapabilityEstimate,
+    ) -> Result<(), Error> {
+        let depth = extension.depth();
+        if depth == 0 || capability.speculative_draft_source().is_none() {
+            return Err(Error::ArchitectureModel(
+                "prediction extension contract is missing executable draft depth".into(),
+            ));
+        }
+        if self.prediction_extension_depth.replace(depth).is_some() {
+            return Err(Error::ArchitectureModel(
+                "prediction extension contract was installed more than once".into(),
+            ));
+        }
+        self.capability_estimate = capability;
+        self.prediction_extension = Some(extension);
+        Ok(())
+    }
+
+    fn prediction_extension_depth(&self) -> Option<usize> {
+        self.prediction_extension_depth
+    }
+
+    fn prepare_prediction_target_cache(&mut self) -> Result<MlxPredictionTargetCache, Error> {
+        self.session
+            .prepare_prediction_target_state(&self.stream)
+            .map(|state| MlxPredictionTargetCache {
+                state: Some(Box::new(state)),
+                extension: self
+                    .prediction_extension
+                    .as_ref()
+                    .map(MlxPredictionExtension::new_state),
+            })
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))
+    }
+
+    fn prefill_prediction_target(
+        &mut self,
+        input: input::ModelInput<'_>,
+        cache: &mut MlxPredictionTargetCache,
+    ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Error> {
+        let stream = self.stream.clone();
+        let tokens = input::text_token_ids(input, &stream)?;
+        let input = MlxTensor::from_array(tokens.clone());
+        self.with_prediction_target_state(cache, |session| {
+            session
+                .prefill_prediction_target(&input, None, &stream)
+                .map(|(logits, hidden)| {
+                    crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput {
+                        logits,
+                        hidden,
+                        tokens: input,
+                    }
+                })
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))
+        })
+    }
+
+    fn verify_prediction_target(
+        &mut self,
+        tokens: &MlxTensor,
+        cache: &mut MlxPredictionTargetCache,
+    ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Error> {
+        let stream = self.stream.clone();
+        let tokens = tokens.clone();
+        self.with_prediction_target_state(cache, |session| {
+            session
+                .decode_prediction_target(&tokens, &stream)
+                .map(|(logits, hidden)| {
+                    crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput {
+                        logits,
+                        hidden,
+                        tokens,
+                    }
+                })
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))
+        })
+    }
+
+    fn prefill_prediction_extension(
+        &mut self,
+        output: &crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput,
+        tokens: &MlxTensor,
+        cache: &mut MlxPredictionTargetCache,
+    ) -> Result<(), Error> {
+        let sequence = tokens.as_array().dim(1);
+        if sequence <= 1 {
+            return Ok(());
+        }
+        let hidden = MlxTensor::from_array(
+            output
+                .hidden
+                .as_array()
+                .try_index_device((.., ..sequence - 1, ..), &self.stream)?,
+        );
+        let next = MlxTensor::from_array(
+            tokens
+                .as_array()
+                .try_index_device((.., 1..), &self.stream)?,
+        );
+        let mut extension = self.prediction_extension.take().ok_or_else(|| {
+            Error::ArchitectureModel("prediction extension was not installed".into())
+        })?;
+        let mut lane = cache.extension.take().ok_or_else(|| {
+            Error::ArchitectureModel("prediction lane has no extension state".into())
+        })?;
+        let checkpoint = lane.clone();
+        let result = match (&mut extension, &mut lane) {
+            (
+                MlxPredictionExtension::DeepSeekV3 { units },
+                MlxPredictionExtensionState::DeepSeekV3(states),
+            ) if units.len() == states.len() => {
+                units.iter_mut().zip(states).try_for_each(|(unit, state)| {
+                    self.session
+                        .apply_prediction_target_operation(
+                            V3PredictionUnitOperation {
+                                unit,
+                                hidden: &hidden,
+                                tokens: &next,
+                                cache: state,
+                            },
+                            &self.stream,
+                        )
+                        .map(|_| ())
+                        .map_err(|error| Error::ArchitectureModel(error.to_string()))
+                })
+            }
+            (
+                MlxPredictionExtension::DeepSeekV4 { units, .. },
+                MlxPredictionExtensionState::DeepSeekV4(states),
+            ) if units.len() == states.len() => {
+                units.iter_mut().zip(states).try_for_each(|(unit, state)| {
+                    self.session
+                        .apply_prediction_target_operation(
+                            V4PredictionUnitOperation {
+                                unit,
+                                hidden: &hidden,
+                                tokens: &next,
+                                cache: state,
+                            },
+                            &self.stream,
+                        )
+                        .map(|_| ())
+                        .map_err(|error| Error::ArchitectureModel(error.to_string()))
+                })
+            }
+            (
+                MlxPredictionExtension::NemotronH { groups, .. },
+                MlxPredictionExtensionState::NemotronH(state),
+            ) => groups
+                .iter_mut()
+                .enumerate()
+                .try_for_each(|(depth, units)| {
+                    self.session
+                        .apply_prediction_target_operation(
+                            NemotronHPredictionGroupOperation {
+                                units,
+                                hidden: &hidden,
+                                tokens: &next,
+                                depth,
+                                state,
+                            },
+                            &self.stream,
+                        )
+                        .map(|_| ())
+                        .map_err(|error| Error::ArchitectureModel(error.to_string()))
+                }),
+            _ => Err(Error::ArchitectureModel(
+                "prediction extension units and lane state differ".into(),
+            )),
+        };
+        if result.is_err() {
+            lane = checkpoint;
+        }
+        cache.extension = Some(lane);
+        self.prediction_extension = Some(extension);
+        result
+    }
+
+    fn prediction_extension_logits(
+        &mut self,
+        hidden: &MlxTensor,
+        last_token: u32,
+        draft_index: usize,
+        cache: &mut MlxPredictionTargetCache,
+    ) -> Result<(MlxTensor, MlxTensor), Error> {
+        let token = MlxTensor::from_array(Array::from_slice(&[last_token], &[1, 1]));
+        let mut extension = self.prediction_extension.take().ok_or_else(|| {
+            Error::ArchitectureModel("prediction extension was not installed".into())
+        })?;
+        let mut lane = cache.extension.take().ok_or_else(|| {
+            Error::ArchitectureModel("prediction lane has no extension state".into())
+        })?;
+        let checkpoint = lane.clone();
+        let result = match (&mut extension, &mut lane) {
+            (
+                MlxPredictionExtension::DeepSeekV3 { units },
+                MlxPredictionExtensionState::DeepSeekV3(states),
+            ) if units.len() == states.len() => {
+                match (units.get_mut(draft_index), states.get_mut(draft_index)) {
+                    (Some(unit), Some(state)) => self
+                        .session
+                        .apply_prediction_target_operation(
+                            V3PredictionUnitOperation {
+                                unit,
+                                hidden,
+                                tokens: &token,
+                                cache: state,
+                            },
+                            &self.stream,
+                        )
+                        .map(|output| (output.logits, output.hidden))
+                        .map_err(|error| Error::ArchitectureModel(error.to_string())),
+                    _ => Err(Error::ArchitectureModel(format!(
+                        "prediction depth {draft_index} exceeds {} units",
+                        units.len()
+                    ))),
+                }
+            }
+            (
+                MlxPredictionExtension::DeepSeekV4 { units, .. },
+                MlxPredictionExtensionState::DeepSeekV4(states),
+            ) if units.len() == states.len() => {
+                match (units.get_mut(draft_index), states.get_mut(draft_index)) {
+                    (Some(unit), Some(state)) => self
+                        .session
+                        .apply_prediction_target_operation(
+                            V4PredictionUnitOperation {
+                                unit,
+                                hidden,
+                                tokens: &token,
+                                cache: state,
+                            },
+                            &self.stream,
+                        )
+                        .map(|output| (output.logits, output.hidden))
+                        .map_err(|error| Error::ArchitectureModel(error.to_string())),
+                    _ => Err(Error::ArchitectureModel(format!(
+                        "prediction depth {draft_index} exceeds {} units",
+                        units.len()
+                    ))),
+                }
+            }
+            (
+                MlxPredictionExtension::NemotronH { groups, .. },
+                MlxPredictionExtensionState::NemotronH(state),
+            ) => {
+                let group_count = groups.len();
+                let units = groups.get_mut(draft_index).ok_or_else(|| {
+                    Error::ArchitectureModel(format!(
+                        "prediction depth {draft_index} exceeds {group_count} groups"
+                    ))
+                })?;
+                self.session
+                    .apply_prediction_target_operation(
+                        NemotronHPredictionGroupOperation {
+                            units,
+                            hidden,
+                            tokens: &token,
+                            depth: draft_index,
+                            state,
+                        },
+                        &self.stream,
+                    )
+                    .map(|output| (output.logits, output.hidden))
+                    .map_err(|error| Error::ArchitectureModel(error.to_string()))
+            }
+            _ => Err(Error::ArchitectureModel(
+                "prediction extension units and lane state differ".into(),
+            )),
+        };
+        if result.is_err() {
+            lane = checkpoint;
+        }
+        cache.extension = Some(lane);
+        self.prediction_extension = Some(extension);
+        result
+    }
+
+    fn advance_prediction_extension(
+        &mut self,
+        hidden: &MlxTensor,
+        tokens: &MlxTensor,
+        cache: &mut MlxPredictionTargetCache,
+    ) -> Result<(), Error> {
+        let mut extension = self.prediction_extension.take().ok_or_else(|| {
+            Error::ArchitectureModel("prediction extension was not installed".into())
+        })?;
+        let mut lane = cache.extension.take().ok_or_else(|| {
+            Error::ArchitectureModel("prediction lane has no extension state".into())
+        })?;
+        let checkpoint = lane.clone();
+        let result = match (&mut extension, &mut lane) {
+            (
+                MlxPredictionExtension::DeepSeekV3 { units },
+                MlxPredictionExtensionState::DeepSeekV3(states),
+            ) if units.len() == states.len() => {
+                units.iter_mut().zip(states).try_for_each(|(unit, state)| {
+                    self.session
+                        .apply_prediction_target_operation(
+                            V3PredictionUnitOperation {
+                                unit,
+                                hidden,
+                                tokens,
+                                cache: state,
+                            },
+                            &self.stream,
+                        )
+                        .map(|_| ())
+                        .map_err(|error| Error::ArchitectureModel(error.to_string()))
+                })
+            }
+            (
+                MlxPredictionExtension::DeepSeekV4 { units, .. },
+                MlxPredictionExtensionState::DeepSeekV4(states),
+            ) if units.len() == states.len() => {
+                units.iter_mut().zip(states).try_for_each(|(unit, state)| {
+                    self.session
+                        .apply_prediction_target_operation(
+                            V4PredictionUnitOperation {
+                                unit,
+                                hidden,
+                                tokens,
+                                cache: state,
+                            },
+                            &self.stream,
+                        )
+                        .map(|_| ())
+                        .map_err(|error| Error::ArchitectureModel(error.to_string()))
+                })
+            }
+            (
+                MlxPredictionExtension::NemotronH { groups, .. },
+                MlxPredictionExtensionState::NemotronH(state),
+            ) => groups
+                .iter_mut()
+                .enumerate()
+                .try_for_each(|(depth, units)| {
+                    self.session
+                        .apply_prediction_target_operation(
+                            NemotronHPredictionGroupOperation {
+                                units,
+                                hidden,
+                                tokens,
+                                depth,
+                                state,
+                            },
+                            &self.stream,
+                        )
+                        .map(|_| ())
+                        .map_err(|error| Error::ArchitectureModel(error.to_string()))
+                }),
+            _ => Err(Error::ArchitectureModel(
+                "prediction extension units and lane state differ".into(),
+            )),
+        };
+        if result.is_err() {
+            lane = checkpoint;
+        }
+        cache.extension = Some(lane);
+        self.prediction_extension = Some(extension);
+        result
     }
 
     #[cfg(test)]
@@ -1547,7 +3867,10 @@ where
         Option<crate::backend::runtime::residency::parameter_bank::ParameterBankResidencyReport>,
         Error,
     > {
-        self.session.execution_strategy().parameter_bank_report()
+        match &self.parameter_bank {
+            Some(bank) => bank.report().map(Some),
+            None => self.session.execution_strategy().parameter_bank_report(),
+        }
     }
 
     fn prompt_cache_model_identity(&self) -> &PromptCacheModelIdentity {
@@ -1558,6 +3881,12 @@ where
         self.session
             .reset(&self.stream)
             .map_err(|error| Exception::custom(error.to_string()))
+    }
+
+    fn reset_cache_distributed(&mut self) -> Result<(), Error> {
+        self.session
+            .reset_distributed(&self.stream)
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))
     }
 
     fn load_prompt_cache(
@@ -1584,6 +3913,73 @@ where
                 descriptor,
                 prefix_token_ids,
                 options,
+                &self.stream,
+            )
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))
+    }
+
+    fn load_prompt_cache_distributed(
+        &mut self,
+        directory: &Path,
+        expected: &PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+    ) -> Result<Option<PromptCacheManifest>, Error> {
+        self.session
+            .load_prompt_cache_distributed(directory, expected, prefix_token_ids, &self.stream)
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))
+    }
+
+    fn load_prompt_cache_for_input_distributed(
+        &mut self,
+        directory: &Path,
+        expected: &PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        input_identity: eredu_runtime::PreparedInputCacheIdentity,
+    ) -> Result<Option<PromptCacheManifest>, Error> {
+        self.session
+            .load_prompt_cache_for_input_distributed(
+                directory,
+                expected,
+                prefix_token_ids,
+                input_identity,
+                &self.stream,
+            )
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))
+    }
+
+    fn save_prompt_cache_distributed(
+        &mut self,
+        destination: &Path,
+        descriptor: PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: &PromptCacheOptions,
+    ) -> Result<Option<PromptCacheManifest>, Error> {
+        self.session
+            .save_prompt_cache_distributed(
+                destination,
+                descriptor,
+                prefix_token_ids,
+                options,
+                &self.stream,
+            )
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))
+    }
+
+    fn save_prompt_cache_for_input_distributed(
+        &mut self,
+        destination: &Path,
+        descriptor: PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: &PromptCacheOptions,
+        input_identity: &eredu_runtime::PreparedInputCacheIdentity,
+    ) -> Result<Option<PromptCacheManifest>, Error> {
+        self.session
+            .save_prompt_cache_for_input_distributed(
+                destination,
+                descriptor,
+                prefix_token_ids,
+                options,
+                input_identity,
                 &self.stream,
             )
             .map_err(|error| Error::ArchitectureModel(error.to_string()))
@@ -1681,28 +4077,14 @@ where
 
 struct CompletedComposite<A, D = eredu_runtime::DirectReplicatedTextExecution>
 where
-    A: CompositeArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error>
-        + eredu_runtime::RoutedLayeredArchitecture<MlxNeuralBackend, MlxHybridState>
-        + 'static,
+    A: CompositeArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error> + 'static,
     A::InputPartPlan: 'static,
-    A::StaticModules: Clone,
     D: eredu_runtime::ReplicatedTextExecutionStrategy<
         PreparedCompositeArchitecture<A>,
         MlxNeuralBackend,
         MlxHybridState,
-        MlxResidentPolicy<
-            <PreparedCompositeArchitecture<A> as eredu_runtime::LayeredArchitecture<
-                MlxNeuralBackend,
-                MlxHybridState,
-            >>::Unit,
-        >,
-        MlxLayerwisePolicy<
-            <PreparedCompositeArchitecture<A> as eredu_runtime::LayeredArchitecture<
-                MlxNeuralBackend,
-                MlxHybridState,
-            >>::Unit,
-            MlxSelectiveUnitPopulator,
-        >,
+        MlxArchitectureLayerwisePolicy<PreparedCompositeArchitecture<A>, MlxHybridState>,
+        MlxArchitectureLayerwisePolicy<PreparedCompositeArchitecture<A>, MlxHybridState>,
     >,
 {
     session: ReplicatedTextSession<
@@ -1717,18 +4099,21 @@ where
     capability_estimate: eredu_architectures::capability::CapabilityEstimate,
     effective_model_type: String,
     materialization: Option<eredu_runtime::WeightMaterializationReport>,
+    prediction_extension_depth: Option<usize>,
+    prediction_extension: Option<MlxPredictionExtension>,
     #[cfg(test)]
     selected_residency: eredu_runtime::LayerWeightResidency,
+    partition_sampling_group: Option<crate::backend::runtime::distributed::Group>,
+    partition_communication_authority: Option<eredu_runtime::PartitionCommunicationAuthority>,
+    partition_sampling_rank: Option<usize>,
+    partition_public_output: bool,
     stream: Stream,
 }
 
 impl<A> CompletedComposite<A>
 where
-    A: CompositeArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error>
-        + eredu_runtime::RoutedLayeredArchitecture<MlxNeuralBackend, MlxHybridState>
-        + 'static,
+    A: CompositeArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error> + 'static,
     A::InputPartPlan: 'static,
-    A::StaticModules: Clone,
     A::Error: std::fmt::Display,
 {
     fn new(
@@ -1775,8 +4160,14 @@ where
             capability_estimate,
             effective_model_type,
             materialization,
+            prediction_extension_depth: None,
+            prediction_extension: None,
             #[cfg(test)]
             selected_residency,
+            partition_sampling_group: None,
+            partition_communication_authority: None,
+            partition_sampling_rank: None,
+            partition_public_output: true,
             stream: stream.clone(),
         })
     }
@@ -1784,30 +4175,153 @@ where
 
 impl<A, D> CompletedComposite<A, D>
 where
-    A: CompositeArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error>
-        + eredu_runtime::RoutedLayeredArchitecture<MlxNeuralBackend, MlxHybridState>
-        + 'static,
+    A: CompositeArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error> + 'static,
     A::InputPartPlan: 'static,
-    A::StaticModules: Clone,
     D: eredu_runtime::ReplicatedTextExecutionStrategy<
         PreparedCompositeArchitecture<A>,
         MlxNeuralBackend,
         MlxHybridState,
-        MlxResidentPolicy<
-            <PreparedCompositeArchitecture<A> as eredu_runtime::LayeredArchitecture<
-                MlxNeuralBackend,
-                MlxHybridState,
-            >>::Unit,
-        >,
-        MlxLayerwisePolicy<
-            <PreparedCompositeArchitecture<A> as eredu_runtime::LayeredArchitecture<
-                MlxNeuralBackend,
-                MlxHybridState,
-            >>::Unit,
-            MlxSelectiveUnitPopulator,
-        >,
+        MlxArchitectureLayerwisePolicy<PreparedCompositeArchitecture<A>, MlxHybridState>,
+        MlxArchitectureLayerwisePolicy<PreparedCompositeArchitecture<A>, MlxHybridState>,
     >,
 {
+    fn with_inkling_prediction_extension<T>(
+        &mut self,
+        cache: &mut MlxPredictionTargetCache,
+        operation: impl FnOnce(
+            &mut Self,
+            &mut crate::backend::nn::shared::MlxModule<
+                eredu_architectures::inkling::MtpModel<MlxNeuralBackend>,
+            >,
+            &mut MlxHybridState,
+        ) -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        let mut extension = self.prediction_extension.take().ok_or_else(|| {
+            Error::ArchitectureModel("prediction extension was not installed".into())
+        })?;
+        let mut lane = cache.extension.take().ok_or_else(|| {
+            Error::ArchitectureModel("prediction lane has no extension state".into())
+        })?;
+        let checkpoint = lane.clone();
+        let result = match (&mut extension, &mut lane) {
+            (
+                MlxPredictionExtension::Inkling { model, .. },
+                MlxPredictionExtensionState::Inkling(state),
+            ) => operation(self, model, state),
+            _ => Err(Error::ArchitectureModel(
+                "prediction extension differs from the composite target".into(),
+            )),
+        };
+        if result.is_err() {
+            lane = checkpoint;
+        }
+        cache.extension = Some(lane);
+        self.prediction_extension = Some(extension);
+        result
+    }
+
+    fn with_qwen_hybrid_prediction_extension<T>(
+        &mut self,
+        cache: &mut MlxPredictionTargetCache,
+        operation: impl FnOnce(
+            &mut Self,
+            &mut [crate::backend::nn::shared::MlxModule<
+                eredu_architectures::qwen::hybrid::PredictionUnit<MlxNeuralBackend>,
+            >],
+            &mut MlxHybridState,
+        ) -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        let mut extension = self.prediction_extension.take().ok_or_else(|| {
+            Error::ArchitectureModel("prediction extension was not installed".into())
+        })?;
+        let mut lane = cache.extension.take().ok_or_else(|| {
+            Error::ArchitectureModel("prediction lane has no extension state".into())
+        })?;
+        let checkpoint = lane.clone();
+        let result = match (&mut extension, &mut lane) {
+            (
+                MlxPredictionExtension::QwenHybrid { units, .. },
+                MlxPredictionExtensionState::QwenHybrid(state),
+            ) => {
+                if units.len() != state.layers_mut().len() {
+                    Err(Error::ArchitectureModel(
+                        "Qwen hybrid prediction units and state differ".into(),
+                    ))
+                } else {
+                    operation(self, units, state)
+                }
+            }
+            _ => Err(Error::ArchitectureModel(
+                "prediction extension differs from the composite target".into(),
+            )),
+        };
+        if result.is_err() {
+            lane = checkpoint;
+        }
+        cache.extension = Some(lane);
+        self.prediction_extension = Some(extension);
+        result
+    }
+
+    fn with_prediction_target_state<T>(
+        &mut self,
+        cache: &mut MlxPredictionTargetCache,
+        operation: impl FnOnce(
+            &mut ReplicatedTextSession<
+                PreparedCompositeArchitecture<A>,
+                MlxNeuralBackend,
+                MlxReplicatedTextMechanisms<PreparedCompositeArchitecture<A>, MlxHybridState>,
+                D,
+            >,
+        ) -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        if !cache
+            .state
+            .as_ref()
+            .is_some_and(|state| state.as_any().is::<MlxHybridState>())
+        {
+            return Err(Error::ArchitectureModel(
+                "external-assistant target cache differs from the neutral composite state".into(),
+            ));
+        }
+        let erased = cache.state.take().ok_or_else(|| {
+            Error::ArchitectureModel("external-assistant target cache is already active".into())
+        })?;
+        let mut lane = *erased
+            .into_any()
+            .downcast::<MlxHybridState>()
+            .expect("external-assistant target state type checked before transfer");
+        if let Err(error) = self
+            .session
+            .exchange_prediction_target_state(&mut lane, &self.stream)
+        {
+            cache.state = Some(Box::new(lane));
+            return Err(Error::ArchitectureModel(error.to_string()));
+        }
+        let result = operation(&mut self.session);
+        let restored = match self
+            .session
+            .exchange_prediction_target_state(&mut lane, &self.stream)
+        {
+            Ok(()) => Ok(()),
+            Err(error) => self
+                .session
+                .recover_prediction_target_state_after_failure(&mut lane)
+                .map_err(|recovery| {
+                    Error::ArchitectureModel(format!(
+                        "prediction target state exchange failed: {error}; local ownership recovery failed: {recovery}"
+                    ))
+                })
+                .and(Err(Error::ArchitectureModel(error.to_string()))),
+        };
+        cache.state = Some(Box::new(lane));
+        match (result, restored) {
+            (Ok(output), Ok(())) => Ok(output),
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn from_session(
         session: ReplicatedTextSession<
@@ -1823,6 +4337,10 @@ where
         effective_model_type: String,
         materialization: Option<eredu_runtime::WeightMaterializationReport>,
         selected_residency: eredu_runtime::LayerWeightResidency,
+        partition_sampling_group: Option<crate::backend::runtime::distributed::Group>,
+        partition_communication_authority: Option<eredu_runtime::PartitionCommunicationAuthority>,
+        partition_sampling_rank: Option<usize>,
+        partition_public_output: bool,
         stream: &Stream,
     ) -> Self {
         #[cfg(not(test))]
@@ -1835,8 +4353,14 @@ where
             capability_estimate,
             effective_model_type,
             materialization,
+            prediction_extension_depth: None,
+            prediction_extension: None,
             #[cfg(test)]
             selected_residency,
+            partition_sampling_group,
+            partition_communication_authority,
+            partition_sampling_rank,
+            partition_public_output,
             stream: stream.clone(),
         }
     }
@@ -1954,34 +4478,454 @@ where
 
 impl<A, D> ErasedReplicatedTextExecutable for CompletedComposite<A, D>
 where
-    A: CompositeArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error>
-        + eredu_runtime::RoutedLayeredArchitecture<MlxNeuralBackend, MlxHybridState>
-        + 'static,
+    A: CompositeArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error> + 'static,
     A::InputPartPlan: 'static,
-    A::StaticModules: Clone,
+    A::AdmissionConfig: 'static,
     A::Error: std::fmt::Display,
     D: eredu_runtime::ReplicatedTextExecutionStrategy<
             PreparedCompositeArchitecture<A>,
             MlxNeuralBackend,
             MlxHybridState,
-            MlxResidentPolicy<
-                <PreparedCompositeArchitecture<A> as eredu_runtime::LayeredArchitecture<
-                    MlxNeuralBackend,
-                    MlxHybridState,
-                >>::Unit,
-            >,
-            MlxLayerwisePolicy<
-                <PreparedCompositeArchitecture<A> as eredu_runtime::LayeredArchitecture<
-                    MlxNeuralBackend,
-                    MlxHybridState,
-                >>::Unit,
-                MlxSelectiveUnitPopulator,
-            >,
+            MlxArchitectureLayerwisePolicy<PreparedCompositeArchitecture<A>, MlxHybridState>,
+            MlxArchitectureLayerwisePolicy<PreparedCompositeArchitecture<A>, MlxHybridState>,
         > + MlxParameterBankTelemetry
         + 'static,
 {
+    fn install_prediction_extension_contract(
+        &mut self,
+        extension: MlxPredictionExtension,
+        capability: eredu_architectures::capability::CapabilityEstimate,
+    ) -> Result<(), Error> {
+        let depth = extension.depth();
+        if depth == 0 || capability.speculative_draft_source().is_none() {
+            return Err(Error::ArchitectureModel(
+                "prediction extension contract is missing executable draft depth".into(),
+            ));
+        }
+        if self.prediction_extension_depth.replace(depth).is_some() {
+            return Err(Error::ArchitectureModel(
+                "prediction extension contract was installed more than once".into(),
+            ));
+        }
+        self.capability_estimate = capability;
+        self.prediction_extension = Some(extension);
+        Ok(())
+    }
+
+    fn prediction_extension_depth(&self) -> Option<usize> {
+        self.prediction_extension_depth
+    }
+
+    fn prepare_prediction_target_cache(&mut self) -> Result<MlxPredictionTargetCache, Error> {
+        self.session
+            .prepare_prediction_target_state(&self.stream)
+            .map(|state| MlxPredictionTargetCache {
+                state: Some(Box::new(state)),
+                extension: self
+                    .prediction_extension
+                    .as_ref()
+                    .map(MlxPredictionExtension::new_state),
+            })
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))
+    }
+
+    fn prefill_prediction_target(
+        &mut self,
+        input: input::ModelInput<'_>,
+        cache: &mut MlxPredictionTargetCache,
+    ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Error> {
+        let stream = self.stream.clone();
+        let tokens = input::text_token_ids(input, &stream)?;
+        let (prepared, admitted, _) = self.prepare(input)?;
+        let paired =
+            PreparedCompositeInput::new(&prepared, &admitted).map_err(Error::ArchitectureModel)?;
+        let tokens = MlxTensor::from_array(tokens.clone());
+        self.with_prediction_target_state(cache, |session| {
+            session
+                .prefill_input_prediction_target(paired, &stream)
+                .map(|(logits, hidden)| {
+                    crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput {
+                        logits,
+                        hidden,
+                        tokens,
+                    }
+                })
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))
+        })
+    }
+
+    fn verify_prediction_target(
+        &mut self,
+        tokens: &MlxTensor,
+        cache: &mut MlxPredictionTargetCache,
+    ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Error> {
+        let stream = self.stream.clone();
+        let (prepared, admitted, _) = self.text_input(tokens.as_array())?;
+        let paired =
+            PreparedCompositeInput::new(&prepared, &admitted).map_err(Error::ArchitectureModel)?;
+        let retained_tokens = tokens.clone();
+        self.with_prediction_target_state(cache, |session| {
+            session
+                .decode_input_prediction_target(paired, &stream)
+                .map(|(logits, hidden)| {
+                    crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput {
+                        logits,
+                        hidden,
+                        tokens: retained_tokens,
+                    }
+                })
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))
+        })
+    }
+
+    fn prefill_prediction_extension(
+        &mut self,
+        output: &crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput,
+        tokens: &MlxTensor,
+        cache: &mut MlxPredictionTargetCache,
+    ) -> Result<(), Error> {
+        let sequence = tokens.as_array().dim(1);
+        if sequence <= 1 {
+            return Ok(());
+        }
+        let hidden = MlxTensor::from_array(
+            output
+                .hidden
+                .as_array()
+                .try_index_device((.., ..sequence - 1, ..), &self.stream)?,
+        );
+        let next = MlxTensor::from_array(
+            tokens
+                .as_array()
+                .try_index_device((.., 1..), &self.stream)?,
+        );
+        if matches!(
+            self.prediction_extension,
+            Some(MlxPredictionExtension::QwenHybrid { .. })
+        ) {
+            self.with_qwen_hybrid_prediction_extension(cache, |this, units, state| {
+                units.iter_mut().enumerate().try_for_each(|(depth, unit)| {
+                    this.session
+                        .apply_prediction_target_operation(
+                            QwenHybridPredictionUnitOperation {
+                                unit,
+                                hidden: &hidden,
+                                tokens: &next,
+                                depth,
+                                state,
+                            },
+                            &this.stream,
+                        )
+                        .map(|_| ())
+                        .map_err(|error| Error::ArchitectureModel(error.to_string()))
+                })
+            })
+        } else {
+            self.with_inkling_prediction_extension(cache, |this, model, state| {
+                (0..model.len()).try_for_each(|depth| {
+                    this.session
+                        .apply_prediction_target_operation(
+                            InklingPredictionUnitOperation {
+                                model,
+                                hidden: &hidden,
+                                tokens: &next,
+                                depth,
+                                state,
+                            },
+                            &this.stream,
+                        )
+                        .map(|_| ())
+                        .map_err(|error| Error::ArchitectureModel(error.to_string()))
+                })
+            })
+        }
+    }
+
+    fn prediction_extension_logits(
+        &mut self,
+        hidden: &MlxTensor,
+        last_token: u32,
+        draft_index: usize,
+        cache: &mut MlxPredictionTargetCache,
+    ) -> Result<(MlxTensor, MlxTensor), Error> {
+        let token = MlxTensor::from_array(Array::from_slice(&[last_token], &[1, 1]));
+        if matches!(
+            self.prediction_extension,
+            Some(MlxPredictionExtension::QwenHybrid { .. })
+        ) {
+            self.with_qwen_hybrid_prediction_extension(cache, |this, units, state| {
+                let unit_count = units.len();
+                let unit = units.get_mut(draft_index).ok_or_else(|| {
+                    Error::ArchitectureModel(format!(
+                        "prediction depth {draft_index} exceeds {unit_count} units"
+                    ))
+                })?;
+                this.session
+                    .apply_prediction_target_operation(
+                        QwenHybridPredictionUnitOperation {
+                            unit,
+                            hidden,
+                            tokens: &token,
+                            depth: draft_index,
+                            state,
+                        },
+                        &this.stream,
+                    )
+                    .map(|output| (output.logits, output.hidden))
+                    .map_err(|error| Error::ArchitectureModel(error.to_string()))
+            })
+        } else {
+            self.with_inkling_prediction_extension(cache, |this, model, state| {
+                if draft_index >= model.len() {
+                    return Err(Error::ArchitectureModel(format!(
+                        "prediction depth {draft_index} exceeds {} units",
+                        model.len()
+                    )));
+                }
+                this.session
+                    .apply_prediction_target_operation(
+                        InklingPredictionUnitOperation {
+                            model,
+                            hidden,
+                            tokens: &token,
+                            depth: draft_index,
+                            state,
+                        },
+                        &this.stream,
+                    )
+                    .map(|output| (output.logits, output.hidden))
+                    .map_err(|error| Error::ArchitectureModel(error.to_string()))
+            })
+        }
+    }
+
+    fn advance_prediction_extension(
+        &mut self,
+        hidden: &MlxTensor,
+        tokens: &MlxTensor,
+        cache: &mut MlxPredictionTargetCache,
+    ) -> Result<(), Error> {
+        if matches!(
+            self.prediction_extension,
+            Some(MlxPredictionExtension::QwenHybrid { .. })
+        ) {
+            self.with_qwen_hybrid_prediction_extension(cache, |this, units, state| {
+                units.iter_mut().enumerate().try_for_each(|(depth, unit)| {
+                    this.session
+                        .apply_prediction_target_operation(
+                            QwenHybridPredictionUnitOperation {
+                                unit,
+                                hidden,
+                                tokens,
+                                depth,
+                                state,
+                            },
+                            &this.stream,
+                        )
+                        .map(|_| ())
+                        .map_err(|error| Error::ArchitectureModel(error.to_string()))
+                })
+            })
+        } else {
+            self.with_inkling_prediction_extension(cache, |this, model, state| {
+                (0..model.len()).try_for_each(|depth| {
+                    this.session
+                        .apply_prediction_target_operation(
+                            InklingPredictionUnitOperation {
+                                model,
+                                hidden,
+                                tokens,
+                                depth,
+                                state,
+                            },
+                            &this.stream,
+                        )
+                        .map(|_| ())
+                        .map_err(|error| Error::ArchitectureModel(error.to_string()))
+                })
+            })
+        }
+    }
+
+    fn external_prediction_capture_request(
+        &self,
+        drafter: &super::speculative::MlxDrafter,
+    ) -> Result<Option<ExternalPredictionCaptureRequest>, Error> {
+        use super::speculative::MlxDrafterKind;
+
+        let admission = &self.admission as &dyn std::any::Any;
+        match drafter.kind() {
+            MlxDrafterKind::Gemma4Assistant => admission
+                .downcast_ref::<eredu_architectures::gemma4::FamilyConfig>()
+                .map(|target| {
+                    eredu_architectures::gemma4::model::external_assistant_capture_request(
+                        target,
+                        &drafter.gemma4().config,
+                    )
+                    .map_err(Error::ArchitectureModel)
+                })
+                .transpose(),
+            MlxDrafterKind::MuseGlimmerDFlash => admission
+                .downcast_ref::<eredu_architectures::muse_glimmer::DecoderConfig>()
+                .map(|target| {
+                    eredu_architectures::muse_glimmer::model::external_assistant_capture_request(
+                        target,
+                        &drafter.muse_glimmer().config,
+                    )
+                    .map_err(Error::ArchitectureModel)
+                })
+                .transpose(),
+        }
+    }
+
+    fn prepare_external_prediction_target_cache(
+        &mut self,
+    ) -> Result<MlxPredictionTargetCache, Error> {
+        self.session
+            .prepare_prediction_target_state(&self.stream)
+            .map(|state| MlxPredictionTargetCache {
+                state: Some(Box::new(state)),
+                extension: None,
+            })
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))
+    }
+
+    fn prefill_external_prediction_target(
+        &mut self,
+        input: input::ModelInput<'_>,
+        request: &ExternalPredictionCaptureRequest,
+        cache: &mut MlxPredictionTargetCache,
+    ) -> Result<(MlxTensor, ExternalPredictionTargetCapture<MlxTensor>), Error> {
+        let paths = A::external_prediction_capture_paths(request)
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?
+            .ok_or_else(|| {
+                Error::ArchitectureModel(
+                    "assistant capture request differs from the neutral target architecture".into(),
+                )
+            })?;
+        let mut observer = ExactPredictionCaptureObserver::new(paths)?;
+        let (prepared, admitted, _) = self.prepare(input)?;
+        let paired =
+            PreparedCompositeInput::new(&prepared, &admitted).map_err(Error::ArchitectureModel)?;
+        let request = request.clone();
+        let captured = observer.values.clone();
+        let stream = self.stream.clone();
+        self.with_prediction_target_state(cache, |session| {
+            session
+                .prefill_input_with_capture(paired, &stream, &mut observer, |forward| {
+                    let values = captured
+                        .borrow()
+                        .iter()
+                        .cloned()
+                        .enumerate()
+                        .map(|(index, value)| {
+                            value.ok_or_else(|| {
+                                eredu_nn::Error::backend(format!(
+                                    "external-assistant target did not reach capture path {index}"
+                                ))
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    A::external_prediction_capture(&request, forward, values)?.ok_or_else(|| {
+                        eredu_nn::Error::backend(
+                            "architecture did not produce its selected assistant capture",
+                        )
+                    })
+                })
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))
+        })
+    }
+
+    fn verify_external_prediction_target(
+        &mut self,
+        tokens: &MlxTensor,
+        request: &ExternalPredictionCaptureRequest,
+        cache: &mut MlxPredictionTargetCache,
+    ) -> Result<(MlxTensor, ExternalPredictionTargetCapture<MlxTensor>), Error> {
+        let token_array = tokens.as_array().clone();
+        let (prepared, admitted, _) = self.text_input(&token_array)?;
+        let paired =
+            PreparedCompositeInput::new(&prepared, &admitted).map_err(Error::ArchitectureModel)?;
+        let paths = A::external_prediction_capture_paths(request)
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?
+            .ok_or_else(|| {
+                Error::ArchitectureModel(
+                    "assistant capture request differs from the neutral target architecture".into(),
+                )
+            })?;
+        let mut observer = ExactPredictionCaptureObserver::new(paths)?;
+        let request = request.clone();
+        let captured = observer.values.clone();
+        let stream = self.stream.clone();
+        self.with_prediction_target_state(cache, |session| {
+            session
+                .decode_input_with_capture(paired, &stream, &mut observer, |forward| {
+                    let values = captured
+                        .borrow()
+                        .iter()
+                        .cloned()
+                        .enumerate()
+                        .map(|(index, value)| {
+                            value.ok_or_else(|| {
+                                eredu_nn::Error::backend(format!(
+                                    "external-assistant target did not reach capture path {index}"
+                                ))
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    A::external_prediction_capture(&request, forward, values)?.ok_or_else(|| {
+                        eredu_nn::Error::backend(
+                            "architecture did not produce its selected assistant capture",
+                        )
+                    })
+                })
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))
+        })
+    }
+
+    fn apply_external_prediction_target_operation(
+        &mut self,
+        operation: ExternalPredictionTargetOperation<'_, MlxTensor>,
+    ) -> Result<MlxTensor, Error> {
+        self.session
+            .apply_prediction_target_operation(
+                CompositePredictionTargetOperation { operation },
+                &self.stream,
+            )
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))
+    }
+
     fn effective_model_type(&self) -> &str {
         &self.effective_model_type
+    }
+
+    fn has_partition_control(&self) -> bool {
+        self.partition_communication_authority.is_some()
+    }
+
+    fn partition_sampling_context(
+        &self,
+    ) -> Option<(
+        &crate::backend::runtime::distributed::Group,
+        &eredu_runtime::PartitionCommunicationAuthority,
+        &Stream,
+        usize,
+    )> {
+        self.partition_sampling_group.as_ref().map(|group| {
+            (
+                group,
+                self.partition_communication_authority
+                    .as_ref()
+                    .expect("partition sampling group has communication authority"),
+                &self.stream,
+                self.partition_sampling_rank
+                    .expect("partition sampling group has selected owner rank"),
+            )
+        })
+    }
+
+    fn partition_public_output(&self) -> bool {
+        self.partition_public_output
     }
 
     fn capability_estimate(&self) -> &eredu_architectures::capability::CapabilityEstimate {
@@ -2104,6 +5048,12 @@ where
             .map_err(|error| Exception::custom(error.to_string()))
     }
 
+    fn reset_cache_distributed(&mut self) -> Result<(), Error> {
+        self.session
+            .reset_distributed(&self.stream)
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))
+    }
+
     fn load_prompt_cache(
         &mut self,
         directory: &Path,
@@ -2162,6 +5112,80 @@ where
             .map_err(|error| Error::ArchitectureModel(error.to_string()))
     }
 
+    fn load_prompt_cache_distributed(
+        &mut self,
+        _directory: &Path,
+        _expected: &PromptCacheDescriptor,
+        _prefix_token_ids: &[u32],
+    ) -> Result<Option<PromptCacheManifest>, Error> {
+        Err(Error::ArchitectureModel(
+            "composite prompt-cache loading requires the prepared-input identity".into(),
+        ))
+    }
+
+    fn load_prompt_cache_for_input_distributed(
+        &mut self,
+        directory: &Path,
+        expected: &PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        input_identity: eredu_runtime::PreparedInputCacheIdentity,
+    ) -> Result<Option<PromptCacheManifest>, Error> {
+        self.session
+            .load_prompt_cache_for_input_distributed(
+                directory,
+                expected,
+                prefix_token_ids,
+                input_identity,
+                &self.stream,
+            )
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))
+    }
+
+    fn save_prompt_cache_distributed(
+        &mut self,
+        destination: &Path,
+        descriptor: PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: &PromptCacheOptions,
+    ) -> Result<Option<PromptCacheManifest>, Error> {
+        let identity = self
+            .session
+            .committed_prompt_input_identity()
+            .cloned()
+            .ok_or_else(|| {
+                Error::ArchitectureModel(
+                    "composite prompt cache requires a committed prepared-input identity".into(),
+                )
+            })?;
+        self.save_prompt_cache_for_input_distributed(
+            destination,
+            descriptor,
+            prefix_token_ids,
+            options,
+            &identity,
+        )
+    }
+
+    fn save_prompt_cache_for_input_distributed(
+        &mut self,
+        destination: &Path,
+        descriptor: PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: &PromptCacheOptions,
+        input_identity: &eredu_runtime::PreparedInputCacheIdentity,
+    ) -> Result<Option<PromptCacheManifest>, Error> {
+        self.session
+            .save_prompt_cache_for_input_distributed(
+                destination,
+                descriptor,
+                prefix_token_ids,
+                options,
+                input_identity,
+                &self.stream,
+            )
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))
+    }
+
     fn cache_residency_report(&self) -> Result<Option<CacheResidencyReport>, Exception> {
         self.session
             .report()
@@ -2170,11 +5194,11 @@ where
     }
 
     fn prefill(&mut self, input: input::ModelInput<'_>, stream: &Stream) -> Result<Array, Error> {
-        #[cfg(test)]
-        super::path_instrumentation::forward();
         let (prepared, admitted, cache_identity) = self.prepare(input)?;
         let paired =
             PreparedCompositeInput::new(&prepared, &admitted).map_err(Error::ArchitectureModel)?;
+        #[cfg(test)]
+        super::path_instrumentation::forward();
         let output = match cache_identity {
             Some(identity) => self
                 .session
@@ -2299,7 +5323,6 @@ impl CompositeTextArchitectureVisitor<MlxNeuralBackend, MlxHybridState>
             + eredu_runtime::RoutedLayeredArchitecture<MlxNeuralBackend, MlxHybridState>
             + 'static,
         A::InputPartPlan: 'static,
-        A::StaticModules: Clone,
         A::Error: std::fmt::Display,
     {
         CompletedComposite::new(prepared, store, self.stream, self.weights_stream)
@@ -2362,6 +5385,10 @@ impl CompositeTextArchitectureVisitor<MlxNeuralBackend, MlxHybridState>
                     effective_model_type,
                     materialization,
                     selected_residency,
+                    None,
+                    None,
+                    None,
+                    true,
                     self.stream,
                 )))
             }
@@ -2392,6 +5419,10 @@ impl CompositeTextArchitectureVisitor<MlxNeuralBackend, MlxHybridState>
                     effective_model_type,
                     materialization,
                     selected_residency,
+                    None,
+                    None,
+                    None,
+                    true,
                     self.stream,
                 )))
             }
@@ -2511,6 +5542,71 @@ fn selected_addressable_bank(
     }
 }
 
+fn shard_addressable_members(
+    members: &[eredu_runtime::AddressableBankMember],
+    store: &dyn CheckpointSource,
+    layout: &eredu_runtime::LocalModelLayout,
+) -> Result<Vec<eredu_runtime::AddressableBankMember>, Error> {
+    members
+        .iter()
+        .map(|member| {
+            let bindings = shard_addressable_member_bindings(
+                member.source().bindings().to_vec(),
+                store,
+                layout,
+            )?;
+            let selected_bytes = bindings.iter().try_fold(0u64, |total, binding| {
+                total.checked_add(binding.expected_bytes()).ok_or_else(|| {
+                    Error::ArchitectureModel(
+                        "rank-local addressable member byte geometry overflowed".into(),
+                    )
+                })
+            })?;
+            eredu_runtime::AddressableBankMember::new(member.key(), bindings, selected_bytes)
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn selected_addressable_partition_bank(
+    members: &[eredu_runtime::AddressableBankMember],
+    quantization: Option<eredu_checkpoint::WeightQuantization>,
+    store: Arc<dyn CheckpointSource>,
+    options: eredu_runtime::ParameterBankLoadOptions,
+    layout: &eredu_runtime::LocalModelLayout,
+    weights_stream: &Stream,
+    stream: &Stream,
+) -> Result<
+    (
+        std::collections::BTreeMap<eredu_runtime::ParameterBankKey, u64>,
+        MlxSharedAddressableBank,
+    ),
+    Error,
+> {
+    let members = shard_addressable_members(members, store.as_ref(), layout)?;
+    let bank = selected_addressable_bank(
+        &members,
+        quantization,
+        store,
+        options,
+        weights_stream,
+        stream,
+    )?;
+    let selected_member_bytes = members
+        .iter()
+        .map(|member| {
+            let bytes = <crate::backend::runtime::residency::parameter_bank::AddressableParameterBank as eredu_runtime::AddressableGroupedBank<MlxNeuralBackend>>::member_bytes(
+                &bank,
+                member.key(),
+            )
+            .expect("constructed addressable bank retains every selected member");
+            (member.key(), bytes)
+        })
+        .collect();
+    Ok((selected_member_bytes, MlxSharedAddressableBank::new(bank)))
+}
+
 #[derive(Clone, Copy)]
 struct Relu2RoutedBindingVisitor<'a> {
     stream: &'a Stream,
@@ -2573,6 +5669,10 @@ impl eredu_architectures::Relu2RoutedTextArchitectureVisitor<MlxNeuralBackend, M
                     effective_model_type,
                     materialization,
                     selected_residency,
+                    None,
+                    None,
+                    None,
+                    true,
                     self.stream,
                 )))
             }
@@ -2606,6 +5706,10 @@ impl eredu_architectures::Relu2RoutedTextArchitectureVisitor<MlxNeuralBackend, M
                     effective_model_type,
                     materialization,
                     selected_residency,
+                    None,
+                    None,
+                    None,
+                    true,
                     self.stream,
                 )))
             }
@@ -2674,6 +5778,10 @@ where
                 effective_model_type,
                 materialization,
                 selected_residency,
+                None,
+                None,
+                None,
+                true,
                 stream,
             )))
         }
@@ -2707,6 +5815,10 @@ where
                 effective_model_type,
                 materialization,
                 selected_residency,
+                None,
+                None,
+                None,
+                true,
                 stream,
             )))
         }
@@ -2780,6 +5892,1801 @@ impl eredu_architectures::GatedRoutedTextArchitectureVisitor<MlxNeuralBackend, M
 pub(crate) struct BindingVisitor<'a> {
     pub stream: &'a Stream,
     pub weights_stream: &'a Stream,
+}
+
+struct PartitionedDenseDecoderBindingVisitor<'a> {
+    distributed: crate::backend::distributed::MlxDistributedSession,
+    additional_claimed_sources: std::collections::BTreeSet<String>,
+    stream: &'a Stream,
+    weights_stream: &'a Stream,
+}
+
+struct PartitionedRoutedDecoderBindingVisitor<'a> {
+    distributed: crate::backend::distributed::MlxDistributedSession,
+    additional_claimed_sources: std::collections::BTreeSet<String>,
+    stream: &'a Stream,
+    weights_stream: &'a Stream,
+}
+
+struct PartitionedPoolingRoutedDecoderBindingVisitor<'a> {
+    distributed: crate::backend::distributed::MlxDistributedSession,
+    stream: &'a Stream,
+    weights_stream: &'a Stream,
+}
+
+impl
+    eredu_architectures::partitioned_execution::RoutedPartitionedProductionVisitor<
+        MlxNeuralBackend,
+        MlxPoolingAttentionState,
+    > for PartitionedPoolingRoutedDecoderBindingVisitor<'_>
+{
+    type Output = Box<dyn ErasedReplicatedTextExecutable>;
+    type Error = Error;
+
+    fn visit<A, G>(
+        self,
+        prepared: eredu_architectures::partitioned_execution::PreparedRoutedPartitionedArchitecture<
+            MlxNeuralBackend,
+            A,
+            G,
+            <A as eredu_runtime::PartitionedLayeredArchitecture<
+                MlxNeuralBackend,
+                MlxPoolingAttentionState,
+            >>::Boundary,
+        >,
+        store: Arc<dyn CheckpointSource>,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        A: eredu_architectures::partitioned_execution::TextPartitionArchitecture<
+                MlxNeuralBackend,
+                MlxPoolingAttentionState,
+            > + ReplicatedTextArchitecture<
+                MlxNeuralBackend,
+                MlxPoolingAttentionState,
+                Error = eredu_nn::Error,
+            > + eredu_runtime::ParallelRoutedLayeredArchitecture<
+                MlxNeuralBackend,
+                MlxPoolingAttentionState,
+            > + 'static,
+        A::StaticModules: Clone,
+        G: 'static,
+    {
+        bind_partitioned_routed_resident(
+            prepared,
+            store,
+            self.distributed,
+            std::collections::BTreeSet::new(),
+            self.stream,
+            self.weights_stream,
+        )
+    }
+}
+
+impl
+    eredu_architectures::partitioned_execution::RoutedPartitionedProductionVisitor<
+        MlxNeuralBackend,
+        MlxHybridState,
+    > for PartitionedRoutedDecoderBindingVisitor<'_>
+{
+    type Output = Box<dyn ErasedReplicatedTextExecutable>;
+    type Error = Error;
+
+    fn visit<A, G>(
+        self,
+        prepared: eredu_architectures::partitioned_execution::PreparedRoutedPartitionedArchitecture<
+            MlxNeuralBackend,
+            A,
+            G,
+            <A as eredu_runtime::PartitionedLayeredArchitecture<
+                MlxNeuralBackend,
+                MlxHybridState,
+            >>::Boundary,
+        >,
+        store: Arc<dyn CheckpointSource>,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        A: eredu_architectures::partitioned_execution::TextPartitionArchitecture<
+                MlxNeuralBackend,
+                MlxHybridState,
+            > + ReplicatedTextArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error>
+            + eredu_runtime::ParallelRoutedLayeredArchitecture<MlxNeuralBackend, MlxHybridState>
+            + 'static,
+        A::StaticModules: Clone,
+        G: 'static,
+    {
+        bind_partitioned_routed_resident(
+            prepared,
+            store,
+            self.distributed,
+            self.additional_claimed_sources,
+            self.stream,
+            self.weights_stream,
+        )
+    }
+}
+impl
+    eredu_architectures::partitioned_execution::RoutedPartitionedProductionVisitor<
+        MlxNeuralBackend,
+        MlxHybridState,
+        eredu_nn::GroupedRelu2Spec,
+    > for PartitionedRoutedDecoderBindingVisitor<'_>
+{
+    type Output = Box<dyn ErasedReplicatedTextExecutable>;
+    type Error = Error;
+
+    fn visit<A, G>(
+        self,
+        prepared: eredu_architectures::partitioned_execution::PreparedRoutedPartitionedArchitecture<
+            MlxNeuralBackend,
+            A,
+            G,
+            <A as eredu_runtime::PartitionedLayeredArchitecture<
+                MlxNeuralBackend,
+                MlxHybridState,
+            >>::Boundary,
+            eredu_nn::GroupedRelu2Spec,
+        >,
+        store: Arc<dyn CheckpointSource>,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        A: eredu_architectures::partitioned_execution::TextPartitionArchitecture<
+                MlxNeuralBackend,
+                MlxHybridState,
+            > + ReplicatedTextArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error>
+            + eredu_runtime::ParallelRoutedLayeredArchitecture<MlxNeuralBackend, MlxHybridState>
+            + 'static,
+        A::StaticModules: Clone,
+        G: 'static,
+    {
+        bind_partitioned_relu2_resident(
+            prepared,
+            store,
+            self.distributed,
+            self.stream,
+            self.weights_stream,
+        )
+    }
+}
+impl
+    eredu_architectures::partitioned_execution::PartitionedArchitectureVisitor<
+        MlxNeuralBackend,
+        MlxHybridState,
+    > for PartitionedDenseDecoderBindingVisitor<'_>
+{
+    type Output = Box<dyn ErasedReplicatedTextExecutable>;
+    type Error = Error;
+
+    fn visit<A, G>(
+        self,
+        prepared: eredu_architectures::partitioned_execution::PreparedPartitionedArchitecture<
+            MlxNeuralBackend,
+            A,
+            G,
+            <A as eredu_runtime::PartitionedLayeredArchitecture<
+                MlxNeuralBackend,
+                MlxHybridState,
+            >>::Boundary,
+        >,
+        store: Arc<dyn CheckpointSource>,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        A: eredu_architectures::partitioned_execution::TextPartitionArchitecture<
+                MlxNeuralBackend,
+                MlxHybridState,
+            > + ReplicatedTextArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error>
+            + 'static,
+        A::StaticModules: Clone,
+        G: 'static,
+    {
+        bind_partitioned(
+            prepared,
+            store,
+            self.distributed,
+            self.additional_claimed_sources,
+            self.stream,
+            self.weights_stream,
+        )
+    }
+}
+
+fn bind_partitioned<A, G>(
+    prepared: eredu_architectures::partitioned_execution::PreparedPartitionedArchitecture<
+        MlxNeuralBackend,
+        A,
+        G,
+        <A as eredu_runtime::PartitionedLayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::Boundary,
+    >,
+    store: Arc<dyn CheckpointSource>,
+    distributed: crate::backend::distributed::MlxDistributedSession,
+    additional_claimed_sources: std::collections::BTreeSet<String>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<Box<dyn ErasedReplicatedTextExecutable>, Error>
+where
+    A: eredu_architectures::partitioned_execution::TextPartitionArchitecture<
+            MlxNeuralBackend,
+            MlxHybridState,
+        > + ReplicatedTextArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error>
+        + 'static,
+    A::StaticModules: Clone,
+    G: 'static,
+{
+    prepared.dispatch_execution(
+        (
+            store,
+            distributed,
+            additional_claimed_sources,
+            stream,
+            weights_stream,
+        ),
+        |prepared, (store, distributed, additional, stream, weights_stream)| {
+            bind_partitioned_local(
+                prepared,
+                store,
+                distributed,
+                additional,
+                stream,
+                weights_stream,
+            )
+        },
+        |prepared, (store, distributed, additional, stream, weights_stream)| {
+            bind_partitioned_pipeline(
+                prepared,
+                store,
+                distributed,
+                additional,
+                stream,
+                weights_stream,
+            )
+        },
+    )
+}
+
+fn bind_partitioned_local<A, G>(
+    prepared: eredu_architectures::partitioned_execution::PreparedPartitionedArchitecture<
+        MlxNeuralBackend,
+        A,
+        G,
+        <A as eredu_runtime::PartitionedLayeredArchitecture<
+            MlxNeuralBackend,
+            MlxHybridState,
+        >>::Boundary,
+    >,
+    store: Arc<dyn CheckpointSource>,
+    distributed: crate::backend::distributed::MlxDistributedSession,
+    additional_claimed_sources: std::collections::BTreeSet<String>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<Box<dyn ErasedReplicatedTextExecutable>, Error>
+where
+    A: eredu_architectures::partitioned_execution::TextPartitionArchitecture<
+            MlxNeuralBackend,
+            MlxHybridState,
+        > + ReplicatedTextArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error>
+        + 'static,
+    A::StaticModules: Clone,
+    G: 'static,
+{
+    let capability_estimate = prepared.capability_estimate().clone();
+    let effective_model_type = prepared.effective_model_type().to_owned();
+    let selected_residency = prepared.prepared().selected().base().residency();
+    let tensor_group = prepared
+        .prepared()
+        .selected()
+        .tensor_group()
+        .ok_or_else(|| {
+            Error::ArchitectureModel("direct partition has no selected tensor group".into())
+        })?;
+    let execution_plan = prepared
+        .prepared()
+        .selected()
+        .direct_execution_plan()
+        .map_err(Error::ArchitectureModel)?;
+    let publication_authority = execution_plan
+        .publication_authority(prepared.prepared().selected().communication())
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?
+        .ok_or_else(|| {
+            Error::ArchitectureModel(
+                "direct resident execution has no selected output publication authority".into(),
+            )
+        })?;
+    let prompt_cache_topology = prepared
+        .prepared()
+        .selected()
+        .prompt_cache_topology()
+        .map_err(Error::ArchitectureModel)?;
+    let prompt_cache_identity = prepared
+        .prepared()
+        .selected()
+        .partition()
+        .state()
+        .ok_or_else(|| Error::ArchitectureModel("direct partition has no state".into()))?
+        .prompt_cache_identity::<MlxNeuralBackend, _>(
+            prepared.prepared().architecture(),
+            prompt_cache_topology.clone(),
+        )
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let materialization_slot = Arc::new(std::sync::Mutex::new(None));
+    let mut mechanisms = MlxReplicatedTextMechanisms::new(
+        store,
+        Arc::clone(&materialization_slot),
+        stream,
+        weights_stream,
+    );
+    mechanisms.set_ignored_checkpoint_sources(additional_claimed_sources);
+    let mut distributed = Some(distributed);
+    let mut partition_sampling_group = None;
+    let mut partition_communication_authority = None;
+    #[cfg(test)]
+    {
+        super::path_instrumentation::constructor();
+        super::path_instrumentation::neutral_partitioned_construction();
+    }
+    let binding = prepared
+        .prepare_session_runtime(
+            prompt_cache_topology.clone(),
+            stream,
+            |input, source_architecture, physical_layout, selected, context| {
+                let (mut architecture, partition, manifest, tasks) = input.into_parts();
+                let (mut source_architecture, source_layout) = source_architecture
+                    .map_or((None, None), |(architecture, layout)| {
+                        (Some(architecture), Some(layout))
+                    });
+                mechanisms.set_parallel_layout(physical_layout);
+                mechanisms.set_source_parallel_layout(source_layout);
+                let layout = partition.unit_layout().clone();
+                partition_materialization_tasks(&tasks, &layout)?;
+                let mut units = Vec::with_capacity(layout.len());
+                for ordinal in 0..layout.len() {
+                    let address = layout.address(ordinal).ok_or_else(|| {
+                        Error::ArchitectureModel(format!(
+                            "partition unit ordinal {ordinal} has no canonical address"
+                        ))
+                    })?;
+                    units.push(
+                        <A as LayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::build_unit(
+                            &architecture,
+                            address.group(),
+                            address.index(),
+                            context,
+                        )
+                        .map_err(|error| Error::ArchitectureModel(error.to_string()))?,
+                    );
+                }
+                let mut source_units = source_architecture
+                    .as_ref()
+                    .map(|source| {
+                        (0..layout.len())
+                            .map(|ordinal| {
+                                let address = layout.address(ordinal).ok_or_else(|| {
+                                    Error::ArchitectureModel(format!(
+                                        "source partition unit ordinal {ordinal} has no canonical address"
+                                    ))
+                                })?;
+                                <A as LayeredArchitecture<
+                                    MlxNeuralBackend,
+                                    MlxHybridState,
+                                >>::build_unit(
+                                    source,
+                                    address.group(),
+                                    address.index(),
+                                    context,
+                                )
+                                .map_err(|error| Error::ArchitectureModel(error.to_string()))
+                            })
+                            .collect::<Result<Vec<_>, _>>()
+                    })
+                    .transpose()?;
+                mechanisms.prepare_materialization(
+                    &mut architecture,
+                    &layout,
+                    &mut units,
+                    source_architecture.as_mut(),
+                    source_units.as_deref_mut(),
+                    &tasks,
+                    &[],
+                    context,
+                )?;
+                let (execution_policy, bounded_policy) = match selected_residency {
+                    eredu_runtime::LayerWeightResidency::FullyResident => (
+                        mechanisms.resident_policy(&mut architecture, units, selected, context)?,
+                        None,
+                    ),
+                    eredu_runtime::LayerWeightResidency::LayerwiseHost(_)
+                    | eredu_runtime::LayerWeightResidency::DenseDiskStream(_) => {
+                        drop(units);
+                        let policy =
+                            mechanisms.bounded_policy(&mut architecture, selected, context)?;
+                        (policy.clone(), Some(policy))
+                    }
+                    _ => {
+                        return Err(Error::ArchitectureModel(
+                            "partitioned execution selected an unknown weight residency".into(),
+                        ));
+                    }
+                };
+                let local_state = partition.state().ok_or_else(|| {
+                    Error::ArchitectureModel("direct partition has no state".into())
+                })?;
+                let selected_state = selected
+                    .state()
+                    .for_partitioned_geometry(local_state)
+                    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+                let rank = eredu_core::cache::CacheRankIdentity::new(
+                    prompt_cache_topology.stage().map(|(_, rank)| rank),
+                    prompt_cache_topology.shard().map(|(_, rank)| rank),
+                    prompt_cache_topology.addressable().map(|(_, rank)| rank),
+                );
+                mechanisms.set_state_partition(rank, local_state.global_layer_offset());
+                let state = <MlxHybridState as MlxStateMechanisms>::realize(
+                    &selected_state,
+                    Some(rank),
+                    local_state.global_layer_offset(),
+                )?;
+                let distributed = distributed.take().ok_or_else(|| {
+                    Error::Parallel("direct partition communication was already consumed".into())
+                })?;
+                let (communication, parallel, sampling, communication_executor) = distributed
+                    .into_partition_communication(
+                        manifest.clone(),
+                        Some(tensor_group),
+                        tensor_group,
+                    )?;
+                let parallel = parallel.ok_or_else(|| {
+                    Error::Parallel("direct partition has no realized tensor group".into())
+                })?;
+                partition_communication_authority = Some(communication.authority());
+                partition_sampling_group = Some(sampling);
+                let layerwise =
+                    eredu_runtime::LayerwiseRuntime::new(architecture, execution_policy);
+                let executor =
+                    eredu_architectures::partitioned_execution::DirectPartitionExecutor::new(
+                        layerwise, parallel,
+                    );
+                let runtime = eredu_runtime::PartitionedTextRuntime::new(
+                    execution_plan,
+                    executor,
+                    communication,
+                    communication_executor,
+                    eredu_runtime::NoBoundaryTransport,
+                    eredu_runtime::OpaqueOutputPublisher,
+                    eredu_runtime::OpaqueFailureAgreement,
+                    selected_residency.execution_residency(),
+                    bounded_policy,
+                )
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+                Ok::<_, Error>((runtime, state))
+            },
+        )
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let session = eredu_runtime::construct_replicated_text_session_with_runtime(
+        binding,
+        mechanisms,
+        MlxDirectPartitionStrategy::<A>::new(),
+    )
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let materialization = materialization_slot
+        .lock()
+        .map_err(|_| Error::ArchitectureModel("materialization report lock was poisoned".into()))?
+        .clone();
+    Ok(Box::new(CompletedReplicatedText::from_session(
+        session,
+        prompt_cache_identity,
+        capability_estimate,
+        effective_model_type,
+        materialization,
+        selected_residency,
+        partition_sampling_group,
+        partition_communication_authority,
+        Some(publication_authority.owner_group_rank()),
+        publication_authority.local_public_output(),
+        stream,
+    )))
+}
+
+fn bind_partitioned_routed_resident<A, S, G>(
+    prepared: eredu_architectures::partitioned_execution::PreparedRoutedPartitionedArchitecture<
+        MlxNeuralBackend,
+        A,
+        G,
+        <A as eredu_runtime::PartitionedLayeredArchitecture<MlxNeuralBackend, S>>::Boundary,
+    >,
+    store: Arc<dyn CheckpointSource>,
+    distributed: crate::backend::distributed::MlxDistributedSession,
+    additional_claimed_sources: std::collections::BTreeSet<String>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<Box<dyn ErasedReplicatedTextExecutable>, Error>
+where
+    S: MlxStateMechanisms + 'static,
+    A: eredu_architectures::partitioned_execution::TextPartitionArchitecture<MlxNeuralBackend, S>
+        + ReplicatedTextArchitecture<MlxNeuralBackend, S, Error = eredu_nn::Error>
+        + eredu_runtime::ParallelRoutedLayeredArchitecture<MlxNeuralBackend, S>
+        + 'static,
+    A::StaticModules: Clone,
+    G: 'static,
+{
+    match prepared.bank_residency() {
+        eredu_runtime::ParameterBankResidency::WithLayer => {
+            let provider = prepared
+                .resident_gated_product_provider()
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+            bind_partitioned_routed_with_provider(
+                prepared,
+                store,
+                distributed,
+                provider,
+                None,
+                additional_claimed_sources,
+                stream,
+                weights_stream,
+            )
+        }
+        eredu_runtime::ParameterBankResidency::IndependentCache(options) => {
+            if prepared.addressable_members().is_empty() {
+                return bind_partitioned_routed_with_provider(
+                    prepared,
+                    store,
+                    distributed,
+                    eredu_architectures::EmptyPartitionRoutedExpertProvider,
+                    None,
+                    additional_claimed_sources,
+                    stream,
+                    weights_stream,
+                );
+            }
+            let (selected_member_bytes, bank) = selected_addressable_partition_bank(
+                prepared.addressable_members(),
+                prepared.addressable_quantization(),
+                Arc::clone(&store),
+                options,
+                prepared.layout(),
+                weights_stream,
+                stream,
+            )?;
+            let provider = prepared
+                .addressable_gated_product_provider(
+                    selected_member_bytes,
+                    bank.clone(),
+                    crate::backend::runtime::residency::parameter_bank::MlxIndexedMovement,
+                    options,
+                )
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+            bind_partitioned_routed_with_provider(
+                prepared,
+                store,
+                distributed,
+                provider,
+                Some(bank),
+                additional_claimed_sources,
+                stream,
+                weights_stream,
+            )
+        }
+        _ => Err(Error::ArchitectureModel(
+            "neutral routed partition selected an unsupported expert-bank residency".into(),
+        )),
+    }
+}
+
+fn bind_partitioned_relu2_resident<A, G>(
+    prepared: eredu_architectures::partitioned_execution::PreparedRoutedPartitionedArchitecture<
+        MlxNeuralBackend,
+        A,
+        G,
+        <A as eredu_runtime::PartitionedLayeredArchitecture<
+            MlxNeuralBackend,
+            MlxHybridState,
+        >>::Boundary,
+        eredu_nn::GroupedRelu2Spec,
+    >,
+    store: Arc<dyn CheckpointSource>,
+    distributed: crate::backend::distributed::MlxDistributedSession,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<Box<dyn ErasedReplicatedTextExecutable>, Error>
+where
+    A: eredu_architectures::partitioned_execution::TextPartitionArchitecture<
+            MlxNeuralBackend,
+            MlxHybridState,
+        > + ReplicatedTextArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error>
+        + eredu_runtime::ParallelRoutedLayeredArchitecture<MlxNeuralBackend, MlxHybridState>
+        + 'static,
+    A::StaticModules: Clone,
+    G: 'static,
+{
+    match prepared.bank_residency() {
+        eredu_runtime::ParameterBankResidency::WithLayer => {
+            let provider = prepared
+                .resident_relu2_provider()
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+            bind_partitioned_routed_with_provider(
+                prepared,
+                store,
+                distributed,
+                provider,
+                None,
+                std::collections::BTreeSet::new(),
+                stream,
+                weights_stream,
+            )
+        }
+        eredu_runtime::ParameterBankResidency::IndependentCache(options) => {
+            if prepared.addressable_members().is_empty() {
+                let provider = eredu_architectures::EmptyPartitionRoutedExpertProvider;
+                return bind_partitioned_routed_with_provider(
+                    prepared,
+                    store,
+                    distributed,
+                    provider,
+                    None,
+                    std::collections::BTreeSet::new(),
+                    stream,
+                    weights_stream,
+                );
+            }
+            let (selected_member_bytes, bank) = selected_addressable_partition_bank(
+                prepared.addressable_members(),
+                prepared.addressable_quantization(),
+                Arc::clone(&store),
+                options,
+                prepared.layout(),
+                weights_stream,
+                stream,
+            )?;
+            let provider = prepared
+                .addressable_relu2_provider(
+                    selected_member_bytes,
+                    bank.clone(),
+                    crate::backend::runtime::residency::parameter_bank::MlxIndexedMovement,
+                    options,
+                )
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+            bind_partitioned_routed_with_provider(
+                prepared,
+                store,
+                distributed,
+                provider,
+                Some(bank),
+                std::collections::BTreeSet::new(),
+                stream,
+                weights_stream,
+            )
+        }
+        _ => Err(Error::ArchitectureModel(
+            "neutral ReLU-squared partition selected an unsupported expert-bank residency".into(),
+        )),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn bind_partitioned_routed_with_provider<A, S, G, E, Provider>(
+    prepared: eredu_architectures::partitioned_execution::PreparedRoutedPartitionedArchitecture<
+        MlxNeuralBackend,
+        A,
+        G,
+        <A as eredu_runtime::PartitionedLayeredArchitecture<MlxNeuralBackend, S>>::Boundary,
+        E,
+    >,
+    store: Arc<dyn CheckpointSource>,
+    distributed: crate::backend::distributed::MlxDistributedSession,
+    provider: Provider,
+    parameter_bank: Option<MlxSharedAddressableBank>,
+    additional_claimed_sources: std::collections::BTreeSet<String>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<Box<dyn ErasedReplicatedTextExecutable>, Error>
+where
+    S: MlxStateMechanisms + 'static,
+    A: eredu_architectures::partitioned_execution::TextPartitionArchitecture<MlxNeuralBackend, S>
+        + ReplicatedTextArchitecture<MlxNeuralBackend, S, Error = eredu_nn::Error>
+        + eredu_runtime::ParallelRoutedLayeredArchitecture<MlxNeuralBackend, S>
+        + 'static,
+    A::StaticModules: Clone,
+    G: 'static,
+    E: eredu_architectures::partitioned_execution::RoutedCollectiveSpec
+        + eredu_architectures::routed_text::RoutedGroupedSpec
+        + 'static,
+    Provider: eredu_runtime::TensorParallelRoutedExpertProvider<MlxNeuralBackend> + 'static,
+    Provider::Error: std::fmt::Display,
+{
+    prepared.dispatch_execution(
+        (
+            store,
+            distributed,
+            provider,
+            parameter_bank,
+            additional_claimed_sources,
+            stream,
+            weights_stream,
+        ),
+        |prepared, (store, distributed, provider, bank, additional, stream, weights_stream)| {
+            bind_partitioned_routed_local_with_provider(
+                prepared,
+                store,
+                distributed,
+                provider,
+                bank,
+                additional,
+                stream,
+                weights_stream,
+            )
+        },
+        |prepared, (store, distributed, provider, bank, additional, stream, weights_stream)| {
+            bind_partitioned_routed_pipeline_with_provider(
+                prepared,
+                store,
+                distributed,
+                provider,
+                bank,
+                additional,
+                stream,
+                weights_stream,
+            )
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn bind_partitioned_routed_local_with_provider<A, S, G, E, Provider>(
+    prepared: eredu_architectures::partitioned_execution::PreparedRoutedPartitionedArchitecture<
+        MlxNeuralBackend,
+        A,
+        G,
+        <A as eredu_runtime::PartitionedLayeredArchitecture<MlxNeuralBackend, S>>::Boundary,
+        E,
+    >,
+    store: Arc<dyn CheckpointSource>,
+    distributed: crate::backend::distributed::MlxDistributedSession,
+    provider: Provider,
+    parameter_bank: Option<MlxSharedAddressableBank>,
+    additional_claimed_sources: std::collections::BTreeSet<String>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<Box<dyn ErasedReplicatedTextExecutable>, Error>
+where
+    S: MlxStateMechanisms + 'static,
+    A: eredu_architectures::partitioned_execution::TextPartitionArchitecture<MlxNeuralBackend, S>
+        + ReplicatedTextArchitecture<MlxNeuralBackend, S, Error = eredu_nn::Error>
+        + eredu_runtime::ParallelRoutedLayeredArchitecture<MlxNeuralBackend, S>
+        + 'static,
+    A::StaticModules: Clone,
+    G: 'static,
+    E: eredu_architectures::routed_text::RoutedGroupedSpec + 'static,
+    Provider: eredu_runtime::TensorParallelRoutedExpertProvider<MlxNeuralBackend> + 'static,
+    Provider::Error: std::fmt::Display,
+{
+    let capability_estimate = prepared.capability_estimate().clone();
+    let effective_model_type = prepared.effective_model_type().to_owned();
+    let selected_residency = prepared.prepared().selected().base().text().residency();
+    let execution_plan = prepared.execution_handoff().execution_plan().clone();
+    let publication_authority = execution_plan
+        .publication_authority(prepared.prepared().selected().communication())
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?
+        .ok_or_else(|| {
+            Error::ArchitectureModel("routed partition has no publication authority".into())
+        })?;
+    let prompt_cache_topology = prepared
+        .prepared()
+        .selected()
+        .prompt_cache_topology()
+        .map_err(Error::ArchitectureModel)?;
+    let prompt_cache_identity = prepared
+        .prepared()
+        .selected()
+        .partition()
+        .state()
+        .ok_or_else(|| Error::ArchitectureModel("routed partition has no state".into()))?
+        .prompt_cache_identity::<MlxNeuralBackend, _>(
+            prepared.prepared().architecture(),
+            prompt_cache_topology.clone(),
+        )
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let mut ignored_expert_sources = prepared.unowned_expert_checkpoint_sources();
+    ignored_expert_sources.extend(additional_claimed_sources);
+    let addressable_parameters = if matches!(
+        prepared.bank_residency(),
+        eredu_runtime::ParameterBankResidency::IndependentCache(_)
+    ) {
+        prepared.addressable_logical_targets()
+    } else {
+        std::collections::BTreeSet::new()
+    };
+    let materialization_slot = Arc::new(std::sync::Mutex::new(None));
+    let mut mechanisms = MlxReplicatedTextMechanisms::new(
+        store,
+        Arc::clone(&materialization_slot),
+        stream,
+        weights_stream,
+    );
+    mechanisms.set_ignored_checkpoint_sources(ignored_expert_sources);
+    let mut distributed = Some(distributed);
+    let mut partition_sampling_group = None;
+    let mut partition_communication_authority = None;
+    let mut provider = Some(provider);
+    #[cfg(test)]
+    {
+        super::path_instrumentation::constructor();
+        super::path_instrumentation::neutral_partitioned_construction();
+    }
+    let binding = prepared
+        .prepare_session_runtime(
+            prompt_cache_topology.clone(),
+            stream,
+            |input, physical_layout, selected, execution, context| {
+                let (mut architecture, partition, manifest, tasks) = input.into_parts();
+                mechanisms.set_parallel_layout(physical_layout);
+                let global_layout = partition.unit_layout().clone();
+                let addresses = partition.units().collect::<Vec<_>>();
+                partition_local_materialization_tasks(&tasks, &global_layout, &addresses)?;
+                let units = addresses
+                    .iter()
+                    .map(|address| {
+                        <A as LayeredArchitecture<MlxNeuralBackend, S>>::build_unit(
+                            &architecture,
+                            address.group(),
+                            address.index(),
+                            context,
+                        )
+                        .map_err(|error| Error::ArchitectureModel(error.to_string()))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                mechanisms.prepare_local_partition_materialization_with_addressable_parameters(
+                    &architecture,
+                    None,
+                    &global_layout,
+                    &addresses,
+                    &units,
+                    None,
+                    None,
+                    &tasks,
+                    &addressable_parameters,
+                )?;
+                let (execution_policy, bounded_policy) = match selected_residency {
+                    eredu_runtime::LayerWeightResidency::FullyResident => (
+                        mechanisms.resident_policy(&mut architecture, units, selected, context)?,
+                        None,
+                    ),
+                    eredu_runtime::LayerWeightResidency::LayerwiseHost(_)
+                    | eredu_runtime::LayerWeightResidency::DenseDiskStream(_) => {
+                        drop(units);
+                        let policy =
+                            mechanisms.bounded_policy(&mut architecture, selected, context)?;
+                        (policy.clone(), Some(policy))
+                    }
+                    _ => {
+                        return Err(Error::ArchitectureModel(
+                            "routed partition selected an unknown ordinary weight residency".into(),
+                        ));
+                    }
+                };
+                let local_state = partition.state().ok_or_else(|| {
+                    Error::ArchitectureModel("routed partition has no local state".into())
+                })?;
+                let selected_state = selected
+                    .state()
+                    .for_partitioned_geometry(local_state)
+                    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+                let rank = eredu_core::cache::CacheRankIdentity::new(
+                    prompt_cache_topology.stage().map(|(_, rank)| rank),
+                    prompt_cache_topology.shard().map(|(_, rank)| rank),
+                    prompt_cache_topology.addressable().map(|(_, rank)| rank),
+                );
+                mechanisms.set_state_partition(rank, local_state.global_layer_offset());
+                let state = <S as MlxStateMechanisms>::realize(
+                    &selected_state,
+                    Some(rank),
+                    local_state.global_layer_offset(),
+                )?;
+                let distributed = distributed.take().ok_or_else(|| {
+                    Error::Parallel("routed partition communication was already consumed".into())
+                })?;
+                let (communication, parallel, sampling, communication_executor) = distributed
+                    .into_partition_communication(
+                        manifest.clone(),
+                        execution.communication_tensor_group(),
+                        execution.sampling_group(),
+                    )?;
+                partition_communication_authority = Some(communication.authority());
+                partition_sampling_group = Some(sampling);
+                let executor = execution
+                    .local_executor(
+                        eredu_runtime::LayerwiseRuntime::new(architecture, execution_policy),
+                        parallel,
+                        provider.take().ok_or_else(|| {
+                            Error::ArchitectureModel("routed provider was already consumed".into())
+                        })?,
+                        super::distributed::expert::MlxExpertRouteTensorMovement::new(context),
+                    )
+                    .map_err(Error::ArchitectureModel)?;
+                let runtime = eredu_runtime::PartitionedTextRuntime::new(
+                    execution_plan,
+                    executor,
+                    communication,
+                    communication_executor,
+                    eredu_runtime::NoBoundaryTransport,
+                    eredu_runtime::OpaqueOutputPublisher,
+                    eredu_runtime::OpaqueFailureAgreement,
+                    selected_residency.execution_residency(),
+                    bounded_policy,
+                )
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+                Ok::<_, Error>((runtime, state))
+            },
+        )
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let session = eredu_runtime::construct_replicated_text_session_with_runtime(
+        binding,
+        mechanisms,
+        eredu_runtime::PartitionedTextExecution::new(),
+    )
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let materialization = materialization_slot
+        .lock()
+        .map_err(|_| Error::ArchitectureModel("materialization report lock was poisoned".into()))?
+        .clone();
+    let mut completed = CompletedReplicatedText::from_session(
+        session,
+        prompt_cache_identity,
+        capability_estimate,
+        effective_model_type,
+        materialization,
+        selected_residency,
+        partition_sampling_group,
+        partition_communication_authority,
+        Some(publication_authority.owner_group_rank()),
+        publication_authority.local_public_output(),
+        stream,
+    );
+    if let Some(bank) = parameter_bank {
+        completed = completed.with_parameter_bank(bank);
+    }
+    Ok(Box::new(completed))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn bind_partitioned_routed_pipeline_with_provider<A, S, G, E, Provider>(
+    prepared: eredu_architectures::partitioned_execution::PreparedRoutedPartitionedArchitecture<
+        MlxNeuralBackend,
+        A,
+        G,
+        <A as eredu_runtime::PartitionedLayeredArchitecture<MlxNeuralBackend, S>>::Boundary,
+        E,
+    >,
+    store: Arc<dyn CheckpointSource>,
+    distributed: crate::backend::distributed::MlxDistributedSession,
+    provider: Provider,
+    parameter_bank: Option<MlxSharedAddressableBank>,
+    additional_claimed_sources: std::collections::BTreeSet<String>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<Box<dyn ErasedReplicatedTextExecutable>, Error>
+where
+    S: MlxStateMechanisms + 'static,
+    A: eredu_architectures::partitioned_execution::TextPartitionArchitecture<MlxNeuralBackend, S>
+        + ReplicatedTextArchitecture<MlxNeuralBackend, S, Error = eredu_nn::Error>
+        + eredu_runtime::ParallelRoutedLayeredArchitecture<MlxNeuralBackend, S>
+        + 'static,
+    A::StaticModules: Clone,
+    G: 'static,
+    E: eredu_architectures::partitioned_execution::RoutedCollectiveSpec
+        + eredu_architectures::routed_text::RoutedGroupedSpec
+        + 'static,
+    Provider: eredu_runtime::TensorParallelRoutedExpertProvider<MlxNeuralBackend> + 'static,
+    Provider::Error: std::fmt::Display,
+{
+    let capability_estimate = prepared.capability_estimate().clone();
+    let effective_model_type = prepared.effective_model_type().to_owned();
+    let selected_residency = prepared.prepared().selected().base().text().residency();
+    let activation_dtype = prepared.execution_handoff().activation_dtype();
+    let execution_plan = prepared.execution_handoff().execution_plan().clone();
+    let publication_authority = execution_plan
+        .publication_authority(prepared.prepared().selected().communication())
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?
+        .ok_or_else(|| {
+            Error::ArchitectureModel("routed pipeline has no publication authority".into())
+        })?;
+    let prompt_cache_topology = prepared
+        .prepared()
+        .selected()
+        .prompt_cache_topology()
+        .map_err(Error::ArchitectureModel)?;
+    let prompt_cache_identity = prepared
+        .prepared()
+        .selected()
+        .partition()
+        .state()
+        .ok_or_else(|| Error::ArchitectureModel("routed pipeline has no local state".into()))?
+        .prompt_cache_identity::<MlxNeuralBackend, _>(
+            prepared.prepared().architecture(),
+            prompt_cache_topology.clone(),
+        )
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let mut ignored_expert_sources = prepared.unowned_expert_checkpoint_sources();
+    ignored_expert_sources.extend(additional_claimed_sources);
+    let addressable_parameters = if matches!(
+        prepared.bank_residency(),
+        eredu_runtime::ParameterBankResidency::IndependentCache(_)
+    ) {
+        prepared.addressable_logical_targets()
+    } else {
+        std::collections::BTreeSet::new()
+    };
+    let materialization_slot = Arc::new(std::sync::Mutex::new(None));
+    let mut mechanisms = MlxReplicatedTextMechanisms::new(
+        store,
+        Arc::clone(&materialization_slot),
+        stream,
+        weights_stream,
+    );
+    mechanisms.set_ignored_checkpoint_sources(ignored_expert_sources);
+    let mut distributed = Some(distributed);
+    let mut partition_sampling_group = None;
+    let mut partition_communication_authority = None;
+    let mut provider = Some(provider);
+    #[cfg(test)]
+    {
+        super::path_instrumentation::constructor();
+        super::path_instrumentation::neutral_partitioned_construction();
+    }
+    let binding = prepared
+        .prepare_session_runtime(
+            prompt_cache_topology.clone(),
+            stream,
+            |input, physical_layout, selected, execution, context| {
+                let (mut architecture, partition, manifest, tasks) = input.into_parts();
+                mechanisms.set_parallel_layout(physical_layout);
+                let global_layout = partition.unit_layout().clone();
+                let addresses = partition.units().collect::<Vec<_>>();
+                partition_local_materialization_tasks(&tasks, &global_layout, &addresses)?;
+                let mut units = addresses
+                    .iter()
+                    .map(|address| {
+                        <A as LayeredArchitecture<MlxNeuralBackend, S>>::build_unit(
+                            &architecture,
+                            address.group(),
+                            address.index(),
+                            context,
+                        )
+                        .map_err(|error| Error::ArchitectureModel(error.to_string()))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                mechanisms.prepare_local_partition_materialization_with_addressable_parameters(
+                    &architecture,
+                    None,
+                    &global_layout,
+                    &addresses,
+                    &units,
+                    None,
+                    None,
+                    &tasks,
+                    &addressable_parameters,
+                )?;
+                let (execution_policy, bounded_policy) = match selected_residency {
+                    eredu_runtime::LayerWeightResidency::FullyResident => (
+                        mechanisms.resident_policy(
+                            &mut architecture,
+                            std::mem::take(&mut units),
+                            selected,
+                            context,
+                        )?,
+                        None,
+                    ),
+                    eredu_runtime::LayerWeightResidency::LayerwiseHost(_)
+                    | eredu_runtime::LayerWeightResidency::DenseDiskStream(_) => {
+                        drop(units);
+                        let policy =
+                            mechanisms.bounded_policy(&mut architecture, selected, context)?;
+                        (policy.clone(), Some(policy))
+                    }
+                    _ => {
+                        return Err(Error::ArchitectureModel(
+                            "routed pipeline selected an unknown ordinary weight residency"
+                                .into(),
+                        ));
+                    }
+                };
+                let local_state = partition.state().ok_or_else(|| {
+                    Error::ArchitectureModel("routed pipeline has no local state".into())
+                })?;
+                let selected_state = selected
+                    .state()
+                    .for_partitioned_geometry(local_state)
+                    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+                let rank = eredu_core::cache::CacheRankIdentity::new(
+                    prompt_cache_topology.stage().map(|(_, rank)| rank),
+                    prompt_cache_topology.shard().map(|(_, rank)| rank),
+                    prompt_cache_topology.addressable().map(|(_, rank)| rank),
+                );
+                mechanisms.set_state_partition(rank, local_state.global_layer_offset());
+                let state = <S as MlxStateMechanisms>::realize(
+                    &selected_state,
+                    Some(rank),
+                    local_state.global_layer_offset(),
+                )?;
+                let distributed = distributed.take().ok_or_else(|| {
+                    Error::Parallel("routed pipeline communication was already consumed".into())
+                })?;
+                let (communication, parallel, sampling, communication_executor) = distributed
+                    .into_partition_communication(
+                        manifest,
+                        execution.communication_tensor_group(),
+                        execution.sampling_group(),
+                    )?;
+                let parallel = execution
+                    .select_parallel(parallel)
+                    .map_err(Error::ArchitectureModel)?;
+                partition_communication_authority = Some(communication.authority());
+                partition_sampling_group = Some(sampling);
+                let provider = provider.take().ok_or_else(|| {
+                    Error::ArchitectureModel("routed provider was already consumed".into())
+                })?;
+                let movement =
+                    super::distributed::expert::MlxExpertRouteTensorMovement::new(context);
+                let unit_strategy = execution
+                    .pipeline_unit_strategy(provider, movement)
+                    .map_err(Error::ArchitectureModel)?;
+                let executor = eredu_architectures::partitioned_execution::PipelinePartitionExecutor::new_with_unit_strategy(
+                    architecture,
+                    execution_policy,
+                    addresses,
+                    parallel,
+                    MlxPartitionTensorAllocator,
+                    activation_dtype,
+                    unit_strategy,
+                )
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+                let runtime = eredu_runtime::PartitionedTextRuntime::new(
+                    execution_plan,
+                    executor,
+                    communication,
+                    communication_executor,
+                    eredu_runtime::OpaqueBoundaryTransport,
+                    eredu_runtime::OpaqueOutputPublisher,
+                    eredu_runtime::OpaqueFailureAgreement,
+                    selected_residency.execution_residency(),
+                    bounded_policy,
+                )
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+                Ok::<_, Error>((runtime, state))
+            },
+        )
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let session = eredu_runtime::construct_replicated_text_session_with_runtime(
+        binding,
+        mechanisms,
+        eredu_runtime::PartitionedTextExecution::new(),
+    )
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let materialization = materialization_slot
+        .lock()
+        .map_err(|_| Error::ArchitectureModel("materialization report lock was poisoned".into()))?
+        .clone();
+    let mut completed = CompletedReplicatedText::from_session(
+        session,
+        prompt_cache_identity,
+        capability_estimate,
+        effective_model_type,
+        materialization,
+        selected_residency,
+        partition_sampling_group,
+        partition_communication_authority,
+        Some(publication_authority.owner_group_rank()),
+        publication_authority.local_public_output(),
+        stream,
+    );
+    if let Some(bank) = parameter_bank {
+        completed = completed.with_parameter_bank(bank);
+    }
+    Ok(Box::new(completed))
+}
+
+fn bind_partitioned_pipeline<A, G>(
+    prepared: eredu_architectures::partitioned_execution::PreparedPartitionedArchitecture<
+        MlxNeuralBackend,
+        A,
+        G,
+        <A as eredu_runtime::PartitionedLayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::Boundary,
+    >,
+    store: Arc<dyn CheckpointSource>,
+    distributed: crate::backend::distributed::MlxDistributedSession,
+    additional_claimed_sources: std::collections::BTreeSet<String>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<Box<dyn ErasedReplicatedTextExecutable>, Error>
+where
+    A: eredu_architectures::partitioned_execution::TextPartitionArchitecture<
+            MlxNeuralBackend,
+            MlxHybridState,
+        > + ReplicatedTextArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error>
+        + 'static,
+    A::StaticModules: Clone,
+    G: 'static,
+{
+    let capability_estimate = prepared.capability_estimate().clone();
+    let effective_model_type = prepared.effective_model_type().to_owned();
+    let selected_residency = prepared.prepared().selected().base().residency();
+    let activation_dtype = prepared.prepared().selected().activation_dtype();
+    let tensor_group = prepared.prepared().selected().tensor_group();
+    let session_group = prepared
+        .prepared()
+        .selected()
+        .session_group()
+        .ok_or_else(|| {
+            Error::ArchitectureModel("pipeline partition has no selected session group".into())
+        })?;
+    let execution_plan = prepared
+        .prepared()
+        .selected()
+        .pipeline_execution_plan()
+        .map_err(Error::ArchitectureModel)?;
+    let publication_authority = execution_plan
+        .publication_authority(prepared.prepared().selected().communication())
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?
+        .ok_or_else(|| {
+            Error::ArchitectureModel(
+                "pipeline resident execution has no selected output publication authority".into(),
+            )
+        })?;
+    let prompt_cache_topology = prepared
+        .prepared()
+        .selected()
+        .prompt_cache_topology()
+        .map_err(Error::ArchitectureModel)?;
+    let prompt_cache_identity = prepared
+        .prepared()
+        .selected()
+        .partition()
+        .state()
+        .ok_or_else(|| Error::ArchitectureModel("pipeline partition has no state".into()))?
+        .prompt_cache_identity::<MlxNeuralBackend, _>(
+            prepared.prepared().architecture(),
+            prompt_cache_topology.clone(),
+        )
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let materialization_slot = Arc::new(std::sync::Mutex::new(None));
+    let mut mechanisms = MlxReplicatedTextMechanisms::new(
+        store,
+        Arc::clone(&materialization_slot),
+        stream,
+        weights_stream,
+    );
+    mechanisms.set_ignored_checkpoint_sources(additional_claimed_sources);
+    let mut distributed = Some(distributed);
+    let mut partition_sampling_group = None;
+    let mut partition_communication_authority = None;
+    #[cfg(test)]
+    {
+        super::path_instrumentation::constructor();
+        super::path_instrumentation::neutral_partitioned_construction();
+    }
+    let binding = prepared
+        .prepare_session_runtime(
+            prompt_cache_topology.clone(),
+            stream,
+            |input, source_architecture, physical_layout, selected, context| {
+                let (mut architecture, partition, manifest, tasks) = input.into_parts();
+                let (source_architecture, source_layout) = source_architecture
+                    .map_or((None, None), |(architecture, layout)| {
+                        (Some(architecture), Some(layout))
+                    });
+                mechanisms.set_parallel_layout(physical_layout);
+                let global_layout = partition.unit_layout().clone();
+                let addresses = partition.units().collect::<Vec<_>>();
+                partition_local_materialization_tasks(&tasks, &global_layout, &addresses)?;
+                let mut units = addresses
+                    .iter()
+                    .map(|address| {
+                        <A as LayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::build_unit(
+                            &architecture,
+                            address.group(),
+                            address.index(),
+                            context,
+                        )
+                        .map_err(|error| Error::ArchitectureModel(error.to_string()))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let source_units = source_architecture
+                    .as_ref()
+                    .map(|source| {
+                        addresses
+                            .iter()
+                            .map(|address| {
+                                <A as LayeredArchitecture<
+                                    MlxNeuralBackend,
+                                    MlxHybridState,
+                                >>::build_unit(
+                                    source,
+                                    address.group(),
+                                    address.index(),
+                                    context,
+                                )
+                                .map_err(|error| Error::ArchitectureModel(error.to_string()))
+                            })
+                            .collect::<Result<Vec<_>, _>>()
+                    })
+                    .transpose()?;
+                mechanisms.prepare_local_partition_materialization(
+                    &architecture,
+                    source_architecture.as_ref(),
+                    &global_layout,
+                    &addresses,
+                    &units,
+                    source_units.as_deref(),
+                    source_layout.as_ref(),
+                    &tasks,
+                )?;
+                let (execution_policy, bounded_policy) = match selected_residency {
+                    eredu_runtime::LayerWeightResidency::FullyResident => (
+                        mechanisms.resident_policy(
+                            &mut architecture,
+                            std::mem::take(&mut units),
+                            selected,
+                            context,
+                        )?,
+                        None,
+                    ),
+                    eredu_runtime::LayerWeightResidency::LayerwiseHost(_)
+                    | eredu_runtime::LayerWeightResidency::DenseDiskStream(_) => {
+                        drop(units);
+                        let policy =
+                            mechanisms.bounded_policy(&mut architecture, selected, context)?;
+                        (policy.clone(), Some(policy))
+                    }
+                    _ => {
+                        return Err(Error::ArchitectureModel(
+                            "partitioned execution selected an unknown weight residency".into(),
+                        ));
+                    }
+                };
+                let local_state = partition.state().ok_or_else(|| {
+                    Error::ArchitectureModel("pipeline partition has no state".into())
+                })?;
+                let selected_state = selected
+                    .state()
+                    .for_partitioned_geometry(local_state)
+                    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+                let rank = eredu_core::cache::CacheRankIdentity::new(
+                    prompt_cache_topology.stage().map(|(_, rank)| rank),
+                    prompt_cache_topology.shard().map(|(_, rank)| rank),
+                    prompt_cache_topology.addressable().map(|(_, rank)| rank),
+                );
+                mechanisms.set_state_partition(rank, local_state.global_layer_offset());
+                let state = <MlxHybridState as MlxStateMechanisms>::realize(
+                    &selected_state,
+                    Some(rank),
+                    local_state.global_layer_offset(),
+                )?;
+                let distributed = distributed.take().ok_or_else(|| {
+                    Error::Parallel("pipeline partition communication was already consumed".into())
+                })?;
+                let (communication, parallel, sampling, communication_executor) = distributed
+                    .into_partition_communication(manifest, tensor_group, session_group)?;
+                partition_communication_authority = Some(communication.authority());
+                partition_sampling_group = Some(sampling);
+                let executor =
+                    eredu_architectures::partitioned_execution::PipelinePartitionExecutor::new(
+                        architecture,
+                        execution_policy,
+                        addresses,
+                        parallel,
+                        MlxPartitionTensorAllocator,
+                        activation_dtype,
+                    )
+                    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+                let runtime = eredu_runtime::PartitionedTextRuntime::new(
+                    execution_plan,
+                    executor,
+                    communication,
+                    communication_executor,
+                    eredu_runtime::OpaqueBoundaryTransport,
+                    eredu_runtime::OpaqueOutputPublisher,
+                    eredu_runtime::OpaqueFailureAgreement,
+                    selected_residency.execution_residency(),
+                    bounded_policy,
+                )
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+                Ok::<_, Error>((runtime, state))
+            },
+        )
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let session = eredu_runtime::construct_replicated_text_session_with_runtime(
+        binding,
+        mechanisms,
+        MlxPipelinePartitionStrategy::<A, MlxHybridState>::new(),
+    )
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let materialization = materialization_slot
+        .lock()
+        .map_err(|_| Error::ArchitectureModel("materialization report lock was poisoned".into()))?
+        .clone();
+    Ok(Box::new(CompletedReplicatedText::from_session(
+        session,
+        prompt_cache_identity,
+        capability_estimate,
+        effective_model_type,
+        materialization,
+        selected_residency,
+        partition_sampling_group,
+        partition_communication_authority,
+        Some(publication_authority.owner_group_rank()),
+        publication_authority.local_public_output(),
+        stream,
+    )))
+}
+
+struct PartitionedCompositeBindingVisitor<'a> {
+    store: Arc<dyn CheckpointSource>,
+    distributed: crate::backend::distributed::MlxDistributedSession,
+    stream: &'a Stream,
+    weights_stream: &'a Stream,
+}
+
+impl
+    eredu_architectures::composite_partitioned::AuthoritativeCompositePartitionVisitor<
+        MlxNeuralBackend,
+        MlxHybridState,
+    > for PartitionedCompositeBindingVisitor<'_>
+{
+    type Output = Box<dyn ErasedReplicatedTextExecutable>;
+    type Error = Error;
+
+    fn visit<A, G, W>(
+        self,
+        prepared: eredu_architectures::composite_partitioned::PreparedCompositePartition<A, G, W>,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        A: CompositeArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error>
+            + eredu_runtime::PartitionedLayeredArchitecture<
+                MlxNeuralBackend,
+                MlxHybridState,
+                Boundary = W,
+            > + eredu_runtime::ParallelRoutedLayeredArchitecture<MlxNeuralBackend, MlxHybridState>
+            + 'static,
+        A::Error: std::fmt::Display,
+        W: eredu_runtime::ArchitectureBoundary,
+    {
+        let execution_plan = prepared
+            .execution_plan()
+            .map_err(Error::ArchitectureModel)?;
+        let publication_authority = execution_plan
+            .publication_authority(prepared.communication())
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?
+            .ok_or_else(|| {
+                Error::ArchitectureModel(
+                    "composite partition has no selected output publication authority".into(),
+                )
+            })?;
+        let selected_residency = prepared
+            .prepared()
+            .selected()
+            .base()
+            .execution()
+            .residency();
+        let session_group = prepared
+            .prepared()
+            .selected()
+            .session_group()
+            .ok_or_else(|| {
+                Error::ArchitectureModel("composite partition has no selected session group".into())
+            })?;
+        let prompt_topology = prepared
+            .prepared()
+            .selected()
+            .prompt_cache_topology()
+            .map_err(Error::ArchitectureModel)?;
+        let local_state = prepared
+            .prepared()
+            .selected()
+            .partition()
+            .state()
+            .ok_or_else(|| {
+                Error::ArchitectureModel("composite partition has no selected local state".into())
+            })?;
+        let prompt_cache_identity = local_state
+            .prompt_cache_identity::<MlxNeuralBackend, _>(
+                prepared.prepared().architecture(),
+                prompt_topology.clone(),
+            )
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        let admission = prepared.prepared().architecture().admission_config();
+        let processor = prepared.prepared().selected().base().processor().clone();
+        let capability_estimate = prepared.capability_estimate().clone();
+        let effective_model_type = prepared.effective_model_type().to_owned();
+        let materialization_slot = Arc::new(std::sync::Mutex::new(None));
+        let mut mechanisms: MlxReplicatedTextMechanisms<
+            PreparedCompositeArchitecture<A>,
+            MlxHybridState,
+        > = MlxReplicatedTextMechanisms::new(
+            self.store,
+            Arc::clone(&materialization_slot),
+            self.stream,
+            self.weights_stream,
+        );
+        let mut distributed = Some(self.distributed);
+        let mut partition_sampling_group = None;
+        let mut partition_communication_authority = None;
+        #[cfg(test)]
+        {
+            super::path_instrumentation::constructor();
+            super::path_instrumentation::neutral_partitioned_construction();
+        }
+        let binding = prepared
+            .prepare_session_runtime::<MlxNeuralBackend, _, _, _, _>(
+                prompt_topology.clone(),
+                self.stream,
+                |input, physical_layout, executor_plan, selected, context| {
+                    let tensor_group = executor_plan.communication_tensor_group();
+                    let (mut architecture, partition, manifest, tasks) = input.into_parts();
+                    mechanisms.set_parallel_layout(physical_layout);
+                    let global_layout = partition.unit_layout().clone();
+                    let addresses = partition.units().collect::<Vec<_>>();
+                    let mut units = addresses
+                        .iter()
+                        .map(|address| {
+                            architecture
+                                .build_unit(address.group(), address.index(), context)
+                                .map_err(|error| Error::ArchitectureModel(error.to_string()))
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    mechanisms.prepare_local_partition_materialization(
+                        &architecture,
+                        None,
+                        &global_layout,
+                        &addresses,
+                        &units,
+                        None,
+                        None,
+                        &tasks,
+                    )?;
+                    let (execution_policy, bounded_policy) = match selected_residency {
+                        eredu_runtime::LayerWeightResidency::FullyResident => (
+                            mechanisms.resident_policy(
+                                &mut architecture,
+                                std::mem::take(&mut units),
+                                selected,
+                                context,
+                            )?,
+                            None,
+                        ),
+                        eredu_runtime::LayerWeightResidency::LayerwiseHost(_)
+                        | eredu_runtime::LayerWeightResidency::DenseDiskStream(_) => {
+                            drop(units);
+                            let policy =
+                                mechanisms.bounded_policy(&mut architecture, selected, context)?;
+                            (policy.clone(), Some(policy))
+                        }
+                        _ => {
+                            return Err(Error::ArchitectureModel(
+                                "composite partition selected an unknown weight residency".into(),
+                            ));
+                        }
+                    };
+                    let local_state = partition.state().ok_or_else(|| {
+                        Error::ArchitectureModel(
+                            "composite partition has no selected local state".into(),
+                        )
+                    })?;
+                    let selected_state = selected
+                        .state()
+                        .for_partitioned_geometry(local_state)
+                        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+                    let rank = eredu_core::cache::CacheRankIdentity::new(
+                        prompt_topology.stage().map(|(_, rank)| rank),
+                        prompt_topology.shard().map(|(_, rank)| rank),
+                        prompt_topology.addressable().map(|(_, rank)| rank),
+                    );
+                    mechanisms.set_state_partition(rank, local_state.global_layer_offset());
+                    let state = <MlxHybridState as MlxStateMechanisms>::realize(
+                        &selected_state,
+                        Some(rank),
+                        local_state.global_layer_offset(),
+                    )?;
+                    let distributed = distributed.take().ok_or_else(|| {
+                        Error::Parallel("composite communication was already consumed".into())
+                    })?;
+                    let (communication, parallel, sampling, communication_executor) = distributed
+                        .into_partition_communication(
+                        manifest,
+                        tensor_group,
+                        session_group,
+                    )?;
+                    partition_communication_authority = Some(communication.authority());
+                    partition_sampling_group = Some(sampling);
+                    let executor = executor_plan.bind(
+                        architecture.into_inner(),
+                        execution_policy,
+                        parallel,
+                        MlxPartitionTensorAllocator,
+                        super::distributed::expert::MlxExpertRouteTensorMovement::new(self.stream),
+                    )?;
+                    let runtime = eredu_runtime::PartitionedTextRuntime::new(
+                        execution_plan,
+                        executor,
+                        communication,
+                        communication_executor,
+                        eredu_runtime::OpaqueBoundaryTransport,
+                        eredu_runtime::OpaqueOutputPublisher,
+                        eredu_runtime::OpaqueFailureAgreement,
+                        selected_residency.execution_residency(),
+                        bounded_policy,
+                    )
+                    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+                    Ok::<_, Error>((runtime, state))
+                },
+            )
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        let session = eredu_runtime::construct_replicated_text_session_with_runtime(
+            binding,
+            mechanisms,
+            eredu_runtime::PartitionedTextExecution::new(),
+        )
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        let materialization = materialization_slot
+            .lock()
+            .map_err(|_| {
+                Error::ArchitectureModel("materialization report lock was poisoned".into())
+            })?
+            .clone();
+        Ok(Box::new(CompletedComposite::from_session(
+            session,
+            admission,
+            processor,
+            prompt_cache_identity,
+            capability_estimate,
+            effective_model_type,
+            materialization,
+            selected_residency,
+            partition_sampling_group,
+            partition_communication_authority,
+            Some(publication_authority.owner_group_rank()),
+            publication_authority.local_public_output(),
+            self.stream,
+        )))
+    }
+}
+
+pub(crate) fn bind_partitioned_composite(
+    selected: eredu_architectures::partitioned_execution::SelectedPartitionedAdmission<
+        eredu_architectures::replicated_text::SelectedCompositeTextRealization,
+        eredu_architectures::replicated_text::CompositeTextRequirements,
+    >,
+    store: Arc<dyn CheckpointSource>,
+    distributed: crate::backend::distributed::MlxDistributedSession,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<Box<dyn ErasedReplicatedTextExecutable>, Error> {
+    eredu_architectures::composite_partitioned::visit_authoritative_composite_partition::<
+        MlxNeuralBackend,
+        MlxHybridState,
+        _,
+    >(
+        selected,
+        stream,
+        PartitionedCompositeBindingVisitor {
+            store,
+            distributed,
+            stream,
+            weights_stream,
+        },
+    )
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))
+}
+
+pub(crate) fn bind_partitioned_dense_decoder(
+    inspection: &eredu_core::ArtifactInspection<
+        eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+    >,
+    selected: eredu_architectures::partitioned_execution::SelectedPartitionedAdmission<
+        SelectedReplicatedTextRealization,
+        ReplicatedTextRequirements,
+    >,
+    store: Arc<dyn CheckpointSource>,
+    distributed: crate::backend::distributed::MlxDistributedSession,
+    additional_claimed_sources: std::collections::BTreeSet<String>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<Box<dyn ErasedReplicatedTextExecutable>, Error> {
+    eredu_architectures::partitioned_execution::visit_resident_partitioned_architecture::<
+        MlxNeuralBackend,
+        MlxHybridState,
+        _,
+    >(
+        inspection,
+        selected,
+        store,
+        stream,
+        PartitionedDenseDecoderBindingVisitor {
+            distributed,
+            additional_claimed_sources,
+            stream,
+            weights_stream,
+        },
+    )
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))
+}
+
+pub(crate) fn bind_partitioned_routed_decoder(
+    inspection: &eredu_core::ArtifactInspection<
+        eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+    >,
+    selected: eredu_architectures::partitioned_execution::SelectedPartitionedAdmission<
+        eredu_architectures::SelectedRoutedTextRealization,
+        eredu_architectures::RoutedTextRequirements,
+    >,
+    store: Arc<dyn CheckpointSource>,
+    distributed: crate::backend::distributed::MlxDistributedSession,
+    additional_claimed_sources: std::collections::BTreeSet<String>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<Box<dyn ErasedReplicatedTextExecutable>, Error> {
+    eredu_architectures::partitioned_execution::dispatch_routed_partitioned_production(
+        inspection,
+        selected,
+        (
+            store,
+            distributed,
+            additional_claimed_sources,
+            stream,
+            weights_stream,
+        ),
+        |(store, distributed, additional, stream, weights_stream), inspection, selected| {
+            eredu_architectures::partitioned_execution::visit_routed_partitioned_production::<
+                MlxNeuralBackend,
+                MlxHybridState,
+                _,
+            >(
+                inspection,
+                selected,
+                store,
+                stream,
+                PartitionedRoutedDecoderBindingVisitor {
+                    distributed,
+                    additional_claimed_sources: additional,
+                    stream,
+                    weights_stream,
+                },
+            )
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))
+        },
+        |(store, distributed, additional, stream, weights_stream), inspection, selected| {
+            eredu_architectures::partitioned_execution::visit_relu2_routed_partitioned_production::<
+                MlxNeuralBackend,
+                MlxHybridState,
+                _,
+            >(
+                inspection,
+                selected,
+                store,
+                stream,
+                PartitionedRoutedDecoderBindingVisitor {
+                    distributed,
+                    additional_claimed_sources: additional,
+                    stream,
+                    weights_stream,
+                },
+            )
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))
+        },
+        |(store, distributed, _, stream, weights_stream), inspection, selected| {
+            eredu_architectures::partitioned_execution::visit_deepseek_v4_routed_partitioned_production::<
+                MlxNeuralBackend,
+                MlxPoolingAttentionState,
+                _,
+            >(
+                inspection,
+                selected,
+                store,
+                stream,
+                PartitionedPoolingRoutedDecoderBindingVisitor {
+                    distributed,
+                    stream,
+                    weights_stream,
+                },
+            )
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))
+        },
+    )
 }
 
 impl ReplicatedTextArchitectureVisitor<MlxNeuralBackend, MlxKeyValueState> for BindingVisitor<'_> {
@@ -3063,6 +7970,76 @@ mod tests {
         ReplicatedTextStateAccess, StateLayout, WeightLoweringDescriptor,
     };
 
+    #[test]
+    fn exact_local_transform_output_is_not_sharded_twice() {
+        use eredu_checkpoint::store::{MemoryWeightStore, TensorSelection};
+        use eredu_runtime::{LocalModelLayout, LocalTensorLayout, ParameterRole, TensorPlacement};
+
+        let store = MemoryWeightStore::from_safetensors([
+            (
+                "transformed.weight".to_owned(),
+                safetensors::Dtype::F32,
+                vec![2, 2],
+                vec![0; 2 * 2 * size_of::<f32>()],
+            ),
+            (
+                "untouched.weight".to_owned(),
+                safetensors::Dtype::F32,
+                vec![4, 2],
+                vec![0; 4 * 2 * size_of::<f32>()],
+            ),
+        ])
+        .unwrap();
+        let mut layout = LocalModelLayout::default();
+        for name in ["transformed.weight", "untouched.weight"] {
+            layout.insert(
+                name.to_owned(),
+                LocalTensorLayout::new(
+                    "projection",
+                    ParameterRole::ColumnProjection,
+                    vec![4, 2],
+                    vec![2, 2],
+                    TensorPlacement::Shard {
+                        axis: 0,
+                        index: 0,
+                        parts: 2,
+                    },
+                    None,
+                    None,
+                    false,
+                ),
+            );
+        }
+        let binding = |name: &str, bytes| {
+            WeightBinding::new(name, name, TensorSelection::Full, bytes)
+                .unwrap()
+                .with_logical_target(name)
+                .unwrap()
+        };
+        let bindings = vec![
+            binding("transformed.weight", 16),
+            binding("untouched.weight", 32),
+        ];
+        let output = shard_unmaterialized_bindings(
+            bindings,
+            &store,
+            &layout,
+            &["transformed.weight".to_owned()].into_iter().collect(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            output[0].source_recipe().infer(&store).unwrap().shape(),
+            [2, 2]
+        );
+        assert_eq!(
+            output[1].source_recipe().infer(&store).unwrap().shape(),
+            [2, 2]
+        );
+        assert_eq!(output[0].expected_bytes(), 16);
+        assert_eq!(output[1].expected_bytes(), 16);
+    }
+
     struct ForgedShapeSource {
         inner: eredu_checkpoint::store::SharedCheckpointSource,
         key: String,
@@ -3123,7 +8100,7 @@ mod tests {
     ) -> Result<crate::backend::MlxModel, crate::backend::error::Error> {
         let selected =
             super::super::loading::select_preparation(plan.inspection(), options, plan.policy())?;
-        super::super::loading::materialize_model_plan(plan, selected, stream, weights_stream)
+        super::super::loading::materialize_model_plan(plan, selected, None, stream, weights_stream)
     }
 
     #[test]
@@ -3361,6 +8338,32 @@ mod tests {
 
     fn tiny_packed_safetensors_artifact(model_type: &str) -> tempfile::TempDir {
         tiny_safetensors_artifact(model_type, false, false, true)
+    }
+
+    #[test]
+    fn dense_decoder_partition_classifier_is_architecture_owned_and_exhaustive() {
+        for model_type in ["llama", "qwen2", "qwen3"] {
+            let root = tiny_artifact(model_type, false);
+            let inspection =
+                eredu_architectures::configuration::inspect_artifact(root.path()).unwrap();
+            assert!(
+                eredu_architectures::partitioned_execution::is_supported_dense_decoder_partition(
+                    inspection.architecture_plan(),
+                ),
+                "{model_type} must enter typed dense-decoder dispatch"
+            );
+        }
+        for model_type in ["qwen3_moe", "gpt_oss"] {
+            let root = tiny_artifact(model_type, false);
+            let inspection =
+                eredu_architectures::configuration::inspect_artifact(root.path()).unwrap();
+            assert!(
+                !eredu_architectures::partitioned_execution::is_supported_dense_decoder_partition(
+                    inspection.architecture_plan(),
+                ),
+                "{model_type} must remain outside dense-decoder dispatch"
+            );
+        }
     }
 
     fn tiny_safetensors_artifact(
@@ -4034,6 +9037,85 @@ mod tests {
         )
     }
 
+    #[test]
+    fn mlx_pipeline_allocator_converts_f16_and_bf16_sources_to_exact_f32_wire_values() {
+        use eredu_architectures::partitioned_execution::PartitionTensorAllocator;
+
+        let (stream, _) = execution_streams();
+        let expected = [1.5_f32, -2.0, 0.25];
+        for source_dtype in [Dtype::Float16, Dtype::Bfloat16] {
+            let source = Array::from_slice(&expected, &[1, 1, 3])
+                .as_dtype(source_dtype, &stream)
+                .unwrap();
+            let converted = MlxPartitionTensorAllocator
+                .tensor_to_wire(
+                    MlxTensor::from_array(source),
+                    eredu_runtime::BoundaryTensorDtype::Activation,
+                    eredu_runtime::PipelineActivationDtype::Float32,
+                    &stream,
+                )
+                .unwrap();
+            let evaluated = converted.as_array().evaluated().unwrap();
+            assert_eq!(evaluated.as_array().dtype(), Dtype::Float32);
+            assert_eq!(evaluated.as_slice::<f32>(), expected.as_slice());
+        }
+    }
+
+    #[test]
+    fn mlx_pipeline_allocator_rejects_nonfloating_source_before_wire_submission() {
+        use eredu_architectures::partitioned_execution::PartitionTensorAllocator;
+
+        let (stream, _) = execution_streams();
+        let source = MlxTensor::from_array(Array::from_slice(&[1_i32], &[1, 1, 1]));
+        let error = MlxPartitionTensorAllocator
+            .tensor_to_wire(
+                source,
+                eredu_runtime::BoundaryTensorDtype::Activation,
+                eredu_runtime::PipelineActivationDtype::Float32,
+                &stream,
+            )
+            .expect_err("integer source activation must not enter the pipeline wire");
+        assert!(error.to_string().contains("logical boundary dtype"));
+    }
+
+    #[test]
+    fn mlx_pipeline_allocator_preserves_exact_u32_and_i32_boundary_roles() {
+        use eredu_architectures::partitioned_execution::PartitionTensorAllocator;
+
+        let (stream, _) = execution_streams();
+        for (source, logical, expected) in [
+            (
+                MlxTensor::from_array(Array::from_slice(&[7_u32], &[1, 1])),
+                eredu_runtime::BoundaryTensorDtype::Uint32,
+                Dtype::Uint32,
+            ),
+            (
+                MlxTensor::from_array(Array::from_slice(&[-7_i32], &[1, 1])),
+                eredu_runtime::BoundaryTensorDtype::Int32,
+                Dtype::Int32,
+            ),
+        ] {
+            let converted = MlxPartitionTensorAllocator
+                .tensor_to_wire(
+                    source,
+                    logical,
+                    eredu_runtime::PipelineActivationDtype::Float32,
+                    &stream,
+                )
+                .unwrap();
+            assert_eq!(converted.as_array().dtype(), expected);
+            let placeholder = MlxPartitionTensorAllocator
+                .tensor_placeholder(
+                    &[1, 1],
+                    logical,
+                    eredu_runtime::PipelineActivationDtype::Float32,
+                    &stream,
+                )
+                .unwrap();
+            assert_eq!(placeholder.as_array().dtype(), expected);
+        }
+    }
+
     fn complete_state_capabilities(
         components: impl IntoIterator<Item = StateComponentMechanism>,
     ) -> StateMechanismCapabilities {
@@ -4344,6 +9426,8 @@ mod tests {
                 constructors: 6,
                 unit_constructions: 6,
                 materializations: 0,
+                local_static_bindings: 0,
+                excluded_local_static_parameters: 0,
                 forwards: 12,
                 state_publications: 12,
                 completions: 12,
@@ -5107,6 +10191,8 @@ mod tests {
                 constructors: 5,
                 unit_constructions: 12,
                 materializations: 0,
+                local_static_bindings: 0,
+                excluded_local_static_parameters: 0,
                 forwards: 15,
                 state_publications: 15,
                 completions: 15,
@@ -5377,6 +10463,8 @@ mod tests {
                 constructors: 10,
                 unit_constructions: 24,
                 materializations: 0,
+                local_static_bindings: 0,
+                excluded_local_static_parameters: 0,
                 forwards: 20,
                 state_publications: 20,
                 completions: 20,
@@ -5814,14 +10902,7 @@ mod tests {
         super::super::path_instrumentation::reset();
         let root = tiny_artifact("llama", false);
         let inspection = eredu_architectures::configuration::inspect_artifact(root.path()).unwrap();
-        let topology = crate::composition::mlx::distributed::topology::MlxParallelPlan::for_rank(
-            0,
-            2,
-            1,
-            1,
-            crate::backend::DeviceAssignment::new(safemlx::DeviceType::Cpu, 0),
-        )
-        .unwrap();
+        let topology = crate::test_parallel_rank(0, 2, 1, 1);
         let requirements =
             eredu_architectures::replicated_text::replicated_text_requirements(&inspection)
                 .unwrap();
@@ -6204,6 +11285,38 @@ mod tests {
     }
 
     #[test]
+    fn deepseek_prediction_artifact_selects_one_neutral_target_before_payload_work() {
+        let mut config = routed_deepseek_v3_config();
+        config["num_nextn_predict_layers"] = 1.into();
+        let artifact = tiny_heterogeneous_artifact(config);
+        let inspection =
+            eredu_architectures::configuration::inspect_artifact(artifact.path()).unwrap();
+        let topology = crate::test_parallel_rank(0, 2, 1, 1);
+        let options = crate::MlxLoadRequest::with_parallel(
+            topology,
+            crate::backend::DeviceAssignment::new(safemlx::DeviceType::Cpu, 0),
+            eredu_runtime::PipelineWireContract::new(
+                eredu_runtime::PipelineActivationDtype::Float32,
+            ),
+            1,
+            2,
+            crate::MlxLoadRequest::test_communication_completion_policy(),
+        );
+        let policy = options.preparation_policy().unwrap();
+        super::super::path_instrumentation::reset();
+
+        let selected = super::super::loading::select_preparation(&inspection, options, policy)
+            .expect("prediction target projection must enter neutral routed admission");
+
+        assert!(selected.communication_manifest().is_some());
+        assert!(selected.rank_context().is_some());
+        assert_eq!(
+            super::super::path_instrumentation::snapshot(),
+            super::super::path_instrumentation::Counts::default()
+        );
+    }
+
+    #[test]
     fn invalid_source_and_missing_grouped_mechanism_never_reach_production_paths() {
         super::super::path_instrumentation::reset();
         let root = tiny_artifact("llama", false);
@@ -6259,19 +11372,16 @@ mod tests {
         let routed_root = tiny_artifact("qwen3_moe", false);
         let routed =
             eredu_architectures::configuration::inspect_artifact(routed_root.path()).unwrap();
-        let topology = crate::composition::mlx::distributed::topology::MlxParallelPlan::for_rank(
-            0,
-            2,
-            1,
-            1,
-            crate::backend::DeviceAssignment::new(safemlx::DeviceType::Cpu, 0),
-        )
-        .unwrap();
+        let topology = crate::test_parallel_rank(0, 2, 1, 1);
         let routed_options = crate::MlxLoadRequest::with_parallel(
             topology,
+            crate::backend::DeviceAssignment::new(safemlx::DeviceType::Cpu, 0),
             eredu_runtime::PipelineWireContract::new(
                 eredu_runtime::PipelineActivationDtype::Float32,
             ),
+            1,
+            128,
+            crate::MlxLoadRequest::test_communication_completion_policy(),
         );
         let routed_policy = routed_options.preparation_policy().unwrap();
         let error = super::super::loading::select_preparation_with_grouped_capabilities(

@@ -534,6 +534,177 @@ pub trait Completion {
     fn wait(&self) -> Result<(), Self::Error>;
 }
 
+/// Mechanism selected for work which has not completed by a bounded deadline.
+#[derive(
+    Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash, serde::Serialize, serde::Deserialize,
+)]
+pub enum CompletionCancellationMode {
+    /// The backend can request native cancellation and safely complete its teardown.
+    NativeCancel,
+    /// Native cancellation is unavailable, so the backend retains the orphaned work
+    /// and every borrowed resource until exact completion can be observed.
+    QuarantineUntilComplete,
+}
+
+/// Monotonic identity of one distributed session transaction.
+#[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct DistributedCommitEpoch(u64);
+
+impl DistributedCommitEpoch {
+    /// First epoch allocated by a newly constructed session.
+    pub const FIRST: Self = Self(1);
+
+    /// Creates a positive durable epoch identity.
+    pub const fn new(value: u64) -> Option<Self> {
+        if value == 0 {
+            None
+        } else {
+            Some(Self(value))
+        }
+    }
+
+    /// Stable serialized epoch value.
+    pub const fn value(self) -> u64 {
+        self.0
+    }
+
+    /// Returns the next representable session epoch.
+    pub const fn next(self) -> Option<Self> {
+        match self.0.checked_add(1) {
+            Some(value) => Some(Self(value)),
+            None => None,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for DistributedCommitEpoch {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = u64::deserialize(deserializer)?;
+        Self::new(value).ok_or_else(|| serde::de::Error::custom("commit epoch must be positive"))
+    }
+}
+
+/// Final decision cut reached by a distributed commit attempt.
+#[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DistributedCommitPhase {
+    /// The rank could not submit its final decision contribution.
+    DecisionSubmission,
+    /// The submitted final decision did not complete within its exact contract.
+    DecisionCompletion,
+    /// The rank observed the globally fixed decision.
+    DecisionObservation,
+}
+
+/// Honest rank-local observation of one globally identified commit attempt.
+#[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DistributedCommitOutcome {
+    /// This rank observed the globally fixed all-success decision.
+    Committed(DistributedCommitEpoch),
+    /// This rank observed the globally fixed abort decision before publication became final.
+    Aborted(DistributedCommitEpoch),
+    /// The rank may have contributed, but could not observe the fixed final decision.
+    Indeterminate {
+        /// Transaction identity retained for recovery and diagnosis.
+        epoch: DistributedCommitEpoch,
+        /// Exact final decision cut whose outcome could not be observed.
+        phase: DistributedCommitPhase,
+    },
+}
+
+impl DistributedCommitOutcome {
+    /// Transaction identity shared by every outcome variant.
+    pub const fn epoch(self) -> DistributedCommitEpoch {
+        match self {
+            Self::Committed(epoch) | Self::Aborted(epoch) | Self::Indeterminate { epoch, .. } => {
+                epoch
+            }
+        }
+    }
+
+    /// Whether further use requires external recovery of the named epoch.
+    pub const fn is_indeterminate(self) -> bool {
+        matches!(self, Self::Indeterminate { .. })
+    }
+}
+
+/// One explicit bounded-wait policy selected before a backend submission is created.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct BoundedCompletionWait {
+    timeout: std::time::Duration,
+    cancellation: CompletionCancellationMode,
+}
+
+impl BoundedCompletionWait {
+    /// Creates a positive relative deadline and its required safe cancellation mode.
+    pub fn new(
+        timeout: std::time::Duration,
+        cancellation: CompletionCancellationMode,
+    ) -> Result<Self, BoundedCompletionWaitError> {
+        if timeout.is_zero() {
+            return Err(BoundedCompletionWaitError::ZeroTimeout);
+        }
+        Ok(Self {
+            timeout,
+            cancellation,
+        })
+    }
+
+    /// Maximum time spent waiting for exact completion.
+    pub const fn timeout(self) -> std::time::Duration {
+        self.timeout
+    }
+
+    /// Required safe disposition for work still live at the deadline.
+    pub const fn cancellation(self) -> CompletionCancellationMode {
+        self.cancellation
+    }
+}
+
+/// Invalid bounded-completion policy.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, thiserror::Error)]
+pub enum BoundedCompletionWaitError {
+    /// A zero duration cannot establish a meaningful completion deadline.
+    #[error("bounded completion timeout must be positive")]
+    ZeroTimeout,
+}
+
+/// Stable result of observing one completion through an explicit bounded policy.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum BoundedCompletionOutcome {
+    /// Exact backend completion was observed before the deadline.
+    Completed,
+    /// The deadline expired and the backend safely applied the selected disposition.
+    DeadlineExceeded {
+        /// Cancellation or retained-orphan mechanism actually applied.
+        cancellation: CompletionCancellationMode,
+    },
+}
+
+/// Completion which can enforce a selected deadline without dropping live resources.
+///
+/// Implementations must consume themselves on timeout. `NativeCancel` means native
+/// cancellation and teardown have completed before returning. `QuarantineUntilComplete`
+/// means the implementation has transferred ownership of the completion and all work
+/// resources to a safe owner which will release them only after exact completion. An
+/// `Err` return has the same ownership obligation: it may represent a terminally
+/// completed backend failure, or it must first transfer still-live work to the selected
+/// safe disposition. Implementations must never return an error by merely dropping live
+/// resources.
+pub trait BoundedCompletion: Completion + Sized {
+    /// Observes exact completion until the policy deadline, then performs its selected
+    /// safe cancellation disposition.
+    fn wait_bounded(
+        self,
+        policy: BoundedCompletionWait,
+    ) -> Result<BoundedCompletionOutcome, Self::Error>;
+}
+
 /// Output and exact completion returned by a backend submission.
 #[derive(Debug)]
 pub struct Submission<T, C> {
@@ -552,6 +723,40 @@ where
         self.completion.wait()?;
         Ok(self.output)
     }
+}
+
+impl<T, C> Submission<T, C>
+where
+    C: BoundedCompletion,
+{
+    /// Waits through the selected bounded policy and returns output only after exact
+    /// completion. Timed-out output is dropped only after its completion has transferred
+    /// ownership of every live backend resource to its safe cancellation owner.
+    pub fn wait_bounded(
+        self,
+        policy: BoundedCompletionWait,
+    ) -> Result<BoundedSubmissionOutcome<T>, C::Error> {
+        match self.completion.wait_bounded(policy)? {
+            BoundedCompletionOutcome::Completed => {
+                Ok(BoundedSubmissionOutcome::Completed(self.output))
+            }
+            BoundedCompletionOutcome::DeadlineExceeded { cancellation } => {
+                Ok(BoundedSubmissionOutcome::DeadlineExceeded { cancellation })
+            }
+        }
+    }
+}
+
+/// Result of a bounded submission wait. Output is authoritative only on completion.
+#[derive(Debug, Eq, PartialEq)]
+pub enum BoundedSubmissionOutcome<T> {
+    /// Exact completion was observed and the output may be consumed.
+    Completed(T),
+    /// The deadline expired and live work entered its selected safe disposition.
+    DeadlineExceeded {
+        /// Cancellation or retained-orphan mechanism actually applied.
+        cancellation: CompletionCancellationMode,
+    },
 }
 
 /// Marker wrapper proving that a model was prepared by a backend.
@@ -2431,5 +2636,19 @@ mod tests {
             r#"{"world_size":6,"rank":6,"groups":[]}"#
         )
         .is_err());
+    }
+
+    #[test]
+    fn distributed_commit_epoch_round_trips_and_rejects_zero() {
+        let outcome = DistributedCommitOutcome::Indeterminate {
+            epoch: DistributedCommitEpoch::new(17).unwrap(),
+            phase: DistributedCommitPhase::DecisionCompletion,
+        };
+        let encoded = serde_json::to_string(&outcome).unwrap();
+        assert_eq!(
+            serde_json::from_str::<DistributedCommitOutcome>(&encoded).unwrap(),
+            outcome
+        );
+        assert!(serde_json::from_str::<DistributedCommitEpoch>("0").is_err());
     }
 }

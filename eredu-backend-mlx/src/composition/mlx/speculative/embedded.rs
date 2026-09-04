@@ -1,13 +1,10 @@
 //! MLX executor adapter for checkpoint-embedded prediction heads.
 
-use crate::backend::runtime::distributed::Group;
 use eredu_core::{SpeculativeCommit, SpeculativeExecutor, SpeculativePrefill, Submission};
-use eredu_runtime::{DraftStateTransaction, SpeculativeSampler};
+use eredu_runtime::DraftStateTransaction;
 use safemlx::{error::Exception, ops::indexing::TryIndexOp, Array, Stream};
 
 use crate::{
-    backend::error::Error,
-    backend::runtime::generation::MlxSamplingBackend,
     backend::runtime::media::input::ModelInput,
     composition::mlx::{
         speculative::{
@@ -18,100 +15,6 @@ use crate::{
     },
     MlxTensor,
 };
-
-/// Sampler wrapper that keeps PRNG and grammar state identical on every rank
-/// while selecting one topology-owned sampling coordinate.
-#[derive(Clone)]
-pub struct DistributedEmbeddedMtpSampler<'a, S> {
-    sampler: S,
-    _sampling_rank: usize,
-    _group: &'a Group,
-}
-
-impl<'a, S> DistributedEmbeddedMtpSampler<'a, S> {
-    pub fn new(sampler: S, sampling_rank: usize, group: &'a Group) -> Result<Self, Error> {
-        if sampling_rank >= group.size() {
-            return Err(Error::Parallel(format!(
-                "embedded MTP sampling rank {sampling_rank} is outside world size {}",
-                group.size()
-            )));
-        }
-        Ok(Self {
-            sampler,
-            _sampling_rank: sampling_rank,
-            _group: group,
-        })
-    }
-}
-
-impl<S: SpeculativeSampler<MlxSamplingBackend>> SpeculativeSampler<MlxSamplingBackend>
-    for DistributedEmbeddedMtpSampler<'_, S>
-{
-    fn supports_exact_optimistic_promotion(&self) -> bool {
-        false
-    }
-
-    fn grammar_is_complete(&mut self) -> Result<bool, Exception> {
-        SpeculativeSampler::<MlxSamplingBackend>::grammar_is_complete(&mut self.sampler)
-    }
-
-    fn prefix_is_complete(&self, history: &[u32]) -> Result<bool, Exception> {
-        SpeculativeSampler::<MlxSamplingBackend>::prefix_is_complete(&self.sampler, history)
-    }
-
-    fn process_logits(
-        &mut self,
-        logits: &MlxTensor,
-        temperature: f32,
-        history: &[u32],
-        stream: &Stream,
-    ) -> Result<MlxTensor, Exception> {
-        SpeculativeSampler::<MlxSamplingBackend>::process_logits(
-            &mut self.sampler,
-            logits,
-            temperature,
-            history,
-            stream,
-        )
-    }
-
-    fn sample_processed(
-        &self,
-        logits: &MlxTensor,
-        temperature: f32,
-        prng_state: Option<&mut crate::backend::random::RandomState>,
-        stream: &Stream,
-    ) -> Result<MlxTensor, Exception> {
-        let sampled = SpeculativeSampler::<MlxSamplingBackend>::sample_processed(
-            &self.sampler,
-            logits,
-            temperature,
-            prng_state,
-            stream,
-        )?;
-        // Pipeline MTP publishes identical complete logits to every rank before
-        // sampling. The speculative scheduler also advances the same sampler
-        // and PRNG state on every rank, so sampling locally is the exact
-        // synchronized operation. A world collective here is unsafe after
-        // point-to-point pipeline traffic on MLX Ring because it can consume a
-        // prior activation payload from the transport queue.
-        Ok(sampled)
-    }
-
-    fn commit_token(
-        &mut self,
-        processed_logits: &MlxTensor,
-        token: u32,
-        stream: &Stream,
-    ) -> Result<(), Exception> {
-        SpeculativeSampler::<MlxSamplingBackend>::commit_token(
-            &mut self.sampler,
-            processed_logits,
-            token,
-            stream,
-        )
-    }
-}
 
 pub struct EmbeddedMtpOutput {
     pub logits: MlxTensor,

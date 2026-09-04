@@ -4,6 +4,7 @@
 //! adapter supplies only a topology-scoped all-gather of portable words.
 
 use crate::scheduler::{CancellationCause, RequestId, WorkId};
+use crate::{BoundedCompletion, BoundedCompletionWait, BoundedSubmissionOutcome, Submission};
 
 /// Topology-scoped transport for scheduler metadata.
 ///
@@ -19,6 +20,24 @@ pub trait ConsensusTransport {
 
     /// Gathers an equally sized word frame from every rank in rank order.
     fn all_gather_words(&self, local: &[u32]) -> Result<Vec<u32>, Self::Error>;
+}
+
+/// Consensus transport that returns exact work ownership under a caller-selected bound.
+pub trait BoundedConsensusTransport: ConsensusTransport {
+    /// Completion retaining transport resources through completion or safe cancellation.
+    type Completion: BoundedCompletion;
+    /// Backend-owned gathered value that remains lazy until exact completion.
+    type GatherOutput;
+
+    /// Submits one equal-word rank-major gather without synchronizing the caller.
+    fn submit_all_gather_words(
+        &self,
+        local: &[u32],
+    ) -> Result<Submission<Self::GatherOutput, Self::Completion>, Self::Error>;
+
+    /// Resolves completed backend output into rank-major portable words.
+    fn resolve_all_gather_words(&self, output: Self::GatherOutput)
+        -> Result<Vec<u32>, Self::Error>;
 }
 
 /// One planned transition and its stable semantic descriptor.
@@ -277,6 +296,171 @@ fn gather_words<T: ConsensusTransport>(
         });
     }
     Ok(gathered)
+}
+
+fn gather_words_bounded<T: BoundedConsensusTransport>(
+    transport: &T,
+    words: &[u32],
+    participants: usize,
+    wait: BoundedCompletionWait,
+) -> Result<Vec<u32>, ConsensusError>
+where
+    <T::Completion as crate::Completion>::Error: std::fmt::Display,
+{
+    let expected = words
+        .len()
+        .checked_mul(participants)
+        .ok_or(ConsensusError::MetadataOverflow("gathered word count"))?;
+    let gathered = transport
+        .submit_all_gather_words(words)
+        .map_err(|error| ConsensusError::Transport(error.to_string()))?
+        .wait_bounded(wait)
+        .map_err(|error| ConsensusError::Transport(error.to_string()))?;
+    let gathered = match gathered {
+        BoundedSubmissionOutcome::Completed(gathered) => transport
+            .resolve_all_gather_words(gathered)
+            .map_err(|error| ConsensusError::Transport(error.to_string()))?,
+        BoundedSubmissionOutcome::DeadlineExceeded { cancellation } => {
+            return Err(ConsensusError::Transport(format!(
+                "bounded consensus deadline exceeded ({cancellation:?})"
+            )))
+        }
+    };
+    if gathered.len() != expected {
+        return Err(ConsensusError::MalformedGather {
+            expected,
+            actual: gathered.len(),
+            participants,
+        });
+    }
+    Ok(gathered)
+}
+
+/// Agrees one cancellation preparation or commit-authorization status under a bound.
+pub fn agree_disposition_status_bounded<T: BoundedConsensusTransport>(
+    transport: &T,
+    protocol: u64,
+    request: RequestId,
+    cause: CancellationCause,
+    phase: u32,
+    local_ready: bool,
+    wait: BoundedCompletionWait,
+) -> Result<bool, ConsensusError>
+where
+    <T::Completion as crate::Completion>::Error: std::fmt::Display,
+{
+    let participants = checked_participants(transport)?;
+    let mut words = vec![protocol as u32, (protocol >> 32) as u32];
+    push_u64(&mut words, request.value());
+    words.push(match cause {
+        CancellationCause::Explicit => 1,
+        CancellationCause::Deadline => 2,
+    });
+    words.push(phase);
+    words.push(u32::from(local_ready));
+    let gathered = gather_words_bounded(transport, &words, participants, wait)?;
+    let semantic = &words[..words.len() - 1];
+    let mut all_ready = true;
+    for rank in 0..participants {
+        let frame = &gathered[rank * words.len()..(rank + 1) * words.len()];
+        if &frame[..semantic.len()] != semantic {
+            return Err(ConsensusError::Mismatch {
+                context: "distributed cancellation transaction",
+                rank,
+            });
+        }
+        match frame[semantic.len()] {
+            0 => all_ready = false,
+            1 => {}
+            _ => {
+                return Err(ConsensusError::Mismatch {
+                    context: "distributed cancellation readiness",
+                    rank,
+                })
+            }
+        }
+    }
+    Ok(all_ready)
+}
+
+/// Agrees the exact active request set and returns every request whose deadline
+/// has expired on at least one rank.
+pub fn agree_deadline_candidates_bounded<T: BoundedConsensusTransport>(
+    transport: &T,
+    protocol: u64,
+    local: &[(RequestId, bool)],
+    max_requests: usize,
+    wait: BoundedCompletionWait,
+) -> Result<Vec<RequestId>, ConsensusError>
+where
+    <T::Completion as crate::Completion>::Error: std::fmt::Display,
+{
+    let participants = checked_participants(transport)?;
+    if local.len() > max_requests {
+        return Err(ConsensusError::MetadataOverflow(
+            "active deadline request count",
+        ));
+    }
+    let count = u32::try_from(local.len())
+        .map_err(|_| ConsensusError::MetadataOverflow("active deadline request count"))?;
+    let slots = u32::try_from(max_requests)
+        .map_err(|_| ConsensusError::MetadataOverflow("deadline request slots"))?;
+    let mut words = vec![protocol as u32, (protocol >> 32) as u32, count, slots];
+    let mut previous = None;
+    for &(request, expired) in local {
+        if previous.is_some_and(|previous| previous >= request) {
+            return Err(ConsensusError::Mismatch {
+                context: "local deadline request ordering",
+                rank: 0,
+            });
+        }
+        previous = Some(request);
+        push_u64(&mut words, request.value());
+        words.push(u32::from(expired));
+    }
+    words.resize(4 + max_requests.saturating_mul(3), 0);
+    let gathered = gather_words_bounded(transport, &words, participants, wait)?;
+    let mut expired = vec![false; local.len()];
+    for rank in 0..participants {
+        let frame = &gathered[rank * words.len()..(rank + 1) * words.len()];
+        if frame[..4] != words[..4] {
+            return Err(ConsensusError::Mismatch {
+                context: "distributed deadline request set header",
+                rank,
+            });
+        }
+        for (index, &(request, _)) in local.iter().enumerate() {
+            let offset = 4 + index * 3;
+            let expected = [request.value() as u32, (request.value() >> 32) as u32];
+            if frame[offset..offset + 2] != expected {
+                return Err(ConsensusError::Mismatch {
+                    context: "distributed deadline request identity",
+                    rank,
+                });
+            }
+            match frame[offset + 2] {
+                0 => {}
+                1 => expired[index] = true,
+                _ => {
+                    return Err(ConsensusError::Mismatch {
+                        context: "distributed deadline request status",
+                        rank,
+                    })
+                }
+            }
+        }
+        if frame[4 + local.len() * 3..].iter().any(|word| *word != 0) {
+            return Err(ConsensusError::Mismatch {
+                context: "distributed deadline request padding",
+                rank,
+            });
+        }
+    }
+    Ok(local
+        .iter()
+        .zip(expired)
+        .filter_map(|(&(request, _), expired)| expired.then_some(request))
+        .collect())
 }
 
 fn push_u64(output: &mut Vec<u32>, value: u64) {

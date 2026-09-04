@@ -1,5 +1,6 @@
 use std::{
     cell::{Cell, RefCell},
+    collections::VecDeque,
     convert::Infallible,
     rc::Rc,
     sync::{
@@ -14,7 +15,9 @@ use eredu_core::{
         StateTensorPolicy, StateTensorRole,
     },
     checkpoint::TensorDtype,
-    AttentionPolicy, Completion, InputModality, InputTensorIdentity, LayerSchedule, TokenFilter,
+    AttentionPolicy, Completion, DistributedCommitEpoch, DistributedCommitOutcome,
+    DistributedCommitPhase, InputModality, InputTensorIdentity, LayerSchedule, Submission,
+    TokenFilter,
 };
 use eredu_nn::{
     AttentionCache, AttentionMask, AttentionRequest, EmbeddingOperator, EmbeddingSpec, Error,
@@ -24,31 +27,45 @@ use eredu_nn::{
     RotarySpec, Tensor,
 };
 use eredu_runtime::{
-    bind_materialized_unit, construct_replicated_text_session, materialize_bindings,
-    prepare_layered_text_contract, prepare_replicated_text_contract, realize_architecture_state,
-    select_replicated_text_realization, ArchitectureGroupKind, ArchitectureGroupPlacement,
-    ArchitectureGroupTransport, ArchitectureMergeDestination, ArchitectureParameterDescription,
-    ArchitectureParameters, ArchitecturePartition, ArchitectureStateFactory,
-    BackendMechanismCapabilities, CacheResidencyPolicy, CollectiveBackend,
-    CompositeLayeredTraversalHook, DeviceState, ExecutionGraph, ExecutionGroupSpec,
-    ExecutionUnitAddress, ExecutionUnitLayout, LayerWeightResidency, LayeredArchitecture,
-    LayeredForwardState, LayeredPartitionDriver, LayeredPartitionInput, LayeredPartitionOutput,
-    LayeredTraversalHook, LayeredTraversalPoint, LayeredUnitAction, LayerwisePolicy,
-    LayerwiseRuntime, NoAuxiliaryBoundary, NoAuxiliaryBoundarySchema, ParallelLayeredArchitecture,
-    ParameterBackend, PartitionOwnership, PartitionedLayeredArchitecture, PenaltyConfig,
+    bind_materialized_unit, construct_replicated_text_session,
+    construct_replicated_text_session_with_runtime, materialize_bindings,
+    prepare_layered_text_contract, prepare_partitioned_session_runtime,
+    prepare_replicated_text_contract, realize_architecture_state,
+    select_replicated_text_realization, ArchitectureBoundary, ArchitectureGroupKind,
+    ArchitectureGroupPlacement, ArchitectureGroupTransport, ArchitectureMergeDestination,
+    ArchitectureParameterDescription, ArchitectureParameters, ArchitecturePartition,
+    ArchitectureStateFactory, BackendMechanismCapabilities, BarrierBackend, CacheResidencyPolicy,
+    CollectiveBackend, CommunicationBackend, CommunicationGroupDescriptor, CommunicationGroupId,
+    CommunicationGroupRequirements, CommunicationManifest, CommunicationOperation,
+    CommunicationOperationRequirement, CommunicationRouteDescriptor, CommunicationRouteId,
+    CommunicationTensorLimits, CommunicationTensorMetadata, CompositeLayeredTraversalHook,
+    DeviceState, DistributedExecutionPhase, ExecutionGraph, ExecutionGroupSpec, ExecutionResidency,
+    ExecutionUnitAddress, ExecutionUnitLayout, FailureAgreementBackend, LayerWeightResidency,
+    LayeredArchitecture, LayeredForwardState, LayeredPartitionDriver, LayeredPartitionInput,
+    LayeredPartitionOutput, LayeredTraversalHook, LayeredTraversalPoint, LayeredUnitAction,
+    LayerwisePolicy, LayerwiseRuntime, NoAuxiliaryBoundary, NoAuxiliaryBoundarySchema,
+    NoBoundaryTransport, NoCommitAgreement, NoOutputPublisher, OpaqueBoundaryTransport,
+    OpaqueCommitAgreement, OpaqueFailureAgreement, ParallelLayeredArchitecture, ParameterBackend,
+    PartitionBoundaryRoute, PartitionBoundaryTransport, PartitionCommitAgreement,
+    PartitionCommunication, PartitionOutputPublication, PartitionOutputPublisher,
+    PartitionOwnership, PartitionedExecutionPlan, PartitionedGroupExecutor,
+    PartitionedLayeredArchitecture, PartitionedTextExecution, PartitionedTextRuntime,
+    PenaltyConfig, PipelineActivationDtype, PipelineWireContract, PointToPointBackend,
     PredictionDirective, PreparedInputPart, PreparedInputPayload, PreparedModelInput,
-    ReplicatedTextArchitecture, ReplicatedTextMaterializationTask, ReplicatedTextParameterOwner,
+    RealizedCommunicationGroup, RealizedCommunicationRoute, ReplicatedTextArchitecture,
+    ReplicatedTextMaterializationTask, ReplicatedTextOutputSelection, ReplicatedTextParameterOwner,
     ReplicatedTextParameterPresence, ReplicatedTextParameterRequirement,
     ReplicatedTextParameterRole, ReplicatedTextPhysicalSource, ReplicatedTextRequirements,
-    ReplicatedTextSelectionRequest, ReplicatedTextSessionMechanisms, ReplicatedTextStateAccess,
-    ResettableRuntimeLayerState, ResettableRuntimeState, ResidentRuntime, RuntimeLayerState,
-    RuntimeState, RuntimeStateComponents, Sampler, SamplingBackend, SequentialDecisionBoundary,
-    SequentialDecisionDriver, SequentialDecisionError, SequentialDecisionPlan,
-    SequentialDecisionSource, SequentialDecisionTraversal, StateComponentMechanism,
-    StateComponentPlacement, StateError, StateLayout, StateMechanismCapabilities, StateSegmentId,
-    StateSegmentLifetime, StateSegmentSpec, StaticParameterVisitor, StaticParameterVisitorMut,
-    SubmissionBackend, TokenDomain, TransferBackend, WeightBinding, WeightLoweringCapability,
-    WeightLoweringKind, WeightResidencyMechanism,
+    ReplicatedTextSelectionRequest, ReplicatedTextSession, ReplicatedTextSessionMechanisms,
+    ReplicatedTextStateAccess, ResettableRuntimeLayerState, ResettableRuntimeState,
+    ResidentRuntime, RuntimeLayerState, RuntimeState, RuntimeStateComponents, Sampler,
+    SamplingBackend, SequentialDecisionBoundary, SequentialDecisionDriver, SequentialDecisionError,
+    SequentialDecisionPlan, SequentialDecisionSource, SequentialDecisionTraversal,
+    StateComponentMechanism, StateComponentPlacement, StateError, StateLayout,
+    StateMechanismCapabilities, StateSegmentId, StateSegmentLifetime, StateSegmentSpec,
+    StaticParameterVisitor, StaticParameterVisitorMut, SubmissionBackend, SumReductionBackend,
+    TokenDomain, TransactionalPromptCacheMechanisms, TransferBackend, UnevenGatherBackend,
+    WeightBinding, WeightLoweringCapability, WeightLoweringKind, WeightResidencyMechanism,
 };
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -554,10 +571,51 @@ impl SamplingBackend for FakeBackend {
 #[derive(Debug)]
 struct Done;
 
+#[derive(Debug)]
+struct CommunicationDone;
+
+#[derive(Debug, Clone, Copy)]
+enum FakeCommunicationError {
+    Submission,
+    CorruptBoundaryHeader,
+}
+
+impl std::fmt::Display for FakeCommunicationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Submission => "injected communication submission failure",
+            Self::CorruptBoundaryHeader => "received boundary frame header was corrupted",
+        })
+    }
+}
+
+impl std::error::Error for FakeCommunicationError {}
+
+#[derive(Debug, Clone, Copy)]
+enum FakeCompletionOutcome {
+    Completed,
+    DeadlineExceeded,
+    CorruptBoundaryHeader,
+}
+
 thread_local! {
     static FORK_COUNT: Cell<usize> = const { Cell::new(0) };
     static SUBMIT_COUNT: Cell<usize> = const { Cell::new(0) };
     static ORDER_COUNT: Cell<usize> = const { Cell::new(0) };
+    static POINT_TO_POINT_COUNT: Cell<usize> = const { Cell::new(0) };
+    static LOCAL_DEPENDENCY_SUBMISSION_COUNT: Cell<usize> = const { Cell::new(0) };
+    static CORRUPT_GATHER: Cell<bool> = const { Cell::new(false) };
+    static CORRUPT_GATHER_DTYPE: Cell<bool> = const { Cell::new(false) };
+    static UNEVEN_GATHER_CALLS: Cell<usize> = const { Cell::new(0) };
+    static COMMUNICATION_COMPLETION_SCRIPT: RefCell<VecDeque<FakeCompletionOutcome>> = const { RefCell::new(VecDeque::new()) };
+    static BOUNDED_COMMUNICATION_WAIT_COUNT: Cell<usize> = const { Cell::new(0) };
+    static FAILURE_AGREEMENT_COUNT: Cell<usize> = const { Cell::new(0) };
+    static FAIL_NEXT_COMMUNICATION_SUBMISSION: Cell<bool> = const { Cell::new(false) };
+}
+
+thread_local! {
+    static PARTITION_COMMIT_TRACE: RefCell<Option<Rc<RefCell<Vec<&'static str>>>>> = const { RefCell::new(None) };
+    static PARTITION_PUBLICATION_VALUES: RefCell<Option<Rc<RefCell<Vec<FakeTensor>>>>> = const { RefCell::new(None) };
 }
 
 impl Completion for Done {
@@ -567,6 +625,51 @@ impl Completion for Done {
     }
     fn wait(&self) -> Result<(), Self::Error> {
         Ok(())
+    }
+}
+
+impl eredu_core::BoundedCompletion for Done {
+    fn wait_bounded(
+        self,
+        _policy: eredu_core::BoundedCompletionWait,
+    ) -> Result<eredu_core::BoundedCompletionOutcome, Self::Error> {
+        Ok(eredu_core::BoundedCompletionOutcome::Completed)
+    }
+}
+
+impl Completion for CommunicationDone {
+    type Error = FakeCommunicationError;
+
+    fn is_complete(&self) -> Result<bool, Self::Error> {
+        Ok(true)
+    }
+
+    fn wait(&self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
+impl eredu_core::BoundedCompletion for CommunicationDone {
+    fn wait_bounded(
+        self,
+        policy: eredu_core::BoundedCompletionWait,
+    ) -> Result<eredu_core::BoundedCompletionOutcome, Self::Error> {
+        BOUNDED_COMMUNICATION_WAIT_COUNT.set(BOUNDED_COMMUNICATION_WAIT_COUNT.get() + 1);
+        Ok(
+            match COMMUNICATION_COMPLETION_SCRIPT.with(|script| script.borrow_mut().pop_front()) {
+                Some(FakeCompletionOutcome::DeadlineExceeded) => {
+                    eredu_core::BoundedCompletionOutcome::DeadlineExceeded {
+                        cancellation: policy.cancellation(),
+                    }
+                }
+                Some(FakeCompletionOutcome::Completed) | None => {
+                    eredu_core::BoundedCompletionOutcome::Completed
+                }
+                Some(FakeCompletionOutcome::CorruptBoundaryHeader) => {
+                    return Err(FakeCommunicationError::CorruptBoundaryHeader)
+                }
+            },
+        )
     }
 }
 
@@ -593,6 +696,586 @@ impl SubmissionBackend for FakeBackend {
     fn retain_until_complete<T: Send + 'static>(_: &(), _: &Done, _: T) -> Result<(), Infallible> {
         Ok(())
     }
+}
+
+impl CommunicationBackend for FakeBackend {
+    type CommunicationGroup = ();
+    type CommunicationRoute = ();
+    type CommunicationCompletion = CommunicationDone;
+    type CommunicationError = FakeCommunicationError;
+
+    fn submit_local_dependencies<'a, I>(
+        values: I,
+        _: &Self::Executor,
+    ) -> Result<Submission<(), Self::CommunicationCompletion>, Self::CommunicationError>
+    where
+        Self::Tensor: 'a,
+        I: IntoIterator<Item = &'a Self::Tensor>,
+    {
+        let _ = values.into_iter().count();
+        LOCAL_DEPENDENCY_SUBMISSION_COUNT.set(LOCAL_DEPENDENCY_SUBMISSION_COUNT.get() + 1);
+        if FAIL_NEXT_COMMUNICATION_SUBMISSION.replace(false) {
+            return Err(FakeCommunicationError::Submission);
+        }
+        Ok(Submission {
+            output: (),
+            completion: CommunicationDone,
+        })
+    }
+}
+
+impl BarrierBackend for FakeBackend {
+    fn barrier(
+        _: &Self::CommunicationGroup,
+        _: &Self::Executor,
+    ) -> Result<Self::CommunicationCompletion, Self::CommunicationError> {
+        PARTITION_COMMIT_TRACE.with(|trace| {
+            if let Some(trace) = trace.borrow().as_ref() {
+                trace.borrow_mut().push("commit");
+            }
+        });
+        Ok(CommunicationDone)
+    }
+}
+
+impl PointToPointBackend for FakeBackend {
+    fn send_receive(
+        values: Vec<eredu_runtime::RoleExactBoundaryValue<Self::Tensor>>,
+        _: &Self::CommunicationRoute,
+        _: &Self::Executor,
+    ) -> Result<
+        Submission<Vec<Self::Tensor>, Self::CommunicationCompletion>,
+        Self::CommunicationError,
+    > {
+        POINT_TO_POINT_COUNT.set(POINT_TO_POINT_COUNT.get() + 1);
+        if FAIL_NEXT_COMMUNICATION_SUBMISSION.replace(false) {
+            return Err(FakeCommunicationError::Submission);
+        }
+        Ok(Submission {
+            output: values
+                .into_iter()
+                .map(|value| value.into_parts().1)
+                .collect(),
+            completion: CommunicationDone,
+        })
+    }
+}
+
+impl FailureAgreementBackend for FakeBackend {
+    type FailureAgreementOutput = bool;
+
+    fn agree_success(
+        local_success: bool,
+        _: &Self::CommunicationGroup,
+        _: &Self::Executor,
+    ) -> Result<Submission<bool, Self::CommunicationCompletion>, Self::CommunicationError> {
+        FAILURE_AGREEMENT_COUNT.set(FAILURE_AGREEMENT_COUNT.get() + 1);
+        if FAIL_NEXT_COMMUNICATION_SUBMISSION.replace(false) {
+            return Err(FakeCommunicationError::Submission);
+        }
+        Ok(Submission {
+            output: local_success,
+            completion: CommunicationDone,
+        })
+    }
+
+    fn resolve_failure_agreement(
+        output: Self::FailureAgreementOutput,
+    ) -> Result<bool, Self::CommunicationError> {
+        Ok(output)
+    }
+}
+
+impl UnevenGatherBackend for FakeBackend {
+    fn all_gather_uneven(
+        _: Self::Tensor,
+        counts: &[usize],
+        _: usize,
+        _: &Self::CommunicationGroup,
+        _: &Self::Executor,
+    ) -> Result<Submission<Self::Tensor, Self::CommunicationCompletion>, Self::CommunicationError>
+    {
+        UNEVEN_GATHER_CALLS.with(|calls| calls.set(calls.get() + 1));
+        let mut rows: usize = counts.iter().sum();
+        CORRUPT_GATHER.with(|corrupt| {
+            if corrupt.get() {
+                rows = rows.saturating_sub(1);
+            }
+        });
+        let mut output = vec![0; rows];
+        CORRUPT_GATHER_DTYPE.with(|corrupt| {
+            if corrupt.get() && !output.is_empty() {
+                output[0] = i32::MIN;
+            }
+        });
+        Ok(Submission {
+            output: FakeTensor(output),
+            completion: CommunicationDone,
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+struct FakeTensorMetadata;
+
+impl CommunicationTensorMetadata<FakeBackend> for FakeTensorMetadata {
+    fn dtype(&self, tensor: &FakeTensor) -> TensorDtype {
+        if tensor.0.first() == Some(&i32::MIN) {
+            TensorDtype::Bf16
+        } else {
+            TensorDtype::F32
+        }
+    }
+
+    fn shape(&self, tensor: &FakeTensor) -> Vec<usize> {
+        vec![tensor.0.len()]
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PipelineTensorMetadata;
+
+fn test_completion_policy() -> eredu_runtime::CommunicationCompletionPolicy {
+    eredu_runtime::CommunicationCompletionPolicy::new(
+        std::time::Duration::from_millis(10),
+        eredu_core::CompletionCancellationMode::QuarantineUntilComplete,
+    )
+    .unwrap()
+}
+
+impl CommunicationTensorMetadata<FakeBackend> for PipelineTensorMetadata {
+    fn dtype(&self, _: &FakeTensor) -> TensorDtype {
+        TensorDtype::F32
+    }
+
+    fn shape(&self, _: &FakeTensor) -> Vec<usize> {
+        vec![1, 1, 1]
+    }
+}
+
+#[test]
+fn uneven_gather_validates_distinct_input_and_completed_result_limits() {
+    UNEVEN_GATHER_CALLS.with(|calls| calls.set(0));
+    let group_id = CommunicationGroupId::new(1);
+    let requirement = CommunicationOperationRequirement::tensors(
+        CommunicationOperation::AllGatherUneven,
+        [TensorDtype::F32],
+        CommunicationTensorLimits::new(1, 1, 2, None)
+            .unwrap()
+            .with_output_tensor_elements(4)
+            .unwrap(),
+        true,
+    )
+    .unwrap();
+    let descriptor = CommunicationGroupDescriptor::new(
+        group_id,
+        0,
+        vec![0, 1],
+        Some(0),
+        CommunicationGroupRequirements::new([requirement.clone()]).unwrap(),
+    )
+    .unwrap();
+    let communication = PartitionCommunication::<FakeBackend, (), (), _>::new(
+        CommunicationManifest::new(2, 0, vec![descriptor], Vec::new())
+            .unwrap()
+            .with_completion_policy(test_completion_policy()),
+        vec![RealizedCommunicationGroup::new(group_id, ())],
+        Vec::new(),
+        FakeTensorMetadata,
+    )
+    .unwrap();
+
+    assert_eq!(
+        communication
+            .all_gather_uneven(FakeTensor(vec![1, 2]), &[2, 2], 0, group_id, &())
+            .unwrap(),
+        FakeTensor(vec![0, 0, 0, 0])
+    );
+    CORRUPT_GATHER.with(|corrupt| corrupt.set(true));
+    let corrupt = communication
+        .all_gather_uneven(FakeTensor(vec![1, 2]), &[2, 2], 0, group_id, &())
+        .unwrap_err();
+    CORRUPT_GATHER.with(|corrupt| corrupt.set(false));
+    assert!(matches!(
+        corrupt,
+        eredu_runtime::PartitionExecutionError::CommunicationOutputShape {
+            expected,
+            actual,
+        } if expected == [4] && actual == [3]
+    ));
+    assert_eq!(UNEVEN_GATHER_CALLS.get(), 2);
+    let retry = communication
+        .all_gather_uneven(FakeTensor(vec![1, 2]), &[2, 2], 0, group_id, &())
+        .unwrap_err();
+    assert!(matches!(
+        retry,
+        eredu_runtime::PartitionExecutionError::CommunicationPoisoned { .. }
+    ));
+    assert_eq!(UNEVEN_GATHER_CALLS.get(), 2);
+
+    let communication = PartitionCommunication::<FakeBackend, (), (), _>::new(
+        CommunicationManifest::new(
+            2,
+            0,
+            vec![CommunicationGroupDescriptor::new(
+                group_id,
+                0,
+                vec![0, 1],
+                Some(0),
+                CommunicationGroupRequirements::new([requirement]).unwrap(),
+            )
+            .unwrap()],
+            Vec::new(),
+        )
+        .unwrap()
+        .with_completion_policy(test_completion_policy()),
+        vec![RealizedCommunicationGroup::new(group_id, ())],
+        Vec::new(),
+        FakeTensorMetadata,
+    )
+    .unwrap();
+    CORRUPT_GATHER_DTYPE.with(|corrupt| corrupt.set(true));
+    let corrupt = communication
+        .all_gather_uneven(FakeTensor(vec![1, 2]), &[2, 2], 0, group_id, &())
+        .unwrap_err();
+    CORRUPT_GATHER_DTYPE.with(|corrupt| corrupt.set(false));
+    assert!(matches!(
+        corrupt,
+        eredu_runtime::PartitionExecutionError::TensorDtype {
+            dtype: TensorDtype::Bf16
+        }
+    ));
+    assert_eq!(UNEVEN_GATHER_CALLS.get(), 3);
+    let retry = communication
+        .all_gather_uneven(FakeTensor(vec![1, 2]), &[2, 2], 0, group_id, &())
+        .unwrap_err();
+    assert!(matches!(
+        retry,
+        eredu_runtime::PartitionExecutionError::CommunicationPoisoned { .. }
+    ));
+    assert_eq!(UNEVEN_GATHER_CALLS.get(), 3);
+}
+
+#[test]
+fn partition_communication_rejects_swapped_native_resource_identities() {
+    let requirement = || {
+        CommunicationGroupRequirements::new([CommunicationOperationRequirement::tensors(
+            CommunicationOperation::AllReduceSum,
+            [TensorDtype::F32],
+            CommunicationTensorLimits::new(1, 1, 1, None).unwrap(),
+            true,
+        )
+        .unwrap()])
+        .unwrap()
+    };
+    let first = CommunicationGroupId::new(1);
+    let second = CommunicationGroupId::new(2);
+    let manifest = CommunicationManifest::new(
+        1,
+        0,
+        vec![
+            CommunicationGroupDescriptor::new(first, 0, vec![0], Some(0), requirement()).unwrap(),
+            CommunicationGroupDescriptor::new(second, 1, vec![0], Some(0), requirement()).unwrap(),
+        ],
+        Vec::new(),
+    )
+    .unwrap()
+    .with_completion_policy(test_completion_policy());
+    let result = PartitionCommunication::<FakeBackend, (), (), _>::new(
+        manifest,
+        vec![
+            RealizedCommunicationGroup::new(second, ()),
+            RealizedCommunicationGroup::new(first, ()),
+        ],
+        Vec::new(),
+        FakeTensorMetadata,
+    );
+
+    assert!(matches!(
+        result,
+        Err(eredu_runtime::PartitionExecutionError::ResourceIdentity {
+            expected: 1,
+            actual: 2,
+        })
+    ));
+}
+
+fn route_test_communication(
+    rank: usize,
+    with_failure_agreement: bool,
+) -> PartitionCommunication<FakeBackend, (), (), PipelineTensorMetadata> {
+    let route_id = CommunicationRouteId::new(9);
+    let requirement = CommunicationOperationRequirement::tensors(
+        CommunicationOperation::SendReceive,
+        [TensorDtype::F32],
+        CommunicationTensorLimits::new(1, 3, 1, None).unwrap(),
+        true,
+    )
+    .unwrap();
+    let group_id = CommunicationGroupId::new(1);
+    let groups = with_failure_agreement
+        .then(|| {
+            CommunicationGroupDescriptor::new(
+                group_id,
+                0,
+                vec![0, 1],
+                Some(rank),
+                CommunicationGroupRequirements::new([
+                    CommunicationOperationRequirement::failure_agreement(true),
+                ])
+                .unwrap(),
+            )
+            .unwrap()
+        })
+        .into_iter()
+        .collect::<Vec<_>>();
+    let manifest = CommunicationManifest::new(
+        2,
+        rank,
+        groups,
+        vec![test_boundary_route(route_id, 0, 0, 1, requirement)],
+    )
+    .unwrap()
+    .with_completion_policy(test_completion_policy());
+    PartitionCommunication::new(
+        manifest,
+        with_failure_agreement
+            .then(|| RealizedCommunicationGroup::new(group_id, ()))
+            .into_iter()
+            .collect(),
+        vec![RealizedCommunicationRoute::new(route_id, ())],
+        PipelineTensorMetadata,
+    )
+    .unwrap()
+}
+
+fn test_boundary_route(
+    id: CommunicationRouteId,
+    order: usize,
+    source: usize,
+    destination: usize,
+    requirement: CommunicationOperationRequirement,
+) -> CommunicationRouteDescriptor {
+    let role = eredu_runtime::BoundaryRoleContract::symbolic(
+        "hidden",
+        TensorDtype::F32,
+        vec![
+            eredu_runtime::BoundaryDimensionContract::Variable { maximum: 1 },
+            eredu_runtime::BoundaryDimensionContract::Variable { maximum: 1 },
+            eredu_runtime::BoundaryDimensionContract::Fixed(1),
+        ],
+    )
+    .unwrap();
+    CommunicationRouteDescriptor::new(id, order, source, destination, requirement)
+        .unwrap()
+        .with_boundary_contract(
+            eredu_runtime::RoleExactBoundaryContract::new("none", [role]).unwrap(),
+        )
+        .unwrap()
+}
+
+fn transfer_test_boundary(
+    communication: &PartitionCommunication<FakeBackend, (), (), PipelineTensorMetadata>,
+) -> Result<Vec<FakeTensor>, eredu_runtime::PartitionExecutionError> {
+    let schema = NoAuxiliaryBoundarySchema::new(1)
+        .wire_schema()
+        .unwrap()
+        .resolve(1, 1)
+        .unwrap();
+    OpaqueBoundaryTransport.transfer(
+        communication,
+        CommunicationRouteId::new(9),
+        vec![eredu_runtime::ArchitectureBoundaryValue::new("hidden", FakeTensor(vec![1])).unwrap()],
+        &schema,
+        PipelineWireContract::new(PipelineActivationDtype::Float32),
+        &(),
+    )
+}
+
+#[test]
+fn two_rank_deadline_poison_is_stable_and_retry_submits_no_native_work() {
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let outcomes = std::thread::scope(|scope| {
+        (0..2)
+            .map(|rank| {
+                let barrier = Arc::clone(&barrier);
+                scope.spawn(move || {
+                    COMMUNICATION_COMPLETION_SCRIPT.with(|script| {
+                        script
+                            .borrow_mut()
+                            .push_back(FakeCompletionOutcome::DeadlineExceeded);
+                    });
+                    POINT_TO_POINT_COUNT.set(0);
+                    let communication = route_test_communication(rank, false);
+                    barrier.wait();
+                    let first = transfer_test_boundary(&communication).unwrap_err();
+                    let calls_after_deadline = POINT_TO_POINT_COUNT.get();
+                    let retry = transfer_test_boundary(&communication).unwrap_err();
+                    (
+                        first,
+                        retry,
+                        calls_after_deadline,
+                        POINT_TO_POINT_COUNT.get(),
+                    )
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+
+    for (first, retry, calls_after_deadline, calls_after_retry) in outcomes {
+        assert!(matches!(
+            first,
+            eredu_runtime::PartitionExecutionError::CommunicationDeadlineExceeded {
+                operation: CommunicationOperation::SendReceive,
+                phase: DistributedExecutionPhase::Execution,
+                route: Some(route),
+                ..
+            } if route == CommunicationRouteId::new(9)
+        ));
+        assert!(matches!(
+            retry,
+            eredu_runtime::PartitionExecutionError::CommunicationPoisoned {
+                operation: CommunicationOperation::SendReceive,
+                phase: DistributedExecutionPhase::Execution,
+                route: Some(route),
+                ..
+            } if route == CommunicationRouteId::new(9)
+        ));
+        assert_eq!(calls_after_deadline, 1);
+        assert_eq!(calls_after_retry, 1);
+    }
+}
+
+#[test]
+fn agreement_deadline_after_completed_transfer_poisons_later_route_use() {
+    let communication = route_test_communication(0, true);
+    COMMUNICATION_COMPLETION_SCRIPT.with(|script| {
+        script.borrow_mut().extend([
+            FakeCompletionOutcome::Completed,
+            FakeCompletionOutcome::DeadlineExceeded,
+        ]);
+    });
+    POINT_TO_POINT_COUNT.set(0);
+    FAILURE_AGREEMENT_COUNT.set(0);
+    transfer_test_boundary(&communication).unwrap();
+    let error = OpaqueFailureAgreement
+        .agree_phase(
+            &communication,
+            CommunicationGroupId::new(1),
+            DistributedExecutionPhase::BoundarySourceReady(CommunicationRouteId::new(9)),
+            true,
+            &(),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        eredu_runtime::PartitionExecutionError::CommunicationDeadlineExceeded {
+            operation: CommunicationOperation::FailureAgreement,
+            phase: DistributedExecutionPhase::BoundarySourceReady(route),
+            ..
+        } if route == CommunicationRouteId::new(9)
+    ));
+    assert!(matches!(
+        transfer_test_boundary(&communication),
+        Err(
+            eredu_runtime::PartitionExecutionError::CommunicationPoisoned {
+                operation: CommunicationOperation::FailureAgreement,
+                ..
+            }
+        )
+    ));
+    assert_eq!(POINT_TO_POINT_COUNT.get(), 1);
+    assert_eq!(FAILURE_AGREEMENT_COUNT.get(), 1);
+}
+
+#[test]
+fn recovery_agreement_cannot_bypass_a_healthy_communication_authority() {
+    let communication = route_test_communication(0, true);
+    FAILURE_AGREEMENT_COUNT.set(0);
+    let error = OpaqueFailureAgreement
+        .agree_phase_after_prior_failure(
+            &communication,
+            CommunicationGroupId::new(1),
+            DistributedExecutionPhase::Execution,
+            true,
+            &(),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        eredu_runtime::PartitionExecutionError::RecoveryAgreementWithoutFailure {
+            phase: DistributedExecutionPhase::Execution,
+        }
+    ));
+    assert_eq!(FAILURE_AGREEMENT_COUNT.get(), 0);
+}
+
+#[test]
+fn final_agreement_submission_and_completion_failures_are_indeterminate_and_poisoned() {
+    for (submission_failure, expected_phase) in [
+        (true, DistributedCommitPhase::DecisionSubmission),
+        (false, DistributedCommitPhase::DecisionCompletion),
+    ] {
+        let communication = route_test_communication(0, true);
+        FAILURE_AGREEMENT_COUNT.set(0);
+        if submission_failure {
+            FAIL_NEXT_COMMUNICATION_SUBMISSION.set(true);
+        } else {
+            COMMUNICATION_COMPLETION_SCRIPT.with(|script| {
+                script
+                    .borrow_mut()
+                    .push_back(FakeCompletionOutcome::DeadlineExceeded);
+            });
+        }
+        let first = OpaqueFailureAgreement.commit(
+            &communication,
+            CommunicationGroupId::new(1),
+            DistributedCommitEpoch::FIRST,
+            &(),
+        );
+        assert_eq!(
+            first,
+            DistributedCommitOutcome::Indeterminate {
+                epoch: DistributedCommitEpoch::FIRST,
+                phase: expected_phase,
+            }
+        );
+        let calls = FAILURE_AGREEMENT_COUNT.get();
+        let retry_epoch = DistributedCommitEpoch::FIRST.next().unwrap();
+        assert!(OpaqueFailureAgreement
+            .commit(
+                &communication,
+                CommunicationGroupId::new(1),
+                retry_epoch,
+                &(),
+            )
+            .is_indeterminate());
+        assert_eq!(FAILURE_AGREEMENT_COUNT.get(), calls);
+    }
+}
+
+#[test]
+fn synchronous_submission_failure_poisons_retry_before_backend_call() {
+    let communication = route_test_communication(0, false);
+    POINT_TO_POINT_COUNT.set(0);
+    FAIL_NEXT_COMMUNICATION_SUBMISSION.set(true);
+    assert!(matches!(
+        transfer_test_boundary(&communication),
+        Err(eredu_runtime::PartitionExecutionError::CommunicationSubmissionFailed {
+            operation: CommunicationOperation::SendReceive,
+            route: Some(route),
+            ..
+        }) if route == CommunicationRouteId::new(9)
+    ));
+    assert_eq!(POINT_TO_POINT_COUNT.get(), 1);
+    assert!(matches!(
+        transfer_test_boundary(&communication),
+        Err(eredu_runtime::PartitionExecutionError::CommunicationPoisoned { .. })
+    ));
+    assert_eq!(POINT_TO_POINT_COUNT.get(), 1);
 }
 
 impl SubmissionBackend for PartitionCollectiveBackend {
@@ -652,6 +1335,46 @@ impl CollectiveBackend for PartitionCollectiveBackend {
             value: value.0.clone(),
         });
         Ok(value)
+    }
+}
+
+impl CommunicationBackend for PartitionCollectiveBackend {
+    type CommunicationGroup = PartitionCollectiveGroup;
+    type CommunicationRoute = ();
+    type CommunicationCompletion = Done;
+    type CommunicationError = Infallible;
+
+    fn submit_local_dependencies<'a, I>(
+        _: I,
+        _: &Self::Executor,
+    ) -> Result<Submission<(), Self::CommunicationCompletion>, Self::CommunicationError>
+    where
+        Self::Tensor: 'a,
+        I: IntoIterator<Item = &'a Self::Tensor>,
+    {
+        Ok(Submission {
+            output: (),
+            completion: Done,
+        })
+    }
+}
+
+impl SumReductionBackend for PartitionCollectiveBackend {
+    fn all_reduce_sum(
+        value: Self::Tensor,
+        group: &Self::CommunicationGroup,
+        _: &Self::Executor,
+    ) -> Result<Submission<Self::Tensor, Self::CommunicationCompletion>, Self::CommunicationError>
+    {
+        group.trace.borrow_mut().push(PartitionCollectiveCall {
+            local_rank: group.local_rank,
+            members: group.members.clone(),
+            value: value.0.clone(),
+        });
+        Ok(Submission {
+            output: value,
+            completion: Done,
+        })
     }
 }
 
@@ -888,6 +1611,46 @@ impl ResettableRuntimeLayerState<FakeBackend> for FakeLayerState {
         self.0 = 0;
         Ok(())
     }
+}
+
+#[derive(Debug, Clone)]
+struct RetainedOrdinalLayerState(FakeTensor);
+
+impl RuntimeLayerState<FakeBackend> for RetainedOrdinalLayerState {
+    type RetainedValues<'a> = std::iter::Once<&'a FakeTensor>;
+
+    fn retained_values(&self) -> Self::RetainedValues<'_> {
+        std::iter::once(&self.0)
+    }
+}
+
+#[test]
+fn device_state_retention_uses_local_ordinal_with_nonzero_partition_offset() {
+    let policy = LayerCachePolicy::key_value(AttentionPolicy::Full, 1, 8).unwrap();
+    let local =
+        StateLayout::new(LayerSchedule::new(2, vec![policy.clone(), policy]).unwrap()).unwrap();
+    let partition = eredu_runtime::PartitionState::new(local.clone(), 5).unwrap();
+    let state = DeviceState::<FakeBackend, RetainedOrdinalLayerState>::create(
+        partition.layout().clone(),
+        |ordinal, _| {
+            Ok::<_, Infallible>(RetainedOrdinalLayerState(FakeTensor(vec![i32::try_from(
+                ordinal,
+            )
+            .unwrap()])))
+        },
+    )
+    .unwrap();
+    let graph = ExecutionGraph::new(vec![ExecutionGroupSpec::root("decoder")], "decoder").unwrap();
+    let units = ExecutionUnitLayout::new(&graph, [7]).unwrap();
+    let global_address = units.address(6).unwrap();
+
+    assert_eq!(partition.global_layer_offset(), 5);
+    let retained = RuntimeState::retained_values(&state, 1, global_address)
+        .unwrap()
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(retained, [FakeTensor(vec![1])]);
+    assert_eq!(global_address.index(), 6);
 }
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
@@ -1138,6 +1901,308 @@ impl
 {
     fn text_input<'a>(tokens: &'a FakeTensor, _: Option<&'a FakeTensor>) -> Self::Input<'a> {
         tokens
+    }
+}
+
+struct PredictionCaptureFixture(OrdinaryTextFixture);
+
+struct PredictionStateOperation {
+    fail: bool,
+}
+
+impl
+    eredu_runtime::PredictionTargetOperation<
+        PredictionCaptureFixture,
+        FakeBackend,
+        DeviceState<FakeBackend, FakeLayerState>,
+    > for PredictionStateOperation
+{
+    type Output = i32;
+
+    fn apply(
+        self,
+        _: &mut PredictionCaptureFixture,
+        state: &mut DeviceState<FakeBackend, FakeLayerState>,
+        _: Option<&()>,
+        _: &(),
+    ) -> Result<Self::Output, Error> {
+        state.as_mut()[0].0 += 10;
+        if self.fail {
+            Err(Error::backend("injected prediction extension failure"))
+        } else {
+            Ok(state.as_ref()[0].0)
+        }
+    }
+}
+
+impl ArchitectureParameters<FakeBackend> for PredictionCaptureFixture {
+    type DefinitionError = Error;
+
+    fn state_layout(&self) -> Result<StateLayout, Self::DefinitionError> {
+        self.0.state_layout()
+    }
+
+    fn state_identity(
+        &self,
+        state: &eredu_runtime::PartitionState,
+        topology: eredu_core::cache::PromptCacheTopology,
+    ) -> Result<eredu_runtime::ModelStateIdentity, Self::DefinitionError> {
+        self.0.state_identity(state, topology)
+    }
+
+    fn parameter_description(
+        &self,
+        context: &(),
+    ) -> Result<ArchitectureParameterDescription, Self::DefinitionError> {
+        self.0.parameter_description(context)
+    }
+
+    fn visit_static_parameters<V>(&self, visitor: &mut V) -> Result<(), V::Error>
+    where
+        V: StaticParameterVisitor<FakeBackend>,
+    {
+        self.0.visit_static_parameters(visitor)
+    }
+
+    fn visit_static_parameters_mut<V>(&mut self, visitor: &mut V) -> Result<(), V::Error>
+    where
+        V: StaticParameterVisitorMut<FakeBackend>,
+    {
+        self.0.visit_static_parameters_mut(visitor)
+    }
+}
+
+impl LayeredArchitecture<FakeBackend, DeviceState<FakeBackend, FakeLayerState>>
+    for PredictionCaptureFixture
+{
+    type Input<'a> = &'a FakeTensor;
+    type StaticModules = FakeOperator;
+    type Unit = FakeUnit;
+    type ForwardContext = FakeTensor;
+    type RetainedContextValues<'a> = std::iter::Empty<&'a FakeTensor>;
+    type Error = Error;
+
+    fn group_transport(&self, group: usize) -> ArchitectureGroupTransport {
+        self.0.group_transport(group)
+    }
+
+    fn primary_execution_group(&self) -> &str {
+        self.0.primary_execution_group()
+    }
+
+    fn state_partition_plan(
+        &self,
+        layout: &StateLayout,
+    ) -> eredu_runtime::ArchitectureStatePartitionPlan {
+        self.0.state_partition_plan(layout)
+    }
+
+    fn execution_graph(&self) -> Result<ExecutionGraph, Self::Error> {
+        self.0.execution_graph()
+    }
+
+    fn group_unit_count(&self, group: usize) -> Result<usize, Self::Error> {
+        self.0.group_unit_count(group)
+    }
+
+    fn unit_path(&self, group: usize, index: usize) -> Result<String, Self::Error> {
+        self.0.unit_path(group, index)
+    }
+
+    fn static_modules(&self) -> &Self::StaticModules {
+        self.0.static_modules()
+    }
+
+    fn static_modules_mut(&mut self) -> &mut Self::StaticModules {
+        self.0.static_modules_mut()
+    }
+
+    fn build_unit(
+        &self,
+        group: usize,
+        index: usize,
+        context: &(),
+    ) -> Result<Self::Unit, Self::Error> {
+        self.0.build_unit(group, index, context)
+    }
+
+    fn begin_forward<'a>(
+        &mut self,
+        input: Self::Input<'a>,
+        state: &mut DeviceState<FakeBackend, FakeLayerState>,
+        context: &(),
+    ) -> Result<LayeredForwardState<FakeTensor, Self::ForwardContext>, Self::Error> {
+        let forward = self.0.begin_forward(input, state, context)?;
+        Ok(LayeredForwardState {
+            context: forward.hidden.clone(),
+            hidden: forward.hidden,
+        })
+    }
+
+    fn begin_execution_group(
+        &mut self,
+        group: usize,
+        initial: &FakeTensor,
+        dependencies: &[&FakeTensor],
+        state: &mut DeviceState<FakeBackend, FakeLayerState>,
+        _forward: &mut Self::ForwardContext,
+        context: &(),
+    ) -> Result<FakeTensor, Self::Error> {
+        self.0
+            .begin_execution_group(group, initial, dependencies, state, &mut (), context)
+    }
+
+    fn forward_unit(
+        &mut self,
+        group: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &FakeTensor,
+        state: &mut DeviceState<FakeBackend, FakeLayerState>,
+        forward: &mut Self::ForwardContext,
+        context: &(),
+    ) -> Result<FakeTensor, Self::Error> {
+        let output = self
+            .0
+            .forward_unit(group, index, unit, hidden, state, &mut (), context)?;
+        forward.clone_from(&output);
+        Ok(output)
+    }
+
+    fn finish_forward(
+        &mut self,
+        hidden: &FakeTensor,
+        state: &mut DeviceState<FakeBackend, FakeLayerState>,
+        _forward: &Self::ForwardContext,
+        context: &(),
+    ) -> Result<FakeTensor, Self::Error> {
+        self.0.finish_forward(hidden, state, &(), context)
+    }
+
+    fn retained_context_values<'a>(
+        &'a self,
+        _forward: &'a Self::ForwardContext,
+        _group: usize,
+        _index: usize,
+    ) -> Self::RetainedContextValues<'a> {
+        std::iter::empty()
+    }
+
+    fn prediction_target_capture(context: &Self::ForwardContext) -> Option<&FakeTensor> {
+        Some(context)
+    }
+}
+
+impl
+    eredu_runtime::ReplicatedTextArchitecture<FakeBackend, DeviceState<FakeBackend, FakeLayerState>>
+    for PredictionCaptureFixture
+{
+    fn text_input<'a>(tokens: &'a FakeTensor, _: Option<&'a FakeTensor>) -> Self::Input<'a> {
+        tokens
+    }
+}
+
+impl ParallelLayeredArchitecture<FakeBackend, DeviceState<FakeBackend, FakeLayerState>>
+    for OrdinaryTextFixture
+{
+    fn begin_forward_parallel<'a>(
+        &mut self,
+        input: Self::Input<'a>,
+        state: &mut DeviceState<FakeBackend, FakeLayerState>,
+        _: &(),
+        context: &(),
+    ) -> Result<LayeredForwardState<FakeTensor, Self::ForwardContext>, Self::Error> {
+        self.begin_forward(input, state, context)
+    }
+
+    fn forward_unit_parallel(
+        &mut self,
+        group: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &FakeTensor,
+        state: &mut DeviceState<FakeBackend, FakeLayerState>,
+        forward: &mut Self::ForwardContext,
+        _: &(),
+        context: &(),
+    ) -> Result<FakeTensor, Self::Error> {
+        self.forward_unit(group, index, unit, hidden, state, forward, context)
+    }
+
+    fn finish_forward_parallel(
+        &mut self,
+        hidden: &FakeTensor,
+        state: &mut DeviceState<FakeBackend, FakeLayerState>,
+        forward: &Self::ForwardContext,
+        _: &(),
+        context: &(),
+    ) -> Result<FakeTensor, Self::Error> {
+        self.finish_forward(hidden, state, forward, context)
+    }
+}
+
+impl PartitionedLayeredArchitecture<FakeBackend, DeviceState<FakeBackend, FakeLayerState>>
+    for OrdinaryTextFixture
+{
+    type Boundary = NoAuxiliaryBoundarySchema;
+
+    fn boundary_schema(&self) -> Result<Self::Boundary, Self::Error> {
+        Ok(NoAuxiliaryBoundarySchema::new(1))
+    }
+
+    fn begin_partition<'a>(
+        &mut self,
+        input: LayeredPartitionInput<'a, FakeTensor, NoAuxiliaryBoundary>,
+        _: Option<&FakeTensor>,
+        _: &mut DeviceState<FakeBackend, FakeLayerState>,
+        _: &StateLayout,
+        _: usize,
+        _: &(),
+    ) -> Result<LayeredForwardState<FakeTensor, Self::ForwardContext>, Self::Error> {
+        let hidden = match input {
+            LayeredPartitionInput::Tokens(tokens) => tokens.clone(),
+            LayeredPartitionInput::Hidden { hidden, .. } => hidden,
+        };
+        Ok(LayeredForwardState {
+            hidden,
+            context: (),
+        })
+    }
+
+    fn begin_partition_parallel<'a>(
+        &mut self,
+        input: LayeredPartitionInput<'a, FakeTensor, NoAuxiliaryBoundary>,
+        mask: Option<&FakeTensor>,
+        state: &mut DeviceState<FakeBackend, FakeLayerState>,
+        expected: &StateLayout,
+        first_state_ordinal: usize,
+        _: &(),
+        context: &(),
+    ) -> Result<LayeredForwardState<FakeTensor, Self::ForwardContext>, Self::Error> {
+        self.begin_partition(input, mask, state, expected, first_state_ordinal, context)
+    }
+
+    fn finish_partition(
+        &mut self,
+        hidden: &FakeTensor,
+        state: &mut DeviceState<FakeBackend, FakeLayerState>,
+        forward: &Self::ForwardContext,
+        owns_output: bool,
+        _: Option<&()>,
+        context: &(),
+    ) -> Result<LayeredPartitionOutput<FakeTensor, NoAuxiliaryBoundary>, Self::Error> {
+        let output = self.finish_forward(hidden, state, forward, context)?;
+        Ok(if owns_output {
+            LayeredPartitionOutput::Final {
+                output,
+                retained: None,
+            }
+        } else {
+            LayeredPartitionOutput::Boundary {
+                hidden: output,
+                auxiliary: NoAuxiliaryBoundary,
+            }
+        })
     }
 }
 
@@ -1703,11 +2768,25 @@ type ReferencePromptCache = Rc<
     >,
 >;
 
+struct ReferencePromptCacheSaveTransaction {
+    cache: ReferencePromptCache,
+    previous: Option<(
+        DeviceState<FakeBackend, FakeLayerState>,
+        eredu_core::cache::PromptCacheManifest,
+    )>,
+    candidate: (
+        DeviceState<FakeBackend, FakeLayerState>,
+        eredu_core::cache::PromptCacheManifest,
+    ),
+    published: bool,
+}
+
 struct ReferenceTextMechanisms {
     tasks: Rc<RefCell<Vec<ReplicatedTextMaterializationTask>>>,
     completions: Rc<RefCell<Vec<FakeTensor>>>,
     counters: ReplicatedSessionCounters,
     fail_completion: Rc<Cell<bool>>,
+    fail_checkpoint: bool,
     prompt_cache: Option<ReferencePromptCache>,
 }
 
@@ -1800,7 +2879,11 @@ where
         state: &Self::State,
         _: &(),
     ) -> Result<Self::StateCheckpoint, Self::Error> {
-        Ok(state.clone())
+        if self.fail_checkpoint {
+            Err("injected state checkpoint failure")
+        } else {
+            Ok(state.clone())
+        }
     }
 
     fn restore_state(
@@ -1841,56 +2924,15 @@ where
             .prompt_cache
             .as_ref()
             .ok_or("prompt cache is not selected by this fixture")?;
-        let batch = i32::try_from(descriptor.batch_size()).map_err(|_| "invalid cache batch")?;
-        let tokens = i32::try_from(prefix.len()).map_err(|_| "invalid cache prefix")?;
-        let logical_bytes = u64::try_from(i64::from(batch) * i64::from(tokens) * 8)
-            .map_err(|_| "invalid cache bytes")?;
-        let blocks = (descriptor.global_layer_start()..descriptor.global_layer_end())
-            .map(|layer| eredu_core::cache::PromptCacheBlock {
-                global_layer: layer,
-                representation: eredu_core::cache::CacheRepresentation::KeyValue,
-                start: 0,
-                end: i64::from(tokens),
-                rank: None,
-                shard: format!("blocks/layer-{layer}.safetensors"),
-                first_array: "keys".into(),
-                second_array: "values".into(),
-                first_shape: vec![batch, 1, tokens, 1],
-                second_shape: vec![batch, 1, tokens, 1],
-                first_dtype: "Float32".into(),
-                second_dtype: "Float32".into(),
-                logical_bytes,
-                payload_sha256: "0".repeat(64),
-            })
-            .collect();
-        let manifest = eredu_core::cache::PromptCacheManifest {
-            schema_version: eredu_core::cache::PROMPT_CACHE_SCHEMA_VERSION,
-            model_family: descriptor.model_family().into(),
-            effective_model_type: descriptor.effective_model_type().into(),
-            checkpoint_fingerprint: descriptor.checkpoint_fingerprint().into(),
-            prefix_content_fingerprint: descriptor.prefix_content_fingerprint().into(),
-            architecture_fingerprint: descriptor.architecture_fingerprint().into(),
-            layer_count: descriptor.layer_count(),
-            global_layer_start: descriptor.global_layer_start(),
-            global_layer_end: descriptor.global_layer_end(),
-            block_size_tokens: tokens,
-            batch_size: descriptor.batch_size(),
-            total_prefix_tokens: prefix.len(),
-            prefix_sha256: eredu_core::cache::prompt_cache_token_fingerprint(prefix),
-            layer_layout: descriptor.layer_layout().clone(),
-            layer_prefix_offsets: descriptor.layer_prefix_offsets().to_vec(),
-            state_segments: descriptor.state_segments().to_vec(),
-            sink_tokens: descriptor.sink_tokens(),
-            topology: descriptor.topology().clone(),
-            application_namespace: None,
-            blocks,
-            state_tensors: Vec::new(),
-        };
+        let manifest = reference_prompt_cache_manifest(&descriptor, prefix)?;
         *cache.borrow_mut() = Some((state.clone(), manifest.clone()));
         Ok(manifest)
     }
 
     fn state_report(&self, state: &Self::State) -> Result<Self::StateReport, Self::Error> {
+        if state.optional_layout().is_none() {
+            return Ok(Vec::new());
+        }
         Ok(state.as_ref().iter().map(|layer| layer.0).collect())
     }
 
@@ -1908,6 +2950,11 @@ where
         _: &Self::State,
         _: &(),
     ) -> Result<(), Self::Error> {
+        PARTITION_COMMIT_TRACE.with(|trace| {
+            if let Some(trace) = trace.borrow().as_ref() {
+                trace.borrow_mut().push("complete");
+            }
+        });
         COMPOSITE_FORWARD_RESOURCE.with(|resource| {
             if let Some(dropped) = resource.borrow().as_ref() {
                 assert!(
@@ -1925,6 +2972,137 @@ where
         self.counters.update(|counts| counts.publications += 1);
         Ok(())
     }
+}
+
+impl<A> TransactionalPromptCacheMechanisms<A, FakeBackend> for ReferenceTextMechanisms
+where
+    A: LayeredArchitecture<
+        FakeBackend,
+        DeviceState<FakeBackend, FakeLayerState>,
+        StaticModules = FakeOperator,
+        Unit = FakeUnit,
+        Error = Error,
+    >,
+{
+    type PromptCacheSaveTransaction = ReferencePromptCacheSaveTransaction;
+
+    fn prepare_prompt_cache_save(
+        &mut self,
+        state: &mut Self::State,
+        _: &std::path::Path,
+        descriptor: eredu_core::cache::PromptCacheDescriptor,
+        prefix: &[u32],
+        options: &eredu_core::cache::PromptCacheOptions,
+        _: &(),
+    ) -> Result<Self::PromptCacheSaveTransaction, Self::Error> {
+        let cache = self
+            .prompt_cache
+            .as_ref()
+            .ok_or("prompt cache is not selected by this fixture")?;
+        if cache.borrow().is_some() && !options.replace_existing() {
+            return Err("prompt cache replacement was not selected");
+        }
+        Ok(ReferencePromptCacheSaveTransaction {
+            cache: Rc::clone(cache),
+            previous: cache.borrow().clone(),
+            candidate: (
+                state.clone(),
+                reference_prompt_cache_manifest(&descriptor, prefix)?,
+            ),
+            published: false,
+        })
+    }
+
+    fn prepared_prompt_cache_manifest(
+        transaction: &Self::PromptCacheSaveTransaction,
+    ) -> &eredu_core::cache::PromptCacheManifest {
+        &transaction.candidate.1
+    }
+
+    fn publish_prompt_cache_save(
+        &mut self,
+        transaction: &mut Self::PromptCacheSaveTransaction,
+    ) -> Result<(), Self::Error> {
+        if transaction.published {
+            return Err("prompt cache transaction was already published");
+        }
+        *transaction.cache.borrow_mut() = Some(transaction.candidate.clone());
+        transaction.published = true;
+        Ok(())
+    }
+
+    fn commit_prompt_cache_save(&mut self, transaction: Self::PromptCacheSaveTransaction) {
+        assert!(transaction.published);
+    }
+
+    fn rollback_prompt_cache_save(&mut self, transaction: Self::PromptCacheSaveTransaction) {
+        if transaction.published {
+            *transaction.cache.borrow_mut() = transaction.previous;
+        }
+    }
+}
+
+fn reference_prompt_cache_manifest(
+    descriptor: &eredu_core::cache::PromptCacheDescriptor,
+    prefix: &[u32],
+) -> Result<eredu_core::cache::PromptCacheManifest, &'static str> {
+    let batch = i32::try_from(descriptor.batch_size()).map_err(|_| "invalid cache batch")?;
+    let tokens = i32::try_from(prefix.len()).map_err(|_| "invalid cache prefix")?;
+    let logical_bytes = u64::try_from(i64::from(batch) * i64::from(tokens) * 8)
+        .map_err(|_| "invalid cache bytes")?;
+    let blocks = (descriptor.global_layer_start()..descriptor.global_layer_end())
+        .map(|layer| eredu_core::cache::PromptCacheBlock {
+            global_layer: layer,
+            representation: eredu_core::cache::CacheRepresentation::KeyValue,
+            start: 0,
+            end: i64::from(tokens),
+            rank: None,
+            shard: format!("blocks/layer-{layer}.safetensors"),
+            first_array: "keys".into(),
+            second_array: "values".into(),
+            first_shape: vec![batch, 1, tokens, 1],
+            second_shape: vec![batch, 1, tokens, 1],
+            first_dtype: "Float32".into(),
+            second_dtype: "Float32".into(),
+            logical_bytes,
+            payload_sha256: "0".repeat(64),
+        })
+        .collect();
+    Ok(eredu_core::cache::PromptCacheManifest {
+        schema_version: eredu_core::cache::PROMPT_CACHE_SCHEMA_VERSION,
+        model_family: descriptor.model_family().into(),
+        effective_model_type: descriptor.effective_model_type().into(),
+        checkpoint_fingerprint: descriptor.checkpoint_fingerprint().into(),
+        prefix_content_fingerprint: descriptor.prefix_content_fingerprint().into(),
+        architecture_fingerprint: descriptor.architecture_fingerprint().into(),
+        layer_count: descriptor.layer_count(),
+        global_layer_start: descriptor.global_layer_start(),
+        global_layer_end: descriptor.global_layer_end(),
+        block_size_tokens: tokens,
+        batch_size: descriptor.batch_size(),
+        total_prefix_tokens: prefix.len(),
+        prefix_sha256: eredu_core::cache::prompt_cache_token_fingerprint(prefix),
+        layer_layout: descriptor.layer_layout().clone(),
+        layer_prefix_offsets: descriptor.layer_prefix_offsets().to_vec(),
+        state_segments: descriptor.state_segments().to_vec(),
+        sink_tokens: descriptor.sink_tokens(),
+        topology: descriptor.topology().clone(),
+        distributed_commit: descriptor.distributed_commit(),
+        application_namespace: None,
+        blocks,
+        state_tensors: Vec::new(),
+    })
+}
+
+fn reference_prompt_cache_snapshot(
+    cache: &ReferencePromptCache,
+) -> Option<(Vec<i32>, eredu_core::cache::PromptCacheManifest)> {
+    cache.borrow().as_ref().map(|(state, manifest)| {
+        (
+            state.as_ref().iter().map(|layer| layer.0).collect(),
+            manifest.clone(),
+        )
+    })
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -2039,12 +3217,10 @@ fn try_select_reference_text(
     .with_session(session_capabilities)
     .with_prompt_cache(denied != Some(DeniedReferenceMechanism::Persistence))
     .with_exact_completion(denied != Some(DeniedReferenceMechanism::Completion));
-    let mut request = ReplicatedTextSelectionRequest::new(residency, CacheResidencyPolicy::Device)
+    let request = ReplicatedTextSelectionRequest::new(residency, CacheResidencyPolicy::Device)
         .with_session(eredu_core::SessionCapabilities::new(false, true, true))
-        .with_exact_completion(true);
-    if denied == Some(DeniedReferenceMechanism::Persistence) {
-        request = request.with_prompt_cache(true);
-    }
+        .with_exact_completion(true)
+        .with_prompt_cache(true);
     select_replicated_text_realization(&requirements, &request, &capabilities)
 }
 
@@ -2058,12 +3234,328 @@ fn selected_reference_text(
 struct FinalOutputReplacement;
 
 impl eredu_runtime::ActivationObserver<FakeTensor, Error> for FinalOutputReplacement {
-    fn observe(&mut self, _: &str, _: &FakeTensor) -> Result<(), Error> {
+    fn observe(&mut self, path: &str, _: &FakeTensor) -> Result<(), Error> {
+        if path == eredu_core::MODEL_LOGITS_OBSERVATION_PATH {
+            PARTITION_COMMIT_TRACE.with(|trace| {
+                if let Some(trace) = trace.borrow().as_ref() {
+                    trace.borrow_mut().push("observe");
+                }
+            });
+        }
         Ok(())
     }
 
     fn intervene(&mut self, path: &str, _: &FakeTensor) -> Result<Option<FakeTensor>, Error> {
         Ok((path == eredu_core::MODEL_LOGITS_OBSERVATION_PATH).then(|| FakeTensor(vec![99])))
+    }
+}
+
+struct CommitOrderingObserver;
+
+impl eredu_runtime::ActivationObserver<FakeTensor, Error> for CommitOrderingObserver {
+    fn observe(&mut self, path: &str, _: &FakeTensor) -> Result<(), Error> {
+        if path == eredu_core::MODEL_LOGITS_OBSERVATION_PATH {
+            PARTITION_COMMIT_TRACE.with(|trace| {
+                if let Some(trace) = trace.borrow().as_ref() {
+                    trace.borrow_mut().push("observe");
+                }
+            });
+        }
+        Ok(())
+    }
+}
+
+struct ReferencePartitionPass {
+    hidden: FakeTensor,
+    output: Option<FakeTensor>,
+}
+
+struct ReferencePartitionExecutor {
+    architecture: OrdinaryTextFixture,
+    unit: FakeUnit,
+    fail_after_state: Rc<Cell<bool>>,
+}
+
+impl
+    PartitionedGroupExecutor<
+        OrdinaryTextFixture,
+        FakeBackend,
+        DeviceState<FakeBackend, FakeLayerState>,
+        (),
+        (),
+        FakeTensorMetadata,
+    > for ReferencePartitionExecutor
+{
+    type Pass<'a> = ReferencePartitionPass;
+
+    fn begin<'a>(
+        &mut self,
+        input: <OrdinaryTextFixture as LayeredArchitecture<
+            FakeBackend,
+            DeviceState<FakeBackend, FakeLayerState>,
+        >>::Input<'a>,
+        _: &mut DeviceState<FakeBackend, FakeLayerState>,
+        _: eredu_runtime::ExpertPass,
+        _: &(),
+    ) -> Result<Self::Pass<'a>, Error> {
+        Ok(ReferencePartitionPass {
+            hidden: input.clone(),
+            output: None,
+        })
+    }
+
+    fn request_group_active(&self, _: &Self::Pass<'_>, _: usize) -> Result<bool, Error> {
+        Ok(false)
+    }
+
+    fn execute_group<O: eredu_runtime::ActivationObserver<FakeTensor, Error> + ?Sized>(
+        &mut self,
+        pass: &mut Self::Pass<'_>,
+        driver: &LayeredPartitionDriver,
+        state: &mut DeviceState<FakeBackend, FakeLayerState>,
+        _: &PartitionCommunication<FakeBackend, (), (), FakeTensorMetadata>,
+        _: &(),
+        context: &(),
+        _: &mut O,
+    ) -> Result<(), Error> {
+        let input = driver
+            .input(LayeredPartitionInput::<FakeTensor, NoAuxiliaryBoundary>::Tokens(&pass.hidden))
+            .map_err(|error| Error::backend(error.to_string()))?;
+        let mut forward = driver
+            .begin::<FakeBackend, _, _>(&mut self.architecture, input, None, state, None, context)
+            .map_err(|error| Error::backend(error.to_string()))?;
+        forward.hidden = self.architecture.forward_unit(
+            driver.group_index(),
+            driver.range().start,
+            &mut self.unit,
+            &forward.hidden,
+            state,
+            &mut forward.context,
+            context,
+        )?;
+        if self.fail_after_state.get() {
+            return Err(Error::backend("injected partition failure"));
+        }
+        pass.output = Some(
+            match driver.finish::<FakeBackend, _, _>(
+                &mut self.architecture,
+                &forward.hidden,
+                state,
+                &mut forward.context,
+                None,
+                context,
+            )? {
+                LayeredPartitionOutput::Final { output, .. } => output,
+                LayeredPartitionOutput::Boundary { hidden, .. } => hidden,
+            },
+        );
+        Ok(())
+    }
+
+    fn boundary_values(
+        &mut self,
+        _: &mut Self::Pass<'_>,
+        _: &eredu_runtime::PartitionBoundaryRoute,
+        _: &eredu_runtime::ResolvedBoundaryWireSchema,
+        _: bool,
+        _: &(),
+    ) -> Result<Vec<eredu_runtime::ArchitectureBoundaryValue<FakeTensor>>, Error> {
+        Err(Error::backend("reference path has no pipeline boundary"))
+    }
+
+    fn boundary_schema(
+        &self,
+        _: &Self::Pass<'_>,
+        _: &eredu_runtime::PartitionBoundaryRoute,
+    ) -> Result<eredu_runtime::ResolvedBoundaryWireSchema, Error> {
+        Err(Error::backend("reference path has no pipeline boundary"))
+    }
+
+    fn accept_boundary(
+        &mut self,
+        _: &mut Self::Pass<'_>,
+        _: &eredu_runtime::PartitionBoundaryRoute,
+        _: Vec<FakeTensor>,
+    ) -> Result<(), Error> {
+        Err(Error::backend("reference path has no pipeline boundary"))
+    }
+
+    fn finish(
+        &mut self,
+        pass: Self::Pass<'_>,
+        _: &mut DeviceState<FakeBackend, FakeLayerState>,
+        _: &(),
+    ) -> Result<(FakeTensor, ()), Error> {
+        Ok((pass.output.unwrap_or(pass.hidden), ()))
+    }
+
+    fn prediction_target_capture(&mut self, _: &(), _: &()) -> Result<Option<FakeTensor>, Error> {
+        Ok(Some(FakeTensor(vec![7])))
+    }
+}
+
+struct PipelineDestinationExecutor {
+    architecture: OrdinaryTextFixture,
+    unit: FakeUnit,
+    trace: Rc<RefCell<Vec<&'static str>>>,
+    boundary: eredu_runtime::ResolvedBoundaryWireSchema,
+    send_boundary: bool,
+    fail_boundary_values: bool,
+    swap_auxiliary_roles: bool,
+}
+
+impl
+    PartitionedGroupExecutor<
+        OrdinaryTextFixture,
+        FakeBackend,
+        DeviceState<FakeBackend, FakeLayerState>,
+        (),
+        (),
+        PipelineTensorMetadata,
+    > for PipelineDestinationExecutor
+{
+    type Pass<'a> = ReferencePartitionPass;
+
+    fn begin<'a>(
+        &mut self,
+        input: <OrdinaryTextFixture as LayeredArchitecture<
+            FakeBackend,
+            DeviceState<FakeBackend, FakeLayerState>,
+        >>::Input<'a>,
+        _: &mut DeviceState<FakeBackend, FakeLayerState>,
+        _: eredu_runtime::ExpertPass,
+        _: &(),
+    ) -> Result<Self::Pass<'a>, Error> {
+        Ok(ReferencePartitionPass {
+            hidden: input.clone(),
+            output: None,
+        })
+    }
+
+    fn request_group_active(&self, _: &Self::Pass<'_>, _: usize) -> Result<bool, Error> {
+        Ok(false)
+    }
+
+    fn execute_group<O: eredu_runtime::ActivationObserver<FakeTensor, Error> + ?Sized>(
+        &mut self,
+        pass: &mut Self::Pass<'_>,
+        driver: &LayeredPartitionDriver,
+        state: &mut DeviceState<FakeBackend, FakeLayerState>,
+        _: &PartitionCommunication<FakeBackend, (), (), PipelineTensorMetadata>,
+        _: &(),
+        context: &(),
+        _: &mut O,
+    ) -> Result<(), Error> {
+        self.trace.borrow_mut().push("execute");
+        if pass.hidden != FakeTensor(vec![77]) {
+            return Err(Error::backend(
+                "pipeline group executed before receiving its boundary",
+            ));
+        }
+        let input = driver
+            .input(LayeredPartitionInput::Hidden {
+                hidden: pass.hidden.clone(),
+                auxiliary: NoAuxiliaryBoundary,
+            })
+            .map_err(|error| Error::backend(error.to_string()))?;
+        let mut forward = driver
+            .begin::<FakeBackend, _, _>(&mut self.architecture, input, None, state, None, context)
+            .map_err(|error| Error::backend(error.to_string()))?;
+        forward.hidden = self.architecture.forward_unit(
+            driver.group_index(),
+            driver.range().start,
+            &mut self.unit,
+            &forward.hidden,
+            state,
+            &mut forward.context,
+            context,
+        )?;
+        pass.output = Some(
+            match driver.finish::<FakeBackend, _, _>(
+                &mut self.architecture,
+                &forward.hidden,
+                state,
+                &mut forward.context,
+                None,
+                context,
+            )? {
+                LayeredPartitionOutput::Final { output, .. } => output,
+                LayeredPartitionOutput::Boundary { hidden, .. } => hidden,
+            },
+        );
+        Ok(())
+    }
+
+    fn boundary_values(
+        &mut self,
+        pass: &mut Self::Pass<'_>,
+        _: &PartitionBoundaryRoute,
+        _: &eredu_runtime::ResolvedBoundaryWireSchema,
+        source: bool,
+        _: &(),
+    ) -> Result<Vec<eredu_runtime::ArchitectureBoundaryValue<FakeTensor>>, Error> {
+        if source {
+            if !self.send_boundary {
+                return Err(Error::backend("destination fixture was asked to send"));
+            }
+            self.trace.borrow_mut().push("send");
+            return Ok(vec![eredu_runtime::ArchitectureBoundaryValue::new(
+                "hidden",
+                pass.output
+                    .clone()
+                    .ok_or_else(|| Error::backend("middle-stage fixture has no output"))?,
+            )
+            .map_err(|error| Error::backend(error.to_string()))?]);
+        }
+        self.trace.borrow_mut().push("receive");
+        if self.fail_boundary_values {
+            return Err(Error::backend("injected destination placeholder failure"));
+        }
+        if self.swap_auxiliary_roles {
+            return Ok(vec![
+                eredu_runtime::ArchitectureBoundaryValue::new("hidden", FakeTensor(vec![77]))
+                    .unwrap(),
+                eredu_runtime::ArchitectureBoundaryValue::new("second", FakeTensor(vec![77]))
+                    .unwrap(),
+                eredu_runtime::ArchitectureBoundaryValue::new("first", FakeTensor(vec![77]))
+                    .unwrap(),
+            ]);
+        }
+        Ok(vec![eredu_runtime::ArchitectureBoundaryValue::new(
+            "hidden",
+            FakeTensor(vec![77]),
+        )
+        .map_err(|error| Error::backend(error.to_string()))?])
+    }
+
+    fn boundary_schema(
+        &self,
+        _: &Self::Pass<'_>,
+        _: &PartitionBoundaryRoute,
+    ) -> Result<eredu_runtime::ResolvedBoundaryWireSchema, Error> {
+        Ok(self.boundary.clone())
+    }
+
+    fn accept_boundary(
+        &mut self,
+        pass: &mut Self::Pass<'_>,
+        _: &PartitionBoundaryRoute,
+        mut values: Vec<FakeTensor>,
+    ) -> Result<(), Error> {
+        self.trace.borrow_mut().push("accept");
+        pass.hidden = values
+            .pop()
+            .ok_or_else(|| Error::backend("pipeline boundary was empty"))?;
+        Ok(())
+    }
+
+    fn finish(
+        &mut self,
+        pass: Self::Pass<'_>,
+        _: &mut DeviceState<FakeBackend, FakeLayerState>,
+        _: &(),
+    ) -> Result<(FakeTensor, ()), Error> {
+        Ok((pass.output.unwrap_or(pass.hidden), ()))
     }
 }
 
@@ -2097,6 +3589,7 @@ fn production_replicated_text_constructor_executes_reference_mechanisms() {
             completions: Rc::clone(&completions),
             counters: counters.clone(),
             fail_completion: Rc::clone(&fail_completion),
+            fail_checkpoint: false,
             prompt_cache: None,
         };
         let mut session = construct_replicated_text_session::<_, FakeBackend, _>(
@@ -2152,6 +3645,17 @@ fn production_replicated_text_constructor_executes_reference_mechanisms() {
         assert_eq!(counters.snapshot().completion_attempts, 2);
         assert_eq!(counters.snapshot().publications, 2);
 
+        let before_prediction = session.report().unwrap().state_report().to_vec();
+        let prediction_error = session
+            .prefill_prediction_target(&FakeTensor(vec![9, 10]), None, &())
+            .expect_err("an architecture without a target capture must fail closed");
+        assert!(prediction_error
+            .to_string()
+            .contains("did not retain its declared hidden capture"));
+        assert_eq!(session.report().unwrap().state_report(), &before_prediction);
+        assert_eq!(counters.snapshot().publications, 2);
+        assert_eq!(counters.snapshot().completion_attempts, 2);
+
         let checkpoint = session.checkpoint(&()).unwrap();
         session.decode(&FakeTensor(vec![4]), &()).unwrap();
         assert_eq!(session.report().unwrap().state_report(), &[3]);
@@ -2162,7 +3666,7 @@ fn production_replicated_text_constructor_executes_reference_mechanisms() {
         fail_completion.set(true);
         assert!(session.decode(&FakeTensor(vec![8]), &()).is_err());
         assert_eq!(session.report().unwrap().state_report(), &[2]);
-        assert_eq!(counters.snapshot().forward_calls, 4);
+        assert_eq!(counters.snapshot().forward_calls, 5);
         assert_eq!(counters.snapshot().completion_attempts, 4);
         assert_eq!(counters.snapshot().publications, 3);
         fail_completion.set(false);
@@ -2172,7 +3676,7 @@ fn production_replicated_text_constructor_executes_reference_mechanisms() {
             .unwrap();
         assert_eq!(observed, FakeTensor(vec![99]));
         assert_eq!(completions.borrow().last(), Some(&FakeTensor(vec![99])));
-        assert_eq!(counters.snapshot().forward_calls, 5);
+        assert_eq!(counters.snapshot().forward_calls, 6);
         assert_eq!(counters.snapshot().completion_attempts, 5);
         assert_eq!(counters.snapshot().publications, 4);
 
@@ -2187,6 +3691,2309 @@ fn production_replicated_text_constructor_executes_reference_mechanisms() {
         assert_eq!(counters.snapshot().state_allocations, 2);
         assert_eq!(completions.borrow().len(), counters.snapshot().publications);
     }
+}
+
+#[test]
+fn prediction_target_capture_uses_one_authoritative_transaction_and_publication() {
+    let counters = ReplicatedSessionCounters::default();
+    let architecture = PredictionCaptureFixture(OrdinaryTextFixture {
+        static_modules: FakeOperator,
+        trace: Vec::new(),
+        counters: counters.clone(),
+        inconsistent_transport: false,
+        inconsistent_identity: false,
+    });
+    let selected = selected_reference_text(&architecture.0, LayerWeightResidency::FullyResident);
+    let expected_identity = selected.requirements().architecture_identity().to_owned();
+    let contract = prepare_replicated_text_contract::<
+        _,
+        FakeBackend,
+        DeviceState<FakeBackend, FakeLayerState>,
+    >(&architecture, None, selected, &expected_identity, &())
+    .unwrap();
+    let completions = Rc::new(RefCell::new(Vec::new()));
+    let mut session = construct_replicated_text_session::<_, FakeBackend, _>(
+        architecture,
+        None,
+        contract,
+        ReferenceTextMechanisms {
+            tasks: Rc::new(RefCell::new(Vec::new())),
+            completions: Rc::clone(&completions),
+            counters: counters.clone(),
+            fail_completion: Rc::new(Cell::new(false)),
+            fail_checkpoint: false,
+            prompt_cache: None,
+        },
+        &(),
+    )
+    .unwrap();
+
+    let (logits, capture) = session
+        .prefill_prediction_target(&FakeTensor(vec![1, 2]), None, &())
+        .unwrap();
+    assert_eq!(logits, FakeTensor(vec![1, 2, 5]));
+    assert_eq!(capture, FakeTensor(vec![1, 2, 5]));
+    assert_eq!(session.report().unwrap().state_report(), &[1]);
+    assert_eq!(counters.snapshot().forward_calls, 1);
+    assert_eq!(counters.snapshot().completion_attempts, 1);
+    assert_eq!(counters.snapshot().publications, 1);
+    assert_eq!(
+        completions.borrow().as_slice(),
+        &[FakeTensor(vec![1, 2, 5])]
+    );
+
+    let mut lane = session.prepare_prediction_target_state(&()).unwrap();
+    session
+        .exchange_prediction_target_state(&mut lane, &())
+        .unwrap();
+    assert_eq!(session.report().unwrap().state_report(), &[0]);
+    session
+        .exchange_prediction_target_state(&mut lane, &())
+        .unwrap();
+    assert_eq!(session.report().unwrap().state_report(), &[1]);
+    assert_eq!(lane.as_ref()[0].0, 0);
+
+    assert_eq!(
+        session
+            .apply_prediction_target_operation(PredictionStateOperation { fail: false }, &())
+            .unwrap(),
+        11
+    );
+    let before_failure = session.report().unwrap().state_report().to_vec();
+    assert!(session
+        .apply_prediction_target_operation(PredictionStateOperation { fail: true }, &())
+        .is_err());
+    assert_eq!(session.report().unwrap().state_report(), &before_failure);
+}
+
+#[test]
+fn production_partitioned_constructor_reuses_session_rollback_and_stateless_rank() {
+    type Strategy = PartitionedTextExecution<
+        ReferencePartitionExecutor,
+        (),
+        (),
+        FakeTensorMetadata,
+        NoBoundaryTransport,
+        NoOutputPublisher,
+        OpaqueCommitAgreement,
+    >;
+
+    let counters = ReplicatedSessionCounters::default();
+    let architecture = OrdinaryTextFixture {
+        static_modules: FakeOperator,
+        trace: Vec::new(),
+        counters: counters.clone(),
+        inconsistent_transport: false,
+        inconsistent_identity: false,
+    };
+    let selected = selected_reference_text(&architecture, LayerWeightResidency::FullyResident);
+    let parameters = architecture.parameter_description(&()).unwrap();
+    let partition = ArchitecturePartition::from_architecture::<
+        FakeBackend,
+        DeviceState<FakeBackend, FakeLayerState>,
+        _,
+        _,
+    >(
+        &architecture,
+        [("decoder", 0..1)],
+        PartitionOwnership::new(true, true, std::iter::empty::<String>()).unwrap(),
+        (),
+        NoAuxiliaryBoundarySchema::new(1),
+        &parameters,
+    )
+    .unwrap();
+    let fail_after_state = Rc::new(Cell::new(false));
+    let commit_group = CommunicationGroupId::new(1);
+    let commit_requirements =
+        CommunicationGroupRequirements::new([CommunicationOperationRequirement::barrier(true)])
+            .unwrap();
+    let binding = prepare_partitioned_session_runtime::<_, FakeBackend, _, _, _, _, Infallible, _>(
+        architecture,
+        selected,
+        partition,
+        CommunicationManifest::new(
+            1,
+            0,
+            vec![CommunicationGroupDescriptor::new(
+                commit_group,
+                0,
+                vec![0],
+                Some(0),
+                commit_requirements,
+            )
+            .unwrap()],
+            Vec::new(),
+        )
+        .unwrap()
+        .with_completion_policy(test_completion_policy()),
+        None,
+        eredu_core::cache::PromptCacheTopology::default(),
+        ReplicatedTextOutputSelection::LastSequencePosition,
+        &(),
+        |input, _selected, _context| {
+            let (architecture, partition, manifest, tasks) = input.into_parts();
+            assert_eq!(tasks.len(), 1);
+            let driver = LayeredPartitionDriver::new(&partition, 0, 0..1).unwrap();
+            let plan = PartitionedExecutionPlan::new(
+                architecture.execution_graph().unwrap(),
+                vec![(ArchitectureGroupKind::Decoder, false)],
+                vec![Some(driver)],
+                Vec::new(),
+                None,
+                Some(commit_group),
+                PipelineWireContract::new(PipelineActivationDtype::Float32),
+            )
+            .unwrap();
+            let communication = PartitionCommunication::<FakeBackend, (), (), _>::new(
+                manifest,
+                vec![RealizedCommunicationGroup::new(commit_group, ())],
+                Vec::new(),
+                FakeTensorMetadata,
+            )
+            .unwrap();
+            let state = DeviceState::create(partition.state().unwrap().layout().clone(), |_, _| {
+                Ok::<_, Infallible>(FakeLayerState(0))
+            })
+            .unwrap();
+            let runtime = PartitionedTextRuntime::new(
+                plan,
+                ReferencePartitionExecutor {
+                    architecture,
+                    unit: FakeUnit { marker: 5 },
+                    fail_after_state: Rc::clone(&fail_after_state),
+                },
+                communication,
+                (),
+                NoBoundaryTransport,
+                NoOutputPublisher,
+                OpaqueCommitAgreement,
+                ExecutionResidency::FullyResident,
+                None::<RecordingPolicy>,
+            )
+            .unwrap();
+            Ok((runtime, state))
+        },
+    )
+    .unwrap();
+    let fail_completion = Rc::new(Cell::new(false));
+    let mechanisms = ReferenceTextMechanisms {
+        tasks: Rc::new(RefCell::new(Vec::new())),
+        completions: Rc::new(RefCell::new(Vec::new())),
+        counters: counters.clone(),
+        fail_completion: Rc::clone(&fail_completion),
+        fail_checkpoint: false,
+        prompt_cache: None,
+    };
+    let mut session = construct_replicated_text_session_with_runtime::<
+        OrdinaryTextFixture,
+        FakeBackend,
+        _,
+        Strategy,
+    >(binding, mechanisms, Strategy::new())
+    .unwrap();
+
+    assert_eq!(
+        session.decode(&FakeTensor(vec![3]), &()).unwrap(),
+        FakeTensor(vec![5])
+    );
+    assert_eq!(session.report().unwrap().state_report(), &[1]);
+
+    let commit_trace = Rc::new(RefCell::new(Vec::new()));
+    PARTITION_COMMIT_TRACE.with(|trace| *trace.borrow_mut() = Some(Rc::clone(&commit_trace)));
+    session
+        .forward_with_observer(&FakeTensor(vec![4]), None, &(), &mut CommitOrderingObserver)
+        .unwrap();
+    PARTITION_COMMIT_TRACE.with(|trace| *trace.borrow_mut() = None);
+    assert_eq!(*commit_trace.borrow(), ["observe", "complete", "commit"]);
+
+    fail_completion.set(true);
+    commit_trace.borrow_mut().clear();
+    PARTITION_COMMIT_TRACE.with(|trace| *trace.borrow_mut() = Some(Rc::clone(&commit_trace)));
+    assert!(session
+        .forward_with_observer(&FakeTensor(vec![5]), None, &(), &mut CommitOrderingObserver,)
+        .is_err());
+    PARTITION_COMMIT_TRACE.with(|trace| *trace.borrow_mut() = None);
+    fail_completion.set(false);
+    assert_eq!(*commit_trace.borrow(), ["observe", "complete"]);
+
+    fail_after_state.set(true);
+    assert!(session.decode(&FakeTensor(vec![9]), &()).is_err());
+    assert_eq!(session.report().unwrap().state_report(), &[2]);
+
+    let stateless_architecture = OrdinaryTextFixture {
+        static_modules: FakeOperator,
+        trace: Vec::new(),
+        counters: counters.clone(),
+        inconsistent_transport: false,
+        inconsistent_identity: false,
+    };
+    let stateless_selected =
+        selected_reference_text(&stateless_architecture, LayerWeightResidency::FullyResident);
+    let stateless_parameters = stateless_architecture.parameter_description(&()).unwrap();
+    let stateless_partition = ArchitecturePartition::from_architecture::<
+        FakeBackend,
+        DeviceState<FakeBackend, FakeLayerState>,
+        _,
+        String,
+    >(
+        &stateless_architecture,
+        std::iter::empty(),
+        PartitionOwnership::new(false, false, std::iter::empty::<String>()).unwrap(),
+        (),
+        NoAuxiliaryBoundarySchema::new(1),
+        &stateless_parameters,
+    )
+    .unwrap();
+    let invalid_architecture = OrdinaryTextFixture {
+        static_modules: FakeOperator,
+        trace: Vec::new(),
+        counters: counters.clone(),
+        inconsistent_transport: false,
+        inconsistent_identity: false,
+    };
+    let invalid_parameters = invalid_architecture.parameter_description(&()).unwrap();
+    let invalid_partition = ArchitecturePartition::from_architecture::<
+        FakeBackend,
+        DeviceState<FakeBackend, FakeLayerState>,
+        _,
+        String,
+    >(
+        &invalid_architecture,
+        std::iter::empty(),
+        PartitionOwnership::new(false, false, std::iter::empty::<String>()).unwrap(),
+        (),
+        NoAuxiliaryBoundarySchema::new(1),
+        &invalid_parameters,
+    )
+    .unwrap();
+    let invalid = prepare_partitioned_session_runtime::<_, FakeBackend, _, _, _, _, Infallible, _>(
+        invalid_architecture,
+        stateless_selected.clone(),
+        invalid_partition,
+        CommunicationManifest::new(2, 1, Vec::new(), Vec::new())
+            .unwrap()
+            .with_completion_policy(test_completion_policy()),
+        None,
+        eredu_core::cache::PromptCacheTopology::default(),
+        ReplicatedTextOutputSelection::LastSequencePosition,
+        &(),
+        |_input, selected, _context| {
+            let state = DeviceState::create(selected.state().layout().clone(), |_, _| {
+                Ok::<_, Infallible>(FakeLayerState(42))
+            })
+            .unwrap();
+            Ok(((), state))
+        },
+    );
+    assert!(matches!(
+        invalid,
+        Err(error) if error.to_string().contains("contains mutable state geometry")
+    ));
+    let binding = prepare_partitioned_session_runtime::<_, FakeBackend, _, _, _, _, Infallible, _>(
+        stateless_architecture,
+        stateless_selected,
+        stateless_partition,
+        CommunicationManifest::new(2, 1, Vec::new(), Vec::new())
+            .unwrap()
+            .with_completion_policy(test_completion_policy()),
+        None,
+        eredu_core::cache::PromptCacheTopology::default(),
+        ReplicatedTextOutputSelection::LastSequencePosition,
+        &(),
+        |input, _selected, _context| {
+            let (architecture, _partition, manifest, tasks) = input.into_parts();
+            assert!(tasks.is_empty());
+            let plan = PartitionedExecutionPlan::new(
+                architecture.execution_graph().unwrap(),
+                vec![(ArchitectureGroupKind::Decoder, false)],
+                vec![None],
+                Vec::new(),
+                None,
+                None,
+                PipelineWireContract::new(PipelineActivationDtype::Float32),
+            )
+            .unwrap();
+            let communication = PartitionCommunication::<FakeBackend, (), (), _>::new(
+                manifest,
+                Vec::new(),
+                Vec::new(),
+                FakeTensorMetadata,
+            )
+            .unwrap();
+            let runtime = PartitionedTextRuntime::new(
+                plan,
+                ReferencePartitionExecutor {
+                    architecture,
+                    unit: FakeUnit { marker: 5 },
+                    fail_after_state: Rc::new(Cell::new(false)),
+                },
+                communication,
+                (),
+                NoBoundaryTransport,
+                NoOutputPublisher,
+                OpaqueCommitAgreement,
+                ExecutionResidency::FullyResident,
+                None::<RecordingPolicy>,
+            )
+            .unwrap();
+            Ok((
+                runtime,
+                DeviceState::<FakeBackend, FakeLayerState>::stateless(),
+            ))
+        },
+    )
+    .unwrap();
+    let mechanisms = ReferenceTextMechanisms {
+        tasks: Rc::new(RefCell::new(Vec::new())),
+        completions: Rc::new(RefCell::new(Vec::new())),
+        counters,
+        fail_completion: Rc::new(Cell::new(false)),
+        fail_checkpoint: false,
+        prompt_cache: None,
+    };
+    let mut stateless_session = construct_replicated_text_session_with_runtime::<
+        OrdinaryTextFixture,
+        FakeBackend,
+        _,
+        Strategy,
+    >(binding, mechanisms, Strategy::new())
+    .unwrap();
+    assert!(stateless_session
+        .report()
+        .unwrap()
+        .state_report()
+        .is_empty());
+    stateless_session.reset(&()).unwrap();
+    assert!(stateless_session
+        .report()
+        .unwrap()
+        .state_report()
+        .is_empty());
+}
+
+#[derive(Clone)]
+struct ScriptedPhaseAgreement {
+    failed_phase: DistributedExecutionPhase,
+    calls: Rc<RefCell<Vec<(DistributedExecutionPhase, bool)>>>,
+    commits: Rc<Cell<usize>>,
+}
+
+impl<I> PartitionCommitAgreement<FakeBackend, (), (), I> for ScriptedPhaseAgreement
+where
+    I: CommunicationTensorMetadata<FakeBackend>,
+{
+    const ENABLED: bool = true;
+    const PHASE_FAILURE_AGREEMENT: bool = true;
+
+    fn agree_phase(
+        &mut self,
+        _: &PartitionCommunication<FakeBackend, (), (), I>,
+        _: CommunicationGroupId,
+        phase: DistributedExecutionPhase,
+        local_success: bool,
+        _: &(),
+    ) -> Result<bool, eredu_runtime::PartitionExecutionError> {
+        self.calls.borrow_mut().push((phase, local_success));
+        Ok(local_success && phase != self.failed_phase)
+    }
+
+    fn commit(
+        &mut self,
+        _: &PartitionCommunication<FakeBackend, (), (), I>,
+        _: CommunicationGroupId,
+        epoch: DistributedCommitEpoch,
+        _: &(),
+    ) -> DistributedCommitOutcome {
+        PARTITION_COMMIT_TRACE.with(|trace| {
+            if let Some(trace) = trace.borrow().as_ref() {
+                trace.borrow_mut().push("commit");
+            }
+        });
+        self.commits.set(self.commits.get() + 1);
+        DistributedCommitOutcome::Committed(epoch)
+    }
+}
+
+struct ConcurrentCheckpointCoordinator {
+    rendezvous: std::sync::Barrier,
+    failed: std::sync::atomic::AtomicBool,
+    calls: std::sync::Mutex<Vec<(usize, DistributedExecutionPhase, bool)>>,
+}
+
+impl ConcurrentCheckpointCoordinator {
+    fn new() -> Self {
+        Self {
+            rendezvous: std::sync::Barrier::new(2),
+            failed: std::sync::atomic::AtomicBool::new(false),
+            calls: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ConcurrentCheckpointAgreement {
+    rank: usize,
+    coordinator: Arc<ConcurrentCheckpointCoordinator>,
+}
+
+enum TestPhaseAgreement {
+    Scripted(ScriptedPhaseAgreement),
+    Concurrent(ConcurrentCheckpointAgreement),
+    Final {
+        result: FinalDecisionResult,
+        commits: Rc<Cell<usize>>,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum FinalDecisionResult {
+    Committed,
+    Aborted,
+    Indeterminate(DistributedCommitPhase),
+}
+
+impl<I> PartitionCommitAgreement<FakeBackend, (), (), I> for TestPhaseAgreement
+where
+    I: CommunicationTensorMetadata<FakeBackend>,
+{
+    const ENABLED: bool = true;
+    const PHASE_FAILURE_AGREEMENT: bool = true;
+
+    fn agree_phase(
+        &mut self,
+        communication: &PartitionCommunication<FakeBackend, (), (), I>,
+        group: CommunicationGroupId,
+        phase: DistributedExecutionPhase,
+        local_success: bool,
+        executor: &(),
+    ) -> Result<bool, eredu_runtime::PartitionExecutionError> {
+        match self {
+            Self::Scripted(scripted) => {
+                scripted.agree_phase(communication, group, phase, local_success, executor)
+            }
+            Self::Concurrent(concurrent) => {
+                assert_eq!(phase, DistributedExecutionPhase::StateCheckpoint);
+                concurrent.coordinator.calls.lock().unwrap().push((
+                    concurrent.rank,
+                    phase,
+                    local_success,
+                ));
+                if !local_success {
+                    concurrent.coordinator.failed.store(true, Ordering::SeqCst);
+                }
+                concurrent.coordinator.rendezvous.wait();
+                let agreed = !concurrent.coordinator.failed.load(Ordering::SeqCst);
+                concurrent.coordinator.rendezvous.wait();
+                Ok(agreed)
+            }
+            Self::Final { .. } => Ok(local_success),
+        }
+    }
+
+    fn commit(
+        &mut self,
+        communication: &PartitionCommunication<FakeBackend, (), (), I>,
+        group: CommunicationGroupId,
+        epoch: DistributedCommitEpoch,
+        executor: &(),
+    ) -> DistributedCommitOutcome {
+        match self {
+            Self::Scripted(scripted) => scripted.commit(communication, group, epoch, executor),
+            Self::Concurrent(_) => panic!("checkpoint-failure fixture must not reach commit"),
+            Self::Final { result, commits } => {
+                commits.set(commits.get() + 1);
+                match result {
+                    FinalDecisionResult::Committed => DistributedCommitOutcome::Committed(epoch),
+                    FinalDecisionResult::Aborted => DistributedCommitOutcome::Aborted(epoch),
+                    FinalDecisionResult::Indeterminate(phase) => {
+                        DistributedCommitOutcome::Indeterminate {
+                            epoch,
+                            phase: *phase,
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum LocalPartitionFailure {
+    None,
+    Checkpoint,
+    Execution,
+    Observation,
+    Intervention,
+    Publication,
+    Completion,
+}
+
+#[derive(Clone, Copy)]
+struct ScriptedOutputPublisher {
+    fail: bool,
+}
+
+impl<I> PartitionOutputPublisher<FakeBackend, (), (), I> for ScriptedOutputPublisher
+where
+    I: CommunicationTensorMetadata<FakeBackend>,
+{
+    const ENABLED: bool = true;
+
+    fn publish(
+        &mut self,
+        _: &PartitionCommunication<FakeBackend, (), (), I>,
+        value: FakeTensor,
+        _: PartitionOutputPublication,
+        _: DistributedExecutionPhase,
+        _: &(),
+    ) -> Result<FakeTensor, eredu_runtime::PartitionExecutionError> {
+        PARTITION_COMMIT_TRACE.with(|trace| {
+            if let Some(trace) = trace.borrow().as_ref() {
+                trace.borrow_mut().push("publish");
+            }
+        });
+        PARTITION_PUBLICATION_VALUES.with(|values| {
+            if let Some(values) = values.borrow().as_ref() {
+                values.borrow_mut().push(value.clone());
+            }
+        });
+        if self.fail {
+            Err(eredu_runtime::PartitionExecutionError::Communication(
+                "injected output publication failure".into(),
+            ))
+        } else {
+            Ok(value)
+        }
+    }
+}
+
+struct FailingFinalOutputObserver;
+
+impl eredu_runtime::ActivationObserver<FakeTensor, Error> for FailingFinalOutputObserver {
+    fn observe(&mut self, path: &str, _: &FakeTensor) -> Result<(), Error> {
+        if path == eredu_core::MODEL_LOGITS_OBSERVATION_PATH {
+            Err(Error::backend("injected final output observation failure"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+struct AgreementRun {
+    failed: bool,
+    state: Vec<i32>,
+    completions: usize,
+    output: Option<FakeTensor>,
+    forwards: usize,
+    outcome: Option<DistributedCommitOutcome>,
+    retry_forwards: usize,
+    cached_outcome: Option<DistributedCommitOutcome>,
+}
+
+type ReferencePartitionedStrategy = PartitionedTextExecution<
+    ReferencePartitionExecutor,
+    (),
+    (),
+    FakeTensorMetadata,
+    NoBoundaryTransport,
+    ScriptedOutputPublisher,
+    TestPhaseAgreement,
+>;
+
+type ReferencePartitionedSession = ReplicatedTextSession<
+    OrdinaryTextFixture,
+    FakeBackend,
+    ReferenceTextMechanisms,
+    ReferencePartitionedStrategy,
+>;
+
+fn run_partitioned_agreement_rank(
+    rank: usize,
+    local_failure: LocalPartitionFailure,
+    failed_phase: DistributedExecutionPhase,
+    calls: Rc<RefCell<Vec<(DistributedExecutionPhase, bool)>>>,
+    commits: Rc<Cell<usize>>,
+) -> AgreementRun {
+    run_partitioned_agreement_rank_with(
+        rank,
+        local_failure,
+        TestPhaseAgreement::Scripted(ScriptedPhaseAgreement {
+            failed_phase,
+            calls,
+            commits,
+        }),
+    )
+}
+
+fn run_partitioned_agreement_rank_with(
+    rank: usize,
+    local_failure: LocalPartitionFailure,
+    agreement: TestPhaseAgreement,
+) -> AgreementRun {
+    let counters = ReplicatedSessionCounters::default();
+    let architecture = OrdinaryTextFixture {
+        static_modules: FakeOperator,
+        trace: Vec::new(),
+        counters: counters.clone(),
+        inconsistent_transport: false,
+        inconsistent_identity: false,
+    };
+    let selected = selected_reference_text(&architecture, LayerWeightResidency::FullyResident);
+    let parameters = architecture.parameter_description(&()).unwrap();
+    let partition = ArchitecturePartition::from_architecture::<
+        FakeBackend,
+        DeviceState<FakeBackend, FakeLayerState>,
+        _,
+        _,
+    >(
+        &architecture,
+        [("decoder", 0..1)],
+        PartitionOwnership::new(true, true, std::iter::empty::<String>()).unwrap(),
+        (),
+        NoAuxiliaryBoundarySchema::new(1),
+        &parameters,
+    )
+    .unwrap();
+    let prompt_model_identity = partition
+        .state()
+        .unwrap()
+        .prompt_cache_identity::<FakeBackend, OrdinaryTextFixture>(
+            &architecture,
+            eredu_core::cache::PromptCacheTopology::default(),
+        )
+        .unwrap();
+    let group = CommunicationGroupId::new(41);
+    let manifest = CommunicationManifest::new(
+        2,
+        rank,
+        vec![CommunicationGroupDescriptor::new(
+            group,
+            0,
+            vec![0, 1],
+            Some(rank),
+            CommunicationGroupRequirements::new([
+                CommunicationOperationRequirement::tensors(
+                    CommunicationOperation::Broadcast,
+                    [TensorDtype::F32],
+                    CommunicationTensorLimits::new(1, 3, 8, None).unwrap(),
+                    true,
+                )
+                .unwrap(),
+                CommunicationOperationRequirement::failure_agreement(true),
+            ])
+            .unwrap(),
+        )
+        .unwrap()],
+        Vec::new(),
+    )
+    .unwrap()
+    .with_completion_policy(test_completion_policy());
+    let binding = prepare_partitioned_session_runtime::<_, FakeBackend, _, _, _, _, Infallible, _>(
+        architecture,
+        selected,
+        partition,
+        manifest,
+        None,
+        eredu_core::cache::PromptCacheTopology::default(),
+        ReplicatedTextOutputSelection::LastSequencePosition,
+        &(),
+        |input, _selected, _context| {
+            let (architecture, partition, manifest, _) = input.into_parts();
+            let driver = LayeredPartitionDriver::new(&partition, 0, 0..1).unwrap();
+            let plan = PartitionedExecutionPlan::new(
+                architecture.execution_graph().unwrap(),
+                vec![(ArchitectureGroupKind::Decoder, false)],
+                vec![Some(driver)],
+                Vec::new(),
+                Some(PartitionOutputPublication {
+                    group,
+                    owner_rank: 0,
+                }),
+                Some(group),
+                PipelineWireContract::new(PipelineActivationDtype::Float32),
+            )
+            .unwrap();
+            let communication = PartitionCommunication::<FakeBackend, (), (), _>::new(
+                manifest,
+                vec![RealizedCommunicationGroup::new(group, ())],
+                Vec::new(),
+                FakeTensorMetadata,
+            )
+            .unwrap();
+            let state = DeviceState::create(partition.state().unwrap().layout().clone(), |_, _| {
+                Ok::<_, Infallible>(FakeLayerState(0))
+            })
+            .unwrap();
+            let runtime = PartitionedTextRuntime::new(
+                plan,
+                ReferencePartitionExecutor {
+                    architecture,
+                    unit: FakeUnit { marker: 5 },
+                    fail_after_state: Rc::new(Cell::new(matches!(
+                        local_failure,
+                        LocalPartitionFailure::Execution
+                    ))),
+                },
+                communication,
+                (),
+                NoBoundaryTransport,
+                ScriptedOutputPublisher {
+                    fail: matches!(local_failure, LocalPartitionFailure::Publication),
+                },
+                agreement,
+                ExecutionResidency::FullyResident,
+                None::<RecordingPolicy>,
+            )
+            .unwrap();
+            Ok((runtime, state))
+        },
+    )
+    .unwrap();
+    let prompt_cache = Rc::new(RefCell::new(None));
+    let mechanisms = ReferenceTextMechanisms {
+        tasks: Rc::new(RefCell::new(Vec::new())),
+        completions: Rc::new(RefCell::new(Vec::new())),
+        counters: counters.clone(),
+        fail_completion: Rc::new(Cell::new(matches!(
+            local_failure,
+            LocalPartitionFailure::Completion
+        ))),
+        fail_checkpoint: matches!(local_failure, LocalPartitionFailure::Checkpoint),
+        prompt_cache: Some(Rc::clone(&prompt_cache)),
+    };
+    let mut session = construct_replicated_text_session_with_runtime::<
+        OrdinaryTextFixture,
+        FakeBackend,
+        _,
+        ReferencePartitionedStrategy,
+    >(binding, mechanisms, ReferencePartitionedStrategy::new())
+    .unwrap();
+    let result = match local_failure {
+        LocalPartitionFailure::Observation => session.forward_with_observer(
+            &FakeTensor(vec![3]),
+            None,
+            &(),
+            &mut FailingFinalOutputObserver,
+        ),
+        LocalPartitionFailure::Intervention => session.forward_with_observer(
+            &FakeTensor(vec![3]),
+            None,
+            &(),
+            &mut FinalOutputReplacement,
+        ),
+        _ => session.decode(&FakeTensor(vec![3]), &()),
+    };
+    let output = result.as_ref().ok().cloned();
+    let report = session.report().unwrap();
+    let state = report.state_report().to_vec();
+    let outcome = report.distributed_commit();
+    let forward_calls = counters.snapshot().forward_calls;
+    let retry_calls = if outcome.is_some_and(DistributedCommitOutcome::is_indeterminate) {
+        assert!(session.decode(&FakeTensor(vec![4]), &()).is_err());
+        let retry_calls = counters.snapshot().forward_calls - forward_calls;
+        let allocations = counters.snapshot().state_allocations;
+        assert!(session.reset(&()).is_err());
+        assert_eq!(counters.snapshot().state_allocations, allocations);
+        retry_calls
+    } else {
+        0
+    };
+    let cached_outcome = if outcome.is_some_and(DistributedCommitOutcome::is_indeterminate) {
+        let descriptor = eredu_core::cache::PromptCacheDescriptor::from_model_identity(
+            prompt_model_identity,
+            "fixture-checkpoint",
+            "fixture-prefix",
+            1,
+        )
+        .unwrap();
+        session
+            .save_prompt_cache(
+                std::path::Path::new("unused"),
+                descriptor.clone(),
+                &[3],
+                &eredu_core::cache::PromptCacheOptions::default(),
+                &(),
+            )
+            .unwrap();
+        session
+            .load_prompt_cache(std::path::Path::new("unused"), &descriptor, &[3], &())
+            .unwrap();
+        session.report().unwrap().distributed_commit()
+    } else {
+        None
+    };
+    AgreementRun {
+        failed: result.is_err(),
+        state,
+        completions: counters.snapshot().completion_attempts,
+        output,
+        forwards: forward_calls,
+        outcome,
+        retry_forwards: retry_calls,
+        cached_outcome,
+    }
+}
+
+#[allow(clippy::type_complexity)]
+fn partitioned_cache_control_session(
+    rank: usize,
+    failed_phase: DistributedExecutionPhase,
+    prompt_cache: Option<ReferencePromptCache>,
+    mechanism_available: bool,
+) -> (
+    ReferencePartitionedSession,
+    eredu_core::cache::PromptCacheDescriptor,
+    ReferencePromptCache,
+    Rc<RefCell<Vec<(DistributedExecutionPhase, bool)>>>,
+    ReplicatedSessionCounters,
+) {
+    let counters = ReplicatedSessionCounters::default();
+    let architecture = OrdinaryTextFixture {
+        static_modules: FakeOperator,
+        trace: Vec::new(),
+        counters: counters.clone(),
+        inconsistent_transport: false,
+        inconsistent_identity: false,
+    };
+    let selected = selected_reference_text(&architecture, LayerWeightResidency::FullyResident);
+    let parameters = architecture.parameter_description(&()).unwrap();
+    let partition = ArchitecturePartition::from_architecture::<
+        FakeBackend,
+        DeviceState<FakeBackend, FakeLayerState>,
+        _,
+        _,
+    >(
+        &architecture,
+        [("decoder", 0..1)],
+        PartitionOwnership::new(true, true, std::iter::empty::<String>()).unwrap(),
+        (),
+        NoAuxiliaryBoundarySchema::new(1),
+        &parameters,
+    )
+    .unwrap();
+    let identity = partition
+        .state()
+        .unwrap()
+        .prompt_cache_identity::<FakeBackend, OrdinaryTextFixture>(
+            &architecture,
+            eredu_core::cache::PromptCacheTopology::default(),
+        )
+        .unwrap();
+    let descriptor = eredu_core::cache::PromptCacheDescriptor::from_model_identity(
+        identity,
+        "fixture-checkpoint",
+        "fixture-prefix",
+        1,
+    )
+    .unwrap();
+    let group = CommunicationGroupId::new(41);
+    let manifest = CommunicationManifest::new(
+        2,
+        rank,
+        vec![CommunicationGroupDescriptor::new(
+            group,
+            0,
+            vec![0, 1],
+            Some(rank),
+            CommunicationGroupRequirements::new([
+                CommunicationOperationRequirement::tensors(
+                    CommunicationOperation::Broadcast,
+                    [TensorDtype::F32],
+                    CommunicationTensorLimits::new(1, 3, 8, None).unwrap(),
+                    true,
+                )
+                .unwrap(),
+                CommunicationOperationRequirement::failure_agreement(true),
+            ])
+            .unwrap(),
+        )
+        .unwrap()],
+        Vec::new(),
+    )
+    .unwrap()
+    .with_completion_policy(test_completion_policy());
+    let calls = Rc::new(RefCell::new(Vec::new()));
+    let agreement = TestPhaseAgreement::Scripted(ScriptedPhaseAgreement {
+        failed_phase,
+        calls: Rc::clone(&calls),
+        commits: Rc::new(Cell::new(0)),
+    });
+    let binding = prepare_partitioned_session_runtime::<_, FakeBackend, _, _, _, _, Infallible, _>(
+        architecture,
+        selected,
+        partition,
+        manifest,
+        None,
+        eredu_core::cache::PromptCacheTopology::default(),
+        ReplicatedTextOutputSelection::LastSequencePosition,
+        &(),
+        |input, _selected, _context| {
+            let (architecture, partition, manifest, _) = input.into_parts();
+            let driver = LayeredPartitionDriver::new(&partition, 0, 0..1).unwrap();
+            let plan = PartitionedExecutionPlan::new(
+                architecture.execution_graph().unwrap(),
+                vec![(ArchitectureGroupKind::Decoder, false)],
+                vec![Some(driver)],
+                Vec::new(),
+                Some(PartitionOutputPublication {
+                    group,
+                    owner_rank: 0,
+                }),
+                Some(group),
+                PipelineWireContract::new(PipelineActivationDtype::Float32),
+            )
+            .unwrap();
+            let communication = PartitionCommunication::<FakeBackend, (), (), _>::new(
+                manifest,
+                vec![RealizedCommunicationGroup::new(group, ())],
+                Vec::new(),
+                FakeTensorMetadata,
+            )
+            .unwrap();
+            let state = DeviceState::create(partition.state().unwrap().layout().clone(), |_, _| {
+                Ok::<_, Infallible>(FakeLayerState(0))
+            })
+            .unwrap();
+            let runtime = PartitionedTextRuntime::new(
+                plan,
+                ReferencePartitionExecutor {
+                    architecture,
+                    unit: FakeUnit { marker: 5 },
+                    fail_after_state: Rc::new(Cell::new(false)),
+                },
+                communication,
+                (),
+                NoBoundaryTransport,
+                ScriptedOutputPublisher { fail: false },
+                agreement,
+                ExecutionResidency::FullyResident,
+                None::<RecordingPolicy>,
+            )
+            .unwrap();
+            Ok((runtime, state))
+        },
+    )
+    .unwrap();
+    let prompt_cache = prompt_cache.unwrap_or_else(|| Rc::new(RefCell::new(None)));
+    let mechanisms = ReferenceTextMechanisms {
+        tasks: Rc::new(RefCell::new(Vec::new())),
+        completions: Rc::new(RefCell::new(Vec::new())),
+        counters: counters.clone(),
+        fail_completion: Rc::new(Cell::new(false)),
+        fail_checkpoint: false,
+        prompt_cache: mechanism_available.then(|| Rc::clone(&prompt_cache)),
+    };
+    let session = construct_replicated_text_session_with_runtime::<
+        OrdinaryTextFixture,
+        FakeBackend,
+        _,
+        ReferencePartitionedStrategy,
+    >(binding, mechanisms, ReferencePartitionedStrategy::new())
+    .unwrap();
+    (session, descriptor, prompt_cache, calls, counters)
+}
+
+#[test]
+fn distributed_prompt_cache_save_is_reversible_and_fences_one_rank_failures() {
+    let replacement_options = eredu_core::cache::PromptCacheOptions::new(None, true).unwrap();
+    let (mut local_failure, descriptor, local_store, local_calls, local_counters) =
+        partitioned_cache_control_session(
+            0,
+            DistributedExecutionPhase::PromptCacheSavePreparation,
+            None,
+            false,
+        );
+    let error = local_failure
+        .save_prompt_cache_distributed(
+            std::path::Path::new("unused"),
+            descriptor.clone(),
+            &[3],
+            &replacement_options,
+            &(),
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("mechanism failed"));
+    assert!(local_store.borrow().is_none());
+    assert_eq!(
+        local_calls.borrow().as_slice(),
+        &[
+            (DistributedExecutionPhase::PromptCacheSavePreflight, true),
+            (DistributedExecutionPhase::PromptCacheSavePreparation, false),
+        ]
+    );
+    let call_count = local_calls.borrow().len();
+    assert!(local_failure
+        .save_prompt_cache_distributed(
+            std::path::Path::new("unused"),
+            descriptor.clone(),
+            &[3],
+            &replacement_options,
+            &(),
+        )
+        .is_err());
+    assert_eq!(local_calls.borrow().len(), call_count);
+    assert_eq!(local_counters.snapshot().forward_calls, 0);
+
+    let (mut peer, descriptor, peer_store, peer_calls, _) = partitioned_cache_control_session(
+        1,
+        DistributedExecutionPhase::PromptCacheSavePreparation,
+        None,
+        true,
+    );
+    peer.save_prompt_cache(
+        std::path::Path::new("unused"),
+        descriptor.clone(),
+        &[1],
+        &eredu_core::cache::PromptCacheOptions::default(),
+        &(),
+    )
+    .unwrap();
+    let previous = reference_prompt_cache_snapshot(&peer_store);
+    assert!(peer
+        .save_prompt_cache_distributed(
+            std::path::Path::new("unused"),
+            descriptor,
+            &[3],
+            &replacement_options,
+            &(),
+        )
+        .is_err());
+    assert_eq!(reference_prompt_cache_snapshot(&peer_store), previous);
+    assert_eq!(
+        peer_calls.borrow().last(),
+        Some(&(DistributedExecutionPhase::PromptCacheSavePreparation, true))
+    );
+
+    let (mut replacement, descriptor, replacement_store, replacement_calls, _) =
+        partitioned_cache_control_session(
+            1,
+            DistributedExecutionPhase::PromptCacheSavePublication,
+            None,
+            true,
+        );
+    replacement
+        .save_prompt_cache(
+            std::path::Path::new("unused"),
+            descriptor.clone(),
+            &[1],
+            &replacement_options,
+            &(),
+        )
+        .unwrap();
+    let previous = reference_prompt_cache_snapshot(&replacement_store);
+    assert!(replacement
+        .save_prompt_cache_distributed(
+            std::path::Path::new("unused"),
+            descriptor,
+            &[3],
+            &replacement_options,
+            &(),
+        )
+        .is_err());
+    assert_eq!(
+        reference_prompt_cache_snapshot(&replacement_store),
+        previous
+    );
+    assert_eq!(
+        replacement_calls.borrow().last(),
+        Some(&(DistributedExecutionPhase::PromptCacheSavePublication, true))
+    );
+
+    let (mut successful, descriptor, successful_store, _, _) = partitioned_cache_control_session(
+        0,
+        DistributedExecutionPhase::PromptCacheLoadPreflight,
+        None,
+        true,
+    );
+    successful
+        .save_prompt_cache(
+            std::path::Path::new("unused"),
+            descriptor.clone(),
+            &[1],
+            &eredu_core::cache::PromptCacheOptions::default(),
+            &(),
+        )
+        .unwrap();
+    let old_prefix = successful_store
+        .borrow()
+        .as_ref()
+        .unwrap()
+        .1
+        .prefix_sha256
+        .clone();
+    let manifest = successful
+        .save_prompt_cache_distributed(
+            std::path::Path::new("unused"),
+            descriptor,
+            &[3],
+            &replacement_options,
+            &(),
+        )
+        .unwrap()
+        .unwrap();
+    assert_ne!(manifest.prefix_sha256, old_prefix);
+    assert_eq!(
+        successful_store.borrow().as_ref().unwrap().1.prefix_sha256,
+        manifest.prefix_sha256
+    );
+}
+
+#[test]
+fn distributed_prompt_cache_load_is_provisional_until_every_rank_succeeds() {
+    let (mut local_failure, descriptor, store, calls, counters) = partitioned_cache_control_session(
+        0,
+        DistributedExecutionPhase::PromptCacheLoadPreparation,
+        None,
+        true,
+    );
+    assert!(local_failure
+        .load_prompt_cache_distributed(std::path::Path::new("unused"), &descriptor, &[3], &(),)
+        .is_err());
+    assert_eq!(local_failure.report().unwrap().state_report(), &[0]);
+    assert!(store.borrow().is_none());
+    assert_eq!(
+        calls.borrow().last(),
+        Some(&(DistributedExecutionPhase::PromptCacheLoadPreparation, false))
+    );
+    let calls_before_retry = calls.borrow().len();
+    assert!(local_failure
+        .load_prompt_cache_distributed(std::path::Path::new("unused"), &descriptor, &[3], &(),)
+        .is_err());
+    assert_eq!(calls.borrow().len(), calls_before_retry);
+    assert_eq!(counters.snapshot().forward_calls, 0);
+
+    let (mut peer, descriptor, _, peer_calls, _) = partitioned_cache_control_session(
+        1,
+        DistributedExecutionPhase::PromptCacheLoadPreparation,
+        None,
+        true,
+    );
+    peer.save_prompt_cache(
+        std::path::Path::new("unused"),
+        descriptor.clone(),
+        &[3],
+        &eredu_core::cache::PromptCacheOptions::default(),
+        &(),
+    )
+    .unwrap();
+    peer.decode(&FakeTensor(vec![4]), &()).unwrap();
+    assert_eq!(peer.report().unwrap().state_report(), &[1]);
+    assert!(peer
+        .load_prompt_cache_distributed(std::path::Path::new("unused"), &descriptor, &[3], &(),)
+        .is_err());
+    assert_eq!(peer.report().unwrap().state_report(), &[1]);
+    assert_eq!(
+        peer_calls.borrow().last(),
+        Some(&(DistributedExecutionPhase::PromptCacheLoadPreparation, true))
+    );
+
+    let (mut successful, descriptor, _, _, _) = partitioned_cache_control_session(
+        0,
+        DistributedExecutionPhase::PromptCacheSavePublication,
+        None,
+        true,
+    );
+    successful
+        .save_prompt_cache(
+            std::path::Path::new("unused"),
+            descriptor.clone(),
+            &[3],
+            &eredu_core::cache::PromptCacheOptions::default(),
+            &(),
+        )
+        .unwrap();
+    successful.decode(&FakeTensor(vec![4]), &()).unwrap();
+    assert_eq!(successful.report().unwrap().state_report(), &[1]);
+    assert!(successful
+        .load_prompt_cache_distributed(std::path::Path::new("unused"), &descriptor, &[3], &(),)
+        .unwrap()
+        .is_some());
+    assert_eq!(successful.report().unwrap().state_report(), &[0]);
+}
+
+#[test]
+fn distributed_prompt_cache_preflight_rejects_wrong_rank_and_input_before_io() {
+    let (mut wrong_rank, descriptor, store, calls, counters) = partitioned_cache_control_session(
+        0,
+        DistributedExecutionPhase::PromptCacheLoadPreflight,
+        None,
+        true,
+    );
+    let wrong_topology =
+        eredu_core::cache::PromptCacheTopology::new(Some((2, 1)), None, None, true).unwrap();
+    let wrong_descriptor = descriptor.with_topology(wrong_topology).unwrap();
+    assert!(
+        wrong_rank
+            .load_prompt_cache_distributed(
+                std::path::Path::new("unused"),
+                &wrong_descriptor,
+                &[3],
+                &(),
+            )
+            .is_err()
+    );
+    assert!(store.borrow().is_none());
+    assert_eq!(
+        calls.borrow().as_slice(),
+        &[(DistributedExecutionPhase::PromptCacheLoadPreflight, false)]
+    );
+    assert_eq!(counters.snapshot().forward_calls, 0);
+
+    let (mut wrong_input, descriptor, store, calls, _) = partitioned_cache_control_session(
+        1,
+        DistributedExecutionPhase::PromptCacheSavePreflight,
+        None,
+        true,
+    );
+    let input_identity = prepared_composite_input(99)
+        .cache_identity(composite_content_fingerprint(99))
+        .unwrap();
+    assert!(wrong_input
+        .save_prompt_cache_for_input_distributed(
+            std::path::Path::new("unused"),
+            descriptor.clone(),
+            &[3],
+            &eredu_core::cache::PromptCacheOptions::default(),
+            &input_identity,
+            &(),
+        )
+        .is_err());
+    assert!(store.borrow().is_none());
+    assert_eq!(
+        calls.borrow().as_slice(),
+        &[(DistributedExecutionPhase::PromptCacheSavePreflight, false)]
+    );
+    let agreement_count = calls.borrow().len();
+    assert!(wrong_input
+        .save_prompt_cache_distributed(
+            std::path::Path::new("unused"),
+            descriptor,
+            &[3],
+            &eredu_core::cache::PromptCacheOptions::default(),
+            &(),
+        )
+        .is_err());
+    assert_eq!(calls.borrow().len(), agreement_count);
+    assert!(store.borrow().is_none());
+}
+
+#[test]
+fn distributed_state_controls_prepare_on_all_ranks_and_fence_failed_retries() {
+    let (mut checkpoint_failure, _, _, calls, counters) = partitioned_cache_control_session(
+        0,
+        DistributedExecutionPhase::SessionCheckpoint,
+        None,
+        true,
+    );
+    assert!(checkpoint_failure
+        .checkpoint_complete_distributed(&())
+        .is_err());
+    assert_eq!(
+        calls.borrow().as_slice(),
+        &[(DistributedExecutionPhase::SessionCheckpoint, true)]
+    );
+    assert!(checkpoint_failure
+        .decode(&FakeTensor(vec![3]), &())
+        .is_err());
+    assert_eq!(counters.snapshot().forward_calls, 0);
+
+    let (mut rollback_failure, _, _, calls, counters) = partitioned_cache_control_session(
+        1,
+        DistributedExecutionPhase::SessionRollbackPreparation,
+        None,
+        true,
+    );
+    let checkpoint = rollback_failure
+        .checkpoint_complete_distributed(&())
+        .unwrap();
+    rollback_failure.decode(&FakeTensor(vec![3]), &()).unwrap();
+    assert_eq!(rollback_failure.report().unwrap().state_report(), &[1]);
+    let forwards = counters.snapshot().forward_calls;
+    assert!(rollback_failure
+        .rollback_complete_distributed(checkpoint, &())
+        .is_err());
+    assert_eq!(rollback_failure.report().unwrap().state_report(), &[1]);
+    assert_eq!(
+        calls.borrow().last(),
+        Some(&(DistributedExecutionPhase::SessionRollbackPreparation, true))
+    );
+    assert!(rollback_failure.decode(&FakeTensor(vec![4]), &()).is_err());
+    assert_eq!(counters.snapshot().forward_calls, forwards);
+
+    let (mut reset_failure, _, _, calls, _) = partitioned_cache_control_session(
+        0,
+        DistributedExecutionPhase::SessionResetPreparation,
+        None,
+        true,
+    );
+    reset_failure.decode(&FakeTensor(vec![3]), &()).unwrap();
+    assert!(reset_failure.reset_distributed(&()).is_err());
+    assert_eq!(reset_failure.report().unwrap().state_report(), &[1]);
+    assert_eq!(
+        calls.borrow().last(),
+        Some(&(DistributedExecutionPhase::SessionResetPreparation, true))
+    );
+
+    let (mut successful, _, _, _, _) = partitioned_cache_control_session(
+        0,
+        DistributedExecutionPhase::PromptCacheLoadPreflight,
+        None,
+        true,
+    );
+    let complete = successful.checkpoint_complete_distributed(&()).unwrap();
+    successful.decode(&FakeTensor(vec![3]), &()).unwrap();
+    successful
+        .rollback_complete_distributed(complete, &())
+        .unwrap();
+    assert_eq!(successful.report().unwrap().state_report(), &[0]);
+    successful.decode(&FakeTensor(vec![4]), &()).unwrap();
+    successful.reset_distributed(&()).unwrap();
+    assert_eq!(successful.report().unwrap().state_report(), &[0]);
+
+    let state = successful.checkpoint_distributed(&()).unwrap();
+    successful.decode(&FakeTensor(vec![5]), &()).unwrap();
+    successful.rollback_distributed(state, &()).unwrap();
+    assert_eq!(successful.report().unwrap().state_report(), &[0]);
+}
+
+#[test]
+fn partitioned_phase_agreement_propagates_execution_observation_and_completion_failures() {
+    for (failed_phase, failing_site) in [
+        (
+            DistributedExecutionPhase::StateCheckpoint,
+            LocalPartitionFailure::Checkpoint,
+        ),
+        (
+            DistributedExecutionPhase::Execution,
+            LocalPartitionFailure::Execution,
+        ),
+        (
+            DistributedExecutionPhase::OutputObservation,
+            LocalPartitionFailure::Observation,
+        ),
+        (
+            DistributedExecutionPhase::OutputPublication,
+            LocalPartitionFailure::Publication,
+        ),
+        (
+            DistributedExecutionPhase::MechanismCompletion,
+            LocalPartitionFailure::Completion,
+        ),
+    ] {
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let commits = Rc::new(Cell::new(0));
+        let failing = run_partitioned_agreement_rank(
+            0,
+            failing_site,
+            failed_phase,
+            Rc::clone(&calls),
+            Rc::clone(&commits),
+        );
+        let peer = run_partitioned_agreement_rank(
+            1,
+            LocalPartitionFailure::None,
+            failed_phase,
+            Rc::clone(&calls),
+            Rc::clone(&commits),
+        );
+
+        assert!(
+            failing.failed && peer.failed,
+            "both ranks must report phase failure"
+        );
+        assert_eq!(failing.state, [0]);
+        assert_eq!(peer.state, [0]);
+        let expected_completions =
+            usize::from(matches!(failing_site, LocalPartitionFailure::Completion));
+        assert_eq!(failing.completions, expected_completions);
+        assert_eq!(peer.completions, expected_completions);
+        if matches!(failing_site, LocalPartitionFailure::Checkpoint) {
+            assert_eq!(
+                failing.forwards, 0,
+                "checkpoint failure must precede local execution"
+            );
+            assert_eq!(
+                peer.forwards, 0,
+                "checkpoint failure must suppress peer execution"
+            );
+        }
+        assert_eq!(commits.get(), 0, "failed phases must not commit");
+        let phase_calls = calls
+            .borrow()
+            .iter()
+            .filter(|(phase, _)| *phase == failed_phase)
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(phase_calls.len(), 2);
+        assert!(phase_calls.iter().any(|(_, success)| !success));
+        assert!(phase_calls.iter().any(|(_, success)| *success));
+    }
+}
+
+#[test]
+fn concurrent_checkpoint_failure_suppresses_execution_on_every_rank() {
+    let coordinator = Arc::new(ConcurrentCheckpointCoordinator::new());
+    let results = std::thread::scope(|scope| {
+        let workers = (0..2)
+            .map(|rank| {
+                let coordinator = Arc::clone(&coordinator);
+                scope.spawn(move || {
+                    run_partitioned_agreement_rank_with(
+                        rank,
+                        if rank == 0 {
+                            LocalPartitionFailure::Checkpoint
+                        } else {
+                            LocalPartitionFailure::None
+                        },
+                        TestPhaseAgreement::Concurrent(ConcurrentCheckpointAgreement {
+                            rank,
+                            coordinator,
+                        }),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+
+    assert!(results.iter().all(|result| result.failed));
+    assert!(results.iter().all(|result| result.state == [0]));
+    assert!(results.iter().all(|result| result.completions == 0));
+    assert!(results.iter().all(|result| result.output.is_none()));
+    assert!(results.iter().all(|result| result.forwards == 0));
+    let mut calls = coordinator.calls.lock().unwrap().clone();
+    calls.sort_by_key(|(rank, _, _)| *rank);
+    assert_eq!(
+        calls,
+        [
+            (0, DistributedExecutionPhase::StateCheckpoint, false),
+            (1, DistributedExecutionPhase::StateCheckpoint, true),
+        ]
+    );
+}
+
+#[test]
+fn partitioned_final_output_observer_runs_only_on_publication_owner() {
+    let calls = Rc::new(RefCell::new(Vec::new()));
+    let commits = Rc::new(Cell::new(0));
+    let result = run_partitioned_agreement_rank(
+        1,
+        LocalPartitionFailure::Observation,
+        DistributedExecutionPhase::Commit,
+        Rc::clone(&calls),
+        Rc::clone(&commits),
+    );
+
+    assert!(
+        !result.failed,
+        "non-owner observer must not see final logits"
+    );
+    assert_eq!(result.state, [1]);
+    assert_eq!(result.completions, 1);
+    assert_eq!(commits.get(), 1);
+    assert!(calls.borrow().iter().any(|(phase, success)| {
+        *phase == DistributedExecutionPhase::OutputObservation && *success
+    }));
+}
+
+#[test]
+fn partitioned_owner_intervenes_before_publication_completion_and_commit() {
+    let calls = Rc::new(RefCell::new(Vec::new()));
+    let commits = Rc::new(Cell::new(0));
+    let trace = Rc::new(RefCell::new(Vec::new()));
+    let published = Rc::new(RefCell::new(Vec::new()));
+    PARTITION_COMMIT_TRACE.with(|slot| *slot.borrow_mut() = Some(Rc::clone(&trace)));
+    PARTITION_PUBLICATION_VALUES.with(|slot| *slot.borrow_mut() = Some(Rc::clone(&published)));
+    let result = run_partitioned_agreement_rank(
+        0,
+        LocalPartitionFailure::Intervention,
+        DistributedExecutionPhase::Commit,
+        calls,
+        Rc::clone(&commits),
+    );
+    PARTITION_COMMIT_TRACE.with(|slot| *slot.borrow_mut() = None);
+    PARTITION_PUBLICATION_VALUES.with(|slot| *slot.borrow_mut() = None);
+
+    assert!(!result.failed);
+    assert_eq!(result.output, Some(FakeTensor(vec![99])));
+    assert_eq!(*published.borrow(), [FakeTensor(vec![99])]);
+    assert_eq!(
+        *trace.borrow(),
+        ["observe", "publish", "complete", "commit"]
+    );
+    assert_eq!(commits.get(), 1);
+}
+
+#[test]
+fn partitioned_prediction_capture_agrees_before_publication_and_rolls_back_on_rejection() {
+    let (mut session, _, _, calls, _) = partitioned_cache_control_session(
+        0,
+        DistributedExecutionPhase::PredictionTargetCapture,
+        None,
+        true,
+    );
+    let published = Rc::new(RefCell::new(Vec::new()));
+    PARTITION_PUBLICATION_VALUES.with(|slot| *slot.borrow_mut() = Some(Rc::clone(&published)));
+    let before = session.report().unwrap().state_report().to_vec();
+    let error = session
+        .prefill_prediction_target(&FakeTensor(vec![3]), None, &())
+        .unwrap_err();
+    PARTITION_PUBLICATION_VALUES.with(|slot| *slot.borrow_mut() = None);
+
+    assert!(error.to_string().contains("another rank could not prepare"));
+    assert_eq!(session.report().unwrap().state_report().to_vec(), before);
+    assert!(
+        published.borrow().is_empty(),
+        "rejected capture published {:?}",
+        *published.borrow()
+    );
+    assert!(calls.borrow().iter().any(|(phase, success)| {
+        *phase == DistributedExecutionPhase::PredictionTargetCapture && *success
+    }));
+}
+
+#[test]
+fn distributed_commit_reports_asymmetric_observation_without_false_rollback() {
+    for phase in [
+        DistributedCommitPhase::DecisionSubmission,
+        DistributedCommitPhase::DecisionCompletion,
+        DistributedCommitPhase::DecisionObservation,
+    ] {
+        let committed_calls = Rc::new(Cell::new(0));
+        let committed = run_partitioned_agreement_rank_with(
+            0,
+            LocalPartitionFailure::None,
+            TestPhaseAgreement::Final {
+                result: FinalDecisionResult::Committed,
+                commits: Rc::clone(&committed_calls),
+            },
+        );
+        let uncertain_calls = Rc::new(Cell::new(0));
+        let uncertain = run_partitioned_agreement_rank_with(
+            1,
+            LocalPartitionFailure::None,
+            TestPhaseAgreement::Final {
+                result: FinalDecisionResult::Indeterminate(phase),
+                commits: Rc::clone(&uncertain_calls),
+            },
+        );
+
+        assert!(!committed.failed);
+        assert_eq!(committed.state, [1]);
+        assert_eq!(committed.output, Some(FakeTensor(vec![5])));
+        assert_eq!(
+            committed.outcome,
+            Some(DistributedCommitOutcome::Committed(
+                DistributedCommitEpoch::FIRST
+            ))
+        );
+        assert!(uncertain.failed);
+        assert_eq!(
+            uncertain.state,
+            [1],
+            "indeterminate state must not roll back"
+        );
+        assert!(
+            uncertain.output.is_none(),
+            "indeterminate output must not escape"
+        );
+        assert_eq!(
+            uncertain.outcome,
+            Some(DistributedCommitOutcome::Indeterminate {
+                epoch: DistributedCommitEpoch::FIRST,
+                phase,
+            })
+        );
+        assert_eq!(
+            uncertain.retry_forwards, 0,
+            "poisoned retry must execute no unit"
+        );
+        assert_eq!(committed_calls.get(), 1);
+        assert_eq!(uncertain_calls.get(), 1, "poisoned retry must not re-agree");
+        assert_eq!(
+            uncertain.cached_outcome, uncertain.outcome,
+            "cache must retain the exact epoch"
+        );
+        assert!(!committed.outcome.unwrap().is_indeterminate());
+        assert_ne!(
+            committed.outcome,
+            Some(DistributedCommitOutcome::Aborted(
+                DistributedCommitEpoch::FIRST
+            ))
+        );
+        assert_ne!(
+            uncertain.outcome,
+            Some(DistributedCommitOutcome::Aborted(
+                DistributedCommitEpoch::FIRST
+            ))
+        );
+    }
+}
+
+#[test]
+fn globally_observed_final_abort_restores_state_and_withholds_output() {
+    let commits = Rc::new(Cell::new(0));
+    let aborted = run_partitioned_agreement_rank_with(
+        0,
+        LocalPartitionFailure::None,
+        TestPhaseAgreement::Final {
+            result: FinalDecisionResult::Aborted,
+            commits: Rc::clone(&commits),
+        },
+    );
+    assert!(aborted.failed);
+    assert_eq!(aborted.state, [0]);
+    assert!(aborted.output.is_none());
+    assert_eq!(
+        aborted.outcome,
+        Some(DistributedCommitOutcome::Aborted(
+            DistributedCommitEpoch::FIRST
+        ))
+    );
+    assert_eq!(commits.get(), 1);
+}
+
+#[test]
+fn partitioned_runtime_factory_rejects_independent_task_proof_before_factory_work() {
+    let counters = ReplicatedSessionCounters::default();
+    let architecture = OrdinaryTextFixture {
+        static_modules: FakeOperator,
+        trace: Vec::new(),
+        counters,
+        inconsistent_transport: false,
+        inconsistent_identity: false,
+    };
+    let selected = selected_reference_text(&architecture, LayerWeightResidency::FullyResident);
+    let parameters = architecture.parameter_description(&()).unwrap();
+    let partition = ArchitecturePartition::from_architecture::<
+        FakeBackend,
+        DeviceState<FakeBackend, FakeLayerState>,
+        _,
+        _,
+    >(
+        &architecture,
+        [("decoder", 0..1)],
+        PartitionOwnership::new(true, true, std::iter::empty::<String>()).unwrap(),
+        (),
+        NoAuxiliaryBoundarySchema::new(1),
+        &parameters,
+    )
+    .unwrap();
+    let factory_called = Rc::new(Cell::new(false));
+    let called = Rc::clone(&factory_called);
+    let error = prepare_partitioned_session_runtime::<
+        _,
+        FakeBackend,
+        _,
+        DeviceState<FakeBackend, FakeLayerState>,
+        _,
+        _,
+        Infallible,
+        _,
+    >(
+        architecture,
+        selected,
+        partition,
+        CommunicationManifest::new(1, 0, Vec::new(), Vec::new())
+            .unwrap()
+            .with_completion_policy(test_completion_policy()),
+        Some(&[]),
+        eredu_core::cache::PromptCacheTopology::default(),
+        ReplicatedTextOutputSelection::LastSequencePosition,
+        &(),
+        move |_input, _selected, _context| {
+            called.set(true);
+            Ok(((), DeviceState::stateless()))
+        },
+    )
+    .err()
+    .expect("independent task proof reached the partition runtime factory");
+    assert!(error
+        .to_string()
+        .contains("precomputed local materialization tasks differ"));
+    assert!(!factory_called.get());
+}
+
+#[test]
+fn partitioned_runtime_rejects_publication_and_agreement_manifest_perturbations_before_calls() {
+    type Runtime = PartitionedTextRuntime<
+        OrdinaryTextFixture,
+        FakeBackend,
+        DeviceState<FakeBackend, FakeLayerState>,
+        RecordingPolicy,
+        ReferencePartitionExecutor,
+        (),
+        (),
+        FakeTensorMetadata,
+        NoBoundaryTransport,
+        ScriptedOutputPublisher,
+        TestPhaseAgreement,
+    >;
+
+    let group = CommunicationGroupId::new(57);
+    for (requirements, operation) in [
+        (
+            CommunicationGroupRequirements::new([
+                CommunicationOperationRequirement::failure_agreement(true),
+            ])
+            .unwrap(),
+            CommunicationOperation::Broadcast,
+        ),
+        (
+            CommunicationGroupRequirements::new([
+                CommunicationOperationRequirement::tensors(
+                    CommunicationOperation::Broadcast,
+                    [TensorDtype::F32],
+                    CommunicationTensorLimits::new(1, 3, 8, None).unwrap(),
+                    true,
+                )
+                .unwrap(),
+                CommunicationOperationRequirement::failure_agreement(false),
+            ])
+            .unwrap(),
+            CommunicationOperation::FailureAgreement,
+        ),
+    ] {
+        let counters = ReplicatedSessionCounters::default();
+        let architecture = OrdinaryTextFixture {
+            static_modules: FakeOperator,
+            trace: Vec::new(),
+            counters: counters.clone(),
+            inconsistent_transport: false,
+            inconsistent_identity: false,
+        };
+        let graph = architecture.execution_graph().unwrap();
+        let plan = PartitionedExecutionPlan::new(
+            graph,
+            vec![(ArchitectureGroupKind::Decoder, false)],
+            vec![None],
+            Vec::new(),
+            Some(PartitionOutputPublication {
+                group,
+                owner_rank: 0,
+            }),
+            Some(group),
+            PipelineWireContract::new(PipelineActivationDtype::Float32),
+        )
+        .unwrap();
+        let manifest = CommunicationManifest::new(
+            2,
+            1,
+            vec![
+                CommunicationGroupDescriptor::new(group, 0, vec![0, 1], Some(1), requirements)
+                    .unwrap(),
+            ],
+            Vec::new(),
+        )
+        .unwrap()
+        .with_completion_policy(test_completion_policy());
+        let communication = PartitionCommunication::<FakeBackend, (), (), _>::new(
+            manifest,
+            vec![RealizedCommunicationGroup::new(group, ())],
+            Vec::new(),
+            FakeTensorMetadata,
+        )
+        .unwrap();
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let commits = Rc::new(Cell::new(0));
+        let error = Runtime::new(
+            plan,
+            ReferencePartitionExecutor {
+                architecture,
+                unit: FakeUnit { marker: 5 },
+                fail_after_state: Rc::new(Cell::new(false)),
+            },
+            communication,
+            (),
+            NoBoundaryTransport,
+            ScriptedOutputPublisher { fail: false },
+            TestPhaseAgreement::Scripted(ScriptedPhaseAgreement {
+                failed_phase: DistributedExecutionPhase::Commit,
+                calls: Rc::clone(&calls),
+                commits: Rc::clone(&commits),
+            }),
+            ExecutionResidency::FullyResident,
+            None,
+        )
+        .err()
+        .expect("perturbed manifest reached runtime execution");
+
+        assert!(matches!(
+            error,
+            eredu_runtime::PartitionExecutionError::OperationNotSelected { operation: actual, .. }
+                | eredu_runtime::PartitionExecutionError::InexactOperationRequirement { operation: actual, .. }
+                if actual == operation
+        ));
+        assert_eq!(counters.snapshot().forward_calls, 0);
+        assert!(calls.borrow().is_empty());
+        assert_eq!(commits.get(), 0);
+    }
+}
+
+#[test]
+fn production_partitioned_middle_stage_completes_source_before_send_and_fences_deadline_retry() {
+    type Strategy = PartitionedTextExecution<
+        PipelineDestinationExecutor,
+        (),
+        (),
+        PipelineTensorMetadata,
+        OpaqueBoundaryTransport,
+        NoOutputPublisher,
+        NoCommitAgreement,
+    >;
+
+    let counters = ReplicatedSessionCounters::default();
+    let architecture = OrdinaryTextFixture {
+        static_modules: FakeOperator,
+        trace: Vec::new(),
+        counters: counters.clone(),
+        inconsistent_transport: false,
+        inconsistent_identity: false,
+    };
+    let selected = selected_reference_text(&architecture, LayerWeightResidency::FullyResident);
+    let parameters = architecture.parameter_description(&()).unwrap();
+    let partition = ArchitecturePartition::from_architecture::<
+        FakeBackend,
+        DeviceState<FakeBackend, FakeLayerState>,
+        _,
+        _,
+    >(
+        &architecture,
+        [("decoder", 0..1)],
+        PartitionOwnership::new(false, false, std::iter::empty::<String>()).unwrap(),
+        (),
+        NoAuxiliaryBoundarySchema::new(1),
+        &parameters,
+    )
+    .unwrap();
+    let boundary = NoAuxiliaryBoundarySchema::new(1)
+        .wire_schema()
+        .unwrap()
+        .resolve(1, 1)
+        .unwrap();
+    let route_id = CommunicationRouteId::new(0);
+    let route_requirement = CommunicationOperationRequirement::tensors(
+        CommunicationOperation::SendReceive,
+        [TensorDtype::F32],
+        CommunicationTensorLimits::new(1, 3, 1, None).unwrap(),
+        true,
+    )
+    .unwrap();
+    let outgoing_route_id = CommunicationRouteId::new(1);
+    let descriptor = test_boundary_route(route_id, 0, 0, 1, route_requirement.clone());
+    let outgoing_descriptor = test_boundary_route(outgoing_route_id, 1, 1, 2, route_requirement);
+    let trace = Rc::new(RefCell::new(Vec::new()));
+    let binding = prepare_partitioned_session_runtime::<_, FakeBackend, _, _, _, _, Infallible, _>(
+        architecture,
+        selected,
+        partition,
+        CommunicationManifest::new(3, 1, Vec::new(), vec![descriptor, outgoing_descriptor])
+            .unwrap()
+            .with_completion_policy(test_completion_policy()),
+        None,
+        eredu_core::cache::PromptCacheTopology::default(),
+        ReplicatedTextOutputSelection::LastSequencePosition,
+        &(),
+        |input, _selected, _context| {
+            let (architecture, partition, manifest, tasks) = input.into_parts();
+            assert_eq!(tasks.len(), 1);
+            let driver = LayeredPartitionDriver::new(&partition, 0, 0..1).unwrap();
+            let plan = PartitionedExecutionPlan::new(
+                architecture.execution_graph().unwrap(),
+                vec![(ArchitectureGroupKind::Decoder, false)],
+                vec![Some(driver)],
+                vec![
+                    PartitionBoundaryRoute {
+                        source_group: 0,
+                        destination_group: 0,
+                        source_rank: 0,
+                        destination_rank: 1,
+                        route: route_id,
+                    },
+                    PartitionBoundaryRoute {
+                        source_group: 0,
+                        destination_group: 0,
+                        source_rank: 1,
+                        destination_rank: 2,
+                        route: outgoing_route_id,
+                    },
+                ],
+                None,
+                None,
+                PipelineWireContract::new(PipelineActivationDtype::Float32),
+            )
+            .unwrap();
+            let communication = PartitionCommunication::<FakeBackend, (), (), _>::new(
+                manifest,
+                Vec::new(),
+                vec![
+                    RealizedCommunicationRoute::new(route_id, ()),
+                    RealizedCommunicationRoute::new(outgoing_route_id, ()),
+                ],
+                PipelineTensorMetadata,
+            )
+            .unwrap();
+            let state = DeviceState::create(partition.state().unwrap().layout().clone(), |_, _| {
+                Ok::<_, Infallible>(FakeLayerState(0))
+            })
+            .unwrap();
+            let runtime = PartitionedTextRuntime::new(
+                plan,
+                PipelineDestinationExecutor {
+                    architecture,
+                    unit: FakeUnit { marker: 5 },
+                    trace: Rc::clone(&trace),
+                    boundary,
+                    send_boundary: true,
+                    fail_boundary_values: false,
+                    swap_auxiliary_roles: false,
+                },
+                communication,
+                (),
+                OpaqueBoundaryTransport,
+                NoOutputPublisher,
+                NoCommitAgreement,
+                ExecutionResidency::FullyResident,
+                None::<RecordingPolicy>,
+            )
+            .unwrap();
+            Ok((runtime, state))
+        },
+    )
+    .unwrap();
+    let mechanisms = ReferenceTextMechanisms {
+        tasks: Rc::new(RefCell::new(Vec::new())),
+        completions: Rc::new(RefCell::new(Vec::new())),
+        counters,
+        fail_completion: Rc::new(Cell::new(false)),
+        fail_checkpoint: false,
+        prompt_cache: None,
+    };
+    let mut session = construct_replicated_text_session_with_runtime::<
+        OrdinaryTextFixture,
+        FakeBackend,
+        _,
+        Strategy,
+    >(binding, mechanisms, Strategy::new())
+    .unwrap();
+
+    assert_eq!(
+        session.decode(&FakeTensor(vec![3]), &()).unwrap(),
+        FakeTensor(vec![5])
+    );
+    assert_eq!(*trace.borrow(), ["receive", "accept", "execute", "send"]);
+
+    POINT_TO_POINT_COUNT.set(0);
+    LOCAL_DEPENDENCY_SUBMISSION_COUNT.set(0);
+    BOUNDED_COMMUNICATION_WAIT_COUNT.set(0);
+    COMMUNICATION_COMPLETION_SCRIPT.with(|script| {
+        script.borrow_mut().extend([
+            FakeCompletionOutcome::Completed,
+            FakeCompletionOutcome::DeadlineExceeded,
+        ]);
+    });
+    let state_before_deadline = session.report().unwrap().state_report().to_vec();
+    assert!(session.decode(&FakeTensor(vec![4]), &()).is_err());
+    assert_eq!(
+        session.report().unwrap().state_report().as_slice(),
+        state_before_deadline.as_slice()
+    );
+    assert_eq!(LOCAL_DEPENDENCY_SUBMISSION_COUNT.get(), 1);
+    assert_eq!(
+        POINT_TO_POINT_COUNT.get(),
+        1,
+        "source dependency deadline must prevent the outgoing route submission",
+    );
+    assert_eq!(BOUNDED_COMMUNICATION_WAIT_COUNT.get(), 2);
+    assert!(session.decode(&FakeTensor(vec![6]), &()).is_err());
+    assert_eq!(LOCAL_DEPENDENCY_SUBMISSION_COUNT.get(), 1);
+    assert_eq!(POINT_TO_POINT_COUNT.get(), 1);
+}
+
+#[derive(Clone, Copy)]
+enum DestinationPreparationFailure {
+    Placeholder,
+    MalformedSchema,
+    SwappedAuxiliaryRoles,
+    CorruptReceivedHeader,
+}
+
+fn assert_destination_preparation_failure_is_agreed_before_transfer(
+    failure: DestinationPreparationFailure,
+) {
+    type Strategy = PartitionedTextExecution<
+        PipelineDestinationExecutor,
+        (),
+        (),
+        PipelineTensorMetadata,
+        OpaqueBoundaryTransport,
+        NoOutputPublisher,
+        ScriptedPhaseAgreement,
+    >;
+
+    let counters = ReplicatedSessionCounters::default();
+    let architecture = OrdinaryTextFixture {
+        static_modules: FakeOperator,
+        trace: Vec::new(),
+        counters: counters.clone(),
+        inconsistent_transport: false,
+        inconsistent_identity: false,
+    };
+    let selected = selected_reference_text(&architecture, LayerWeightResidency::FullyResident);
+    let parameters = architecture.parameter_description(&()).unwrap();
+    let partition = ArchitecturePartition::from_architecture::<
+        FakeBackend,
+        DeviceState<FakeBackend, FakeLayerState>,
+        _,
+        _,
+    >(
+        &architecture,
+        [("decoder", 0..1)],
+        PartitionOwnership::new(false, true, std::iter::empty::<String>()).unwrap(),
+        (),
+        NoAuxiliaryBoundarySchema::new(1),
+        &parameters,
+    )
+    .unwrap();
+    let boundary = match failure {
+        DestinationPreparationFailure::Placeholder => {
+            NoAuxiliaryBoundarySchema::new(1).wire_schema().unwrap()
+        }
+        DestinationPreparationFailure::MalformedSchema => {
+            NoAuxiliaryBoundarySchema::new(2).wire_schema().unwrap()
+        }
+        DestinationPreparationFailure::CorruptReceivedHeader => {
+            NoAuxiliaryBoundarySchema::new(1).wire_schema().unwrap()
+        }
+        DestinationPreparationFailure::SwappedAuxiliaryRoles => {
+            eredu_runtime::BoundaryWireSchema::new(
+                "swapped.fixture",
+                eredu_runtime::BoundaryTensorSpec::primary_activation(1),
+                [
+                    eredu_runtime::BoundaryTensorSpec::new(
+                        "first",
+                        [
+                            eredu_runtime::BoundaryTensorDimension::Batch,
+                            eredu_runtime::BoundaryTensorDimension::Sequence,
+                            eredu_runtime::BoundaryTensorDimension::Fixed(1),
+                        ],
+                        eredu_runtime::BoundaryTensorDtype::Activation,
+                    ),
+                    eredu_runtime::BoundaryTensorSpec::new(
+                        "second",
+                        [
+                            eredu_runtime::BoundaryTensorDimension::Batch,
+                            eredu_runtime::BoundaryTensorDimension::Sequence,
+                            eredu_runtime::BoundaryTensorDimension::Fixed(1),
+                        ],
+                        eredu_runtime::BoundaryTensorDtype::Activation,
+                    ),
+                ],
+            )
+            .unwrap()
+        }
+    }
+    .resolve(1, 1)
+    .unwrap();
+    let route_id = CommunicationRouteId::new(0);
+    let route_requirement = CommunicationOperationRequirement::tensors(
+        CommunicationOperation::SendReceive,
+        [TensorDtype::F32],
+        CommunicationTensorLimits::new(1, 3, 1, None).unwrap(),
+        true,
+    )
+    .unwrap();
+    let group = CommunicationGroupId::new(1);
+    let manifest = CommunicationManifest::new(
+        2,
+        1,
+        vec![CommunicationGroupDescriptor::new(
+            group,
+            0,
+            vec![0, 1],
+            Some(1),
+            CommunicationGroupRequirements::new([
+                CommunicationOperationRequirement::failure_agreement(true),
+            ])
+            .unwrap(),
+        )
+        .unwrap()],
+        vec![test_boundary_route(route_id, 0, 0, 1, route_requirement)],
+    )
+    .unwrap()
+    .with_completion_policy(test_completion_policy());
+    let trace = Rc::new(RefCell::new(Vec::new()));
+    let calls = Rc::new(RefCell::new(Vec::new()));
+    let commits = Rc::new(Cell::new(0));
+    let binding = prepare_partitioned_session_runtime::<_, FakeBackend, _, _, _, _, Infallible, _>(
+        architecture,
+        selected,
+        partition,
+        manifest,
+        None,
+        eredu_core::cache::PromptCacheTopology::default(),
+        ReplicatedTextOutputSelection::LastSequencePosition,
+        &(),
+        |input, _selected, _context| {
+            let (architecture, partition, manifest, _) = input.into_parts();
+            let driver = LayeredPartitionDriver::new(&partition, 0, 0..1).unwrap();
+            let plan = PartitionedExecutionPlan::new(
+                architecture.execution_graph().unwrap(),
+                vec![(ArchitectureGroupKind::Decoder, false)],
+                vec![Some(driver)],
+                vec![PartitionBoundaryRoute {
+                    source_group: 0,
+                    destination_group: 0,
+                    source_rank: 0,
+                    destination_rank: 1,
+                    route: route_id,
+                }],
+                None,
+                Some(group),
+                PipelineWireContract::new(PipelineActivationDtype::Float32),
+            )
+            .unwrap();
+            let communication = PartitionCommunication::<FakeBackend, (), (), _>::new(
+                manifest,
+                vec![RealizedCommunicationGroup::new(group, ())],
+                vec![RealizedCommunicationRoute::new(route_id, ())],
+                PipelineTensorMetadata,
+            )
+            .unwrap();
+            let state = DeviceState::create(partition.state().unwrap().layout().clone(), |_, _| {
+                Ok::<_, Infallible>(FakeLayerState(0))
+            })
+            .unwrap();
+            let runtime = PartitionedTextRuntime::new(
+                plan,
+                PipelineDestinationExecutor {
+                    architecture,
+                    unit: FakeUnit { marker: 5 },
+                    trace: Rc::clone(&trace),
+                    boundary,
+                    send_boundary: false,
+                    fail_boundary_values: matches!(
+                        failure,
+                        DestinationPreparationFailure::Placeholder
+                    ),
+                    swap_auxiliary_roles: matches!(
+                        failure,
+                        DestinationPreparationFailure::SwappedAuxiliaryRoles
+                    ),
+                },
+                communication,
+                (),
+                OpaqueBoundaryTransport,
+                NoOutputPublisher,
+                ScriptedPhaseAgreement {
+                    failed_phase: DistributedExecutionPhase::Commit,
+                    calls: Rc::clone(&calls),
+                    commits: Rc::clone(&commits),
+                },
+                ExecutionResidency::FullyResident,
+                None::<RecordingPolicy>,
+            )
+            .unwrap();
+            Ok((runtime, state))
+        },
+    )
+    .unwrap();
+    let mechanisms = ReferenceTextMechanisms {
+        tasks: Rc::new(RefCell::new(Vec::new())),
+        completions: Rc::new(RefCell::new(Vec::new())),
+        counters,
+        fail_completion: Rc::new(Cell::new(false)),
+        fail_checkpoint: false,
+        prompt_cache: None,
+    };
+    let mut session = construct_replicated_text_session_with_runtime::<
+        OrdinaryTextFixture,
+        FakeBackend,
+        _,
+        Strategy,
+    >(binding, mechanisms, Strategy::new())
+    .unwrap();
+
+    POINT_TO_POINT_COUNT.set(0);
+    if matches!(
+        failure,
+        DestinationPreparationFailure::CorruptReceivedHeader
+    ) {
+        COMMUNICATION_COMPLETION_SCRIPT.with(|script| {
+            script
+                .borrow_mut()
+                .push_back(FakeCompletionOutcome::CorruptBoundaryHeader);
+        });
+    }
+    assert!(session.decode(&FakeTensor(vec![3]), &()).is_err());
+    assert_eq!(trace.borrow().as_slice(), ["receive"]);
+    assert_eq!(
+        POINT_TO_POINT_COUNT.get(),
+        usize::from(matches!(
+            failure,
+            DestinationPreparationFailure::CorruptReceivedHeader
+        ))
+    );
+    assert_eq!(session.report().unwrap().state_report(), &[0]);
+    assert_eq!(commits.get(), 0);
+    let boundary_ready = matches!(
+        failure,
+        DestinationPreparationFailure::CorruptReceivedHeader
+    );
+    let mut expected_phases = vec![
+        (DistributedExecutionPhase::StateCheckpoint, true),
+        (
+            DistributedExecutionPhase::BoundarySourceCompletion(route_id),
+            boundary_ready,
+        ),
+    ];
+    if boundary_ready {
+        expected_phases.push((
+            DistributedExecutionPhase::BoundarySourceReady(route_id),
+            true,
+        ));
+    }
+    expected_phases.push((DistributedExecutionPhase::Execution, false));
+    assert_eq!(calls.borrow().as_slice(), expected_phases);
+    if matches!(
+        failure,
+        DestinationPreparationFailure::CorruptReceivedHeader
+    ) {
+        let calls_before_retry = POINT_TO_POINT_COUNT.get();
+        assert!(session.decode(&FakeTensor(vec![4]), &()).is_err());
+        assert_eq!(POINT_TO_POINT_COUNT.get(), calls_before_retry);
+    }
+}
+
+#[test]
+fn destination_placeholder_failure_is_agreed_before_native_boundary_transfer() {
+    assert_destination_preparation_failure_is_agreed_before_transfer(
+        DestinationPreparationFailure::Placeholder,
+    );
+}
+
+#[test]
+fn malformed_boundary_schema_is_agreed_before_native_boundary_transfer() {
+    assert_destination_preparation_failure_is_agreed_before_transfer(
+        DestinationPreparationFailure::MalformedSchema,
+    );
+}
+
+#[test]
+fn same_shape_auxiliary_role_swap_is_agreed_before_submission_and_rolled_back() {
+    assert_destination_preparation_failure_is_agreed_before_transfer(
+        DestinationPreparationFailure::SwappedAuxiliaryRoles,
+    );
+}
+
+#[test]
+fn corrupt_received_role_header_is_agreed_by_all_ranks_and_rolled_back() {
+    assert_destination_preparation_failure_is_agreed_before_transfer(
+        DestinationPreparationFailure::CorruptReceivedHeader,
+    );
 }
 
 #[test]
@@ -2901,6 +6708,11 @@ fn partition_extension_uses_stable_groups_ownership_and_boundary_schema() {
             &(),
         )
         .unwrap();
+    assert_eq!(
+        second.context,
+        vec![(usize::MAX, 0), (2, usize::MAX)],
+        "a nonzero global unit range must address its rank-local state from ordinal zero"
+    );
     for index in drivers[1].range() {
         let mut unit = architecture.build_unit(2, index, &()).unwrap();
         second.hidden = architecture
@@ -3190,6 +7002,7 @@ fn production_composite_input_reuses_the_shared_session_lifecycle() {
             completions: Rc::clone(&completions),
             counters: counters.clone(),
             fail_completion: Rc::clone(&fail_completion),
+            fail_checkpoint: false,
             prompt_cache: Some(Rc::clone(&prompt_cache)),
         };
         let mut session = construct_replicated_text_session::<_, FakeBackend, _>(
@@ -3738,5 +7551,84 @@ fn composite_traversal_hook_preserves_order_and_combines_tail_skip() {
             "left.group.1",
             "right.group.1",
         ]
+    );
+}
+
+#[test]
+fn opaque_communication_projection_drives_backend_independent_callbacks() {
+    let topology = eredu_core::ParallelTopology::new(2, 2, 1, 1).unwrap();
+    let tensor_limits = eredu_runtime::CommunicationTensorLimits::new(1, 3, 4096, None).unwrap();
+    let tensor_requirement = eredu_runtime::CommunicationOperationRequirement::tensors(
+        eredu_runtime::CommunicationOperation::AllReduceSum,
+        [TensorDtype::F32],
+        tensor_limits,
+        true,
+    )
+    .unwrap();
+    let group_requirements =
+        eredu_runtime::CommunicationGroupRequirements::new([tensor_requirement]).unwrap();
+    let route_requirement = eredu_runtime::CommunicationOperationRequirement::tensors(
+        eredu_runtime::CommunicationOperation::SendReceive,
+        [TensorDtype::F32],
+        eredu_runtime::CommunicationTensorLimits::new(2, 3, 4096, None).unwrap(),
+        true,
+    )
+    .unwrap();
+    let plan = eredu_runtime::TopologyCommunicationPlan::new()
+        .with_tensor_groups(group_requirements)
+        .with_pipeline_routes(route_requirement)
+        .unwrap();
+    let manifest = eredu_runtime::project_all_communication_manifests(topology, &plan)
+        .unwrap()
+        .remove(0);
+
+    let local_groups = manifest
+        .try_create_groups(|descriptor| {
+            Ok::<_, Infallible>(
+                descriptor
+                    .collective_descriptor()
+                    .map(|group| (group.id(), group.members().to_vec(), group.local_rank())),
+            )
+        })
+        .unwrap();
+    assert_eq!(
+        local_groups.into_iter().flatten().collect::<Vec<_>>(),
+        [(eredu_core::CollectiveGroupId::new(1), vec![0, 1], 0)]
+    );
+
+    let routes = manifest
+        .try_create_routes(|descriptor| {
+            Ok::<_, Infallible>((
+                descriptor.id(),
+                descriptor.source(),
+                descriptor.destination(),
+                descriptor.requirement().operation(),
+            ))
+        })
+        .unwrap();
+    assert_eq!(routes.len(), 2);
+    assert!(routes.iter().all(|(_, source, destination, operation)| {
+        source != destination && *operation == eredu_runtime::CommunicationOperation::SendReceive
+    }));
+}
+
+#[test]
+fn communication_extensions_require_only_the_selected_operation() {
+    let trace = Rc::new(RefCell::new(Vec::new()));
+    let group = PartitionCollectiveGroup {
+        members: vec![2, 5],
+        local_rank: 1,
+        trace: Rc::clone(&trace),
+    };
+    let submission =
+        PartitionCollectiveBackend::all_reduce_sum(FakeTensor(vec![7, 9]), &group, &()).unwrap();
+    assert_eq!(submission.wait().unwrap(), FakeTensor(vec![7, 9]));
+    assert_eq!(
+        trace.borrow().as_slice(),
+        [PartitionCollectiveCall {
+            local_rank: 1,
+            members: vec![2, 5],
+            value: vec![7, 9],
+        }]
     );
 }

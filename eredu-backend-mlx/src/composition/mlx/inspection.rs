@@ -736,6 +736,10 @@ mod tests {
                 eredu_gguf::MetadataValue::String("llama".into()),
             ),
             (
+                "general.file_type".into(),
+                eredu_gguf::MetadataValue::Uint32(0),
+            ),
+            (
                 "llama.block_count".into(),
                 eredu_gguf::MetadataValue::Uint32(1),
             ),
@@ -744,7 +748,7 @@ mod tests {
             metadata.extend([
                 (
                     "llama.embedding_length".into(),
-                    eredu_gguf::MetadataValue::Uint32(1),
+                    eredu_gguf::MetadataValue::Uint32(16),
                 ),
                 (
                     "llama.attention.head_count".into(),
@@ -752,7 +756,7 @@ mod tests {
                 ),
                 (
                     "llama.feed_forward_length".into(),
-                    eredu_gguf::MetadataValue::Uint32(1),
+                    eredu_gguf::MetadataValue::Uint32(16),
                 ),
                 (
                     "llama.attention.layer_norm_rms_epsilon".into(),
@@ -760,7 +764,7 @@ mod tests {
                 ),
                 (
                     "llama.vocab_size".into(),
-                    eredu_gguf::MetadataValue::Uint32(1),
+                    eredu_gguf::MetadataValue::Uint32(16),
                 ),
                 (
                     "llama.context_length".into(),
@@ -771,29 +775,34 @@ mod tests {
         if let Some(tokenizer_eos) = tokenizer_eos {
             metadata.insert("tokenizer.ggml.eos_token_id".into(), tokenizer_eos);
         }
-        let data = 1.0_f32.to_le_bytes();
+        let vector_data = [0_u8; 64];
+        let matrix_data = [0_u8; 1024];
         let tensor = |name, dimensions| eredu_gguf::TensorInput {
             name,
             dimensions,
             ggml_type: eredu_gguf::GgmlType::F32,
-            data: &data,
+            data: if dimensions.len() == 1 {
+                &vector_data
+            } else {
+                &matrix_data
+            },
         };
         let tensors = if include_embedding_length {
             vec![
-                tensor("token_embd.weight", &[1, 1]),
-                tensor("output_norm.weight", &[1]),
-                tensor("blk.0.attn_norm.weight", &[1]),
-                tensor("blk.0.ffn_norm.weight", &[1]),
-                tensor("blk.0.attn_q.weight", &[1, 1]),
-                tensor("blk.0.attn_k.weight", &[1, 1]),
-                tensor("blk.0.attn_v.weight", &[1, 1]),
-                tensor("blk.0.attn_output.weight", &[1, 1]),
-                tensor("blk.0.ffn_gate.weight", &[1, 1]),
-                tensor("blk.0.ffn_up.weight", &[1, 1]),
-                tensor("blk.0.ffn_down.weight", &[1, 1]),
+                tensor("token_embd.weight", &[16, 16]),
+                tensor("output_norm.weight", &[16]),
+                tensor("blk.0.attn_norm.weight", &[16]),
+                tensor("blk.0.ffn_norm.weight", &[16]),
+                tensor("blk.0.attn_q.weight", &[16, 16]),
+                tensor("blk.0.attn_k.weight", &[16, 16]),
+                tensor("blk.0.attn_v.weight", &[16, 16]),
+                tensor("blk.0.attn_output.weight", &[16, 16]),
+                tensor("blk.0.ffn_gate.weight", &[16, 16]),
+                tensor("blk.0.ffn_up.weight", &[16, 16]),
+                tensor("blk.0.ffn_down.weight", &[16, 16]),
             ]
         } else {
-            vec![tensor("token_embd.weight", &[1])]
+            vec![tensor("token_embd.weight", &[16])]
         };
         eredu_gguf::Writer::default()
             .write(std::fs::File::create(path).unwrap(), &metadata, &tensors)
@@ -1051,35 +1060,40 @@ mod tests {
     }
 
     #[test]
-    fn gguf_inspection_rejects_quantization_before_complete_tensor_parallel_loading() {
+    fn gguf_inspection_admits_quantization_before_partition_route_selection() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("model.gguf");
         write_minimal_llama_gguf(&path, true, None);
-        let topology = crate::composition::mlx::distributed::topology::MlxParallelPlan::for_rank(
-            0,
-            2,
-            1,
-            1,
-            crate::backend::DeviceAssignment::new(safemlx::DeviceType::Cpu, 0),
-        )
-        .unwrap();
+        let topology = crate::test_parallel_rank(0, 2, 1, 1);
         let options = MlxInspectionOptions::new(
-            MlxLoadRequest::with_quantization(eredu_core::QuantizationRequest::MxFp4)
-                .with_parallel_topology(
-                    topology,
-                    eredu_runtime::PipelineWireContract::new(
-                        eredu_runtime::PipelineActivationDtype::Float32,
-                    ),
+            MlxLoadRequest::with_quantization(eredu_core::QuantizationRequest::Affine {
+                group_size: 16,
+                bits: 4,
+            })
+            .with_parallel_topology(
+                topology,
+                crate::backend::DeviceAssignment::new(safemlx::DeviceType::Cpu, 0),
+                eredu_runtime::PipelineWireContract::new(
+                    eredu_runtime::PipelineActivationDtype::Float32,
                 ),
+                1,
+                128,
+                MlxLoadRequest::test_communication_completion_policy(),
+            ),
         );
 
         let report = inspect_model(&path, options).unwrap();
 
-        assert_eq!(report.requested_load, InspectionReadiness::Unsupported);
-        assert!(report.issues.iter().any(|issue| {
-            issue.code == InspectionIssueCode::UnsupportedQuantizationRequest
-                && issue.detail.contains("complete tensor-parallel")
-        }));
+        assert_eq!(
+            report.requested_load,
+            InspectionReadiness::Ready,
+            "unexpected inspection issues: {:?}",
+            report.issues
+        );
+        assert!(!report
+            .issues
+            .iter()
+            .any(|issue| issue.code == InspectionIssueCode::UnsupportedQuantizationRequest));
     }
 
     #[test]

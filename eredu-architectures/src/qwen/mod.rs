@@ -19,18 +19,19 @@ pub use config::{
     prompt_cache_architecture_fingerprint, ConfigError, ModelArgs, QwenVariant, TextConfigContext,
 };
 pub use moe::{
-    expert_bank_spec, expert_realization_plan, replicated_expert_realization_plan, FeedForward,
-    RoutedGatedProduct,
+    expert_bank_spec, expert_realization_plan, partition_expert_realization_plan,
+    replicated_expert_realization_plan, FeedForward, RoutedGatedProduct,
 };
 pub use parallel::{
     layer_parallel_parameter_groups, local_block_args, local_geometry, local_key_value_heads,
-    routed_layer_parallel_parameter_groups, LocalGeometry,
+    partition_local_routed_geometry, routed_layer_parallel_parameter_groups, LocalGeometry,
 };
 
 pub use crate::decoder::{
-    cache_layout, cache_layout_with_key_value_heads, create_caches, state_layout,
-    static_parallel_parameter_groups, validate_caches, Attention, AttentionInput, ForwardContext,
-    LayeredInput, Mlp, StaticModules,
+    cache_layout, cache_layout_with_key_value_heads, create_caches, dense_parameter_description,
+    partition_local_geometry, state_layout, static_parallel_parameter_groups, validate_caches,
+    Attention, AttentionInput, ForwardContext, LayeredInput, Mlp, PartitionLocalGeometry,
+    PartitionStaticModules, StaticModules,
 };
 
 use eredu_core::cache::PromptCacheTopology;
@@ -130,6 +131,62 @@ where
 /// Shared layered lifecycle specialized to dense Qwen policy.
 pub type LayeredModel<B> = crate::decoder::LayeredModel<B, ModelArgs, QwenBlockFactory>;
 
+/// Genuinely pipeline-local neutral dense Qwen2/Qwen3 model.
+pub type PartitionedLayeredModel<B> =
+    crate::decoder::PartitionedLayeredModel<B, ModelArgs, QwenBlockFactory>;
+
+impl crate::decoder::PartitionedConfig for ModelArgs {
+    fn set_local_geometry(
+        &mut self,
+        query_heads: i32,
+        key_value_heads: i32,
+        intermediate: i32,
+    ) -> Result<(), eredu_nn::Error> {
+        if self.is_moe() {
+            return Err(eredu_nn::Error::backend(
+                "local dense Qwen geometry does not accept routed MoE configuration",
+            ));
+        }
+        if query_heads <= 0 || key_value_heads <= 0 || intermediate <= 0 {
+            return Err(eredu_nn::Error::backend(
+                "local dense Qwen geometry must be positive",
+            ));
+        }
+        self.num_attention_heads = query_heads;
+        self.num_key_value_heads = key_value_heads;
+        self.intermediate_size = intermediate;
+        Ok(())
+    }
+
+    fn local_block_config(
+        &self,
+        layer: usize,
+        layout: &eredu_runtime::LocalModelLayout,
+    ) -> Result<Self, eredu_nn::Error> {
+        if self.is_moe() {
+            return Err(eredu_nn::Error::backend(
+                "local dense Qwen geometry does not accept routed MoE configuration",
+            ));
+        }
+        parallel::local_block_args(self, layer, layout).map_err(eredu_nn::Error::backend)
+    }
+
+    fn validate_partition_parameters(
+        &self,
+        parameters: &eredu_runtime::ArchitectureParameterDescription,
+    ) -> Result<(), eredu_nn::Error> {
+        if !self.is_moe() {
+            let expected = crate::decoder::dense_parameter_description(self)
+                .map_err(eredu_nn::Error::backend)?;
+            return (&expected == parameters)
+                .then_some(())
+                .ok_or_else(|| eredu_nn::Error::backend("dense Qwen parameter topology drifted"));
+        }
+        crate::decoder::validate_partitioned_decoder_description(self, parameters)?;
+        validate_routed_partition_parameters(self, parameters)
+    }
+}
+
 /// Statically dispatched Qwen policy for adapters that admit dense and MoE configurations.
 pub struct RoutedQwenBlockFactory;
 
@@ -148,6 +205,25 @@ where
             args,
             layer,
             FeedForward::new(args, layer, context)?,
+            context,
+        )
+    }
+
+    fn build_partitioned(
+        global: &ModelArgs,
+        local: &ModelArgs,
+        layer: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<RoutedTransformerBlock<B>, Error> {
+        if !global.is_moe() || !local.is_moe() {
+            return Err(Error::backend(
+                "partitioned routed Qwen construction requires Qwen3-MoE",
+            ));
+        }
+        assemble_block(
+            local,
+            layer,
+            FeedForward::new_partitioned(global, local, layer, context)?,
             context,
         )
     }
@@ -172,8 +248,72 @@ pub fn new_routed_block<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBac
     )
 }
 
+/// Builds one partition-local routed block with a global router and the exact
+/// TP/EP-local expert bank selected by architecture geometry.
+pub fn new_partitioned_routed_block<
+    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
+>(
+    global: &ModelArgs,
+    local: &ModelArgs,
+    layer: usize,
+    context: &<B::Tensor as Tensor>::Context,
+) -> Result<RoutedTransformerBlock<B>, Error> {
+    <RoutedQwenBlockFactory as crate::decoder::BlockFactory<B, ModelArgs>>::build_partitioned(
+        global, local, layer, context,
+    )
+}
+
 /// Layered Qwen lifecycle for adapters that dynamically admit dense and MoE configurations.
 pub type RoutedLayeredModel<B> = crate::decoder::LayeredModel<B, ModelArgs, RoutedQwenBlockFactory>;
+
+/// Pipeline-local Qwen3-MoE model with global routing and local expert banks.
+pub type PartitionedRoutedLayeredModel<B> =
+    crate::decoder::PartitionedLayeredModel<B, ModelArgs, RoutedQwenBlockFactory>;
+
+fn validate_routed_partition_parameters(
+    args: &ModelArgs,
+    parameters: &eredu_runtime::ArchitectureParameterDescription,
+) -> Result<(), Error> {
+    let experts = usize::try_from(args.num_experts).map_err(Error::backend)?;
+    let layers = usize::try_from(args.num_hidden_layers).map_err(Error::backend)?;
+    for layer in 0..layers {
+        let prefix = format!("{}.layers.{layer}", args.parameter_root);
+        for required in [
+            format!("{prefix}.mlp.gate"),
+            format!("{prefix}.mlp.experts.intermediate"),
+            format!("{prefix}.self_attn.q_norm"),
+            format!("{prefix}.self_attn.k_norm"),
+        ] {
+            if !parameters
+                .groups()
+                .iter()
+                .any(|owned| owned.group().logical_name() == required)
+            {
+                return Err(Error::backend(format!(
+                    "routed Qwen parameter description omits {required}"
+                )));
+            }
+        }
+        let expert_group = parameters
+            .groups()
+            .iter()
+            .find(|owned| {
+                owned.group().logical_name() == format!("{prefix}.mlp.experts.intermediate")
+            })
+            .expect("required expert group was checked above");
+        if expert_group
+            .group()
+            .members()
+            .iter()
+            .any(|member| member.global_shape().first().copied() != Some(experts))
+        {
+            return Err(Error::backend(format!(
+                "routed Qwen unit {layer} expert axis differs from {experts}"
+            )));
+        }
+    }
+    Ok(())
+}
 
 /// Declares Qwen cache identity independently of concrete cache storage.
 pub fn state_identity(

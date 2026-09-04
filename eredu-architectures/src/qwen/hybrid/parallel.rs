@@ -1,10 +1,12 @@
 //! Semantic tensor-parallel placement for shared Qwen hybrid units.
 
+use std::ops::Range;
+
 use eredu_nn::{GroupedNeuralBackend, VocabularyParallelRange};
 use eredu_runtime::{
     aligned_partition_units, module_parameter_group, partitioned_module_parameter_group,
-    LocalModelLayout, MemberSharding, ParallelPlanError, ParameterGroupSpec, ParameterRole,
-    StateLayout, TensorPlacement,
+    ArchitecturePartition, LocalModelLayout, MemberSharding, ParallelPlanError, ParameterGroupSpec,
+    ParameterRole, PartitionOwnership, StateLayout, TensorPlacement,
 };
 
 use super::{
@@ -211,6 +213,271 @@ pub struct ConditionalLocalGeometry {
     merger_widths: Vec<i32>,
 }
 
+/// Exact dense prediction-free conditional-Qwen geometry owned by one TP/PP rank.
+#[derive(Debug, Clone)]
+pub struct ConditionalPartitionLocalGeometry {
+    vision_units: Option<Range<usize>>,
+    vision_blocks: Vec<(i32, i32)>,
+    target_units: Range<usize>,
+    target: Vec<HybridConfig>,
+    embedding_range: VocabularyParallelRange,
+    output_range: Option<VocabularyParallelRange>,
+    merger_widths: Vec<i32>,
+    deepstack_layers: Vec<i32>,
+    complete_state_layout: StateLayout,
+    static_roles: Vec<String>,
+    owns_input: bool,
+    owns_output: bool,
+    architecture_fingerprint: String,
+}
+
+/// Validated architecture-owned handoff for one conditional-Qwen partition.
+#[derive(Debug, Clone)]
+pub struct ConditionalPartitionLocalFoundation {
+    geometry: ConditionalPartitionLocalGeometry,
+    parameter_targets: Vec<String>,
+}
+
+impl ConditionalPartitionLocalGeometry {
+    /// Architecture-global optional vision units owned here.
+    pub fn vision_units(&self) -> Option<Range<usize>> {
+        self.vision_units.clone()
+    }
+
+    /// Architecture-global target units owned here.
+    pub fn target_units(&self) -> Range<usize> {
+        self.target_units.clone()
+    }
+
+    /// Returns one TP-local target configuration by architecture-global index.
+    pub fn target(&self, global_unit: usize) -> Option<&HybridConfig> {
+        self.target_units
+            .contains(&global_unit)
+            .then(|| &self.target[global_unit - self.target_units.start])
+    }
+
+    /// Returns one TP-local owned vision block's `(heads, intermediate)` geometry.
+    pub fn vision_block(&self, global_unit: usize) -> Option<(i32, i32)> {
+        let range = self.vision_units.as_ref()?;
+        range
+            .contains(&global_unit)
+            .then(|| self.vision_blocks[global_unit - range.start])
+    }
+
+    /// Input vocabulary ownership on this TP rank.
+    pub const fn embedding_range(&self) -> &VocabularyParallelRange {
+        &self.embedding_range
+    }
+
+    /// Untied output vocabulary ownership on this TP rank.
+    pub const fn output_range(&self) -> Option<&VocabularyParallelRange> {
+        self.output_range.as_ref()
+    }
+
+    /// Main plus per-DeepStack merger widths owned by the vision static root.
+    pub fn merger_widths(&self) -> &[i32] {
+        &self.merger_widths
+    }
+
+    /// Vision-layer indices contributing immutable DeepStack boundary values.
+    pub fn deepstack_layers(&self) -> &[i32] {
+        &self.deepstack_layers
+    }
+
+    /// Complete TP-local target state before PP slicing.
+    pub const fn complete_state_layout(&self) -> &StateLayout {
+        &self.complete_state_layout
+    }
+
+    /// Exact target-state slice owned by this PP rank.
+    pub fn local_state_layout(&self) -> Result<StateLayout, ParallelPlanError> {
+        self.complete_state_layout
+            .slice(self.target_units.clone())
+            .map_err(|error| invalid(error.to_string()))
+    }
+
+    /// Selected static roles in canonical vision/target order.
+    pub fn static_roles(&self) -> &[String] {
+        &self.static_roles
+    }
+
+    fn validate_for(&self, parsed: &ParsedHybridConfig) -> Result<(), ParallelPlanError> {
+        require_prediction_free_conditional(parsed)?;
+        let target_count = usize::try_from(parsed.text.num_hidden_layers)
+            .map_err(|_| invalid("conditional Qwen target layer count is negative"))?;
+        let vision = parsed
+            .vision
+            .as_ref()
+            .ok_or_else(|| invalid("conditional Qwen partition has no vision policy"))?;
+        if self.architecture_fingerprint
+            != super::conditional_prompt_cache_architecture_fingerprint(parsed)
+            || self.target_units.is_empty()
+            || self.target_units.end > target_count
+            || self.target.len() != self.target_units.len()
+            || self.complete_state_layout.len() != target_count
+            || self.owns_input != (self.target_units.start == 0)
+            || self.owns_output != (self.target_units.end == target_count)
+        {
+            return Err(invalid(
+                "partition-local conditional Qwen geometry belongs to another model or partition",
+            ));
+        }
+        match &self.vision_units {
+            Some(range)
+                if !range.is_empty()
+                    && range.end <= vision.layer_count()
+                    && range.len() == self.vision_blocks.len() => {}
+            None if self.vision_blocks.is_empty() => {}
+            _ => {
+                return Err(invalid(
+                    "partition-local conditional Qwen vision range is invalid",
+                ))
+            }
+        }
+        self.embedding_range
+            .validate_global_rows(parsed.text.vocab_size)
+            .map_err(|error| invalid(error.to_string()))?;
+        match (parsed.text.tie_word_embeddings, self.output_range.as_ref()) {
+            (true, None) => {}
+            (false, Some(range)) => range
+                .validate_global_rows(parsed.text.vocab_size)
+                .map_err(|error| invalid(error.to_string()))?,
+            _ => {
+                return Err(invalid(
+                    "conditional Qwen output vocabulary ownership drifted",
+                ))
+            }
+        }
+        if self.merger_widths.len() != vision.deepstack_layer_count() + 1
+            || self.deepstack_layers != vision.deepstack_layers()
+        {
+            return Err(invalid(
+                "partition-local conditional Qwen DeepStack geometry drifted",
+            ));
+        }
+        let mut expected_roles = Vec::<String>::new();
+        if self
+            .vision_units
+            .as_ref()
+            .is_some_and(|range| range.start == 0)
+        {
+            expected_roles.push("vision".into());
+        }
+        if self.target_units.start == 0 {
+            expected_roles.push("embedding".into());
+        }
+        if self.target_units.end == target_count {
+            expected_roles.push("norm".into());
+            let output = if parsed.text.tie_word_embeddings {
+                "embedding"
+            } else {
+                "output"
+            };
+            if !expected_roles.iter().any(|role| role == output) {
+                expected_roles.push(output.into());
+            }
+        }
+        if self.static_roles != expected_roles {
+            return Err(invalid(format!(
+                "partition-local conditional Qwen static roles {:?} differ from {:?}",
+                self.static_roles, expected_roles
+            )));
+        }
+        self.local_state_layout()?;
+        Ok(())
+    }
+}
+
+impl ConditionalPartitionLocalFoundation {
+    /// Validates graph ranges, target state, DeepStack boundary, and selected parameters.
+    pub fn from_partition(
+        parsed: &ParsedHybridConfig,
+        partition: &ArchitecturePartition<
+            ConditionalPartitionLocalGeometry,
+            super::ConditionalPipelineBoundarySchema,
+        >,
+    ) -> Result<Self, ParallelPlanError> {
+        let geometry = partition.local_geometry();
+        geometry.validate_for(parsed)?;
+        let expected_groups = [
+            geometry
+                .vision_units()
+                .map(|range| (super::VISION_EXECUTION_GROUP, range)),
+            Some((
+                crate::decoder::TARGET_EXECUTION_GROUP,
+                geometry.target_units(),
+            )),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        let actual_groups = partition
+            .groups()
+            .iter()
+            .map(|group| (group.group().as_str(), group.global_units()))
+            .collect::<Vec<_>>();
+        if actual_groups != expected_groups {
+            return Err(invalid(
+                "conditional Qwen partition groups differ from family-local geometry",
+            ));
+        }
+        let state = partition
+            .state()
+            .ok_or_else(|| invalid("conditional Qwen target partition has no state"))?;
+        if state.global_layer_offset() != geometry.target_units.start
+            || state.layout() != &geometry.local_state_layout()?
+        {
+            return Err(invalid(
+                "conditional Qwen partition state differs from its target range",
+            ));
+        }
+        let boundary = partition.boundary_schema();
+        let expected_auxiliary = (0..geometry.deepstack_layers.len())
+            .map(|index| {
+                eredu_runtime::BoundaryTensorSpec::new(
+                    format!("deepstack.{index}"),
+                    [
+                        eredu_runtime::BoundaryTensorDimension::Batch,
+                        eredu_runtime::BoundaryTensorDimension::Sequence,
+                        eredu_runtime::BoundaryTensorDimension::Fixed(parsed.text.hidden_size),
+                    ],
+                    eredu_runtime::BoundaryTensorDtype::Activation,
+                )
+            })
+            .collect::<Vec<_>>();
+        if boundary.deepstack_count() != geometry.deepstack_layers.len()
+            || eredu_runtime::ArchitectureBoundary::primary_tensor_spec(boundary)
+                != eredu_runtime::BoundaryTensorSpec::primary_activation(parsed.text.hidden_size)
+            || eredu_runtime::ArchitectureBoundary::auxiliary_tensor_specs(boundary)
+                != expected_auxiliary
+        {
+            return Err(invalid(
+                "conditional Qwen partition boundary differs from DeepStack geometry",
+            ));
+        }
+        let parameter_targets = partition
+            .parameter_bindings()
+            .iter()
+            .flat_map(|binding| binding.members())
+            .map(|member| member.target().to_owned())
+            .collect();
+        Ok(Self {
+            geometry: geometry.clone(),
+            parameter_targets,
+        })
+    }
+
+    /// Exact family-local construction geometry.
+    pub const fn geometry(&self) -> &ConditionalPartitionLocalGeometry {
+        &self.geometry
+    }
+
+    /// Canonical selected materialization targets.
+    pub fn parameter_targets(&self) -> &[String] {
+        &self.parameter_targets
+    }
+}
+
 impl ConditionalLocalGeometry {
     /// Returns the local target/MTP/vocabulary/state geometry.
     pub const fn text(&self) -> &LocalGeometry {
@@ -275,6 +542,142 @@ pub fn conditional_local_geometry(
         text,
         vision_blocks,
         merger_widths,
+    };
+    geometry.validate_for(parsed)?;
+    Ok(geometry)
+}
+
+fn require_dense_prediction_free_conditional(
+    parsed: &ParsedHybridConfig,
+) -> Result<(), ParallelPlanError> {
+    require_prediction_free_conditional(parsed)?;
+    if parsed.text.is_moe() {
+        return Err(invalid(
+            "partition-local routed conditional Qwen requires a selected expert realization",
+        ));
+    }
+    Ok(())
+}
+
+fn require_prediction_free_conditional(
+    parsed: &ParsedHybridConfig,
+) -> Result<(), ParallelPlanError> {
+    if parsed.text.mtp_num_hidden_layers != 0 {
+        return Err(invalid(
+            "partition-local conditional Qwen prediction requires an explicit prediction bridge",
+        ));
+    }
+    if parsed.vision.is_none() {
+        return Err(invalid(
+            "partition-local conditional Qwen requires an admitted vision policy",
+        ));
+    }
+    Ok(())
+}
+
+fn conditional_partition_ranges(
+    group_ranges: impl IntoIterator<Item = (impl AsRef<str>, Range<usize>)>,
+) -> Result<(Option<Range<usize>>, Range<usize>), ParallelPlanError> {
+    let mut vision = None;
+    let mut target = None;
+    for (group, range) in group_ranges {
+        if range.is_empty() {
+            return Err(invalid(
+                "conditional Qwen partition group range cannot be empty",
+            ));
+        }
+        let slot = match group.as_ref() {
+            super::VISION_EXECUTION_GROUP => &mut vision,
+            crate::decoder::TARGET_EXECUTION_GROUP => &mut target,
+            other => {
+                return Err(invalid(format!(
+                    "unknown conditional Qwen partition group {other:?}"
+                )))
+            }
+        };
+        if slot.replace(range).is_some() {
+            return Err(invalid("duplicate conditional Qwen partition group"));
+        }
+    }
+    Ok((
+        vision,
+        target.ok_or_else(|| invalid("conditional Qwen partition has no target range"))?,
+    ))
+}
+
+/// Derives exact dense prediction-free TP/PP-local conditional-Qwen geometry.
+pub fn conditional_partition_local_geometry(
+    parsed: &ParsedHybridConfig,
+    layout: &LocalModelLayout,
+    group_ranges: impl IntoIterator<Item = (impl AsRef<str>, Range<usize>)>,
+    ownership: &PartitionOwnership,
+) -> Result<ConditionalPartitionLocalGeometry, ParallelPlanError> {
+    require_dense_prediction_free_conditional(parsed)?;
+    conditional_partition_local_geometry_impl(parsed, layout, group_ranges, ownership)
+}
+
+pub(crate) fn routed_conditional_partition_local_geometry(
+    parsed: &ParsedHybridConfig,
+    layout: &LocalModelLayout,
+    group_ranges: impl IntoIterator<Item = (impl AsRef<str>, Range<usize>)>,
+    ownership: &PartitionOwnership,
+) -> Result<ConditionalPartitionLocalGeometry, ParallelPlanError> {
+    require_prediction_free_conditional(parsed)?;
+    if !parsed.text.is_moe() {
+        return Err(invalid(
+            "routed conditional Qwen has no sparse target units",
+        ));
+    }
+    conditional_partition_local_geometry_impl(parsed, layout, group_ranges, ownership)
+}
+
+fn conditional_partition_local_geometry_impl(
+    parsed: &ParsedHybridConfig,
+    layout: &LocalModelLayout,
+    group_ranges: impl IntoIterator<Item = (impl AsRef<str>, Range<usize>)>,
+    ownership: &PartitionOwnership,
+) -> Result<ConditionalPartitionLocalGeometry, ParallelPlanError> {
+    let (vision_units, target_units) = conditional_partition_ranges(group_ranges)?;
+    let complete = conditional_local_geometry(parsed, layout)?;
+    let target_count = complete.text.target.len();
+    if target_units.is_empty() || target_units.end > target_count {
+        return Err(invalid(format!(
+            "conditional Qwen target range {target_units:?} is outside {target_count} layers"
+        )));
+    }
+    let vision_count = complete.vision_blocks.len();
+    if vision_units
+        .as_ref()
+        .is_some_and(|range| range.is_empty() || range.end > vision_count)
+    {
+        return Err(invalid(format!(
+            "conditional Qwen vision range {vision_units:?} is outside {vision_count} layers"
+        )));
+    }
+    let vision_blocks = vision_units
+        .clone()
+        .into_iter()
+        .flatten()
+        .map(|global| complete.vision_blocks[global])
+        .collect();
+    let geometry = ConditionalPartitionLocalGeometry {
+        vision_units,
+        vision_blocks,
+        target: complete.text.target[target_units.clone()].to_vec(),
+        target_units,
+        embedding_range: complete.text.embedding_range,
+        output_range: complete.text.output_range,
+        merger_widths: complete.merger_widths,
+        deepstack_layers: parsed
+            .vision
+            .as_ref()
+            .expect("validated conditional vision")
+            .deepstack_layers(),
+        complete_state_layout: complete.text.state_layout,
+        static_roles: ownership.static_roles().to_vec(),
+        owns_input: ownership.owns_input(),
+        owns_output: ownership.owns_output(),
+        architecture_fingerprint: super::conditional_prompt_cache_architecture_fingerprint(parsed),
     };
     geometry.validate_for(parsed)?;
     Ok(geometry)

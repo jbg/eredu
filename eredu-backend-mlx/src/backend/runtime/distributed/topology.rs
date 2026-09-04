@@ -1,16 +1,24 @@
 //! MLX checkpoint placement and selective materialization.
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
-    marker::PhantomData,
     path::{Path, PathBuf},
 };
 
 use eredu_checkpoint::store::{
     CheckpointSource, ReadPolicy, SafetensorsWeightStore, TensorReadRequest, TensorSelection,
 };
-use eredu_core::{CollectiveGroupDescriptor, CollectiveGroupId};
-use eredu_runtime::TensorPlacement;
+use eredu_core::{
+    checkpoint::TensorDtype, BoundedSubmissionOutcome, CollectiveGroupDescriptor,
+    CollectiveGroupId, Submission,
+};
+use eredu_runtime::{
+    CommunicationCapabilities, CommunicationCompletionCapabilities, CommunicationGroupDescriptor,
+    CommunicationManifest, CommunicationOperation, CommunicationOperationRequirement,
+    CommunicationRouteDescriptor, CommunicationRouteId, CommunicationTensorLimits, TensorPlacement,
+};
 use safemlx::{distributed::Group as NativeGroup, Array, Stream};
 
 use crate::{
@@ -24,6 +32,19 @@ use crate::backend::DeviceAssignment;
 #[cfg(test)]
 use safemlx::{Device, DeviceType};
 
+#[cfg(test)]
+static MANIFEST_GROUP_REALIZATIONS: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(super) fn reset_manifest_group_realizations() {
+    MANIFEST_GROUP_REALIZATIONS.store(0, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub(super) fn manifest_group_realizations() -> usize {
+    MANIFEST_GROUP_REALIZATIONS.load(Ordering::Relaxed)
+}
+
 type LogicalRoutePlan = Vec<(usize, Vec<Option<usize>>)>;
 
 /// Backend-only realization of one opaque collective group.
@@ -34,6 +55,7 @@ pub(crate) struct CollectiveGroupRealization {
     local_rank: usize,
     split_color: usize,
     logical_routes: Option<LogicalRoutePlan>,
+    manifest_descriptor: Option<CommunicationGroupDescriptor>,
 }
 
 impl CollectiveGroupRealization {
@@ -52,12 +74,43 @@ impl CollectiveGroupRealization {
             local_rank,
             split_color,
             logical_routes,
+            manifest_descriptor: None,
         })
     }
 
     pub(crate) fn descriptor(&self) -> CollectiveGroupDescriptor {
         CollectiveGroupDescriptor::new(self.id, self.members.clone(), self.local_rank)
             .expect("collective realization is validated at construction")
+    }
+
+    fn from_manifest_descriptor(descriptor: &CommunicationGroupDescriptor) -> Result<Self, Error> {
+        let local_rank = descriptor.local_index().ok_or_else(|| {
+            Error::Parallel(format!(
+                "MLX communication group {} does not contain manifest rank",
+                descriptor.id().value()
+            ))
+        })?;
+        let split_color = usize::try_from(descriptor.id().value())
+            .map_err(|_| Error::Parallel("opaque communication group ID exceeds usize".into()))?;
+        if split_color == 0 {
+            return Err(Error::Parallel(
+                "opaque communication group ID zero is reserved".into(),
+            ));
+        }
+        i32::try_from(split_color)
+            .map_err(|_| Error::Parallel("opaque communication group ID exceeds i32".into()))?;
+        i32::try_from(local_rank).map_err(|_| {
+            Error::Parallel("opaque communication group local index exceeds i32".into())
+        })?;
+        let mut realization = Self::new(
+            descriptor.id(),
+            descriptor.members().to_vec(),
+            local_rank,
+            split_color,
+            None,
+        )?;
+        realization.manifest_descriptor = Some(descriptor.clone());
+        Ok(realization)
     }
 }
 
@@ -105,31 +158,406 @@ impl CollectiveRealization {
         self.global_rank
     }
 
-    pub(crate) fn descriptor(&self) -> eredu_core::DistributedSessionDescriptor {
-        eredu_core::DistributedSessionDescriptor::new(
-            self.world_size,
-            self.global_rank,
-            self.groups
-                .iter()
-                .filter(|group| group.members.len() > 1)
-                .map(CollectiveGroupRealization::descriptor)
-                .collect(),
-        )
-        .expect("collective realization is validated at construction")
+    fn from_manifest(manifest: &CommunicationManifest) -> Result<Self, Error> {
+        let groups =
+            manifest.try_create_groups(CollectiveGroupRealization::from_manifest_descriptor)?;
+        Self::new(manifest.world_size(), manifest.rank(), groups)
     }
+}
+
+/// Backend-owned handle for one opaque directed communication route.
+#[derive(Debug, Clone)]
+pub struct CommunicationRouteRealization {
+    descriptor: CommunicationRouteDescriptor,
+    group: Option<Group>,
+    endpoint: Option<CommunicationRouteEndpoint>,
+    peer_rank: Option<usize>,
+}
+
+/// This rank's role in one realized directed route.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum CommunicationRouteEndpoint {
+    /// Supplies the boundary tensor bundle.
+    Source,
+    /// Receives the boundary tensor bundle.
+    Destination,
+}
+
+impl CommunicationRouteRealization {
+    fn from_descriptor(
+        descriptor: &CommunicationRouteDescriptor,
+        world: &Group,
+        world_collective_wave: bool,
+    ) -> Result<Self, Error> {
+        if descriptor.source() >= world.size() || descriptor.destination() >= world.size() {
+            return Err(Error::Parallel(format!(
+                "communication route {} endpoints {} -> {} exceed owned world size {}",
+                descriptor.id().value(),
+                descriptor.source(),
+                descriptor.destination(),
+                world.size()
+            )));
+        }
+        let endpoint = match world.rank() {
+            rank if rank == descriptor.source() => Some(CommunicationRouteEndpoint::Source),
+            rank if rank == descriptor.destination() => {
+                Some(CommunicationRouteEndpoint::Destination)
+            }
+            _ => None,
+        };
+        let group = endpoint
+            .map(|_| world.logical_subgroup(&[descriptor.source(), descriptor.destination()]))
+            .transpose()
+            .map(|group| group.map(|group| group.with_world_collective_wave(world_collective_wave)))
+            .map_err(|error| {
+                Error::Parallel(format!(
+                    "failed to realize communication route {} as endpoint subgroup [{}, {}]: {error}",
+                    descriptor.id().value(),
+                    descriptor.source(),
+                    descriptor.destination()
+                ))
+            })?;
+        let peer_rank = endpoint.map(|endpoint| match endpoint {
+            CommunicationRouteEndpoint::Source => 1,
+            CommunicationRouteEndpoint::Destination => 0,
+        });
+        Ok(Self {
+            descriptor: descriptor.clone(),
+            group,
+            endpoint,
+            peer_rank,
+        })
+    }
+
+    /// Returns the exact neutral descriptor retained by this route handle.
+    pub const fn descriptor(&self) -> &CommunicationRouteDescriptor {
+        &self.descriptor
+    }
+
+    /// Returns this rank's retained endpoint role, if it participates.
+    pub const fn endpoint(&self) -> Option<CommunicationRouteEndpoint> {
+        self.endpoint
+    }
+
+    /// Returns the endpoint-local peer index in the ordered `[source, destination]` group.
+    pub const fn peer_rank(&self) -> Option<usize> {
+        self.peer_rank
+    }
+
+    /// Returns the exact two-member endpoint subgroup on a participating rank.
+    pub(crate) const fn group(&self) -> Option<&Group> {
+        self.group.as_ref()
+    }
+}
+
+#[derive(Debug)]
+struct PreparedCommunicationManifest {
+    groups: CollectiveRealization,
+    routes: Vec<CommunicationRouteDescriptor>,
+}
+
+fn world_collective_wave_proofs(manifests: &[CommunicationManifest]) -> Result<Vec<bool>, Error> {
+    let Some(reference) = manifests.first() else {
+        return Err(Error::Parallel(
+            "communication consensus returned no rank manifests".into(),
+        ));
+    };
+    let world_size = reference.world_size();
+    let mut by_rank = vec![None; world_size];
+    for manifest in manifests {
+        if manifest.world_size() != world_size
+            || manifest.groups().len() != reference.groups().len()
+            || manifest.rank() >= world_size
+            || by_rank[manifest.rank()].replace(manifest).is_some()
+        {
+            return Err(Error::Parallel(
+                "communication consensus returned invalid or duplicate rank manifests".into(),
+            ));
+        }
+    }
+    if by_rank.iter().any(Option::is_none) {
+        return Err(Error::Parallel(
+            "communication consensus omitted one or more rank manifests".into(),
+        ));
+    }
+    Ok((0..reference.groups().len())
+        .map(|order| {
+            let requirements = reference.groups()[order].requirements();
+            manifests.iter().all(|manifest| {
+                let rank = manifest.rank();
+                let Some(group) = manifest.groups().get(order) else {
+                    return false;
+                };
+                if group.requirements() != requirements
+                    || group.creation_order() != order
+                    || group
+                        .members()
+                        .get(group.local_index().unwrap_or(usize::MAX))
+                        != Some(&rank)
+                {
+                    return false;
+                }
+                group.members().iter().all(|member| {
+                    by_rank
+                        .get(*member)
+                        .and_then(|peer| *peer)
+                        .and_then(|peer| peer.groups().get(order))
+                        .is_some_and(|peer| {
+                            peer.id() == group.id()
+                                && peer.members() == group.members()
+                                && peer.requirements() == group.requirements()
+                                && peer.creation_order() == group.creation_order()
+                        })
+                })
+            })
+        })
+        .collect())
+}
+
+fn validate_logical_variable_all_to_all_waves(
+    manifest: &CommunicationManifest,
+    proofs: &[bool],
+) -> Result<(), Error> {
+    for (order, group) in manifest.groups().iter().enumerate() {
+        let requires_wave = group.members().len() < manifest.world_size()
+            && group.requirements().operations().iter().any(|requirement| {
+                requirement.operation() == CommunicationOperation::VariableAllToAll
+            });
+        if requires_wave && proofs.get(order) != Some(&true) {
+            return Err(Error::Parallel(format!(
+                "opaque logical group {} selects VariableAllToAll without a consensus-proven world participation wave",
+                group.id().value()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn route_world_collective_wave_proofs(
+    world_size: usize,
+    routes: &[CommunicationRouteDescriptor],
+) -> Vec<bool> {
+    let mut proofs = vec![false; routes.len()];
+    let mut batch_start = 0;
+    while batch_start < routes.len() {
+        let reference = &routes[batch_start];
+        let mut members = vec![false; world_size];
+        let mut batch_end = batch_start;
+        while batch_end < routes.len() {
+            let route = &routes[batch_end];
+            if route.requirement() != reference.requirement()
+                || route.boundary_contract() != reference.boundary_contract()
+                || members[route.source()]
+                || members[route.destination()]
+            {
+                break;
+            }
+            members[route.source()] = true;
+            members[route.destination()] = true;
+            batch_end += 1;
+            if members.iter().all(|member| *member) {
+                proofs[batch_start..batch_end].fill(true);
+                break;
+            }
+        }
+        batch_start = batch_end.max(batch_start + 1);
+    }
+    proofs
+}
+
+struct NativeWorldManifestTransport<'a> {
+    world: &'a NativeGroup,
+    stream: &'a Stream,
+    completion: eredu_runtime::CommunicationCompletionPolicy,
+}
+
+fn manifest_consensus_completion_policy() -> eredu_runtime::CommunicationCompletionPolicy {
+    // The manifest's own policy is untrusted input until all ranks have
+    // exchanged it. Use one backend setup bound solely for that control-plane
+    // exchange, then validate and install the agreed serialized policy.
+    eredu_runtime::CommunicationCompletionPolicy::new(
+        std::time::Duration::from_secs(30),
+        eredu_core::CompletionCancellationMode::QuarantineUntilComplete,
+    )
+    .expect("static manifest-consensus completion policy is valid")
+}
+
+impl eredu_core::consensus::ConsensusTransport for NativeWorldManifestTransport<'_> {
+    type Error = Error;
+
+    fn participant_count(&self) -> usize {
+        self.world.size()
+    }
+
+    fn all_gather_words(&self, local: &[u32]) -> Result<Vec<u32>, Self::Error> {
+        let deadline = safemlx::RuntimeCallDeadline::new(self.completion.timeout())?;
+        let _setup = deadline.enter()?;
+        let length = i32::try_from(local.len())
+            .map_err(|_| Error::Parallel("communication manifest frame exceeds i32".into()))?;
+        let signed = local.iter().map(|word| *word as i32).collect::<Vec<_>>();
+        let local = Array::from_slice(&signed, &[length]);
+        _setup.check()?;
+        let gathered = safemlx::distributed::all_gather(&local, self.world, self.stream)?;
+        let completion =
+            crate::backend::runtime::distributed::completion::MlxCommunicationCompletion::submit(
+                [&gathered],
+                vec![local, gathered.clone()],
+                Vec::new(),
+                vec![Group::uncontracted(self.world)],
+                Vec::new(),
+                vec![self.stream.clone()],
+            )?;
+        let (words, completion) = completion.with_i32_words(gathered);
+        match (Submission {
+            output: words,
+            completion,
+        })
+        .wait_bounded(self.completion.bounded_wait())?
+        {
+            BoundedSubmissionOutcome::Completed(words) => {
+                Ok(words
+                    .resolve()?
+                    .iter()
+                    .map(|word| *word as u32)
+                    .collect())
+            }
+            BoundedSubmissionOutcome::DeadlineExceeded { cancellation } => {
+                Err(Error::Parallel(format!(
+                    "communication manifest consensus exceeded its selected deadline ({cancellation:?})"
+                )))
+            }
+        }
+    }
+}
+
+impl PreparedCommunicationManifest {
+    fn new(manifest: &CommunicationManifest) -> Result<Self, Error> {
+        let groups = CollectiveRealization::from_manifest(manifest)?;
+        let routes = manifest.routes().to_vec();
+        Ok(Self { groups, routes })
+    }
+}
+
+fn mlx_collective_dtypes() -> [TensorDtype; 3] {
+    [TensorDtype::F32, TensorDtype::F16, TensorDtype::Bf16]
+}
+
+fn mlx_even_gather_dtypes() -> [TensorDtype; 4] {
+    [
+        TensorDtype::F32,
+        TensorDtype::F16,
+        TensorDtype::Bf16,
+        TensorDtype::I32,
+    ]
+}
+
+fn mlx_variable_all_to_all_dtypes() -> [TensorDtype; 4] {
+    [
+        TensorDtype::F32,
+        TensorDtype::F16,
+        TensorDtype::Bf16,
+        TensorDtype::I32,
+    ]
+}
+
+fn mlx_point_to_point_dtypes() -> [TensorDtype; 5] {
+    [
+        TensorDtype::F32,
+        TensorDtype::F16,
+        TensorDtype::Bf16,
+        TensorDtype::I32,
+        TensorDtype::U32,
+    ]
+}
+
+/// Conservative operation surface implemented by reusable MLX mechanisms.
+pub(crate) fn mlx_communication_capabilities() -> CommunicationCapabilities {
+    let tensor_limits =
+        CommunicationTensorLimits::new(1, i32::MAX as usize, i32::MAX as usize, None)
+            .expect("static MLX tensor limits are valid");
+    let collective_requirement = |operation| {
+        CommunicationOperationRequirement::tensors(
+            operation,
+            mlx_collective_dtypes(),
+            tensor_limits,
+            true,
+        )
+        .expect("static MLX communication capability is valid")
+    };
+    let variable = CommunicationOperationRequirement::tensors(
+        CommunicationOperation::VariableAllToAll,
+        mlx_variable_all_to_all_dtypes(),
+        CommunicationTensorLimits::new(
+            1,
+            i32::MAX as usize,
+            i32::MAX as usize,
+            Some(i32::MAX as usize),
+        )
+        .expect("static MLX variable all-to-all limits are valid"),
+        true,
+    )
+    .expect("static MLX variable all-to-all capability is valid");
+    let point_to_point = CommunicationOperationRequirement::tensors(
+        CommunicationOperation::SendReceive,
+        mlx_point_to_point_dtypes(),
+        CommunicationTensorLimits::new(
+            i32::MAX as usize,
+            i32::MAX as usize,
+            i32::MAX as usize,
+            None,
+        )
+        .expect("static MLX point-to-point limits are valid"),
+        true,
+    )
+    .expect("static MLX point-to-point capability is valid");
+    CommunicationCapabilities::new([
+        collective_requirement(CommunicationOperation::AllReduceSum),
+        CommunicationOperationRequirement::tensors(
+            CommunicationOperation::AllGatherEven,
+            mlx_even_gather_dtypes(),
+            tensor_limits,
+            true,
+        )
+        .expect("static MLX even all-gather capability is valid"),
+        collective_requirement(CommunicationOperation::AllGatherUneven),
+        variable,
+        point_to_point,
+        collective_requirement(CommunicationOperation::Broadcast),
+        CommunicationOperationRequirement::barrier(true),
+        CommunicationOperationRequirement::failure_agreement(true),
+    ])
+    .expect("static MLX communication capabilities are valid")
+    .with_boundary_framing([eredu_runtime::BoundaryFramingProtocol::RoleExactV1])
+    .expect("static MLX boundary framing capability is valid")
+    .with_completion_capabilities(
+        CommunicationCompletionCapabilities::new([
+            eredu_core::CompletionCancellationMode::QuarantineUntilComplete,
+        ])
+        .expect("static MLX completion capabilities are valid"),
+    )
+}
+
+fn validate_mlx_communication_manifest(manifest: &CommunicationManifest) -> Result<(), Error> {
+    mlx_communication_capabilities()
+        .validate_manifest(manifest)
+        .map_err(|error| {
+            Error::Parallel(format!(
+                "communication manifest exceeds MLX mechanism capabilities: {error}"
+            ))
+        })
 }
 
 /// Backend communication contexts materialized from opaque group realizations.
 ///
-/// Construction is collective when a non-global subgroup must be split. All
-/// ranks must call [`Self::new`] in the same order. Singleton axes do not own a
-/// communication group, while an axis spanning the complete world borrows the
-/// original group without splitting it.
-pub struct ParallelCommunicators<'a> {
+/// Uncontracted construction may enter native subgroup splits. Opaque manifest
+/// construction creates exact logical membership views and permits a
+/// world-collective implementation only when consensus proves a complete,
+/// same-requirement subgroup wave at that creation order.
+pub struct ParallelCommunicators {
     realization: CollectiveRealization,
-    world: Group,
+    control_world: Group,
     groups: HashMap<CollectiveGroupId, GroupCommunicator>,
-    _world: PhantomData<&'a NativeGroup>,
+    routes: HashMap<CommunicationRouteId, CommunicationRouteRealization>,
 }
 
 struct GroupCommunicator {
@@ -137,7 +565,7 @@ struct GroupCommunicator {
     native: Option<Group>,
 }
 
-impl std::fmt::Debug for ParallelCommunicators<'_> {
+impl std::fmt::Debug for ParallelCommunicators {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("ParallelCommunicators")
@@ -146,12 +574,70 @@ impl std::fmt::Debug for ParallelCommunicators<'_> {
     }
 }
 
-impl<'a> ParallelCommunicators<'a> {
-    /// Validates the world group and materializes every required native subgroup.
-    pub(crate) fn new(
-        realization: CollectiveRealization,
-        world: &'a NativeGroup,
+impl ParallelCommunicators {
+    /// Realizes an already selected opaque manifest without semantic topology input.
+    ///
+    /// Capability and descriptor conversion complete before group realization.
+    /// Selected subgroups never enter MLX's non-cancellable native split.
+    pub fn from_manifest(
+        manifest: &CommunicationManifest,
+        world: &NativeGroup,
+        stream: &Stream,
     ) -> Result<Self, Error> {
+        let agreed_manifests = eredu_runtime::validate_communication_manifest_consensus(
+            &NativeWorldManifestTransport {
+                world,
+                stream,
+                completion: manifest_consensus_completion_policy(),
+            },
+            manifest,
+        )
+        .map_err(|error| {
+            Error::Parallel(format!("communication manifest consensus failed: {error}"))
+        })?;
+        // Every rank must finish the complete opaque-manifest exchange before
+        // any rank-local backend capability, quarantine, or world-identity
+        // check can diverge. A corrupt projection therefore has one shared
+        // fail-closed result and cannot strand peers in setup or payload work.
+        validate_mlx_communication_manifest(manifest)?;
+        let completion = manifest.completion_policy().ok_or_else(|| {
+            Error::Parallel(
+                "communication manifest requires an explicit bounded completion policy".into(),
+            )
+        })?;
+        let control = Group::uncontracted(world);
+        crate::backend::runtime::distributed::completion::ensure_group_available(&control)?;
+        let world_collective_waves = world_collective_wave_proofs(&agreed_manifests)?;
+        validate_logical_variable_all_to_all_waves(manifest, &world_collective_waves)?;
+        let prepared = PreparedCommunicationManifest::new(manifest)?;
+        let route_world_collective_waves =
+            route_world_collective_wave_proofs(manifest.world_size(), &prepared.routes);
+        Self::new_with_routes(
+            prepared.groups,
+            prepared.routes,
+            world,
+            Some(completion),
+            Some(world_collective_waves),
+            Some(route_world_collective_waves),
+        )
+    }
+
+    fn new_with_routes(
+        realization: CollectiveRealization,
+        routes: Vec<CommunicationRouteDescriptor>,
+        world: &NativeGroup,
+        completion: Option<eredu_runtime::CommunicationCompletionPolicy>,
+        world_collective_waves: Option<Vec<bool>>,
+        route_world_collective_waves: Option<Vec<bool>>,
+    ) -> Result<Self, Error> {
+        // Fence both manifest and uncontracted construction while any timed-out
+        // work on this exact native communicator remains quarantined.
+        let owned_world = completion.map_or_else(
+            || Group::uncontracted(world),
+            |policy| Group::uncontracted(world).with_completion_policy(policy),
+        );
+        crate::backend::runtime::distributed::completion::ensure_group_available(&owned_world)?;
+        let _setup = owned_world.begin_bounded_setup()?;
         if world.rank() != realization.global_rank || world.size() != realization.world_size {
             return Err(Error::Parallel(format!(
                 "collective realization expects world rank {}/{} but received {}/{}",
@@ -161,20 +647,47 @@ impl<'a> ParallelCommunicators<'a> {
                 world.size()
             )));
         }
-        let world = Group::native(world);
+        // This unsplit handle is intentionally uncontracted: it is the control
+        // plane from which exact manifest handles are realized.
+        let world = owned_world;
         let mut groups = HashMap::new();
-        for group in realization.groups.iter().cloned() {
+        for (order, group) in realization.groups.iter().cloned().enumerate() {
             let id = group.id;
             groups.insert(
                 id,
-                Self::materialize(group, realization.world_size, &world)?,
+                Self::materialize(
+                    group,
+                    realization.world_size,
+                    &world,
+                    world_collective_waves
+                        .as_ref()
+                        .and_then(|proofs| proofs.get(order))
+                        .copied()
+                        .unwrap_or(false),
+                )?,
             );
         }
+        let routes = routes
+            .into_iter()
+            .enumerate()
+            .map(|(order, descriptor)| {
+                let route = CommunicationRouteRealization::from_descriptor(
+                    &descriptor,
+                    &world,
+                    route_world_collective_waves
+                        .as_ref()
+                        .and_then(|proofs| proofs.get(order))
+                        .copied()
+                        .unwrap_or(false),
+                )?;
+                Ok((descriptor.id(), route))
+            })
+            .collect::<Result<HashMap<_, _>, Error>>()?;
         Ok(Self {
             realization,
-            world,
+            control_world: world,
             groups,
-            _world: PhantomData,
+            routes,
         })
     }
 
@@ -182,10 +695,34 @@ impl<'a> ParallelCommunicators<'a> {
         realization: CollectiveGroupRealization,
         world_size: usize,
         world: &Group,
+        world_collective_wave: bool,
     ) -> Result<GroupCommunicator, Error> {
+        #[cfg(test)]
+        MANIFEST_GROUP_REALIZATIONS.fetch_add(1, Ordering::Relaxed);
         let size = realization.members.len();
-        let native = if size == 1 || size == world_size {
-            None
+        let native = if size == world_size {
+            world.clone()
+        } else if realization.manifest_descriptor.is_some() {
+            match realization.logical_routes.clone() {
+                Some(routes) => world
+                    .logical_subgroup_with_routes(&realization.members, routes)
+                    .map(|group| group.with_world_collective_wave(world_collective_wave))
+                    .map_err(|error| {
+                        Error::Parallel(format!(
+                            "failed to materialize routed logical group {} with members {:?}: {error}",
+                            realization.id.value(), realization.members
+                        ))
+                    })?,
+                None => world
+                    .logical_subgroup(&realization.members)
+                    .map(|group| group.with_world_collective_wave(world_collective_wave))
+                    .map_err(|error| {
+                        Error::Parallel(format!(
+                            "failed to materialize logical group {} with members {:?}: {error}",
+                            realization.id.value(), realization.members
+                        ))
+                    })?,
+            }
         } else {
             let color = i32::try_from(realization.split_color)
                 .map_err(|_| Error::Parallel("collective group split color exceeds i32".into()))?;
@@ -222,29 +759,112 @@ impl<'a> ParallelCommunicators<'a> {
                     group.size()
                 )));
             }
-            Some(group)
+            group
+        };
+        let native = match &realization.manifest_descriptor {
+            Some(descriptor) => native
+                .with_manifest_contract(
+                    descriptor,
+                    world.completion_policy().ok_or_else(|| {
+                        Error::Parallel("manifest group has no selected completion policy".into())
+                    })?,
+                )
+                .map_err(|error| Error::Parallel(error.to_string()))?,
+            None => native,
         };
         Ok(GroupCommunicator {
             realization,
-            native,
+            native: Some(native),
         })
     }
 
-    /// Returns the global communication group.
-    pub const fn world(&self) -> &Group {
-        &self.world
+    /// Returns the unsplit world handle retained only for portable metadata consensus.
+    pub(crate) const fn control_world(&self) -> &Group {
+        &self.control_world
     }
 
     /// Returns the group for an active opaque collective identity.
     pub fn group(&self, id: CollectiveGroupId) -> Option<&Group> {
         let communicator = self.groups.get(&id)?;
         if communicator.realization.members.len() == 1 {
-            None
-        } else if communicator.realization.members.len() == self.realization.world_size {
-            Some(&self.world)
-        } else {
-            communicator.native.as_ref()
+            return None;
         }
+        communicator.native.as_ref()
+    }
+
+    /// Returns the opaque mechanism handle, including singleton identities.
+    pub fn communication_group(&self, id: CollectiveGroupId) -> Option<&Group> {
+        let communicator = self.groups.get(&id)?;
+        communicator.native.as_ref()
+    }
+
+    /// Consumes manifest-realized communicators into the neutral runtime's exact resource order.
+    pub(crate) fn into_partition_resources(
+        self,
+        manifest: &CommunicationManifest,
+    ) -> Result<
+        (
+            Vec<eredu_runtime::RealizedCommunicationGroup<Group>>,
+            Vec<eredu_runtime::RealizedCommunicationRoute<CommunicationRouteRealization>>,
+        ),
+        Error,
+    > {
+        let Self {
+            realization: _,
+            control_world: _,
+            mut groups,
+            mut routes,
+        } = self;
+        let realized_groups = manifest
+            .groups()
+            .iter()
+            .map(|descriptor| {
+                let communicator = groups.remove(&descriptor.id()).ok_or_else(|| {
+                    Error::Parallel(format!(
+                        "manifest group {} was not realized",
+                        descriptor.id().value()
+                    ))
+                })?;
+                let group = communicator.native.ok_or_else(|| {
+                    Error::Parallel(format!(
+                        "manifest group {} has no native or logical resource",
+                        descriptor.id().value()
+                    ))
+                })?;
+                Ok(eredu_runtime::RealizedCommunicationGroup::new(
+                    descriptor.id(),
+                    group,
+                ))
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+        let realized_routes = manifest
+            .routes()
+            .iter()
+            .map(|descriptor| {
+                routes
+                    .remove(&descriptor.id())
+                    .map(|route| {
+                        eredu_runtime::RealizedCommunicationRoute::new(descriptor.id(), route)
+                    })
+                    .ok_or_else(|| {
+                        Error::Parallel(format!(
+                            "manifest route {} was not realized",
+                            descriptor.id().value()
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+        if !groups.is_empty() || !routes.is_empty() {
+            return Err(Error::Parallel(
+                "realized communication contains resources outside the selected manifest".into(),
+            ));
+        }
+        Ok((realized_groups, realized_routes))
+    }
+
+    /// Returns one opaque point-to-point route selected by neutral composition.
+    pub fn route(&self, id: CommunicationRouteId) -> Option<&CommunicationRouteRealization> {
+        self.routes.get(&id)
     }
 
     pub(crate) fn descriptors(&self) -> Vec<CollectiveGroupDescriptor> {
@@ -830,8 +1450,20 @@ pub fn load_partition_from_store_on_streams(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eredu_core::ParallelAxis;
+    use eredu_core::ParallelTopology;
+    use eredu_runtime::{
+        project_all_communication_manifests, CommunicationGroupRequirements,
+        TopologyCommunicationPlan,
+    };
     use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
+
+    fn completion_policy() -> eredu_runtime::CommunicationCompletionPolicy {
+        eredu_runtime::CommunicationCompletionPolicy::new(
+            std::time::Duration::from_secs(30),
+            eredu_core::CompletionCancellationMode::QuarantineUntilComplete,
+        )
+        .unwrap()
+    }
 
     fn stream() -> Stream {
         Stream::new_with_device(&Device::new(DeviceType::Cpu, 0))
@@ -862,48 +1494,740 @@ mod tests {
         serialize_to_file([(name, view)], None, path).unwrap();
     }
 
-    fn parallel_plan(
-        rank: usize,
-        tp: usize,
-        pp: usize,
-        ep: usize,
-    ) -> crate::composition::mlx::distributed::topology::MlxParallelPlan {
-        crate::composition::mlx::distributed::topology::MlxParallelPlan::for_rank(
-            rank,
-            tp,
-            pp,
-            ep,
+    fn topology(rank: usize, tp: usize, pp: usize, ep: usize) -> MlxRankContext {
+        let topology = crate::test_parallel_rank(rank, tp, pp, ep);
+        MlxRankContext::new(
+            topology.world_size(),
+            topology.global_rank(),
             DeviceAssignment::new(DeviceType::Cpu, 0),
         )
         .unwrap()
     }
 
-    fn topology(rank: usize, tp: usize, pp: usize, ep: usize) -> MlxRankContext {
-        parallel_plan(rank, tp, pp, ep).rank_context()
+    fn communication_requirement(
+        operation: CommunicationOperation,
+    ) -> CommunicationOperationRequirement {
+        CommunicationOperationRequirement::tensors(
+            operation,
+            [TensorDtype::F32, TensorDtype::Bf16],
+            CommunicationTensorLimits::new(
+                1,
+                4,
+                16_384,
+                (operation == CommunicationOperation::VariableAllToAll).then_some(4096),
+            )
+            .unwrap(),
+            true,
+        )
+        .unwrap()
+    }
+
+    fn communication_group_requirements(
+        operation: CommunicationOperation,
+    ) -> CommunicationGroupRequirements {
+        CommunicationGroupRequirements::new([communication_requirement(operation)]).unwrap()
     }
 
     #[test]
-    fn ring_neighbor_routes_cover_arbitrary_stage_local_axis_degrees() {
-        for rank in 0..18 {
-            let topology = parallel_plan(rank, 3, 2, 3);
-            for axis in [ParallelAxis::Tensor, ParallelAxis::Expert] {
-                let routes =
-                    crate::composition::mlx::distributed::topology::logical_stage_group_routes(
-                        topology, axis,
+    fn complete_subgroup_batches_are_the_only_world_collective_waves() {
+        let topology = ParallelTopology::new(4, 2, 2, 1).unwrap();
+        let plan = TopologyCommunicationPlan::new()
+            .with_tensor_groups(communication_group_requirements(
+                CommunicationOperation::AllReduceSum,
+            ))
+            .with_pipeline_groups(communication_group_requirements(
+                CommunicationOperation::AllGatherEven,
+            ));
+        let manifests = project_all_communication_manifests(topology, &plan).unwrap();
+        assert_eq!(
+            world_collective_wave_proofs(&manifests).unwrap(),
+            [true, true]
+        );
+
+        let asymmetric = [
+            CommunicationManifest::new(
+                2,
+                0,
+                vec![CommunicationGroupDescriptor::new(
+                    CollectiveGroupId::new(1),
+                    0,
+                    vec![0, 1],
+                    Some(0),
+                    communication_group_requirements(CommunicationOperation::AllReduceSum),
+                )
+                .unwrap()],
+                vec![],
+            )
+            .unwrap(),
+            CommunicationManifest::new(
+                2,
+                1,
+                vec![CommunicationGroupDescriptor::new(
+                    CollectiveGroupId::new(1),
+                    0,
+                    vec![0, 1],
+                    Some(1),
+                    communication_group_requirements(CommunicationOperation::AllGatherEven),
+                )
+                .unwrap()],
+                vec![],
+            )
+            .unwrap(),
+        ];
+        assert_eq!(world_collective_wave_proofs(&asymmetric).unwrap(), [false]);
+
+        let inconsistent_overlap = (0..4)
+            .map(|rank| {
+                let (id, members) = match rank {
+                    0 | 1 => (CollectiveGroupId::new(1), vec![0, 1]),
+                    2 => (CollectiveGroupId::new(2), vec![1, 2]),
+                    3 => (CollectiveGroupId::new(3), vec![2, 3]),
+                    _ => unreachable!(),
+                };
+                let local = members.iter().position(|member| *member == rank).unwrap();
+                CommunicationManifest::new(
+                    4,
+                    rank,
+                    vec![CommunicationGroupDescriptor::new(
+                        id,
+                        0,
+                        members,
+                        Some(local),
+                        communication_group_requirements(CommunicationOperation::VariableAllToAll),
                     )
-                    .unwrap();
-                assert_eq!(routes.len(), 3);
-                let mut sources = routes.iter().map(|(source, _)| *source).collect::<Vec<_>>();
-                sources.sort_unstable();
-                assert_eq!(sources, [0, 1, 2]);
-                assert!(routes.iter().flat_map(|(_, rounds)| rounds).all(|peer| {
-                    peer.is_none_or(|peer| {
-                        (rank + 1) % topology.world_size() == peer
-                            || (peer + 1) % topology.world_size() == rank
-                    })
-                }));
+                    .unwrap()],
+                    vec![],
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            world_collective_wave_proofs(&inconsistent_overlap).unwrap(),
+            [false],
+            "same-contract descriptors that do not form consistent disjoint classes cannot share a native world wave"
+        );
+        super::super::group::reset_native_collective_submissions();
+        let error = validate_logical_variable_all_to_all_waves(
+            &inconsistent_overlap[0],
+            &world_collective_wave_proofs(&inconsistent_overlap).unwrap(),
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("without a consensus-proven world participation wave"));
+        assert_eq!(
+            super::super::group::native_collective_submissions(),
+            0,
+            "an unproven logical exchange must fail before native payload submission"
+        );
+
+        let topology = ParallelTopology::new(2, 1, 2, 1).unwrap();
+        let plan = TopologyCommunicationPlan::new()
+            .with_tensor_groups(communication_group_requirements(
+                CommunicationOperation::AllReduceSum,
+            ))
+            .with_expert_groups(communication_group_requirements(
+                CommunicationOperation::VariableAllToAll,
+            ));
+        let compound = project_all_communication_manifests(topology, &plan).unwrap();
+        let proofs = world_collective_wave_proofs(&compound).unwrap();
+        assert_eq!(proofs, [true, true]);
+        for manifest in &compound {
+            validate_logical_variable_all_to_all_waves(manifest, &proofs).unwrap();
+        }
+    }
+
+    #[test]
+    fn route_wave_requires_identical_disjoint_pairs_covering_the_world() {
+        let route = |id, source, destination, operation| {
+            CommunicationRouteDescriptor::new(
+                CommunicationRouteId::new(id),
+                id as usize,
+                source,
+                destination,
+                communication_requirement(operation),
+            )
+            .unwrap()
+        };
+        let complete = [
+            route(1, 0, 2, CommunicationOperation::SendReceive),
+            route(2, 1, 3, CommunicationOperation::SendReceive),
+        ];
+        assert_eq!(
+            route_world_collective_wave_proofs(4, &complete),
+            [true, true]
+        );
+
+        let partial = [route(1, 0, 2, CommunicationOperation::SendReceive)];
+        assert_eq!(route_world_collective_wave_proofs(4, &partial), [false]);
+
+        let overlapping = [
+            route(1, 0, 2, CommunicationOperation::SendReceive),
+            route(2, 0, 3, CommunicationOperation::SendReceive),
+        ];
+        assert_eq!(
+            route_world_collective_wave_proofs(4, &overlapping),
+            [false, false]
+        );
+
+        let incompatible = [
+            route(1, 0, 2, CommunicationOperation::SendReceive),
+            CommunicationRouteDescriptor::new(
+                CommunicationRouteId::new(2),
+                2,
+                1,
+                3,
+                CommunicationOperationRequirement::tensors(
+                    CommunicationOperation::SendReceive,
+                    [TensorDtype::I32],
+                    CommunicationTensorLimits::new(1, 1, 8, None).unwrap(),
+                    true,
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        ];
+        assert_eq!(
+            route_world_collective_wave_proofs(4, &incompatible),
+            [false, false]
+        );
+    }
+
+    #[test]
+    fn manifest_preparation_preserves_opaque_groups_and_routes() {
+        let manifest = CommunicationManifest::new(
+            6,
+            2,
+            vec![
+                CommunicationGroupDescriptor::new(
+                    CollectiveGroupId::new(7),
+                    0,
+                    vec![0, 2, 4],
+                    Some(1),
+                    communication_group_requirements(CommunicationOperation::AllReduceSum),
+                )
+                .unwrap(),
+                CommunicationGroupDescriptor::new(
+                    CollectiveGroupId::new(11),
+                    1,
+                    vec![2, 3],
+                    Some(0),
+                    communication_group_requirements(CommunicationOperation::AllGatherEven),
+                )
+                .unwrap(),
+            ],
+            vec![CommunicationRouteDescriptor::new(
+                CommunicationRouteId::new(19),
+                0,
+                2,
+                5,
+                communication_requirement(CommunicationOperation::SendReceive),
+            )
+            .unwrap()],
+        )
+        .unwrap();
+
+        let prepared = PreparedCommunicationManifest::new(&manifest).unwrap();
+        assert_eq!(prepared.groups.world_size, 6);
+        assert_eq!(prepared.groups.global_rank, 2);
+        assert_eq!(prepared.groups.groups.len(), 2);
+        assert_eq!(prepared.groups.groups[0].id, CollectiveGroupId::new(7));
+        assert_eq!(prepared.groups.groups[0].members, [0, 2, 4]);
+        assert_eq!(prepared.groups.groups[0].local_rank, 1);
+        assert_eq!(prepared.groups.groups[0].split_color, 7);
+        assert!(prepared.groups.groups[0].logical_routes.is_none());
+        assert_eq!(prepared.groups.groups[1].id, CollectiveGroupId::new(11));
+        assert_eq!(prepared.groups.groups[1].split_color, 11);
+        assert_eq!(prepared.routes.len(), 1);
+        assert_eq!(prepared.routes[0].id(), CommunicationRouteId::new(19));
+        assert_eq!(prepared.routes[0].source(), 2);
+        assert_eq!(prepared.routes[0].destination(), 5);
+    }
+
+    #[test]
+    fn manifest_constructor_preserves_singleton_group_mechanics() {
+        let all_reduce_requirement = CommunicationOperationRequirement::tensors(
+            CommunicationOperation::AllReduceSum,
+            [TensorDtype::F32],
+            CommunicationTensorLimits::new(1, 1, 4, None).unwrap(),
+            true,
+        )
+        .unwrap();
+        let gather_requirement = CommunicationOperationRequirement::tensors(
+            CommunicationOperation::AllGatherEven,
+            [TensorDtype::F32],
+            CommunicationTensorLimits::new(1, 1, 4, None).unwrap(),
+            true,
+        )
+        .unwrap();
+        let variable_requirement = CommunicationOperationRequirement::tensors(
+            CommunicationOperation::VariableAllToAll,
+            [TensorDtype::F32],
+            CommunicationTensorLimits::new(1, 1, 4, Some(1)).unwrap(),
+            true,
+        )
+        .unwrap();
+        let inexact_requirement = CommunicationOperationRequirement::tensors(
+            CommunicationOperation::AllReduceSum,
+            [TensorDtype::F32],
+            CommunicationTensorLimits::new(1, 1, 4, None).unwrap(),
+            false,
+        )
+        .unwrap();
+        let manifest = CommunicationManifest::new(
+            1,
+            0,
+            vec![
+                CommunicationGroupDescriptor::new(
+                    CollectiveGroupId::new(23),
+                    0,
+                    vec![0],
+                    Some(0),
+                    CommunicationGroupRequirements::new([all_reduce_requirement]).unwrap(),
+                )
+                .unwrap(),
+                CommunicationGroupDescriptor::new(
+                    CollectiveGroupId::new(29),
+                    1,
+                    vec![0],
+                    Some(0),
+                    CommunicationGroupRequirements::new([gather_requirement]).unwrap(),
+                )
+                .unwrap(),
+                CommunicationGroupDescriptor::new(
+                    CollectiveGroupId::new(31),
+                    2,
+                    vec![0],
+                    Some(0),
+                    CommunicationGroupRequirements::new([variable_requirement]).unwrap(),
+                )
+                .unwrap(),
+                CommunicationGroupDescriptor::new(
+                    CollectiveGroupId::new(37),
+                    3,
+                    vec![0],
+                    Some(0),
+                    CommunicationGroupRequirements::new([inexact_requirement]).unwrap(),
+                )
+                .unwrap(),
+            ],
+            vec![],
+        )
+        .unwrap()
+        .with_completion_policy(completion_policy());
+        let world = safemlx::distributed::init(false, safemlx::distributed::Backend::Ring).unwrap();
+
+        let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+        let communicators =
+            ParallelCommunicators::from_manifest(&manifest, &world, &stream).unwrap();
+        assert!(communicators.group(CollectiveGroupId::new(23)).is_none());
+        let all_reduce = communicators
+            .communication_group(CollectiveGroupId::new(23))
+            .unwrap();
+        let gather = communicators
+            .communication_group(CollectiveGroupId::new(29))
+            .unwrap();
+        let variable = communicators
+            .communication_group(CollectiveGroupId::new(31))
+            .unwrap();
+        let inexact = communicators
+            .communication_group(CollectiveGroupId::new(37))
+            .unwrap();
+        assert_eq!(all_reduce.opaque_id(), Some(CollectiveGroupId::new(23)));
+        assert_eq!(gather.opaque_id(), Some(CollectiveGroupId::new(29)));
+        assert_eq!(
+            all_reduce.native_group().size(),
+            gather.native_group().size()
+        );
+
+        super::super::group::reset_native_collective_submissions();
+        let bf16 = Array::from_slice(&[1.0_f32], &[1])
+            .as_dtype(safemlx::Dtype::Bfloat16, &stream)
+            .unwrap();
+        let error = super::super::group::all_sum(&bf16, all_reduce, &stream)
+            .expect_err("F32-only manifest must reject BF16 before native submission");
+        assert!(error.what().contains("does not admit dtype"));
+        assert_eq!(super::super::group::native_collective_submissions(), 0);
+
+        let input = Array::from_slice(&[1.0_f32], &[1]);
+        let error = super::super::group::all_sum(&input, gather, &stream)
+            .expect_err("one opaque ID must not borrow another ID's operation contract");
+        assert!(error.what().contains("does not select operation"));
+        assert_eq!(super::super::group::native_collective_submissions(), 0);
+
+        let oversized = Array::from_slice(&[0.0_f32; 5], &[5]);
+        let error = super::super::group::all_sum(&oversized, all_reduce, &stream)
+            .expect_err("manifest tensor limit must reject before native submission");
+        assert!(error.what().contains("rejects tensor shape"));
+        assert_eq!(super::super::group::native_collective_submissions(), 0);
+
+        let variable_input = Array::from_slice(&[1.0_f32, 2.0], &[2]);
+        let error =
+            super::super::group::all_to_all_v(&variable_input, &[2], &[2], variable, &stream)
+                .expect_err("per-peer contract must reject before native submission");
+        assert!(error.what().contains("peer counts exceed"));
+        assert_eq!(super::super::group::native_collective_submissions(), 0);
+
+        let error = super::super::group::all_sum(&input, inexact, &stream)
+            .expect_err("inexact manifest operation must not reach exact native entry point");
+        assert!(error.what().contains("selects inexact operation"));
+        assert_eq!(super::super::group::native_collective_submissions(), 0);
+
+        let output = super::super::group::all_sum(&input, all_reduce, &stream).unwrap();
+        assert_eq!(super::super::group::native_collective_submissions(), 1);
+        assert_eq!(output.evaluated().unwrap().as_slice::<f32>(), &[1.0]);
+        assert!(communicators.route(CommunicationRouteId::new(1)).is_none());
+    }
+
+    #[test]
+    fn route_handle_rejects_endpoints_outside_its_owned_world() {
+        let world = safemlx::distributed::init(false, safemlx::distributed::Backend::Ring).unwrap();
+        assert_eq!(world.size(), 1);
+        let world = Group::uncontracted(&world);
+        let descriptor = CommunicationRouteDescriptor::new(
+            CommunicationRouteId::new(29),
+            0,
+            0,
+            1,
+            communication_requirement(CommunicationOperation::SendReceive),
+        )
+        .unwrap();
+        let error = CommunicationRouteRealization::from_descriptor(&descriptor, &world, false)
+            .expect_err("route must be bound to a world containing both endpoints");
+        assert!(error.to_string().contains("owned world size 1"));
+    }
+
+    #[test]
+    fn projected_manifests_prepare_one_local_group_per_creation_batch_on_every_rank() {
+        let topology = ParallelTopology::new(2, 2, 2, 1).unwrap();
+        let plan = TopologyCommunicationPlan::new()
+            .with_tensor_groups(communication_group_requirements(
+                CommunicationOperation::AllReduceSum,
+            ))
+            .with_pipeline_groups(communication_group_requirements(
+                CommunicationOperation::AllGatherEven,
+            ))
+            .with_expert_groups(communication_group_requirements(
+                CommunicationOperation::VariableAllToAll,
+            ));
+        let manifests = project_all_communication_manifests(topology, &plan).unwrap();
+
+        for manifest in &manifests {
+            let prepared = PreparedCommunicationManifest::new(manifest).unwrap();
+            assert_eq!(prepared.groups.groups.len(), 3);
+            for (creation_order, group) in prepared.groups.groups.iter().enumerate() {
+                assert_eq!(
+                    manifest.groups()[creation_order].creation_order(),
+                    creation_order
+                );
+                assert_eq!(group.id, manifest.groups()[creation_order].id());
+                assert_eq!(group.split_color, group.id.value() as usize);
+                assert_eq!(group.members[group.local_rank], manifest.rank());
+                assert_eq!(group.members.len(), 2);
             }
         }
+    }
+
+    #[test]
+    fn mlx_manifest_capabilities_admit_publication_but_fail_closed_on_unsupported_dtype() {
+        let publication = CommunicationManifest::new(
+            2,
+            0,
+            vec![CommunicationGroupDescriptor::new(
+                CollectiveGroupId::new(1),
+                0,
+                vec![0, 1],
+                Some(0),
+                CommunicationGroupRequirements::new([
+                    communication_requirement(CommunicationOperation::Broadcast),
+                    CommunicationOperationRequirement::barrier(true),
+                    CommunicationOperationRequirement::failure_agreement(true),
+                ])
+                .unwrap(),
+            )
+            .unwrap()],
+            vec![],
+        )
+        .unwrap()
+        .with_completion_policy(completion_policy());
+        validate_mlx_communication_manifest(&publication).unwrap();
+
+        let unsupported = CommunicationManifest::new(
+            1,
+            0,
+            vec![CommunicationGroupDescriptor::new(
+                CollectiveGroupId::new(1),
+                0,
+                vec![0],
+                Some(0),
+                CommunicationGroupRequirements::new([CommunicationOperationRequirement::tensors(
+                    CommunicationOperation::Broadcast,
+                    [TensorDtype::I32],
+                    CommunicationTensorLimits::new(1, 1, 1, None).unwrap(),
+                    true,
+                )
+                .unwrap()])
+                .unwrap(),
+            )
+            .unwrap()],
+            vec![],
+        )
+        .unwrap()
+        .with_completion_policy(completion_policy());
+        let error = validate_mlx_communication_manifest(&unsupported)
+            .expect_err("integer broadcast must be rejected");
+        assert!(error.to_string().contains("I32"));
+
+        let zero_id = CommunicationManifest::new(
+            2,
+            0,
+            vec![CommunicationGroupDescriptor::new(
+                CollectiveGroupId::new(0),
+                0,
+                vec![0, 1],
+                Some(0),
+                communication_group_requirements(CommunicationOperation::AllReduceSum),
+            )
+            .unwrap()],
+            vec![],
+        )
+        .unwrap();
+        let error = PreparedCommunicationManifest::new(&zero_id)
+            .expect_err("zero group ID must be rejected");
+        assert!(error.to_string().contains("ID zero is reserved"));
+    }
+
+    #[test]
+    fn mlx_failure_agreement_capability_is_exact_and_distinct_from_barrier() {
+        let failure_agreement = CommunicationManifest::new(
+            1,
+            0,
+            vec![CommunicationGroupDescriptor::new(
+                CollectiveGroupId::new(3),
+                0,
+                vec![0],
+                Some(0),
+                CommunicationGroupRequirements::new([
+                    CommunicationOperationRequirement::failure_agreement(true),
+                ])
+                .unwrap(),
+            )
+            .unwrap()],
+            vec![],
+        )
+        .unwrap()
+        .with_completion_policy(completion_policy());
+        validate_mlx_communication_manifest(&failure_agreement).unwrap();
+
+        let capabilities_without_agreement =
+            CommunicationCapabilities::new([CommunicationOperationRequirement::barrier(true)])
+                .unwrap()
+                .with_completion_capabilities(
+                    CommunicationCompletionCapabilities::new([
+                        eredu_core::CompletionCancellationMode::QuarantineUntilComplete,
+                    ])
+                    .unwrap(),
+                );
+        assert!(capabilities_without_agreement
+            .validate_manifest(&failure_agreement)
+            .is_err());
+
+        let inexact_agreement =
+            CommunicationCapabilities::new([CommunicationOperationRequirement::failure_agreement(
+                false,
+            )])
+            .unwrap()
+            .with_completion_capabilities(
+                CommunicationCompletionCapabilities::new([
+                    eredu_core::CompletionCancellationMode::QuarantineUntilComplete,
+                ])
+                .unwrap(),
+            );
+        assert!(inexact_agreement
+            .validate_manifest(&failure_agreement)
+            .is_err());
+    }
+
+    #[test]
+    fn mlx_capabilities_are_operation_specific_and_exclude_encoded_payloads() {
+        let capabilities = mlx_communication_capabilities();
+        let group_manifest = |operation, dtype| {
+            let max_peer_count =
+                (operation == CommunicationOperation::VariableAllToAll).then_some(8);
+            CommunicationManifest::new(
+                1,
+                0,
+                vec![CommunicationGroupDescriptor::new(
+                    CollectiveGroupId::new(1),
+                    0,
+                    vec![0],
+                    Some(0),
+                    CommunicationGroupRequirements::new([
+                        CommunicationOperationRequirement::tensors(
+                            operation,
+                            [dtype],
+                            CommunicationTensorLimits::new(1, 2, 8, max_peer_count).unwrap(),
+                            true,
+                        )
+                        .unwrap(),
+                    ])
+                    .unwrap(),
+                )
+                .unwrap()],
+                vec![],
+            )
+            .unwrap()
+            .with_completion_policy(completion_policy())
+        };
+
+        capabilities
+            .validate_manifest(&group_manifest(
+                CommunicationOperation::AllGatherEven,
+                TensorDtype::I32,
+            ))
+            .unwrap();
+        assert!(capabilities
+            .validate_manifest(&group_manifest(
+                CommunicationOperation::AllReduceSum,
+                TensorDtype::I32,
+            ))
+            .is_err());
+        assert!(capabilities
+            .validate_manifest(&group_manifest(
+                CommunicationOperation::AllGatherUneven,
+                TensorDtype::I32,
+            ))
+            .is_err());
+        capabilities
+            .validate_manifest(&group_manifest(
+                CommunicationOperation::VariableAllToAll,
+                TensorDtype::I32,
+            ))
+            .unwrap();
+        assert!(capabilities
+            .validate_manifest(&group_manifest(
+                CommunicationOperation::VariableAllToAll,
+                TensorDtype::U32,
+            ))
+            .is_err());
+        assert!(capabilities
+            .validate_manifest(&group_manifest(
+                CommunicationOperation::AllGatherEven,
+                TensorDtype::U32,
+            ))
+            .is_err());
+
+        let route_manifest = |dtype| {
+            CommunicationManifest::new(
+                2,
+                0,
+                vec![],
+                vec![CommunicationRouteDescriptor::new(
+                    CommunicationRouteId::new(1),
+                    0,
+                    0,
+                    1,
+                    CommunicationOperationRequirement::tensors(
+                        CommunicationOperation::SendReceive,
+                        [dtype],
+                        CommunicationTensorLimits::new(1, 2, 8, None).unwrap(),
+                        true,
+                    )
+                    .unwrap(),
+                )
+                .unwrap()],
+            )
+            .unwrap()
+            .with_completion_policy(completion_policy())
+        };
+        for dtype in [TensorDtype::I32, TensorDtype::U32] {
+            capabilities
+                .validate_manifest(&route_manifest(dtype))
+                .unwrap();
+        }
+        assert!(capabilities
+            .validate_manifest(&route_manifest(TensorDtype::I64))
+            .is_err());
+
+        let requirements =
+            CommunicationGroupRequirements::new([CommunicationOperationRequirement::tensors(
+                CommunicationOperation::AllReduceSum,
+                [TensorDtype::Encoded("packed".into())],
+                CommunicationTensorLimits::new(1, 1, 8, None).unwrap(),
+                true,
+            )
+            .unwrap()])
+            .unwrap();
+        let manifest = CommunicationManifest::new(
+            1,
+            0,
+            vec![CommunicationGroupDescriptor::new(
+                CollectiveGroupId::new(1),
+                0,
+                vec![0],
+                Some(0),
+                requirements,
+            )
+            .unwrap()],
+            vec![],
+        )
+        .unwrap()
+        .with_completion_policy(completion_policy());
+        assert!(capabilities.validate_manifest(&manifest).is_err());
+
+        let route_manifest = CommunicationManifest::new(
+            2,
+            0,
+            vec![],
+            vec![CommunicationRouteDescriptor::new(
+                CommunicationRouteId::new(1),
+                0,
+                0,
+                1,
+                communication_requirement(CommunicationOperation::SendReceive),
+            )
+            .unwrap()],
+        )
+        .unwrap()
+        .with_completion_policy(completion_policy());
+        validate_mlx_communication_manifest(&route_manifest).unwrap();
+
+        let exact_manifest = CommunicationManifest::new(
+            1,
+            0,
+            vec![CommunicationGroupDescriptor::new(
+                CollectiveGroupId::new(1),
+                0,
+                vec![0],
+                Some(0),
+                communication_group_requirements(CommunicationOperation::AllReduceSum),
+            )
+            .unwrap()],
+            vec![],
+        )
+        .unwrap()
+        .with_completion_policy(completion_policy());
+        validate_mlx_communication_manifest(&exact_manifest).unwrap();
+
+        let barrier = CommunicationManifest::new(
+            1,
+            0,
+            vec![CommunicationGroupDescriptor::new(
+                CollectiveGroupId::new(2),
+                0,
+                vec![0],
+                Some(0),
+                CommunicationGroupRequirements::new([CommunicationOperationRequirement::barrier(
+                    true,
+                )])
+                .unwrap(),
+            )
+            .unwrap()],
+            vec![],
+        )
+        .unwrap()
+        .with_completion_policy(completion_policy());
+        validate_mlx_communication_manifest(&barrier).unwrap();
     }
 
     #[test]
@@ -924,15 +2248,7 @@ mod tests {
             .validate_execution_stream(&stream)
             .unwrap();
         let other_assignment =
-            crate::composition::mlx::distributed::topology::MlxParallelPlan::for_rank(
-                0,
-                1,
-                1,
-                1,
-                DeviceAssignment::new(DeviceType::Cpu, 1),
-            )
-            .unwrap()
-            .rank_context();
+            MlxRankContext::new(1, 0, DeviceAssignment::new(DeviceType::Cpu, 1)).unwrap();
         assert!(other_assignment.validate_execution_stream(&stream).is_err());
     }
 

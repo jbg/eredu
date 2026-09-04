@@ -19,15 +19,115 @@ use crate::composition::mlx::ModelProcessor;
 use crate::{
     backend::error::Error,
     backend::MlxModel,
-    composition::mlx::{structural, Executable},
+    composition::{
+        mlx::{structural, Executable},
+        MlxNeuralBackend,
+    },
     MlxLoadRequest,
 };
 
 use super::realization::{
-    requires_distributed_stage, AddressableParameterBankBinding,
-    CompleteTensorParallelBinding as TensorParallelBinding, FamilyBinding, FixedGgufBinding,
-    GgufBinding, QuantizedGgufBinding,
+    AddressableParameterBankBinding, FamilyBinding, FixedGgufBinding, GgufBinding,
+    QuantizedGgufBinding,
 };
+
+struct PredictionTargetCheckpointSource {
+    source: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
+    extension_sources: std::collections::BTreeSet<String>,
+}
+
+impl PredictionTargetCheckpointSource {
+    fn new(
+        source: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
+        extension_sources: std::collections::BTreeSet<String>,
+    ) -> Self {
+        Self {
+            source,
+            extension_sources,
+        }
+    }
+
+    fn authorize(&self, key: &str) -> Result<(), eredu_checkpoint::store::StoreError> {
+        if self.extension_sources.contains(key) {
+            Err(eredu_checkpoint::store::StoreError::UnauthorizedTensor {
+                contract: "prediction-target".into(),
+                key: key.into(),
+            })
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl eredu_checkpoint::store::CheckpointSource for PredictionTargetCheckpointSource {
+    fn source_keys(&self) -> Vec<String> {
+        self.source
+            .source_keys()
+            .into_iter()
+            .filter(|key| !self.extension_sources.contains(key))
+            .collect()
+    }
+
+    fn source_metadata(
+        &self,
+        key: &str,
+    ) -> Result<eredu_checkpoint::store::TensorMetadata, eredu_checkpoint::store::StoreError> {
+        self.authorize(key)?;
+        self.source.source_metadata(key)
+    }
+
+    fn acquire_lease(
+        &self,
+        request: eredu_checkpoint::store::TensorReadRequest,
+    ) -> Result<eredu_checkpoint::store::CheckpointLease, eredu_checkpoint::store::StoreError> {
+        self.authorize(&request.key)?;
+        self.source.acquire_lease(request)
+    }
+
+    fn source_diagnostics(
+        &self,
+    ) -> Result<eredu_checkpoint::store::WeightStoreDiagnostics, eredu_checkpoint::store::StoreError>
+    {
+        self.source.source_diagnostics()
+    }
+
+    fn source_provenance(
+        &self,
+        key: &str,
+    ) -> Result<eredu_checkpoint::store::TensorSourceProvenance, eredu_checkpoint::store::StoreError>
+    {
+        self.authorize(key)?;
+        self.source.source_provenance(key)
+    }
+
+    fn materialized_source_keys(&self) -> Vec<String> {
+        self.source
+            .materialized_source_keys()
+            .into_iter()
+            .filter(|key| !self.extension_sources.contains(key))
+            .collect()
+    }
+
+    fn materialized_source_shards(&self) -> Vec<std::path::PathBuf> {
+        self.source.materialized_source_shards()
+    }
+
+    fn unclaimed_checkpoint_keys(&self) -> Vec<String> {
+        self.source
+            .unclaimed_checkpoint_keys()
+            .into_iter()
+            .filter(|key| !self.extension_sources.contains(key))
+            .collect()
+    }
+
+    fn is_authoritative_materialized_key(&self, key: &str) -> bool {
+        !self.extension_sources.contains(key) && self.source.is_authoritative_materialized_key(key)
+    }
+
+    fn is_checkpoint_contract_resolved(&self) -> bool {
+        self.source.is_checkpoint_contract_resolved()
+    }
+}
 
 /// Opaque MLX model configuration selected before payloads are opened.
 #[derive(Debug, Clone)]
@@ -48,30 +148,131 @@ impl MlxModelConfig {
 /// Opaque, authoritative MLX construction policy selected before payloads are opened.
 #[derive(Debug, Clone)]
 pub struct MlxSelectedPreparation {
-    execution: eredu_architectures::replicated_text::SelectedReplicatedTextExecution<
+    execution: MlxSelectedExecution,
+    session: eredu_core::SessionCapabilities,
+    rank_context: Option<crate::backend::MlxRankContext>,
+    prediction_extension: Option<eredu_architectures::configuration::PredictionExtensionPlan>,
+}
+
+type OrdinaryMlxSelectedExecution =
+    eredu_architectures::replicated_text::SelectedReplicatedTextExecution<
         eredu_runtime::SelectedReplicatedTextRealization,
         eredu_architectures::SelectedRoutedTextRealization,
         eredu_architectures::replicated_text::SelectedCompositeTextRealization,
         SelectedMlxConstruction,
-    >,
-    session: eredu_core::SessionCapabilities,
+    >;
+
+#[derive(Debug, Clone)]
+enum MlxSelectedExecution {
+    Ordinary(OrdinaryMlxSelectedExecution),
+    PartitionedDense {
+        selected: eredu_architectures::partitioned_execution::SelectedPartitionedAdmission<
+            eredu_runtime::SelectedReplicatedTextRealization,
+            eredu_runtime::ReplicatedTextRequirements,
+        >,
+    },
+    PartitionedRouted {
+        selected: eredu_architectures::partitioned_execution::SelectedPartitionedAdmission<
+            eredu_architectures::SelectedRoutedTextRealization,
+            eredu_architectures::RoutedTextRequirements,
+        >,
+    },
+    PartitionedComposite {
+        selected: eredu_architectures::partitioned_execution::SelectedPartitionedAdmission<
+            eredu_architectures::replicated_text::SelectedCompositeTextRealization,
+            eredu_architectures::replicated_text::CompositeTextRequirements,
+        >,
+    },
 }
 
 impl MlxSelectedPreparation {
     const fn new(
-        execution: eredu_architectures::replicated_text::SelectedReplicatedTextExecution<
-            eredu_runtime::SelectedReplicatedTextRealization,
-            eredu_architectures::SelectedRoutedTextRealization,
-            eredu_architectures::replicated_text::SelectedCompositeTextRealization,
-            SelectedMlxConstruction,
-        >,
+        execution: MlxSelectedExecution,
         session: eredu_core::SessionCapabilities,
+        rank_context: Option<crate::backend::MlxRankContext>,
+        prediction_extension: Option<eredu_architectures::configuration::PredictionExtensionPlan>,
     ) -> Self {
-        Self { execution, session }
+        Self {
+            execution,
+            session,
+            rank_context,
+            prediction_extension,
+        }
     }
 
     pub(crate) const fn session_capabilities(&self) -> eredu_core::SessionCapabilities {
         self.session
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn prediction_extension_kind(
+        &self,
+    ) -> Option<eredu_architectures::configuration::PredictionExtensionKind> {
+        match &self.prediction_extension {
+            Some(extension) => Some(extension.kind()),
+            None => None,
+        }
+    }
+
+    pub(crate) const fn rank_context(&self) -> Option<crate::backend::MlxRankContext> {
+        self.rank_context
+    }
+
+    /// Returns the architecture-owned opaque manifest selected for an included path.
+    #[cfg(test)]
+    pub(crate) const fn communication_manifest(
+        &self,
+    ) -> Option<&eredu_runtime::CommunicationManifest> {
+        match &self.execution {
+            MlxSelectedExecution::PartitionedDense { selected } => {
+                Some(selected.requirements().communication())
+            }
+            MlxSelectedExecution::PartitionedRouted { selected } => {
+                Some(selected.requirements().communication())
+            }
+            MlxSelectedExecution::PartitionedComposite { selected } => {
+                Some(selected.requirements().communication())
+            }
+            MlxSelectedExecution::Ordinary(_) => None,
+        }
+    }
+
+    /// Returns the architecture-admitted activation dtype without entering a
+    /// family-specific materializer.
+    #[cfg(test)]
+    pub(crate) const fn partitioned_activation_dtype(
+        &self,
+    ) -> Option<eredu_runtime::PipelineActivationDtype> {
+        match &self.execution {
+            MlxSelectedExecution::PartitionedDense { selected } => {
+                Some(selected.requirements().activation_dtype())
+            }
+            MlxSelectedExecution::PartitionedRouted { selected } => {
+                Some(selected.requirements().activation_dtype())
+            }
+            MlxSelectedExecution::PartitionedComposite { selected } => {
+                Some(selected.requirements().activation_dtype())
+            }
+            MlxSelectedExecution::Ordinary(_) => None,
+        }
+    }
+
+    /// Returns the architecture-selected manifest consumed by partitioned materialization.
+    pub(crate) const fn realized_communication_manifest(
+        &self,
+    ) -> Option<&eredu_runtime::CommunicationManifest> {
+        match &self.execution {
+            MlxSelectedExecution::PartitionedDense { selected } => {
+                Some(selected.requirements().communication())
+            }
+            MlxSelectedExecution::PartitionedRouted { selected } => {
+                Some(selected.requirements().communication())
+            }
+            MlxSelectedExecution::Ordinary(_) => None,
+            MlxSelectedExecution::PartitionedComposite { selected } => {
+                Some(selected.requirements().communication())
+            }
+        }
     }
 }
 
@@ -79,10 +280,7 @@ impl MlxSelectedPreparation {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) struct SelectedMlxConstruction {
     quantization: Option<WeightQuantization>,
-    pub(crate) parallel: Option<(
-        super::distributed::topology::MlxParallelPlan,
-        eredu_runtime::PipelineWireContract,
-    )>,
+    pub(crate) parallel: Option<eredu_core::ParallelRankTopology>,
     pub(crate) weight_residency: eredu_runtime::WeightResidency,
     pub(crate) state_residency: CacheResidencyPolicy,
     session: eredu_core::SessionCapabilities,
@@ -96,7 +294,7 @@ impl SelectedMlxConstruction {
     ) -> Result<Self, Error> {
         Ok(Self {
             quantization: request.weight_quantization()?,
-            parallel: request.parallel_execution(),
+            parallel: request.parallel_topology(),
             weight_residency: request.weight_residency(),
             state_residency: request.state_residency().clone(),
             session,
@@ -112,21 +310,7 @@ impl SelectedMlxConstruction {
         self
     }
 
-    pub(crate) const fn parallel_topology(
-        &self,
-    ) -> Option<super::distributed::topology::MlxParallelPlan> {
-        match self.parallel {
-            Some((topology, _)) => Some(topology),
-            None => None,
-        }
-    }
-
-    pub(crate) const fn parallel_execution(
-        &self,
-    ) -> Option<(
-        super::distributed::topology::MlxParallelPlan,
-        eredu_runtime::PipelineWireContract,
-    )> {
+    pub(crate) const fn parallel_topology(&self) -> Option<eredu_core::ParallelRankTopology> {
         self.parallel
     }
 
@@ -327,11 +511,112 @@ pub(crate) fn select_preparation(
     )
 }
 
+#[derive(Clone)]
 struct MlxExecutionClassSelection {
     options: MlxLoadRequest,
     policy: eredu_core::PreparationPolicy,
     admitted_session: eredu_core::SessionCapabilities,
     processor: Option<eredu_runtime::SelectedProcessorExecution>,
+    partitioned_base: bool,
+}
+
+struct MlxPartitionedAdmissionSelection<'a> {
+    inspection: &'a eredu_core::ArtifactInspection<ArtifactArchitecturePlan>,
+    base: MlxExecutionClassSelection,
+    communication: &'a eredu_runtime::CommunicationCapabilities,
+}
+
+impl eredu_architectures::partitioned_execution::PartitionedAdmissionDispatcher
+    for MlxPartitionedAdmissionSelection<'_>
+{
+    type Output = MlxSelectedExecution;
+    type Error = Error;
+
+    fn direct(
+        self,
+        requirements: eredu_architectures::partitioned_execution::DirectPartitionedAdmission,
+    ) -> Result<Self::Output, Self::Error> {
+        use eredu_architectures::replicated_text::ReplicatedTextExecutionClassDispatcher as _;
+
+        let selected = self
+            .base
+            .clone()
+            .replicated(requirements.execution().clone())?;
+        let selected =
+            eredu_architectures::partitioned_execution::select_direct_partitioned_admission(
+                requirements,
+                selected,
+                self.communication,
+            )
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        match eredu_architectures::partitioned_execution::dense_decoder_partitioned_production_route(
+            self.inspection,
+            &selected,
+        ) {
+            eredu_architectures::partitioned_execution::DenseDecoderPartitionedProductionRoute::NeutralPartitioned => {
+                Ok(MlxSelectedExecution::PartitionedDense { selected })
+            }
+            eredu_architectures::partitioned_execution::DenseDecoderPartitionedProductionRoute::Unsupported(reason) => {
+                Err(Error::ArchitectureModel(format!(
+                    "selected direct partition has no neutral production implementation: {reason:?}"
+                )))
+            }
+        }
+    }
+
+    fn routed(
+        self,
+        requirements: eredu_architectures::partitioned_execution::RoutedPartitionedAdmission,
+    ) -> Result<Self::Output, Self::Error> {
+        use eredu_architectures::replicated_text::ReplicatedTextExecutionClassDispatcher as _;
+
+        let selected = self.base.clone().routed(requirements.execution().clone())?;
+        let selected =
+            eredu_architectures::partitioned_execution::select_routed_partitioned_admission(
+                requirements,
+                selected,
+                self.communication,
+            )
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        let supported =
+            eredu_architectures::partitioned_execution::routed_partitioned_production_supported(
+                self.inspection,
+                &selected,
+            );
+        if !supported {
+            return Err(Error::ArchitectureModel(
+                "selected routed execution has no neutral production implementation".into(),
+            ));
+        }
+        Ok(MlxSelectedExecution::PartitionedRouted { selected })
+    }
+
+    fn composite(
+        self,
+        requirements: eredu_architectures::partitioned_execution::CompositePartitionedAdmission,
+    ) -> Result<Self::Output, Self::Error> {
+        use eredu_architectures::replicated_text::ReplicatedTextExecutionClassDispatcher as _;
+
+        let selected = self
+            .base
+            .clone()
+            .composite(requirements.execution().clone())?;
+        let selected =
+            eredu_architectures::partitioned_execution::select_composite_partitioned_admission(
+                requirements,
+                selected,
+                self.communication,
+            )
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        match eredu_architectures::composite_partitioned::composite_partitioned_production_decision(&selected) {
+            eredu_architectures::composite_partitioned::CompositePartitionedProductionDecision::Resident => {
+                Ok(MlxSelectedExecution::PartitionedComposite { selected })
+            }
+            eredu_architectures::composite_partitioned::CompositePartitionedProductionDecision::Unsupported(reason) => {
+                Err(Error::ArchitectureModel(reason.into()))
+            }
+        }
+    }
 }
 
 impl eredu_architectures::replicated_text::ReplicatedTextExecutionClassDispatcher
@@ -357,8 +642,10 @@ impl eredu_architectures::replicated_text::ReplicatedTextExecutionClassDispatche
             CacheResidencyPolicy::Paged(_)
         ))
         .with_exact_completion(true);
-        if let Some(topology) = self.policy.topology() {
-            request = request.with_topology(topology);
+        if !self.partitioned_base {
+            if let Some(topology) = self.policy.topology() {
+                request = request.with_topology(topology);
+            }
         }
         if let Some(quantization) = self.policy.quantization() {
             request = request.with_quantization(quantization);
@@ -385,8 +672,10 @@ impl eredu_architectures::replicated_text::ReplicatedTextExecutionClassDispatche
             CacheResidencyPolicy::Paged(_)
         ))
         .with_exact_completion(true);
-        if let Some(topology) = self.policy.topology() {
-            text = text.with_topology(topology);
+        if !self.partitioned_base {
+            if let Some(topology) = self.policy.topology() {
+                text = text.with_topology(topology);
+            }
         }
         if let Some(quantization) = self.policy.quantization() {
             text = text.with_quantization(quantization);
@@ -418,8 +707,10 @@ impl eredu_architectures::replicated_text::ReplicatedTextExecutionClassDispatche
             CacheResidencyPolicy::Paged(_)
         ))
         .with_exact_completion(true);
-        if let Some(topology) = self.policy.topology() {
-            execution_request = execution_request.with_topology(topology);
+        if !self.partitioned_base {
+            if let Some(topology) = self.policy.topology() {
+                execution_request = execution_request.with_topology(topology);
+            }
         }
         if let Some(quantization) = self.policy.quantization() {
             execution_request = execution_request.with_quantization(quantization);
@@ -451,6 +742,22 @@ pub(crate) fn select_preparation_with_grouped_capabilities(
     policy: eredu_core::PreparationPolicy,
     grouped_capabilities: &[eredu_runtime::GroupedOperationRequirement],
 ) -> Result<MlxSelectedPreparation, Error> {
+    select_preparation_with_capabilities(
+        inspection,
+        options,
+        policy,
+        grouped_capabilities,
+        &crate::backend::runtime::distributed::topology::mlx_communication_capabilities(),
+    )
+}
+
+fn select_preparation_with_capabilities(
+    inspection: &eredu_core::ArtifactInspection<ArtifactArchitecturePlan>,
+    options: MlxLoadRequest,
+    policy: eredu_core::PreparationPolicy,
+    grouped_capabilities: &[eredu_runtime::GroupedOperationRequirement],
+    communication_capabilities: &eredu_runtime::CommunicationCapabilities,
+) -> Result<MlxSelectedPreparation, Error> {
     if let Some(kind) = inspection
         .architecture_plan()
         .required_gguf_special_tokens()
@@ -478,6 +785,14 @@ pub(crate) fn select_preparation_with_grouped_capabilities(
             "backend is missing architecture-required grouped mechanisms: {missing_grouped:?}"
         )));
     }
+    let projection = inspection
+        .architecture_plan()
+        .prediction_target_projection()
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let prediction_extension = projection.as_ref().map(|(_, extension)| extension.clone());
+    let projected_inspection =
+        projection.map(|(target, _)| inspection.clone().map_architecture_plan(|_complete| target));
+    let inspection = projected_inspection.as_ref().unwrap_or(inspection);
     let processor =
         eredu_architectures::replicated_text::composite_processor_execution_requirements(
             inspection.architecture_plan(),
@@ -512,39 +827,647 @@ pub(crate) fn select_preparation_with_grouped_capabilities(
             .map_err(|error| Error::ArchitectureModel(error.to_string()))
         })
         .transpose()?;
-    let execution = eredu_architectures::replicated_text::dispatch_replicated_text_execution_class(
-        inspection,
-        policy.topology(),
-        MlxExecutionClassSelection {
-            options,
-            policy,
-            admitted_session,
-            processor,
-        },
-    )
-    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    Ok(MlxSelectedPreparation::new(execution, admitted_session))
+    let parallel_topology = options
+        .parallel_topology()
+        .filter(|topology| !topology.is_replicated());
+    let rank_context = options.parallel_rank_context()?;
+    if let (Some(extension), Some(topology)) = (prediction_extension.as_ref(), parallel_topology) {
+        eredu_architectures::prediction_extension::validate_partitioned_prediction_extension(
+            extension, topology,
+        )
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    }
+    let base = MlxExecutionClassSelection {
+        options,
+        policy,
+        admitted_session,
+        processor,
+        partitioned_base: parallel_topology.is_some(),
+    };
+    let execution = if let Some(topology) = parallel_topology {
+        let (maximum_batch_size, maximum_sequence_length) = base
+            .options
+            .partitioned_invocation_limits()?
+            .ok_or_else(|| {
+                Error::Parallel("partitioned selection requires explicit invocation limits".into())
+            })?;
+        let activation_dtype = base
+            .options
+            .pipeline_wire_contract()
+            .ok_or_else(|| {
+                Error::Parallel("partitioned selection requires an activation wire contract".into())
+            })?
+            .activation_dtype();
+        let completion_policy = base
+            .options
+            .communication_completion_policy()?
+            .ok_or_else(|| {
+                Error::Parallel(
+                    "partitioned selection requires an explicit bounded communication completion policy"
+                        .into(),
+                )
+            })?;
+        let request = eredu_architectures::partitioned_execution::PartitionedSelectionRequest::new(
+            topology.topology(),
+            topology.global_rank(),
+            maximum_batch_size,
+            maximum_sequence_length,
+            activation_dtype,
+        )
+        .map_err(Error::ArchitectureModel)?
+        .with_completion_policy(completion_policy);
+        match eredu_architectures::partitioned_execution::dispatch_partitioned_admission(
+            inspection,
+            request,
+            MlxPartitionedAdmissionSelection {
+                inspection,
+                base: base.clone(),
+                communication: communication_capabilities,
+            },
+        ) {
+            Ok(selected) => selected,
+            Err(
+                error @ eredu_architectures::partitioned_execution::PartitionedAdmissionError::Unsupported(_),
+            ) => {
+                if prediction_extension.is_some() {
+                    return Err(Error::ArchitectureModel(format!(
+                        "neutral prediction target admission failed: {error}"
+                    )));
+                }
+                return Err(Error::ArchitectureModel(error.to_string()));
+            }
+            Err(eredu_architectures::partitioned_execution::PartitionedAdmissionError::Dispatch(
+                error,
+            )) => return Err(error),
+        }
+    } else {
+        let selected =
+            eredu_architectures::replicated_text::dispatch_replicated_text_execution_class(
+                inspection,
+                policy.topology(),
+                base,
+            )
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        MlxSelectedExecution::Ordinary(selected)
+    };
+    Ok(MlxSelectedPreparation::new(
+        execution,
+        admitted_session,
+        rank_context,
+        prediction_extension,
+    ))
 }
 
 pub fn materialize_model_plan(
     plan: ModelPreparationPlan<ArtifactArchitecturePlan>,
     selected: MlxSelectedPreparation,
+    distributed: Option<crate::backend::distributed::MlxDistributedSession>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<MlxModel, Error> {
     let MlxSelectedPreparation {
         execution,
         session: _,
+        rank_context: _,
+        prediction_extension,
     } = selected;
-    execution.dispatch(MlxSelectedExecutionMaterializer {
+    let materializer = MlxSelectedExecutionMaterializer {
         plan,
+        prediction_extension,
         stream,
         weights_stream,
-    })
+    };
+    match execution {
+        MlxSelectedExecution::Ordinary(selected) => {
+            debug_assert!(distributed.is_none());
+            selected.dispatch(materializer)
+        }
+        MlxSelectedExecution::PartitionedDense { selected } => {
+            materialize_partitioned_dense_decoder(
+                materializer.plan,
+                materializer.prediction_extension,
+                selected,
+                distributed,
+                stream,
+                weights_stream,
+            )
+        }
+        MlxSelectedExecution::PartitionedRouted { selected } => {
+            materialize_partitioned_routed_decoder(
+                materializer.plan,
+                materializer.prediction_extension,
+                selected,
+                distributed,
+                stream,
+                weights_stream,
+            )
+        }
+        MlxSelectedExecution::PartitionedComposite { selected } => {
+            materialize_partitioned_composite(
+                materializer.plan,
+                materializer.prediction_extension,
+                selected,
+                distributed,
+                stream,
+                weights_stream,
+            )
+        }
+    }
+}
+
+fn materialize_partitioned_composite(
+    plan: ModelPreparationPlan<ArtifactArchitecturePlan>,
+    selected_prediction_extension: Option<
+        eredu_architectures::configuration::PredictionExtensionPlan,
+    >,
+    selected: eredu_architectures::partitioned_execution::SelectedPartitionedAdmission<
+        eredu_architectures::replicated_text::SelectedCompositeTextRealization,
+        eredu_architectures::replicated_text::CompositeTextRequirements,
+    >,
+    distributed: Option<crate::backend::distributed::MlxDistributedSession>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<MlxModel, Error> {
+    let distributed = distributed.ok_or_else(|| {
+        Error::Parallel("neutral composite binding has no realized communication".into())
+    })?;
+    let floating_state_dtype_bytes = inspected_floating_state_dtype_bytes(plan.inspection())?;
+    let state_residency = selected.base().execution().state().policy().clone();
+    let max_cached_shards = selected.base().execution().residency().max_cached_shards();
+    let selected_processor = selected.base().processor().clone();
+    let inspection = plan.inspection().clone();
+    let projection = inspection
+        .architecture_plan()
+        .prediction_target_projection()
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let prediction_extension = projection
+        .as_ref()
+        .map(|(_, extension)| extension.clone())
+        .or(selected_prediction_extension)
+        .or_else(|| {
+            inspection
+                .architecture_plan()
+                .prediction_extension()
+                .cloned()
+        });
+    let architecture_plan = projection.map_or_else(
+        || inspection.architecture_plan().clone(),
+        |(target, _)| target,
+    );
+    let prediction_extension_sources = prediction_extension
+        .as_ref()
+        .map(|extension| {
+            prepared_safetensors_architecture(&architecture_plan).and_then(|target| {
+                extension
+                    .source_keys(target)
+                    .map_err(|error| Error::ArchitectureModel(error.to_string()))
+            })
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let kind = prepared_model_kind(&architecture_plan);
+    let store: Arc<dyn eredu_checkpoint::store::CheckpointSource> = match plan.into_artifact() {
+        ModelArtifact::SafeTensors {
+            path: _,
+            configuration,
+            tensors,
+            shards,
+        } => {
+            let store_architecture = prediction_extension.as_ref().map_or_else(
+                || prepared_safetensors_architecture(&architecture_plan).cloned(),
+                |extension| Ok(extension.complete_architecture().clone()),
+            )?;
+            let prepared = super::artifact::PreparedSafetensorsArtifact::open(
+                configuration,
+                store_architecture,
+                tensors,
+                shards,
+                max_cached_shards,
+            )?;
+            prepared.store()
+        }
+        ModelArtifact::Gguf { validated, .. } => {
+            let architecture = prepared_gguf_plan(&architecture_plan)?.clone();
+            let (source, projector) = structural::AdmittedGguf::from_admission(
+                architecture,
+                architecture_plan.gguf_media_projector().cloned(),
+                validated,
+            )?;
+            #[cfg(test)]
+            super::path_instrumentation::payload_open();
+            let primary_mapping = projector
+                .as_ref()
+                .map_or(source.plan().tensor_mapping(), |projector| {
+                    projector.plan().primary_tensor_mapping()
+                });
+            let primary: Arc<dyn eredu_checkpoint::store::CheckpointSource> = Arc::new(
+                crate::backend::runtime::checkpoint::store::open_gguf_checkpoint_source(
+                    source.checkpoint().clone(),
+                    source.plan().checkpoint(),
+                    primary_mapping,
+                    max_cached_shards,
+                )?,
+            );
+            match projector {
+                None => primary,
+                Some(projector) => {
+                    let companion: Arc<dyn eredu_checkpoint::store::CheckpointSource> = Arc::new(
+                        crate::backend::runtime::checkpoint::store::open_gguf_checkpoint_source(
+                            projector.checkpoint().clone(),
+                            projector.plan().checkpoint(),
+                            projector.plan().tensor_mapping(),
+                            max_cached_shards,
+                        )?,
+                    );
+                    Arc::new(eredu_checkpoint::store::CompositeCheckpointSource::new([
+                        primary, companion,
+                    ])?)
+                }
+            }
+        }
+        _ => {
+            return Err(Error::ArchitectureModel(
+                "unsupported artifact route for partitioned composite composition".into(),
+            ));
+        }
+    };
+    let prediction_extension_execution = prediction_extension
+        .as_ref()
+        .map(|extension| {
+            let prepared = eredu_architectures::prediction_extension::prepare_partitioned_prediction_extension::<
+                MlxNeuralBackend,
+                _,
+                _,
+            >(extension, &selected, store.as_ref(), weights_stream, stream)
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+            super::replicated_text::materialize_prediction_extension(
+                prepared,
+                store.as_ref(),
+                stream,
+                weights_stream,
+            )
+        })
+        .transpose()
+        .map_err(|error| {
+            Error::ArchitectureModel(format!(
+                "prediction extension materialization failed: {error}"
+            ))
+        })?;
+    let target_store: Arc<dyn eredu_checkpoint::store::CheckpointSource> =
+        if prediction_extension_sources.is_empty() {
+            store
+        } else {
+            Arc::new(PredictionTargetCheckpointSource::new(
+                store,
+                prediction_extension_sources,
+            ))
+        };
+    let mut executable = super::replicated_text::bind_partitioned_composite(
+        selected,
+        target_store,
+        distributed,
+        stream,
+        weights_stream,
+    )?;
+    if let Some((extension, execution)) = prediction_extension.zip(prediction_extension_execution) {
+        let capability =
+            eredu_architectures::prediction_extension::prediction_extension_capability(&extension)
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        executable.install_prediction_extension_contract(execution, capability)?;
+    }
+    let model = MlxModel::complete(
+        Executable::replicated_text(kind, executable)?,
+        floating_state_dtype_bytes,
+        state_residency,
+    );
+    attach_selected_processor(model, &architecture_plan, &selected_processor)
+}
+
+fn materialize_partitioned_routed_decoder(
+    plan: ModelPreparationPlan<ArtifactArchitecturePlan>,
+    selected_prediction_extension: Option<
+        eredu_architectures::configuration::PredictionExtensionPlan,
+    >,
+    selected: eredu_architectures::partitioned_execution::SelectedPartitionedAdmission<
+        eredu_architectures::SelectedRoutedTextRealization,
+        eredu_architectures::RoutedTextRequirements,
+    >,
+    distributed: Option<crate::backend::distributed::MlxDistributedSession>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<MlxModel, Error> {
+    let kind = prepared_model_kind(plan.inspection().architecture_plan());
+    let distributed = distributed.ok_or_else(|| {
+        Error::Parallel("neutral routed-decoder binding has no realized communication".into())
+    })?;
+    let floating_state_dtype_bytes = inspected_floating_state_dtype_bytes(plan.inspection())?;
+    let state_residency = selected.base().text().state().policy().clone();
+    let max_cached_shards = selected.base().text().residency().max_cached_shards();
+    let inspection = plan.inspection().clone();
+    let projection = inspection
+        .architecture_plan()
+        .prediction_target_projection()
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let prediction_extension = projection
+        .as_ref()
+        .map(|(_, extension)| extension.clone())
+        .or(selected_prediction_extension)
+        .or_else(|| {
+            inspection
+                .architecture_plan()
+                .prediction_extension()
+                .cloned()
+        });
+    let architecture_plan = projection.map_or_else(
+        || inspection.architecture_plan().clone(),
+        |(target, _)| target,
+    );
+    let prediction_extension_sources = prediction_extension
+        .as_ref()
+        .map(|extension| {
+            prepared_safetensors_architecture(&architecture_plan).and_then(|target| {
+                extension
+                    .source_keys(target)
+                    .map_err(|error| Error::ArchitectureModel(error.to_string()))
+            })
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let inspection = inspection.map_architecture_plan(|_complete| architecture_plan.clone());
+    let store: Arc<dyn eredu_checkpoint::store::CheckpointSource> = match plan.into_artifact() {
+        ModelArtifact::SafeTensors {
+            path: _,
+            configuration,
+            tensors,
+            shards,
+        } => {
+            let store_architecture = prediction_extension.as_ref().map_or_else(
+                || prepared_safetensors_architecture(&architecture_plan).cloned(),
+                |extension| Ok(extension.complete_architecture().clone()),
+            )?;
+            super::artifact::PreparedSafetensorsArtifact::open(
+                configuration,
+                store_architecture,
+                tensors,
+                shards,
+                max_cached_shards,
+            )?
+            .store()
+        }
+        ModelArtifact::Gguf { validated, .. } => {
+            let architecture = prepared_gguf_plan(&architecture_plan)?.clone();
+            let (source, projector) = structural::AdmittedGguf::from_admission(
+                architecture,
+                architecture_plan.gguf_media_projector().cloned(),
+                validated,
+            )?;
+            if projector.is_some() {
+                return Err(Error::ArchitectureModel(
+                    "partitioned routed text composition cannot bind a media projector".into(),
+                ));
+            }
+            #[cfg(test)]
+            super::path_instrumentation::payload_open();
+            Arc::new(
+                crate::backend::runtime::checkpoint::store::open_gguf_checkpoint_source(
+                    source.checkpoint().clone(),
+                    source.plan().checkpoint(),
+                    source.plan().tensor_mapping(),
+                    max_cached_shards,
+                )?,
+            )
+        }
+        _ => {
+            return Err(Error::ArchitectureModel(
+                "unsupported artifact route for partitioned routed text composition".into(),
+            ));
+        }
+    };
+    let prediction_extension_execution = prediction_extension
+        .as_ref()
+        .map(|extension| {
+            let prepared = eredu_architectures::prediction_extension::prepare_partitioned_prediction_extension::<
+                MlxNeuralBackend,
+                _,
+                _,
+            >(extension, &selected, store.as_ref(), weights_stream, stream)
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+            super::replicated_text::materialize_prediction_extension(
+                prepared,
+                store.as_ref(),
+                stream,
+                weights_stream,
+            )
+        })
+        .transpose()
+        .map_err(|error| {
+            Error::ArchitectureModel(format!(
+                "prediction extension materialization failed: {error}"
+            ))
+        })?;
+    let target_store: Arc<dyn eredu_checkpoint::store::CheckpointSource> =
+        if prediction_extension_sources.is_empty() {
+            store
+        } else {
+            Arc::new(PredictionTargetCheckpointSource::new(
+                store,
+                prediction_extension_sources.clone(),
+            ))
+        };
+    let mut executable = super::replicated_text::bind_partitioned_routed_decoder(
+        &inspection,
+        selected,
+        target_store,
+        distributed,
+        prediction_extension_sources,
+        stream,
+        weights_stream,
+    )?;
+    if let Some((extension, execution)) = prediction_extension.zip(prediction_extension_execution) {
+        let capability =
+            eredu_architectures::prediction_extension::prediction_extension_capability(&extension)
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        executable.install_prediction_extension_contract(execution, capability)?;
+    }
+    Ok(MlxModel::complete(
+        Executable::replicated_text(kind, executable)?,
+        floating_state_dtype_bytes,
+        state_residency,
+    ))
+}
+
+fn materialize_partitioned_dense_decoder(
+    plan: ModelPreparationPlan<ArtifactArchitecturePlan>,
+    selected_prediction_extension: Option<
+        eredu_architectures::configuration::PredictionExtensionPlan,
+    >,
+    selected: eredu_architectures::partitioned_execution::SelectedPartitionedAdmission<
+        eredu_runtime::SelectedReplicatedTextRealization,
+        eredu_runtime::ReplicatedTextRequirements,
+    >,
+    distributed: Option<crate::backend::distributed::MlxDistributedSession>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<MlxModel, Error> {
+    let kind = prepared_model_kind(plan.inspection().architecture_plan());
+    let distributed = distributed.ok_or_else(|| {
+        Error::Parallel("neutral dense-decoder binding has no realized communication".into())
+    })?;
+    let floating_state_dtype_bytes = inspected_floating_state_dtype_bytes(plan.inspection())?;
+    let state_residency = selected.base().state().policy().clone();
+    let max_cached_shards = selected.base().residency().max_cached_shards();
+    let inspection = plan.inspection().clone();
+    let projection = inspection
+        .architecture_plan()
+        .prediction_target_projection()
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let prediction_extension = projection
+        .as_ref()
+        .map(|(_, extension)| extension.clone())
+        .or(selected_prediction_extension)
+        .or_else(|| {
+            inspection
+                .architecture_plan()
+                .prediction_extension()
+                .cloned()
+        });
+    let architecture_plan = projection.map_or_else(
+        || inspection.architecture_plan().clone(),
+        |(target, _)| target,
+    );
+    let prediction_extension_sources = prediction_extension
+        .as_ref()
+        .map(|extension| {
+            prepared_safetensors_architecture(&architecture_plan).and_then(|target| {
+                extension
+                    .source_keys(target)
+                    .map_err(|error| Error::ArchitectureModel(error.to_string()))
+            })
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let inspection = inspection.map_architecture_plan(|_complete| architecture_plan.clone());
+    let artifact = plan.into_artifact();
+    let store: Arc<dyn eredu_checkpoint::store::CheckpointSource> = match artifact {
+        ModelArtifact::SafeTensors {
+            path: _,
+            configuration,
+            tensors,
+            shards,
+        } => {
+            let store_architecture = prediction_extension.as_ref().map_or_else(
+                || prepared_safetensors_architecture(&architecture_plan).cloned(),
+                |extension| Ok(extension.complete_architecture().clone()),
+            )?;
+            let prepared = super::artifact::PreparedSafetensorsArtifact::open(
+                configuration,
+                store_architecture,
+                tensors,
+                shards,
+                max_cached_shards,
+            )?;
+            prepared.store()
+        }
+        ModelArtifact::Gguf { validated, .. } => {
+            let architecture = prepared_gguf_plan(&architecture_plan)?.clone();
+            let (source, projector) = structural::AdmittedGguf::from_admission(
+                architecture,
+                architecture_plan.gguf_media_projector().cloned(),
+                validated,
+            )?;
+            if projector.is_some() {
+                return Err(Error::ArchitectureModel(
+                    "partitioned dense text composition cannot bind a media projector".into(),
+                ));
+            }
+            #[cfg(test)]
+            super::path_instrumentation::payload_open();
+            Arc::new(
+                crate::backend::runtime::checkpoint::store::open_gguf_checkpoint_source(
+                    source.checkpoint().clone(),
+                    source.plan().checkpoint(),
+                    source.plan().tensor_mapping(),
+                    max_cached_shards,
+                )?,
+            )
+        }
+        _ => {
+            return Err(Error::ArchitectureModel(
+                "unsupported artifact route for partitioned dense text composition".into(),
+            ));
+        }
+    };
+    let missing_prediction_sources = prediction_extension_sources
+        .iter()
+        .filter(|source| {
+            !store
+                .source_keys()
+                .iter()
+                .any(|available| available == *source)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if !missing_prediction_sources.is_empty() {
+        return Err(Error::ArchitectureModel(format!(
+            "prediction extension sources are absent from the admitted checkpoint: {missing_prediction_sources:?}"
+        )));
+    }
+    let prediction_extension_execution = prediction_extension
+        .as_ref()
+        .map(|extension| {
+            let prepared = eredu_architectures::prediction_extension::prepare_partitioned_prediction_extension::<
+                MlxNeuralBackend,
+                _,
+                _,
+            >(extension, &selected, store.as_ref(), weights_stream, stream)
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+            super::replicated_text::materialize_prediction_extension(
+                prepared,
+                store.as_ref(),
+                stream,
+                weights_stream,
+            )
+        })
+        .transpose()
+        .map_err(|error| {
+            Error::ArchitectureModel(format!(
+                "prediction extension materialization failed: {error}"
+            ))
+        })?;
+    let target_store: Arc<dyn eredu_checkpoint::store::CheckpointSource> =
+        if prediction_extension_sources.is_empty() {
+            store
+        } else {
+            Arc::new(PredictionTargetCheckpointSource::new(
+                store,
+                prediction_extension_sources.clone(),
+            ))
+        };
+    let mut executable = super::replicated_text::bind_partitioned_dense_decoder(
+        &inspection,
+        selected,
+        target_store,
+        distributed,
+        prediction_extension_sources,
+        stream,
+        weights_stream,
+    )?;
+    if let Some((extension, execution)) = prediction_extension.zip(prediction_extension_execution) {
+        let capability =
+            eredu_architectures::prediction_extension::prediction_extension_capability(&extension)
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        executable.install_prediction_extension_contract(execution, capability)?;
+    }
+    Ok(MlxModel::complete(
+        Executable::replicated_text(kind, executable)?,
+        floating_state_dtype_bytes,
+        state_residency,
+    ))
 }
 
 struct MlxSelectedExecutionMaterializer<'a> {
     plan: ModelPreparationPlan<ArtifactArchitecturePlan>,
+    prediction_extension: Option<eredu_architectures::configuration::PredictionExtensionPlan>,
     stream: &'a Stream,
     weights_stream: &'a Stream,
 }
@@ -564,21 +1487,39 @@ impl
         self,
         selected: eredu_runtime::SelectedReplicatedTextRealization,
     ) -> Result<Self::Output, Self::Error> {
-        materialize_replicated_text_plan(self.plan, selected, self.stream, self.weights_stream)
+        materialize_replicated_text_plan(
+            self.plan,
+            self.prediction_extension,
+            selected,
+            self.stream,
+            self.weights_stream,
+        )
     }
 
     fn routed(
         self,
         selected: eredu_architectures::SelectedRoutedTextRealization,
     ) -> Result<Self::Output, Self::Error> {
-        materialize_routed_text_plan(self.plan, selected, self.stream, self.weights_stream)
+        materialize_routed_text_plan(
+            self.plan,
+            self.prediction_extension,
+            selected,
+            self.stream,
+            self.weights_stream,
+        )
     }
 
     fn composite(
         self,
         selected: eredu_architectures::replicated_text::SelectedCompositeTextRealization,
     ) -> Result<Self::Output, Self::Error> {
-        materialize_composite_text_plan(self.plan, selected, self.stream, self.weights_stream)
+        materialize_composite_text_plan(
+            self.plan,
+            self.prediction_extension,
+            selected,
+            self.stream,
+            self.weights_stream,
+        )
     }
 
     fn other(self, selected: SelectedMlxConstruction) -> Result<Self::Output, Self::Error> {
@@ -593,8 +1534,78 @@ impl
     }
 }
 
+fn replicated_prediction_projection(
+    inspection: &eredu_core::ArtifactInspection<ArtifactArchitecturePlan>,
+    selected: Option<eredu_architectures::configuration::PredictionExtensionPlan>,
+) -> Result<
+    (
+        ArtifactArchitecturePlan,
+        Option<eredu_architectures::configuration::PredictionExtensionPlan>,
+        std::collections::BTreeSet<String>,
+    ),
+    Error,
+> {
+    let projection = inspection
+        .architecture_plan()
+        .prediction_target_projection()
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let extension = projection
+        .as_ref()
+        .map(|(_, extension)| extension.clone())
+        .or(selected);
+    let target = projection.map_or_else(
+        || inspection.architecture_plan().clone(),
+        |(target, _)| target,
+    );
+    let sources = extension
+        .as_ref()
+        .map(|extension| {
+            prepared_safetensors_architecture(&target).and_then(|target| {
+                extension
+                    .source_keys(target)
+                    .map_err(|error| Error::ArchitectureModel(error.to_string()))
+            })
+        })
+        .transpose()?
+        .unwrap_or_default();
+    Ok((target, extension, sources))
+}
+
+fn materialize_replicated_prediction_extension(
+    extension: &eredu_architectures::configuration::PredictionExtensionPlan,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<super::replicated_text::MlxPredictionExtension, Error> {
+    let prepared =
+        eredu_architectures::prediction_extension::prepare_replicated_prediction_extension::<
+            MlxNeuralBackend,
+        >(extension, store, weights_stream, stream)
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    super::replicated_text::materialize_prediction_extension(
+        prepared,
+        store,
+        stream,
+        weights_stream,
+    )
+}
+
+fn install_replicated_prediction_extension(
+    executable: &mut Box<dyn super::replicated_text::ErasedReplicatedTextExecutable>,
+    extension: eredu_architectures::configuration::PredictionExtensionPlan,
+    materialized: super::replicated_text::MlxPredictionExtension,
+) -> Result<(), Error> {
+    let capability =
+        eredu_architectures::prediction_extension::prediction_extension_capability(&extension)
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    executable.install_prediction_extension_contract(materialized, capability)
+}
+
 fn materialize_replicated_text_plan(
     plan: ModelPreparationPlan<ArtifactArchitecturePlan>,
+    selected_prediction_extension: Option<
+        eredu_architectures::configuration::PredictionExtensionPlan,
+    >,
     realization: eredu_runtime::SelectedReplicatedTextRealization,
     stream: &Stream,
     weights_stream: &Stream,
@@ -602,7 +1613,8 @@ fn materialize_replicated_text_plan(
     let floating_state_dtype_bytes = inspected_floating_state_dtype_bytes(plan.inspection())?;
     let max_cached_shards = realization.residency().max_cached_shards();
     let state_residency = realization.state().policy().clone();
-    let architecture_plan = plan.inspection().architecture_plan().clone();
+    let (architecture_plan, prediction_extension, prediction_extension_sources) =
+        replicated_prediction_projection(plan.inspection(), selected_prediction_extension)?;
     let artifact = plan.into_artifact();
     let kind = prepared_model_kind(&architecture_plan);
     let executable = match artifact {
@@ -612,20 +1624,49 @@ fn materialize_replicated_text_plan(
             tensors,
             shards,
         } => {
+            let store_architecture = prediction_extension.as_ref().map_or_else(
+                || prepared_safetensors_architecture(&architecture_plan).cloned(),
+                |extension| Ok(extension.complete_architecture().clone()),
+            )?;
             let prepared = super::artifact::PreparedSafetensorsArtifact::open(
                 configuration,
-                prepared_safetensors_architecture(&architecture_plan)?.clone(),
+                store_architecture,
                 tensors,
                 shards,
                 max_cached_shards,
             )?;
-            bind_replicated_text(
+            let store = prepared.store();
+            let materialized = prediction_extension
+                .as_ref()
+                .map(|extension| {
+                    materialize_replicated_prediction_extension(
+                        extension,
+                        store.as_ref(),
+                        stream,
+                        weights_stream,
+                    )
+                })
+                .transpose()?;
+            let target_store: Arc<dyn eredu_checkpoint::store::CheckpointSource> =
+                if prediction_extension_sources.is_empty() {
+                    store
+                } else {
+                    Arc::new(PredictionTargetCheckpointSource::new(
+                        store,
+                        prediction_extension_sources,
+                    ))
+                };
+            let mut executable = bind_replicated_text(
                 &architecture_plan,
                 realization,
-                prepared.store(),
+                target_store,
                 stream,
                 weights_stream,
-            )?
+            )?;
+            if let Some((extension, materialized)) = prediction_extension.zip(materialized) {
+                install_replicated_prediction_extension(&mut executable, extension, materialized)?;
+            }
+            executable
         }
         ModelArtifact::Gguf { validated, .. } => {
             let architecture = prepared_gguf_plan(&architecture_plan)?.clone();
@@ -673,6 +1714,9 @@ fn materialize_replicated_text_plan(
 
 fn materialize_routed_text_plan(
     plan: ModelPreparationPlan<ArtifactArchitecturePlan>,
+    selected_prediction_extension: Option<
+        eredu_architectures::configuration::PredictionExtensionPlan,
+    >,
     realization: eredu_architectures::SelectedRoutedTextRealization,
     stream: &Stream,
     weights_stream: &Stream,
@@ -680,8 +1724,11 @@ fn materialize_routed_text_plan(
     let floating_state_dtype_bytes = inspected_floating_state_dtype_bytes(plan.inspection())?;
     let max_cached_shards = realization.text().residency().max_cached_shards();
     let state_residency = realization.text().state().policy().clone();
-    let inspection = plan.inspection().clone();
-    let architecture_plan = inspection.architecture_plan().clone();
+    let complete_inspection = plan.inspection().clone();
+    let (architecture_plan, prediction_extension, prediction_extension_sources) =
+        replicated_prediction_projection(&complete_inspection, selected_prediction_extension)?;
+    let inspection =
+        complete_inspection.map_architecture_plan(|_complete| architecture_plan.clone());
     let artifact = plan.into_artifact();
     let kind = prepared_model_kind(&architecture_plan);
     let executable = match artifact {
@@ -691,20 +1738,49 @@ fn materialize_routed_text_plan(
             tensors,
             shards,
         } => {
+            let store_architecture = prediction_extension.as_ref().map_or_else(
+                || prepared_safetensors_architecture(&architecture_plan).cloned(),
+                |extension| Ok(extension.complete_architecture().clone()),
+            )?;
             let prepared = super::artifact::PreparedSafetensorsArtifact::open(
                 configuration,
-                prepared_safetensors_architecture(&architecture_plan)?.clone(),
+                store_architecture,
                 tensors,
                 shards,
                 max_cached_shards,
             )?;
-            super::replicated_text::bind_routed_text(
+            let store = prepared.store();
+            let materialized = prediction_extension
+                .as_ref()
+                .map(|extension| {
+                    materialize_replicated_prediction_extension(
+                        extension,
+                        store.as_ref(),
+                        stream,
+                        weights_stream,
+                    )
+                })
+                .transpose()?;
+            let target_store: Arc<dyn eredu_checkpoint::store::CheckpointSource> =
+                if prediction_extension_sources.is_empty() {
+                    store
+                } else {
+                    Arc::new(PredictionTargetCheckpointSource::new(
+                        store,
+                        prediction_extension_sources,
+                    ))
+                };
+            let mut executable = super::replicated_text::bind_routed_text(
                 &inspection,
                 realization,
-                prepared.store(),
+                target_store,
                 stream,
                 weights_stream,
-            )?
+            )?;
+            if let Some((extension, materialized)) = prediction_extension.zip(materialized) {
+                install_replicated_prediction_extension(&mut executable, extension, materialized)?;
+            }
+            executable
         }
         ModelArtifact::Gguf { validated, .. } => {
             let architecture = prepared_gguf_plan(&architecture_plan)?.clone();
@@ -752,6 +1828,9 @@ fn materialize_routed_text_plan(
 
 fn materialize_composite_text_plan(
     plan: ModelPreparationPlan<ArtifactArchitecturePlan>,
+    selected_prediction_extension: Option<
+        eredu_architectures::configuration::PredictionExtensionPlan,
+    >,
     realization: eredu_architectures::replicated_text::SelectedCompositeTextRealization,
     stream: &Stream,
     weights_stream: &Stream,
@@ -759,8 +1838,11 @@ fn materialize_composite_text_plan(
     let floating_state_dtype_bytes = inspected_floating_state_dtype_bytes(plan.inspection())?;
     let max_cached_shards = realization.execution().residency().max_cached_shards();
     let state_residency = realization.execution().state().policy().clone();
-    let inspection = plan.inspection().clone();
-    let architecture_plan = inspection.architecture_plan().clone();
+    let complete_inspection = plan.inspection().clone();
+    let (architecture_plan, prediction_extension, prediction_extension_sources) =
+        replicated_prediction_projection(&complete_inspection, selected_prediction_extension)?;
+    let inspection =
+        complete_inspection.map_architecture_plan(|_complete| architecture_plan.clone());
     let requirements =
         eredu_architectures::replicated_text::composite_text_requirements(&inspection)
             .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
@@ -774,9 +1856,13 @@ fn materialize_composite_text_plan(
             tensors,
             shards,
         } => {
+            let store_architecture = prediction_extension.as_ref().map_or_else(
+                || prepared_safetensors_architecture(&architecture_plan).cloned(),
+                |extension| Ok(extension.complete_architecture().clone()),
+            )?;
             let prepared = super::artifact::PreparedSafetensorsArtifact::open(
                 configuration,
-                prepared_safetensors_architecture(&architecture_plan)?.clone(),
+                store_architecture,
                 tensors,
                 shards,
                 max_cached_shards,
@@ -828,14 +1914,34 @@ fn materialize_composite_text_plan(
             ));
         }
     };
-    let executable = eredu_architectures::replicated_text::visit_composite_text_architecture::<
+    let materialized = prediction_extension
+        .as_ref()
+        .map(|extension| {
+            materialize_replicated_prediction_extension(
+                extension,
+                store.as_ref(),
+                stream,
+                weights_stream,
+            )
+        })
+        .transpose()?;
+    let target_store: Arc<dyn eredu_checkpoint::store::CheckpointSource> =
+        if prediction_extension_sources.is_empty() {
+            store
+        } else {
+            Arc::new(PredictionTargetCheckpointSource::new(
+                store,
+                prediction_extension_sources,
+            ))
+        };
+    let mut executable = eredu_architectures::replicated_text::visit_composite_text_architecture::<
         crate::backend::nn::shared::MlxNeuralBackend,
         crate::backend::runtime::cache::state::MlxHybridState,
         _,
     >(
         requirements,
         realization,
-        store,
+        target_store,
         stream,
         super::replicated_text::CompositeBindingVisitor {
             stream,
@@ -843,6 +1949,9 @@ fn materialize_composite_text_plan(
         },
     )
     .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    if let Some((extension, materialized)) = prediction_extension.zip(materialized) {
+        install_replicated_prediction_extension(&mut executable, extension, materialized)?;
+    }
     let model = MlxModel::complete(
         Executable::replicated_text(kind, executable)?,
         floating_state_dtype_bytes,
@@ -877,74 +1986,13 @@ fn materialize_excluded_model_plan(
     }
     let floating_state_dtype_bytes = inspected_floating_state_dtype_bytes(plan.inspection())?;
     let state_residency = options.state_residency.clone();
-    if let Some(topology) = options
+    if options
         .parallel_topology()
-        .filter(|topology| !topology.is_replicated())
+        .is_some_and(|topology| !topology.is_replicated())
     {
-        let kind = prepared_model_kind(plan.inspection().architecture_plan());
-        if requires_distributed_stage(kind, topology.topology()) {
-            let architecture_plan = plan.inspection().architecture_plan().clone();
-            let model =
-                crate::composition::mlx::distributed::pipeline::load_pipeline_model_with_options(
-                    plan,
-                    options,
-                    stream,
-                    weights_stream,
-                )
-                .map(|model| {
-                    MlxModel::pipeline(model, floating_state_dtype_bytes, state_residency.clone())
-                })?;
-            return attach_optional_selected_processor(
-                model,
-                &architecture_plan,
-                selected_processor.as_ref(),
-            );
-        }
-        let architecture_plan = plan.inspection().architecture_plan().clone();
-        let artifact = plan.into_artifact();
-        return match artifact {
-            artifact @ ModelArtifact::Gguf { .. } => materialize_gguf_artifact(
-                artifact,
-                architecture_plan,
-                family_route,
-                options,
-                stream,
-                weights_stream,
-            )
-            .map(|model| {
-                complete_gguf_model(model, floating_state_dtype_bytes, state_residency.clone())
-            }),
-            ModelArtifact::SafeTensors {
-                path: _,
-                configuration,
-                tensors,
-                shards,
-            } => {
-                let prepared = super::artifact::PreparedSafetensorsArtifact::open(
-                    configuration,
-                    prepared_safetensors_architecture(&architecture_plan)?.clone(),
-                    tensors,
-                    shards,
-                    options.weight_residency.max_cached_shards(),
-                )?;
-                let model = materialize_tensor_parallel(&prepared, options, stream, weights_stream)
-                    .map(|model| {
-                        MlxModel::complete(
-                            model,
-                            floating_state_dtype_bytes,
-                            state_residency.clone(),
-                        )
-                    })?;
-                attach_optional_selected_processor(
-                    model,
-                    &architecture_plan,
-                    selected_processor.as_ref(),
-                )
-            }
-            _ => Err(Error::ArchitectureModel(
-                "unsupported artifact route for tensor-parallel composition".into(),
-            )),
-        };
+        return Err(Error::ArchitectureModel(
+            "selected distributed execution has no neutral production implementation".into(),
+        ));
     }
     let architecture_plan = plan.inspection().architecture_plan().clone();
     let artifact = plan.into_artifact();
@@ -1066,15 +2114,73 @@ fn mlx_floating_state_dtype_bytes(
 mod floating_state_dtype_tests {
     use super::{
         inspected_floating_state_dtype_bytes, mlx_floating_state_dtype_bytes,
-        reject_complete_tensor_parallel_quantization,
+        select_preparation_with_capabilities, MlxSelectedExecution,
     };
-    use crate::composition::mlx::realization::requires_distributed_stage;
-    use crate::{backend::DeviceAssignment, native::MlxParallelPlan};
-    use eredu_architectures::ModelKind;
-    use eredu_checkpoint::WeightQuantization;
-    use eredu_core::checkpoint::TensorDtype;
+    use crate::backend::{ExecutionContext, MlxBackend};
+    use eredu_core::{
+        checkpoint::TensorDtype, residency::OffloadConfig, ModelLoadingBackend as _,
+        ParallelTopology,
+    };
     use eredu_gguf::{GgmlType, MetadataValue, TensorInput, Writer};
-    use safemlx::DeviceType;
+
+    #[test]
+    fn deepseek_v4_prediction_selection_retains_neutral_extension_contract() {
+        let root = tempfile::tempdir().unwrap();
+        crate::tests::distributed_pipeline_ring::write_deepseek_v4_fixture(root.path(), 1);
+        let inspection = eredu_architectures::configuration::inspect_artifact(root.path()).unwrap();
+        let topology = crate::test_parallel_rank(0, 2, 1, 1);
+        let options = crate::MlxLoadRequest::with_parallel(
+            topology,
+            crate::backend::DeviceAssignment::new(safemlx::DeviceType::Cpu, 0),
+            eredu_runtime::PipelineWireContract::new(
+                eredu_runtime::PipelineActivationDtype::Float32,
+            ),
+            4,
+            4096,
+            crate::MlxLoadRequest::test_communication_completion_policy(),
+        );
+        let policy = options.preparation_policy().unwrap();
+
+        let selected = super::select_preparation(&inspection, options, policy).unwrap();
+
+        let (target, extension) = inspection
+            .architecture_plan()
+            .prediction_target_projection()
+            .unwrap()
+            .unwrap();
+        let extension_sources = extension
+            .source_keys(target.safetensors_architecture().unwrap())
+            .unwrap();
+        assert_eq!(extension_sources.len(), 41);
+        let target_sources = target
+            .safetensors_architecture()
+            .unwrap()
+            .checkpoint_resolution()
+            .unwrap()
+            .source_keys();
+        let complete_sources = extension
+            .complete_architecture()
+            .checkpoint_resolution()
+            .unwrap()
+            .source_keys();
+        assert!(target_sources.is_disjoint(&extension_sources));
+        assert_eq!(
+            target_sources
+                .union(&extension_sources)
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            *complete_sources
+        );
+        assert!(selected.prediction_extension.is_some());
+        assert!(matches!(
+            selected.execution,
+            MlxSelectedExecution::PartitionedDense { .. }
+                | MlxSelectedExecution::PartitionedRouted { .. }
+        ));
+        assert!(selected.realized_communication_manifest().is_some());
+        assert!(selected.rank_context().is_some());
+    }
+    use safemlx::{Device, DeviceType};
     use std::collections::BTreeMap;
 
     fn write_minimal_llama_gguf(path: &std::path::Path, dtype: GgmlType) {
@@ -1083,39 +2189,56 @@ mod floating_state_dtype_tests {
                 "general.architecture".into(),
                 MetadataValue::String("llama".into()),
             ),
-            ("llama.block_count".into(), MetadataValue::Uint32(1)),
-            ("llama.embedding_length".into(), MetadataValue::Uint32(1)),
+            ("llama.block_count".into(), MetadataValue::Uint32(2)),
+            ("llama.embedding_length".into(), MetadataValue::Uint32(16)),
             (
                 "llama.attention.head_count".into(),
-                MetadataValue::Uint32(1),
+                MetadataValue::Uint32(2),
             ),
-            ("llama.feed_forward_length".into(), MetadataValue::Uint32(1)),
+            (
+                "llama.feed_forward_length".into(),
+                MetadataValue::Uint32(16),
+            ),
             (
                 "llama.attention.layer_norm_rms_epsilon".into(),
                 MetadataValue::Float32(1e-5),
             ),
-            ("llama.vocab_size".into(), MetadataValue::Uint32(1)),
+            ("llama.vocab_size".into(), MetadataValue::Uint32(16)),
             ("llama.context_length".into(), MetadataValue::Uint32(1)),
         ]);
-        let data = [0_u8; 2];
+        let vector_data = [0_u8; 32];
+        let matrix_data = [0_u8; 512];
         let tensor = |name, dimensions| TensorInput {
             name,
             dimensions,
             ggml_type: dtype,
-            data: &data,
+            data: if dimensions.len() == 1 {
+                &vector_data
+            } else {
+                &matrix_data
+            },
         };
         let tensors = [
-            tensor("token_embd.weight", &[1, 1]),
-            tensor("output_norm.weight", &[1]),
-            tensor("blk.0.attn_norm.weight", &[1]),
-            tensor("blk.0.ffn_norm.weight", &[1]),
-            tensor("blk.0.attn_q.weight", &[1, 1]),
-            tensor("blk.0.attn_k.weight", &[1, 1]),
-            tensor("blk.0.attn_v.weight", &[1, 1]),
-            tensor("blk.0.attn_output.weight", &[1, 1]),
-            tensor("blk.0.ffn_gate.weight", &[1, 1]),
-            tensor("blk.0.ffn_up.weight", &[1, 1]),
-            tensor("blk.0.ffn_down.weight", &[1, 1]),
+            tensor("token_embd.weight", &[16, 16]),
+            tensor("output_norm.weight", &[16]),
+            tensor("blk.0.attn_norm.weight", &[16]),
+            tensor("blk.0.ffn_norm.weight", &[16]),
+            tensor("blk.0.attn_q.weight", &[16, 16]),
+            tensor("blk.0.attn_k.weight", &[16, 16]),
+            tensor("blk.0.attn_v.weight", &[16, 16]),
+            tensor("blk.0.attn_output.weight", &[16, 16]),
+            tensor("blk.0.ffn_gate.weight", &[16, 16]),
+            tensor("blk.0.ffn_up.weight", &[16, 16]),
+            tensor("blk.0.ffn_down.weight", &[16, 16]),
+            tensor("blk.1.attn_norm.weight", &[16]),
+            tensor("blk.1.ffn_norm.weight", &[16]),
+            tensor("blk.1.attn_q.weight", &[16, 16]),
+            tensor("blk.1.attn_k.weight", &[16, 16]),
+            tensor("blk.1.attn_v.weight", &[16, 16]),
+            tensor("blk.1.attn_output.weight", &[16, 16]),
+            tensor("blk.1.ffn_gate.weight", &[16, 16]),
+            tensor("blk.1.ffn_up.weight", &[16, 16]),
+            tensor("blk.1.ffn_down.weight", &[16, 16]),
         ];
         Writer::default()
             .write(std::fs::File::create(path).unwrap(), &metadata, &tensors)
@@ -1123,58 +2246,316 @@ mod floating_state_dtype_tests {
     }
 
     #[test]
-    fn deepseek_pure_tp_uses_distributed_stage_loader() {
-        let topology =
-            MlxParallelPlan::for_rank(0, 2, 1, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
-                .unwrap();
-        for kind in [ModelKind::DeepSeekV3, ModelKind::DeepSeekV4] {
-            assert!(requires_distributed_stage(kind, topology.topology()));
-        }
-    }
+    fn partitioned_capability_failure_precedes_native_or_payload_work() {
+        let root = tempfile::tempdir().unwrap();
+        let model = root.path().join("model.gguf");
+        write_minimal_llama_gguf(&model, GgmlType::F16);
+        let inspection = eredu_architectures::configuration::inspect_artifact(&model).unwrap();
+        let topology = crate::test_parallel_rank(0, 2, 1, 1);
+        let options = crate::MlxLoadRequest::with_parallel(
+            topology,
+            crate::backend::DeviceAssignment::new(safemlx::DeviceType::Cpu, 0),
+            eredu_runtime::PipelineWireContract::new(
+                eredu_runtime::PipelineActivationDtype::Float32,
+            ),
+            1,
+            1,
+            crate::MlxLoadRequest::test_communication_completion_policy(),
+        );
+        let policy = options.preparation_policy().unwrap();
+        super::super::path_instrumentation::reset();
 
-    #[test]
-    fn complete_tensor_parallel_loader_rejects_unbound_quantization() {
-        reject_complete_tensor_parallel_quantization(None, "deepseek4").unwrap();
-        let error = reject_complete_tensor_parallel_quantization(
-            Some(WeightQuantization::MxFp4),
-            "deepseek4",
+        let error = select_preparation_with_capabilities(
+            &inspection,
+            options,
+            policy,
+            &super::super::replicated_text::GROUPED_OPERATION_CAPABILITIES,
+            &eredu_runtime::CommunicationCapabilities::new([]).unwrap(),
         )
         .unwrap_err();
-        assert!(matches!(
-            error,
-            crate::backend::error::Error::Quantization(message)
-                if message.contains("deepseek4")
-        ));
+
+        assert!(
+            error.to_string().contains("communication"),
+            "unexpected selection failure: {error}"
+        );
+        assert_eq!(
+            super::super::path_instrumentation::communication_realization_attempts(),
+            0
+        );
+        assert_eq!(
+            super::super::path_instrumentation::snapshot(),
+            Default::default()
+        );
     }
 
     #[test]
-    fn specialized_qwen_tp_uses_distributed_stage_loader() {
+    fn data_parallel_request_reaches_neutral_selection_and_fails_before_native_or_payload_work() {
+        let root = tempfile::tempdir().unwrap();
+        let model = root.path().join("model.gguf");
+        write_minimal_llama_gguf(&model, GgmlType::F16);
+        let inspection = eredu_architectures::configuration::inspect_artifact(&model).unwrap();
         let topology =
-            MlxParallelPlan::for_rank(0, 2, 1, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
+            eredu_core::ParallelRankTopology::new(ParallelTopology::new(1, 1, 1, 2).unwrap(), 0)
                 .unwrap();
-        for kind in [
-            ModelKind::Qwen3Next,
-            ModelKind::Qwen35,
-            ModelKind::Qwen3Vl,
-            ModelKind::Qwen3VlMoe,
-        ] {
-            assert!(requires_distributed_stage(kind, topology.topology()));
+        let options = crate::MlxLoadRequest::with_parallel(
+            topology,
+            crate::backend::DeviceAssignment::new(safemlx::DeviceType::Cpu, 0),
+            eredu_runtime::PipelineWireContract::new(
+                eredu_runtime::PipelineActivationDtype::Float32,
+            ),
+            1,
+            1,
+            crate::MlxLoadRequest::test_communication_completion_policy(),
+        );
+        let policy = options.preparation_policy().unwrap();
+        super::super::path_instrumentation::reset();
+
+        let error = super::select_preparation(&inspection, options, policy).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("data-parallel execution is not supported"),
+            "unexpected data-parallel rejection: {error}"
+        );
+        assert_eq!(
+            super::super::path_instrumentation::communication_realization_attempts(),
+            0
+        );
+        assert_eq!(
+            super::super::path_instrumentation::manifest_communication_realization_attempts(),
+            0
+        );
+        assert_eq!(
+            super::super::path_instrumentation::snapshot(),
+            Default::default()
+        );
+    }
+
+    #[test]
+    fn public_preparation_rejects_every_oversubscribed_pipeline_rank_before_native_work() {
+        let root = tempfile::tempdir().unwrap();
+        let model = root.path().join("model.gguf");
+        write_minimal_llama_gguf(&model, GgmlType::F16);
+        let inspection = eredu_architectures::configuration::inspect_artifact(&model).unwrap();
+        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let backend = MlxBackend::new(execution.stream(), execution.stream());
+
+        for rank in 0..3 {
+            let topology = crate::test_parallel_rank(rank, 1, 3, 1);
+            let options = crate::MlxLoadRequest::with_parallel(
+                topology,
+                crate::backend::DeviceAssignment::new(safemlx::DeviceType::Cpu, 0),
+                eredu_runtime::PipelineWireContract::new(
+                    eredu_runtime::PipelineActivationDtype::Float32,
+                ),
+                1,
+                1,
+                crate::MlxLoadRequest::test_communication_completion_policy(),
+            );
+            let policy = backend.preparation_policy(&options).unwrap();
+            super::super::path_instrumentation::reset();
+
+            let error = backend
+                .select_preparation(&inspection, &options, policy)
+                .unwrap_err();
+
+            assert!(
+                error
+                    .to_string()
+                    .contains("decoder execution group 0 has 2 units for 3 pipeline stages"),
+                "rank {rank} returned an unexpected selection failure: {error}"
+            );
+            assert_eq!(
+                super::super::path_instrumentation::communication_realization_attempts(),
+                0,
+                "rank {rank} reached native communication realization"
+            );
+            assert_eq!(
+                super::super::path_instrumentation::manifest_communication_realization_attempts(),
+                0,
+                "rank {rank} reached opaque manifest realization"
+            );
+            assert_eq!(
+                super::super::path_instrumentation::snapshot(),
+                Default::default(),
+                "rank {rank} performed payload, construction, state, or execution work"
+            );
         }
-        assert!(!requires_distributed_stage(
-            ModelKind::Qwen3,
-            topology.topology()
-        ));
     }
 
     #[test]
-    fn expert_parallel_topology_unconditionally_uses_distributed_stage_loader() {
-        let topology =
-            MlxParallelPlan::for_rank(0, 1, 1, 2, DeviceAssignment::new(DeviceType::Cpu, 0))
-                .unwrap();
-        assert!(requires_distributed_stage(
-            ModelKind::Llama,
-            topology.topology()
+    fn gguf_llama_tp_selects_neutral_partitioned_execution() {
+        let root = tempfile::tempdir().unwrap();
+        let model = root.path().join("model.gguf");
+        write_minimal_llama_gguf(&model, GgmlType::F16);
+        let inspection = eredu_architectures::configuration::inspect_artifact(&model).unwrap();
+        let topology = crate::test_parallel_rank(0, 2, 1, 1);
+        let options = crate::MlxLoadRequest::with_parallel(
+            topology,
+            crate::backend::DeviceAssignment::new(safemlx::DeviceType::Cpu, 0),
+            eredu_runtime::PipelineWireContract::new(
+                eredu_runtime::PipelineActivationDtype::Float32,
+            ),
+            1,
+            1,
+            crate::MlxLoadRequest::test_communication_completion_policy(),
+        );
+        let policy = options.preparation_policy().unwrap();
+
+        let selected = super::select_preparation(&inspection, options, policy).unwrap();
+        assert!(matches!(
+            &selected.execution,
+            MlxSelectedExecution::PartitionedDense { .. }
         ));
+        let manifest = selected
+            .communication_manifest()
+            .expect("prediction-free Llama TP must retain neutral communication");
+        assert_eq!(manifest.world_size(), 2);
+        assert_eq!(manifest.rank(), 0);
+        assert!(!manifest.groups().is_empty());
+        assert!(selected.rank_context().is_some());
+    }
+
+    #[test]
+    fn gguf_llama_pp_selects_neutral_partitioned_execution() {
+        let root = tempfile::tempdir().unwrap();
+        let model = root.path().join("model.gguf");
+        write_minimal_llama_gguf(&model, GgmlType::F16);
+        let inspection = eredu_architectures::configuration::inspect_artifact(&model).unwrap();
+        let topology = crate::test_parallel_rank(0, 1, 2, 1);
+        let options = crate::MlxLoadRequest::with_parallel(
+            topology,
+            crate::backend::DeviceAssignment::new(safemlx::DeviceType::Cpu, 0),
+            eredu_runtime::PipelineWireContract::new(
+                eredu_runtime::PipelineActivationDtype::Float32,
+            ),
+            1,
+            1,
+            crate::MlxLoadRequest::test_communication_completion_policy(),
+        );
+        let policy = options.preparation_policy().unwrap();
+
+        let selected = super::select_preparation(&inspection, options, policy).unwrap();
+        assert!(matches!(
+            &selected.execution,
+            MlxSelectedExecution::PartitionedDense { .. }
+        ));
+        let manifest = selected
+            .communication_manifest()
+            .expect("prediction-free Llama PP must retain neutral communication");
+        assert_eq!(manifest.world_size(), 2);
+        assert!(!manifest.routes().is_empty());
+        let session_group = match &selected.execution {
+            MlxSelectedExecution::PartitionedDense { selected } => {
+                selected.requirements().session_group()
+            }
+            _ => None,
+        }
+        .expect("PP admission must select one session-wide publication group");
+        let descriptor = manifest
+            .groups()
+            .iter()
+            .find(|group| group.id() == session_group)
+            .expect("selected session group must be present in the manifest");
+        assert_eq!(descriptor.creation_order(), 0);
+        assert_eq!(descriptor.members(), [0, 1]);
+        assert_eq!(descriptor.local_index(), Some(0));
+        assert_eq!(
+            descriptor
+                .requirements()
+                .operations()
+                .iter()
+                .map(eredu_runtime::CommunicationOperationRequirement::operation)
+                .collect::<Vec<_>>(),
+            [
+                eredu_runtime::CommunicationOperation::Broadcast,
+                eredu_runtime::CommunicationOperation::FailureAgreement,
+            ]
+        );
+        let broadcast = &descriptor.requirements().operations()[0];
+        assert_eq!(
+            broadcast.dtypes(),
+            [eredu_core::checkpoint::TensorDtype::F32]
+        );
+        assert!(broadcast.exact_completion());
+        assert_eq!(broadcast.limits().unwrap().max_tensors(), 1);
+        assert_eq!(broadcast.limits().unwrap().max_tensor_rank(), 3);
+        assert!(descriptor.requirements().operations()[1].limits().is_none());
+        assert!(selected.rank_context().is_some());
+        assert!(selected.realized_communication_manifest().is_some());
+    }
+
+    #[test]
+    fn gguf_llama_bounded_residency_selects_neutral_partitioned_execution() {
+        let root = tempfile::tempdir().unwrap();
+        let model = root.path().join("model.gguf");
+        write_minimal_llama_gguf(&model, GgmlType::F16);
+        let inspection = eredu_architectures::configuration::inspect_artifact(&model).unwrap();
+        let layerwise = eredu_runtime::WeightResidency::layerwise_host(
+            eredu_runtime::LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap()),
+        );
+        let dense = eredu_runtime::WeightResidency::dense_disk_stream(
+            eredu_runtime::DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1).unwrap(),
+        );
+
+        for residency in [layerwise, dense] {
+            let topology = crate::test_parallel_rank(0, 2, 1, 1);
+            let options = crate::MlxLoadRequest::with_parallel(
+                topology,
+                crate::backend::DeviceAssignment::new(safemlx::DeviceType::Cpu, 0),
+                eredu_runtime::PipelineWireContract::new(
+                    eredu_runtime::PipelineActivationDtype::Float32,
+                ),
+                1,
+                1,
+                crate::MlxLoadRequest::test_communication_completion_policy(),
+            )
+            .with_weight_residency(residency);
+            let policy = options.preparation_policy().unwrap();
+
+            let selected = super::select_preparation(&inspection, options, policy).unwrap();
+            assert!(matches!(
+                &selected.execution,
+                MlxSelectedExecution::PartitionedDense { .. }
+            ));
+            assert!(selected.communication_manifest().is_some());
+            assert!(selected.rank_context().is_some());
+        }
+    }
+
+    #[test]
+    fn gguf_llama_tp_transform_selects_the_immutable_neutral_route() {
+        let root = tempfile::tempdir().unwrap();
+        let model = root.path().join("model.gguf");
+        write_minimal_llama_gguf(&model, GgmlType::F16);
+        let inspection = eredu_architectures::configuration::inspect_artifact(&model).unwrap();
+        let topology = crate::test_parallel_rank(0, 2, 1, 1);
+        let options =
+            crate::MlxLoadRequest::with_quantization(eredu_core::QuantizationRequest::Affine {
+                group_size: 16,
+                bits: 4,
+            })
+            .with_parallel_topology(
+                topology,
+                crate::backend::DeviceAssignment::new(safemlx::DeviceType::Cpu, 0),
+                eredu_runtime::PipelineWireContract::new(
+                    eredu_runtime::PipelineActivationDtype::Float32,
+                ),
+                1,
+                1,
+                crate::MlxLoadRequest::test_communication_completion_policy(),
+            );
+        let policy = options.preparation_policy().unwrap();
+        super::super::path_instrumentation::reset();
+
+        let selected = super::select_preparation(&inspection, options, policy).unwrap();
+        assert!(matches!(
+            &selected.execution,
+            MlxSelectedExecution::PartitionedDense { .. }
+        ));
+        assert!(selected.communication_manifest().is_some());
+        assert!(selected.rank_context().is_some());
     }
 
     #[cfg(feature = "image")]
@@ -1258,7 +2639,7 @@ mod floating_state_dtype_tests {
             .unwrap();
         std::fs::remove_file(sidecar).unwrap();
 
-        assert_eq!(architecture_plan.model_kind(), ModelKind::Qwen3Vl);
+        assert_eq!(architecture_plan.model_kind(), super::ModelKind::Qwen3Vl);
         assert!(crate::composition::mlx::ModelProcessor::from_plan(&architecture_plan).is_some());
     }
 
@@ -1389,146 +2770,6 @@ fn complete_gguf_model(
     model
 }
 
-fn materialize_tensor_parallel(
-    artifact: &super::artifact::PreparedSafetensorsArtifact,
-    options: SelectedMlxConstruction,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<Executable, Error> {
-    let kind = artifact.architecture().model_kind();
-    let binding = TensorParallelBinding::for_kind(kind).ok_or_else(|| {
-        if FamilyBinding::for_kind(kind).is_some() {
-            Error::ArchitectureModel(format!(
-                "distributed-stage-only {} reached complete tensor-parallel materialization",
-                kind.canonical_name()
-            ))
-        } else {
-            Error::ArchitectureModel(format!(
-                "MLX has no tensor-parallel model realization for {}",
-                kind.canonical_name()
-            ))
-        }
-    })?;
-    let topology = options.parallel_topology().ok_or_else(|| {
-        Error::Parallel("tensor-parallel materialization requires a topology".into())
-    })?;
-    if topology.tensor_parallel_size() <= 1
-        || topology.pipeline_parallel_size() != 1
-        || topology.expert_parallel_size() != 1
-    {
-        return Err(Error::Parallel(
-            "complete executable materialization supports pure tensor parallelism only".into(),
-        ));
-    }
-    if options.weight_residency.parameter_bank_cache().is_some() {
-        return Err(Error::Parallel(
-            "tensor-parallel model materialization does not compose with independent expert caching"
-                .into(),
-        ));
-    }
-    reject_complete_tensor_parallel_quantization(
-        options.weight_quantization(),
-        kind.canonical_name(),
-    )?;
-    let execution = options.weight_residency.layers();
-    let build = crate::composition::mlx::distributed::topology::ParallelBuildContext::new(
-        topology,
-        eredu_runtime::ShardingPolicy::Require,
-    );
-    match binding {
-        TensorParallelBinding::Gemma4 => Ok(Executable::gemma4(
-            kind,
-            crate::composition::gemma4::load_safetensors_tensor_parallel(
-                artifact,
-                execution,
-                build,
-                stream,
-                weights_stream,
-            )?,
-        )?),
-        TensorParallelBinding::GptOss => Ok(Executable::gpt_oss(
-            kind,
-            crate::composition::gpt_oss::load_gpt_oss_tensor_parallel_model(
-                artifact,
-                execution,
-                build,
-                stream,
-                weights_stream,
-            )?,
-        )?),
-        TensorParallelBinding::Inkling => Ok(Executable::inkling(
-            kind,
-            crate::composition::inkling::load_safetensors_tensor_parallel(
-                artifact,
-                execution,
-                build,
-                stream,
-                weights_stream,
-            )?,
-        )?),
-        TensorParallelBinding::KimiLinear => Ok(Executable::kimi_linear(
-            kind,
-            crate::composition::kimi_linear::load_kimi_linear_tensor_parallel_model(
-                artifact,
-                execution,
-                build,
-                stream,
-                weights_stream,
-            )?,
-        )?),
-        TensorParallelBinding::Llama => Ok(Executable::partitioned_llama(
-            kind,
-            crate::composition::llama::load_partitioned_llama_safetensors(
-                artifact,
-                execution,
-                build,
-                stream,
-                weights_stream,
-            )?,
-        )?),
-        TensorParallelBinding::MuseGlimmer => Ok(Executable::muse_glimmer(
-            kind,
-            crate::composition::muse_glimmer::load_safetensors_tensor_parallel(
-                artifact,
-                execution,
-                build,
-                stream,
-                weights_stream,
-            )?,
-        )?),
-        TensorParallelBinding::Lfm2 => Ok(Executable::lfm2(
-            kind,
-            crate::composition::lfm2::load_lfm2_tensor_parallel_model(
-                artifact,
-                execution,
-                build,
-                stream,
-                weights_stream,
-            )?,
-        )?),
-        TensorParallelBinding::NemotronH => Ok(Executable::nemotron_h(
-            kind,
-            crate::composition::nemotron_h::load_nemotron_h_tensor_parallel_model(
-                artifact,
-                execution,
-                build,
-                stream,
-                weights_stream,
-            )?,
-        )?),
-        TensorParallelBinding::Qwen => Ok(Executable::qwen(
-            kind,
-            crate::composition::qwen::load_qwen_tensor_parallel_model(
-                artifact,
-                execution,
-                build,
-                stream,
-                weights_stream,
-            )?,
-        )?),
-    }
-}
-
 fn materialize_gguf_artifact(
     artifact: ModelArtifact,
     architecture_plan: ArtifactArchitecturePlan,
@@ -1562,23 +2803,6 @@ fn materialize_gguf_artifact(
         .map(|selected| ModelProcessor::from_selected(&architecture_plan, selected))
         .transpose()?
         .flatten();
-    if options
-        .parallel_topology()
-        .is_some_and(|topology| !topology.is_replicated())
-    {
-        let model = materialize_gguf_tensor_parallel(
-            &source,
-            projector.as_ref(),
-            options,
-            stream,
-            weights_stream,
-        )?;
-        return Ok(MaterializedGgufModel {
-            model,
-            #[cfg(any(feature = "image", feature = "audio"))]
-            processor,
-        });
-    }
     let model = materialize_gguf_model(
         &source,
         projector.as_ref(),
@@ -1592,150 +2816,6 @@ fn materialize_gguf_artifact(
         #[cfg(any(feature = "image", feature = "audio"))]
         processor,
     })
-}
-
-fn materialize_gguf_tensor_parallel(
-    source: &structural::AdmittedGguf,
-    projector: Option<&structural::AdmittedGgufProjector>,
-    options: SelectedMlxConstruction,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<Executable, Error> {
-    let architecture = source.architecture();
-    let kind = architecture.model_kind();
-    let binding = TensorParallelBinding::for_kind(kind).ok_or_else(|| {
-        if FamilyBinding::for_kind(kind).is_some() {
-            Error::ArchitectureModel(format!(
-                "distributed-stage-only {} reached complete GGUF tensor-parallel materialization",
-                architecture.metadata_name()
-            ))
-        } else {
-            Error::ArchitectureModel(format!(
-                "MLX has no tensor-parallel GGUF realization for {}",
-                architecture.metadata_name()
-            ))
-        }
-    })?;
-    let topology = options.parallel_topology().ok_or_else(|| {
-        Error::Parallel("tensor-parallel GGUF materialization requires a topology".into())
-    })?;
-    reject_complete_tensor_parallel_quantization(
-        options.weight_quantization(),
-        architecture.metadata_name(),
-    )?;
-    let residency = options.weight_residency.layers();
-    let build = crate::composition::mlx::distributed::topology::ParallelBuildContext::new(
-        topology,
-        eredu_runtime::ShardingPolicy::Require,
-    );
-    match binding {
-        TensorParallelBinding::KimiLinear => {
-            let model =
-                crate::composition::kimi_linear::load_kimi_linear_gguf_tensor_parallel_model(
-                    source,
-                    residency,
-                    build,
-                    stream,
-                    weights_stream,
-                )?;
-            Executable::kimi_linear(kind, model)
-        }
-        TensorParallelBinding::GptOss => {
-            let model = crate::composition::gpt_oss::load_gpt_oss_gguf_tensor_parallel_model(
-                source,
-                residency,
-                build,
-                stream,
-                weights_stream,
-            )?;
-            Executable::gpt_oss(kind, model)
-        }
-        TensorParallelBinding::Inkling => {
-            let model = crate::composition::inkling::load_gguf_tensor_parallel(
-                source,
-                projector,
-                residency,
-                build,
-                stream,
-                weights_stream,
-            )?;
-            Executable::inkling(kind, model)
-        }
-        TensorParallelBinding::Gemma4 => {
-            let model = crate::composition::gemma4::load_gguf_tensor_parallel(
-                source,
-                projector,
-                residency,
-                build,
-                stream,
-                weights_stream,
-            )?;
-            Executable::gemma4(kind, model)
-        }
-        TensorParallelBinding::Llama => {
-            let model = crate::composition::llama::load_partitioned_llama_gguf(
-                source,
-                residency,
-                build,
-                stream,
-                weights_stream,
-            )?;
-            Executable::partitioned_llama(kind, model)
-        }
-        TensorParallelBinding::MuseGlimmer => {
-            let model = crate::composition::muse_glimmer::load_gguf_tensor_parallel(
-                source,
-                projector,
-                residency,
-                build,
-                stream,
-                weights_stream,
-            )?;
-            Executable::muse_glimmer(kind, model)
-        }
-        TensorParallelBinding::Lfm2 => {
-            let model = crate::composition::lfm2::load_lfm2_gguf_tensor_parallel_model(
-                source,
-                residency,
-                build,
-                stream,
-                weights_stream,
-            )?;
-            Executable::lfm2(kind, model)
-        }
-        TensorParallelBinding::NemotronH => {
-            let model = crate::composition::nemotron_h::load_nemotron_h_gguf_tensor_parallel_model(
-                source,
-                residency,
-                build,
-                stream,
-                weights_stream,
-            )?;
-            Executable::nemotron_h(kind, model)
-        }
-        TensorParallelBinding::Qwen => {
-            let model = crate::composition::qwen::load_qwen_gguf_tensor_parallel_model(
-                source,
-                residency,
-                build,
-                stream,
-                weights_stream,
-            )?;
-            Executable::qwen(kind, model)
-        }
-    }
-}
-
-fn reject_complete_tensor_parallel_quantization(
-    quantization: Option<WeightQuantization>,
-    architecture: &str,
-) -> Result<(), Error> {
-    if quantization.is_some() {
-        return Err(Error::Quantization(format!(
-            "load-time quantization is not implemented for complete tensor-parallel {architecture} materialization"
-        )));
-    }
-    Ok(())
 }
 
 pub fn validate_gguf_quantization_source(

@@ -1,12 +1,8 @@
 // MLX artifact and residency binding for the neutral Qwen3-VL graph.
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    path::Path,
-    sync::Arc,
-};
+use std::{collections::BTreeSet, path::Path, sync::Arc};
 
-use eredu_architectures::qwen::{self, vl};
+use eredu_architectures::qwen::vl;
 use eredu_checkpoint::{
     store::{CheckpointSource, CompositeCheckpointSource},
     WeightQuantization,
@@ -14,7 +10,7 @@ use eredu_checkpoint::{
 use eredu_runtime::{
     ArchitectureParameters, CacheResidencyPolicy, CausalModel, ExecutionUnitLayout,
     LayerWeightResidency, LayeredArchitecture, LayerwiseRuntime, PagedCacheOptions, ParameterRole,
-    ResidencyReport, WeightBinding, WeightResidency,
+    ResidencyReport, WeightResidency,
 };
 use safemlx::{error::Exception, ops::indexing::TryIndexOp, Array, Stream};
 
@@ -97,9 +93,8 @@ use crate::backend::{
             state::MlxHybridState,
         },
         checkpoint::binding::{
-            apply_rank_local_parameter_recipes, build_module_bindings_with_recipes,
-            build_module_bindings_with_recipes_excluding, parameter_name_in_targets,
-            parameter_role_targets, populate_module_from_lease_excluding,
+            build_module_bindings_with_recipes, build_module_bindings_with_recipes_excluding,
+            parameter_name_in_targets, populate_module_from_lease_excluding,
         },
         checkpoint::{
             load::gguf_quantization_configs, quantization::should_quantize_on_load,
@@ -119,14 +114,6 @@ use crate::backend::{
 
 type Architecture = vl::LayeredModel<MlxNeuralBackend>;
 type Unit = vl::Unit<MlxNeuralBackend>;
-
-fn group_kind(architecture: &Architecture, group: usize) -> eredu_runtime::ArchitectureGroupKind {
-    <Architecture as LayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::group_transport(
-        architecture,
-        group,
-    )
-    .kind
-}
 
 #[derive(eredu_nn::Parameterized)]
 #[parameterized(tensor = "crate::MlxTensor")]
@@ -170,184 +157,6 @@ impl QwenVlCheckpointTemplate {
 struct UnitPopulator {
     external_experts: bool,
     expert_targets: Arc<BTreeSet<String>>,
-}
-
-fn unit_expert_targets(
-    architecture: &Architecture,
-    index: usize,
-    unit: &MlxModule<Unit>,
-) -> Result<BTreeSet<String>, Error> {
-    let Unit::Text(block) = &unit.inner else {
-        return Ok(BTreeSet::new());
-    };
-    Ok(parameter_role_targets(
-        &qwen::routed_layer_parallel_parameter_groups(block, &architecture.args().text, index)?,
-        ParameterRole::ExpertIntermediate,
-    ))
-}
-
-/// Pipeline and Cartesian-parallel binder for the same neutral Qwen3-VL
-/// architecture used by resident and bounded execution.
-#[derive(Default)]
-pub struct QwenVlPipelineBindings {
-    external_experts: bool,
-}
-
-impl QwenVlPipelineBindings {
-    pub const fn new() -> Self {
-        Self {
-            external_experts: false,
-        }
-    }
-
-    pub const fn new_external_experts() -> Self {
-        Self {
-            external_experts: true,
-        }
-    }
-
-    pub fn model_type<'a>(&self, architecture: &'a Architecture) -> &'a str {
-        architecture.args().effective_model_type()
-    }
-
-    pub fn begin_pipeline_ingress(
-        &self,
-        architecture: &mut Architecture,
-        typed: input::ModelInput<'_>,
-        offset: i32,
-        delta: Option<&Array>,
-        parallel: Option<&crate::backend::runtime::distributed::Group>,
-        stream: &Stream,
-    ) -> Result<vl::PipelineVisionState<crate::MlxTensor>, Error> {
-        let prepared = prepare_model_input(architecture.args(), typed, stream)?;
-        let delta = crate::composition::tensor_opt(delta);
-        prepared.with_model_input(|input| {
-            match parallel {
-                Some(parallel) => {
-                    architecture.begin_pipeline_parallel(input, offset, delta, parallel, stream)
-                }
-                None => architecture.begin_pipeline(input, offset, delta, stream),
-            }
-            .map_err(|error| Error::Parallel(error.to_string()))
-        })
-    }
-
-    pub fn quantizes_static_binding(&self, _binding: &WeightBinding) -> bool {
-        true
-    }
-
-    pub fn layer_bindings(
-        &self,
-        architecture: &Architecture,
-        group: usize,
-        index: usize,
-        layer: &MlxModule<Unit>,
-        store: &dyn CheckpointSource,
-    ) -> Result<Vec<WeightBinding>, Error> {
-        let expert_targets = unit_expert_targets(architecture, index, layer)?;
-        let ordinal = unit_ordinal(architecture, group, index)?;
-        let recipes = vl::unit_recipes(store, architecture.args(), ordinal)
-            .map_err(Error::ArchitectureModel)?;
-        Ok(build_module_bindings_with_recipes_excluding(
-            layer,
-            "",
-            store,
-            recipes,
-            |name| self.external_experts && parameter_name_in_targets(name, &expert_targets),
-        )?)
-    }
-
-    pub fn expert_parallel_assignment(
-        &self,
-        realization: Option<
-            &eredu_architectures::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>,
-        >,
-    ) -> Result<Option<crate::composition::expert_dispatch::ExpertAssignment>, Error> {
-        match realization {
-            None if self.external_experts => Err(Error::Parallel(
-                "Qwen3-VL has no architecture expert realization".into(),
-            )),
-            None => Ok(None),
-            Some(plan) if plan.expert_parallel_size() == 1 && !self.external_experts => Ok(None),
-            Some(plan) => {
-                crate::composition::expert_dispatch::ExpertAssignment::from_realization(plan)
-                    .map(Some)
-            }
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn cartesian_layer_bindings(
-        &self,
-        architecture: &Architecture,
-        group: usize,
-        index: usize,
-        global_layer: &MlxModule<Unit>,
-        store: &dyn CheckpointSource,
-        layout: Option<&eredu_runtime::LocalModelLayout>,
-        assignment: Option<&crate::composition::expert_dispatch::ExpertAssignment>,
-    ) -> Result<Vec<WeightBinding>, Error> {
-        match (&global_layer.inner, group_kind(architecture, group)) {
-            (Unit::Vision(_), eredu_runtime::ArchitectureGroupKind::VisionEncoder) => {
-                let bindings =
-                    build_module_bindings_with_recipes(global_layer, "", store, BTreeMap::new())?;
-                if let Some(layout) = layout {
-                    crate::backend::runtime::execution::layerwise::shard_layer_bindings(
-                        bindings, store, layout,
-                    )
-                } else {
-                    Ok(bindings)
-                }
-            }
-            (Unit::Text(_), eredu_runtime::ArchitectureGroupKind::Decoder) => {
-                let expert_targets = unit_expert_targets(architecture, index, global_layer)?;
-                let recipes = if self.external_experts {
-                    BTreeMap::new()
-                } else {
-                    vl::unit_recipes(
-                        store,
-                        architecture.args(),
-                        unit_ordinal(architecture, group, index)?,
-                    )
-                    .map_err(Error::ArchitectureModel)?
-                };
-                let bindings = build_module_bindings_with_recipes_excluding(
-                    global_layer,
-                    "",
-                    store,
-                    recipes,
-                    |name| {
-                        self.external_experts && parameter_name_in_targets(name, &expert_targets)
-                    },
-                )?;
-                let bindings = match assignment {
-                    Some(assignment) if !self.external_experts => {
-                        apply_rank_local_parameter_recipes(
-                            bindings,
-                            store,
-                            vl::rank_local_unit_recipes(
-                                store,
-                                architecture.args(),
-                                unit_ordinal(architecture, group, index)?,
-                                assignment.local_global_group_indices(),
-                            )
-                            .map_err(Error::ArchitectureModel)?,
-                        )?
-                    }
-                    _ => bindings,
-                };
-                match layout {
-                    Some(layout) => {
-                        crate::backend::runtime::execution::layerwise::shard_layer_bindings(
-                            bindings, store, layout,
-                        )
-                    }
-                    None => Ok(bindings),
-                }
-            }
-            _ => Err(Error::Parallel("Qwen3-VL unit/group mismatch".into())),
-        }
-    }
 }
 
 impl MlxUnitPopulator<Unit> for UnitPopulator {
@@ -401,16 +210,6 @@ impl QwenVlModel {
 
     pub fn args(&self) -> &vl::ModelArgs {
         &self.args
-    }
-
-    pub fn parallel_info(
-        &self,
-    ) -> Option<
-        &eredu_runtime::ParallelModelInfo<
-            crate::composition::mlx::distributed::topology::MlxParallelPlan,
-        >,
-    > {
-        None
     }
 
     pub fn new_cache(&self) -> MlxHybridState {
@@ -595,21 +394,6 @@ impl QwenVlModel {
         stream: &Stream,
         observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
     ) -> Result<Array, Error> {
-        let positions = input
-            .parts
-            .iter()
-            .map(|part| match part {
-                vl::InputPart::Text(tokens)
-                | vl::InputPart::Image { tokens, .. }
-                | vl::InputPart::Video { tokens, .. } => tokens.dim(1),
-                vl::InputPart::Projected { tokens, .. } => tokens.dim(1),
-            })
-            .sum::<i32>();
-        let pass = if positions > 1 {
-            eredu_runtime::ExpertPass::Prefill
-        } else {
-            eredu_runtime::ExpertPass::Decode
-        };
         let parts = neutral_input_parts(input.parts);
         let input = vl::ModelInput {
             parts: &parts,
@@ -625,22 +409,22 @@ impl QwenVlModel {
                     let mut provider =
                         crate::composition::qwen::expert::cached_provider(parameter_bank, &args);
                     match &mut self.execution {
-                        Execution::Resident(runtime) => runtime.forward_with_provider_and_observer(
-                            input,
-                            cache,
-                            pass,
-                            &mut provider,
-                            stream,
-                            &mut neutral,
-                        ),
-                        Execution::Bounded(runtime) => runtime.forward_with_provider_and_observer(
-                            input,
-                            cache,
-                            pass,
-                            &mut provider,
-                            stream,
-                            &mut neutral,
-                        ),
+                        Execution::Resident(runtime) => runtime
+                            .forward_with_inferred_provider_and_observer(
+                                input,
+                                cache,
+                                &mut provider,
+                                stream,
+                                &mut neutral,
+                            ),
+                        Execution::Bounded(runtime) => runtime
+                            .forward_with_inferred_provider_and_observer(
+                                input,
+                                cache,
+                                &mut provider,
+                                stream,
+                                &mut neutral,
+                            ),
                     }
                 }
                 None => match &mut self.execution {
@@ -768,12 +552,6 @@ fn unit_layout(architecture: &Architecture) -> Result<ExecutionUnitLayout, Error
         .collect::<Result<Vec<_>, _>>()?;
     ExecutionUnitLayout::new(&graph, counts)
         .map_err(|error| Error::ArchitectureModel(error.to_string()))
-}
-
-fn unit_ordinal(architecture: &Architecture, group: usize, index: usize) -> Result<usize, Error> {
-    unit_layout(architecture)?
-        .ordinal(group, index)
-        .ok_or_else(|| Error::Parallel(format!("Qwen3-VL has no unit {index} in group {group}")))
 }
 
 fn quantize_store(

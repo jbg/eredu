@@ -1,9 +1,11 @@
 //! Fair transactional scheduling independent of event and tensor runtimes.
 
 use crate::consensus::{
-    resolve_completions, validate_disposition, validate_schedule, CompletionObservation,
-    CompletionResolution, ConsensusTransport, ScheduledWork,
+    agree_deadline_candidates_bounded, agree_disposition_status_bounded, resolve_completions,
+    validate_schedule, BoundedConsensusTransport, CompletionObservation, CompletionResolution,
+    ConsensusTransport, ScheduledWork,
 };
+use crate::BoundedCompletionWait;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -780,16 +782,18 @@ impl<W, S: SemanticStateTransaction, O: TransitionOutput> Scheduler<W, S, O> {
         &mut self,
         protocol: u64,
         transport: &T,
+        wait: BoundedCompletionWait,
         now: Instant,
         execute: impl FnMut(WorkId, &W, &mut S::Branch) -> Result<O, E>,
     ) -> Result<SchedulerProgress<W, O>, SchedulerError>
     where
         W: WorkDescriptor,
-        T: ConsensusTransport,
+        T: BoundedConsensusTransport,
+        <T::Completion as crate::Completion>::Error: std::fmt::Display,
         E: std::error::Error,
     {
         self.ensure_ready()?;
-        self.expire_deadlines_distributed(protocol, transport, now)?;
+        self.expire_deadlines_distributed(protocol, transport, wait, now)?;
         let mut progress = self.poll_distributed(protocol, transport, now)?;
         self.prepare_bounded(self.limits.max_new_submissions_per_turn, now)?;
         let plan = self
@@ -821,21 +825,70 @@ impl<W, S: SemanticStateTransaction, O: TransitionOutput> Scheduler<W, S, O> {
     }
 
     /// Reaches topology-wide consensus before cancelling a request.
-    pub fn cancel_distributed<T: ConsensusTransport>(
+    pub fn cancel_distributed<T: BoundedConsensusTransport>(
         &mut self,
         protocol: u64,
         request: RequestId,
         transport: &T,
+        wait: BoundedCompletionWait,
         now: Instant,
-    ) -> Result<(), SchedulerError> {
+    ) -> Result<(), SchedulerError>
+    where
+        <T::Completion as crate::Completion>::Error: std::fmt::Display,
+    {
         self.ensure_ready()?;
-        if let Err(error) =
-            validate_disposition(transport, protocol, request, CancellationCause::Explicit)
-        {
-            self.poison(error.to_string(), now);
-            return Err(SchedulerError::Consensus(error.to_string()));
+        let locally_ready =
+            self.requests.contains_key(&request) && !self.terminal.contains_key(&request);
+        let prepared = agree_disposition_status_bounded(
+            transport,
+            protocol,
+            request,
+            CancellationCause::Explicit,
+            1,
+            locally_ready,
+            wait,
+        );
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.fence(error.to_string());
+                return Err(SchedulerError::Consensus(error.to_string()));
+            }
+        };
+        if !prepared {
+            let error = "distributed cancellation preparation failed on at least one rank";
+            self.fence(error.to_string());
+            return Err(SchedulerError::Consensus(error.into()));
         }
-        self.cancel_internal(request, CancellationCause::Explicit, now)
+        let committed = agree_disposition_status_bounded(
+            transport,
+            protocol,
+            request,
+            CancellationCause::Explicit,
+            2,
+            true,
+            wait,
+        );
+        let committed = match committed {
+            Ok(committed) => committed,
+            Err(error) => {
+                self.fence(error.to_string());
+                return Err(SchedulerError::Consensus(error.to_string()));
+            }
+        };
+        if !committed {
+            let error = "distributed cancellation commit authorization failed";
+            self.fence(error.to_string());
+            return Err(SchedulerError::Consensus(error.into()));
+        }
+        let result = self.cancel_internal(request, CancellationCause::Explicit, now);
+        if let Err(error) = &result {
+            // The disposition is already globally authorized and local
+            // cancellation marks every owned work item abandoned before
+            // reporting branch-cleanup failure. Fence later scheduler work.
+            self.poison(error.to_string(), now);
+        }
+        result
     }
 
     /// Marks a request finished and discards its queued work.
@@ -1179,12 +1232,16 @@ impl<W, S: SemanticStateTransaction, O: TransitionOutput> Scheduler<W, S, O> {
         Ok(())
     }
 
-    fn expire_deadlines_distributed<T: ConsensusTransport>(
+    fn expire_deadlines_distributed<T: BoundedConsensusTransport>(
         &mut self,
         protocol: u64,
         transport: &T,
+        wait: BoundedCompletionWait,
         now: Instant,
-    ) -> Result<(), SchedulerError> {
+    ) -> Result<(), SchedulerError>
+    where
+        <T::Completion as crate::Completion>::Error: std::fmt::Display,
+    {
         let mut expired = BTreeSet::new();
         for (request, entry) in &self.requests {
             if entry
@@ -1200,14 +1257,56 @@ impl<W, S: SemanticStateTransaction, O: TransitionOutput> Scheduler<W, S, O> {
                 expired.insert(work.id.request());
             }
         }
-        for request in expired {
-            if let Err(error) =
-                validate_disposition(transport, protocol, request, CancellationCause::Deadline)
-            {
-                self.poison(error.to_string(), now);
+        let local = self
+            .requests
+            .keys()
+            .copied()
+            .map(|request| (request, expired.contains(&request)))
+            .collect::<Vec<_>>();
+        let globally_expired = match agree_deadline_candidates_bounded(
+            transport,
+            protocol,
+            &local,
+            self.limits.max_active_requests,
+            wait,
+        ) {
+            Ok(expired) => expired,
+            Err(error) => {
+                self.fence(error.to_string());
                 return Err(SchedulerError::Consensus(error.to_string()));
             }
-            self.cancel_internal(request, CancellationCause::Deadline, now)?;
+        };
+        for request in globally_expired {
+            for phase in [1, 2] {
+                let agreed = match agree_disposition_status_bounded(
+                    transport,
+                    protocol,
+                    request,
+                    CancellationCause::Deadline,
+                    phase,
+                    self.requests.contains_key(&request),
+                    wait,
+                ) {
+                    Ok(agreed) => agreed,
+                    Err(error) => {
+                        self.fence(error.to_string());
+                        return Err(SchedulerError::Consensus(error.to_string()));
+                    }
+                };
+                if !agreed {
+                    let error = if phase == 1 {
+                        "distributed deadline preparation failed on at least one rank"
+                    } else {
+                        "distributed deadline commit authorization failed"
+                    };
+                    self.fence(error.into());
+                    return Err(SchedulerError::Consensus(error.into()));
+                }
+            }
+            if let Err(error) = self.cancel_internal(request, CancellationCause::Deadline, now) {
+                self.poison(error.to_string(), now);
+                return Err(error);
+            }
         }
         Ok(())
     }
@@ -1347,6 +1446,12 @@ impl<W, S: SemanticStateTransaction, O: TransitionOutput> Scheduler<W, S, O> {
         self.poisoned.as_ref().map_or(Ok(()), |reason| {
             Err(SchedulerError::Poisoned(reason.clone()))
         })
+    }
+
+    fn fence(&mut self, reason: String) {
+        if self.poisoned.is_none() {
+            self.poisoned = Some(reason);
+        }
     }
 
     fn poison(&mut self, reason: String, now: Instant) {
@@ -1544,6 +1649,59 @@ mod tests {
             }
             Ok(gathered)
         }
+    }
+
+    struct ReadyConsensusCompletion;
+
+    impl crate::Completion for ReadyConsensusCompletion {
+        type Error = Infallible;
+
+        fn is_complete(&self) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+
+        fn wait(&self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    impl crate::BoundedCompletion for ReadyConsensusCompletion {
+        fn wait_bounded(
+            self,
+            _: crate::BoundedCompletionWait,
+        ) -> Result<crate::BoundedCompletionOutcome, Self::Error> {
+            Ok(crate::BoundedCompletionOutcome::Completed)
+        }
+    }
+
+    impl BoundedConsensusTransport for ScriptedTransport {
+        type Completion = ReadyConsensusCompletion;
+        type GatherOutput = Vec<u32>;
+
+        fn submit_all_gather_words(
+            &self,
+            local: &[u32],
+        ) -> Result<crate::Submission<Self::GatherOutput, Self::Completion>, Self::Error> {
+            Ok(crate::Submission {
+                output: self.all_gather_words(local)?,
+                completion: ReadyConsensusCompletion,
+            })
+        }
+
+        fn resolve_all_gather_words(
+            &self,
+            output: Self::GatherOutput,
+        ) -> Result<Vec<u32>, Self::Error> {
+            Ok(output)
+        }
+    }
+
+    fn consensus_wait() -> crate::BoundedCompletionWait {
+        crate::BoundedCompletionWait::new(
+            Duration::from_millis(10),
+            crate::CompletionCancellationMode::QuarantineUntilComplete,
+        )
+        .unwrap()
     }
 
     fn scheduler() -> Scheduler<u32, State, Output> {
@@ -1748,6 +1906,7 @@ mod tests {
             2,
             vec![
                 GatherStep::default(),
+                GatherStep::default(),
                 GatherStep {
                     replacements: vec![(1, 10, 99)],
                 },
@@ -1759,12 +1918,18 @@ mod tests {
         let work = scheduler.enqueue(request, 7).unwrap();
 
         let error = scheduler
-            .run_distributed_turn(0xAA, &transport, Instant::now(), |_, _, _| {
-                Ok::<_, Infallible>(Output {
-                    complete: Rc::new(Cell::new(false)),
-                    fail: false,
-                })
-            })
+            .run_distributed_turn(
+                0xAA,
+                &transport,
+                consensus_wait(),
+                Instant::now(),
+                |_, _, _| {
+                    Ok::<_, Infallible>(Output {
+                        complete: Rc::new(Cell::new(false)),
+                        fail: false,
+                    })
+                },
+            )
             .unwrap_err();
         assert!(matches!(error, SchedulerError::Consensus(_)));
         assert!(scheduler.poison_reason().is_some());
@@ -1788,6 +1953,7 @@ mod tests {
                 GatherStep::default(),
                 GatherStep::default(),
                 GatherStep::default(),
+                GatherStep::default(),
                 GatherStep {
                     replacements: vec![(1, 4, 99)],
                 },
@@ -1799,21 +1965,33 @@ mod tests {
         scheduler.register(request, State::default()).unwrap();
         scheduler.enqueue(request, 1).unwrap();
         scheduler
-            .run_distributed_turn(0xEE, &transport, Instant::now(), |_, _, _| {
-                Ok::<_, Infallible>(Output {
-                    complete: done.clone(),
-                    fail: false,
-                })
-            })
+            .run_distributed_turn(
+                0xEE,
+                &transport,
+                consensus_wait(),
+                Instant::now(),
+                |_, _, _| {
+                    Ok::<_, Infallible>(Output {
+                        complete: done.clone(),
+                        fail: false,
+                    })
+                },
+            )
             .unwrap();
 
         let error = scheduler
-            .run_distributed_turn(0xEE, &transport, Instant::now(), |_, _, _| {
-                Ok::<_, Infallible>(Output {
-                    complete: done.clone(),
-                    fail: false,
-                })
-            })
+            .run_distributed_turn(
+                0xEE,
+                &transport,
+                consensus_wait(),
+                Instant::now(),
+                |_, _, _| {
+                    Ok::<_, Infallible>(Output {
+                        complete: done.clone(),
+                        fail: false,
+                    })
+                },
+            )
             .unwrap_err();
         assert!(matches!(error, SchedulerError::Consensus(_)));
         assert_eq!(scheduler.report().abandoned_in_flight_work, 1);
@@ -1840,9 +2018,12 @@ mod tests {
             vec![
                 GatherStep::default(),
                 GatherStep::default(),
+                GatherStep::default(),
+                GatherStep::default(),
                 GatherStep {
                     replacements: vec![(1, 7, 2), (2, 7, 0)],
                 },
+                GatherStep::default(),
                 GatherStep::default(),
                 GatherStep {
                     replacements: vec![(1, 7, 2), (2, 7, 1)],
@@ -1860,23 +2041,40 @@ mod tests {
         };
 
         scheduler
-            .run_distributed_turn(0xBB, &transport, Instant::now(), |_, _, _| {
-                Ok::<_, Infallible>(output())
-            })
+            .run_distributed_turn(
+                0xBB,
+                &transport,
+                consensus_wait(),
+                Instant::now(),
+                |_, _, _| {
+                    Ok::<_, Infallible>(Output {
+                        complete: Rc::new(Cell::new(true)),
+                        fail: false,
+                    })
+                },
+            )
             .unwrap();
         let pending = scheduler
-            .run_distributed_turn(0xBB, &transport, Instant::now(), |_, _, _| {
-                Ok::<_, Infallible>(output())
-            })
+            .run_distributed_turn(
+                0xBB,
+                &transport,
+                consensus_wait(),
+                Instant::now(),
+                |_, _, _| Ok::<_, Infallible>(output()),
+            )
             .unwrap();
         assert!(pending.failed.is_empty());
         assert_eq!(scheduler.report().failed_in_flight_work, 1);
         assert_eq!(scheduler.report().current_in_flight_work, 1);
 
         let terminal = scheduler
-            .run_distributed_turn(0xBB, &transport, Instant::now(), |_, _, _| {
-                Ok::<_, Infallible>(output())
-            })
+            .run_distributed_turn(
+                0xBB,
+                &transport,
+                consensus_wait(),
+                Instant::now(),
+                |_, _, _| Ok::<_, Infallible>(output()),
+            )
             .unwrap();
         assert_eq!(terminal.failed.len(), 1);
         assert_eq!(scheduler.report().current_in_flight_work, 0);
@@ -1888,13 +2086,14 @@ mod tests {
 
     #[test]
     fn distributed_cancellation_and_deadline_use_the_same_core_lifecycle() {
-        let transport = ScriptedTransport::new(2, vec![GatherStep::default()]);
+        let transport =
+            ScriptedTransport::new(2, vec![GatherStep::default(), GatherStep::default()]);
         let mut cancelled = scheduler();
         let request = RequestId::new(52);
         cancelled.register(request, State::default()).unwrap();
         cancelled.enqueue(request, 1).unwrap();
         cancelled
-            .cancel_distributed(0xCC, request, &transport, Instant::now())
+            .cancel_distributed(0xCC, request, &transport, consensus_wait(), Instant::now())
             .unwrap();
         assert_eq!(
             cancelled.request_status(request),
@@ -1920,17 +2119,164 @@ mod tests {
             )
             .unwrap();
         scheduler
-            .run_distributed_turn(0xDD, &transport, Instant::now(), |_, _, _| {
-                Ok::<_, Infallible>(Output {
-                    complete: Rc::new(Cell::new(true)),
-                    fail: false,
-                })
-            })
+            .run_distributed_turn(
+                0xDD,
+                &transport,
+                consensus_wait(),
+                Instant::now(),
+                |_, _, _| {
+                    Ok::<_, Infallible>(Output {
+                        complete: Rc::new(Cell::new(true)),
+                        fail: false,
+                    })
+                },
+            )
             .unwrap();
         assert_eq!(
             scheduler.request_status(request),
             Some(RequestStatus::DeadlineExceeded)
         );
+    }
+
+    #[test]
+    fn bounded_distributed_cancellation_rolls_back_failed_phases_and_fences_retry() {
+        for steps in [
+            vec![
+                GatherStep {
+                    replacements: vec![(1, 6, 0)],
+                },
+                GatherStep::default(),
+            ],
+            vec![
+                GatherStep::default(),
+                GatherStep {
+                    replacements: vec![(1, 6, 0)],
+                },
+                GatherStep::default(),
+            ],
+        ] {
+            let transport = ScriptedTransport::new(2, steps);
+            let mut scheduler = scheduler();
+            let request = RequestId::new(53);
+            scheduler.register(request, State::default()).unwrap();
+            scheduler.enqueue(request, 1).unwrap();
+
+            assert!(scheduler
+                .cancel_distributed(0xCD, request, &transport, consensus_wait(), Instant::now(),)
+                .is_err());
+            assert!(scheduler.request_state(request).is_some());
+            assert_eq!(
+                scheduler.request_status(request),
+                Some(RequestStatus::Active)
+            );
+            let remaining = transport.steps.borrow().len();
+            assert!(scheduler
+                .cancel_distributed(0xCD, request, &transport, consensus_wait(), Instant::now(),)
+                .is_err());
+            assert_eq!(transport.steps.borrow().len(), remaining);
+            assert!(scheduler.request_state(request).is_some());
+        }
+    }
+
+    #[test]
+    fn bounded_distributed_deadline_uses_remote_status_and_fences_failed_phases() {
+        let remote_expiry = GatherStep {
+            replacements: vec![(1, 6, 1)],
+        };
+        let transport = ScriptedTransport::new(
+            2,
+            vec![
+                remote_expiry,
+                GatherStep::default(),
+                GatherStep::default(),
+                GatherStep::default(),
+                GatherStep::default(),
+            ],
+        );
+        let mut successful_scheduler = scheduler();
+        let request = RequestId::new(54);
+        successful_scheduler
+            .register(request, State::default())
+            .unwrap();
+        successful_scheduler.enqueue(request, 1).unwrap();
+        successful_scheduler
+            .run_distributed_turn(
+                0xCE,
+                &transport,
+                consensus_wait(),
+                Instant::now(),
+                |_, _, _| {
+                    Ok::<_, Infallible>(Output {
+                        complete: Rc::new(Cell::new(true)),
+                        fail: false,
+                    })
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            successful_scheduler.request_status(request),
+            Some(RequestStatus::DeadlineExceeded)
+        );
+
+        for steps in [
+            vec![
+                GatherStep {
+                    replacements: vec![(1, 6, 1)],
+                },
+                GatherStep {
+                    replacements: vec![(1, 6, 0)],
+                },
+            ],
+            vec![
+                GatherStep {
+                    replacements: vec![(1, 6, 1)],
+                },
+                GatherStep::default(),
+                GatherStep {
+                    replacements: vec![(1, 6, 0)],
+                },
+            ],
+        ] {
+            let transport = ScriptedTransport::new(2, steps);
+            let mut scheduler = scheduler();
+            let request = RequestId::new(55);
+            scheduler.register(request, State::default()).unwrap();
+            scheduler.enqueue(request, 1).unwrap();
+            assert!(scheduler
+                .run_distributed_turn(
+                    0xCF,
+                    &transport,
+                    consensus_wait(),
+                    Instant::now(),
+                    |_, _, _| {
+                        Ok::<_, Infallible>(Output {
+                            complete: Rc::new(Cell::new(true)),
+                            fail: false,
+                        })
+                    },
+                )
+                .is_err());
+            assert_eq!(
+                scheduler.request_status(request),
+                Some(RequestStatus::Active)
+            );
+            let remaining = transport.steps.borrow().len();
+            assert!(scheduler
+                .run_distributed_turn(
+                    0xCF,
+                    &transport,
+                    consensus_wait(),
+                    Instant::now(),
+                    |_, _, _| {
+                        Ok::<_, Infallible>(Output {
+                            complete: Rc::new(Cell::new(true)),
+                            fail: false,
+                        })
+                    },
+                )
+                .is_err());
+            assert_eq!(transport.steps.borrow().len(), remaining);
+        }
     }
 
     #[test]

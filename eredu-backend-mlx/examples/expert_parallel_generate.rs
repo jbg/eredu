@@ -1,7 +1,7 @@
 //! Minimal MLX sparse-cache Ring expert-parallel generation probe.
 
 use eredu_backend_mlx::backend::runtime::media::input::{token_ids_part, ModelInput};
-use eredu_backend_mlx::native::{DeviceAssignment, MlxParallelPlan};
+use eredu_backend_mlx::native::DeviceAssignment;
 use eredu_core::{load_model, BackendProvider as _, BackendSession as _};
 use eredu_runtime::DefaultSampler;
 use eredu_runtime::{OrdinaryWeightResidency, ParameterBankLoadOptions, WeightResidency};
@@ -19,18 +19,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .and_then(|rank| rank.parse().ok())
         .unwrap_or(0);
-    let topology = MlxParallelPlan::for_group(
-        &group,
-        1,
-        1,
-        group.size(),
-        DeviceAssignment::new(DeviceType::Gpu, local_index),
+    let topology = eredu_core::ParallelRankTopology::new(
+        eredu_core::ParallelTopology::new(1, 1, group.size(), 1)?,
+        group.rank(),
     )?;
-    let stream = Stream::new_with_device(&topology.device()?);
-    let weights_stream = Stream::new_with_device(&topology.device()?);
+    let device = DeviceAssignment::new(DeviceType::Gpu, local_index);
+    let stream = Stream::new_with_device(&device.device()?);
+    let weights_stream = Stream::new_with_device(&device.device()?);
     let options = eredu_backend_mlx::native::parallel_load_options(
         topology,
+        device,
         eredu_runtime::PipelineWireContract::new(eredu_runtime::PipelineActivationDtype::Float32),
+        1,
+        4096,
+        eredu_runtime::CommunicationCompletionPolicy::new(
+            std::time::Duration::from_secs(30),
+            eredu_core::CompletionCancellationMode::QuarantineUntilComplete,
+        )?,
     )
     .with_weight_residency(WeightResidency::with_independent_parameter_banks(
         OrdinaryWeightResidency::LayerwiseHost(Default::default()),

@@ -209,7 +209,7 @@ fn expert_exchange_ring_worker() {
         return;
     };
     let expected_rank: usize = rank.to_string_lossy().parse().unwrap();
-    let group = crate::backend::runtime::distributed::Group::native(
+    let group = crate::backend::runtime::distributed::Group::uncontracted(
         &distributed::init(true, Backend::Ring).unwrap(),
     );
     assert_eq!(group.rank(), expected_rank);

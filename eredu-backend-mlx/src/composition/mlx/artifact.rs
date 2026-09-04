@@ -23,14 +23,13 @@ use eredu_core::{
 /// Family composition receives this object instead of an artifact path so it
 /// cannot rediscover configuration or checkpoint topology after admission.
 pub struct PreparedSafetensorsArtifact {
-    configuration: ModelConfiguration,
     architecture: eredu_architectures::configuration::SafetensorsArchitecturePlan,
     store: SharedCheckpointSource,
 }
 
 impl PreparedSafetensorsArtifact {
     pub fn open(
-        configuration: ModelConfiguration,
+        _configuration: ModelConfiguration,
         architecture: eredu_architectures::configuration::SafetensorsArchitecturePlan,
         catalog: TensorCatalog,
         shards: SafetensorsShards,
@@ -49,18 +48,9 @@ impl PreparedSafetensorsArtifact {
             .clone();
         let store = eredu_checkpoint::store::ResolvedCheckpointSource::new(store, resolution);
         Ok(Self {
-            configuration,
             architecture,
             store: Arc::new(store),
         })
-    }
-
-    pub fn loading_protocol(&self) -> eredu_core::LoadingProtocol {
-        self.configuration.loading_protocol()
-    }
-
-    pub fn effective_model_type(&self) -> &str {
-        self.configuration.effective_model_type()
     }
 
     pub fn architecture(&self) -> &eredu_architectures::configuration::SafetensorsArchitecturePlan {
@@ -341,7 +331,6 @@ mod tests {
     fn composition_keeps_prepared_configuration_when_sidecar_changes() {
         let directory = tempfile::tempdir().unwrap();
         write_tensor(directory.path(), &[0.0]);
-        let prepared = serde_json::json!({"model_type": "llama", "hidden_size": 16});
         std::fs::write(
             directory.path().join("config.json"),
             serde_json::to_vec(&serde_json::json!({
@@ -358,7 +347,6 @@ mod tests {
         )
         .unwrap();
         let artifact = PreparedSafetensorsArtifact {
-            configuration: configuration(prepared),
             architecture: architecture(),
             store: std::sync::Arc::new(PreparedCatalogSource {
                 catalog: catalog_for(directory.path(), vec![1], 4),

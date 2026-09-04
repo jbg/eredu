@@ -10,6 +10,8 @@ pub mod config;
 pub mod moe;
 /// Semantic placement and rank-local construction geometry.
 pub mod parallel;
+/// Exact resident TP/PP construction for dense prediction-free LFM2.
+pub mod partitioned;
 
 pub use block::{Block, BlockGeometry, TokenMixer};
 pub use checkpoint::{
@@ -28,9 +30,12 @@ pub use moe::{
     RoutedGatedProduct,
 };
 pub use parallel::{
-    layer_parallel_parameter_groups, local_block_geometry, local_geometry, local_state_geometry,
-    static_parallel_parameter_groups, LocalGeometry,
+    dense_parameter_description, layer_parallel_parameter_groups, local_block_geometry,
+    local_geometry, local_state_geometry, partition_local_geometry,
+    partition_local_routed_geometry, partitioned_state_layout, static_parallel_parameter_groups,
+    LocalGeometry, PartitionExpertBankOwnership, PartitionLocalGeometry,
 };
+pub use partitioned::PartitionedLayeredModel;
 
 use eredu_core::cache::PromptCacheTopology;
 use eredu_nn::{

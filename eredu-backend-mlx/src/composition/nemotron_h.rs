@@ -7,8 +7,7 @@ use eredu_checkpoint::{store::CheckpointSource, WeightQuantization};
 use eredu_runtime::{
     ActivationObserver, ArchitectureParameters, CacheResidencyPolicy, CausalModel,
     DenseDiskStreamReport, LayerWeightResidency, LayeredArchitecture, LayerwiseRuntime,
-    PagedCacheOptions, ParallelModelInfo, ParameterRole, ResidencyReport, WeightBinding,
-    WeightResidency,
+    PagedCacheOptions, ParameterRole, ResidencyReport, WeightResidency,
 };
 use safemlx::{error::Exception, ops::indexing::TryIndexOp, Array, Stream};
 
@@ -26,9 +25,8 @@ use crate::backend::{
         },
         checkpoint::{
             binding::{
-                binding_bytes, build_module_bindings_with_recipes,
-                build_module_bindings_with_recipes_excluding, parameter_name_in_targets,
-                parameter_role_targets, populate_module_from_lease_excluding,
+                build_module_bindings_with_recipes, build_module_bindings_with_recipes_excluding,
+                parameter_name_in_targets, populate_module_from_lease_excluding,
             },
             load::gguf_quantization_configs,
             quantization::should_quantize_on_load,
@@ -40,7 +38,7 @@ use crate::backend::{
                 prepare_layerwise_policy_with_bindings, MlxLayerwisePolicy, MlxResidentPolicy,
                 MlxUnitPopulator,
             },
-            layerwise::{quantize_module_store_with_bindings, shard_layer_bindings},
+            layerwise::quantize_module_store_with_bindings,
         },
         media::input,
         residency::parameter_bank::ParameterBankEntry,
@@ -66,13 +64,6 @@ type BoundedRuntime = LayerwiseRuntime<
     MlxHybridState,
     MlxLayerwisePolicy<NeutralBlock, NemotronHUnitPopulator>,
 >;
-type ParallelBoundedRuntime = LayerwiseRuntime<
-    NeutralArchitecture,
-    MlxNeuralBackend,
-    MlxHybridState,
-    MlxLayerwisePolicy<NeutralBlock, NemotronHParallelUnitPopulator>,
->;
-
 #[derive(eredu_nn::Parameterized)]
 #[parameterized(tensor = "crate::MlxTensor")]
 #[doc(hidden)]
@@ -107,138 +98,10 @@ impl NemotronHCheckpointTemplate {
     }
 }
 
-fn neutral_embedded_input<'a>(
-    input: eredu_architectures::nemotron_h::EmbeddedInput<'a, Array>,
-) -> eredu_architectures::nemotron_h::EmbeddedInput<'a, crate::MlxTensor> {
-    match input {
-        eredu_architectures::nemotron_h::EmbeddedInput::Target { tokens, mask } => {
-            eredu_architectures::nemotron_h::EmbeddedInput::target(
-                crate::composition::tensor_ref(tokens),
-                crate::composition::tensor_opt(mask),
-            )
-        }
-        eredu_architectures::nemotron_h::EmbeddedInput::Draft {
-            tokens,
-            hidden,
-            depth,
-        } => eredu_architectures::nemotron_h::EmbeddedInput::draft(
-            crate::composition::tensor_ref(tokens),
-            crate::composition::tensor_ref(hidden),
-            depth,
-        ),
-    }
-}
-
 #[derive(Clone)]
 struct NemotronHUnitPopulator {
     external_experts: bool,
     expert_targets: Arc<std::collections::BTreeSet<String>>,
-}
-
-/// Pipeline/loading adapter over the same neutral Nemotron-H blocks used by resident
-/// and bounded execution.
-#[derive(Default)]
-pub struct NemotronHBindings {
-    external_experts: bool,
-}
-
-impl NemotronHBindings {
-    pub const fn new() -> Self {
-        Self {
-            external_experts: false,
-        }
-    }
-
-    pub const fn new_external_experts() -> Self {
-        Self {
-            external_experts: true,
-        }
-    }
-
-    pub fn model_type<'a>(&self, architecture: &'a NeutralArchitecture) -> &'a str {
-        &architecture.args().model_type
-    }
-
-    pub fn layer_bindings(
-        &self,
-        architecture: &NeutralArchitecture,
-        group: usize,
-        index: usize,
-        layer: &MlxModule<NeutralBlock>,
-        store: &dyn CheckpointSource,
-    ) -> Result<Vec<WeightBinding>, Error> {
-        let flat = architecture_execution_layout::<_, MlxHybridState>(architecture)?
-            .ordinal(group, index)
-            .ok_or_else(|| {
-                Error::Parallel(format!("Nemotron-H has no unit {index} in group {group}"))
-            })?;
-        let expert_targets = parameter_role_targets(
-            &eredu_architectures::nemotron_h::unit_parallel_parameter_groups(
-                layer,
-                architecture.args(),
-                flat,
-            )?,
-            ParameterRole::ExpertIntermediate,
-        );
-        let recipes = eredu_architectures::nemotron_h::unit_recipes(
-            store,
-            architecture.args(),
-            group,
-            index,
-            !self.external_experts,
-        )
-        .map_err(Error::ArchitectureModel)?;
-        build_module_bindings_with_recipes_excluding(layer, "", store, recipes, |name| {
-            self.external_experts && parameter_name_in_targets(name, &expert_targets)
-        })
-        .map_err(Into::into)
-    }
-
-    pub fn quantizes_static_binding(&self, _binding: &WeightBinding) -> bool {
-        true
-    }
-
-    pub fn expert_parallel_assignment(
-        &self,
-        realization: Option<
-            &eredu_architectures::ExpertRealizationPlan<eredu_nn::GroupedRelu2Spec>,
-        >,
-    ) -> Result<Option<crate::composition::expert_dispatch::ExpertAssignment>, Error> {
-        if !self.external_experts {
-            return Ok(None);
-        }
-        realization
-            .map(crate::composition::expert_dispatch::ExpertAssignment::from_realization)
-            .transpose()
-            .and_then(|assignment| {
-                assignment
-                    .ok_or_else(|| {
-                        Error::Parallel(
-                            "Nemotron-H external experts require an architecture realization"
-                                .into(),
-                        )
-                    })
-                    .map(Some)
-            })
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn cartesian_layer_bindings(
-        &self,
-        architecture: &NeutralArchitecture,
-        group: usize,
-        index: usize,
-        global_layer: &MlxModule<NeutralBlock>,
-        store: &dyn CheckpointSource,
-        layout: Option<&eredu_runtime::LocalModelLayout>,
-        _assignment: Option<&crate::composition::expert_dispatch::ExpertAssignment>,
-    ) -> Result<Vec<WeightBinding>, Error> {
-        let bindings = self.layer_bindings(architecture, group, index, global_layer, store)?;
-        match layout {
-            Some(layout) => shard_layer_bindings(bindings, store, layout),
-            None => Ok(bindings),
-        }
-    }
 }
 
 impl MlxUnitPopulator<NeutralBlock> for NemotronHUnitPopulator {
@@ -254,30 +117,9 @@ impl MlxUnitPopulator<NeutralBlock> for NemotronHUnitPopulator {
     }
 }
 
-#[derive(Clone)]
-struct NemotronHParallelUnitPopulator {
-    external_experts: bool,
-    expert_targets: Arc<std::collections::BTreeSet<String>>,
-}
-
-impl MlxUnitPopulator<NeutralBlock> for NemotronHParallelUnitPopulator {
-    fn populate(
-        &mut self,
-        unit: &mut MlxModule<NeutralBlock>,
-        lease: &crate::backend::runtime::residency::manager::ResidentUnitLease,
-    ) -> Result<(), Error> {
-        populate_module_from_lease_excluding(unit, lease, |name| {
-            self.external_experts && parameter_name_in_targets(name, &self.expert_targets)
-        })?;
-        Ok(())
-    }
-}
-
 enum NemotronHExecution {
     Resident(Box<ResidentRuntime>),
     Layerwise(Box<BoundedRuntime>),
-    TensorParallelResident(Box<ResidentRuntime>),
-    TensorParallelLayerwise(Box<ParallelBoundedRuntime>),
 }
 
 impl NemotronHExecution {
@@ -285,8 +127,6 @@ impl NemotronHExecution {
         match self {
             Self::Resident(runtime) => runtime.architecture(),
             Self::Layerwise(runtime) => runtime.architecture(),
-            Self::TensorParallelResident(runtime) => runtime.architecture(),
-            Self::TensorParallelLayerwise(runtime) => runtime.architecture(),
         }
     }
 }
@@ -312,18 +152,15 @@ pub fn expert_catalog_selected(
 
 fn cached_provider<'a>(
     cache: &'a AddressableParameterBank,
-    args: &'a ModelArgs,
-    realization: &'a eredu_architectures::ExpertRealizationPlan<eredu_nn::GroupedRelu2Spec>,
+    descriptor: &'a eredu_architectures::nemotron_h::ExpertProviderDescriptor,
 ) -> CachedRelu2GroupProvider<'a, impl FnMut(usize) -> Result<eredu_nn::GroupedRelu2Spec, Error> + 'a>
 {
     CachedRelu2GroupProvider::new(cache, move |layer| {
-        eredu_architectures::nemotron_h::realized_expert_bank_spec(realization, args, layer)
-            .cloned()
-            .ok_or_else(|| {
-                Error::ArchitectureModel(format!(
-                    "Nemotron-H realization has no expert bank for identity layer {layer}"
-                ))
-            })
+        descriptor.grouped_spec(layer).cloned().ok_or_else(|| {
+            Error::ArchitectureModel(format!(
+                "Nemotron-H provider descriptor has no expert bank for identity layer {layer}"
+            ))
+        })
     })
 }
 
@@ -340,14 +177,9 @@ fn load_neutral(
     let replicated_topology = eredu_core::ParallelTopology::new(1, 1, 1, 1)
         .and_then(|topology| eredu_core::ParallelRankTopology::new(topology, 0))
         .map_err(|error| Error::Parallel(error.to_string()))?;
-    let expert_realization = eredu_architectures::nemotron_h::expert_realization_plan(
-        &architecture,
-        replicated_topology,
-    )
-    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    if let Some(realization) = expert_realization.clone() {
-        architecture.install_expert_realization(realization);
-    }
+    let expert_provider = architecture
+        .prepare_expert_provider_descriptor(replicated_topology)
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let expert_targets = Arc::new(
         architecture
             .parameter_description(stream)
@@ -416,207 +248,9 @@ fn load_neutral(
         args,
         state_layout,
         execution,
-        expert_realization,
+        expert_provider,
         parameter_bank: None,
-        parallel_info: None,
         parallel_rank: None,
-    })
-}
-
-fn load_neutral_parallel(
-    store: Arc<dyn CheckpointSource>,
-    args: ModelArgs,
-    options: LayerWeightResidency,
-    build: crate::composition::mlx::distributed::topology::ParallelBuildContext,
-    stream: &Stream,
-    weights_stream: &Stream,
-    external_experts: bool,
-) -> Result<NemotronHModel, Error> {
-    let global_architecture = NeutralArchitecture::new(args.clone(), stream)
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    let parameter_description = global_architecture
-        .parameter_description(stream)
-        .map_err(|error| Error::Parallel(error.to_string()))?;
-    let global_execution =
-        architecture_execution_layout::<_, MlxHybridState>(&global_architecture)?;
-    let expert_targets =
-        Arc::new(parameter_description.targets_for_role(ParameterRole::ExpertIntermediate));
-    let layout =
-        crate::composition::parallel_layout_from_description(build, &parameter_description)?;
-    if layout.is_empty() {
-        return Err(Error::Parallel(
-            "Nemotron-H declared no tensor-parallel parameters".into(),
-        ));
-    }
-    let geometry = eredu_architectures::nemotron_h::local_geometry(&args, &layout)
-        .map_err(|error| Error::Parallel(error.to_string()))?;
-    let mut architecture = NeutralArchitecture::new_parallel(args.clone(), geometry, stream)
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    let expert_realization = eredu_architectures::nemotron_h::expert_realization_plan(
-        &architecture,
-        build.topology().rank_topology(),
-    )
-    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    if let Some(realization) = expert_realization.clone() {
-        architecture.install_expert_realization(realization);
-    }
-    let state_layout = eredu_runtime::ArchitectureParameters::state_layout(&architecture)
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    let factory = NemotronHParallelUnitPopulator {
-        external_experts,
-        expert_targets: Arc::clone(&expert_targets),
-    };
-
-    let global_static = MlxModule::new(global_architecture.static_modules().clone());
-    let global_static_bindings = build_module_bindings_with_recipes(
-        &global_static,
-        "",
-        store.as_ref(),
-        eredu_architectures::nemotron_h::static_recipes(store.as_ref(), &args, None)
-            .map_err(Error::ArchitectureModel)?,
-    )?;
-    let mut global_parameter_bytes = binding_bytes(&global_static_bindings)?;
-    for ordinal in 0..global_execution.len() {
-        let unit = construct_architecture_unit(
-            &global_architecture,
-            &global_execution,
-            ordinal,
-            stream,
-            std::marker::PhantomData::<MlxHybridState>,
-        )?;
-        let address = global_execution
-            .address(ordinal)
-            .expect("architecture execution layout contains every ordinal");
-        let bindings = build_module_bindings_with_recipes_excluding(
-            &MlxModule::new(unit),
-            "",
-            store.as_ref(),
-            eredu_architectures::nemotron_h::unit_recipes(
-                store.as_ref(),
-                &args,
-                address.group(),
-                address.index(),
-                !external_experts,
-            )
-            .map_err(Error::ArchitectureModel)?,
-            |name| external_experts && parameter_name_in_targets(name, &expert_targets),
-        )?;
-        global_parameter_bytes = global_parameter_bytes
-            .checked_add(binding_bytes(&bindings)?)
-            .ok_or_else(|| {
-                Error::Parallel("global Nemotron-H parameter bytes overflowed".into())
-            })?;
-    }
-
-    let shared_layout = Arc::new(layout);
-    let static_layout = Arc::clone(&shared_layout);
-    let unit_layout = Arc::clone(&shared_layout);
-    let static_binding_args = args.clone();
-    let binding_args = args.clone();
-    let global_static_modules = global_architecture.static_modules().clone();
-    let binding_architecture = global_architecture;
-    let excluded_expert_targets = Arc::clone(&expert_targets);
-    let binding_expert_targets = Arc::clone(&expert_targets);
-    let (policy, mut metadata) = prepare_layerwise_policy_with_bindings(
-        Arc::clone(&store),
-        &mut architecture,
-        factory,
-        std::marker::PhantomData::<MlxHybridState>,
-        options,
-        stream,
-        weights_stream,
-        move |key| external_experts && parameter_name_in_targets(key, &excluded_expert_targets),
-        move |_modules, store| {
-            let global = MlxModule::new(global_static_modules.clone());
-            let bindings = build_module_bindings_with_recipes(
-                &global,
-                "",
-                store,
-                eredu_architectures::nemotron_h::static_recipes(store, &static_binding_args, None)
-                    .map_err(Error::ArchitectureModel)?,
-            )?;
-            shard_layer_bindings(bindings, store, &static_layout)
-        },
-        move |_ordinal, address, _path, _local, store, stream| {
-            let global = <NeutralArchitecture as LayeredArchitecture<
-                MlxNeuralBackend,
-                MlxHybridState,
-            >>::build_unit(
-                &binding_architecture,
-                address.group(),
-                address.index(),
-                stream,
-            )
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-            let bindings = build_module_bindings_with_recipes_excluding(
-                &MlxModule::new(global),
-                "",
-                store,
-                eredu_architectures::nemotron_h::unit_recipes(
-                    store,
-                    &binding_args,
-                    address.group(),
-                    address.index(),
-                    !external_experts,
-                )
-                .map_err(Error::ArchitectureModel)?,
-                |name| external_experts && parameter_name_in_targets(name, &binding_expert_targets),
-            )?;
-            shard_layer_bindings(bindings, store, &unit_layout)
-        },
-    )?;
-    metadata.set_effective_model_type(args.model_type.clone());
-    metadata.set_quantization(args.weight_quantization);
-    let local_parameter_bytes = metadata
-        .static_device_bytes()
-        .checked_add(metadata.layer_parameter_bytes())
-        .ok_or_else(|| Error::Parallel("local Nemotron-H parameter bytes overflowed".into()))?;
-    let maximum_device_parameter_bytes = metadata
-        .static_device_bytes()
-        .checked_add(metadata.maximum_device_layer_bytes())
-        .ok_or_else(|| Error::Parallel("device Nemotron-H parameter bytes overflowed".into()))?;
-    let info = ParallelModelInfo::new(
-        build.topology(),
-        args.model_type.clone(),
-        shared_layout
-            .tensors()
-            .map(|(target, _)| target.to_owned())
-            .collect(),
-        local_parameter_bytes,
-        global_parameter_bytes,
-        if options.is_fully_resident() {
-            local_parameter_bytes
-        } else {
-            metadata.static_device_bytes()
-        },
-        maximum_device_parameter_bytes,
-    );
-    let rank =
-        crate::composition::mlx::distributed::topology::prompt_cache_topology(build.topology())
-            .cache_rank_identity();
-    let execution = if options.is_fully_resident() {
-        NemotronHExecution::TensorParallelResident(Box::new(LayerwiseRuntime::new_policy_first(
-            policy.into_resident(
-                &architecture,
-                stream,
-                std::marker::PhantomData::<MlxHybridState>,
-            )?,
-            architecture,
-        )))
-    } else {
-        NemotronHExecution::TensorParallelLayerwise(Box::new(LayerwiseRuntime::new(
-            architecture,
-            policy,
-        )))
-    };
-    Ok(NemotronHModel {
-        args,
-        state_layout,
-        execution,
-        expert_realization,
-        parameter_bank: None,
-        parallel_info: Some(info),
-        parallel_rank: rank,
     })
 }
 
@@ -719,27 +353,9 @@ pub struct NemotronHModel {
     args: ModelArgs,
     state_layout: eredu_runtime::StateLayout,
     execution: NemotronHExecution,
-    expert_realization:
-        Option<eredu_architectures::ExpertRealizationPlan<eredu_nn::GroupedRelu2Spec>>,
+    expert_provider: Option<eredu_architectures::nemotron_h::ExpertProviderDescriptor>,
     parameter_bank: Option<AddressableParameterBank>,
-    parallel_info:
-        Option<ParallelModelInfo<crate::composition::mlx::distributed::topology::MlxParallelPlan>>,
     parallel_rank: Option<eredu_core::cache::CacheRankIdentity>,
-}
-
-/// Collective context adapter for the same neutral embedded-MTP target.
-pub struct NemotronHTensorMtpTarget<'a> {
-    model: &'a mut NemotronHModel,
-    group: &'a crate::backend::runtime::distributed::Group,
-}
-
-impl<'a> NemotronHTensorMtpTarget<'a> {
-    pub const fn new(
-        model: &'a mut NemotronHModel,
-        group: &'a crate::backend::runtime::distributed::Group,
-    ) -> Self {
-        Self { model, group }
-    }
 }
 
 impl NemotronHModel {
@@ -747,7 +363,6 @@ impl NemotronHModel {
         self.args.has_sparse_moe_layers()
             || self.args.num_nextn_predict_layers > 0
             || self.parameter_bank.is_some()
-            || self.parallel_info.is_some()
     }
 
     /// Returns validated family policy.
@@ -760,19 +375,7 @@ impl NemotronHModel {
         match &self.execution {
             NemotronHExecution::Resident(runtime) => runtime.architecture().mtp_len(),
             NemotronHExecution::Layerwise(runtime) => runtime.architecture().mtp_len(),
-            NemotronHExecution::TensorParallelResident(runtime) => runtime.architecture().mtp_len(),
-            NemotronHExecution::TensorParallelLayerwise(runtime) => {
-                runtime.architecture().mtp_len()
-            }
         }
-    }
-
-    /// Returns parallel metadata when a distributed binder supplied it.
-    pub fn parallel_info(
-        &self,
-    ) -> Option<&ParallelModelInfo<crate::composition::mlx::distributed::topology::MlxParallelPlan>>
-    {
-        self.parallel_info.as_ref()
     }
 
     /// Creates device-resident heterogeneous state.
@@ -802,12 +405,6 @@ impl NemotronHModel {
         match &self.execution {
             NemotronHExecution::Resident(runtime) => runtime.policy().residency_report(),
             NemotronHExecution::Layerwise(runtime) => runtime.policy().residency_report(),
-            NemotronHExecution::TensorParallelResident(runtime) => {
-                runtime.policy().residency_report()
-            }
-            NemotronHExecution::TensorParallelLayerwise(runtime) => {
-                runtime.policy().residency_report()
-            }
         }
     }
 
@@ -816,10 +413,6 @@ impl NemotronHModel {
         match &self.execution {
             NemotronHExecution::Resident(_) => Ok(None),
             NemotronHExecution::Layerwise(runtime) => runtime.policy().dense_stream_report(),
-            NemotronHExecution::TensorParallelResident(_) => Ok(None),
-            NemotronHExecution::TensorParallelLayerwise(runtime) => {
-                runtime.policy().dense_stream_report()
-            }
         }
     }
 
@@ -836,12 +429,6 @@ impl NemotronHModel {
         match &self.execution {
             NemotronHExecution::Resident(runtime) => runtime.policy().checkpoint_store_arc(),
             NemotronHExecution::Layerwise(runtime) => runtime.policy().checkpoint_store_arc(),
-            NemotronHExecution::TensorParallelResident(runtime) => {
-                runtime.policy().checkpoint_store_arc()
-            }
-            NemotronHExecution::TensorParallelLayerwise(runtime) => {
-                runtime.policy().checkpoint_store_arc()
-            }
         }
     }
 
@@ -849,13 +436,7 @@ impl NemotronHModel {
     pub fn prompt_cache_model_identity(&self) -> Result<PromptCacheModelIdentity, Error> {
         crate::composition::replicated_prompt_cache_identity(
             self.execution.architecture(),
-            self.parallel_info
-                .as_ref()
-                .map_or_else(PromptCacheTopology::default, |info| {
-                    crate::composition::mlx::distributed::topology::prompt_cache_topology(
-                        info.topology(),
-                    )
-                }),
+            PromptCacheTopology::default(),
         )
     }
 
@@ -953,14 +534,13 @@ impl NemotronHModel {
         stream: &Stream,
     ) -> Result<Array, Error> {
         if let Some(parameter_bank) = self.parameter_bank.take() {
-            let args = self.args.clone();
-            let realization = self.expert_realization.clone().ok_or_else(|| {
+            let descriptor = self.expert_provider.clone().ok_or_else(|| {
                 Error::ArchitectureModel(
-                    "Nemotron-H expert cache has no architecture realization".into(),
+                    "Nemotron-H expert cache has no architecture provider descriptor".into(),
                 )
             })?;
             let result = {
-                let mut provider = cached_provider(&parameter_bank, &args, &realization);
+                let mut provider = cached_provider(&parameter_bank, &descriptor);
                 self.forward_with_provider(tokens, None, cache, &mut provider, stream)
             };
             self.parameter_bank = Some(parameter_bank);
@@ -973,12 +553,6 @@ impl NemotronHModel {
         let output = match &mut self.execution {
             NemotronHExecution::Resident(runtime) => runtime.forward(input, cache, stream),
             NemotronHExecution::Layerwise(runtime) => runtime.forward(input, cache, stream),
-            NemotronHExecution::TensorParallelResident(_)
-            | NemotronHExecution::TensorParallelLayerwise(_) => {
-                return Err(Error::Parallel(
-                    "tensor-parallel Nemotron-H requires collective execution".into(),
-                ))
-            }
         }
         .map(crate::MlxTensor::into_array)
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
@@ -1053,11 +627,6 @@ impl NemotronHModel {
                     hook,
                     |_, _, _| Ok(()),
                 ),
-            _ => {
-                return Err(Error::Parallel(
-                    "tensor-parallel Nemotron-H expert cache requires collective execution".into(),
-                ))
-            }
         }
         .map_err(|error| Error::Parallel(error.to_string()))?;
         Ok(output)
@@ -1072,11 +641,12 @@ impl NemotronHModel {
         let parameter_bank = self.parameter_bank.take();
         let result = match parameter_bank.as_ref() {
             Some(cache_store) => {
-                let args = self.args.clone();
-                let realization = self.expert_realization.clone().ok_or_else(|| {
-                    Exception::custom("Nemotron-H expert cache has no architecture realization")
+                let descriptor = self.expert_provider.clone().ok_or_else(|| {
+                    Exception::custom(
+                        "Nemotron-H expert cache has no architecture provider descriptor",
+                    )
                 })?;
-                let mut provider = cached_provider(cache_store, &args, &realization);
+                let mut provider = cached_provider(cache_store, &descriptor);
                 self.forward_with_provider_context(tokens, None, cache, &mut provider, stream)
             }
             None => self.forward_with_provider_context(
@@ -1098,91 +668,6 @@ impl NemotronHModel {
                 logits,
                 hidden,
                 tokens: crate::MlxTensor::from_array(tokens.clone()),
-            },
-        )
-    }
-
-    fn forward_mtp_draft(
-        &mut self,
-        hidden: &Array,
-        tokens: &Array,
-        depth: usize,
-        cache: &mut MlxHybridState,
-        stream: &Stream,
-    ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Exception> {
-        let input = eredu_architectures::nemotron_h::EmbeddedInput::draft(
-            crate::composition::tensor_ref(tokens),
-            crate::composition::tensor_ref(hidden),
-            depth,
-        );
-        let parameter_bank = self.parameter_bank.take();
-        let result = match parameter_bank.as_ref() {
-            Some(cache_store) => {
-                let args = self.args.clone();
-                let realization = self.expert_realization.clone().ok_or_else(|| {
-                    Exception::custom("Nemotron-H expert cache has no architecture realization")
-                })?;
-                let mut provider = cached_provider(cache_store, &args, &realization);
-                self.forward_input_with_provider_context(input, cache, &mut provider, stream)
-            }
-            None => self.forward_input_with_provider_context(
-                input,
-                cache,
-                &mut eredu_runtime::ResidentExpertProvider,
-                stream,
-            ),
-        };
-        self.parameter_bank = parameter_bank;
-        let (logits, context) = result.map_err(|error| Exception::custom(error.to_string()))?;
-        let hidden = context
-            .target_capture()
-            .cloned()
-            .ok_or_else(|| Exception::custom("Nemotron-H draft pass retained no hidden state"))?;
-        Ok(
-            crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput {
-                logits,
-                hidden,
-                tokens: crate::MlxTensor::from_array(tokens.clone()),
-            },
-        )
-    }
-
-    fn forward_mtp_parallel(
-        &mut self,
-        input: eredu_architectures::nemotron_h::EmbeddedInput<'_, Array>,
-        cache: &mut MlxHybridState,
-        group: &crate::backend::runtime::distributed::Group,
-        stream: &Stream,
-    ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Exception> {
-        let tokens = match &input {
-            eredu_architectures::nemotron_h::EmbeddedInput::Target { tokens, .. }
-            | eredu_architectures::nemotron_h::EmbeddedInput::Draft { tokens, .. } => {
-                (*tokens).clone()
-            }
-        };
-        let input = neutral_embedded_input(input);
-        let result = match &mut self.execution {
-            NemotronHExecution::TensorParallelResident(runtime) => runtime
-                .forward_parallel_with_context_hook(input, cache, group, stream, |_, _, _| Ok(())),
-            NemotronHExecution::TensorParallelLayerwise(runtime) => runtime
-                .forward_parallel_with_context_hook(input, cache, group, stream, |_, _, _| Ok(())),
-            _ => {
-                return Err(Exception::custom(
-                    "Nemotron-H was not loaded for tensor-parallel MTP",
-                ))
-            }
-        }
-        .map_err(|error| Exception::custom(error.to_string()))?;
-        let hidden = result
-            .1
-            .target_capture()
-            .cloned()
-            .ok_or_else(|| Exception::custom("Nemotron-H MTP pass retained no hidden state"))?;
-        Ok(
-            crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput {
-                logits: result.0,
-                hidden,
-                tokens: crate::MlxTensor::from_array(tokens),
             },
         )
     }
@@ -1217,7 +702,7 @@ impl NemotronHModel {
                     group, index, unit, hidden, state, forward, provider, context,
                 )
             };
-        let output = match &mut self.execution {
+        match &mut self.execution {
             NemotronHExecution::Resident(runtime) => runtime
                 .forward_with_unit_executor_and_context_hook(
                     input,
@@ -1234,18 +719,56 @@ impl NemotronHModel {
                     hook,
                     |_, _, _| Ok(()),
                 ),
-            _ => {
-                return Err(Error::Parallel(
-                    "tensor-parallel Nemotron-H requires collective MTP execution".into(),
-                ))
-            }
         }
-        .map_err(|error| Error::Parallel(error.to_string()))?;
-        Ok(output)
+        .map_err(|error| Error::Parallel(error.to_string()))
     }
 
-    /// Executes a replicated neutral pass with activation intervention and
-    /// normalized routing observations.
+    fn forward_mtp_draft(
+        &mut self,
+        hidden: &Array,
+        tokens: &Array,
+        depth: usize,
+        cache: &mut MlxHybridState,
+        stream: &Stream,
+    ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Exception> {
+        let input = eredu_architectures::nemotron_h::EmbeddedInput::draft(
+            crate::composition::tensor_ref(tokens),
+            crate::composition::tensor_ref(hidden),
+            depth,
+        );
+        let parameter_bank = self.parameter_bank.take();
+        let result = match parameter_bank.as_ref() {
+            Some(cache_store) => {
+                let descriptor = self.expert_provider.clone().ok_or_else(|| {
+                    Exception::custom(
+                        "Nemotron-H expert cache has no architecture provider descriptor",
+                    )
+                })?;
+                let mut provider = cached_provider(cache_store, &descriptor);
+                self.forward_input_with_provider_context(input, cache, &mut provider, stream)
+            }
+            None => self.forward_input_with_provider_context(
+                input,
+                cache,
+                &mut eredu_runtime::ResidentExpertProvider,
+                stream,
+            ),
+        };
+        self.parameter_bank = parameter_bank;
+        let (logits, context) = result.map_err(|error| Exception::custom(error.to_string()))?;
+        let hidden = context
+            .target_capture()
+            .cloned()
+            .ok_or_else(|| Exception::custom("Nemotron-H draft pass retained no hidden state"))?;
+        Ok(
+            crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput {
+                logits,
+                hidden,
+                tokens: crate::MlxTensor::from_array(tokens.clone()),
+            },
+        )
+    }
+
     pub fn forward_with_observer(
         &mut self,
         tokens: &Array,
@@ -1259,13 +782,13 @@ impl NemotronHModel {
             let mut observer = crate::composition::NeutralActivationObserver::new(observer);
             match parameter_bank.as_ref() {
                 Some(parameter_bank) => {
-                    let args = self.args.clone();
-                    let realization = self.expert_realization.clone().ok_or_else(|| {
+                    let descriptor = self.expert_provider.clone().ok_or_else(|| {
                         Error::ArchitectureModel(
-                            "Nemotron-H expert cache has no architecture realization".into(),
+                            "Nemotron-H expert cache has no architecture provider descriptor"
+                                .into(),
                         )
                     })?;
-                    let mut provider = cached_provider(parameter_bank, &args, &realization);
+                    let mut provider = cached_provider(parameter_bank, &descriptor);
                     self.forward_observed_with_provider(
                         tokens,
                         mask,
@@ -1335,75 +858,9 @@ impl NemotronHModel {
             NemotronHExecution::Layerwise(runtime) => {
                 runtime.forward_with_unit_executor(input, cache, stream, hook)
             }
-            _ => {
-                return Err(Error::Parallel(
-                    "tensor-parallel Nemotron-H observation requires distributed observation"
-                        .into(),
-                ))
-            }
         }
         .map_err(|error| Error::Parallel(error.to_string()))?;
         eredu_runtime::observe_model_logits(observer, &output)
-            .map(crate::MlxTensor::into_array)
-            .map_err(Into::into)
-    }
-
-    /// Executes a rank-local tensor-parallel forward pass.
-    pub fn forward_tensor_parallel(
-        &mut self,
-        tokens: &Array,
-        cache: &mut MlxHybridState,
-        group: &crate::backend::runtime::distributed::Group,
-        stream: &Stream,
-    ) -> Result<Array, Error> {
-        let input = eredu_architectures::nemotron_h::EmbeddedInput::target(
-            crate::composition::tensor_ref(tokens),
-            None,
-        );
-        match &mut self.execution {
-            NemotronHExecution::TensorParallelResident(runtime) => {
-                runtime.forward_parallel(input, cache, group, stream)
-            }
-            NemotronHExecution::TensorParallelLayerwise(runtime) => {
-                runtime.forward_parallel(input, cache, group, stream)
-            }
-            _ => {
-                return Err(Error::Parallel(
-                    "Nemotron-H was not loaded for tensor parallelism".into(),
-                ))
-            }
-        }
-        .map(crate::MlxTensor::into_array)
-        .map_err(|error| Error::Parallel(error.to_string()))
-    }
-
-    pub fn forward_tensor_parallel_with_observer(
-        &mut self,
-        tokens: &Array,
-        cache: &mut MlxHybridState,
-        group: &crate::backend::runtime::distributed::Group,
-        stream: &Stream,
-        observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
-    ) -> Result<Array, Error> {
-        let input = eredu_architectures::nemotron_h::EmbeddedInput::target(
-            crate::composition::tensor_ref(tokens),
-            None,
-        );
-        let mut neutral = crate::composition::NeutralActivationObserver::new(observer);
-        let output =
-            match &mut self.execution {
-                NemotronHExecution::TensorParallelResident(runtime) => runtime
-                    .forward_parallel_with_observer(input, cache, group, stream, &mut neutral),
-                NemotronHExecution::TensorParallelLayerwise(runtime) => runtime
-                    .forward_parallel_with_observer(input, cache, group, stream, &mut neutral),
-                _ => {
-                    return Err(Error::Parallel(
-                        "Nemotron-H was not loaded for tensor parallelism".into(),
-                    ))
-                }
-            }
-            .map_err(|error| Error::Parallel(error.to_string()))?;
-        eredu_runtime::observe_model_logits(&mut neutral, &output)
             .map(crate::MlxTensor::into_array)
             .map_err(Into::into)
     }
@@ -1539,138 +996,6 @@ impl crate::composition::mlx::speculative::embedded::EmbeddedMtpTarget for Nemot
     }
 }
 
-impl crate::composition::mlx::speculative::embedded::EmbeddedMtpTarget
-    for NemotronHTensorMtpTarget<'_>
-{
-    type Cache = MlxHybridState;
-    type DraftCache = MlxHybridState;
-
-    fn prefill_target(
-        &mut self,
-        input: input::ModelInput<'_>,
-        cache: &mut Self::Cache,
-        stream: &Stream,
-    ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Exception> {
-        let tokens = input::text_token_ids(input, stream)?;
-        cache.clear()?;
-        self.model.forward_mtp_parallel(
-            eredu_architectures::nemotron_h::EmbeddedInput::target(&tokens, None),
-            cache,
-            self.group,
-            stream,
-        )
-    }
-
-    fn verify_target(
-        &mut self,
-        tokens: &crate::MlxTensor,
-        cache: &mut Self::Cache,
-        stream: &Stream,
-    ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Exception> {
-        self.model.forward_mtp_parallel(
-            eredu_architectures::nemotron_h::EmbeddedInput::target(tokens.as_array(), None),
-            cache,
-            self.group,
-            stream,
-        )
-    }
-
-    fn prefill_draft_cache(
-        &mut self,
-        output: &crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput,
-        tokens: &crate::MlxTensor,
-        cache: &mut Self::Cache,
-        stream: &Stream,
-    ) -> Result<(), Exception> {
-        let sequence = tokens.as_array().dim(1);
-        if sequence <= 1 {
-            return Ok(());
-        }
-        let hidden = output
-            .hidden
-            .as_array()
-            .try_index_device((.., ..sequence - 1, ..), stream)?;
-        let next = tokens.as_array().try_index_device((.., 1..), stream)?;
-        for depth in 0..self.model.mtp_len() {
-            let _ = self.model.forward_mtp_parallel(
-                eredu_architectures::nemotron_h::EmbeddedInput::draft(&next, &hidden, depth),
-                cache,
-                self.group,
-                stream,
-            )?;
-        }
-        Ok(())
-    }
-
-    fn draft_cache(&self, cache: &Self::Cache) -> Self::DraftCache {
-        cache
-            .deep_clone_state()
-            .expect("evaluated Nemotron-H tensor draft state must be forkable")
-    }
-
-    fn commit_draft_cache(&self, cache: &mut Self::Cache, draft: &Self::DraftCache) {
-        cache
-            .commit_segment_from(draft, PREDICTION_STATE_SEGMENT)
-            .expect("validated Nemotron-H tensor prediction state segment");
-    }
-
-    fn restore_target_checkpoint(
-        cache: &mut Self::Cache,
-        checkpoint: &Self::Cache,
-        stream: &Stream,
-    ) -> Result<(), Exception> {
-        cache.restore_checkpoint(checkpoint, stream)
-    }
-
-    fn draft_logits(
-        &mut self,
-        hidden: &crate::MlxTensor,
-        last_token: u32,
-        draft_index: usize,
-        cache: &mut Self::DraftCache,
-        stream: &Stream,
-    ) -> Result<(crate::MlxTensor, crate::MlxTensor), Exception> {
-        let token = Array::from_slice(&[last_token], &[1, 1]);
-        let output = self.model.forward_mtp_parallel(
-            eredu_architectures::nemotron_h::EmbeddedInput::draft(
-                &token,
-                hidden.as_array(),
-                draft_index,
-            ),
-            cache,
-            self.group,
-            stream,
-        )?;
-        Ok((output.logits, output.hidden))
-    }
-
-    fn advance_draft_cache(
-        &mut self,
-        hidden: &crate::MlxTensor,
-        tokens: &crate::MlxTensor,
-        cache: &mut Self::DraftCache,
-        stream: &Stream,
-    ) -> Result<(), Exception> {
-        for depth in 0..self.model.mtp_len() {
-            let _ = self.model.forward_mtp_parallel(
-                eredu_architectures::nemotron_h::EmbeddedInput::draft(
-                    tokens.as_array(),
-                    hidden.as_array(),
-                    depth,
-                ),
-                cache,
-                self.group,
-                stream,
-            )?;
-        }
-        Ok(())
-    }
-
-    fn max_draft_tokens(&self) -> usize {
-        self.model.mtp_len()
-    }
-}
-
 /// Loads SafeTensors Nemotron-H through one neutral model object.
 pub fn load_nemotron_h_model(
     artifact: &crate::composition::mlx::artifact::PreparedSafetensorsArtifact,
@@ -1746,26 +1071,6 @@ fn attach_parameter_bank(
 }
 
 /// Loads SafeTensors Nemotron-H through generalized tensor-parallel placement.
-pub fn load_nemotron_h_tensor_parallel_model(
-    artifact: &crate::composition::mlx::artifact::PreparedSafetensorsArtifact,
-    options: impl Into<LayerWeightResidency>,
-    build: crate::composition::mlx::distributed::topology::ParallelBuildContext,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<NemotronHModel, Error> {
-    let options = options.into();
-    let eredu_architectures::configuration::SafetensorsModelConfig::NemotronH(args) =
-        artifact.model()
-    else {
-        return Err(Error::ArchitectureModel(
-            "Nemotron-H loader received a different prepared architecture".into(),
-        ));
-    };
-    let args = args.clone();
-    let store = artifact.store();
-    load_neutral_parallel(store, args, options, build, stream, weights_stream, false)
-}
-
 pub(crate) struct PreparedGguf {
     pub args: ModelArgs,
 }
@@ -1832,33 +1137,5 @@ pub(crate) fn load_nemotron_h_gguf_model(
     if let Some(expert_options) = expert_options {
         attach_parameter_bank(&mut model, expert_options, stream, weights_stream)?;
     }
-    Ok(model)
-}
-
-/// Loads GGUF Nemotron-H with tensor-parallel placement.
-pub(crate) fn load_nemotron_h_gguf_tensor_parallel_model(
-    source: &crate::composition::mlx::structural::AdmittedGguf,
-    options: LayerWeightResidency,
-    build: crate::composition::mlx::distributed::topology::ParallelBuildContext,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<NemotronHModel, Error> {
-    let checkpoint = source.checkpoint();
-    let prepared = prepare_gguf(source)?;
-    let store: Arc<dyn CheckpointSource> = Arc::new(open_gguf_checkpoint_source(
-        checkpoint.clone(),
-        source.plan().checkpoint(),
-        source.plan().tensor_mapping(),
-        options.max_cached_shards(),
-    )?);
-    let model = load_neutral_parallel(
-        store,
-        prepared.args,
-        options,
-        build,
-        stream,
-        weights_stream,
-        false,
-    )?;
     Ok(model)
 }

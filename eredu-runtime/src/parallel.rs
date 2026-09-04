@@ -101,8 +101,10 @@ pub enum ParameterRole {
     AttentionHeads,
     /// Dense feed-forward intermediate channels shared by input and output projections.
     FeedForwardIntermediate,
-    /// Routed or shared expert intermediate channels.
+    /// Routed expert intermediate channels partitioned over the expert axis.
     ExpertIntermediate,
+    /// Always-on expert intermediate channels replicated over the expert axis.
+    SharedExpertIntermediate,
     /// State-space, convolution, or recurrent channels.
     Channels,
     /// A fused tensor containing independently partitioned segments.
@@ -193,6 +195,12 @@ impl ParameterMemberSpec {
 
     fn with_sharding(mut self, sharding: MemberSharding) -> Self {
         self.sharding = sharding;
+        self
+    }
+
+    fn with_linear_companion(mut self, role: eredu_nn::LinearCompanionRole, primary: &str) -> Self {
+        self.linear_companion = Some(role);
+        self.linear_companion_of = Some(primary.to_owned());
         self
     }
 
@@ -787,7 +795,8 @@ fn expand_linear_format_member(
                 .and_then(|value| remap_linear_segments(&value, column_axis, columns, name))?;
             Ok(vec![
                 source.clone(),
-                ParameterMemberSpec::new(scale.id.as_str(), scale_shape, scale_sharding),
+                ParameterMemberSpec::new(scale.id.as_str(), scale_shape, scale_sharding)
+                    .with_linear_companion(eredu_nn::LinearCompanionRole::Scale, name),
             ])
         }
         LinearFormat::GgufIQuant { ggml_type, .. } => {
@@ -854,17 +863,19 @@ fn expand_linear_format_member(
             )];
             let companion_sharding =
                 remap_linear_segments(source.sharding(), column_axis, group, name)?;
-            members.push(ParameterMemberSpec::new(
-                scale.id.as_str(),
-                companion.clone(),
-                companion_sharding.clone(),
-            ));
+            members.push(
+                ParameterMemberSpec::new(
+                    scale.id.as_str(),
+                    companion.clone(),
+                    companion_sharding.clone(),
+                )
+                .with_linear_companion(eredu_nn::LinearCompanionRole::Scale, name),
+            );
             if let Some(bias) = bias {
-                members.push(ParameterMemberSpec::new(
-                    bias.id.as_str(),
-                    companion,
-                    companion_sharding,
-                ));
+                members.push(
+                    ParameterMemberSpec::new(bias.id.as_str(), companion, companion_sharding)
+                        .with_linear_companion(eredu_nn::LinearCompanionRole::AffineBias, name),
+                );
             }
             Ok(members)
         }
@@ -939,6 +950,7 @@ pub struct LocalTensorLayout<P = TensorPlacement> {
     global_shape: Vec<usize>,
     local_shape: Vec<usize>,
     placement: P,
+    additional_placements: Vec<TensorPlacement>,
     logical_units: Option<usize>,
     logical_range: Option<Range<usize>>,
     fell_back_to_replication: bool,
@@ -963,6 +975,7 @@ impl<P> LocalTensorLayout<P> {
             global_shape,
             local_shape,
             placement,
+            additional_placements: Vec::new(),
             logical_units,
             logical_range,
             fell_back_to_replication,
@@ -994,6 +1007,23 @@ impl<P> LocalTensorLayout<P> {
         &self.placement
     }
 
+    /// Returns independent checkpoint-global selections applied before the
+    /// primary placement.
+    ///
+    /// This is used when distinct parallel axes own distinct tensor axes, such
+    /// as EP selection of packed experts followed by TP selection of each
+    /// expert matrix. Empty means the primary placement is complete.
+    pub fn additional_placements(&self) -> &[TensorPlacement] {
+        &self.additional_placements
+    }
+
+    /// Adds one exact checkpoint-global selection preceding the primary
+    /// placement.
+    pub fn with_additional_placement(mut self, placement: TensorPlacement) -> Self {
+        self.additional_placements.push(placement);
+        self
+    }
+
     /// Returns the rank-local range in the parameter group's semantic domain.
     pub fn logical_range(&self) -> Option<&Range<usize>> {
         self.logical_range.as_ref()
@@ -1011,7 +1041,7 @@ impl<P> LocalTensorLayout<P> {
 }
 
 /// Complete rank-local model geometry produced alongside checkpoint placement.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct LocalModelLayout<P = TensorPlacement> {
     tensors: BTreeMap<String, LocalTensorLayout<P>>,
 }

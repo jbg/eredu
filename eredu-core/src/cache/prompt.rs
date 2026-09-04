@@ -84,6 +84,8 @@ pub struct PromptCacheDescriptor {
     sink_tokens: usize,
     /// Distributed rank-local layout.
     topology: PromptCacheTopology,
+    /// Last distributed commit observation associated with the persisted state.
+    distributed_commit: Option<crate::DistributedCommitOutcome>,
 }
 
 impl PromptCacheDescriptor {
@@ -120,6 +122,7 @@ impl PromptCacheDescriptor {
             state_segments,
             sink_tokens,
             topology,
+            distributed_commit: None,
         };
         for value in [
             &descriptor.model_family,
@@ -194,6 +197,18 @@ impl PromptCacheDescriptor {
     pub const fn topology(&self) -> &PromptCacheTopology {
         &self.topology
     }
+    /// Last distributed commit observation attached by the owning session.
+    pub const fn distributed_commit(&self) -> Option<crate::DistributedCommitOutcome> {
+        self.distributed_commit
+    }
+    /// Attaches the owning session's exact distributed commit observation.
+    pub const fn with_distributed_commit(
+        mut self,
+        outcome: Option<crate::DistributedCommitOutcome>,
+    ) -> Self {
+        self.distributed_commit = outcome;
+        self
+    }
     /// Replaces the distributed topology and revalidates the descriptor.
     pub fn with_topology(
         mut self,
@@ -249,6 +264,7 @@ impl PromptCacheDescriptor {
             state_segments: model.state_segments,
             sink_tokens: model.sink_tokens,
             topology: model.topology,
+            distributed_commit: None,
         };
         descriptor.validate()?;
         Ok(descriptor)
@@ -778,6 +794,9 @@ pub struct PromptCacheManifest {
     pub sink_tokens: usize,
     /// Distributed rank-local representation.
     pub topology: PromptCacheTopology,
+    /// Durable rank-local observation of the distributed commit epoch.
+    #[serde(default)]
+    pub distributed_commit: Option<crate::DistributedCommitOutcome>,
     /// Optional non-authoritative application grouping label.
     pub application_namespace: Option<String>,
     /// Ordered immutable cache blocks.
@@ -1324,6 +1343,7 @@ mod tests {
             state_segments: vec![PromptCacheStateSegment::new("state", 0..1).unwrap()],
             sink_tokens: 0,
             topology: PromptCacheTopology::default(),
+            distributed_commit: None,
             application_namespace: None,
             blocks: vec![PromptCacheBlock {
                 global_layer: 0,
@@ -1459,6 +1479,7 @@ mod tests {
             state_segments: manifest.state_segments.clone(),
             sink_tokens: 0,
             topology: PromptCacheTopology::default(),
+            distributed_commit: None,
         };
         manifest
             .validate_compatibility(&descriptor, &[7, 8])

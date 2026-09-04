@@ -9,6 +9,7 @@ pub mod mlp;
 pub mod model;
 pub mod mtp;
 pub mod parallel;
+mod partitioned;
 
 pub use attention::{new_attention, new_attention_at};
 pub use block::{Block, Operator};
@@ -31,8 +32,11 @@ pub use model::{
 pub use mtp::{EmbeddedInput, ForwardMode, PredictionUnit, RetainedValues};
 pub use parallel::{
     layer_parallel_parameter_groups, local_block_geometry, local_geometry, local_state_geometry,
+    partition_local_geometry, partition_local_routed_geometry, partitioned_state_layout,
     static_parallel_parameter_groups, unit_parallel_parameter_groups, LocalGeometry,
+    PartitionExpertBankOwnership, PartitionLocalGeometry,
 };
+pub use partitioned::{PartitionedForwardContext, PartitionedLayeredModel};
 
 /// Derives the complete replicated target expert plan from normalized geometry.
 pub fn replicated_expert_realization_plan(
@@ -169,8 +173,20 @@ pub fn expert_realization_plan<
         .map_err(eredu_nn::Error::backend)
 }
 
-/// Resolves an identity-layer callback to its architecture-owned local bank spec.
-pub fn realized_expert_bank_spec<'a>(
+/// Opaque identity-indexed expert provider descriptor selected by Nemotron-H.
+#[derive(Clone)]
+pub struct ExpertProviderDescriptor {
+    specs: std::collections::BTreeMap<usize, eredu_nn::GroupedRelu2Spec>,
+}
+
+impl ExpertProviderDescriptor {
+    /// Returns the selected local grouped specification for one routed identity.
+    pub fn grouped_spec(&self, identity_layer: usize) -> Option<&eredu_nn::GroupedRelu2Spec> {
+        self.specs.get(&identity_layer)
+    }
+}
+
+fn realized_expert_bank_spec<'a>(
     plan: &'a crate::ExpertRealizationPlan<eredu_nn::GroupedRelu2Spec>,
     args: &ModelArgs,
     identity_layer: usize,
@@ -187,6 +203,30 @@ pub fn realized_expert_bank_spec<'a>(
         .checked_div(prediction_steps)
         .filter(|value| *value > 0)?;
     plan.unit_spec(&format!("mtp.{}", physical / pattern), physical % pattern)
+}
+
+/// Projects the architecture realization into an opaque provider descriptor.
+pub(crate) fn expert_provider_descriptor(
+    plan: &crate::ExpertRealizationPlan<eredu_nn::GroupedRelu2Spec>,
+    args: &ModelArgs,
+) -> Result<ExpertProviderDescriptor, eredu_nn::Error> {
+    let target = usize::try_from(args.num_hidden_layers).map_err(eredu_nn::Error::backend)?;
+    let total = target
+        .checked_add(args.mtp_policies().map_err(eredu_nn::Error::backend)?.len())
+        .ok_or_else(|| eredu_nn::Error::backend("Nemotron-H expert identity count overflowed"))?;
+    let specs = (0..total)
+        .filter_map(|identity| {
+            realized_expert_bank_spec(plan, args, identity)
+                .cloned()
+                .map(|spec| (identity, spec))
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    if specs.len() != plan.unit_specs().len() {
+        return Err(eredu_nn::Error::backend(
+            "Nemotron-H expert provider descriptor omitted a realized unit",
+        ));
+    }
+    Ok(ExpertProviderDescriptor { specs })
 }
 
 /// Declares cache identity independently of its backend realization.

@@ -2,26 +2,32 @@
 
 use std::{
     cell::{Cell, RefCell},
-    collections::BTreeMap,
-    sync::{Arc, Condvar, Mutex},
+    collections::{BTreeMap, BTreeSet},
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, Condvar, Mutex,
+    },
 };
 
 use eredu_architectures::{
-    decoder, deepseek, execute_routed_gated_product, gemma4, gpt_oss, inkling, kimi_linear, lfm2,
-    llama, moshi, muse_glimmer, nemotron_h, qwen,
+    agree_expert_route_counts, decoder, deepseek, exchange_expert_rows,
+    execute_routed_gated_product, gemma4, gpt_oss, inkling, kimi_linear, lfm2, llama, moshi,
+    muse_glimmer, nemotron_h, qwen,
     replicated_text::{
         dispatch_replicated_text_architecture, CompositeTextArchitectureVisitor,
         PreparedCompositeTextArchitecture, PreparedReplicatedTextArchitecture,
         ReplicatedTextArchitectureVisitor, ReplicatedTextProfileDispatcher,
     },
     ExpertParameterRecipe, ExpertParameterRole, ExpertRealizationPlan, ExpertResidencyCatalog,
-    ExpertResidencyDistribution, ExpertResidencyUnit, GatedRoutedTextArchitectureVisitor,
-    PlannedAddressableGatedProduct, PlannedAddressableRelu2, PreparedRoutedTextArchitecture,
+    ExpertResidencyDistribution, ExpertResidencyUnit, ExpertRouteCountPlan,
+    ExpertRouteExchangeDirection, ExpertRoutePackingPlan, GatedRoutedTextArchitectureVisitor,
+    PlannedAddressableGatedProduct, PlannedAddressableRelu2, PlannedResidentGatedProduct,
+    PreparedRoutedTextArchitecture, RoutedTextExecutionError,
 };
 use eredu_core::cache::{LayerCachePolicy, PromptCacheTopology, StateTensorRole};
 use eredu_core::{
-    CollectiveGroupId, Completion, LayerSchedule, ModelConfigurationResolver, ParallelRankTopology,
-    ParallelTopology, TokenFilter,
+    CollectiveGroupId, Completion, CompletionCancellationMode, DistributedCommitOutcome,
+    LayerSchedule, ModelConfigurationResolver, ParallelRankTopology, ParallelTopology, TokenFilter,
 };
 use eredu_nn::{
     reference_gated_delta_scan, reference_selective_state_space_scan, validate_parameter_topology,
@@ -47,19 +53,29 @@ use eredu_nn::{
     TopKGroupSelectorSpec, VocabularyParallelRange,
 };
 use eredu_runtime::{
-    construct_replicated_text_session, AddressableGatedProductBank, AddressableGroupedBank,
-    ArchitectureParameters, CollectiveBackend, CompositeLayeredTraversalHook, DeviceState,
-    ExecutionGroupId, ExecutionUnitAddress, ExpertPass, IndexedMovement, LayerRuntimeState,
-    LayerWeightResidency, LayeredArchitecture, LayeredTraversalHook, LayerwiseAcquireError,
-    LayerwisePolicy, LayerwiseRuntime, LocalModelLayout, LocalTensorLayout, MemberSharding,
+    construct_replicated_text_session, AddressableExpertRouteProvider,
+    AddressableExpertRouteRequest, AddressableGatedProductBank, AddressableGroupedBank,
+    ArchitectureParameters, ArchitecturePartition, ArchitectureStatePartitionPlan,
+    ArchitectureStatePartitionRule, CollectiveBackend, CommunicationBackend,
+    CommunicationCompletionPolicy, CommunicationGroupDescriptor, CommunicationGroupRequirements,
+    CommunicationManifest, CommunicationOperation, CommunicationOperationRequirement,
+    CommunicationTensorLimits, CommunicationTensorMetadata, CompositeLayeredTraversalHook,
+    DeviceState, EvenGatherBackend, ExecutionGroupId, ExecutionUnitAddress, ExpertPass,
+    ExpertRouteExchange, ExpertRouteTensorMovement, IndexedMovement, LayerRuntimeState,
+    LayerWeightResidency, LayeredArchitecture, LayeredPartitionDriver, LayeredPartitionInput,
+    LayeredPartitionOutput, LayeredTraversalHook, LayerwiseAcquireError, LayerwisePolicy,
+    LayerwiseRuntime, LocalModelLayout, LocalTensorLayout, MemberSharding, NoAuxiliaryBoundary,
+    NoAuxiliaryBoundarySchema, ParallelLayeredArchitecture, ParallelRoutedLayeredArchitecture,
     ParameterBankAcquisition, ParameterBankKey, ParameterBankLoadOptions, ParameterGroupSpec,
-    ParameterRole, PenaltyConfig, PredictionDirective, ReplicatedTextMaterializationTask,
+    ParameterRole, PartitionCommunication, PartitionOwnership, PenaltyConfig, PredictionDirective,
+    RealizedCommunicationGroup, RealizedCommunicationRoute, ReplicatedTextMaterializationTask,
     ReplicatedTextSessionMechanisms, ResettableRuntimeLayerState, ResidentRuntime,
     ResidentUnitWindow, RoutedExpertProvider, RoutedExpertRequest,
-    RoutedExpertTensorParallelOutput, RuntimeLayerState, RuntimeState, RuntimeStateComponents,
-    Sampler, SamplingBackend, SequentialDecisionDriver, SequentialDecisionPlan,
-    SequentialDecisionSource, SequentialDecisionTraversal, StateError, SubmissionBackend,
-    TensorParallelRoutedExpertProvider, TensorPlacement, TokenDomain,
+    RoutedExpertTensorParallelOutput, RoutedLayeredArchitecture, RuntimeLayerState, RuntimeState,
+    RuntimeStateComponents, Sampler, SamplingBackend, SequentialDecisionDriver,
+    SequentialDecisionPlan, SequentialDecisionSource, SequentialDecisionTraversal, StateError,
+    SubmissionBackend, TensorParallelRoutedExpertProvider, TensorPlacement, TokenDomain,
+    VariableAllToAllBackend,
 };
 
 fn dense_linear_format() -> eredu_nn::LinearFormatSpec {
@@ -70,13 +86,23 @@ fn dense_linear_format() -> eredu_nn::LinearFormatSpec {
 struct NumericTensor {
     shape: Vec<i32>,
     data: Vec<f32>,
+    dtype: eredu_core::checkpoint::TensorDtype,
 }
 
 impl NumericTensor {
     fn new(shape: impl Into<Vec<i32>>, data: Vec<f32>) -> Self {
         let shape = shape.into();
         assert_eq!(elements(&shape), data.len());
-        Self { shape, data }
+        Self {
+            shape,
+            data,
+            dtype: eredu_core::checkpoint::TensorDtype::F32,
+        }
+    }
+
+    fn with_dtype(mut self, dtype: eredu_core::checkpoint::TensorDtype) -> Self {
+        self.dtype = dtype;
+        self
     }
 
     fn zeros(shape: impl Into<Vec<i32>>) -> Self {
@@ -84,6 +110,7 @@ impl NumericTensor {
         Self {
             data: vec![0.0; elements(&shape)],
             shape,
+            dtype: eredu_core::checkpoint::TensorDtype::F32,
         }
     }
 
@@ -92,6 +119,7 @@ impl NumericTensor {
             vec![1, i32::try_from(ids.len()).unwrap()],
             ids.iter().map(|id| *id as f32).collect(),
         )
+        .with_dtype(eredu_core::checkpoint::TensorDtype::U32)
     }
 
     fn axis_slice(&self, axis: usize, start: usize, end: usize) -> Self {
@@ -99,6 +127,7 @@ impl NumericTensor {
         let mut shape = self.shape.clone();
         shape[axis] = (end - start) as i32;
         let mut output = Self::zeros(shape);
+        output.dtype = self.dtype.clone();
         for output_index in 0..output.data.len() {
             let mut coordinate = unravel(output_index, &output.shape);
             coordinate[axis] += start;
@@ -398,7 +427,9 @@ impl PoolingAttentionCache<NumericTensor> for NumericPoolingCache {
             for key in 0..keys {
                 let query_position = offset + query;
                 let key_position = key_offset + key;
-                if key_position > query_position || key_position <= query_position - self.window {
+                let outside_window = self.window != i32::MAX
+                    && key_position <= query_position.saturating_sub(self.window);
+                if key_position > query_position || outside_window {
                     mask.data[(query * keys + key) as usize] = -1.0e9;
                 }
             }
@@ -606,7 +637,7 @@ impl Tensor for NumericTensor {
     }
 
     fn unloaded_i32(shape: &[i32], _: &NumericContext) -> Result<Self, Error> {
-        Ok(Self::zeros(shape.to_vec()))
+        Ok(Self::zeros(shape.to_vec()).with_dtype(eredu_core::checkpoint::TensorDtype::I32))
     }
 
     fn from_f32_slice(values: &[f32], shape: &[i32], _: &NumericContext) -> Result<Self, Error> {
@@ -617,7 +648,21 @@ impl Tensor for NumericTensor {
         Ok(Self::new(
             shape.to_vec(),
             values.iter().map(|value| *value as f32).collect(),
-        ))
+        )
+        .with_dtype(eredu_core::checkpoint::TensorDtype::I32))
+    }
+
+    fn to_i32_vec(&self, _: &NumericContext) -> Result<Vec<i32>, Error> {
+        self.data
+            .iter()
+            .map(|value| {
+                if !value.is_finite() || value.fract() != 0.0 {
+                    return Err(Error::backend("numeric tensor is not integral"));
+                }
+                i32::try_from(*value as i64)
+                    .map_err(|_| Error::backend("numeric integer is outside i32"))
+            })
+            .collect()
     }
 
     fn full_f32(value: f32, shape: &[i32], _: &NumericContext) -> Result<Self, Error> {
@@ -625,10 +670,10 @@ impl Tensor for NumericTensor {
     }
 
     fn full_i32(value: i32, shape: &[i32], _: &NumericContext) -> Result<Self, Error> {
-        Ok(Self::new(
-            shape.to_vec(),
-            vec![value as f32; elements(shape)],
-        ))
+        Ok(
+            Self::new(shape.to_vec(), vec![value as f32; elements(shape)])
+                .with_dtype(eredu_core::checkpoint::TensorDtype::I32),
+        )
     }
 
     fn add(&self, rhs: &Self, _: &NumericContext) -> Result<Self, Error> {
@@ -661,6 +706,60 @@ impl Tensor for NumericTensor {
 
     fn maximum_scalar(&self, rhs: f32, _: &NumericContext) -> Result<Self, Error> {
         Ok(self.map(|value| value.max(rhs)))
+    }
+
+    fn zeros_like(&self, _: &NumericContext) -> Result<Self, Error> {
+        Ok(Self::zeros(self.shape.clone()).with_dtype(self.dtype.clone()))
+    }
+
+    fn equal_i32(&self, value: i32, _: &NumericContext) -> Result<Self, Error> {
+        Ok(Self::new(
+            self.shape.clone(),
+            self.data
+                .iter()
+                .map(|element| f32::from(*element == value as f32))
+                .collect(),
+        )
+        .with_dtype(eredu_core::checkpoint::TensorDtype::Bool))
+    }
+
+    fn logical_or(&self, rhs: &Self, _: &NumericContext) -> Result<Self, Error> {
+        Ok(self
+            .zip(rhs, |left, right| f32::from(left != 0.0 || right != 0.0))?
+            .with_dtype(eredu_core::checkpoint::TensorDtype::Bool))
+    }
+
+    fn masked_scatter(
+        &self,
+        mask: &Self,
+        source: &Self,
+        _: &NumericContext,
+    ) -> Result<Self, Error> {
+        if mask.shape.len() >= self.shape.len() || self.shape[..mask.shape.len()] != mask.shape {
+            return Err(Error::backend(
+                "numeric masked scatter mask geometry mismatch",
+            ));
+        }
+        let row_width = elements(&self.shape[mask.shape.len()..]);
+        let selected = mask.data.iter().filter(|value| **value != 0.0).count();
+        if source.data.len() != selected * row_width {
+            return Err(Error::backend(
+                "numeric masked scatter source geometry mismatch",
+            ));
+        }
+        let mut output = self.clone();
+        let mut source_row = 0;
+        for (row, selected) in mask.data.iter().enumerate() {
+            if *selected == 0.0 {
+                continue;
+            }
+            let destination = row * row_width;
+            let source_offset = source_row * row_width;
+            output.data[destination..destination + row_width]
+                .copy_from_slice(&source.data[source_offset..source_offset + row_width]);
+            source_row += 1;
+        }
+        Ok(output)
     }
 
     fn clip(&self, minimum: &Self, maximum: &Self, _: &NumericContext) -> Result<Self, Error> {
@@ -933,19 +1032,34 @@ impl Tensor for NumericTensor {
         let selected = axis(selected, first.shape.len(), false)?;
         let mut shape = first.shape.clone();
         shape[selected] = 0;
+        let integer_mix = values.iter().all(|value| {
+            matches!(
+                value.dtype,
+                eredu_core::checkpoint::TensorDtype::I32 | eredu_core::checkpoint::TensorDtype::U32
+            )
+        });
         for value in values {
-            if value.shape.len() != shape.len()
+            if (!integer_mix && value.dtype != first.dtype)
+                || value.shape.len() != shape.len()
                 || value
                     .shape
                     .iter()
                     .enumerate()
                     .any(|(current, dimension)| current != selected && *dimension != shape[current])
             {
-                return Err(Error::backend("numeric concatenate shape mismatch"));
+                return Err(Error::backend(format!(
+                    "numeric concatenate shape mismatch on axis {selected}: first {:?} {:?}, current {:?} {:?}",
+                    first.dtype, first.shape, value.dtype, value.shape
+                )));
             }
             shape[selected] += value.shape[selected];
         }
         let mut output = Self::zeros(shape);
+        output.dtype = if integer_mix {
+            eredu_core::checkpoint::TensorDtype::I32
+        } else {
+            first.dtype.clone()
+        };
         let mut axis_base = 0;
         for value in values {
             for input_index in 0..value.data.len() {
@@ -1428,7 +1542,11 @@ fn local_parameter(
             spec.id.as_str()
         )));
     }
-    let selected = select_parameter(&parameter(spec, global_shape, norm), layout.placement())?;
+    let mut selected = parameter(spec, global_shape, norm);
+    for placement in layout.additional_placements() {
+        selected = select_parameter(&selected, placement)?;
+    }
+    let selected = select_parameter(&selected, layout.placement())?;
     if selected.shape != expected_local {
         return Err(Error::backend(format!(
             "numeric local parameter {} selected shape {:?}, planned {expected_local:?}",
@@ -2279,6 +2397,7 @@ struct NumericContext {
     sliding_attention_calls: Cell<usize>,
     local_layout: Option<Arc<LocalModelLayout>>,
     mechanisms: Arc<Mutex<Vec<NumericMechanismTrace>>>,
+    partition: Option<NumericPartitionContext>,
 }
 
 impl NumericContext {
@@ -2287,6 +2406,20 @@ impl NumericContext {
             sliding_attention_calls: Cell::new(0),
             local_layout: Some(Arc::new(layout)),
             mechanisms: Arc::default(),
+            partition: None,
+        }
+    }
+
+    fn with_partition(
+        layout: LocalModelLayout,
+        rank: usize,
+        world: Arc<NumericPartitionWorld>,
+    ) -> Self {
+        Self {
+            sliding_attention_calls: Cell::new(0),
+            local_layout: Some(Arc::new(layout)),
+            mechanisms: Arc::default(),
+            partition: Some(NumericPartitionContext::new(rank, world)),
         }
     }
 
@@ -2315,6 +2448,15 @@ impl NumericContext {
 enum NumericMechanismTrace {
     BankLookup(String),
     AllToAll(u64),
+    VariableAllToAll {
+        group: u64,
+        send: Vec<usize>,
+        receive: Vec<usize>,
+    },
+    AllGatherEven {
+        group: u64,
+        axis: usize,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -2358,17 +2500,39 @@ impl NumericParallelGroup {
 
 struct NumericParallelContext {
     rank: usize,
+    global_rank: usize,
     group: Arc<NumericParallelGroup>,
+    world: Option<Arc<NumericPartitionWorld>>,
     next_sequence: Cell<usize>,
     trace: RefCell<Vec<NumericCollectiveTrace>>,
 }
 
 impl NumericParallelContext {
     fn new(rank: usize, group: Arc<NumericParallelGroup>) -> Self {
+        Self::new_inner(rank, rank, group, None)
+    }
+
+    fn new_partitioned(
+        rank: usize,
+        global_rank: usize,
+        group: Arc<NumericParallelGroup>,
+        world: Arc<NumericPartitionWorld>,
+    ) -> Self {
+        Self::new_inner(rank, global_rank, group, Some(world))
+    }
+
+    fn new_inner(
+        rank: usize,
+        global_rank: usize,
+        group: Arc<NumericParallelGroup>,
+        world: Option<Arc<NumericPartitionWorld>>,
+    ) -> Self {
         assert!(rank < group.size);
         Self {
             rank,
+            global_rank,
             group,
+            world,
             next_sequence: Cell::new(0),
             trace: RefCell::new(Vec::new()),
         }
@@ -2379,6 +2543,16 @@ impl NumericParallelContext {
         kind: NumericCollectiveKind,
         value: NumericTensor,
     ) -> Result<NumericTensor, Error> {
+        if let Some(world) = &self.world {
+            world
+                .tensor_collective_calls
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if self.world.as_ref().is_some_and(|world| {
+            world.take_fault(self.global_rank, NumericPartitionFault::Collective)
+        }) {
+            return Err(Error::backend("injected numeric tensor collective failure"));
+        }
         let sequence = self.next_sequence.get();
         self.next_sequence.set(sequence + 1);
         let input_shape = value.shape.clone();
@@ -2479,14 +2653,892 @@ impl NumericParallelContext {
     }
 }
 
+#[derive(Debug, Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+enum NumericOpaqueOperation {
+    AllGatherEven,
+    AllGatherUneven,
+    AllReduceSum,
+    Broadcast,
+    FailureAgreement,
+    PointToPoint,
+    VariableAllToAll,
+}
+
+#[derive(Debug, Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+enum NumericPartitionFault {
+    LocalExecution,
+    Transfer,
+    Collective,
+    PeerSubmission,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct NumericOpaqueTrace {
+    rank: usize,
+    operation: NumericOpaqueOperation,
+    id: u64,
+    sequence: usize,
+}
+
+#[derive(Default)]
+struct NumericOpaqueSlot {
+    members: Vec<usize>,
+    tensors: BTreeMap<usize, Vec<NumericTensor>>,
+    booleans: BTreeMap<usize, bool>,
+    output: Option<Vec<NumericTensor>>,
+    peer_outputs: BTreeMap<usize, Vec<NumericTensor>>,
+    agreement: Option<bool>,
+    readers: usize,
+}
+
+#[derive(Default)]
+struct NumericPartitionWorldState {
+    groups: BTreeMap<u64, Vec<usize>>,
+    routes: BTreeMap<u64, (usize, usize)>,
+    parallel_groups: BTreeMap<u64, Arc<NumericParallelGroup>>,
+    slots: BTreeMap<(NumericOpaqueOperation, u64, usize), NumericOpaqueSlot>,
+    trace: Vec<NumericOpaqueTrace>,
+    materializations: BTreeMap<usize, usize>,
+    fail_completion_ranks: BTreeSet<usize>,
+    fault_ranks: BTreeSet<(usize, NumericPartitionFault)>,
+    deadline_ranks: BTreeSet<(usize, NumericOpaqueOperation)>,
+    completion_delay: std::time::Duration,
+    completion_timeout: Option<std::time::Duration>,
+    submission_calls: BTreeMap<NumericOpaqueOperation, usize>,
+    completion_waits: BTreeMap<NumericOpaqueOperation, usize>,
+    completion_successes: BTreeMap<NumericOpaqueOperation, usize>,
+    commits: BTreeMap<usize, usize>,
+    prompt_cache_identities: BTreeMap<usize, eredu_core::cache::PromptCacheModelIdentity>,
+    cache_load_attempts: BTreeMap<usize, usize>,
+    prompt_caches: BTreeMap<
+        (std::path::PathBuf, usize),
+        (
+            DeviceState<NumericBackend, NumericHybridLayerState>,
+            eredu_core::cache::PromptCacheManifest,
+        ),
+    >,
+}
+
+#[derive(Default)]
+struct NumericPartitionWorld {
+    state: Mutex<NumericPartitionWorldState>,
+    ready: Condvar,
+    tensor_collective_calls: AtomicUsize,
+}
+
+type NumericLifecycleCounts = (
+    BTreeMap<NumericOpaqueOperation, usize>,
+    BTreeMap<NumericOpaqueOperation, usize>,
+    BTreeMap<NumericOpaqueOperation, usize>,
+    BTreeMap<usize, usize>,
+);
+
+impl NumericPartitionWorld {
+    fn tensor_collective_calls(&self) -> usize {
+        self.tensor_collective_calls.load(Ordering::Relaxed)
+    }
+
+    fn realize_manifest(&self, manifest: &CommunicationManifest) -> Result<(), Error> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| Error::backend("numeric partition world lock poisoned"))?;
+        let timeout = manifest
+            .completion_policy()
+            .ok_or_else(|| Error::backend("numeric manifest has no bounded completion policy"))?
+            .timeout();
+        if state
+            .completion_timeout
+            .replace(timeout)
+            .is_some_and(|selected| selected != timeout)
+        {
+            return Err(Error::backend(
+                "numeric ranks selected different completion deadlines",
+            ));
+        }
+        for group in manifest.groups() {
+            let members = group.members().to_vec();
+            if state
+                .groups
+                .insert(u64::from(group.id().value()), members.clone())
+                .is_some_and(|existing| existing != members)
+            {
+                return Err(Error::backend("numeric opaque group membership drifted"));
+            }
+        }
+        for route in manifest.routes() {
+            let endpoints = (route.source(), route.destination());
+            if state
+                .routes
+                .insert(route.id().value(), endpoints)
+                .is_some_and(|existing| existing != endpoints)
+            {
+                return Err(Error::backend("numeric opaque route endpoints drifted"));
+            }
+        }
+        Ok(())
+    }
+
+    fn fail_one_completion_per_agreement_group(&self) {
+        let mut state = self.state.lock().expect("numeric partition world lock");
+        let group_ids = state
+            .trace
+            .iter()
+            .filter(|event| event.operation == NumericOpaqueOperation::FailureAgreement)
+            .map(|event| event.id)
+            .collect::<BTreeSet<_>>();
+        let representatives = group_ids
+            .into_iter()
+            .map(|id| {
+                state
+                    .groups
+                    .get(&id)
+                    .and_then(|members| members.first())
+                    .copied()
+                    .expect("numeric agreement group has members")
+            })
+            .collect::<Vec<_>>();
+        state.fail_completion_ranks.extend(representatives);
+    }
+
+    fn arm_fault_all(&self, world_size: usize, fault: NumericPartitionFault) {
+        self.state
+            .lock()
+            .expect("numeric partition world lock")
+            .fault_ranks
+            .extend((0..world_size).map(|rank| (rank, fault)));
+    }
+
+    fn arm_fault_one_per_agreement_group(&self, fault: NumericPartitionFault) {
+        let mut state = self.state.lock().expect("numeric partition world lock");
+        let group_ids = state
+            .trace
+            .iter()
+            .filter(|event| event.operation == NumericOpaqueOperation::FailureAgreement)
+            .map(|event| event.id)
+            .collect::<BTreeSet<_>>();
+        let representatives = group_ids
+            .into_iter()
+            .filter_map(|id| state.groups.get(&id).and_then(|members| members.first()))
+            .copied()
+            .collect::<Vec<_>>();
+        state
+            .fault_ranks
+            .extend(representatives.into_iter().map(|rank| (rank, fault)));
+    }
+
+    fn take_fault(&self, rank: usize, fault: NumericPartitionFault) -> bool {
+        self.state
+            .lock()
+            .expect("numeric partition world lock")
+            .fault_ranks
+            .remove(&(rank, fault))
+    }
+
+    fn set_completion_delay(&self, delay: std::time::Duration) {
+        self.state
+            .lock()
+            .expect("numeric partition world lock")
+            .completion_delay = delay;
+    }
+
+    fn arm_deadline_all(&self, world_size: usize, operation: NumericOpaqueOperation) {
+        self.state
+            .lock()
+            .expect("numeric partition world lock")
+            .deadline_ranks
+            .extend((0..world_size).map(|rank| (rank, operation)));
+    }
+
+    fn record_submission(&self, operation: NumericOpaqueOperation) {
+        *self
+            .state
+            .lock()
+            .expect("numeric partition world lock")
+            .submission_calls
+            .entry(operation)
+            .or_default() += 1;
+    }
+
+    fn wait_completion(
+        &self,
+        rank: usize,
+        operation: NumericOpaqueOperation,
+        policy: eredu_core::BoundedCompletionWait,
+    ) -> eredu_core::BoundedCompletionOutcome {
+        let (delay, deadline) = {
+            let mut state = self.state.lock().expect("numeric partition world lock");
+            *state.completion_waits.entry(operation).or_default() += 1;
+            (
+                state.completion_delay,
+                state.deadline_ranks.remove(&(rank, operation)),
+            )
+        };
+        if deadline || delay > policy.timeout() {
+            return eredu_core::BoundedCompletionOutcome::DeadlineExceeded {
+                cancellation: policy.cancellation(),
+            };
+        }
+        if !delay.is_zero() {
+            std::thread::sleep(delay);
+        }
+        *self
+            .state
+            .lock()
+            .expect("numeric partition world lock")
+            .completion_successes
+            .entry(operation)
+            .or_default() += 1;
+        eredu_core::BoundedCompletionOutcome::Completed
+    }
+
+    fn record_commit(&self, rank: usize) {
+        *self
+            .state
+            .lock()
+            .expect("numeric partition world lock")
+            .commits
+            .entry(rank)
+            .or_default() += 1;
+    }
+
+    fn record_prompt_cache_identity(
+        &self,
+        rank: usize,
+        identity: eredu_core::cache::PromptCacheModelIdentity,
+    ) {
+        self.state
+            .lock()
+            .expect("numeric partition world lock")
+            .prompt_cache_identities
+            .insert(rank, identity);
+    }
+
+    fn prompt_cache_identities(
+        &self,
+    ) -> BTreeMap<usize, eredu_core::cache::PromptCacheModelIdentity> {
+        self.state
+            .lock()
+            .expect("numeric partition world lock")
+            .prompt_cache_identities
+            .clone()
+    }
+
+    fn lifecycle_counts(&self) -> NumericLifecycleCounts {
+        let state = self.state.lock().expect("numeric partition world lock");
+        (
+            state.submission_calls.clone(),
+            state.completion_waits.clone(),
+            state.completion_successes.clone(),
+            state.commits.clone(),
+        )
+    }
+
+    fn parallel_group(&self, id: CollectiveGroupId) -> Result<Arc<NumericParallelGroup>, Error> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| Error::backend("numeric partition world lock poisoned"))?;
+        let size = state
+            .groups
+            .get(&u64::from(id.value()))
+            .ok_or_else(|| Error::backend("numeric tensor group is not realized"))?
+            .len();
+        Ok(state
+            .parallel_groups
+            .entry(u64::from(id.value()))
+            .or_insert_with(|| NumericParallelGroup::new(size))
+            .clone())
+    }
+
+    fn take_completion_failure(&self, rank: usize) -> bool {
+        self.state
+            .lock()
+            .expect("numeric partition world lock")
+            .fail_completion_ranks
+            .remove(&rank)
+    }
+
+    fn trace(&self) -> Vec<NumericOpaqueTrace> {
+        self.state
+            .lock()
+            .expect("numeric partition world lock")
+            .trace
+            .clone()
+    }
+
+    fn groups(&self) -> BTreeMap<u64, Vec<usize>> {
+        self.state
+            .lock()
+            .expect("numeric partition world lock")
+            .groups
+            .clone()
+    }
+
+    fn routes(&self) -> BTreeMap<u64, (usize, usize)> {
+        self.state
+            .lock()
+            .expect("numeric partition world lock")
+            .routes
+            .clone()
+    }
+
+    fn record_materialization(&self, rank: usize, tasks: usize) {
+        self.state
+            .lock()
+            .expect("numeric partition world lock")
+            .materializations
+            .insert(rank, tasks);
+    }
+
+    fn materializations(&self) -> BTreeMap<usize, usize> {
+        self.state
+            .lock()
+            .expect("numeric partition world lock")
+            .materializations
+            .clone()
+    }
+
+    fn save_prompt_cache(
+        &self,
+        path: &std::path::Path,
+        rank: usize,
+        state: DeviceState<NumericBackend, NumericHybridLayerState>,
+        manifest: eredu_core::cache::PromptCacheManifest,
+    ) {
+        self.state
+            .lock()
+            .expect("numeric partition world lock")
+            .prompt_caches
+            .insert((path.to_path_buf(), rank), (state, manifest));
+    }
+
+    fn load_prompt_cache(
+        &self,
+        path: &std::path::Path,
+        rank: usize,
+    ) -> Option<(
+        DeviceState<NumericBackend, NumericHybridLayerState>,
+        eredu_core::cache::PromptCacheManifest,
+    )> {
+        let mut state = self.state.lock().expect("numeric partition world lock");
+        *state.cache_load_attempts.entry(rank).or_default() += 1;
+        state
+            .prompt_caches
+            .get(&(path.to_path_buf(), rank))
+            .cloned()
+    }
+
+    fn cache_load_attempts(&self, rank: usize) -> usize {
+        self.state
+            .lock()
+            .expect("numeric partition world lock")
+            .cache_load_attempts
+            .get(&rank)
+            .copied()
+            .unwrap_or_default()
+    }
+}
+
+#[derive(Clone)]
+struct NumericPartitionContext {
+    rank: usize,
+    world: Arc<NumericPartitionWorld>,
+    sequences: Arc<Mutex<BTreeMap<(NumericOpaqueOperation, u64), usize>>>,
+}
+
+impl NumericPartitionContext {
+    fn new(rank: usize, world: Arc<NumericPartitionWorld>) -> Self {
+        Self {
+            rank,
+            world,
+            sequences: Arc::default(),
+        }
+    }
+
+    fn next_sequence(&self, operation: NumericOpaqueOperation, id: u64) -> usize {
+        let mut sequences = self.sequences.lock().expect("numeric sequence lock");
+        let sequence = sequences.entry((operation, id)).or_default();
+        let current = *sequence;
+        *sequence += 1;
+        current
+    }
+
+    fn group_tensors(
+        &self,
+        operation: NumericOpaqueOperation,
+        id: u64,
+        values: Vec<NumericTensor>,
+        root: Option<usize>,
+    ) -> Result<Vec<NumericTensor>, Error> {
+        let sequence = self.next_sequence(operation, id);
+        let key = (operation, id, sequence);
+        let mut state = self
+            .world
+            .state
+            .lock()
+            .map_err(|_| Error::backend("numeric partition world lock poisoned"))?;
+        let members =
+            state.groups.get(&id).cloned().ok_or_else(|| {
+                Error::backend(format!("numeric opaque group {id} is not realized"))
+            })?;
+        let local_index = members
+            .iter()
+            .position(|member| *member == self.rank)
+            .ok_or_else(|| Error::backend("numeric rank is outside its opaque group"))?;
+        let slot = state.slots.entry(key).or_default();
+        if slot.members.is_empty() {
+            slot.members = members.clone();
+        }
+        if slot.members != members || slot.tensors.insert(self.rank, values).is_some() {
+            return Err(Error::backend("numeric opaque tensor submission drifted"));
+        }
+        if slot.tensors.len() == members.len() {
+            let owner = root.unwrap_or(0);
+            let owner_rank = *members
+                .get(owner)
+                .ok_or_else(|| Error::backend("numeric broadcast root is outside its group"))?;
+            slot.output = Some(
+                slot.tensors
+                    .get(&owner_rank)
+                    .ok_or_else(|| Error::backend("numeric broadcast owner did not submit"))?
+                    .clone(),
+            );
+            self.world.ready.notify_all();
+        }
+        while state
+            .slots
+            .get(&key)
+            .and_then(|slot| slot.output.as_ref())
+            .is_none()
+        {
+            state = self
+                .world
+                .ready
+                .wait(state)
+                .map_err(|_| Error::backend("numeric opaque tensor wait poisoned"))?;
+        }
+        let (output, remove) = {
+            let slot = state.slots.get_mut(&key).unwrap();
+            let output = slot.output.as_ref().unwrap().clone();
+            slot.readers += 1;
+            (output, slot.readers == members.len())
+        };
+        state.trace.push(NumericOpaqueTrace {
+            rank: self.rank,
+            operation,
+            id,
+            sequence,
+        });
+        if remove {
+            state.slots.remove(&key);
+        }
+        let _ = local_index;
+        Ok(output)
+    }
+
+    fn gather(
+        &self,
+        operation: NumericOpaqueOperation,
+        id: u64,
+        value: NumericTensor,
+        axis: usize,
+    ) -> Result<NumericTensor, Error> {
+        let sequence = self.next_sequence(operation, id);
+        let key = (operation, id, sequence);
+        let mut state = self
+            .world
+            .state
+            .lock()
+            .map_err(|_| Error::backend("numeric partition world lock poisoned"))?;
+        let members =
+            state.groups.get(&id).cloned().ok_or_else(|| {
+                Error::backend(format!("numeric opaque group {id} is not realized"))
+            })?;
+        let slot = state.slots.entry(key).or_default();
+        if slot.members.is_empty() {
+            slot.members = members.clone();
+        }
+        if slot.members != members || slot.tensors.insert(self.rank, vec![value]).is_some() {
+            return Err(Error::backend("numeric even-gather submission drifted"));
+        }
+        if slot.tensors.len() == members.len() {
+            let values = members
+                .iter()
+                .map(|member| slot.tensors[member][0].clone())
+                .collect::<Vec<_>>();
+            slot.output = Some(vec![NumericTensor::concatenate(
+                &values,
+                i32::try_from(axis).map_err(Error::backend)?,
+                &NumericContext::default(),
+            )?]);
+            self.world.ready.notify_all();
+        }
+        while state
+            .slots
+            .get(&key)
+            .and_then(|slot| slot.output.as_ref())
+            .is_none()
+        {
+            let timeout = state
+                .completion_timeout
+                .ok_or_else(|| Error::backend("numeric collective has no selected deadline"))?;
+            let (next, waited) = self
+                .world
+                .ready
+                .wait_timeout(state, timeout)
+                .map_err(|_| Error::backend("numeric even-gather wait poisoned"))?;
+            state = next;
+            if waited.timed_out()
+                && state
+                    .slots
+                    .get(&key)
+                    .and_then(|slot| slot.output.as_ref())
+                    .is_none()
+            {
+                return Err(Error::backend("numeric even-gather deadline exceeded"));
+            }
+        }
+        let (output, remove) = {
+            let slot = state.slots.get_mut(&key).unwrap();
+            let output = slot.output.as_ref().unwrap()[0].clone();
+            slot.readers += 1;
+            (output, slot.readers == members.len())
+        };
+        state.trace.push(NumericOpaqueTrace {
+            rank: self.rank,
+            operation,
+            id,
+            sequence,
+        });
+        if remove {
+            state.slots.remove(&key);
+        }
+        Ok(output)
+    }
+
+    fn all_gather_even(&self, id: u64, value: NumericTensor) -> Result<NumericTensor, Error> {
+        self.gather(NumericOpaqueOperation::AllGatherEven, id, value, 0)
+    }
+
+    fn all_reduce_sum(&self, id: u64, value: NumericTensor) -> Result<NumericTensor, Error> {
+        let input_shape = value.shape.clone();
+        let gathered = self.gather(NumericOpaqueOperation::AllReduceSum, id, value, 0)?;
+        if gathered.shape.len() != input_shape.len()
+            || gathered.shape[1..] != input_shape[1..]
+            || gathered.shape[0] % input_shape[0] != 0
+        {
+            return Err(Error::backend("numeric sum-reduction geometry drifted"));
+        }
+        let rows = usize::try_from(input_shape[0]).unwrap();
+        let row_elements = elements(&input_shape[1..]);
+        let partitions = usize::try_from(gathered.shape[0] / input_shape[0]).unwrap();
+        let mut output = NumericTensor::zeros(input_shape).with_dtype(gathered.dtype.clone());
+        for partition in 0..partitions {
+            for index in 0..rows * row_elements {
+                output.data[index] += gathered.data[partition * rows * row_elements + index];
+            }
+        }
+        Ok(output)
+    }
+
+    fn variable_all_to_all(
+        &self,
+        id: u64,
+        value: NumericTensor,
+        counts: &eredu_runtime::CommunicationPeerCounts,
+    ) -> Result<NumericTensor, Error> {
+        let operation = NumericOpaqueOperation::VariableAllToAll;
+        let sequence = self.next_sequence(operation, id);
+        let key = (operation, id, sequence);
+        let mut state = self
+            .world
+            .state
+            .lock()
+            .map_err(|_| Error::backend("numeric partition world lock poisoned"))?;
+        let members =
+            state.groups.get(&id).cloned().ok_or_else(|| {
+                Error::backend(format!("numeric opaque group {id} is not realized"))
+            })?;
+        let encode_counts = |values: &[usize]| {
+            values
+                .iter()
+                .map(|value| i32::try_from(*value).map_err(Error::backend))
+                .collect::<Result<Vec<_>, _>>()
+                .map(|values| {
+                    NumericTensor::new(
+                        vec![i32::try_from(values.len()).unwrap()],
+                        values.into_iter().map(|value| value as f32).collect(),
+                    )
+                    .with_dtype(eredu_core::checkpoint::TensorDtype::I32)
+                })
+        };
+        let submitted = vec![
+            value,
+            encode_counts(counts.send())?,
+            encode_counts(counts.receive())?,
+        ];
+        let slot = state.slots.entry(key).or_default();
+        if slot.members.is_empty() {
+            slot.members = members.clone();
+        }
+        if slot.members != members || slot.tensors.insert(self.rank, submitted).is_some() {
+            return Err(Error::backend(
+                "numeric variable-all-to-all submission drifted",
+            ));
+        }
+        if slot.tensors.len() == members.len() {
+            let submissions = slot.tensors.clone();
+            for (destination_index, destination) in members.iter().copied().enumerate() {
+                let mut pieces = Vec::with_capacity(members.len());
+                for (source_index, source) in members.iter().copied().enumerate() {
+                    let submitted = &submissions[&source];
+                    let send = submitted[1]
+                        .to_i32_vec(&NumericContext::default())?
+                        .into_iter()
+                        .map(|value| usize::try_from(value).map_err(Error::backend))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let receive = submissions[&destination][2]
+                        .to_i32_vec(&NumericContext::default())?
+                        .into_iter()
+                        .map(|value| usize::try_from(value).map_err(Error::backend))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    if send.len() != members.len()
+                        || receive.len() != members.len()
+                        || receive[source_index] != send[destination_index]
+                    {
+                        return Err(Error::backend(
+                            "numeric variable-all-to-all peer counts disagree",
+                        ));
+                    }
+                    let start = send[..destination_index].iter().sum::<usize>();
+                    let end = start + send[destination_index];
+                    pieces.push(submitted[0].axis_slice(0, start, end));
+                }
+                let output = NumericTensor::concatenate(&pieces, 0, &NumericContext::default())?;
+                state
+                    .slots
+                    .get_mut(&key)
+                    .unwrap()
+                    .peer_outputs
+                    .insert(destination, vec![output]);
+            }
+            self.world.ready.notify_all();
+        }
+        while state
+            .slots
+            .get(&key)
+            .and_then(|slot| slot.peer_outputs.get(&self.rank))
+            .is_none()
+        {
+            let timeout = state
+                .completion_timeout
+                .ok_or_else(|| Error::backend("numeric collective has no selected deadline"))?;
+            let (next, waited) = self
+                .world
+                .ready
+                .wait_timeout(state, timeout)
+                .map_err(|_| Error::backend("numeric variable-all-to-all wait poisoned"))?;
+            state = next;
+            if waited.timed_out()
+                && state
+                    .slots
+                    .get(&key)
+                    .and_then(|slot| slot.peer_outputs.get(&self.rank))
+                    .is_none()
+            {
+                return Err(Error::backend(
+                    "numeric variable-all-to-all deadline exceeded",
+                ));
+            }
+        }
+        let (output, remove) = {
+            let slot = state.slots.get_mut(&key).unwrap();
+            let output = slot.peer_outputs[&self.rank][0].clone();
+            slot.readers += 1;
+            (output, slot.readers == members.len())
+        };
+        state.trace.push(NumericOpaqueTrace {
+            rank: self.rank,
+            operation,
+            id,
+            sequence,
+        });
+        if remove {
+            state.slots.remove(&key);
+        }
+        Ok(output)
+    }
+
+    fn agree(&self, id: u64, success: bool) -> Result<bool, Error> {
+        let operation = NumericOpaqueOperation::FailureAgreement;
+        let sequence = self.next_sequence(operation, id);
+        let key = (operation, id, sequence);
+        let mut state = self
+            .world
+            .state
+            .lock()
+            .map_err(|_| Error::backend("numeric partition world lock poisoned"))?;
+        let members =
+            state.groups.get(&id).cloned().ok_or_else(|| {
+                Error::backend(format!("numeric opaque group {id} is not realized"))
+            })?;
+        let slot = state.slots.entry(key).or_default();
+        if slot.members.is_empty() {
+            slot.members = members.clone();
+        }
+        if slot.members != members || slot.booleans.insert(self.rank, success).is_some() {
+            return Err(Error::backend(
+                "numeric failure-agreement submission drifted",
+            ));
+        }
+        if slot.booleans.len() == members.len() {
+            slot.agreement = Some(slot.booleans.values().all(|success| *success));
+            self.world.ready.notify_all();
+        }
+        while state
+            .slots
+            .get(&key)
+            .and_then(|slot| slot.agreement)
+            .is_none()
+        {
+            let timeout = state
+                .completion_timeout
+                .ok_or_else(|| Error::backend("numeric agreement has no selected deadline"))?;
+            let (next, waited) = self
+                .world
+                .ready
+                .wait_timeout(state, timeout)
+                .map_err(|_| Error::backend("numeric failure-agreement wait poisoned"))?;
+            state = next;
+            if waited.timed_out()
+                && state
+                    .slots
+                    .get(&key)
+                    .and_then(|slot| slot.agreement)
+                    .is_none()
+            {
+                return Err(Error::backend(
+                    "numeric failure-agreement deadline exceeded",
+                ));
+            }
+        }
+        let (agreement, remove) = {
+            let slot = state.slots.get_mut(&key).unwrap();
+            let agreement = slot.agreement.unwrap();
+            slot.readers += 1;
+            (agreement, slot.readers == members.len())
+        };
+        state.trace.push(NumericOpaqueTrace {
+            rank: self.rank,
+            operation,
+            id,
+            sequence,
+        });
+        if remove {
+            state.slots.remove(&key);
+        }
+        Ok(agreement)
+    }
+
+    fn route(&self, id: u64, values: Vec<NumericTensor>) -> Result<Vec<NumericTensor>, Error> {
+        let operation = NumericOpaqueOperation::PointToPoint;
+        let sequence = self.next_sequence(operation, id);
+        let key = (operation, id, sequence);
+        let mut state = self
+            .world
+            .state
+            .lock()
+            .map_err(|_| Error::backend("numeric partition world lock poisoned"))?;
+        let (source, destination) = *state
+            .routes
+            .get(&id)
+            .ok_or_else(|| Error::backend(format!("numeric opaque route {id} is not realized")))?;
+        if self.rank != source && self.rank != destination {
+            return Err(Error::backend("numeric rank is outside its opaque route"));
+        }
+        let slot = state.slots.entry(key).or_default();
+        if slot.members.is_empty() {
+            slot.members = vec![source, destination];
+        }
+        if slot.tensors.insert(self.rank, values).is_some() {
+            return Err(Error::backend("numeric route endpoint submitted twice"));
+        }
+        if slot.tensors.len() == 2 {
+            slot.output = Some(slot.tensors.get(&source).unwrap().clone());
+            self.world.ready.notify_all();
+        }
+        while state
+            .slots
+            .get(&key)
+            .and_then(|slot| slot.output.as_ref())
+            .is_none()
+        {
+            state = self
+                .world
+                .ready
+                .wait(state)
+                .map_err(|_| Error::backend("numeric route wait poisoned"))?;
+        }
+        let (output, remove) = {
+            let slot = state.slots.get_mut(&key).unwrap();
+            let output = slot.output.as_ref().unwrap().clone();
+            slot.readers += 1;
+            (output, slot.readers == 2)
+        };
+        state.trace.push(NumericOpaqueTrace {
+            rank: self.rank,
+            operation,
+            id,
+            sequence,
+        });
+        if remove {
+            state.slots.remove(&key);
+        }
+        Ok(output)
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct NumericBackend;
 
-#[derive(Debug)]
-struct NumericCompletion;
+#[derive(Clone)]
+struct NumericCompletion {
+    partition: Option<NumericPartitionContext>,
+    operation: NumericOpaqueOperation,
+}
+
+impl std::fmt::Debug for NumericCompletion {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NumericCompletion")
+            .field(
+                "rank",
+                &self.partition.as_ref().map(|partition| partition.rank),
+            )
+            .field("operation", &self.operation)
+            .finish()
+    }
+}
+
+impl NumericCompletion {
+    fn immediate() -> Self {
+        Self {
+            partition: None,
+            operation: NumericOpaqueOperation::FailureAgreement,
+        }
+    }
+
+    fn partition(partition: &NumericPartitionContext, operation: NumericOpaqueOperation) -> Self {
+        Self {
+            partition: Some(partition.clone()),
+            operation,
+        }
+    }
+}
 
 impl Completion for NumericCompletion {
-    type Error = std::convert::Infallible;
+    type Error = Error;
 
     fn is_complete(&self) -> Result<bool, Self::Error> {
         Ok(true)
@@ -2494,6 +3546,22 @@ impl Completion for NumericCompletion {
 
     fn wait(&self) -> Result<(), Self::Error> {
         Ok(())
+    }
+}
+
+impl eredu_core::BoundedCompletion for NumericCompletion {
+    fn wait_bounded(
+        self,
+        policy: eredu_core::BoundedCompletionWait,
+    ) -> Result<eredu_core::BoundedCompletionOutcome, Self::Error> {
+        Ok(self.partition.map_or(
+            eredu_core::BoundedCompletionOutcome::Completed,
+            |partition| {
+                partition
+                    .world
+                    .wait_completion(partition.rank, self.operation, policy)
+            },
+        ))
     }
 }
 
@@ -2505,22 +3573,19 @@ impl SubmissionBackend for NumericBackend {
     fn fork_executors(
         executor: &Self::Executor,
         count: usize,
-    ) -> Result<Vec<Self::OwnedExecutor>, std::convert::Infallible> {
+    ) -> Result<Vec<Self::OwnedExecutor>, Error> {
         Ok(vec![executor.clone(); count])
     }
 
-    fn submit<'a, I>(_: &Self::Executor, _: I) -> Result<Self::Completion, std::convert::Infallible>
+    fn submit<'a, I>(_: &Self::Executor, _: I) -> Result<Self::Completion, Error>
     where
         Self::Tensor: 'a,
         I: IntoIterator<Item = &'a Self::Tensor>,
     {
-        Ok(NumericCompletion)
+        Ok(NumericCompletion::immediate())
     }
 
-    fn order_after(
-        _: &Self::Completion,
-        _: &Self::Executor,
-    ) -> Result<(), std::convert::Infallible> {
+    fn order_after(_: &Self::Completion, _: &Self::Executor) -> Result<(), Error> {
         Ok(())
     }
 
@@ -2528,7 +3593,7 @@ impl SubmissionBackend for NumericBackend {
         _: &Self::Executor,
         _: &Self::Completion,
         _: T,
-    ) -> Result<(), std::convert::Infallible> {
+    ) -> Result<(), Error> {
         Ok(())
     }
 }
@@ -2564,6 +3629,298 @@ impl CollectiveBackend for NumericBackend {
             .expect("numeric mechanism trace lock")
             .push(NumericMechanismTrace::AllToAll(*group));
         Ok(value)
+    }
+}
+
+impl CommunicationBackend for NumericBackend {
+    type CommunicationGroup = u64;
+    type CommunicationRoute = u64;
+    type CommunicationCompletion = NumericCompletion;
+    type CommunicationError = Error;
+
+    fn submit_local_dependencies<'a, I>(
+        values: I,
+        context: &Self::Executor,
+    ) -> Result<eredu_core::Submission<(), Self::CommunicationCompletion>, Self::CommunicationError>
+    where
+        Self::Tensor: 'a,
+        I: IntoIterator<Item = &'a Self::Tensor>,
+    {
+        let _ = values.into_iter().count();
+        let completion =
+            context
+                .partition
+                .as_ref()
+                .map_or_else(NumericCompletion::immediate, |partition| {
+                    partition
+                        .world
+                        .record_submission(NumericOpaqueOperation::PointToPoint);
+                    NumericCompletion::partition(partition, NumericOpaqueOperation::PointToPoint)
+                });
+        Ok(eredu_core::Submission {
+            output: (),
+            completion,
+        })
+    }
+}
+
+impl eredu_runtime::BroadcastBackend for NumericBackend {
+    fn broadcast(
+        value: Self::Tensor,
+        root: usize,
+        group: &Self::CommunicationGroup,
+        context: &Self::Executor,
+    ) -> Result<eredu_core::Submission<Self::Tensor, NumericCompletion>, Error> {
+        let partition = context
+            .partition
+            .as_ref()
+            .ok_or_else(|| Error::backend("numeric broadcast has no partition context"))?;
+        partition
+            .world
+            .record_submission(NumericOpaqueOperation::Broadcast);
+        let mut output = partition.group_tensors(
+            NumericOpaqueOperation::Broadcast,
+            *group,
+            vec![value],
+            Some(root),
+        )?;
+        Ok(eredu_core::Submission {
+            output: output.remove(0),
+            completion: NumericCompletion::partition(partition, NumericOpaqueOperation::Broadcast),
+        })
+    }
+}
+
+impl eredu_runtime::FailureAgreementBackend for NumericBackend {
+    type FailureAgreementOutput = bool;
+
+    fn agree_success(
+        local_success: bool,
+        group: &Self::CommunicationGroup,
+        context: &Self::Executor,
+    ) -> Result<eredu_core::Submission<bool, NumericCompletion>, Error> {
+        let partition = context
+            .partition
+            .as_ref()
+            .ok_or_else(|| Error::backend("numeric agreement has no partition context"))?;
+        partition
+            .world
+            .record_submission(NumericOpaqueOperation::FailureAgreement);
+        Ok(eredu_core::Submission {
+            output: partition.agree(*group, local_success)?,
+            completion: NumericCompletion::partition(
+                partition,
+                NumericOpaqueOperation::FailureAgreement,
+            ),
+        })
+    }
+
+    fn resolve_failure_agreement(output: bool) -> Result<bool, Error> {
+        Ok(output)
+    }
+}
+
+impl eredu_runtime::PointToPointBackend for NumericBackend {
+    fn send_receive(
+        values: Vec<eredu_runtime::RoleExactBoundaryValue<Self::Tensor>>,
+        route: &Self::CommunicationRoute,
+        context: &Self::Executor,
+    ) -> Result<eredu_core::Submission<Vec<Self::Tensor>, NumericCompletion>, Error> {
+        let partition = context
+            .partition
+            .as_ref()
+            .ok_or_else(|| Error::backend("numeric route has no partition context"))?;
+        partition
+            .world
+            .record_submission(NumericOpaqueOperation::PointToPoint);
+        if partition
+            .world
+            .take_fault(partition.rank, NumericPartitionFault::PeerSubmission)
+        {
+            return Err(Error::backend("injected numeric peer submission failure"));
+        }
+        let values = values
+            .into_iter()
+            .map(eredu_runtime::RoleExactBoundaryValue::into_parts)
+            .map(|(_, tensor)| tensor)
+            .collect();
+        Ok(eredu_core::Submission {
+            output: partition.route(*route, values)?,
+            completion: NumericCompletion::partition(
+                partition,
+                NumericOpaqueOperation::PointToPoint,
+            ),
+        })
+    }
+}
+
+impl VariableAllToAllBackend for NumericBackend {
+    fn variable_all_to_all(
+        value: Self::Tensor,
+        counts: &eredu_runtime::CommunicationPeerCounts,
+        axis: usize,
+        group: &Self::CommunicationGroup,
+        context: &Self::Executor,
+    ) -> Result<
+        eredu_core::Submission<Self::Tensor, Self::CommunicationCompletion>,
+        Self::CommunicationError,
+    > {
+        assert_eq!(axis, 0);
+        context
+            .mechanisms
+            .lock()
+            .expect("numeric mechanism trace lock")
+            .push(NumericMechanismTrace::VariableAllToAll {
+                group: *group,
+                send: counts.send().to_vec(),
+                receive: counts.receive().to_vec(),
+            });
+        let Some(partition) = context.partition.as_ref() else {
+            let receive_rows = counts.receive().iter().sum::<usize>();
+            let source_rows = usize::try_from(value.shape[0]).unwrap();
+            let row_elements = value.data.len().checked_div(source_rows.max(1)).unwrap();
+            let mut shape = value.shape.clone();
+            shape[0] = i32::try_from(receive_rows).unwrap();
+            let dtype = value.dtype.clone();
+            let mut data = value.data;
+            data.resize(receive_rows * row_elements, 0.0);
+            return Ok(eredu_core::Submission {
+                output: NumericTensor::new(shape, data).with_dtype(dtype),
+                completion: NumericCompletion::immediate(),
+            });
+        };
+        partition
+            .world
+            .record_submission(NumericOpaqueOperation::VariableAllToAll);
+        let output = partition.variable_all_to_all(*group, value, counts)?;
+        Ok(eredu_core::Submission {
+            output,
+            completion: NumericCompletion::partition(
+                partition,
+                NumericOpaqueOperation::VariableAllToAll,
+            ),
+        })
+    }
+}
+
+impl EvenGatherBackend for NumericBackend {
+    fn all_gather_even(
+        value: Self::Tensor,
+        axis: usize,
+        group: &Self::CommunicationGroup,
+        context: &Self::Executor,
+    ) -> Result<
+        eredu_core::Submission<Self::Tensor, Self::CommunicationCompletion>,
+        Self::CommunicationError,
+    > {
+        assert_eq!(axis, 0);
+        context
+            .mechanisms
+            .lock()
+            .expect("numeric mechanism trace lock")
+            .push(NumericMechanismTrace::AllGatherEven {
+                group: *group,
+                axis,
+            });
+        let Some(partition) = context.partition.as_ref() else {
+            return Ok(eredu_core::Submission {
+                output: NumericTensor::concatenate(&[value.clone(), value], 0, context).unwrap(),
+                completion: NumericCompletion::immediate(),
+            });
+        };
+        partition
+            .world
+            .record_submission(NumericOpaqueOperation::AllGatherEven);
+        let output = partition.all_gather_even(*group, value)?;
+        Ok(eredu_core::Submission {
+            output,
+            completion: NumericCompletion::partition(
+                partition,
+                NumericOpaqueOperation::AllGatherEven,
+            ),
+        })
+    }
+}
+
+impl eredu_runtime::UnevenGatherBackend for NumericBackend {
+    fn all_gather_uneven(
+        value: Self::Tensor,
+        counts: &[usize],
+        axis: usize,
+        group: &Self::CommunicationGroup,
+        context: &Self::Executor,
+    ) -> Result<
+        eredu_core::Submission<Self::Tensor, Self::CommunicationCompletion>,
+        Self::CommunicationError,
+    > {
+        let Some(partition) = context.partition.as_ref() else {
+            return Ok(eredu_core::Submission {
+                output: value,
+                completion: NumericCompletion::immediate(),
+            });
+        };
+        let output =
+            partition.gather(NumericOpaqueOperation::AllGatherUneven, *group, value, axis)?;
+        if output
+            .shape
+            .get(axis)
+            .and_then(|dimension| usize::try_from(*dimension).ok())
+            != Some(counts.iter().sum())
+        {
+            return Err(Error::backend(
+                "numeric uneven gather count geometry drifted",
+            ));
+        }
+        Ok(eredu_core::Submission {
+            output,
+            completion: NumericCompletion::partition(
+                partition,
+                NumericOpaqueOperation::AllGatherUneven,
+            ),
+        })
+    }
+}
+
+impl eredu_runtime::SumReductionBackend for NumericBackend {
+    fn all_reduce_sum(
+        value: Self::Tensor,
+        group: &Self::CommunicationGroup,
+        context: &Self::Executor,
+    ) -> Result<
+        eredu_core::Submission<Self::Tensor, Self::CommunicationCompletion>,
+        Self::CommunicationError,
+    > {
+        let Some(partition) = context.partition.as_ref() else {
+            return Ok(eredu_core::Submission {
+                output: value,
+                completion: NumericCompletion::immediate(),
+            });
+        };
+        let output = partition.all_reduce_sum(*group, value)?;
+        Ok(eredu_core::Submission {
+            output,
+            completion: NumericCompletion::partition(
+                partition,
+                NumericOpaqueOperation::AllReduceSum,
+            ),
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct NumericCommunicationMetadata(Option<eredu_core::checkpoint::TensorDtype>);
+
+impl CommunicationTensorMetadata<NumericBackend> for NumericCommunicationMetadata {
+    fn dtype(&self, tensor: &NumericTensor) -> eredu_core::checkpoint::TensorDtype {
+        self.0.clone().unwrap_or_else(|| tensor.dtype.clone())
+    }
+
+    fn shape(&self, tensor: &NumericTensor) -> Vec<usize> {
+        tensor
+            .shape()
+            .iter()
+            .map(|dimension| usize::try_from(*dimension).unwrap())
+            .collect()
     }
 }
 
@@ -5244,6 +6601,7 @@ impl AttentionCache<NumericTensor> for NumericCache {
 struct NumericHybridLayerState {
     attention: Option<NumericCache>,
     compressed: Option<NumericCompressedCache>,
+    pooling: Option<NumericPoolingCache>,
     fixed: BTreeMap<StateTensorRole, Option<NumericTensor>>,
     fixed_offset: i32,
     resets: usize,
@@ -5251,6 +6609,26 @@ struct NumericHybridLayerState {
 
 impl NumericHybridLayerState {
     fn new(policy: &LayerCachePolicy) -> Self {
+        let pooling_required = matches!(
+            policy,
+            LayerCachePolicy::KeyOnly { .. } | LayerCachePolicy::KeyOnlyWithFixedState { .. }
+        );
+        let pooling_ratios = policy
+            .fixed_state()
+            .iter()
+            .filter_map(|tensor| match tensor.role {
+                StateTensorRole::Pooling {
+                    stream,
+                    component: eredu_core::cache::PoolingStateComponent::Pooled,
+                } => tensor.shape.iter().find_map(|dimension| match dimension {
+                    eredu_core::cache::StateTensorDimension::PrefixTokensDiv(ratio) => {
+                        Some((stream, i32::try_from(ratio.get()).unwrap()))
+                    }
+                    _ => None,
+                }),
+                _ => None,
+            })
+            .collect::<BTreeMap<_, _>>();
         Self {
             attention: match policy {
                 LayerCachePolicy::KeyValue { attention, .. }
@@ -5263,6 +6641,18 @@ impl NumericHybridLayerState {
             },
             compressed: matches!(policy, LayerCachePolicy::CompressedLatentRotary { .. })
                 .then(NumericCompressedCache::resident),
+            pooling: pooling_required.then(|| {
+                let ratios = pooling_ratios.values().copied().collect::<Vec<_>>();
+                NumericPoolingCache::new(
+                    policy
+                        .attention()
+                        .expect("pooling state requires local attention")
+                        .sliding_window_i32()
+                        .unwrap()
+                        .unwrap_or(i32::MAX),
+                    &ratios,
+                )
+            }),
             fixed: policy
                 .fixed_state()
                 .iter()
@@ -5291,6 +6681,16 @@ impl RuntimeLayerState<NumericBackend> for NumericHybridLayerState {
                     .flat_map(|state| [&state.latent, &state.rotary]),
             );
         }
+        if let Some(pooling) = &self.pooling {
+            values.extend(pooling.local.iter());
+            for stream in &pooling.streams {
+                values.extend(stream.pending_values.iter());
+                values.extend(stream.pending_gates.iter());
+                values.extend(stream.pooled.iter());
+                values.extend(stream.overlap_values.iter());
+                values.extend(stream.overlap_gates.iter());
+            }
+        }
         values.extend(self.fixed.values().filter_map(Option::as_ref));
         values.into_iter()
     }
@@ -5308,6 +6708,14 @@ impl ResettableRuntimeLayerState<NumericBackend> for NumericHybridLayerState {
             compressed.state = None;
             compressed.offset = 0;
         }
+        if let Some(pooling) = &mut self.pooling {
+            let ratios = pooling
+                .streams
+                .iter()
+                .map(|stream| stream.ratio)
+                .collect::<Vec<_>>();
+            *pooling = NumericPoolingCache::new(pooling.window, &ratios);
+        }
         self.fixed.values_mut().for_each(|value| *value = None);
         self.fixed_offset = 0;
         Ok(())
@@ -5316,15 +6724,18 @@ impl ResettableRuntimeLayerState<NumericBackend> for NumericHybridLayerState {
 
 impl RuntimeStateComponents<NumericBackend> for NumericHybridLayerState {
     fn position(&self) -> i32 {
-        self.attention
-            .as_ref()
-            .map(AttentionCache::offset)
-            .or_else(|| {
-                self.compressed
-                    .as_ref()
-                    .map(CompressedAttentionCache::offset)
-            })
-            .unwrap_or(self.fixed_offset)
+        [
+            self.attention.as_ref().map(AttentionCache::offset),
+            self.compressed
+                .as_ref()
+                .map(CompressedAttentionCache::offset),
+            self.pooling.as_ref().map(PoolingAttentionCache::offset),
+            Some(self.fixed_offset),
+        ]
+        .into_iter()
+        .flatten()
+        .max()
+        .unwrap_or_default()
     }
 
     fn fixed_component(
@@ -5337,7 +6748,7 @@ impl RuntimeStateComponents<NumericBackend> for NumericHybridLayerState {
     }
 
     fn advance_fixed(&mut self, tokens: i32) -> Result<(), StateError> {
-        if self.attention.is_some() || tokens <= 0 {
+        if self.attention.is_some() || self.pooling.is_some() || tokens <= 0 {
             return Err(StateError::InvalidAdvance(format!(
                 "invalid fixed-state advance {tokens}"
             )));
@@ -5415,6 +6826,126 @@ impl CompressedAttentionCache<NumericTensor> for NumericHybridLayerState {
         self.compressed
             .as_mut()
             .ok_or_else(|| Error::backend("layer has no compressed attention state"))?
+            .clear()
+    }
+}
+
+impl PoolingAttentionCache<NumericTensor> for NumericHybridLayerState {
+    type Checkpoint = NumericPoolingCache;
+
+    fn offset(&self) -> i32 {
+        self.position()
+    }
+
+    fn pooling_ratio(&self, stream: u32) -> Option<i32> {
+        self.pooling
+            .as_ref()
+            .and_then(|pooling| pooling.pooling_ratio(stream))
+    }
+
+    fn append_local(
+        &mut self,
+        keys: NumericTensor,
+        context: &NumericContext,
+    ) -> Result<NumericTensor, Error> {
+        self.pooling
+            .as_mut()
+            .ok_or_else(|| Error::backend("layer has no pooling attention state"))?
+            .append_local(keys, context)
+    }
+
+    fn local_mask(
+        &self,
+        query_tokens: i32,
+        offset: i32,
+        context: &NumericContext,
+    ) -> Result<NumericTensor, Error> {
+        self.pooling
+            .as_ref()
+            .ok_or_else(|| Error::backend("layer has no pooling attention state"))?
+            .local_mask(query_tokens, offset, context)
+    }
+
+    fn accumulate_pooling_windows(
+        &mut self,
+        stream: u32,
+        values: NumericTensor,
+        gates: NumericTensor,
+        absolute_offset: i32,
+        context: &NumericContext,
+    ) -> Result<PoolingWindows<NumericTensor>, Error> {
+        self.pooling
+            .as_mut()
+            .ok_or_else(|| Error::backend("layer has no pooling attention state"))?
+            .accumulate_pooling_windows(stream, values, gates, absolute_offset, context)
+    }
+
+    fn replace_pooling_overlap(
+        &mut self,
+        stream: u32,
+        values: NumericTensor,
+        gates: NumericTensor,
+    ) -> Result<PoolingOverlap<NumericTensor>, Error> {
+        self.pooling
+            .as_mut()
+            .ok_or_else(|| Error::backend("layer has no pooling attention state"))?
+            .replace_pooling_overlap(stream, values, gates)
+    }
+
+    fn append_pooled(
+        &mut self,
+        stream: u32,
+        values: NumericTensor,
+        context: &NumericContext,
+    ) -> Result<NumericTensor, Error> {
+        self.pooling
+            .as_mut()
+            .ok_or_else(|| Error::backend("layer has no pooling attention state"))?
+            .append_pooled(stream, values, context)
+    }
+
+    fn pooling_mask(
+        &self,
+        stream: u32,
+        query_tokens: i32,
+        offset: i32,
+        context: &NumericContext,
+    ) -> Result<Option<NumericTensor>, Error> {
+        self.pooling
+            .as_ref()
+            .ok_or_else(|| Error::backend("layer has no pooling attention state"))?
+            .pooling_mask(stream, query_tokens, offset, context)
+    }
+
+    fn checkpoint(&self) -> Self::Checkpoint {
+        self.pooling
+            .as_ref()
+            .expect("pooling checkpoint requested for pooling layer")
+            .clone()
+    }
+
+    fn restore(
+        &mut self,
+        checkpoint: &Self::Checkpoint,
+        context: &NumericContext,
+    ) -> Result<(), Error> {
+        self.pooling
+            .as_mut()
+            .ok_or_else(|| Error::backend("layer has no pooling attention state"))?
+            .restore(checkpoint, context)
+    }
+
+    fn finalize(&mut self) -> Result<(), Error> {
+        self.pooling
+            .as_mut()
+            .ok_or_else(|| Error::backend("layer has no pooling attention state"))?
+            .finalize()
+    }
+
+    fn clear(&mut self) -> Result<(), Error> {
+        self.pooling
+            .as_mut()
+            .ok_or_else(|| Error::backend("layer has no pooling attention state"))?
             .clear()
     }
 }
@@ -6747,6 +8278,90 @@ struct NumericAddressableBank {
     trace: NumericContext,
 }
 
+fn numeric_expert_communication(
+    operation: CommunicationOperation,
+) -> PartitionCommunication<NumericBackend, u64, u64, NumericCommunicationMetadata> {
+    let limits = CommunicationTensorLimits::new(
+        1,
+        2,
+        1_024,
+        (operation == CommunicationOperation::VariableAllToAll).then_some(1_024),
+    )
+    .unwrap();
+    let requirement = CommunicationOperationRequirement::tensors(
+        operation,
+        [eredu_core::checkpoint::TensorDtype::F32],
+        limits,
+        true,
+    )
+    .unwrap();
+    let descriptor = CommunicationGroupDescriptor::new(
+        CollectiveGroupId::new(41),
+        0,
+        vec![2, 3],
+        Some(1),
+        CommunicationGroupRequirements::new([requirement]).unwrap(),
+    )
+    .unwrap();
+    let manifest = CommunicationManifest::new(4, 3, vec![descriptor], Vec::new())
+        .unwrap()
+        .with_completion_policy(
+            CommunicationCompletionPolicy::new(
+                std::time::Duration::from_secs(1),
+                CompletionCancellationMode::QuarantineUntilComplete,
+            )
+            .unwrap(),
+        );
+    PartitionCommunication::new(
+        manifest,
+        vec![RealizedCommunicationGroup::new(
+            CollectiveGroupId::new(41),
+            41,
+        )],
+        Vec::<RealizedCommunicationRoute<u64>>::new(),
+        NumericCommunicationMetadata(Some(eredu_core::checkpoint::TensorDtype::F32)),
+    )
+    .unwrap()
+}
+
+fn numeric_expert_count_communication(
+) -> PartitionCommunication<NumericBackend, u64, u64, NumericCommunicationMetadata> {
+    let requirement = CommunicationOperationRequirement::tensors(
+        CommunicationOperation::AllGatherEven,
+        [eredu_core::checkpoint::TensorDtype::I32],
+        CommunicationTensorLimits::new(1, 1, 16, None).unwrap(),
+        true,
+    )
+    .unwrap();
+    let descriptor = CommunicationGroupDescriptor::new(
+        CollectiveGroupId::new(41),
+        0,
+        vec![2, 3],
+        Some(1),
+        CommunicationGroupRequirements::new([requirement]).unwrap(),
+    )
+    .unwrap();
+    let manifest = CommunicationManifest::new(4, 3, vec![descriptor], Vec::new())
+        .unwrap()
+        .with_completion_policy(
+            CommunicationCompletionPolicy::new(
+                std::time::Duration::from_secs(1),
+                CompletionCancellationMode::QuarantineUntilComplete,
+            )
+            .unwrap(),
+        );
+    PartitionCommunication::new(
+        manifest,
+        vec![RealizedCommunicationGroup::new(
+            CollectiveGroupId::new(41),
+            41,
+        )],
+        Vec::<RealizedCommunicationRoute<u64>>::new(),
+        NumericCommunicationMetadata(Some(eredu_core::checkpoint::TensorDtype::I32)),
+    )
+    .unwrap()
+}
+
 impl AddressableGatedProductBank<NumericBackend> for NumericAddressableBank {
     type Error = Error;
 
@@ -6857,6 +8472,103 @@ fn routed_extension_translates_architecture_identity_to_grouped_mechanisms() {
             NumericMechanismTrace::AllToAll(41),
         ]
     );
+}
+
+#[test]
+fn neutral_expert_count_consensus_uses_opaque_even_gather() {
+    let context = NumericContext::default();
+    let communication = numeric_expert_count_communication();
+
+    let counts = agree_expert_route_counts(
+        CollectiveGroupId::new(41),
+        1,
+        vec![2, 0],
+        &communication,
+        &context,
+        &context,
+    )
+    .unwrap();
+
+    assert_eq!(counts.count_matrix(), [2, 0, 2, 0]);
+    assert_eq!(counts.forward().send(), [2, 0]);
+    assert_eq!(counts.forward().receive(), [0, 0]);
+    assert_eq!(
+        context.mechanism_trace(),
+        [NumericMechanismTrace::AllGatherEven { group: 41, axis: 0 }]
+    );
+}
+
+#[test]
+fn neutral_expert_exchange_preserves_forward_and_reverse_peer_layouts() {
+    let context = NumericContext::default();
+    let communication = numeric_expert_communication(CommunicationOperation::VariableAllToAll);
+    let counts = ExpertRouteCountPlan::from_consensus(
+        CollectiveGroupId::new(41),
+        1,
+        vec![2, 1],
+        vec![0, 3, 2, 1],
+    )
+    .unwrap();
+    let input = NumericTensor::new(vec![3, 2], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+
+    let owner_rows = exchange_expert_rows(
+        &counts,
+        ExpertRouteExchangeDirection::Forward,
+        input,
+        &communication,
+        &context,
+    )
+    .unwrap();
+    assert_eq!(owner_rows.shape(), [4, 2]);
+    let returned = exchange_expert_rows(
+        &counts,
+        ExpertRouteExchangeDirection::Reverse,
+        owner_rows,
+        &communication,
+        &context,
+    )
+    .unwrap();
+    assert_eq!(returned.shape(), [3, 2]);
+    assert_eq!(
+        context.mechanism_trace(),
+        [
+            NumericMechanismTrace::VariableAllToAll {
+                group: 41,
+                send: vec![2, 1],
+                receive: vec![3, 1],
+            },
+            NumericMechanismTrace::VariableAllToAll {
+                group: 41,
+                send: vec![3, 1],
+                receive: vec![2, 1],
+            },
+        ]
+    );
+}
+
+#[test]
+fn neutral_expert_exchange_fails_before_backend_on_contract_error() {
+    let context = NumericContext::default();
+    let communication = numeric_expert_communication(CommunicationOperation::AllReduceSum);
+    let counts = ExpertRouteCountPlan::from_consensus(
+        CollectiveGroupId::new(41),
+        1,
+        vec![0, 1],
+        vec![1, 0, 0, 1],
+    )
+    .unwrap();
+    let input = NumericTensor::new(vec![1, 2], vec![1.0, 2.0]);
+
+    let error = exchange_expert_rows(
+        &counts,
+        ExpertRouteExchangeDirection::Forward,
+        input,
+        &communication,
+        &context,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("variable-count exchange"));
+    assert!(context.mechanism_trace().is_empty());
 }
 
 #[derive(Default)]
@@ -8997,6 +10709,116 @@ fn assert_shared_qwen_tp2(model_type: &str, tied: bool) {
 }
 
 #[test]
+fn partitioned_dense_qwen_matches_shared_numeric_decoder() {
+    for model_type in ["qwen2", "qwen3"] {
+        let mut value = config(model_type, false);
+        value["num_hidden_layers"] = 2.into();
+        let args = qwen::model_args_from_config_value(&value).unwrap();
+        let tokens = NumericTensor::token_ids(&[0, 4, 6]);
+
+        let reference_context = NumericContext::default();
+        let reference =
+            qwen::LayeredModel::<NumericBackend>::new(args.clone(), &reference_context).unwrap();
+        let reference_units = (0..args.num_hidden_layers as usize)
+            .map(|layer| {
+                <qwen::LayeredModel<NumericBackend> as LayeredArchitecture<
+                    NumericBackend,
+                    DeviceState<NumericBackend, NumericHybridLayerState>,
+                >>::build_unit(&reference, 0, layer, &reference_context)
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let mut reference_runtime =
+            LayerwiseRuntime::new(reference, ResidentUnitWindow::new(reference_units));
+        let mut reference_state = DeviceState::<NumericBackend, _>::create(
+            qwen::state_layout(&args).unwrap(),
+            |_, policy| Ok::<_, Error>(NumericHybridLayerState::new(policy)),
+        )
+        .unwrap();
+        let expected = reference_runtime
+            .forward(
+                decoder::LayeredInput {
+                    tokens: &tokens,
+                    mask: None,
+                },
+                &mut reference_state,
+                &reference_context,
+            )
+            .unwrap();
+
+        let description = qwen::dense_parameter_description(&args).unwrap();
+        let topology = ParallelTopology::new(1, 1, 1, 1).unwrap();
+        let rank = ParallelRankTopology::new(topology, 0).unwrap();
+        let layout = eredu_architectures::partitioned_execution::derive_partitioned_local_layout(
+            &description,
+            rank,
+        )
+        .unwrap();
+        let units = 0..args.num_hidden_layers as usize;
+        let geometry = qwen::partition_local_geometry(&args, &layout, units.clone()).unwrap();
+        let state_layout = geometry.complete_state_layout().clone();
+        let state_plan = eredu_runtime::ArchitectureStatePartitionPlan::new([
+            eredu_runtime::ArchitectureStatePartitionRule::group_units(0, 0..state_layout.len()),
+        ]);
+        let partition = eredu_runtime::ArchitecturePartition::from_description(
+            &description,
+            [(decoder::TEXT_DECODER_EXECUTION_GROUP, units)],
+            eredu_runtime::PartitionOwnership::new(true, true, ["embedding", "norm", "output"])
+                .unwrap(),
+            &state_layout,
+            &state_plan,
+            geometry,
+            eredu_runtime::NoAuxiliaryBoundarySchema::new(args.hidden_size),
+        )
+        .unwrap();
+        let context = NumericContext::with_local_layout(layout);
+        let architecture = qwen::PartitionedLayeredModel::<NumericBackend>::from_partition(
+            args.clone(),
+            &description,
+            &partition,
+            &context,
+        )
+        .unwrap();
+        let local_units = (0..args.num_hidden_layers as usize)
+            .map(|layer| {
+                <qwen::PartitionedLayeredModel<NumericBackend> as LayeredArchitecture<
+                    NumericBackend,
+                    DeviceState<NumericBackend, NumericHybridLayerState>,
+                >>::build_unit(&architecture, 0, layer, &context)
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let mut runtime = LayerwiseRuntime::new(architecture, ResidentUnitWindow::new(local_units));
+        let mut state = DeviceState::<NumericBackend, _>::create(state_layout, |_, policy| {
+            Ok::<_, Error>(NumericHybridLayerState::new(policy))
+        })
+        .unwrap();
+        let actual = runtime
+            .forward(
+                decoder::LayeredInput {
+                    tokens: &tokens,
+                    mask: None,
+                },
+                &mut state,
+                &context,
+            )
+            .unwrap();
+
+        assert_tensor_exact(
+            &actual,
+            &expected,
+            &format!("partitioned {model_type} logits"),
+        );
+        assert_state_exact(
+            &state,
+            &reference_state,
+            args.num_hidden_layers as usize,
+            &format!("partitioned {model_type} state"),
+        );
+    }
+}
+
+#[test]
 fn shared_qwen2_qwen3_and_routed_moe_tp2_match_replicated_with_exact_collectives() {
     assert_shared_qwen_tp2("qwen2", false);
     assert_shared_qwen_tp2("qwen3", true);
@@ -10839,7 +12661,7 @@ fn muse_text_decode_skips_vision_and_is_chunk_invariant() {
           "output_multiplier":1.0,"final_logit_softcapping":7.0},
         "vision_config":{"model_type":"muse_glimmer_vision","hidden_size":8,
           "intermediate_size":12,"num_attention_heads":2,"num_hidden_layers":1,
-          "patch_size":2,"patch_temporal":1,"merge_size":1,"pos_emb_height":2,
+          "patch_size":2,"patch_temporal":1,"merge_size":2,"pos_emb_height":2,
           "pos_emb_width":2,"max_position_embeddings":4,"layer_norm_eps":0.00001,
           "hidden_act":"gelu","layer_types":["full_attention"],
           "rope_parameters":{"rope_theta":10000.0,"rope_type":"default"}}
@@ -11996,6 +13818,7 @@ fn assert_lfm2_tp2_mixed_state_matches_replicated_and_rolls_back_invalid_tokens(
     let args = lfm2::model_args_from_config_value(&config).unwrap();
     let context = NumericContext::default();
     let architecture = lfm2::LayeredModel::<NumericBackend>::new(args.clone(), &context).unwrap();
+    let description = architecture.parameter_description(&context).unwrap();
     let mut groups = lfm2::static_parallel_parameter_groups(architecture.static_modules()).unwrap();
     for layer in 0..2 {
         let unit = <lfm2::LayeredModel<NumericBackend> as LayeredArchitecture<
@@ -12080,19 +13903,89 @@ fn assert_lfm2_tp2_mixed_state_matches_replicated_and_rolls_back_invalid_tokens(
             .enumerate()
             .map(|(rank, layout)| {
                 let args = args.clone();
+                let description = description.clone();
                 let tokens = tokens.clone();
                 let group = Arc::clone(&group);
                 scope.spawn(move || {
                     let context = NumericContext::with_local_layout(layout.clone());
-                    let geometry = lfm2::local_geometry(&args, &layout).unwrap();
-                    let state_layout = geometry.state_layout().clone();
-                    let architecture = lfm2::LayeredModel::<NumericBackend>::new_parallel(
-                        args, geometry, &context,
-                    )
-                    .unwrap();
+                    let (architecture, state_layout) = if sparse {
+                        let topology = ParallelRankTopology::new(
+                            ParallelTopology::new(2, 1, 1, 1).unwrap(),
+                            rank,
+                        )
+                        .unwrap();
+                        let plan_source = lfm2::LayeredModel::<NumericBackend>::new_parallel(
+                            args.clone(),
+                            lfm2::local_geometry(&args, &layout).unwrap(),
+                            &context,
+                        )
+                        .unwrap();
+                        let realization = lfm2::expert_realization_plan(&plan_source, topology)
+                            .unwrap()
+                            .unwrap();
+                        let geometry = lfm2::partition_local_routed_geometry(
+                            &args,
+                            &layout,
+                            0..2,
+                            topology,
+                            &realization,
+                        )
+                        .unwrap();
+                        let state_layout = geometry.complete_state_layout().clone();
+                        let partition = ArchitecturePartition::from_description(
+                            &description,
+                            [(decoder::TARGET_EXECUTION_GROUP, 0..2)],
+                            PartitionOwnership::new(true, true, ["embedding", "norm", "output"])
+                                .unwrap(),
+                            &state_layout,
+                            &ArchitectureStatePartitionPlan::new([
+                                ArchitectureStatePartitionRule::group_units(0, 0..2),
+                            ]),
+                            geometry,
+                            NoAuxiliaryBoundarySchema::new(args.hidden_size),
+                        )
+                        .unwrap();
+                        (
+                            lfm2::PartitionedLayeredModel::<NumericBackend>::from_partition(
+                                args.clone(),
+                                &description,
+                                &partition,
+                                &context,
+                            )
+                            .unwrap(),
+                            state_layout,
+                        )
+                    } else {
+                        let geometry =
+                            lfm2::partition_local_geometry(&args, &layout, 0..2).unwrap();
+                        let state_layout = geometry.complete_state_layout().clone();
+                        let partition = ArchitecturePartition::from_description(
+                            &description,
+                            [(decoder::TARGET_EXECUTION_GROUP, 0..2)],
+                            PartitionOwnership::new(true, true, ["embedding", "norm", "output"])
+                                .unwrap(),
+                            &state_layout,
+                            &ArchitectureStatePartitionPlan::new([
+                                ArchitectureStatePartitionRule::group_units(0, 0..2),
+                            ]),
+                            geometry,
+                            NoAuxiliaryBoundarySchema::new(args.hidden_size),
+                        )
+                        .unwrap();
+                        (
+                            lfm2::PartitionedLayeredModel::<NumericBackend>::from_partition(
+                                args.clone(),
+                                &description,
+                                &partition,
+                                &context,
+                            )
+                            .unwrap(),
+                            state_layout,
+                        )
+                    };
                     let units = (0..2)
                         .map(|layer| {
-                            <lfm2::LayeredModel<NumericBackend> as LayeredArchitecture<
+                            <lfm2::PartitionedLayeredModel<NumericBackend> as LayeredArchitecture<
                                 NumericBackend,
                                 DeviceState<NumericBackend, NumericHybridLayerState>,
                             >>::build_unit(
@@ -12167,6 +14060,1317 @@ fn assert_lfm2_tp2_mixed_state_matches_replicated_and_rolls_back_invalid_tokens(
 fn lfm2_and_lfm2_moe_tp2_mixed_state_match_replicated_and_rollback_invalid_tokens() {
     assert_lfm2_tp2_mixed_state_matches_replicated_and_rolls_back_invalid_tokens(false);
     assert_lfm2_tp2_mixed_state_matches_replicated_and_rolls_back_invalid_tokens(true);
+}
+
+#[test]
+fn routed_lfm2_partitioned_pure_pp_uses_ordinary_provider_path() {
+    let args = lfm2::model_args_from_config_value(&serde_json::json!({
+        "model_type":"lfm2_moe", "vocab_size":7, "hidden_size":8,
+        "intermediate_size":10, "num_hidden_layers":2,
+        "num_attention_heads":4, "num_key_value_heads":2,
+        "max_position_embeddings":32, "layer_types":["conv","full_attention"],
+        "conv_L_cache":3, "block_multiple_of":2,
+        "block_ffn_dim_multiplier":1.0, "block_auto_adjust_ff_dim":true,
+        "num_dense_layers":1, "moe_intermediate_size":6,
+        "num_experts":2, "num_experts_per_tok":1,
+        "tie_word_embeddings":false
+    }))
+    .unwrap();
+    let context = NumericContext::default();
+    let reference_architecture =
+        lfm2::LayeredModel::<NumericBackend>::new(args.clone(), &context).unwrap();
+    let description = reference_architecture
+        .parameter_description(&context)
+        .unwrap();
+    let reference_units = (0..2)
+        .map(|index| {
+            <lfm2::LayeredModel<NumericBackend> as LayeredArchitecture<
+                NumericBackend,
+                DeviceState<NumericBackend, NumericHybridLayerState>,
+            >>::build_unit(&reference_architecture, 0, index, &context)
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let mut reference = LayerwiseRuntime::new(
+        reference_architecture,
+        ResidentUnitWindow::new(reference_units),
+    );
+    let mut reference_state = DeviceState::<NumericBackend, _>::create(
+        lfm2::state_layout(&args).unwrap(),
+        |_, policy| Ok::<_, Error>(NumericHybridLayerState::new(policy)),
+    )
+    .unwrap();
+    let inputs = [
+        NumericTensor::token_ids(&[0, 4, 6]),
+        NumericTensor::token_ids(&[3]),
+    ];
+    let expected = inputs
+        .iter()
+        .map(|tokens| {
+            reference
+                .forward(
+                    decoder::LayeredInput { tokens, mask: None },
+                    &mut reference_state,
+                    &context,
+                )
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+
+    let topology = ParallelTopology::new(1, 2, 1, 1).unwrap();
+    let make_stage = |stage: usize, range: std::ops::Range<usize>| {
+        let rank = ParallelRankTopology::new(topology, stage).unwrap();
+        let layout = eredu_architectures::partitioned_execution::derive_partitioned_local_layout(
+            &description,
+            rank,
+        )
+        .unwrap();
+        let context = NumericContext::with_local_layout(layout.clone());
+        let plan_source =
+            lfm2::LayeredModel::<NumericBackend>::new(args.clone(), &context).unwrap();
+        let realization = lfm2::expert_realization_plan(&plan_source, rank)
+            .unwrap()
+            .unwrap();
+        let geometry = lfm2::partition_local_routed_geometry(
+            &args,
+            &layout,
+            range.clone(),
+            rank,
+            &realization,
+        )
+        .unwrap();
+        let complete_state = geometry.complete_state_layout().clone();
+        let ownership = if stage == 0 {
+            PartitionOwnership::new(true, false, ["embedding"]).unwrap()
+        } else {
+            PartitionOwnership::new(false, true, ["norm", "output"]).unwrap()
+        };
+        let partition = ArchitecturePartition::from_description(
+            &description,
+            [(decoder::TARGET_EXECUTION_GROUP, range.clone())],
+            ownership,
+            &complete_state,
+            &ArchitectureStatePartitionPlan::new([ArchitectureStatePartitionRule::group_units(
+                0,
+                0..2,
+            )]),
+            geometry,
+            NoAuxiliaryBoundarySchema::new(args.hidden_size),
+        )
+        .unwrap();
+        let architecture = lfm2::PartitionedLayeredModel::<NumericBackend>::from_partition(
+            args.clone(),
+            &description,
+            &partition,
+            &context,
+        )
+        .unwrap();
+        let units = range
+            .clone()
+            .map(|index| architecture.construct_unit(index, &context).unwrap())
+            .collect::<Vec<_>>();
+        let state = DeviceState::<NumericBackend, _>::create(
+            partition.state().unwrap().layout().clone(),
+            |_, policy| Ok::<_, Error>(NumericHybridLayerState::new(policy)),
+        )
+        .unwrap();
+        let driver = LayeredPartitionDriver::new(&partition, 0, range).unwrap();
+        let provider = PlannedResidentGatedProduct::new_partitioned(
+            ExecutionGroupId::new(decoder::TARGET_EXECUTION_GROUP).unwrap(),
+            realization,
+            1,
+        )
+        .unwrap();
+        (architecture, units, state, driver, provider, context)
+    };
+    let (
+        mut first_model,
+        mut first_units,
+        mut first_state,
+        first_driver,
+        mut first_provider,
+        first_context,
+    ) = make_stage(0, 0..1);
+    let (
+        mut last_model,
+        mut last_units,
+        mut last_state,
+        last_driver,
+        mut last_provider,
+        last_context,
+    ) = make_stage(1, 1..2);
+    for (step, tokens) in inputs.iter().enumerate() {
+        let mut first = first_driver
+            .begin(
+                &mut first_model,
+                LayeredPartitionInput::Tokens(tokens),
+                None,
+                &mut first_state,
+                None,
+                &first_context,
+            )
+            .unwrap();
+        first.hidden = first_model
+            .forward_unit_with_provider(
+                0,
+                0,
+                &mut first_units[0],
+                &first.hidden,
+                &mut first_state,
+                &mut first.context,
+                if tokens.dim(1) > 1 {
+                    ExpertPass::Prefill
+                } else {
+                    ExpertPass::Decode
+                },
+                &mut first_provider,
+                &first_context,
+            )
+            .unwrap();
+        let LayeredPartitionOutput::Boundary { hidden, .. } = first_driver
+            .finish(
+                &mut first_model,
+                &first.hidden,
+                &mut first_state,
+                &mut first.context,
+                None,
+                &first_context,
+            )
+            .unwrap()
+        else {
+            panic!("input LFM2 stage unexpectedly produced logits")
+        };
+        let mut last = last_driver
+            .begin(
+                &mut last_model,
+                LayeredPartitionInput::Hidden {
+                    hidden,
+                    auxiliary: NoAuxiliaryBoundary,
+                },
+                None,
+                &mut last_state,
+                None,
+                &last_context,
+            )
+            .unwrap();
+        last.hidden = last_model
+            .forward_unit_with_provider(
+                0,
+                1,
+                &mut last_units[0],
+                &last.hidden,
+                &mut last_state,
+                &mut last.context,
+                if tokens.dim(1) > 1 {
+                    ExpertPass::Prefill
+                } else {
+                    ExpertPass::Decode
+                },
+                &mut last_provider,
+                &last_context,
+            )
+            .unwrap();
+        let LayeredPartitionOutput::Final { output, .. } = last_driver
+            .finish(
+                &mut last_model,
+                &last.hidden,
+                &mut last_state,
+                &mut last.context,
+                None,
+                &last_context,
+            )
+            .unwrap()
+        else {
+            panic!("output LFM2 stage unexpectedly produced a boundary")
+        };
+        assert_tensor_close(
+            &output,
+            &expected[step],
+            &format!("routed LFM2 PP2 step {step}"),
+        );
+    }
+}
+
+#[test]
+fn dense_lfm2_partitioned_tp2_pp2_matches_replicated_prefill_and_decode() {
+    let args = lfm2::model_args_from_config_value(&serde_json::json!({
+        "model_type":"lfm2", "vocab_size":7, "hidden_size":8,
+        "intermediate_size":12, "num_hidden_layers":4,
+        "num_attention_heads":4, "num_key_value_heads":2,
+        "max_position_embeddings":64,
+        "layer_types":["conv","full_attention","conv","full_attention"],
+        "conv_L_cache":3, "block_auto_adjust_ff_dim":false,
+        "tie_word_embeddings":false
+    }))
+    .unwrap();
+    let reference_context = NumericContext::default();
+    let reference_architecture =
+        lfm2::LayeredModel::<NumericBackend>::new(args.clone(), &reference_context).unwrap();
+    let description = reference_architecture
+        .parameter_description(&reference_context)
+        .unwrap();
+    let reference_units = (0..4)
+        .map(|layer| {
+            <lfm2::LayeredModel<NumericBackend> as LayeredArchitecture<
+                NumericBackend,
+                DeviceState<NumericBackend, NumericHybridLayerState>,
+            >>::build_unit(&reference_architecture, 0, layer, &reference_context)
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let mut reference = LayerwiseRuntime::new(
+        reference_architecture,
+        ResidentUnitWindow::new(reference_units),
+    );
+    let mut reference_state = DeviceState::<NumericBackend, _>::create(
+        lfm2::state_layout(&args).unwrap(),
+        |_, policy| Ok::<_, Error>(NumericHybridLayerState::new(policy)),
+    )
+    .unwrap();
+    let prefill = NumericTensor::token_ids(&[0, 4, 6]);
+    let decode = NumericTensor::token_ids(&[3]);
+    let expected_prefill = reference
+        .forward(
+            decoder::LayeredInput {
+                tokens: &prefill,
+                mask: None,
+            },
+            &mut reference_state,
+            &reference_context,
+        )
+        .unwrap();
+    let expected_decode = reference
+        .forward(
+            decoder::LayeredInput {
+                tokens: &decode,
+                mask: None,
+            },
+            &mut reference_state,
+            &reference_context,
+        )
+        .unwrap();
+
+    let topology = ParallelTopology::new(2, 2, 1, 1).unwrap();
+    let tensor_group = NumericParallelGroup::new(2);
+    let results = std::thread::scope(|scope| {
+        let handles = (0..2)
+            .map(|tensor_rank| {
+                let args = args.clone();
+                let description = description.clone();
+                let prefill = prefill.clone();
+                let decode = decode.clone();
+                let tensor_group = Arc::clone(&tensor_group);
+                scope.spawn(move || {
+                    let rank = ParallelRankTopology::new(topology, tensor_rank).unwrap();
+                    let layout = eredu_architectures::partitioned_execution::derive_partitioned_local_layout(
+                        &description,
+                        rank,
+                    )
+                    .unwrap();
+                    let context = NumericContext::with_local_layout(layout.clone());
+                    let state_plan = ArchitectureStatePartitionPlan::new([
+                        ArchitectureStatePartitionRule::group_units(0, 0..4),
+                    ]);
+                    let make_stage = |
+                        range: std::ops::Range<usize>,
+                        ownership: PartitionOwnership,
+                    | {
+                        let geometry =
+                            lfm2::partition_local_geometry(&args, &layout, range.clone()).unwrap();
+                        let complete_state = geometry.complete_state_layout().clone();
+                        let partition = ArchitecturePartition::from_description(
+                            &description,
+                            [(decoder::TARGET_EXECUTION_GROUP, range.clone())],
+                            ownership,
+                            &complete_state,
+                            &state_plan,
+                            geometry,
+                            NoAuxiliaryBoundarySchema::new(args.hidden_size),
+                        )
+                        .unwrap();
+                        let architecture =
+                            lfm2::PartitionedLayeredModel::<NumericBackend>::from_partition(
+                                args.clone(),
+                                &description,
+                                &partition,
+                                &context,
+                            )
+                            .unwrap();
+                        let units = range
+                            .clone()
+                            .map(|index| architecture.construct_unit(index, &context).unwrap())
+                            .collect::<Vec<_>>();
+                        let state = DeviceState::<NumericBackend, _>::create(
+                            partition.state().unwrap().layout().clone(),
+                            |_, policy| Ok::<_, Error>(NumericHybridLayerState::new(policy)),
+                        )
+                        .unwrap();
+                        let driver = LayeredPartitionDriver::new(&partition, 0, range).unwrap();
+                        (architecture, units, state, driver, partition)
+                    };
+                    let (mut input_model, mut input_units, mut input_state, input_driver, input_partition) =
+                        make_stage(
+                            0..2,
+                            PartitionOwnership::new(true, false, ["embedding"]).unwrap(),
+                        );
+                    let (mut output_model, mut output_units, mut output_state, output_driver, output_partition) =
+                        make_stage(
+                            2..4,
+                            PartitionOwnership::new(false, true, ["norm", "output"]).unwrap(),
+                        );
+                    let parallel = NumericParallelContext::new(tensor_rank, tensor_group);
+
+                    let (actual_prefill, actual_decode) = {
+                        let mut run = |tokens: &NumericTensor| -> NumericTensor {
+                            let mut first = input_driver
+                            .begin(
+                                &mut input_model,
+                                LayeredPartitionInput::Tokens(tokens),
+                                None,
+                                &mut input_state,
+                                Some(&parallel),
+                                &context,
+                            )
+                            .unwrap();
+                        for (ordinal, index) in (0..2).enumerate() {
+                            first.hidden = input_model
+                                .forward_unit_parallel(
+                                    0,
+                                    index,
+                                    &mut input_units[ordinal],
+                                    &first.hidden,
+                                    &mut input_state,
+                                    &mut first.context,
+                                    &parallel,
+                                    &context,
+                                )
+                                .unwrap();
+                        }
+                        let boundary = input_driver
+                            .finish(
+                                &mut input_model,
+                                &first.hidden,
+                                &mut input_state,
+                                &mut first.context,
+                                Some(&parallel),
+                                &context,
+                            )
+                            .unwrap();
+                        let LayeredPartitionOutput::Boundary { hidden, .. } = boundary else {
+                            panic!("input LFM2 stage unexpectedly produced logits")
+                        };
+                        let mut second = output_driver
+                            .begin(
+                                &mut output_model,
+                                LayeredPartitionInput::Hidden {
+                                    hidden,
+                                    auxiliary: NoAuxiliaryBoundary,
+                                },
+                                None,
+                                &mut output_state,
+                                Some(&parallel),
+                                &context,
+                            )
+                            .unwrap();
+                        for (ordinal, index) in (2..4).enumerate() {
+                            second.hidden = output_model
+                                .forward_unit_parallel(
+                                    0,
+                                    index,
+                                    &mut output_units[ordinal],
+                                    &second.hidden,
+                                    &mut output_state,
+                                    &mut second.context,
+                                    &parallel,
+                                    &context,
+                                )
+                                .unwrap();
+                        }
+                        let output = output_driver
+                            .finish(
+                                &mut output_model,
+                                &second.hidden,
+                                &mut output_state,
+                                &mut second.context,
+                                Some(&parallel),
+                                &context,
+                            )
+                            .unwrap();
+                        let LayeredPartitionOutput::Final { output, .. } = output else {
+                            panic!("output LFM2 stage unexpectedly produced a boundary")
+                        };
+                            output
+                        };
+                        (run(&prefill), run(&decode))
+                    };
+                    assert_eq!(input_partition.state().unwrap().global_layer_offset(), 0);
+                    assert_eq!(output_partition.state().unwrap().global_layer_offset(), 2);
+                    assert_eq!(input_state.layer(0).unwrap().position(), 4);
+                    assert_eq!(input_state.layer(1).unwrap().position(), 4);
+                    assert_eq!(output_state.layer(0).unwrap().position(), 4);
+                    assert_eq!(output_state.layer(1).unwrap().position(), 4);
+                    let input_conv = input_state.as_ref()[0]
+                        .fixed
+                        .get(&StateTensorRole::Convolution { slot: 0 })
+                        .unwrap()
+                        .as_ref()
+                        .unwrap();
+                    let output_conv = output_state.as_ref()[0]
+                        .fixed
+                        .get(&StateTensorRole::Convolution { slot: 0 })
+                        .unwrap()
+                        .as_ref()
+                        .unwrap();
+                    assert_eq!(input_conv.shape, [1, 2, 4]);
+                    assert_eq!(output_conv.shape, [1, 2, 4]);
+                    (actual_prefill, actual_decode)
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    for (rank, (actual_prefill, actual_decode)) in results.iter().enumerate() {
+        assert_tensor_close(
+            actual_prefill,
+            &expected_prefill,
+            &format!("partitioned LFM2 TP2xPP2 rank {rank} prefill"),
+        );
+        assert_tensor_close(
+            actual_decode,
+            &expected_decode,
+            &format!("partitioned LFM2 TP2xPP2 rank {rank} decode"),
+        );
+    }
+}
+
+#[test]
+fn routed_kimi_partitioned_tp2_pp2_matches_replicated_prefill_and_repeated_decode() {
+    let args = kimi_linear::model_args_from_config_value(&serde_json::json!({
+        "model_type":"kimi_linear", "vocab_size":8, "hidden_size":8,
+        "num_hidden_layers":4, "num_attention_heads":2, "num_key_value_heads":2,
+        "intermediate_size":10, "head_dim":4, "model_max_length":64,
+        "linear_attn_config":{
+            "kda_layers":[1,3], "full_attn_layers":[2,4], "num_heads":2,
+            "head_dim":4, "short_conv_kernel_size":3
+        },
+        "num_experts":2, "moe_intermediate_size":6, "kv_lora_rank":4,
+        "qk_nope_head_dim":4, "qk_rope_head_dim":2, "v_head_dim":4,
+        "mla_use_nope":true, "num_experts_per_token":1, "num_shared_experts":1,
+        "routed_scaling_factor":1.0, "first_k_dense_replace":1,
+        "num_expert_group":1, "topk_group":1, "tie_word_embeddings":false
+    }))
+    .unwrap();
+    let reference_context = NumericContext::default();
+    let reference_architecture =
+        kimi_linear::LayeredModel::<NumericBackend>::new(args.clone(), &reference_context).unwrap();
+    let description = reference_architecture
+        .parameter_description(&reference_context)
+        .unwrap();
+    let reference_units = (0..4)
+        .map(|layer| {
+            <kimi_linear::LayeredModel<NumericBackend> as LayeredArchitecture<
+                NumericBackend,
+                DeviceState<NumericBackend, NumericHybridLayerState>,
+            >>::build_unit(&reference_architecture, 0, layer, &reference_context)
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let mut reference = LayerwiseRuntime::new(
+        reference_architecture,
+        ResidentUnitWindow::new(reference_units),
+    );
+    let mut reference_state = DeviceState::<NumericBackend, _>::create(
+        kimi_linear::state_layout(&args).unwrap(),
+        |_, policy| Ok::<_, Error>(NumericHybridLayerState::new(policy)),
+    )
+    .unwrap();
+    let inputs = [
+        NumericTensor::token_ids(&[0, 4, 6]),
+        NumericTensor::token_ids(&[3]),
+        NumericTensor::token_ids(&[2]),
+    ];
+    let expected = inputs
+        .iter()
+        .map(|tokens| {
+            reference
+                .forward(
+                    decoder::LayeredInput { tokens, mask: None },
+                    &mut reference_state,
+                    &reference_context,
+                )
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+
+    let topology = ParallelTopology::new(2, 2, 1, 1).unwrap();
+    let tensor_group = NumericParallelGroup::new(2);
+    let results = std::thread::scope(|scope| {
+        let handles = (0..2)
+            .map(|tensor_rank| {
+                let args = args.clone();
+                let description = description.clone();
+                let inputs = inputs.clone();
+                let tensor_group = Arc::clone(&tensor_group);
+                scope.spawn(move || {
+                    let rank = ParallelRankTopology::new(topology, tensor_rank).unwrap();
+                    let layout = eredu_architectures::partitioned_execution::derive_partitioned_local_layout(
+                        &description,
+                        rank,
+                    )
+                    .unwrap();
+                    let context = NumericContext::with_local_layout(layout.clone());
+                    let plan_source = kimi_linear::LayeredModel::<NumericBackend>::new_parallel(
+                        args.clone(),
+                        kimi_linear::local_geometry(&args, &layout).unwrap(),
+                        &context,
+                    )
+                    .unwrap();
+                    let realization_for_stage = |pipeline_rank| {
+                        let stage_rank = (0..topology.world_size())
+                            .map(|rank| ParallelRankTopology::new(topology, rank).unwrap())
+                            .find(|rank| {
+                                rank.tensor_parallel_rank() == tensor_rank
+                                    && rank.pipeline_parallel_rank() == pipeline_rank
+                            })
+                            .unwrap();
+                        (
+                            stage_rank,
+                            kimi_linear::expert_realization_plan(&plan_source, stage_rank)
+                                .unwrap()
+                                .unwrap(),
+                        )
+                    };
+                    let state_plan = ArchitectureStatePartitionPlan::new([
+                        ArchitectureStatePartitionRule::group_units(0, 0..4),
+                    ]);
+                    let make_stage = |
+                        range: std::ops::Range<usize>,
+                        ownership: PartitionOwnership,
+                    | {
+                        let (stage_rank, realization) =
+                            realization_for_stage(range.start / 2);
+                        let geometry = kimi_linear::partition_local_routed_geometry(
+                            &args,
+                            &layout,
+                            range.clone(),
+                            stage_rank,
+                            &realization,
+                        )
+                        .unwrap();
+                        let complete_state = geometry.complete_state_layout().clone();
+                        let partition = ArchitecturePartition::from_description(
+                            &description,
+                            [(decoder::TARGET_EXECUTION_GROUP, range.clone())],
+                            ownership,
+                            &complete_state,
+                            &state_plan,
+                            geometry,
+                            NoAuxiliaryBoundarySchema::new(args.hidden_size),
+                        )
+                        .unwrap();
+                        let architecture =
+                            kimi_linear::PartitionedLayeredModel::<NumericBackend>::from_partition(
+                                args.clone(),
+                                &description,
+                                &partition,
+                                &context,
+                            )
+                            .unwrap();
+                        let units = range
+                            .clone()
+                            .map(|index| architecture.construct_unit(index, &context).unwrap())
+                            .collect::<Vec<_>>();
+                        let state = DeviceState::<NumericBackend, _>::create(
+                            partition.state().unwrap().layout().clone(),
+                            |_, policy| Ok::<_, Error>(NumericHybridLayerState::new(policy)),
+                        )
+                        .unwrap();
+                        let driver = LayeredPartitionDriver::new(&partition, 0, range).unwrap();
+                        let provider = PlannedResidentGatedProduct::new_partitioned(
+                            ExecutionGroupId::new(decoder::TARGET_EXECUTION_GROUP).unwrap(),
+                            realization,
+                            usize::try_from(args.num_experts_per_token).unwrap(),
+                        )
+                        .unwrap();
+                        (architecture, units, state, driver, partition, provider)
+                    };
+                    let (drift_rank, drift_realization) = realization_for_stage(1);
+                    let drift_geometry = kimi_linear::partition_local_routed_geometry(
+                        &args,
+                        &layout,
+                        2..4,
+                        drift_rank,
+                        &drift_realization,
+                    )
+                    .unwrap();
+                    let drift_state = drift_geometry.complete_state_layout().clone();
+                    let drift_partition = ArchitecturePartition::from_description(
+                        &description,
+                        [(decoder::TARGET_EXECUTION_GROUP, 2..4)],
+                        PartitionOwnership::new(false, true, ["norm", "output"]).unwrap(),
+                        &drift_state,
+                        &ArchitectureStatePartitionPlan::new([
+                            ArchitectureStatePartitionRule::output_owner(0..4),
+                        ]),
+                        drift_geometry,
+                        NoAuxiliaryBoundarySchema::new(args.hidden_size),
+                    )
+                    .unwrap();
+                    assert!(kimi_linear::PartitionedLayeredModel::<NumericBackend>::from_partition(
+                        args.clone(),
+                        &description,
+                        &drift_partition,
+                        &context,
+                    )
+                    .is_err());
+                    let (
+                        mut input_model,
+                        mut input_units,
+                        mut input_state,
+                        input_driver,
+                        input_partition,
+                        mut input_provider,
+                    ) = make_stage(
+                        0..2,
+                        PartitionOwnership::new(true, false, ["embedding"]).unwrap(),
+                    );
+                    let (
+                        mut output_model,
+                        mut output_units,
+                        mut output_state,
+                        output_driver,
+                        output_partition,
+                        mut output_provider,
+                    ) = make_stage(
+                        2..4,
+                        PartitionOwnership::new(false, true, ["norm", "output"]).unwrap(),
+                    );
+                    assert!(input_model.static_modules().embeddings.is_some());
+                    assert!(input_model.static_modules().norm.is_none());
+                    assert!(output_model.static_modules().embeddings.is_none());
+                    assert!(output_model.static_modules().norm.is_some());
+                    assert!(output_model.static_modules().lm_head.is_some());
+                    assert!(output_model.construct_unit(1, &context).is_err());
+                    let parallel = NumericParallelContext::new(tensor_rank, tensor_group);
+
+                    let actual = inputs
+                        .iter()
+                        .map(|tokens| {
+                            let mut first = input_driver
+                                .begin(
+                                    &mut input_model,
+                                    LayeredPartitionInput::Tokens(tokens),
+                                    None,
+                                    &mut input_state,
+                                    Some(&parallel),
+                                    &context,
+                                )
+                                .unwrap();
+                            for (ordinal, index) in (0..2).enumerate() {
+                                first.hidden = input_model
+                                    .forward_unit_parallel_with_provider(
+                                        0,
+                                        index,
+                                        &mut input_units[ordinal],
+                                        &first.hidden,
+                                        &mut input_state,
+                                        &mut first.context,
+                                        if tokens.dim(1) > 1 {
+                                            ExpertPass::Prefill
+                                        } else {
+                                            ExpertPass::Decode
+                                        },
+                                        &mut input_provider,
+                                        &parallel,
+                                        &context,
+                                    )
+                                    .unwrap();
+                            }
+                            let boundary = input_driver
+                                .finish(
+                                    &mut input_model,
+                                    &first.hidden,
+                                    &mut input_state,
+                                    &mut first.context,
+                                    Some(&parallel),
+                                    &context,
+                                )
+                                .unwrap();
+                            let LayeredPartitionOutput::Boundary { hidden, .. } = boundary else {
+                                panic!("input Kimi stage unexpectedly produced logits")
+                            };
+                            let mut second = output_driver
+                                .begin(
+                                    &mut output_model,
+                                    LayeredPartitionInput::Hidden {
+                                        hidden,
+                                        auxiliary: NoAuxiliaryBoundary,
+                                    },
+                                    None,
+                                    &mut output_state,
+                                    Some(&parallel),
+                                    &context,
+                                )
+                                .unwrap();
+                            for (ordinal, index) in (2..4).enumerate() {
+                                second.hidden = output_model
+                                    .forward_unit_parallel_with_provider(
+                                        0,
+                                        index,
+                                        &mut output_units[ordinal],
+                                        &second.hidden,
+                                        &mut output_state,
+                                        &mut second.context,
+                                        if tokens.dim(1) > 1 {
+                                            ExpertPass::Prefill
+                                        } else {
+                                            ExpertPass::Decode
+                                        },
+                                        &mut output_provider,
+                                        &parallel,
+                                        &context,
+                                    )
+                                    .unwrap();
+                            }
+                            let output = output_driver
+                                .finish(
+                                    &mut output_model,
+                                    &second.hidden,
+                                    &mut output_state,
+                                    &mut second.context,
+                                    Some(&parallel),
+                                    &context,
+                                )
+                                .unwrap();
+                            let LayeredPartitionOutput::Final { output, .. } = output else {
+                                panic!("output Kimi stage unexpectedly produced a boundary")
+                            };
+                            output
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(input_partition.state().unwrap().global_layer_offset(), 0);
+                    assert_eq!(output_partition.state().unwrap().global_layer_offset(), 2);
+                    assert_eq!(input_state.layer(0).unwrap().position(), 5);
+                    assert_eq!(input_state.layer(1).unwrap().position(), 5);
+                    assert_eq!(output_state.layer(0).unwrap().position(), 5);
+                    assert_eq!(output_state.layer(1).unwrap().position(), 5);
+                    for state in [&input_state, &output_state] {
+                        let convolution = state.as_ref()[0]
+                            .fixed
+                            .get(&StateTensorRole::Convolution { slot: 0 })
+                            .unwrap()
+                            .as_ref()
+                            .unwrap();
+                        assert_eq!(convolution.shape, [1, 2, 4]);
+                        let recurrent = state.as_ref()[0]
+                            .fixed
+                            .get(&StateTensorRole::Recurrent)
+                            .unwrap()
+                            .as_ref()
+                            .unwrap();
+                        assert_eq!(recurrent.shape, [1, 1, 4, 4]);
+                        assert_eq!(state.as_ref()[1].compressed.as_ref().unwrap().offset, 5);
+                    }
+                    actual
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    for (rank, actual) in results.iter().enumerate() {
+        for (step, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+            assert_tensor_close(
+                actual,
+                expected,
+                &format!("partitioned Kimi TP2xPP2 rank {rank} step {step}"),
+            );
+        }
+    }
+}
+
+#[test]
+fn dense_nemotron_h_partitioned_tp2_pp2_matches_prefill_and_repeated_decode() {
+    let args = nemotron_h::model_args_from_config_value(&serde_json::json!({
+        "model_type":"nemotron_h", "vocab_size":8, "hidden_size":8,
+        "intermediate_size":10, "num_hidden_layers":4,
+        "hybrid_override_pattern":"M*-*", "num_attention_heads":2,
+        "num_key_value_heads":2, "head_dim":4, "mamba_num_heads":2,
+        "n_groups":2, "mamba_head_dim":4, "ssm_state_size":3,
+        "conv_kernel":3, "chunk_size":2, "sliding_window":2,
+        "n_routed_experts":2, "n_shared_experts":1,
+        "moe_intermediate_size":6, "moe_shared_expert_intermediate_size":6,
+        "num_experts_per_tok":1, "n_group":1, "topk_group":1,
+        "num_nextn_predict_layers":0, "tie_word_embeddings":false,
+        "residual_in_fp32":true
+    }))
+    .unwrap();
+    let reference_context = NumericContext::default();
+    let reference_architecture =
+        nemotron_h::LayeredModel::<NumericBackend>::new(args.clone(), &reference_context).unwrap();
+    let description = reference_architecture
+        .parameter_description(&reference_context)
+        .unwrap();
+    let reference_units = (0..4)
+        .map(|layer| {
+            <nemotron_h::LayeredModel<NumericBackend> as LayeredArchitecture<
+                NumericBackend,
+                DeviceState<NumericBackend, NumericHybridLayerState>,
+            >>::build_unit(&reference_architecture, 0, layer, &reference_context)
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let mut reference = LayerwiseRuntime::new(
+        reference_architecture,
+        ResidentUnitWindow::new(reference_units),
+    );
+    let mut reference_state = DeviceState::<NumericBackend, _>::create(
+        nemotron_h::state_layout(&args).unwrap(),
+        |_, policy| Ok::<_, Error>(NumericHybridLayerState::new(policy)),
+    )
+    .unwrap();
+    let inputs = [
+        NumericTensor::token_ids(&[0, 4, 6]),
+        NumericTensor::token_ids(&[3]),
+        NumericTensor::token_ids(&[2]),
+    ];
+    let expected = inputs
+        .iter()
+        .map(|tokens| {
+            reference
+                .forward(
+                    nemotron_h::EmbeddedInput::target(tokens, None),
+                    &mut reference_state,
+                    &reference_context,
+                )
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+
+    let topology = ParallelTopology::new(2, 2, 1, 1).unwrap();
+    let tensor_group = NumericParallelGroup::new(2);
+    let results = std::thread::scope(|scope| {
+        let handles = (0..2)
+            .map(|tensor_rank| {
+                let args = args.clone();
+                let description = description.clone();
+                let inputs = inputs.clone();
+                let tensor_group = Arc::clone(&tensor_group);
+                scope.spawn(move || {
+                    let rank = ParallelRankTopology::new(topology, tensor_rank).unwrap();
+                    let layout = eredu_architectures::partitioned_execution::derive_partitioned_local_layout(
+                        &description,
+                        rank,
+                    )
+                    .unwrap();
+                    let context = NumericContext::with_local_layout(layout.clone());
+                    let state_plan = ArchitectureStatePartitionPlan::new([
+                        ArchitectureStatePartitionRule::group_units(0, 0..4),
+                    ]);
+                    let make_stage = |
+                        range: std::ops::Range<usize>,
+                        ownership: PartitionOwnership,
+                    | {
+                        let geometry = nemotron_h::partition_local_geometry(
+                            &args,
+                            &layout,
+                            range.clone(),
+                        )
+                        .unwrap();
+                        let complete_state = geometry.complete_state_layout().clone();
+                        let partition = ArchitecturePartition::from_description(
+                            &description,
+                            [(decoder::TARGET_EXECUTION_GROUP, range.clone())],
+                            ownership,
+                            &complete_state,
+                            &state_plan,
+                            geometry,
+                            nemotron_h::TargetBoundarySchema::from_args(&args),
+                        )
+                        .unwrap();
+                        let architecture = nemotron_h::PartitionedLayeredModel::<NumericBackend>::from_partition(
+                            args.clone(),
+                            &description,
+                            &partition,
+                            &context,
+                        )
+                        .unwrap();
+                        let units = range
+                            .clone()
+                            .map(|index| architecture.construct_unit(index, &context).unwrap())
+                            .collect::<Vec<_>>();
+                        let state = DeviceState::<NumericBackend, _>::create(
+                            partition.state().unwrap().layout().clone(),
+                            |_, policy| Ok::<_, Error>(NumericHybridLayerState::new(policy)),
+                        )
+                        .unwrap();
+                        let driver = LayeredPartitionDriver::new(&partition, 0, range).unwrap();
+                        (architecture, units, state, driver, partition)
+                    };
+
+                    let drift_geometry =
+                        nemotron_h::partition_local_geometry(&args, &layout, 2..4).unwrap();
+                    let drift_state = drift_geometry.complete_state_layout().clone();
+                    let drift_partition = ArchitecturePartition::from_description(
+                        &description,
+                        [(decoder::TARGET_EXECUTION_GROUP, 2..4)],
+                        PartitionOwnership::new(false, true, ["norm", "output"]).unwrap(),
+                        &drift_state,
+                        &ArchitectureStatePartitionPlan::new([
+                            ArchitectureStatePartitionRule::output_owner(0..4),
+                        ]),
+                        drift_geometry,
+                        nemotron_h::TargetBoundarySchema::from_args(&args),
+                    )
+                    .unwrap();
+                    assert!(nemotron_h::PartitionedLayeredModel::<NumericBackend>::from_partition(
+                        args.clone(),
+                        &description,
+                        &drift_partition,
+                        &context,
+                    )
+                    .is_err());
+
+                    let (
+                        mut input_model,
+                        mut input_units,
+                        mut input_state,
+                        input_driver,
+                        input_partition,
+                    ) = make_stage(
+                        0..2,
+                        PartitionOwnership::new(true, false, ["embedding"]).unwrap(),
+                    );
+                    let (
+                        mut output_model,
+                        mut output_units,
+                        mut output_state,
+                        output_driver,
+                        output_partition,
+                    ) = make_stage(
+                        2..4,
+                        PartitionOwnership::new(false, true, ["norm", "output"]).unwrap(),
+                    );
+                    assert!(input_model.static_modules().embeddings.is_some());
+                    assert!(input_model.static_modules().norm.is_none());
+                    assert!(output_model.static_modules().embeddings.is_none());
+                    assert!(output_model.static_modules().norm.is_some());
+                    assert!(output_model.static_modules().lm_head.is_some());
+                    assert!(output_model.construct_unit(1, &context).is_err());
+                    let parallel = NumericParallelContext::new(tensor_rank, tensor_group);
+
+                    let actual = inputs
+                        .iter()
+                        .map(|tokens| {
+                            let mut first = input_driver
+                                .begin(
+                                    &mut input_model,
+                                    LayeredPartitionInput::Tokens(tokens),
+                                    None,
+                                    &mut input_state,
+                                    Some(&parallel),
+                                    &context,
+                                )
+                                .unwrap();
+                            for (ordinal, index) in (0..2).enumerate() {
+                                first.hidden = input_model
+                                    .forward_unit_parallel(
+                                        0,
+                                        index,
+                                        &mut input_units[ordinal],
+                                        &first.hidden,
+                                        &mut input_state,
+                                        &mut first.context,
+                                        &parallel,
+                                        &context,
+                                    )
+                                    .unwrap();
+                            }
+                            let boundary = input_driver
+                                .finish(
+                                    &mut input_model,
+                                    &first.hidden,
+                                    &mut input_state,
+                                    &mut first.context,
+                                    Some(&parallel),
+                                    &context,
+                                )
+                                .unwrap();
+                            let LayeredPartitionOutput::Boundary {
+                                hidden,
+                                auxiliary,
+                            } = boundary
+                            else {
+                                panic!("input Nemotron-H stage unexpectedly produced logits")
+                            };
+                            let mut second = output_driver
+                                .begin(
+                                    &mut output_model,
+                                    LayeredPartitionInput::Hidden { hidden, auxiliary },
+                                    None,
+                                    &mut output_state,
+                                    Some(&parallel),
+                                    &context,
+                                )
+                                .unwrap();
+                            let before_unowned = [
+                                output_state.layer(0).unwrap().position(),
+                                output_state.layer(1).unwrap().position(),
+                            ];
+                            assert!(output_model
+                                .forward_unit_parallel(
+                                    0,
+                                    1,
+                                    &mut output_units[0],
+                                    &second.hidden,
+                                    &mut output_state,
+                                    &mut second.context,
+                                    &parallel,
+                                    &context,
+                                )
+                                .is_err());
+                            assert_eq!(
+                                [
+                                    output_state.layer(0).unwrap().position(),
+                                    output_state.layer(1).unwrap().position(),
+                                ],
+                                before_unowned
+                            );
+                            for (ordinal, index) in (2..4).enumerate() {
+                                second.hidden = output_model
+                                    .forward_unit_parallel(
+                                        0,
+                                        index,
+                                        &mut output_units[ordinal],
+                                        &second.hidden,
+                                        &mut output_state,
+                                        &mut second.context,
+                                        &parallel,
+                                        &context,
+                                    )
+                                    .unwrap();
+                            }
+                            let output = output_driver
+                                .finish(
+                                    &mut output_model,
+                                    &second.hidden,
+                                    &mut output_state,
+                                    &mut second.context,
+                                    Some(&parallel),
+                                    &context,
+                                )
+                                .unwrap();
+                            let LayeredPartitionOutput::Final { output, .. } = output else {
+                                panic!("output Nemotron-H stage unexpectedly produced a boundary")
+                            };
+                            output
+                        })
+                        .collect::<Vec<_>>();
+
+                    assert_eq!(input_partition.state().unwrap().global_layer_offset(), 0);
+                    assert_eq!(output_partition.state().unwrap().global_layer_offset(), 2);
+                    assert_eq!(input_state.layer(0).unwrap().position(), 5);
+                    assert_eq!(input_state.layer(1).unwrap().position(), 5);
+                    assert_eq!(output_state.layer(0).unwrap().position(), 0);
+                    assert_eq!(output_state.layer(1).unwrap().position(), 5);
+                    let convolution = input_state.as_ref()[0]
+                        .fixed
+                        .get(&StateTensorRole::Convolution { slot: 0 })
+                        .unwrap()
+                        .as_ref()
+                        .unwrap();
+                    let recurrent = input_state.as_ref()[0]
+                        .fixed
+                        .get(&StateTensorRole::Recurrent)
+                        .unwrap()
+                        .as_ref()
+                        .unwrap();
+                    assert_eq!(convolution.shape, [1, 2, 10]);
+                    assert_eq!(recurrent.shape, [1, 1, 4, 3]);
+                    assert_eq!(output_state.as_ref()[1].attention.as_ref().unwrap().offset, 5);
+                    actual
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    for (rank, actual) in results.iter().enumerate() {
+        for (step, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+            assert_tensor_close(
+                actual,
+                expected,
+                &format!("partitioned Nemotron-H TP2xPP2 rank {rank} step {step}"),
+            );
+        }
+    }
+}
+
+#[test]
+fn routed_nemotron_h_partitioned_relu2_tp2_matches_replicated_prefill_and_decode() {
+    let args = nemotron_h::model_args_from_config_value(&serde_json::json!({
+        "model_type":"nemotron_h", "vocab_size":8, "hidden_size":8,
+        "intermediate_size":10, "num_hidden_layers":4,
+        "hybrid_override_pattern":"M*-E", "num_attention_heads":2,
+        "num_key_value_heads":2, "head_dim":4, "mamba_num_heads":2,
+        "n_groups":2, "mamba_head_dim":4, "ssm_state_size":3,
+        "conv_kernel":3, "chunk_size":2, "sliding_window":2,
+        "n_routed_experts":2, "n_shared_experts":1,
+        "moe_intermediate_size":6, "moe_shared_expert_intermediate_size":6,
+        "num_experts_per_tok":1, "n_group":1, "topk_group":1,
+        "num_nextn_predict_layers":0, "tie_word_embeddings":false,
+        "residual_in_fp32":true
+    }))
+    .unwrap();
+    let reference_context = NumericContext::default();
+    let reference_architecture =
+        nemotron_h::LayeredModel::<NumericBackend>::new(args.clone(), &reference_context).unwrap();
+    let description = reference_architecture
+        .parameter_description(&reference_context)
+        .unwrap();
+    let reference_units = (0..4)
+        .map(|layer| {
+            <nemotron_h::LayeredModel<NumericBackend> as LayeredArchitecture<
+                NumericBackend,
+                DeviceState<NumericBackend, NumericHybridLayerState>,
+            >>::build_unit(&reference_architecture, 0, layer, &reference_context)
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let mut reference = LayerwiseRuntime::new(
+        reference_architecture,
+        ResidentUnitWindow::new(reference_units),
+    );
+    let mut reference_state = DeviceState::<NumericBackend, _>::create(
+        nemotron_h::state_layout(&args).unwrap(),
+        |_, policy| Ok::<_, Error>(NumericHybridLayerState::new(policy)),
+    )
+    .unwrap();
+    let inputs = [
+        NumericTensor::token_ids(&[0, 4, 6]),
+        NumericTensor::token_ids(&[3]),
+    ];
+    let expected = inputs
+        .iter()
+        .map(|tokens| {
+            reference
+                .forward(
+                    nemotron_h::EmbeddedInput::target(tokens, None),
+                    &mut reference_state,
+                    &reference_context,
+                )
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+
+    let topology = ParallelTopology::new(2, 1, 1, 1).unwrap();
+    let tensor_group = NumericParallelGroup::new(2);
+    let results = std::thread::scope(|scope| {
+        let handles = (0..2)
+            .map(|tensor_rank| {
+                let args = args.clone();
+                let description = description.clone();
+                let inputs = inputs.clone();
+                let tensor_group = Arc::clone(&tensor_group);
+                scope.spawn(move || {
+                    let rank = ParallelRankTopology::new(topology, tensor_rank).unwrap();
+                    let layout = eredu_architectures::partitioned_execution::derive_partitioned_local_layout(
+                        &description,
+                        rank,
+                    )
+                    .unwrap();
+                    let context = NumericContext::with_local_layout(layout.clone());
+                    let plan_source = nemotron_h::LayeredModel::<NumericBackend>::new_parallel(
+                        args.clone(),
+                        nemotron_h::local_geometry(&args, &layout).unwrap(),
+                        &context,
+                    )
+                    .unwrap();
+                    let realization = nemotron_h::expert_realization_plan(&plan_source, rank)
+                        .unwrap()
+                        .unwrap();
+                    let geometry = nemotron_h::partition_local_routed_geometry(
+                        &args,
+                        &layout,
+                        0..4,
+                        rank,
+                        &realization,
+                    )
+                    .unwrap();
+                    let complete_state = geometry.complete_state_layout().clone();
+                    let partition = ArchitecturePartition::from_description(
+                        &description,
+                        [(decoder::TARGET_EXECUTION_GROUP, 0..4)],
+                        PartitionOwnership::new(
+                            true,
+                            true,
+                            ["embedding", "norm", "output"],
+                        )
+                        .unwrap(),
+                        &complete_state,
+                        &ArchitectureStatePartitionPlan::new([
+                            ArchitectureStatePartitionRule::group_units(0, 0..4),
+                        ]),
+                        geometry,
+                        nemotron_h::TargetBoundarySchema::from_args(&args),
+                    )
+                    .unwrap();
+                    let architecture =
+                        nemotron_h::PartitionedLayeredModel::<NumericBackend>::from_partition(
+                            args,
+                            &description,
+                            &partition,
+                            &context,
+                        )
+                        .unwrap();
+                    let units = (0..4)
+                        .map(|layer| architecture.construct_unit(layer, &context).unwrap())
+                        .collect::<Vec<_>>();
+                    let mut runtime =
+                        LayerwiseRuntime::new(architecture, ResidentUnitWindow::new(units));
+                    let mut state = DeviceState::<NumericBackend, _>::create(
+                        complete_state,
+                        |_, policy| Ok::<_, Error>(NumericHybridLayerState::new(policy)),
+                    )
+                    .unwrap();
+                    let parallel = NumericParallelContext::new(tensor_rank, tensor_group);
+                    inputs
+                        .iter()
+                        .map(|tokens| {
+                            runtime
+                                .forward_parallel(
+                                    nemotron_h::EmbeddedInput::target(tokens, None),
+                                    &mut state,
+                                    &parallel,
+                                    &context,
+                                )
+                                .unwrap()
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    for (rank, actual) in results.iter().enumerate() {
+        for (step, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+            assert_tensor_close(
+                actual,
+                expected,
+                &format!("partitioned Nemotron-H ReLU2 TP2 rank {rank} step {step}"),
+            );
+        }
+    }
 }
 
 fn assert_tensor_close(actual: &NumericTensor, expected: &NumericTensor, label: &str) {
@@ -12330,7 +15534,15 @@ impl<U> LayerwisePolicy<NumericBackend, U> for NumericReplicatedPolicy<U> {
         Ok(())
     }
 
-    fn finish(&mut self, _: &NumericTensor, _: &NumericContext) -> Result<(), Self::Error> {
+    fn finish(&mut self, _: &NumericTensor, context: &NumericContext) -> Result<(), Self::Error> {
+        if let Some(partition) = &context.partition {
+            if partition
+                .world
+                .take_fault(partition.rank, NumericPartitionFault::LocalExecution)
+            {
+                return Err(Error::backend("injected numeric local execution failure"));
+            }
+        }
         Ok(())
     }
 }
@@ -12371,12 +15583,17 @@ where
         _: Option<&mut [A::Unit]>,
         tasks: &[ReplicatedTextMaterializationTask],
         _: &[String],
-        _: &NumericContext,
+        context: &NumericContext,
     ) -> Result<(), Self::Error> {
         if tasks.is_empty() {
             return Err(Error::backend(
                 "numeric replicated construction received no materialization tasks",
             ));
+        }
+        if let Some(partition) = &context.partition {
+            partition
+                .world
+                .record_materialization(partition.rank, tasks.len());
         }
         Ok(())
     }
@@ -12447,30 +15664,221 @@ where
 
     fn load_prompt_cache(
         &mut self,
-        _: &std::path::Path,
+        directory: &std::path::Path,
         _: &eredu_core::cache::PromptCacheDescriptor,
         _: &eredu_core::cache::PromptCacheModelIdentity,
         _: &[u32],
         _: &eredu_runtime::SelectedStateRealization,
-        _: &NumericContext,
+        context: &NumericContext,
     ) -> Result<(Self::State, eredu_core::cache::PromptCacheManifest), Self::Error> {
-        Err(Error::backend(
-            "numeric replicated prompt-cache persistence is not selected",
-        ))
+        let partition = context
+            .partition
+            .as_ref()
+            .ok_or_else(|| Error::backend("numeric prompt cache has no partition context"))?;
+        partition
+            .world
+            .load_prompt_cache(directory, partition.rank)
+            .ok_or_else(|| Error::backend("numeric prompt cache was not saved"))
     }
 
     fn save_prompt_cache(
         &mut self,
-        _: &mut Self::State,
-        _: &std::path::Path,
-        _: eredu_core::cache::PromptCacheDescriptor,
-        _: &[u32],
+        state: &mut Self::State,
+        destination: &std::path::Path,
+        descriptor: eredu_core::cache::PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
         _: &eredu_core::cache::PromptCacheOptions,
-        _: &NumericContext,
+        context: &NumericContext,
     ) -> Result<eredu_core::cache::PromptCacheManifest, Self::Error> {
-        Err(Error::backend(
-            "numeric replicated prompt-cache persistence is not selected",
-        ))
+        let partition = context
+            .partition
+            .as_ref()
+            .ok_or_else(|| Error::backend("numeric prompt cache has no partition context"))?;
+        let batch = i32::try_from(descriptor.batch_size()).map_err(Error::backend)?;
+        let tokens = i32::try_from(prefix_token_ids.len()).map_err(Error::backend)?;
+        let blocks = descriptor
+            .layer_layout()
+            .iter()
+            .enumerate()
+            .filter_map(|(local_layer, policy)| {
+                let geometry = match policy {
+                    LayerCachePolicy::NoState | LayerCachePolicy::FixedState { .. } => return None,
+                    LayerCachePolicy::KeyValue {
+                        num_key_value_heads,
+                        head_dim,
+                        ..
+                    }
+                    | LayerCachePolicy::KeyValueWithFixedState {
+                        num_key_value_heads,
+                        head_dim,
+                        ..
+                    } => {
+                        let shape = vec![
+                            batch,
+                            num_key_value_heads.get() as i32,
+                            tokens,
+                            head_dim.get() as i32,
+                        ];
+                        (
+                            eredu_core::cache::CacheRepresentation::KeyValue,
+                            shape.clone(),
+                            shape,
+                            "keys",
+                            "values",
+                        )
+                    }
+                    LayerCachePolicy::KeyOnly {
+                        num_key_heads,
+                        head_dim,
+                        ..
+                    }
+                    | LayerCachePolicy::KeyOnlyWithFixedState {
+                        num_key_heads,
+                        head_dim,
+                        ..
+                    } => (
+                        eredu_core::cache::CacheRepresentation::KeyValue,
+                        vec![
+                            batch,
+                            num_key_heads.get() as i32,
+                            tokens,
+                            head_dim.get() as i32,
+                        ],
+                        vec![batch, num_key_heads.get() as i32, tokens, 1],
+                        "keys",
+                        "values",
+                    ),
+                    LayerCachePolicy::CompressedLatentRotary {
+                        latent_dim,
+                        rotary_dim,
+                        ..
+                    } => (
+                        eredu_core::cache::CacheRepresentation::CompressedLatentRotary,
+                        vec![batch, tokens, latent_dim.get() as i32],
+                        vec![batch, tokens, rotary_dim.get() as i32],
+                        "latent",
+                        "rotary_key",
+                    ),
+                };
+                let (representation, first_shape, second_shape, first_array, second_array) =
+                    geometry;
+                let elements = |shape: &[i32]| {
+                    shape.iter().try_fold(1_u64, |elements, dimension| {
+                        u64::try_from(*dimension)
+                            .ok()
+                            .and_then(|dimension| elements.checked_mul(dimension))
+                    })
+                };
+                let logical_bytes = elements(&first_shape)
+                    .and_then(|first| {
+                        elements(&second_shape).and_then(|second| first.checked_add(second))
+                    })
+                    .and_then(|elements| elements.checked_mul(4))
+                    .unwrap_or(4);
+                Some(eredu_core::cache::PromptCacheBlock {
+                    global_layer: descriptor.global_layer_start() + local_layer,
+                    representation,
+                    start: 0,
+                    end: i64::from(tokens),
+                    rank: descriptor.topology().cache_rank_identity(),
+                    shard: format!(
+                        "blocks/rank-{}/layer-{local_layer}.safetensors",
+                        partition.rank
+                    ),
+                    first_array: first_array.into(),
+                    second_array: second_array.into(),
+                    first_shape,
+                    second_shape,
+                    first_dtype: "Float32".into(),
+                    second_dtype: "Float32".into(),
+                    logical_bytes,
+                    payload_sha256: "0".repeat(64),
+                })
+            })
+            .collect::<Vec<_>>();
+        let cache_batch_size = descriptor.batch_size();
+        let cache_global_layer_start = descriptor.global_layer_start();
+        let cache_rank = partition.rank;
+        let state_tensors = descriptor
+            .layer_layout()
+            .iter()
+            .enumerate()
+            .flat_map(|(local_layer, policy)| {
+                let prefix_tokens =
+                    descriptor.layer_prefix_offsets()[local_layer].unsigned_abs() as usize;
+                let prefix_tokens = prefix_token_ids.len().saturating_sub(prefix_tokens);
+                policy
+                    .fixed_state()
+                    .iter()
+                    .filter(move |tensor| tensor.is_required_for(prefix_tokens))
+                    .map(move |tensor| {
+                        let shape = tensor
+                            .resolved_shape(cache_batch_size, prefix_tokens)
+                            .expect("numeric cache state shape must resolve");
+                        let logical_bytes = shape
+                            .iter()
+                            .map(|dimension| u64::try_from(*dimension).unwrap())
+                            .product::<u64>()
+                            .checked_mul(4)
+                            .unwrap();
+                        let dtype = match tensor.dtype {
+                            eredu_core::cache::StateTensorDtype::Int32 => "Int32",
+                            eredu_core::cache::StateTensorDtype::Uint32 => "Uint32",
+                            eredu_core::cache::StateTensorDtype::Floating
+                            | eredu_core::cache::StateTensorDtype::Float32 => "Float32",
+                        };
+                        eredu_core::cache::PromptCacheStateTensor {
+                            owner: eredu_core::cache::StateTensorOwner::Layer(
+                                cache_global_layer_start + local_layer,
+                            ),
+                            role: tensor.role,
+                            shard: format!(
+                                "state/rank-{}/layer-{local_layer}-state.safetensors",
+                                cache_rank
+                            ),
+                            array: "state".into(),
+                            shape,
+                            dtype: dtype.into(),
+                            logical_bytes,
+                            payload_sha256: "0".repeat(64),
+                        }
+                    })
+            })
+            .collect::<Vec<_>>();
+        let manifest = eredu_core::cache::PromptCacheManifest {
+            schema_version: eredu_core::cache::PROMPT_CACHE_SCHEMA_VERSION,
+            model_family: descriptor.model_family().into(),
+            effective_model_type: descriptor.effective_model_type().into(),
+            checkpoint_fingerprint: descriptor.checkpoint_fingerprint().into(),
+            prefix_content_fingerprint: descriptor.prefix_content_fingerprint().into(),
+            architecture_fingerprint: descriptor.architecture_fingerprint().into(),
+            layer_count: descriptor.layer_count(),
+            global_layer_start: descriptor.global_layer_start(),
+            global_layer_end: descriptor.global_layer_end(),
+            block_size_tokens: tokens,
+            batch_size: descriptor.batch_size(),
+            total_prefix_tokens: prefix_token_ids.len(),
+            prefix_sha256: eredu_core::cache::prompt_cache_token_fingerprint(prefix_token_ids),
+            layer_layout: descriptor.layer_layout().clone(),
+            layer_prefix_offsets: descriptor.layer_prefix_offsets().to_vec(),
+            state_segments: descriptor.state_segments().to_vec(),
+            sink_tokens: descriptor.sink_tokens(),
+            topology: descriptor.topology().clone(),
+            distributed_commit: descriptor.distributed_commit(),
+            application_namespace: None,
+            blocks,
+            state_tensors,
+        };
+        manifest
+            .validate()
+            .map_err(|error| Error::backend(error.to_string()))?;
+        partition.world.save_prompt_cache(
+            destination,
+            partition.rank,
+            state.clone(),
+            manifest.clone(),
+        );
+        Ok(manifest)
     }
 
     fn state_report(&self, state: &Self::State) -> Result<Self::StateReport, Self::Error> {
@@ -12489,10 +15897,3285 @@ where
         &mut self,
         _: &NumericTensor,
         _: &Self::State,
-        _: &NumericContext,
+        context: &NumericContext,
     ) -> Result<(), Self::Error> {
+        if let Some(partition) = &context.partition {
+            if partition.world.take_completion_failure(partition.rank) {
+                return Err(Error::backend("injected numeric completion failure"));
+            }
+        }
         Ok(())
     }
+}
+
+struct NumericPartitionTensorAllocator;
+
+impl eredu_architectures::partitioned_execution::PartitionTensorAllocator<NumericBackend>
+    for NumericPartitionTensorAllocator
+{
+    fn tensor_to_wire(
+        &mut self,
+        tensor: NumericTensor,
+        logical_dtype: eredu_runtime::BoundaryTensorDtype,
+        activation_dtype: eredu_runtime::PipelineActivationDtype,
+        context: &NumericContext,
+    ) -> Result<NumericTensor, Error> {
+        if let Some(partition) = &context.partition {
+            if partition
+                .world
+                .take_fault(partition.rank, NumericPartitionFault::Transfer)
+            {
+                return Err(Error::backend("injected numeric boundary transfer failure"));
+            }
+        }
+        match logical_dtype {
+            eredu_runtime::BoundaryTensorDtype::Activation
+                if activation_dtype == eredu_runtime::PipelineActivationDtype::Float32
+                    && tensor.dtype == eredu_core::checkpoint::TensorDtype::F32 => {}
+            eredu_runtime::BoundaryTensorDtype::Uint32
+                if tensor.dtype == eredu_core::checkpoint::TensorDtype::U32 => {}
+            eredu_runtime::BoundaryTensorDtype::Int32
+                if tensor.dtype == eredu_core::checkpoint::TensorDtype::I32 => {}
+            _ => return Err(Error::backend("numeric partition wire dtype mismatch")),
+        }
+        Ok(tensor)
+    }
+
+    fn tensor_placeholder(
+        &mut self,
+        shape: &[i32],
+        logical_dtype: eredu_runtime::BoundaryTensorDtype,
+        activation_dtype: eredu_runtime::PipelineActivationDtype,
+        _: &NumericContext,
+    ) -> Result<NumericTensor, Error> {
+        let dtype = match logical_dtype {
+            eredu_runtime::BoundaryTensorDtype::Activation
+                if activation_dtype == eredu_runtime::PipelineActivationDtype::Float32 =>
+            {
+                eredu_core::checkpoint::TensorDtype::F32
+            }
+            eredu_runtime::BoundaryTensorDtype::Uint32 => eredu_core::checkpoint::TensorDtype::U32,
+            eredu_runtime::BoundaryTensorDtype::Int32 => eredu_core::checkpoint::TensorDtype::I32,
+            _ => return Err(Error::backend("numeric partition wire dtype mismatch")),
+        };
+        Ok(NumericTensor::zeros(shape.to_vec()).with_dtype(dtype))
+    }
+}
+
+fn numeric_composite_optional_activity_at_begin<A, G, W>(
+    architecture: A,
+    partition: &ArchitecturePartition<G, W>,
+    group_kinds: Vec<eredu_runtime::ArchitectureGroupKind>,
+    input: eredu_architectures::composite_execution::PreparedCompositeInput<
+        '_,
+        NumericTensor,
+        A::InputPartPlan,
+    >,
+) -> Vec<bool>
+where
+    A: eredu_architectures::composite_execution::CompositeArchitecture<
+            NumericBackend,
+            DeviceState<NumericBackend, NumericHybridLayerState>,
+        > + eredu_runtime::PartitionedLayeredArchitecture<
+            NumericBackend,
+            DeviceState<NumericBackend, NumericHybridLayerState>,
+            Boundary = W,
+            Error = Error,
+        > + 'static,
+    A::InputPartPlan: 'static,
+    W: eredu_runtime::ArchitectureBoundary,
+{
+    type NumericState = DeviceState<NumericBackend, NumericHybridLayerState>;
+    let mut state = DeviceState::create(
+        partition
+            .state()
+            .expect("numeric composite activity requires selected state")
+            .layout()
+            .clone(),
+        |_, policy| Ok::<_, Error>(NumericHybridLayerState::new(policy)),
+    )
+    .unwrap();
+    let mut executor = eredu_architectures::partitioned_execution::CompositePartitionExecutor::new(
+        architecture,
+        NumericReplicatedPolicy::bounded(),
+        partition,
+        group_kinds,
+        None,
+        NumericPartitionTensorAllocator,
+        eredu_runtime::PipelineActivationDtype::Float32,
+        std::iter::empty(),
+        eredu_architectures::partitioned_execution::PublicationValueDescriptor::new(7).unwrap(),
+    )
+    .unwrap();
+    let pass = <_ as eredu_runtime::PartitionedGroupExecutor<
+        eredu_architectures::composite_execution::PreparedCompositeArchitecture<A>,
+        NumericBackend,
+        NumericState,
+        u64,
+        u64,
+        NumericCommunicationMetadata,
+    >>::begin(
+        &mut executor,
+        input,
+        &mut state,
+        ExpertPass::Prefill,
+        &NumericContext::default(),
+    )
+    .unwrap();
+    (0..partition.graph().groups().len())
+        .map(|group| {
+            <_ as eredu_runtime::PartitionedGroupExecutor<
+                eredu_architectures::composite_execution::PreparedCompositeArchitecture<A>,
+                NumericBackend,
+                NumericState,
+                u64,
+                u64,
+                NumericCommunicationMetadata,
+            >>::request_group_active(&executor, &pass, group)
+            .unwrap()
+        })
+        .collect()
+}
+
+struct NumericCompositePartitionAdmission;
+
+impl eredu_architectures::partitioned_execution::PartitionedAdmissionDispatcher
+    for NumericCompositePartitionAdmission
+{
+    type Output = eredu_architectures::partitioned_execution::CompositePartitionedAdmission;
+    type Error = Error;
+
+    fn direct(
+        self,
+        _: eredu_architectures::partitioned_execution::DirectPartitionedAdmission,
+    ) -> Result<Self::Output, Self::Error> {
+        Err(Error::backend("numeric proof expected composite admission"))
+    }
+
+    fn routed(
+        self,
+        _: eredu_architectures::partitioned_execution::RoutedPartitionedAdmission,
+    ) -> Result<Self::Output, Self::Error> {
+        Err(Error::backend("numeric proof expected composite admission"))
+    }
+
+    fn composite(
+        self,
+        admission: eredu_architectures::partitioned_execution::CompositePartitionedAdmission,
+    ) -> Result<Self::Output, Self::Error> {
+        Ok(admission)
+    }
+}
+
+fn numeric_composite_selection(
+    requirements: &eredu_architectures::replicated_text::CompositeTextRequirements,
+    input: &eredu_runtime::PreparedModelInput<NumericTensor>,
+) -> eredu_architectures::replicated_text::SelectedCompositeTextRealization {
+    let execution = requirements.execution();
+    let lowerings = execution
+        .parameters()
+        .iter()
+        .filter(|parameter| parameter.has_lowering_source())
+        .map(|parameter| {
+            let kind = if matches!(
+                parameter.presence(),
+                eredu_runtime::ReplicatedTextParameterPresence::Derived { .. }
+            ) {
+                eredu_runtime::WeightLoweringKind::Derived
+            } else {
+                eredu_runtime::WeightLoweringKind::Direct
+            };
+            eredu_runtime::WeightLoweringCapability::new(
+                parameter
+                    .lowering_descriptor(parameter.native_executable())
+                    .unwrap(),
+                kind,
+            )
+        })
+        .collect();
+    let state = eredu_runtime::StateMechanismCapabilities::new(
+        (0..execution.state_layout().len()).flat_map(|layer| {
+            execution
+                .state_layout()
+                .components(layer)
+                .unwrap()
+                .iter()
+                .cloned()
+                .map(move |component| {
+                    eredu_runtime::StateComponentMechanism::new(
+                        layer,
+                        component,
+                        Some(eredu_runtime::StateComponentPlacement::Device),
+                        None,
+                    )
+                })
+        }),
+    )
+    .with_transactions(true, true)
+    .with_reset(true);
+    let capabilities = eredu_runtime::BackendMechanismCapabilities::new(
+        eredu_nn::NeuralOperatorCapabilities::ALL,
+        lowerings,
+        vec![eredu_runtime::WeightResidencyMechanism::Resident],
+        state,
+    )
+    .with_grouped_operations([
+        eredu_runtime::GroupedOperationRequirement::GatedProduct,
+        eredu_runtime::GroupedOperationRequirement::GatedProductTensorParallelPartial,
+    ]);
+    let processor_request = eredu_runtime::ProcessorSelectionRequest::new(
+        input.parts().iter().map(|part| part.modality()),
+    )
+    .with_prepared_tensors(true);
+    let processor_capabilities = eredu_runtime::MediaPrimitiveCapabilities::new(
+        [],
+        [
+            eredu_core::InputModality::Text,
+            eredu_core::InputModality::Image,
+            eredu_core::InputModality::Video,
+            eredu_core::InputModality::Audio,
+        ],
+        [
+            eredu_core::InputModality::Text,
+            eredu_core::InputModality::Image,
+            eredu_core::InputModality::Video,
+            eredu_core::InputModality::Audio,
+        ],
+        [],
+        i32::MAX as u64,
+    );
+    eredu_architectures::replicated_text::select_composite_text_realization(
+        requirements,
+        &eredu_runtime::ReplicatedTextSelectionRequest::new(
+            LayerWeightResidency::FullyResident,
+            eredu_runtime::CacheResidencyPolicy::Device,
+        ),
+        eredu_runtime::WeightResidency::fully_resident(),
+        &processor_request,
+        &capabilities,
+        &processor_capabilities,
+    )
+    .unwrap()
+}
+
+type NumericCompositePartitionForward = dyn FnMut(
+    &eredu_runtime::PreparedModelInput<NumericTensor>,
+    bool,
+) -> Result<NumericTensor, Error>;
+type NumericCompositePartitionObservedForward = dyn FnMut(
+    &eredu_runtime::PreparedModelInput<NumericTensor>,
+    bool,
+    &mut NumericLifecycleObserver,
+) -> Result<NumericTensor, Error>;
+
+struct NumericCompositePartitionExecutable {
+    forward: Box<NumericCompositePartitionForward>,
+    forward_observed: Box<NumericCompositePartitionObservedForward>,
+    positions: Box<dyn Fn() -> Result<Vec<i32>, Error>>,
+}
+
+impl NumericCompositePartitionExecutable {
+    fn forward(
+        &mut self,
+        input: &eredu_runtime::PreparedModelInput<NumericTensor>,
+        prefill: bool,
+    ) -> Result<NumericTensor, Error> {
+        (self.forward)(input, prefill)
+    }
+
+    fn forward_observed(
+        &mut self,
+        input: &eredu_runtime::PreparedModelInput<NumericTensor>,
+        prefill: bool,
+        observer: &mut NumericLifecycleObserver,
+    ) -> Result<NumericTensor, Error> {
+        (self.forward_observed)(input, prefill, observer)
+    }
+
+    fn positions(&self) -> Result<Vec<i32>, Error> {
+        (self.positions)()
+    }
+}
+
+struct NumericCompositePartitionVisitor {
+    world: Arc<NumericPartitionWorld>,
+    context: NumericContext,
+}
+
+impl
+    eredu_architectures::composite_partitioned::AuthoritativeCompositePartitionVisitor<
+        NumericBackend,
+        DeviceState<NumericBackend, NumericHybridLayerState>,
+    > for NumericCompositePartitionVisitor
+{
+    type Output = NumericCompositePartitionExecutable;
+    type Error = Error;
+
+    fn visit<A, G, W>(
+        self,
+        prepared: eredu_architectures::composite_partitioned::PreparedCompositePartition<A, G, W>,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        A: eredu_architectures::composite_execution::CompositeArchitecture<
+                NumericBackend,
+                DeviceState<NumericBackend, NumericHybridLayerState>,
+            > + eredu_runtime::PartitionedLayeredArchitecture<
+                NumericBackend,
+                DeviceState<NumericBackend, NumericHybridLayerState>,
+                Boundary = W,
+                Error = Error,
+            > + eredu_runtime::ParallelRoutedLayeredArchitecture<
+                NumericBackend,
+                DeviceState<NumericBackend, NumericHybridLayerState>,
+            > + 'static,
+        A::Error: std::fmt::Display,
+        W: eredu_runtime::ArchitectureBoundary,
+    {
+        let plan = prepared.execution_plan().map_err(Error::backend)?;
+        let tensor_group = prepared.prepared().selected().tensor_group();
+        let prompt = prepared
+            .prepared()
+            .selected()
+            .prompt_cache_topology()
+            .map_err(Error::backend)?;
+        let admission = prepared.prepared().architecture().admission_config();
+        let factory_world = Arc::clone(&self.world);
+        let binding = prepared
+            .prepare_session_runtime::<NumericBackend, _, _, _, _>(
+                prompt,
+                &self.context,
+                move |input, layout, executor_plan, selected, context| {
+                    let (architecture, partition, manifest, tasks) = input.into_parts();
+                    if tasks.is_empty() || layout != *context.local_layout.as_deref().unwrap() {
+                        return Err(Error::backend(
+                            "numeric composite local task/layout authority drifted",
+                        ));
+                    }
+                    factory_world.record_materialization(manifest.rank(), tasks.len());
+                    factory_world.realize_manifest(&manifest)?;
+                    let architecture = architecture.into_inner();
+                    let addresses = partition.units().collect::<Vec<_>>();
+                    let units = addresses
+                        .iter()
+                        .map(|address| {
+                            architecture.build_unit(address.group(), address.index(), context)
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let state = numeric_partition_state(selected, &partition)?;
+                    let parallel = tensor_group
+                        .map(|id| numeric_parallel_context(&factory_world, &manifest, id))
+                        .transpose()?;
+                    let communication = numeric_partition_communication(&factory_world, manifest)?;
+                    let executor = executor_plan.bind(
+                        architecture,
+                        NumericReplicatedPolicy::resident(units),
+                        parallel,
+                        NumericPartitionTensorAllocator,
+                        RouteMovement::default(),
+                    )?;
+                    let runtime = eredu_runtime::PartitionedTextRuntime::new(
+                        plan,
+                        executor,
+                        communication,
+                        context.clone(),
+                        eredu_runtime::OpaqueBoundaryTransport,
+                        eredu_runtime::OpaqueOutputPublisher,
+                        eredu_runtime::OpaqueFailureAgreement,
+                        eredu_runtime::ExecutionResidency::FullyResident,
+                        None::<NumericReplicatedPolicy<A::Unit>>,
+                    )
+                    .map_err(|error| Error::backend(error.to_string()))?;
+                    Ok((runtime, state))
+                },
+            )
+            .map_err(|error| Error::backend(error.to_string()))?;
+        let prompt_cache_identity = binding
+            .prompt_cache_identity()
+            .cloned()
+            .ok_or_else(|| Error::backend("numeric composite session has no cache identity"))?;
+        let rank = self
+            .context
+            .partition
+            .as_ref()
+            .ok_or_else(|| Error::backend("numeric composite context has no partition rank"))?
+            .rank;
+        self.world
+            .record_prompt_cache_identity(rank, prompt_cache_identity);
+        let session = eredu_runtime::construct_replicated_text_session_with_runtime(
+            binding,
+            NumericReplicatedMechanisms,
+            eredu_runtime::PartitionedTextExecution::new(),
+        )
+        .map_err(|error| Error::backend(error.to_string()))?;
+        let session = std::rc::Rc::new(RefCell::new(session));
+        let observed_session = std::rc::Rc::clone(&session);
+        let report_session = std::rc::Rc::clone(&session);
+        let context = self.context;
+        let observed_context = context.clone();
+        let observed_admission = admission.clone();
+        let invocation_world = self.world;
+        let observed_world = Arc::clone(&invocation_world);
+        Ok(NumericCompositePartitionExecutable {
+            forward: Box::new(move |input, prefill| {
+                let admitted = A::admit_prepared_input(&admission, input, &NumericInputInspector)
+                    .map_err(|error| Error::backend(error.to_string()))?;
+                let paired = eredu_architectures::composite_execution::PreparedCompositeInput::new(
+                    input, &admitted,
+                )
+                .map_err(Error::backend)?;
+                let mut session = session.borrow_mut();
+                let output = if prefill {
+                    session
+                        .prefill_input(paired, &context)
+                        .map_err(|error| Error::backend(error.to_string()))
+                } else {
+                    session
+                        .decode_input(paired, &context)
+                        .map_err(|error| Error::backend(error.to_string()))
+                };
+                if output.is_ok() {
+                    if let Some(partition) = &context.partition {
+                        invocation_world.record_commit(partition.rank);
+                    }
+                }
+                output
+            }),
+            forward_observed: Box::new(move |input, prefill, observer| {
+                let admitted =
+                    A::admit_prepared_input(&observed_admission, input, &NumericInputInspector)
+                        .map_err(|error| Error::backend(error.to_string()))?;
+                let paired = eredu_architectures::composite_execution::PreparedCompositeInput::new(
+                    input, &admitted,
+                )
+                .map_err(Error::backend)?;
+                let mut session = observed_session.borrow_mut();
+                let output = if prefill {
+                    session
+                        .prefill_input_with_observer(paired, &observed_context, observer)
+                        .map_err(|error| Error::backend(error.to_string()))
+                } else {
+                    session
+                        .decode_input_with_observer(paired, &observed_context, observer)
+                        .map_err(|error| Error::backend(error.to_string()))
+                };
+                if output.is_ok() {
+                    if let Some(partition) = &observed_context.partition {
+                        observed_world.record_commit(partition.rank);
+                    }
+                }
+                output
+            }),
+            positions: Box::new(move || {
+                let report = report_session
+                    .borrow()
+                    .report()
+                    .map_err(|error| Error::backend(error.to_string()))?;
+                Ok(report
+                    .state_report()
+                    .as_ref()
+                    .iter()
+                    .map(|layer| layer.position())
+                    .collect())
+            }),
+        })
+    }
+}
+
+fn numeric_partition_communication(
+    world: &NumericPartitionWorld,
+    manifest: CommunicationManifest,
+) -> Result<PartitionCommunication<NumericBackend, u64, u64, NumericCommunicationMetadata>, Error> {
+    world.realize_manifest(&manifest)?;
+    let groups = manifest
+        .groups()
+        .iter()
+        .map(|group| RealizedCommunicationGroup::new(group.id(), u64::from(group.id().value())))
+        .collect();
+    let routes = manifest
+        .routes()
+        .iter()
+        .map(|route| RealizedCommunicationRoute::new(route.id(), route.id().value()))
+        .collect();
+    PartitionCommunication::new(manifest, groups, routes, NumericCommunicationMetadata(None))
+        .map_err(|error| Error::backend(error.to_string()))
+}
+
+type NumericPartitionForward = dyn FnMut(&NumericTensor, bool) -> Result<NumericTensor, Error>;
+type NumericPartitionObservedForward =
+    dyn FnMut(&NumericTensor, bool, &mut NumericLifecycleObserver) -> Result<NumericTensor, Error>;
+type NumericPartitionCacheSave = dyn FnMut(
+    &std::path::Path,
+    eredu_core::cache::PromptCacheDescriptor,
+    &[u32],
+)
+    -> Result<eredu_core::cache::PromptCacheManifest, Error>;
+type NumericPartitionCacheLoad = dyn FnMut(
+    &std::path::Path,
+    &eredu_core::cache::PromptCacheDescriptor,
+    &[u32],
+)
+    -> Result<eredu_core::cache::PromptCacheManifest, Error>;
+type NumericPreparedPartition<A, G> =
+    eredu_architectures::partitioned_execution::PreparedPartitionedArchitecture<
+        NumericBackend,
+        A,
+        G,
+        <A as eredu_runtime::PartitionedLayeredArchitecture<
+            NumericBackend,
+            DeviceState<NumericBackend, NumericHybridLayerState>,
+        >>::Boundary,
+    >;
+
+#[derive(Default)]
+struct NumericLifecycleObserver {
+    paths: Vec<String>,
+    replacements: BTreeMap<String, NumericTensor>,
+    fail_path: Option<String>,
+    zero_path: Option<String>,
+    replacement_value: Option<f32>,
+    zero_unit_outputs: bool,
+    zero_final_output: bool,
+}
+
+impl eredu_runtime::ActivationObserver<NumericTensor, Error> for NumericLifecycleObserver {
+    fn observe(&mut self, path: &str, _: &NumericTensor) -> Result<(), Error> {
+        self.paths.push(path.into());
+        if self.fail_path.as_deref() == Some(path) {
+            return Err(Error::backend(format!(
+                "injected numeric observation failure at {path}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn intervene(
+        &mut self,
+        path: &str,
+        value: &NumericTensor,
+    ) -> Result<Option<NumericTensor>, Error> {
+        if self.zero_path.as_deref() == Some(path) {
+            let replacement = self.replacement_value.unwrap_or_default();
+            return Ok(Some(
+                NumericTensor::new(value.shape.clone(), vec![replacement; value.data.len()])
+                    .with_dtype(value.dtype.clone()),
+            ));
+        }
+        if (self.zero_final_output && path == eredu_core::MODEL_LOGITS_OBSERVATION_PATH)
+            || (self.zero_unit_outputs
+                && path != eredu_core::MODEL_LOGITS_OBSERVATION_PATH
+                && path.ends_with(".output"))
+        {
+            return Ok(Some(NumericTensor::zeros(value.shape.clone())));
+        }
+        Ok(self.replacements.get(path).cloned())
+    }
+}
+
+struct NumericPartitionExecutable {
+    forward: Box<NumericPartitionForward>,
+    forward_observed: Box<NumericPartitionObservedForward>,
+    positions: Box<dyn Fn() -> Result<Vec<i32>, Error>>,
+    reset: Box<dyn FnMut() -> Result<(), Error>>,
+    prompt_cache_identity: Box<dyn Fn() -> eredu_core::cache::PromptCacheModelIdentity>,
+    save_prompt_cache: Box<NumericPartitionCacheSave>,
+    load_prompt_cache: Box<NumericPartitionCacheLoad>,
+}
+
+impl NumericPartitionExecutable {
+    fn forward(&mut self, tokens: &NumericTensor, prefill: bool) -> Result<NumericTensor, Error> {
+        (self.forward)(tokens, prefill)
+    }
+
+    fn positions(&self) -> Result<Vec<i32>, Error> {
+        (self.positions)()
+    }
+
+    fn forward_observed(
+        &mut self,
+        tokens: &NumericTensor,
+        prefill: bool,
+        observer: &mut NumericLifecycleObserver,
+    ) -> Result<NumericTensor, Error> {
+        (self.forward_observed)(tokens, prefill, observer)
+    }
+
+    fn reset(&mut self) -> Result<(), Error> {
+        (self.reset)()
+    }
+
+    fn prompt_cache_identity(&self) -> eredu_core::cache::PromptCacheModelIdentity {
+        (self.prompt_cache_identity)()
+    }
+
+    fn save_prompt_cache(
+        &mut self,
+        path: &std::path::Path,
+        descriptor: eredu_core::cache::PromptCacheDescriptor,
+        prefix: &[u32],
+    ) -> Result<eredu_core::cache::PromptCacheManifest, Error> {
+        (self.save_prompt_cache)(path, descriptor, prefix)
+    }
+
+    fn load_prompt_cache(
+        &mut self,
+        path: &std::path::Path,
+        descriptor: &eredu_core::cache::PromptCacheDescriptor,
+        prefix: &[u32],
+    ) -> Result<eredu_core::cache::PromptCacheManifest, Error> {
+        (self.load_prompt_cache)(path, descriptor, prefix)
+    }
+}
+
+fn erase_numeric_partition_session<S>(
+    session: S,
+    context: NumericContext,
+    prompt_cache_identity: eredu_core::cache::PromptCacheModelIdentity,
+) -> NumericPartitionExecutable
+where
+    S: 'static,
+    for<'a> &'a mut S: NumericPartitionSession,
+    for<'a> &'a S: NumericPartitionSessionReport,
+{
+    let session = std::rc::Rc::new(RefCell::new(session));
+    let forward_session = std::rc::Rc::clone(&session);
+    let observed_session = std::rc::Rc::clone(&session);
+    let report_session = std::rc::Rc::clone(&session);
+    let reset_session = std::rc::Rc::clone(&session);
+    let save_session = std::rc::Rc::clone(&session);
+    let load_session = std::rc::Rc::clone(&session);
+    let forward_context = context.clone();
+    let observed_context = context.clone();
+    let reset_context = context.clone();
+    let save_context = context.clone();
+    let load_context = context;
+    NumericPartitionExecutable {
+        forward: Box::new(move |tokens, prefill| {
+            let mut session = forward_session.borrow_mut();
+            let output = if prefill {
+                (&mut *session).numeric_prefill(tokens, &forward_context)
+            } else {
+                (&mut *session).numeric_decode(tokens, &forward_context)
+            };
+            if output.is_ok() {
+                if let Some(partition) = &forward_context.partition {
+                    partition.world.record_commit(partition.rank);
+                }
+            }
+            output
+        }),
+        forward_observed: Box::new(move |tokens, prefill, observer| {
+            let mut session = observed_session.borrow_mut();
+            let output = (&mut *session).numeric_forward_observed(
+                tokens,
+                prefill,
+                &observed_context,
+                observer,
+            );
+            if output.is_ok() {
+                if let Some(partition) = &observed_context.partition {
+                    partition.world.record_commit(partition.rank);
+                }
+            }
+            output
+        }),
+        positions: Box::new(move || (&*report_session.borrow()).numeric_positions()),
+        reset: Box::new(move || (&mut *reset_session.borrow_mut()).numeric_reset(&reset_context)),
+        prompt_cache_identity: Box::new(move || prompt_cache_identity.clone()),
+        save_prompt_cache: Box::new(move |path, descriptor, prefix| {
+            (&mut *save_session.borrow_mut()).numeric_save_prompt_cache(
+                path,
+                descriptor,
+                prefix,
+                &save_context,
+            )
+        }),
+        load_prompt_cache: Box::new(move |path, descriptor, prefix| {
+            (&mut *load_session.borrow_mut()).numeric_load_prompt_cache(
+                path,
+                descriptor,
+                prefix,
+                &load_context,
+            )
+        }),
+    }
+}
+
+trait NumericPartitionSession {
+    fn numeric_prefill(
+        self,
+        tokens: &NumericTensor,
+        context: &NumericContext,
+    ) -> Result<NumericTensor, Error>;
+    fn numeric_decode(
+        self,
+        tokens: &NumericTensor,
+        context: &NumericContext,
+    ) -> Result<NumericTensor, Error>;
+    fn numeric_forward_observed(
+        self,
+        tokens: &NumericTensor,
+        prefill: bool,
+        context: &NumericContext,
+        observer: &mut NumericLifecycleObserver,
+    ) -> Result<NumericTensor, Error>;
+    fn numeric_reset(self, context: &NumericContext) -> Result<(), Error>;
+    fn numeric_save_prompt_cache(
+        self,
+        path: &std::path::Path,
+        descriptor: eredu_core::cache::PromptCacheDescriptor,
+        prefix: &[u32],
+        context: &NumericContext,
+    ) -> Result<eredu_core::cache::PromptCacheManifest, Error>;
+    fn numeric_load_prompt_cache(
+        self,
+        path: &std::path::Path,
+        descriptor: &eredu_core::cache::PromptCacheDescriptor,
+        prefix: &[u32],
+        context: &NumericContext,
+    ) -> Result<eredu_core::cache::PromptCacheManifest, Error>;
+}
+
+trait NumericPartitionSessionReport {
+    fn numeric_positions(self) -> Result<Vec<i32>, Error>;
+}
+
+impl<A, D> NumericPartitionSession
+    for &mut eredu_runtime::ReplicatedTextSession<A, NumericBackend, NumericReplicatedMechanisms, D>
+where
+    A: eredu_runtime::ReplicatedTextArchitecture<
+            NumericBackend,
+            DeviceState<NumericBackend, NumericHybridLayerState>,
+            Error = Error,
+        > + 'static,
+    D: eredu_runtime::ReplicatedTextExecutionStrategy<
+        A,
+        NumericBackend,
+        DeviceState<NumericBackend, NumericHybridLayerState>,
+        NumericReplicatedPolicy<A::Unit>,
+        NumericReplicatedPolicy<A::Unit>,
+    >,
+{
+    fn numeric_prefill(
+        self,
+        tokens: &NumericTensor,
+        context: &NumericContext,
+    ) -> Result<NumericTensor, Error> {
+        self.prefill(tokens, None, context)
+            .map_err(|error| Error::backend(error.to_string()))
+    }
+
+    fn numeric_decode(
+        self,
+        tokens: &NumericTensor,
+        context: &NumericContext,
+    ) -> Result<NumericTensor, Error> {
+        self.decode(tokens, context)
+            .map_err(|error| Error::backend(error.to_string()))
+    }
+
+    fn numeric_forward_observed(
+        self,
+        tokens: &NumericTensor,
+        prefill: bool,
+        context: &NumericContext,
+        observer: &mut NumericLifecycleObserver,
+    ) -> Result<NumericTensor, Error> {
+        if prefill {
+            self.prefill_with_observer(tokens, None, context, observer)
+        } else {
+            self.decode_with_observer(tokens, context, observer)
+        }
+        .map_err(|error| Error::backend(error.to_string()))
+    }
+
+    fn numeric_reset(self, context: &NumericContext) -> Result<(), Error> {
+        self.reset(context)
+            .map_err(|error| Error::backend(error.to_string()))
+    }
+
+    fn numeric_save_prompt_cache(
+        self,
+        path: &std::path::Path,
+        descriptor: eredu_core::cache::PromptCacheDescriptor,
+        prefix: &[u32],
+        context: &NumericContext,
+    ) -> Result<eredu_core::cache::PromptCacheManifest, Error> {
+        self.save_prompt_cache(
+            path,
+            descriptor,
+            prefix,
+            &eredu_core::cache::PromptCacheOptions::default(),
+            context,
+        )
+        .map_err(|error| Error::backend(error.to_string()))
+    }
+
+    fn numeric_load_prompt_cache(
+        self,
+        path: &std::path::Path,
+        descriptor: &eredu_core::cache::PromptCacheDescriptor,
+        prefix: &[u32],
+        context: &NumericContext,
+    ) -> Result<eredu_core::cache::PromptCacheManifest, Error> {
+        self.load_prompt_cache(path, descriptor, prefix, context)
+            .map_err(|error| Error::backend(error.to_string()))
+    }
+}
+
+impl<A, D> NumericPartitionSessionReport
+    for &eredu_runtime::ReplicatedTextSession<A, NumericBackend, NumericReplicatedMechanisms, D>
+where
+    A: eredu_runtime::ReplicatedTextArchitecture<
+            NumericBackend,
+            DeviceState<NumericBackend, NumericHybridLayerState>,
+            Error = Error,
+        > + 'static,
+    D: eredu_runtime::ReplicatedTextExecutionStrategy<
+        A,
+        NumericBackend,
+        DeviceState<NumericBackend, NumericHybridLayerState>,
+        NumericReplicatedPolicy<A::Unit>,
+        NumericReplicatedPolicy<A::Unit>,
+    >,
+{
+    fn numeric_positions(self) -> Result<Vec<i32>, Error> {
+        let report = self
+            .report()
+            .map_err(|error| Error::backend(error.to_string()))?;
+        Ok(report
+            .state_report()
+            .as_ref()
+            .iter()
+            .map(|layer| layer.position())
+            .collect())
+    }
+}
+
+struct NumericResidentPartitionVisitor {
+    world: Arc<NumericPartitionWorld>,
+    context: NumericContext,
+}
+
+struct CountingPartitionedRoutedProvider {
+    inner: PlannedResidentGatedProduct,
+    calls: Arc<AtomicUsize>,
+}
+
+struct NumericPipelineWaveStrategy<U> {
+    inner: U,
+    omit_inactive: Option<Arc<std::sync::atomic::AtomicBool>>,
+}
+
+impl<A, U>
+    eredu_architectures::partitioned_execution::PipelinePartitionUnitStrategy<
+        A,
+        NumericBackend,
+        DeviceState<NumericBackend, NumericHybridLayerState>,
+    > for NumericPipelineWaveStrategy<U>
+where
+    A: eredu_architectures::partitioned_execution::TextPartitionArchitecture<
+        NumericBackend,
+        DeviceState<NumericBackend, NumericHybridLayerState>,
+        Error = Error,
+    >,
+    U: eredu_architectures::partitioned_execution::PipelinePartitionUnitStrategy<
+        A,
+        NumericBackend,
+        DeviceState<NumericBackend, NumericHybridLayerState>,
+    >,
+{
+    fn has_cross_stage_collective_waves(&self) -> bool {
+        self.inner.has_cross_stage_collective_waves()
+    }
+
+    fn forward_unit<G, R, I>(
+        &mut self,
+        architecture: &mut A,
+        address: ExecutionUnitAddress,
+        unit: &mut A::Unit,
+        hidden: &NumericTensor,
+        state: &mut DeviceState<NumericBackend, NumericHybridLayerState>,
+        forward: &mut A::ForwardContext,
+        pass: ExpertPass,
+        parallel: Option<&NumericParallelContext>,
+        communication: &PartitionCommunication<NumericBackend, G, R, I>,
+        communication_executor: &NumericContext,
+        context: &NumericContext,
+    ) -> Result<NumericTensor, Error>
+    where
+        G: std::borrow::Borrow<u64>,
+        R: std::borrow::Borrow<u64>,
+        I: CommunicationTensorMetadata<NumericBackend>,
+    {
+        self.inner.forward_unit(
+            architecture,
+            address,
+            unit,
+            hidden,
+            state,
+            forward,
+            pass,
+            parallel,
+            communication,
+            communication_executor,
+            context,
+        )
+    }
+
+    fn participate_inactive_pipeline_wave<G, R, I, F>(
+        &mut self,
+        wave: usize,
+        communication: &PartitionCommunication<NumericBackend, G, R, I>,
+        communication_executor: &NumericContext,
+        allocator: &mut F,
+        activation_dtype: eredu_runtime::PipelineActivationDtype,
+        batch: i32,
+        sequence: i32,
+        context: &NumericContext,
+    ) -> Result<(), Error>
+    where
+        F: eredu_architectures::partitioned_execution::PartitionTensorAllocator<NumericBackend>,
+        G: std::borrow::Borrow<u64>,
+        R: std::borrow::Borrow<u64>,
+        I: CommunicationTensorMetadata<NumericBackend>,
+    {
+        if self
+            .omit_inactive
+            .as_ref()
+            .is_some_and(|armed| armed.load(Ordering::Relaxed))
+        {
+            return Err(Error::backend(
+                "injected missing routed pipeline zero participant",
+            ));
+        }
+        self.inner.participate_inactive_pipeline_wave(
+            wave,
+            communication,
+            communication_executor,
+            allocator,
+            activation_dtype,
+            batch,
+            sequence,
+            context,
+        )
+    }
+}
+
+impl RoutedExpertProvider<NumericBackend> for CountingPartitionedRoutedProvider {
+    type Error = RoutedTextExecutionError;
+
+    fn forward_grouped(
+        &mut self,
+        resident_bank: &mut NumericExpertBank,
+        request: RoutedExpertRequest<'_, NumericTensor>,
+        context: &NumericContext,
+    ) -> Result<NumericTensor, Self::Error> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        <PlannedResidentGatedProduct as RoutedExpertProvider<NumericBackend>>::forward_grouped(
+            &mut self.inner,
+            resident_bank,
+            request,
+            context,
+        )
+    }
+
+    fn forward_relu2_routed(
+        &mut self,
+        resident_bank: &mut NumericRelu2Groups,
+        request: RoutedExpertRequest<'_, NumericTensor>,
+        context: &NumericContext,
+    ) -> Result<NumericTensor, Self::Error> {
+        <PlannedResidentGatedProduct as RoutedExpertProvider<NumericBackend>>::forward_relu2_routed(
+            &mut self.inner,
+            resident_bank,
+            request,
+            context,
+        )
+    }
+}
+
+impl TensorParallelRoutedExpertProvider<NumericBackend> for CountingPartitionedRoutedProvider {
+    fn forward_grouped_tensor_parallel(
+        &mut self,
+        resident_bank: &mut NumericExpertBank,
+        request: RoutedExpertRequest<'_, NumericTensor>,
+        partitions: usize,
+        context: &NumericContext,
+    ) -> Result<RoutedExpertTensorParallelOutput<NumericTensor>, Self::Error> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        <PlannedResidentGatedProduct as TensorParallelRoutedExpertProvider<NumericBackend>>::forward_grouped_tensor_parallel(
+            &mut self.inner,
+            resident_bank,
+            request,
+            partitions,
+            context,
+        )
+    }
+
+    fn forward_relu2_routed_tensor_parallel(
+        &mut self,
+        resident_bank: &mut NumericRelu2Groups,
+        request: RoutedExpertRequest<'_, NumericTensor>,
+        partitions: usize,
+        context: &NumericContext,
+    ) -> Result<RoutedExpertTensorParallelOutput<NumericTensor>, Self::Error> {
+        <PlannedResidentGatedProduct as TensorParallelRoutedExpertProvider<NumericBackend>>::forward_relu2_routed_tensor_parallel(
+            &mut self.inner,
+            resident_bank,
+            request,
+            partitions,
+            context,
+        )
+    }
+}
+
+struct NumericRoutedPartitionVisitor {
+    world: Arc<NumericPartitionWorld>,
+    context: NumericContext,
+    provider_calls: Arc<AtomicUsize>,
+    omit_inactive: Option<Arc<AtomicBool>>,
+}
+
+impl
+    eredu_architectures::partitioned_execution::PartitionedArchitectureVisitor<
+        NumericBackend,
+        DeviceState<NumericBackend, NumericHybridLayerState>,
+    > for NumericResidentPartitionVisitor
+{
+    type Output = NumericPartitionExecutable;
+    type Error = Error;
+
+    fn visit<A, G>(
+        self,
+        prepared: eredu_architectures::partitioned_execution::PreparedPartitionedArchitecture<
+            NumericBackend,
+            A,
+            G,
+            <A as eredu_runtime::PartitionedLayeredArchitecture<
+                NumericBackend,
+                DeviceState<NumericBackend, NumericHybridLayerState>,
+            >>::Boundary,
+        >,
+        _store: eredu_checkpoint::store::SharedCheckpointSource,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        A: eredu_architectures::partitioned_execution::TextPartitionArchitecture<
+                NumericBackend,
+                DeviceState<NumericBackend, NumericHybridLayerState>,
+            > + eredu_runtime::ReplicatedTextArchitecture<
+                NumericBackend,
+                DeviceState<NumericBackend, NumericHybridLayerState>,
+                Error = Error,
+            > + 'static,
+        A::StaticModules: Clone,
+        G: 'static,
+    {
+        if prepared
+            .prepared()
+            .selected()
+            .topology()
+            .pipeline_parallel_size()
+            > 1
+        {
+            bind_numeric_pipeline(prepared, self.world, self.context)
+        } else {
+            bind_numeric_direct(prepared, self.world, self.context)
+        }
+    }
+}
+
+impl
+    eredu_architectures::partitioned_execution::RoutedPartitionedProductionVisitor<
+        NumericBackend,
+        DeviceState<NumericBackend, NumericHybridLayerState>,
+    > for NumericRoutedPartitionVisitor
+{
+    type Output = NumericPartitionExecutable;
+    type Error = Error;
+
+    fn visit<A, G>(
+        self,
+        prepared: eredu_architectures::partitioned_execution::PreparedRoutedPartitionedArchitecture<
+            NumericBackend,
+            A,
+            G,
+            <A as eredu_runtime::PartitionedLayeredArchitecture<
+                NumericBackend,
+                DeviceState<NumericBackend, NumericHybridLayerState>,
+            >>::Boundary,
+        >,
+        _store: eredu_checkpoint::store::SharedCheckpointSource,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        A: eredu_architectures::partitioned_execution::TextPartitionArchitecture<
+                NumericBackend,
+                DeviceState<NumericBackend, NumericHybridLayerState>,
+            > + eredu_runtime::ReplicatedTextArchitecture<
+                NumericBackend,
+                DeviceState<NumericBackend, NumericHybridLayerState>,
+                Error = Error,
+            > + eredu_runtime::ParallelRoutedLayeredArchitecture<
+                NumericBackend,
+                DeviceState<NumericBackend, NumericHybridLayerState>,
+            > + 'static,
+        A::StaticModules: Clone,
+        G: 'static,
+    {
+        bind_numeric_routed_pipeline(
+            prepared,
+            self.world,
+            self.context,
+            self.provider_calls,
+            self.omit_inactive,
+        )
+    }
+}
+
+fn numeric_partition_state<G, D>(
+    selected: &eredu_runtime::SelectedReplicatedTextRealization,
+    partition: &ArchitecturePartition<G, D>,
+) -> Result<DeviceState<NumericBackend, NumericHybridLayerState>, Error>
+where
+    D: eredu_runtime::ArchitectureBoundary,
+{
+    let local = partition
+        .state()
+        .ok_or_else(|| Error::backend("numeric partition has no local state"))?;
+    let selected = selected
+        .state()
+        .for_partitioned_geometry(local)
+        .map_err(|error| Error::backend(error.to_string()))?;
+    DeviceState::create(selected.layout().clone(), |_, policy| {
+        Ok::<_, Error>(NumericHybridLayerState::new(policy))
+    })
+}
+
+fn numeric_parallel_context(
+    world: &Arc<NumericPartitionWorld>,
+    manifest: &CommunicationManifest,
+    id: CollectiveGroupId,
+) -> Result<NumericParallelContext, Error> {
+    let descriptor = manifest
+        .groups()
+        .iter()
+        .find(|group| group.id() == id)
+        .ok_or_else(|| Error::backend("numeric tensor group is absent"))?;
+    Ok(NumericParallelContext::new_partitioned(
+        descriptor
+            .local_index()
+            .ok_or_else(|| Error::backend("numeric tensor group has no local index"))?,
+        manifest.rank(),
+        world.parallel_group(id)?,
+        Arc::clone(world),
+    ))
+}
+
+fn bind_numeric_direct<A, G>(
+    prepared: NumericPreparedPartition<A, G>,
+    world: Arc<NumericPartitionWorld>,
+    context: NumericContext,
+) -> Result<NumericPartitionExecutable, Error>
+where
+    A: eredu_architectures::partitioned_execution::TextPartitionArchitecture<
+            NumericBackend,
+            DeviceState<NumericBackend, NumericHybridLayerState>,
+        > + eredu_runtime::ReplicatedTextArchitecture<
+            NumericBackend,
+            DeviceState<NumericBackend, NumericHybridLayerState>,
+            Error = Error,
+        > + 'static,
+    A::StaticModules: Clone,
+    G: 'static,
+{
+    let plan = prepared
+        .prepared()
+        .selected()
+        .direct_execution_plan()
+        .map_err(Error::backend)?;
+    let tensor_group = prepared
+        .prepared()
+        .selected()
+        .tensor_group()
+        .ok_or_else(|| Error::backend("numeric direct partition has no tensor group"))?;
+    let prompt = prepared
+        .prepared()
+        .selected()
+        .prompt_cache_topology()
+        .map_err(Error::backend)?;
+    let prompt_cache_identity = prepared
+        .prepared()
+        .selected()
+        .partition()
+        .state()
+        .ok_or_else(|| Error::backend("numeric direct partition has no cache state"))?
+        .prompt_cache_identity::<NumericBackend, A>(
+            prepared.prepared().architecture(),
+            prompt.clone(),
+        )
+        .map_err(|error| Error::backend(error.to_string()))?;
+    let factory_world = Arc::clone(&world);
+    let binding = prepared
+        .prepare_session_runtime(
+            prompt,
+            &context,
+            move |input, _source, layout, selected, context| {
+                let (architecture, partition, manifest, tasks) = input.into_parts();
+                if tasks.is_empty() || layout != *context.local_layout.as_deref().unwrap() {
+                    return Err(Error::backend(
+                        "numeric direct local task/layout authority drifted",
+                    ));
+                }
+                factory_world.record_materialization(manifest.rank(), tasks.len());
+                factory_world.realize_manifest(&manifest)?;
+                let addresses = partition.units().collect::<Vec<_>>();
+                let units = addresses
+                    .iter()
+                    .map(|address| {
+                        architecture.build_unit(address.group(), address.index(), context)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let state = numeric_partition_state(selected, &partition)?;
+                let parallel = numeric_parallel_context(&factory_world, &manifest, tensor_group)?;
+                let communication = numeric_partition_communication(&factory_world, manifest)?;
+                let executor =
+                    eredu_architectures::partitioned_execution::DirectPartitionExecutor::new(
+                        LayerwiseRuntime::new(
+                            architecture,
+                            NumericReplicatedPolicy::resident(units),
+                        ),
+                        parallel,
+                    );
+                let runtime = eredu_runtime::PartitionedTextRuntime::new(
+                    plan,
+                    executor,
+                    communication,
+                    context.clone(),
+                    eredu_runtime::NoBoundaryTransport,
+                    eredu_runtime::OpaqueOutputPublisher,
+                    eredu_runtime::OpaqueFailureAgreement,
+                    eredu_runtime::ExecutionResidency::FullyResident,
+                    None::<NumericReplicatedPolicy<A::Unit>>,
+                )
+                .map_err(|error| Error::backend(error.to_string()))?;
+                Ok((runtime, state))
+            },
+        )
+        .map_err(|error| Error::backend(error.to_string()))?;
+    let session = eredu_runtime::construct_replicated_text_session_with_runtime(
+        binding,
+        NumericReplicatedMechanisms,
+        eredu_runtime::PartitionedTextExecution::new(),
+    )
+    .map_err(|error| Error::backend(error.to_string()))?;
+    Ok(erase_numeric_partition_session(
+        session,
+        context,
+        prompt_cache_identity,
+    ))
+}
+
+fn bind_numeric_pipeline<A, G>(
+    prepared: NumericPreparedPartition<A, G>,
+    world: Arc<NumericPartitionWorld>,
+    context: NumericContext,
+) -> Result<NumericPartitionExecutable, Error>
+where
+    A: eredu_architectures::partitioned_execution::TextPartitionArchitecture<
+            NumericBackend,
+            DeviceState<NumericBackend, NumericHybridLayerState>,
+        > + eredu_runtime::ReplicatedTextArchitecture<
+            NumericBackend,
+            DeviceState<NumericBackend, NumericHybridLayerState>,
+            Error = Error,
+        > + 'static,
+    A::StaticModules: Clone,
+    G: 'static,
+{
+    let plan = prepared
+        .prepared()
+        .selected()
+        .pipeline_execution_plan()
+        .map_err(Error::backend)?;
+    let tensor_group = prepared.prepared().selected().tensor_group();
+    let activation_dtype = prepared.prepared().selected().activation_dtype();
+    let prompt = prepared
+        .prepared()
+        .selected()
+        .prompt_cache_topology()
+        .map_err(Error::backend)?;
+    let prompt_cache_identity = prepared
+        .prepared()
+        .selected()
+        .partition()
+        .state()
+        .ok_or_else(|| Error::backend("numeric pipeline partition has no cache state"))?
+        .prompt_cache_identity::<NumericBackend, A>(
+            prepared.prepared().architecture(),
+            prompt.clone(),
+        )
+        .map_err(|error| Error::backend(error.to_string()))?;
+    let factory_world = Arc::clone(&world);
+    let binding = prepared
+        .prepare_session_runtime(
+            prompt,
+            &context,
+            move |input, _source, layout, selected, context| {
+                let (architecture, partition, manifest, tasks) = input.into_parts();
+                if tasks.is_empty() || layout != *context.local_layout.as_deref().unwrap() {
+                    return Err(Error::backend(
+                        "numeric pipeline local task/layout authority drifted",
+                    ));
+                }
+                factory_world.record_materialization(manifest.rank(), tasks.len());
+                factory_world.realize_manifest(&manifest)?;
+                let addresses = partition.units().collect::<Vec<_>>();
+                let units = addresses
+                    .iter()
+                    .map(|address| {
+                        architecture.build_unit(address.group(), address.index(), context)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let state = numeric_partition_state(selected, &partition)?;
+                let parallel = tensor_group
+                    .map(|id| numeric_parallel_context(&factory_world, &manifest, id))
+                    .transpose()?;
+                let communication = numeric_partition_communication(&factory_world, manifest)?;
+                let executor =
+                    eredu_architectures::partitioned_execution::PipelinePartitionExecutor::new(
+                        architecture,
+                        NumericReplicatedPolicy::resident(units),
+                        addresses,
+                        parallel,
+                        NumericPartitionTensorAllocator,
+                        activation_dtype,
+                    )?;
+                let runtime = eredu_runtime::PartitionedTextRuntime::new(
+                    plan,
+                    executor,
+                    communication,
+                    context.clone(),
+                    eredu_runtime::OpaqueBoundaryTransport,
+                    eredu_runtime::OpaqueOutputPublisher,
+                    eredu_runtime::OpaqueFailureAgreement,
+                    eredu_runtime::ExecutionResidency::FullyResident,
+                    None::<NumericReplicatedPolicy<A::Unit>>,
+                )
+                .map_err(|error| Error::backend(error.to_string()))?;
+                Ok((runtime, state))
+            },
+        )
+        .map_err(|error| Error::backend(error.to_string()))?;
+    let session = eredu_runtime::construct_replicated_text_session_with_runtime(
+        binding,
+        NumericReplicatedMechanisms,
+        eredu_runtime::PartitionedTextExecution::new(),
+    )
+    .map_err(|error| Error::backend(error.to_string()))?;
+    Ok(erase_numeric_partition_session(
+        session,
+        context,
+        prompt_cache_identity,
+    ))
+}
+
+type NumericPreparedRoutedPartition<A, G> =
+    eredu_architectures::partitioned_execution::PreparedRoutedPartitionedArchitecture<
+        NumericBackend,
+        A,
+        G,
+        <A as eredu_runtime::PartitionedLayeredArchitecture<
+            NumericBackend,
+            DeviceState<NumericBackend, NumericHybridLayerState>,
+        >>::Boundary,
+    >;
+
+fn bind_numeric_routed_direct<A, G>(
+    prepared: NumericPreparedRoutedPartition<A, G>,
+    world: Arc<NumericPartitionWorld>,
+    context: NumericContext,
+    provider_calls: Arc<AtomicUsize>,
+) -> Result<NumericPartitionExecutable, Error>
+where
+    A: eredu_architectures::partitioned_execution::TextPartitionArchitecture<
+            NumericBackend,
+            DeviceState<NumericBackend, NumericHybridLayerState>,
+        > + eredu_runtime::ReplicatedTextArchitecture<
+            NumericBackend,
+            DeviceState<NumericBackend, NumericHybridLayerState>,
+            Error = Error,
+        > + eredu_runtime::ParallelRoutedLayeredArchitecture<
+            NumericBackend,
+            DeviceState<NumericBackend, NumericHybridLayerState>,
+        > + 'static,
+    A::StaticModules: Clone,
+    G: 'static,
+{
+    let plan = prepared.execution_handoff().execution_plan().clone();
+    let prompt = prepared
+        .prepared()
+        .selected()
+        .prompt_cache_topology()
+        .map_err(Error::backend)?;
+    let prompt_cache_identity = prepared
+        .prepared()
+        .selected()
+        .partition()
+        .state()
+        .ok_or_else(|| Error::backend("numeric routed direct partition has no cache state"))?
+        .prompt_cache_identity::<NumericBackend, A>(
+            prepared.prepared().architecture(),
+            prompt.clone(),
+        )
+        .map_err(|error| Error::backend(error.to_string()))?;
+    let provider = CountingPartitionedRoutedProvider {
+        inner: prepared
+            .resident_gated_product_provider()
+            .map_err(|error| Error::backend(error.to_string()))?,
+        calls: provider_calls,
+    };
+    let factory_world = Arc::clone(&world);
+    let binding = prepared
+        .prepare_session_runtime(
+            prompt,
+            &context,
+            move |input, layout, selected, execution, context| {
+                let (architecture, partition, manifest, tasks) = input.into_parts();
+                if tasks.is_empty() || layout != *context.local_layout.as_deref().unwrap() {
+                    return Err(Error::backend(
+                        "numeric routed direct local task/layout authority drifted",
+                    ));
+                }
+                factory_world.record_materialization(manifest.rank(), tasks.len());
+                factory_world.realize_manifest(&manifest)?;
+                let units = partition
+                    .units()
+                    .map(|address| {
+                        architecture.build_unit(address.group(), address.index(), context)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let state = numeric_partition_state(selected, &partition)?;
+                let parallel = execution
+                    .communication_tensor_group()
+                    .map(|id| numeric_parallel_context(&factory_world, &manifest, id))
+                    .transpose()?;
+                let communication = numeric_partition_communication(&factory_world, manifest)?;
+                let executor = execution
+                    .local_executor(
+                        LayerwiseRuntime::new(
+                            architecture,
+                            NumericReplicatedPolicy::resident(units),
+                        ),
+                        parallel,
+                        provider,
+                        RouteMovement::default(),
+                    )
+                    .map_err(Error::backend)?;
+                let runtime = eredu_runtime::PartitionedTextRuntime::new(
+                    plan,
+                    executor,
+                    communication,
+                    context.clone(),
+                    eredu_runtime::NoBoundaryTransport,
+                    eredu_runtime::OpaqueOutputPublisher,
+                    eredu_runtime::OpaqueFailureAgreement,
+                    eredu_runtime::ExecutionResidency::FullyResident,
+                    None::<NumericReplicatedPolicy<A::Unit>>,
+                )
+                .map_err(|error| Error::backend(error.to_string()))?;
+                Ok((runtime, state))
+            },
+        )
+        .map_err(|error| Error::backend(error.to_string()))?;
+    let session = eredu_runtime::construct_replicated_text_session_with_runtime(
+        binding,
+        NumericReplicatedMechanisms,
+        eredu_runtime::PartitionedTextExecution::new(),
+    )
+    .map_err(|error| Error::backend(error.to_string()))?;
+    Ok(erase_numeric_partition_session(
+        session,
+        context,
+        prompt_cache_identity,
+    ))
+}
+
+fn bind_numeric_routed_pipeline<A, G>(
+    prepared: NumericPreparedRoutedPartition<A, G>,
+    world: Arc<NumericPartitionWorld>,
+    context: NumericContext,
+    provider_calls: Arc<AtomicUsize>,
+    omit_inactive: Option<Arc<AtomicBool>>,
+) -> Result<NumericPartitionExecutable, Error>
+where
+    A: eredu_architectures::partitioned_execution::TextPartitionArchitecture<
+            NumericBackend,
+            DeviceState<NumericBackend, NumericHybridLayerState>,
+        > + eredu_runtime::ReplicatedTextArchitecture<
+            NumericBackend,
+            DeviceState<NumericBackend, NumericHybridLayerState>,
+            Error = Error,
+        > + eredu_runtime::ParallelRoutedLayeredArchitecture<
+            NumericBackend,
+            DeviceState<NumericBackend, NumericHybridLayerState>,
+        > + 'static,
+    A::StaticModules: Clone,
+    G: 'static,
+{
+    prepared.dispatch_execution(
+        (world, context, provider_calls, omit_inactive),
+        |prepared, (world, context, provider_calls, _)| {
+            bind_numeric_routed_direct(prepared, world, context, provider_calls)
+        },
+        |prepared, (world, context, provider_calls, omit_inactive)| {
+            bind_numeric_routed_pipeline_impl(
+                prepared,
+                world,
+                context,
+                provider_calls,
+                omit_inactive,
+            )
+        },
+    )
+}
+
+fn bind_numeric_routed_pipeline_impl<A, G>(
+    prepared: NumericPreparedRoutedPartition<A, G>,
+    world: Arc<NumericPartitionWorld>,
+    context: NumericContext,
+    provider_calls: Arc<AtomicUsize>,
+    omit_inactive: Option<Arc<AtomicBool>>,
+) -> Result<NumericPartitionExecutable, Error>
+where
+    A: eredu_architectures::partitioned_execution::TextPartitionArchitecture<
+            NumericBackend,
+            DeviceState<NumericBackend, NumericHybridLayerState>,
+        > + eredu_runtime::ReplicatedTextArchitecture<
+            NumericBackend,
+            DeviceState<NumericBackend, NumericHybridLayerState>,
+            Error = Error,
+        > + eredu_runtime::ParallelRoutedLayeredArchitecture<
+            NumericBackend,
+            DeviceState<NumericBackend, NumericHybridLayerState>,
+        > + 'static,
+    A::StaticModules: Clone,
+    G: 'static,
+{
+    let plan = prepared.execution_handoff().execution_plan().clone();
+    let activation_dtype = prepared.execution_handoff().activation_dtype();
+    let prompt = prepared
+        .prepared()
+        .selected()
+        .prompt_cache_topology()
+        .map_err(Error::backend)?;
+    let prompt_cache_identity = prepared
+        .prepared()
+        .selected()
+        .partition()
+        .state()
+        .ok_or_else(|| Error::backend("numeric routed pipeline has no cache state"))?
+        .prompt_cache_identity::<NumericBackend, A>(
+            prepared.prepared().architecture(),
+            prompt.clone(),
+        )
+        .map_err(|error| Error::backend(error.to_string()))?;
+    let provider = CountingPartitionedRoutedProvider {
+        inner: prepared
+            .resident_gated_product_provider()
+            .map_err(|error| Error::backend(error.to_string()))?,
+        calls: provider_calls,
+    };
+    let factory_world = Arc::clone(&world);
+    let binding = prepared
+        .prepare_session_runtime(
+            prompt,
+            &context,
+            move |input, layout, selected, execution, context| {
+                let (architecture, partition, manifest, tasks) = input.into_parts();
+                if tasks.is_empty() || layout != *context.local_layout.as_deref().unwrap() {
+                    return Err(Error::backend(
+                        "numeric routed pipeline local task/layout authority drifted",
+                    ));
+                }
+                factory_world.record_materialization(manifest.rank(), tasks.len());
+                factory_world.realize_manifest(&manifest)?;
+                let addresses = partition.units().collect::<Vec<_>>();
+                let units = addresses
+                    .iter()
+                    .map(|address| {
+                        architecture.build_unit(address.group(), address.index(), context)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let state = numeric_partition_state(selected, &partition)?;
+                let parallel = execution
+                    .communication_tensor_group()
+                    .map(|id| numeric_parallel_context(&factory_world, &manifest, id))
+                    .transpose()?;
+                let parallel = execution.select_parallel(parallel).map_err(Error::backend)?;
+                let communication = numeric_partition_communication(&factory_world, manifest)?;
+                let unit_strategy = execution
+                    .pipeline_unit_strategy(provider, RouteMovement::default())
+                    .map_err(Error::backend)?;
+                let unit_strategy = NumericPipelineWaveStrategy {
+                    inner: unit_strategy,
+                    omit_inactive,
+                };
+                let executor = eredu_architectures::partitioned_execution::PipelinePartitionExecutor::new_with_unit_strategy(
+                    architecture,
+                    NumericReplicatedPolicy::resident(units),
+                    addresses,
+                    parallel,
+                    NumericPartitionTensorAllocator,
+                    activation_dtype,
+                    unit_strategy,
+                )?;
+                let runtime = eredu_runtime::PartitionedTextRuntime::new(
+                    plan,
+                    executor,
+                    communication,
+                    context.clone(),
+                    eredu_runtime::OpaqueBoundaryTransport,
+                    eredu_runtime::OpaqueOutputPublisher,
+                    eredu_runtime::OpaqueFailureAgreement,
+                    eredu_runtime::ExecutionResidency::FullyResident,
+                    None::<NumericReplicatedPolicy<A::Unit>>,
+                )
+                .map_err(|error| Error::backend(error.to_string()))?;
+                Ok((runtime, state))
+            },
+        )
+        .map_err(|error| Error::backend(error.to_string()))?;
+    let session = eredu_runtime::construct_replicated_text_session_with_runtime(
+        binding,
+        NumericReplicatedMechanisms,
+        eredu_runtime::PartitionedTextExecution::new(),
+    )
+    .map_err(|error| Error::backend(error.to_string()))?;
+    Ok(erase_numeric_partition_session(
+        session,
+        context,
+        prompt_cache_identity,
+    ))
+}
+
+struct NumericDirectPartitionAdmission;
+
+struct NumericRoutedPartitionAdmission;
+
+impl eredu_architectures::partitioned_execution::PartitionedAdmissionDispatcher
+    for NumericRoutedPartitionAdmission
+{
+    type Output = eredu_architectures::partitioned_execution::RoutedPartitionedAdmission;
+    type Error = Error;
+
+    fn direct(
+        self,
+        _: eredu_architectures::partitioned_execution::DirectPartitionedAdmission,
+    ) -> Result<Self::Output, Self::Error> {
+        Err(Error::backend(
+            "numeric production proof requires routed execution",
+        ))
+    }
+
+    fn routed(
+        self,
+        admission: eredu_architectures::partitioned_execution::RoutedPartitionedAdmission,
+    ) -> Result<Self::Output, Self::Error> {
+        Ok(admission)
+    }
+
+    fn composite(
+        self,
+        _: eredu_architectures::partitioned_execution::CompositePartitionedAdmission,
+    ) -> Result<Self::Output, Self::Error> {
+        Err(Error::backend(
+            "numeric production proof requires routed execution",
+        ))
+    }
+}
+
+impl eredu_architectures::partitioned_execution::PartitionedAdmissionDispatcher
+    for NumericDirectPartitionAdmission
+{
+    type Output = eredu_architectures::partitioned_execution::DirectPartitionedAdmission;
+    type Error = Error;
+
+    fn direct(
+        self,
+        admission: eredu_architectures::partitioned_execution::DirectPartitionedAdmission,
+    ) -> Result<Self::Output, Self::Error> {
+        Ok(admission)
+    }
+
+    fn routed(
+        self,
+        _: eredu_architectures::partitioned_execution::RoutedPartitionedAdmission,
+    ) -> Result<Self::Output, Self::Error> {
+        Err(Error::backend(
+            "numeric production proof requires direct execution",
+        ))
+    }
+
+    fn composite(
+        self,
+        _: eredu_architectures::partitioned_execution::CompositePartitionedAdmission,
+    ) -> Result<Self::Output, Self::Error> {
+        Err(Error::backend(
+            "numeric production proof requires direct execution",
+        ))
+    }
+}
+
+fn numeric_resident_selection(
+    inspection: &eredu_core::ArtifactInspection<
+        eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+    >,
+) -> eredu_runtime::SelectedReplicatedTextRealization {
+    let requirements =
+        eredu_architectures::replicated_text::replicated_text_requirements(inspection).unwrap();
+    let lowerings = requirements
+        .parameters()
+        .iter()
+        .filter(|parameter| parameter.has_lowering_source())
+        .map(|parameter| {
+            eredu_runtime::WeightLoweringCapability::new(
+                parameter
+                    .lowering_descriptor(parameter.native_executable())
+                    .unwrap(),
+                eredu_runtime::WeightLoweringKind::Direct,
+            )
+        })
+        .collect();
+    let state = eredu_runtime::StateMechanismCapabilities::new(
+        (0..requirements.state_layout().len()).flat_map(|layer| {
+            requirements
+                .state_layout()
+                .components(layer)
+                .unwrap()
+                .iter()
+                .cloned()
+                .map(move |component| {
+                    eredu_runtime::StateComponentMechanism::new(
+                        layer,
+                        component,
+                        Some(eredu_runtime::StateComponentPlacement::Device),
+                        None,
+                    )
+                })
+        }),
+    )
+    .with_transactions(true, true)
+    .with_reset(true)
+    .with_prompt_cache(true)
+    .with_observation_retention(true);
+    let capabilities = eredu_runtime::BackendMechanismCapabilities::new(
+        eredu_nn::NeuralOperatorCapabilities::ALL,
+        lowerings,
+        vec![eredu_runtime::WeightResidencyMechanism::Resident],
+        state,
+    )
+    .with_session(eredu_core::SessionCapabilities::new(true, true, true))
+    .with_prompt_cache(true)
+    .with_exact_completion(true);
+    eredu_runtime::select_replicated_text_realization(
+        &requirements,
+        &eredu_runtime::ReplicatedTextSelectionRequest::new(
+            LayerWeightResidency::FullyResident,
+            eredu_runtime::CacheResidencyPolicy::Device,
+        )
+        .with_session(eredu_core::SessionCapabilities::new(true, true, true))
+        .with_prompt_cache(true)
+        .with_exact_completion(true),
+        &capabilities,
+    )
+    .unwrap()
+}
+
+fn numeric_routed_partition_selection(
+    inspection: &eredu_core::ArtifactInspection<
+        eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+    >,
+) -> eredu_architectures::SelectedRoutedTextRealization {
+    let requirements = eredu_architectures::routed_text_requirements(inspection).unwrap();
+    let lowerings = requirements
+        .text()
+        .parameters()
+        .iter()
+        .filter(|parameter| parameter.has_lowering_source())
+        .map(|parameter| {
+            let kind = if matches!(
+                parameter.presence(),
+                eredu_runtime::ReplicatedTextParameterPresence::Derived { .. }
+            ) {
+                eredu_runtime::WeightLoweringKind::Derived
+            } else {
+                eredu_runtime::WeightLoweringKind::Direct
+            };
+            eredu_runtime::WeightLoweringCapability::new(
+                parameter
+                    .lowering_descriptor(parameter.native_executable())
+                    .unwrap(),
+                kind,
+            )
+        })
+        .collect();
+    let state = eredu_runtime::StateMechanismCapabilities::new(
+        (0..requirements.text().state_layout().len()).flat_map(|layer| {
+            requirements
+                .text()
+                .state_layout()
+                .components(layer)
+                .unwrap()
+                .iter()
+                .cloned()
+                .map(move |component| {
+                    eredu_runtime::StateComponentMechanism::new(
+                        layer,
+                        component,
+                        Some(eredu_runtime::StateComponentPlacement::Device),
+                        None,
+                    )
+                })
+        }),
+    )
+    .with_transactions(true, true)
+    .with_reset(true)
+    .with_prompt_cache(true)
+    .with_observation_retention(true);
+    let capabilities = eredu_runtime::BackendMechanismCapabilities::new(
+        eredu_nn::NeuralOperatorCapabilities::ALL,
+        lowerings,
+        vec![eredu_runtime::WeightResidencyMechanism::Resident],
+        state,
+    )
+    .with_grouped_operations([eredu_runtime::GroupedOperationRequirement::GatedProduct])
+    .with_session(eredu_core::SessionCapabilities::new(true, true, true))
+    .with_prompt_cache(true)
+    .with_exact_completion(true);
+    let request = eredu_architectures::RoutedTextSelectionRequest::new(
+        eredu_runtime::ReplicatedTextSelectionRequest::new(
+            LayerWeightResidency::FullyResident,
+            eredu_runtime::CacheResidencyPolicy::Device,
+        )
+        .with_session(eredu_core::SessionCapabilities::new(true, true, true))
+        .with_prompt_cache(true)
+        .with_exact_completion(true),
+        eredu_runtime::WeightResidency::fully_resident(),
+    )
+    .unwrap();
+    eredu_architectures::select_routed_text_realization(&requirements, &request, &capabilities)
+        .unwrap()
+}
+
+fn numeric_partition_capabilities() -> eredu_runtime::CommunicationCapabilities {
+    let limits = CommunicationTensorLimits::new(8, 8, 1 << 20, None).unwrap();
+    eredu_runtime::CommunicationCapabilities::new([
+        CommunicationOperationRequirement::tensors(
+            CommunicationOperation::AllReduceSum,
+            [eredu_core::checkpoint::TensorDtype::F32],
+            limits,
+            true,
+        )
+        .unwrap(),
+        CommunicationOperationRequirement::tensors(
+            CommunicationOperation::AllGatherUneven,
+            [eredu_core::checkpoint::TensorDtype::F32],
+            limits,
+            true,
+        )
+        .unwrap(),
+        CommunicationOperationRequirement::tensors(
+            CommunicationOperation::AllGatherEven,
+            [eredu_core::checkpoint::TensorDtype::I32],
+            limits,
+            true,
+        )
+        .unwrap(),
+        CommunicationOperationRequirement::tensors(
+            CommunicationOperation::VariableAllToAll,
+            [
+                eredu_core::checkpoint::TensorDtype::F32,
+                eredu_core::checkpoint::TensorDtype::I32,
+            ],
+            CommunicationTensorLimits::new(8, 8, 1 << 20, Some(1 << 20)).unwrap(),
+            true,
+        )
+        .unwrap(),
+        CommunicationOperationRequirement::tensors(
+            CommunicationOperation::SendReceive,
+            [
+                eredu_core::checkpoint::TensorDtype::F32,
+                eredu_core::checkpoint::TensorDtype::I32,
+                eredu_core::checkpoint::TensorDtype::U32,
+            ],
+            limits,
+            true,
+        )
+        .unwrap(),
+        CommunicationOperationRequirement::tensors(
+            CommunicationOperation::Broadcast,
+            [eredu_core::checkpoint::TensorDtype::F32],
+            limits,
+            true,
+        )
+        .unwrap(),
+        CommunicationOperationRequirement::failure_agreement(true),
+    ])
+    .unwrap()
+    .with_boundary_framing([eredu_runtime::BoundaryFramingProtocol::RoleExactV1])
+    .unwrap()
+    .with_completion_capabilities(
+        eredu_runtime::CommunicationCompletionCapabilities::new([
+            CompletionCancellationMode::QuarantineUntilComplete,
+        ])
+        .unwrap(),
+    )
+}
+
+#[test]
+fn authoritative_partitioned_numeric_sessions_match_tp_pp_and_tp_pp_reference() {
+    use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
+
+    for (architecture_name, model_type) in [
+        ("LlamaForCausalLM", "llama"),
+        ("MistralForCausalLM", "mistral"),
+    ] {
+        let config = serde_json::json!({
+            "architectures":[architecture_name], "model_type":model_type,
+            "vocab_size":8, "hidden_size":8, "intermediate_size":12,
+            "num_hidden_layers":4, "num_attention_heads":4,
+            "num_key_value_heads":2, "max_position_embeddings":64,
+            "rms_norm_eps":1e-5, "rope_theta":10000.0,
+            "tie_word_embeddings":false
+        });
+        let args = llama::model_args_from_config_value(&config).unwrap();
+        let reference_context = NumericContext::default();
+        let reference_architecture =
+            llama::LayeredModel::<NumericBackend>::new(args.clone(), &reference_context).unwrap();
+        let description = reference_architecture
+            .parameter_description(&reference_context)
+            .unwrap();
+        let units = (0..4)
+            .map(|layer| {
+                <llama::LayeredModel<NumericBackend> as LayeredArchitecture<
+                    NumericBackend,
+                    DeviceState<NumericBackend, NumericHybridLayerState>,
+                >>::build_unit(&reference_architecture, 0, layer, &reference_context)
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let mut reference = LayerwiseRuntime::new(
+            reference_architecture,
+            NumericReplicatedPolicy::resident(units),
+        );
+        let mut reference_state =
+            DeviceState::create(llama::state_layout(&args).unwrap(), |_, policy| {
+                Ok::<_, Error>(NumericHybridLayerState::new(policy))
+            })
+            .unwrap();
+        let inputs = [
+            NumericTensor::token_ids(&[0, 4, 6]),
+            NumericTensor::token_ids(&[3]),
+            NumericTensor::token_ids(&[2]),
+        ];
+        let expected = inputs
+            .iter()
+            .map(|tokens| {
+                let logits = reference
+                    .forward(
+                        decoder::LayeredInput { tokens, mask: None },
+                        &mut reference_state,
+                        &reference_context,
+                    )
+                    .unwrap();
+                numeric_text_output(logits).unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        let artifact = tempfile::tempdir().unwrap();
+        std::fs::write(
+            artifact.path().join("config.json"),
+            serde_json::to_vec(&config).unwrap(),
+        )
+        .unwrap();
+        let tensors = description
+            .groups()
+            .iter()
+            .flat_map(|group| group.members())
+            .map(|member| {
+                let bytes = vec![0_u8; member.global_shape().iter().product::<usize>() * 4];
+                (
+                    member.target().to_owned(),
+                    member.global_shape().to_vec(),
+                    bytes,
+                )
+            })
+            .collect::<Vec<_>>();
+        let views = tensors
+            .iter()
+            .map(|(name, shape, bytes)| {
+                (
+                    name.as_str(),
+                    TensorView::new(Dtype::F32, shape.clone(), bytes).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        serialize_to_file(
+            views,
+            None,
+            &artifact.path().join("model-00001-of-00001.safetensors"),
+        )
+        .unwrap();
+        let weight_map = tensors
+            .iter()
+            .map(|(name, _, _)| (name, "model-00001-of-00001.safetensors"))
+            .collect::<BTreeMap<_, _>>();
+        std::fs::write(
+            artifact.path().join("model.safetensors.index.json"),
+            serde_json::to_vec(&serde_json::json!({"weight_map":weight_map})).unwrap(),
+        )
+        .unwrap();
+        let inspection = Arc::new(
+            eredu_architectures::configuration::inspect_artifact(artifact.path()).unwrap(),
+        );
+        let selected_base = numeric_resident_selection(&inspection);
+        let capabilities = numeric_partition_capabilities();
+        let store: eredu_checkpoint::store::SharedCheckpointSource = Arc::new(
+            eredu_checkpoint::store::SafetensorsWeightStore::open(artifact.path()).unwrap(),
+        );
+
+        for topology in [
+            ParallelTopology::new(2, 1, 1, 1).unwrap(),
+            ParallelTopology::new(1, 2, 1, 1).unwrap(),
+            ParallelTopology::new(2, 2, 1, 1).unwrap(),
+        ] {
+            let world = Arc::new(NumericPartitionWorld::default());
+            let barrier = Arc::new(std::sync::Barrier::new(topology.world_size()));
+            let cache_path = artifact.path().join(format!(
+                "numeric-cache-tp{}-pp{}",
+                topology.tensor(),
+                topology.pipeline()
+            ));
+            let results = std::thread::scope(|scope| {
+                (0..topology.world_size())
+                .map(|rank| {
+                    let inspection = Arc::clone(&inspection);
+                    let selected_base = selected_base.clone();
+                    let capabilities = capabilities.clone();
+                    let store = Arc::clone(&store);
+                    let description = description.clone();
+                    let inputs = inputs.clone();
+                    let world = Arc::clone(&world);
+                    let barrier = Arc::clone(&barrier);
+                    let cache_path = cache_path.clone();
+                    scope.spawn(move || {
+                        let admission = eredu_architectures::partitioned_execution::dispatch_partitioned_admission(
+                            &inspection,
+                            eredu_architectures::partitioned_execution::PartitionedSelectionRequest::new(
+                                topology,
+                                rank,
+                                1,
+                                8,
+                                eredu_runtime::PipelineActivationDtype::Float32,
+                            )
+                            .unwrap()
+                            .with_completion_policy(
+                                CommunicationCompletionPolicy::new(
+                                    std::time::Duration::from_secs(2),
+                                    CompletionCancellationMode::QuarantineUntilComplete,
+                                )
+                                .unwrap(),
+                            ),
+                            NumericDirectPartitionAdmission,
+                        )
+                        .unwrap();
+                        let selected = eredu_architectures::partitioned_execution::select_direct_partitioned_admission(
+                            admission,
+                            selected_base,
+                            &capabilities,
+                        )
+                        .unwrap();
+                        assert_eq!(
+                            eredu_architectures::partitioned_execution::dense_decoder_partitioned_production_route(
+                                &inspection,
+                                &selected,
+                            ),
+                            eredu_architectures::partitioned_execution::DenseDecoderPartitionedProductionRoute::NeutralPartitioned,
+                        );
+                        let rank_topology = ParallelRankTopology::new(topology, rank).unwrap();
+                        let layout = eredu_architectures::partitioned_execution::derive_partitioned_local_layout(
+                            &description,
+                            rank_topology,
+                        )
+                        .unwrap();
+                        let context = NumericContext::with_partition(
+                            layout,
+                            rank,
+                            Arc::clone(&world),
+                        );
+                        let mut executable = eredu_architectures::partitioned_execution::visit_resident_partitioned_architecture(
+                            &inspection,
+                            selected,
+                            store,
+                            &context,
+                            NumericResidentPartitionVisitor {
+                                world: Arc::clone(&world),
+                                context: context.clone(),
+                            },
+                        )
+                        .unwrap();
+                        let actual = inputs
+                            .iter()
+                            .enumerate()
+                            .map(|(index, tokens)| executable.forward(tokens, index == 0).unwrap())
+                            .collect::<Vec<_>>();
+                        let prefix = [0, 4, 6, 3, 2];
+                        let identity = executable.prompt_cache_identity();
+                        let expected_cache_topology =
+                            eredu_core::cache::PromptCacheTopology::new(
+                                (topology.pipeline() > 1).then_some((
+                                    topology.pipeline(),
+                                    rank_topology.pipeline_parallel_rank(),
+                                )),
+                                (topology.tensor() > 1).then_some((
+                                    topology.tensor(),
+                                    rank_topology.tensor_parallel_rank(),
+                                )),
+                                None,
+                                true,
+                            )
+                            .unwrap();
+                        assert_eq!(identity.topology(), &expected_cache_topology);
+                        let descriptor = eredu_core::cache::PromptCacheDescriptor::from_model_identity(
+                            identity.clone(),
+                            "numeric-checkpoint",
+                            "numeric-prefix",
+                            1,
+                        )
+                        .unwrap();
+                        let saved = executable
+                            .save_prompt_cache(&cache_path, descriptor.clone(), &prefix)
+                            .unwrap();
+                        assert_eq!(saved.topology, identity.topology().clone());
+                        assert_eq!(saved.global_layer_start, identity.global_layer_start());
+                        assert_eq!(saved.global_layer_end, identity.global_layer_end());
+
+                        let wrong_identity = eredu_core::cache::PromptCacheModelIdentity::new(
+                            identity.model_family(),
+                            identity.effective_model_type(),
+                            identity.architecture_fingerprint(),
+                            identity.layer_count(),
+                            identity.global_layer_start(),
+                            identity.global_layer_end(),
+                            identity.sink_tokens(),
+                            eredu_core::cache::PromptCacheTopology::default(),
+                            identity.layer_layout().clone(),
+                            identity.layer_prefix_offsets().to_vec(),
+                            identity.state_segments().to_vec(),
+                        )
+                        .unwrap();
+                        let wrong_descriptor =
+                            eredu_core::cache::PromptCacheDescriptor::from_model_identity(
+                                wrong_identity,
+                                "numeric-checkpoint",
+                                "numeric-prefix",
+                                1,
+                            )
+                            .unwrap();
+                        let load_attempts = world.cache_load_attempts(rank);
+                        assert!(executable
+                            .load_prompt_cache(&cache_path, &wrong_descriptor, &prefix)
+                            .is_err());
+                        assert_eq!(world.cache_load_attempts(rank), load_attempts);
+
+                        let wrong_rank_topology = eredu_core::cache::PromptCacheTopology::new(
+                            expected_cache_topology
+                                .stage()
+                                .map(|(size, stage)| (size, (stage + 1) % size)),
+                            expected_cache_topology.shard().map(|(size, shard)| {
+                                if expected_cache_topology.stage().is_some() {
+                                    (size, shard)
+                                } else {
+                                    (size, (shard + 1) % size)
+                                }
+                            }),
+                            None,
+                            true,
+                        )
+                        .unwrap();
+                        let wrong_rank_identity =
+                            eredu_core::cache::PromptCacheModelIdentity::new(
+                                identity.model_family(),
+                                identity.effective_model_type(),
+                                identity.architecture_fingerprint(),
+                                identity.layer_count(),
+                                identity.global_layer_start(),
+                                identity.global_layer_end(),
+                                identity.sink_tokens(),
+                                wrong_rank_topology,
+                                identity.layer_layout().clone(),
+                                identity.layer_prefix_offsets().to_vec(),
+                                identity.state_segments().to_vec(),
+                            )
+                            .unwrap();
+                        let wrong_rank_descriptor =
+                            eredu_core::cache::PromptCacheDescriptor::from_model_identity(
+                                wrong_rank_identity,
+                                "numeric-checkpoint",
+                                "numeric-prefix",
+                                1,
+                            )
+                            .unwrap();
+                        assert!(executable
+                            .load_prompt_cache(&cache_path, &wrong_rank_descriptor, &prefix)
+                            .is_err());
+                        assert_eq!(world.cache_load_attempts(rank), load_attempts);
+
+                        executable.reset().unwrap();
+                        assert!(executable
+                            .positions()
+                            .unwrap()
+                            .iter()
+                            .all(|position| *position == 0));
+                        let loaded = executable
+                            .load_prompt_cache(&cache_path, &descriptor, &prefix)
+                            .unwrap();
+                        assert_eq!(loaded, saved);
+                        assert!(executable
+                            .positions()
+                            .unwrap()
+                            .iter()
+                            .all(|position| *position == 5));
+
+                        let baseline = executable
+                            .forward(&NumericTensor::token_ids(&[1]), false)
+                            .unwrap();
+                        executable.reset().unwrap();
+                        executable
+                            .load_prompt_cache(&cache_path, &descriptor, &prefix)
+                            .unwrap();
+                        let mut unit_observer = NumericLifecycleObserver {
+                            zero_unit_outputs: true,
+                            ..Default::default()
+                        };
+                        let intervened = executable
+                            .forward_observed(
+                                &NumericTensor::token_ids(&[1]),
+                                false,
+                                &mut unit_observer,
+                            )
+                            .unwrap();
+                        assert!(unit_observer.paths.iter().any(|path| {
+                            path != eredu_core::MODEL_LOGITS_OBSERVATION_PATH
+                                && path.ends_with(".output")
+                        }));
+                        assert_ne!(intervened.data, baseline.data);
+
+                        executable.reset().unwrap();
+                        executable
+                            .load_prompt_cache(&cache_path, &descriptor, &prefix)
+                            .unwrap();
+                        let mut final_observer = NumericLifecycleObserver {
+                            zero_final_output: true,
+                            ..Default::default()
+                        };
+                        let final_output = executable
+                            .forward_observed(
+                                &NumericTensor::token_ids(&[1]),
+                                false,
+                                &mut final_observer,
+                            )
+                            .unwrap();
+                        assert!(final_output.data.iter().all(|value| *value == 0.0));
+
+                        barrier.wait();
+                        if rank == 0 {
+                            world.set_completion_delay(std::time::Duration::from_millis(1));
+                        }
+                        barrier.wait();
+                        let delayed_before = world.lifecycle_counts();
+                        executable
+                            .forward(&NumericTensor::token_ids(&[1]), false)
+                            .unwrap();
+                        barrier.wait();
+                        if rank == 0 {
+                            world.set_completion_delay(std::time::Duration::ZERO);
+                        }
+                        barrier.wait();
+                        let delayed_after = world.lifecycle_counts();
+                        assert!(
+                            delayed_after.1.values().sum::<usize>()
+                                > delayed_before.1.values().sum::<usize>()
+                        );
+
+                        let before_observer_failure = executable.positions().unwrap();
+                        let observer_counts = world.lifecycle_counts();
+                        let mut failing_observer = NumericLifecycleObserver {
+                            fail_path: Some(eredu_core::MODEL_LOGITS_OBSERVATION_PATH.into()),
+                            ..Default::default()
+                        };
+                        assert!(executable
+                            .forward_observed(
+                                &NumericTensor::token_ids(&[1]),
+                                false,
+                                &mut failing_observer,
+                            )
+                            .is_err());
+                        assert_eq!(executable.positions().unwrap(), before_observer_failure);
+                        barrier.wait();
+                        let after_observer_counts = world.lifecycle_counts();
+                        assert_eq!(after_observer_counts.3, observer_counts.3);
+                        assert_eq!(
+                            after_observer_counts
+                                .2
+                                .get(&NumericOpaqueOperation::Broadcast),
+                            observer_counts.2.get(&NumericOpaqueOperation::Broadcast),
+                        );
+
+                        barrier.wait();
+                        if rank == 0 {
+                            world.arm_fault_one_per_agreement_group(
+                                NumericPartitionFault::LocalExecution,
+                            );
+                        }
+                        barrier.wait();
+                        let local_before = executable.positions().unwrap();
+                        let local_counts = world.lifecycle_counts();
+                        assert!(executable
+                            .forward(&NumericTensor::token_ids(&[1]), false)
+                            .is_err());
+                        assert_eq!(executable.positions().unwrap(), local_before);
+                        barrier.wait();
+                        let local_after_counts = world.lifecycle_counts();
+                        assert_eq!(local_after_counts.3, local_counts.3);
+
+                        if topology.tensor() > 1 {
+                            barrier.wait();
+                            if rank == 0 {
+                                world.arm_fault_all(
+                                    topology.world_size(),
+                                    NumericPartitionFault::Collective,
+                                );
+                            }
+                            barrier.wait();
+                            let collective_before = executable.positions().unwrap();
+                            let collective_counts = world.lifecycle_counts();
+                            assert!(executable
+                                .forward(&NumericTensor::token_ids(&[1]), false)
+                                .is_err());
+                            assert_eq!(executable.positions().unwrap(), collective_before);
+                            barrier.wait();
+                            assert_eq!(world.lifecycle_counts().3, collective_counts.3);
+                        }
+
+                        if topology.pipeline() > 1 {
+                            barrier.wait();
+                            if rank == 0 {
+                                world.arm_fault_all(
+                                    topology.world_size(),
+                                    NumericPartitionFault::Transfer,
+                                );
+                            }
+                            barrier.wait();
+                            let transfer_before = executable.positions().unwrap();
+                            let transfer_counts = world.lifecycle_counts();
+                            assert!(executable
+                                .forward(&NumericTensor::token_ids(&[1]), false)
+                                .is_err());
+                            assert_eq!(executable.positions().unwrap(), transfer_before);
+                            barrier.wait();
+                            assert_eq!(world.lifecycle_counts().3, transfer_counts.3);
+                        }
+
+                        let before = executable.positions().unwrap();
+                        barrier.wait();
+                        if rank == 0 {
+                            world.fail_one_completion_per_agreement_group();
+                        }
+                        barrier.wait();
+                        let completion_counts = world.lifecycle_counts();
+                        assert!(executable
+                            .forward(&NumericTensor::token_ids(&[1]), false)
+                            .is_err());
+                        let after = executable.positions().unwrap();
+                        assert_eq!(after, before);
+                        barrier.wait();
+                        assert_eq!(world.lifecycle_counts().3, completion_counts.3);
+
+                        barrier.wait();
+                        if rank == 0 {
+                            if topology.pipeline() == 1 {
+                                world.arm_deadline_all(
+                                    topology.world_size(),
+                                    NumericOpaqueOperation::Broadcast,
+                                );
+                            } else {
+                                world.arm_fault_all(
+                                    topology.world_size(),
+                                    NumericPartitionFault::PeerSubmission,
+                                );
+                            }
+                        }
+                        barrier.wait();
+                        let poison_before = executable.positions().unwrap();
+                        let poison_initial_counts = world.lifecycle_counts();
+                        assert!(executable
+                            .forward(&NumericTensor::token_ids(&[1]), false)
+                            .is_err());
+                        assert_eq!(executable.positions().unwrap(), poison_before);
+                        barrier.wait();
+                        let poisoned_counts = world.lifecycle_counts();
+                        assert_eq!(poisoned_counts.3, poison_initial_counts.3);
+                        assert_eq!(
+                            poisoned_counts
+                                .2
+                                .get(&NumericOpaqueOperation::Broadcast),
+                            poison_initial_counts
+                                .2
+                                .get(&NumericOpaqueOperation::Broadcast),
+                        );
+                        assert!(executable
+                            .forward(&NumericTensor::token_ids(&[1]), false)
+                            .is_err());
+                        assert_eq!(executable.positions().unwrap(), poison_before);
+                        barrier.wait();
+                        assert_eq!(world.lifecycle_counts(), poisoned_counts);
+                        (actual, before, final_observer.paths)
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+            });
+            for (rank, (actual, positions, final_paths)) in results.iter().enumerate() {
+                for (step, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+                    assert_tensor_close(
+                        actual,
+                        expected,
+                        &format!("authoritative topology {topology:?} rank {rank} step {step}"),
+                    );
+                }
+                assert!(positions.iter().all(|position| *position == 7));
+                let coordinates = ParallelRankTopology::new(topology, rank).unwrap();
+                assert_eq!(
+                    final_paths
+                        .iter()
+                        .any(|path| path == eredu_core::MODEL_LOGITS_OBSERVATION_PATH),
+                    coordinates.tensor_parallel_rank() == 0
+                        && coordinates.pipeline_parallel_rank() + 1 == topology.pipeline(),
+                );
+            }
+            assert_eq!(world.materializations().len(), topology.world_size());
+            assert!(world.materializations().values().all(|tasks| *tasks > 0));
+            let trace = world.trace();
+            assert!(trace.iter().any(|event| {
+                event.operation == NumericOpaqueOperation::Broadcast && event.sequence == 0
+            }));
+            assert!(trace.iter().any(|event| {
+                event.operation == NumericOpaqueOperation::FailureAgreement && event.sequence == 0
+            }));
+            let pipeline = topology.pipeline() > 1;
+            assert_eq!(
+                trace
+                    .iter()
+                    .any(|event| event.operation == NumericOpaqueOperation::PointToPoint),
+                pipeline,
+            );
+            let groups = world.groups();
+            let routes = world.routes();
+            let mut participants =
+                BTreeMap::<(NumericOpaqueOperation, u64, usize), BTreeSet<usize>>::new();
+            let mut sequences =
+                BTreeMap::<(usize, NumericOpaqueOperation, u64), BTreeSet<usize>>::new();
+            for event in trace {
+                assert!(event.rank < topology.world_size());
+                match event.operation {
+                    NumericOpaqueOperation::PointToPoint => {
+                        let (source, destination) = routes[&event.id];
+                        assert!([source, destination].contains(&event.rank));
+                    }
+                    NumericOpaqueOperation::AllGatherEven
+                    | NumericOpaqueOperation::AllGatherUneven
+                    | NumericOpaqueOperation::AllReduceSum
+                    | NumericOpaqueOperation::Broadcast
+                    | NumericOpaqueOperation::FailureAgreement => {
+                        assert!(groups[&event.id].contains(&event.rank));
+                    }
+                    NumericOpaqueOperation::VariableAllToAll => {
+                        assert!(groups[&event.id].contains(&event.rank));
+                    }
+                }
+                participants
+                    .entry((event.operation, event.id, event.sequence))
+                    .or_default()
+                    .insert(event.rank);
+                sequences
+                    .entry((event.rank, event.operation, event.id))
+                    .or_default()
+                    .insert(event.sequence);
+            }
+            for ((operation, id, _), actual) in participants {
+                let expected = match operation {
+                    NumericOpaqueOperation::PointToPoint => {
+                        let (source, destination) = routes[&id];
+                        BTreeSet::from([source, destination])
+                    }
+                    NumericOpaqueOperation::AllGatherEven
+                    | NumericOpaqueOperation::AllGatherUneven
+                    | NumericOpaqueOperation::AllReduceSum
+                    | NumericOpaqueOperation::Broadcast
+                    | NumericOpaqueOperation::FailureAgreement => {
+                        groups[&id].iter().copied().collect()
+                    }
+                    NumericOpaqueOperation::VariableAllToAll => {
+                        groups[&id].iter().copied().collect()
+                    }
+                };
+                assert_eq!(actual, expected);
+            }
+            for (_, actual) in sequences {
+                assert_eq!(actual, (0..actual.len()).collect());
+            }
+        }
+    }
+}
+
+#[test]
+fn routed_tp_pp_ep_collective_wave_schedule_is_exact_for_qwen_and_gpt_oss() {
+    use eredu_architectures::partitioned_execution::RoutedExpertWaveOperation as Operation;
+
+    let topology = ParallelTopology::new(2, 2, 2, 1).unwrap();
+    let owner_group = ExecutionGroupId::new("text_decoder").unwrap();
+    let qwen_args = qwen::model_args_from_config_value(&serde_json::json!({
+        "model_type":"qwen3_moe", "vocab_size":32, "hidden_size":32,
+        "intermediate_size":0, "moe_intermediate_size":32, "num_hidden_layers":4,
+        "num_attention_heads":4, "num_key_value_heads":2, "head_dim":8,
+        "max_position_embeddings":64, "rms_norm_eps":1e-6, "rope_theta":10000.0,
+        "num_experts":4, "num_experts_per_tok":2, "norm_topk_prob":true,
+        "attention_bias":false, "mlp_bias":false, "tie_word_embeddings":false
+    }))
+    .unwrap();
+    let gpt_args = gpt_oss::model_args_from_config_value(&serde_json::json!({
+        "model_type":"gpt_oss", "vocab_size":32, "hidden_size":32,
+        "intermediate_size":64, "num_hidden_layers":4,
+        "num_attention_heads":4, "num_key_value_heads":2, "head_dim":8,
+        "max_position_embeddings":64, "rms_norm_eps":1e-5, "rope_theta":150000.0,
+        "sliding_window":16, "num_local_experts":4, "num_experts_per_tok":2,
+        "quantization_config":{"quant_method":"mxfp4"}, "swiglu_limit":7.0
+    }))
+    .unwrap();
+    let context = NumericContext::default();
+    let qwen_description =
+        qwen::RoutedLayeredModel::<NumericBackend>::new(qwen_args.clone(), &context)
+            .unwrap()
+            .parameter_description(&context)
+            .unwrap();
+    let gpt_description = gpt_oss::LayeredModel::<NumericBackend>::new(gpt_args.clone(), &context)
+        .unwrap()
+        .parameter_description(&context)
+        .unwrap();
+    let qwen_operations = [
+        Operation::CountConsensus,
+        Operation::ForwardGlobalExpertIds,
+        Operation::ForwardOwnerLocalExpertIds,
+        Operation::ForwardRouteTags,
+        Operation::ForwardInput,
+        Operation::ForwardScores,
+        Operation::ForwardCoefficients,
+        Operation::ReverseOutput,
+        Operation::ReverseRouteTags,
+    ];
+    let gpt_operations = [
+        Operation::CountConsensus,
+        Operation::ForwardGlobalExpertIds,
+        Operation::ForwardOwnerLocalExpertIds,
+        Operation::ForwardRouteTags,
+        Operation::ForwardInput,
+        Operation::ForwardScores,
+        Operation::ForwardCoefficients,
+        Operation::ReverseOutput,
+        Operation::ReversePostReduceBias,
+        Operation::ReverseRouteTags,
+    ];
+
+    for rank in 0..topology.world_size() {
+        let rank_topology = ParallelRankTopology::new(topology, rank).unwrap();
+        let qwen_layout =
+            eredu_architectures::partitioned_execution::derive_partitioned_local_layout(
+                &qwen_description,
+                rank_topology,
+            )
+            .unwrap();
+        let gpt_layout =
+            eredu_architectures::partitioned_execution::derive_partitioned_local_layout(
+                &gpt_description,
+                rank_topology,
+            )
+            .unwrap();
+        let qwen_plan =
+            qwen::partition_expert_realization_plan(&qwen_args, &qwen_layout, rank_topology)
+                .unwrap();
+        let gpt_plan =
+            gpt_oss::partition_expert_realization_plan(&gpt_args, &gpt_layout, rank_topology)
+                .unwrap();
+        for (plan, expected) in [
+            (&qwen_plan, qwen_operations.as_slice()),
+            (&gpt_plan, gpt_operations.as_slice()),
+        ] {
+            let schedule =
+                eredu_architectures::partitioned_execution::routed_expert_collective_wave_schedule(
+                    plan,
+                    &owner_group,
+                    4,
+                    2,
+                    rank_topology.tensor_parallel_rank(),
+                    2,
+                    32,
+                    32,
+                )
+                .unwrap();
+            assert_eq!(schedule.stage_count(), 2);
+            for stage in 0..2 {
+                let waves = schedule.stage(stage).unwrap();
+                assert_eq!(waves.len(), 2);
+                for (offset, wave) in waves.iter().enumerate() {
+                    assert_eq!(wave.unit(), stage * 2 + offset);
+                    assert_eq!(wave.hidden_width(), 32);
+                    assert_eq!(wave.operations(), expected);
+                }
+            }
+        }
+        let complete_gpt_schedule =
+            eredu_architectures::partitioned_execution::routed_expert_collective_wave_schedule(
+                &gpt_plan,
+                &owner_group,
+                4,
+                1,
+                0,
+                2,
+                32,
+                32,
+            )
+            .unwrap();
+        for stage in 0..2 {
+            for wave in complete_gpt_schedule.stage(stage).unwrap() {
+                assert_eq!(wave.operations(), qwen_operations.as_slice());
+                assert!(!wave
+                    .operations()
+                    .contains(&Operation::ReversePostReduceBias));
+            }
+        }
+    }
+    assert_eq!(3 * 4 * topology.world_size(), 96);
+    assert_eq!(3 * 4 * 8 * topology.world_size(), 768);
+}
+
+fn assert_authoritative_routed_numeric_sessions(
+    label: &str,
+    config: serde_json::Value,
+    description: eredu_runtime::ArchitectureParameterDescription,
+    routed_units: usize,
+    deepseek_v4: bool,
+    topologies: &[ParallelTopology],
+) {
+    use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
+    let reference_context = NumericContext::default();
+    let inputs = [
+        NumericTensor::token_ids(&[1, 3, 2]),
+        NumericTensor::token_ids(&[4]),
+        NumericTensor::token_ids(&[5]),
+    ];
+    let reference = if deepseek_v4 {
+        let args = deepseek::parse_v4_config(&config).unwrap();
+        let architecture =
+            deepseek::v4::Model::<NumericBackend>::new(args.clone(), &reference_context).unwrap();
+        let units = (0..usize::try_from(args.num_hidden_layers).unwrap())
+            .map(|unit| {
+                <deepseek::v4::Model<NumericBackend> as LayeredArchitecture<
+                    NumericBackend,
+                    DeviceState<NumericBackend, NumericHybridLayerState>,
+                >>::build_unit(&architecture, 0, unit, &reference_context)
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let mut state = DeviceState::<NumericBackend, _>::create(
+            deepseek::v4::state_layout(&args).unwrap(),
+            |_, policy| Ok::<_, Error>(NumericHybridLayerState::new(policy)),
+        )
+        .unwrap();
+        let mut runtime =
+            LayerwiseRuntime::new(architecture, NumericReplicatedPolicy::resident(units));
+        let outputs = inputs
+            .iter()
+            .map(|tokens| {
+                numeric_text_output(
+                    runtime
+                        .forward(
+                            deepseek::mtp::EmbeddedInput::target(tokens, None),
+                            &mut state,
+                            &reference_context,
+                        )
+                        .unwrap(),
+                )
+                .unwrap()
+            })
+            .collect();
+        NumericReplicatedRun {
+            outputs,
+            state,
+            bank_report: None,
+        }
+    } else {
+        execute_numeric_routed_visitor(&config, &reference_context, &inputs[0], false)
+    };
+
+    let artifact = tempfile::tempdir().unwrap();
+    std::fs::write(
+        artifact.path().join("config.json"),
+        serde_json::to_vec(&config).unwrap(),
+    )
+    .unwrap();
+    let resolved = eredu_architectures::configuration::MODEL_CONFIGURATIONS
+        .resolve_safetensors(&config)
+        .unwrap();
+    let checkpoint = resolved
+        .architecture_plan()
+        .safetensors_architecture()
+        .unwrap()
+        .checkpoint();
+    let constraints = checkpoint
+        .common_tensors
+        .iter()
+        .filter(|constraint| {
+            constraint.requirement == eredu_checkpoint::schema::TensorRequirement::Required
+        })
+        .chain(
+            checkpoint
+                .layout_groups
+                .iter()
+                .filter(|group| group.required)
+                .filter_map(|group| group.variants.first())
+                .flat_map(|variant| variant.tensors.iter()),
+        )
+        .collect::<Vec<_>>();
+    let mut tensors = BTreeMap::<String, (Vec<usize>, Dtype, Vec<u8>)>::new();
+    for constraint in constraints {
+        tensors.entry(constraint.key.clone()).or_insert_with(|| {
+            let dtype = if constraint
+                .dtype
+                .accepts(&eredu_checkpoint::StoredDtype::I32)
+                && !constraint
+                    .dtype
+                    .accepts(&eredu_checkpoint::StoredDtype::F32)
+            {
+                Dtype::I32
+            } else {
+                Dtype::F32
+            };
+            (
+                constraint.shape.clone(),
+                dtype,
+                vec![0_u8; constraint.shape.iter().product::<usize>() * 4],
+            )
+        });
+    }
+    let views = tensors
+        .iter()
+        .map(|(name, (shape, dtype, bytes))| {
+            (
+                name.as_str(),
+                TensorView::new(*dtype, shape.clone(), bytes).unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    serialize_to_file(views, None, &artifact.path().join("model.safetensors")).unwrap();
+    let inspection =
+        Arc::new(eredu_architectures::configuration::inspect_artifact(artifact.path()).unwrap());
+    let selected_base = numeric_routed_partition_selection(&inspection);
+    let capabilities = numeric_partition_capabilities();
+    let store: eredu_checkpoint::store::SharedCheckpointSource =
+        Arc::new(eredu_checkpoint::store::SafetensorsWeightStore::open(artifact.path()).unwrap());
+
+    for topology in topologies.iter().copied() {
+        let world = Arc::new(NumericPartitionWorld::default());
+        let barrier = Arc::new(std::sync::Barrier::new(topology.world_size()));
+        let omit_zero_participant = Arc::new(AtomicBool::new(false));
+        let cache_path = artifact.path().join(format!(
+            "numeric-{label}-cache-tp{}-pp{}-ep{}",
+            topology.tensor(),
+            topology.pipeline(),
+            topology.expert(),
+        ));
+        let results = std::thread::scope(|scope| {
+            (0..topology.world_size())
+                .map(|rank| {
+                    let inspection = Arc::clone(&inspection);
+                    let selected_base = selected_base.clone();
+                    let capabilities = capabilities.clone();
+                    let store = Arc::clone(&store);
+                    let description = description.clone();
+                    let inputs = inputs.clone();
+                    let world = Arc::clone(&world);
+                    let barrier = Arc::clone(&barrier);
+                    let omit_zero_participant = Arc::clone(&omit_zero_participant);
+                    let cache_path = cache_path.clone();
+                    scope.spawn(move || {
+                        let admission = eredu_architectures::partitioned_execution::dispatch_partitioned_admission(
+                            &inspection,
+                            eredu_architectures::partitioned_execution::PartitionedSelectionRequest::new(
+                                topology,
+                                rank,
+                                1,
+                                8,
+                                eredu_runtime::PipelineActivationDtype::Float32,
+                            )
+                            .unwrap()
+                            .with_completion_policy(
+                                CommunicationCompletionPolicy::new(
+                                    std::time::Duration::from_secs(2),
+                                    CompletionCancellationMode::QuarantineUntilComplete,
+                                )
+                                .unwrap(),
+                            ),
+                            NumericRoutedPartitionAdmission,
+                        )
+                        .unwrap();
+                        let selected = eredu_architectures::partitioned_execution::select_routed_partitioned_admission(
+                            admission,
+                            selected_base,
+                            &capabilities,
+                        )
+                        .unwrap();
+                        assert_eq!(
+                            selected
+                                .requirements()
+                                .topology()
+                                .expert_parallel_size(),
+                            topology.expert(),
+                        );
+                        let rank_topology = ParallelRankTopology::new(topology, rank).unwrap();
+                        let omit_inactive = (topology.expert() > 1
+                            && topology.pipeline() > 1
+                            && rank_topology.pipeline_parallel_rank() == 1
+                            && rank_topology.tensor_parallel_rank() == 0
+                            && rank_topology.expert_parallel_rank() == 0)
+                            .then(|| Arc::clone(&omit_zero_participant));
+                        let layout = eredu_architectures::partitioned_execution::derive_partitioned_local_layout(
+                            &description,
+                            rank_topology,
+                        )
+                        .unwrap();
+                        let context = NumericContext::with_partition(
+                            layout,
+                            rank,
+                            Arc::clone(&world),
+                        );
+                        let provider_calls = Arc::new(AtomicUsize::new(0));
+                        let visitor = NumericRoutedPartitionVisitor {
+                            world: Arc::clone(&world),
+                            context: context.clone(),
+                            provider_calls: Arc::clone(&provider_calls),
+                            omit_inactive,
+                        };
+                        let mut executable = if deepseek_v4 {
+                            eredu_architectures::partitioned_execution::visit_deepseek_v4_routed_partitioned_production::<
+                                NumericBackend,
+                                DeviceState<NumericBackend, NumericHybridLayerState>,
+                                _,
+                            >(&inspection, selected, store, &context, visitor)
+                        } else {
+                            eredu_architectures::partitioned_execution::visit_routed_partitioned_production::<
+                                NumericBackend,
+                                DeviceState<NumericBackend, NumericHybridLayerState>,
+                                _,
+                            >(&inspection, selected, store, &context, visitor)
+                        }
+                        .unwrap_or_else(|error| {
+                            panic!(
+                                "{label} topology {topology:?} rank {rank} construction: {error}"
+                            )
+                        });
+                        let actual = inputs
+                            .iter()
+                            .enumerate()
+                            .map(|(index, tokens)| {
+                                executable.forward(tokens, index == 0).unwrap_or_else(|error| {
+                                    panic!(
+                                        "{label} topology {topology:?} rank {rank} step {index}: {error}"
+                                    )
+                                })
+                            })
+                            .collect::<Vec<_>>();
+                        barrier.wait();
+                        let successful_wave_trace = world.trace();
+                        if topology.tensor() == 1 && topology.expert() > 1 {
+                            assert_eq!(
+                                world.tensor_collective_calls(),
+                                0,
+                                "PP x EP execution without TP must not submit tensor collectives",
+                            );
+                        }
+                        assert!(provider_calls.load(Ordering::Relaxed) > 0);
+
+                        let identity = executable.prompt_cache_identity();
+                        assert_eq!(
+                            identity.topology(),
+                            &PromptCacheTopology::new(
+                                (topology.pipeline() > 1).then_some((
+                                    topology.pipeline(),
+                                    rank_topology.pipeline_parallel_rank(),
+                                )),
+                                (topology.tensor() > 1).then_some((
+                                    topology.tensor(),
+                                    rank_topology.tensor_parallel_rank(),
+                                )),
+                                (topology.expert() > 1).then_some((
+                                    topology.expert(),
+                                    rank_topology.expert_parallel_rank(),
+                                )),
+                                true,
+                            )
+                            .unwrap(),
+                        );
+                        let prefix = [1, 3, 2, 4, 5];
+                        let descriptor = eredu_core::cache::PromptCacheDescriptor::from_model_identity(
+                            identity,
+                            "numeric-routed-checkpoint",
+                            "numeric-routed-prefix",
+                            1,
+                        )
+                        .unwrap();
+                        let saved = executable
+                            .save_prompt_cache(&cache_path, descriptor.clone(), &prefix)
+                            .unwrap();
+                        assert!(matches!(
+                            saved.distributed_commit,
+                            Some(DistributedCommitOutcome::Committed(_))
+                        ));
+                        executable.reset().unwrap();
+                        let loaded = executable
+                            .load_prompt_cache(&cache_path, &descriptor, &prefix)
+                            .unwrap();
+                        assert_eq!(loaded.distributed_commit, saved.distributed_commit);
+                        assert!(executable
+                            .positions()
+                            .unwrap()
+                            .iter()
+                            .all(|position| *position == 5));
+                        assert_eq!(
+                            saved.topology.stage(),
+                            (topology.pipeline() > 1).then_some((
+                                topology.pipeline(),
+                                rank_topology.pipeline_parallel_rank(),
+                            )),
+                        );
+
+                        if label == "deepseek-v3"
+                            && topology.tensor() == 1
+                            && topology.pipeline() == 1
+                            && topology.expert() == 2
+                        {
+                            let routed_output = "model.layers.1.output";
+                            barrier.wait();
+                            executable.reset().unwrap();
+                            executable
+                                .load_prompt_cache(&cache_path, &descriptor, &prefix)
+                                .unwrap();
+                            let baseline = executable
+                                .forward(&NumericTensor::token_ids(&[6]), false)
+                                .unwrap();
+                            barrier.wait();
+                            executable.reset().unwrap();
+                            executable
+                                .load_prompt_cache(&cache_path, &descriptor, &prefix)
+                                .unwrap();
+                            let mut replacing = NumericLifecycleObserver {
+                                zero_path: Some(routed_output.into()),
+                                ..Default::default()
+                            };
+                            let replaced = executable
+                                .forward_observed(
+                                    &NumericTensor::token_ids(&[6]),
+                                    false,
+                                    &mut replacing,
+                                )
+                                .unwrap();
+                            assert_eq!(
+                                replacing
+                                    .paths
+                                    .iter()
+                                    .filter(|path| path.as_str() == routed_output)
+                                    .count(),
+                                1,
+                                "the selected routed unit output must be observed and replaced exactly once",
+                            );
+                            assert_ne!(replaced.data, baseline.data);
+
+                            barrier.wait();
+                            executable.reset().unwrap();
+                            executable
+                                .load_prompt_cache(&cache_path, &descriptor, &prefix)
+                                .unwrap();
+                            barrier.wait();
+                            let before_observer_failure = executable.positions().unwrap();
+                            let counts_before_observer_failure = world.lifecycle_counts();
+                            let mut failing = NumericLifecycleObserver {
+                                fail_path: Some(routed_output.into()),
+                                ..Default::default()
+                            };
+                            assert!(executable
+                                .forward_observed(
+                                    &NumericTensor::token_ids(&[6]),
+                                    false,
+                                    &mut failing,
+                                )
+                                .is_err());
+                            assert_eq!(
+                                executable.positions().unwrap(),
+                                before_observer_failure
+                            );
+                            barrier.wait();
+                            let counts_after_observer_failure = world.lifecycle_counts();
+                            assert_eq!(
+                                counts_after_observer_failure.3,
+                                counts_before_observer_failure.3,
+                                "observer failure must not commit partition state",
+                            );
+                            assert_eq!(
+                                counts_after_observer_failure
+                                    .0
+                                    .get(&NumericOpaqueOperation::Broadcast),
+                                counts_before_observer_failure
+                                    .0
+                                    .get(&NumericOpaqueOperation::Broadcast),
+                                "observer failure must not publish output",
+                            );
+                        }
+
+                        barrier.wait();
+                        let before_failure = executable.positions().unwrap();
+                        let lifecycle_before = world.lifecycle_counts();
+                        let commits_before = lifecycle_before.3;
+                        let broadcasts_before = lifecycle_before
+                            .0
+                            .get(&NumericOpaqueOperation::Broadcast)
+                            .copied()
+                            .unwrap_or_default();
+                        if topology.expert() > 1 && topology.pipeline() > 1 {
+                            if rank == 0 {
+                                omit_zero_participant.store(true, Ordering::Relaxed);
+                            }
+                        } else if rank == 0 {
+                            world.arm_fault_all(
+                                topology.world_size(),
+                                NumericPartitionFault::LocalExecution,
+                            );
+                        }
+                        barrier.wait();
+                        assert!(executable
+                            .forward(&NumericTensor::token_ids(&[6]), false)
+                            .is_err());
+                        assert_eq!(executable.positions().unwrap(), before_failure);
+                        barrier.wait();
+                        let lifecycle_after_failure = world.lifecycle_counts();
+                        assert_eq!(lifecycle_after_failure.3, commits_before);
+                        assert_eq!(
+                            lifecycle_after_failure
+                                .0
+                                .get(&NumericOpaqueOperation::Broadcast)
+                                .copied()
+                                .unwrap_or_default(),
+                            broadcasts_before,
+                            "a failed collective wave must not publish output",
+                        );
+                        if topology.expert() > 1 && topology.pipeline() > 1 {
+                            let expert_submissions_after_failure = [
+                                NumericOpaqueOperation::AllGatherEven,
+                                NumericOpaqueOperation::VariableAllToAll,
+                            ]
+                            .into_iter()
+                            .map(|operation| {
+                                lifecycle_after_failure
+                                    .0
+                                    .get(&operation)
+                                    .copied()
+                                    .unwrap_or_default()
+                            })
+                            .sum::<usize>();
+                            assert!(executable
+                                .forward(&NumericTensor::token_ids(&[7]), false)
+                                .is_err());
+                            assert_eq!(executable.positions().unwrap(), before_failure);
+                            barrier.wait();
+                            let lifecycle_after_retry = world.lifecycle_counts();
+                            let expert_submissions_after_retry = [
+                                NumericOpaqueOperation::AllGatherEven,
+                                NumericOpaqueOperation::VariableAllToAll,
+                            ]
+                            .into_iter()
+                            .map(|operation| {
+                                lifecycle_after_retry
+                                    .0
+                                    .get(&operation)
+                                    .copied()
+                                    .unwrap_or_default()
+                            })
+                            .sum::<usize>();
+                            assert_eq!(
+                                expert_submissions_after_retry,
+                                expert_submissions_after_failure,
+                                "a poisoned retry must fail before any expert collective submission",
+                            );
+                            assert_eq!(lifecycle_after_retry.3, commits_before);
+                        }
+                        (
+                            actual,
+                            provider_calls.load(Ordering::Relaxed),
+                            successful_wave_trace,
+                        )
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|thread| thread.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        for (rank, (actual, calls, _)) in results.iter().enumerate() {
+            assert!(*calls > 0, "{label} rank {rank} never invoked its provider");
+            for (step, (actual, expected)) in actual.iter().zip(&reference.outputs).enumerate() {
+                assert_tensor_close(
+                    actual,
+                    expected,
+                    &format!("{label} routed rank {rank} step {step}"),
+                );
+            }
+        }
+        if topology.expert() > 1 {
+            let successful_wave_trace = &results[0].2;
+            assert_eq!(
+                successful_wave_trace
+                    .iter()
+                    .filter(|event| event.operation == NumericOpaqueOperation::AllGatherEven)
+                    .count(),
+                inputs.len() * routed_units * topology.world_size(),
+            );
+            assert_eq!(
+                successful_wave_trace
+                    .iter()
+                    .filter(|event| event.operation == NumericOpaqueOperation::VariableAllToAll)
+                    .count(),
+                inputs.len() * routed_units * 8 * topology.world_size(),
+            );
+        }
+        assert_eq!(world.materializations().len(), topology.world_size());
+        let trace = world.trace();
+        assert_eq!(
+            trace
+                .iter()
+                .any(|event| event.operation == NumericOpaqueOperation::PointToPoint),
+            topology.pipeline() > 1,
+        );
+        assert!(trace
+            .iter()
+            .any(|event| event.operation == NumericOpaqueOperation::Broadcast));
+        assert!(trace
+            .iter()
+            .any(|event| event.operation == NumericOpaqueOperation::FailureAgreement));
+    }
+}
+
+#[test]
+fn authoritative_qwen_routed_numeric_sessions_match_partitioned_reference() {
+    let config = serde_json::json!({
+        "architectures":["Qwen3MoeForCausalLM"], "model_type":"qwen3_moe",
+        "vocab_size":32, "hidden_size":32, "intermediate_size":0,
+        "moe_intermediate_size":32, "num_hidden_layers":4,
+        "num_attention_heads":4, "num_key_value_heads":2, "head_dim":8,
+        "max_position_embeddings":64, "rms_norm_eps":1e-6, "rope_theta":10000.0,
+        "num_experts":4, "num_experts_per_tok":2, "norm_topk_prob":true,
+        "attention_bias":false, "mlp_bias":false, "tie_word_embeddings":false
+    });
+    let context = NumericContext::default();
+    let args = qwen::model_args_from_config_value(&config).unwrap();
+    let description = qwen::RoutedLayeredModel::<NumericBackend>::new(args, &context)
+        .unwrap()
+        .parameter_description(&context)
+        .unwrap();
+    assert_authoritative_routed_numeric_sessions(
+        "qwen3-moe",
+        config,
+        description,
+        4,
+        false,
+        &[
+            ParallelTopology::new(1, 2, 1, 1).unwrap(),
+            ParallelTopology::new(2, 2, 1, 1).unwrap(),
+            ParallelTopology::new(1, 2, 2, 1).unwrap(),
+            ParallelTopology::new(2, 2, 2, 1).unwrap(),
+        ],
+    );
+}
+
+#[test]
+fn prediction_free_deepseek_v3_v4_routed_sessions_cover_cartesian_state_cache_and_failure() {
+    let v3 = serde_json::json!({
+        "model_type":"deepseek_v3", "vocab_size":16, "hidden_size":8,
+        "intermediate_size":12, "moe_intermediate_size":8, "num_hidden_layers":4,
+        "num_attention_heads":4, "max_position_embeddings":64,
+        "q_lora_rank":2, "kv_lora_rank":2, "qk_nope_head_dim":2,
+        "qk_rope_head_dim":2, "v_head_dim":2, "first_k_dense_replace":1,
+        "n_routed_experts":2, "n_shared_experts":1, "num_experts_per_tok":1,
+        "n_group":1, "topk_group":1, "num_nextn_predict_layers":0,
+        "tie_word_embeddings":false
+    });
+    let v4 = serde_json::json!({
+        "model_type":"deepseek_v4", "hidden_size":4, "moe_intermediate_size":4,
+        "num_hidden_layers":4, "num_attention_heads":2, "num_key_value_heads":1,
+        "head_dim":4, "qk_rope_head_dim":2, "q_lora_rank":2, "o_lora_rank":2,
+        "o_groups":2, "vocab_size":16, "max_position_embeddings":128,
+        "sliding_window":4, "compress_ratios":[0,4,128,0], "index_n_heads":2,
+        "index_head_dim":4, "index_topk":1, "hc_mult":2, "hc_sinkhorn_iters":2,
+        "n_routed_experts":2, "n_shared_experts":1, "num_experts_per_tok":1,
+        "num_hash_layers":1, "scoring_func":"sqrtsoftplus", "topk_method":"noaux_tc",
+        "norm_topk_prob":true, "routed_scaling_factor":1.0, "swiglu_limit":4.0,
+        "num_nextn_predict_layers":0
+    });
+    let context = NumericContext::default();
+    let v3_args = deepseek::parse_v3_config(&v3).unwrap();
+    let v3_description = deepseek::v3::Model::<NumericBackend>::new(v3_args, &context)
+        .unwrap()
+        .parameter_description(&context)
+        .unwrap();
+    let v4_args = deepseek::parse_v4_config(&v4).unwrap();
+    let v4_description = deepseek::v4::Model::<NumericBackend>::new(v4_args, &context)
+        .unwrap()
+        .parameter_description(&context)
+        .unwrap();
+    let topologies = [
+        ParallelTopology::new(2, 1, 1, 1).unwrap(),
+        ParallelTopology::new(1, 2, 1, 1).unwrap(),
+        ParallelTopology::new(1, 1, 2, 1).unwrap(),
+        ParallelTopology::new(2, 2, 1, 1).unwrap(),
+        ParallelTopology::new(2, 1, 2, 1).unwrap(),
+        ParallelTopology::new(1, 2, 2, 1).unwrap(),
+        ParallelTopology::new(2, 2, 2, 1).unwrap(),
+    ];
+    assert_authoritative_routed_numeric_sessions(
+        "deepseek-v3",
+        v3,
+        v3_description,
+        3,
+        false,
+        &topologies,
+    );
+    assert_authoritative_routed_numeric_sessions(
+        "deepseek-v4",
+        v4,
+        v4_description,
+        4,
+        true,
+        &topologies,
+    );
 }
 
 struct NumericInputInspector;
@@ -12586,7 +19269,8 @@ impl eredu_architectures::processor_execution::ProcessorMechanisms for NumericPr
         Ok(NumericTensor::new(
             shape.iter().map(|value| *value as i32).collect::<Vec<_>>(),
             values.iter().map(|value| *value as f32).collect(),
-        ))
+        )
+        .with_dtype(eredu_core::checkpoint::TensorDtype::U32))
     }
 
     fn tensor_f32(&mut self, values: &[f32], shape: &[usize]) -> Result<Self::Tensor, Self::Error> {
@@ -12602,7 +19286,8 @@ impl eredu_architectures::processor_execution::ProcessorMechanisms for NumericPr
         Ok(NumericTensor::new(
             shape.iter().map(|value| *value as i32).collect::<Vec<_>>(),
             values.iter().map(|value| *value as f32).collect(),
-        ))
+        )
+        .with_dtype(eredu_core::checkpoint::TensorDtype::I32))
     }
 }
 
@@ -13417,23 +20102,35 @@ fn execute_numeric_routed_visitor(
             .filter_map(|group| group.variants.first())
             .flat_map(|variant| variant.tensors.iter()),
     );
-    let mut tensors = BTreeMap::<String, (Vec<usize>, Vec<u8>)>::new();
+    let mut tensors = BTreeMap::<String, (Vec<usize>, Dtype, Vec<u8>)>::new();
     for constraint in constraints.into_iter().filter(|constraint| {
         constraint.requirement == eredu_checkpoint::schema::TensorRequirement::Required
     }) {
         tensors.entry(constraint.key.clone()).or_insert_with(|| {
+            let dtype = if constraint
+                .dtype
+                .accepts(&eredu_checkpoint::StoredDtype::I32)
+                && !constraint
+                    .dtype
+                    .accepts(&eredu_checkpoint::StoredDtype::F32)
+            {
+                Dtype::I32
+            } else {
+                Dtype::F32
+            };
             (
                 constraint.shape.clone(),
+                dtype,
                 vec![0_u8; constraint.shape.iter().product::<usize>() * 4],
             )
         });
     }
     let views = tensors
         .iter()
-        .map(|(name, (shape, bytes))| {
+        .map(|(name, (shape, dtype, bytes))| {
             (
                 name.as_str(),
-                TensorView::new(Dtype::F32, shape.clone(), bytes.as_slice()).unwrap(),
+                TensorView::new(*dtype, shape.clone(), bytes.as_slice()).unwrap(),
             )
         })
         .collect::<Vec<_>>();
@@ -13589,53 +20286,7 @@ fn execute_numeric_composite_visitor_with_observer(
     addressable: bool,
     observer: Option<std::rc::Rc<std::cell::RefCell<CompositeObservation>>>,
 ) -> NumericReplicatedRun {
-    use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
-
-    let artifact = tempfile::tempdir().unwrap();
-    std::fs::write(
-        artifact.path().join("config.json"),
-        serde_json::to_vec(config).unwrap(),
-    )
-    .unwrap();
-    let resolved = eredu_architectures::configuration::MODEL_CONFIGURATIONS
-        .resolve_safetensors(config)
-        .unwrap();
-    let checkpoint = resolved
-        .architecture_plan()
-        .safetensors_architecture()
-        .unwrap()
-        .checkpoint();
-    let mut constraints = checkpoint.common_tensors.iter().collect::<Vec<_>>();
-    constraints.extend(
-        checkpoint
-            .layout_groups
-            .iter()
-            .filter(|group| group.required)
-            .filter_map(|group| group.variants.first())
-            .flat_map(|variant| variant.tensors.iter()),
-    );
-    let mut tensors = BTreeMap::<String, (Vec<usize>, Vec<u8>)>::new();
-    for constraint in constraints.into_iter().filter(|constraint| {
-        constraint.requirement == eredu_checkpoint::schema::TensorRequirement::Required
-    }) {
-        tensors.entry(constraint.key.clone()).or_insert_with(|| {
-            (
-                constraint.shape.clone(),
-                vec![0_u8; constraint.shape.iter().product::<usize>() * 4],
-            )
-        });
-    }
-    let views = tensors
-        .iter()
-        .map(|(name, (shape, bytes))| {
-            (
-                name.as_str(),
-                TensorView::new(Dtype::F32, shape.clone(), bytes.as_slice()).unwrap(),
-            )
-        })
-        .collect::<Vec<_>>();
-    serialize_to_file(views, None, &artifact.path().join("model.safetensors")).unwrap();
-
+    let artifact = numeric_composite_artifact(config);
     let inspection = eredu_architectures::configuration::inspect_artifact(artifact.path()).unwrap();
     let requirements =
         eredu_architectures::replicated_text::composite_text_requirements(&inspection).unwrap();
@@ -13790,6 +20441,56 @@ fn execute_numeric_composite_visitor_with_observer(
         },
     )
     .unwrap()
+}
+
+fn numeric_composite_artifact(config: &serde_json::Value) -> tempfile::TempDir {
+    use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
+
+    let artifact = tempfile::tempdir().unwrap();
+    std::fs::write(
+        artifact.path().join("config.json"),
+        serde_json::to_vec(config).unwrap(),
+    )
+    .unwrap();
+    let resolved = eredu_architectures::configuration::MODEL_CONFIGURATIONS
+        .resolve_safetensors(config)
+        .unwrap();
+    let checkpoint = resolved
+        .architecture_plan()
+        .safetensors_architecture()
+        .unwrap()
+        .checkpoint();
+    let mut constraints = checkpoint.common_tensors.iter().collect::<Vec<_>>();
+    constraints.extend(
+        checkpoint
+            .layout_groups
+            .iter()
+            .filter(|group| group.required)
+            .filter_map(|group| group.variants.first())
+            .flat_map(|variant| variant.tensors.iter()),
+    );
+    let mut tensors = BTreeMap::<String, (Vec<usize>, Vec<u8>)>::new();
+    for constraint in constraints.into_iter().filter(|constraint| {
+        constraint.requirement == eredu_checkpoint::schema::TensorRequirement::Required
+    }) {
+        tensors.entry(constraint.key.clone()).or_insert_with(|| {
+            (
+                constraint.shape.clone(),
+                vec![0_u8; constraint.shape.iter().product::<usize>() * 4],
+            )
+        });
+    }
+    let views = tensors
+        .iter()
+        .map(|(name, (shape, bytes))| {
+            (
+                name.as_str(),
+                TensorView::new(Dtype::F32, shape.clone(), bytes.as_slice()).unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    serialize_to_file(views, None, &artifact.path().join("model.safetensors")).unwrap();
+    artifact
 }
 
 fn prepare_numeric_qwen_image_request(
@@ -16718,4 +23419,2406 @@ fn v4_observer_reports_sparse_indexes_hyper_streams_and_routes() {
             observer.paths
         );
     }
+}
+
+#[derive(Default)]
+struct RouteMovement {
+    scatters: usize,
+}
+
+impl ExpertRouteTensorMovement<NumericTensor> for RouteMovement {
+    type Error = Error;
+
+    fn shape(&self, value: &NumericTensor) -> Vec<usize> {
+        value.shape.iter().map(|value| *value as usize).collect()
+    }
+
+    fn gather_rows(
+        &mut self,
+        value: &NumericTensor,
+        rows: &[usize],
+    ) -> Result<NumericTensor, Self::Error> {
+        let width = value.shape[1] as usize;
+        let mut data = Vec::with_capacity(rows.len() * width);
+        for row in rows {
+            data.extend_from_slice(&value.data[row * width..(row + 1) * width]);
+        }
+        Ok(NumericTensor::new(
+            vec![rows.len() as i32, width as i32],
+            data,
+        ))
+    }
+
+    fn gather_route_values(
+        &mut self,
+        value: &NumericTensor,
+        flattened_routes: &[usize],
+    ) -> Result<NumericTensor, Self::Error> {
+        Ok(NumericTensor::new(
+            vec![flattened_routes.len() as i32, 1],
+            flattened_routes
+                .iter()
+                .map(|route| value.data[*route])
+                .collect(),
+        ))
+    }
+
+    fn scatter_add_rows(
+        &mut self,
+        value: NumericTensor,
+        destination_rows: &[usize],
+        output_rows: usize,
+    ) -> Result<NumericTensor, Self::Error> {
+        self.scatters += 1;
+        let width = value.shape[1] as usize;
+        let mut output = vec![0.0; output_rows * width];
+        for (source, destination) in destination_rows.iter().copied().enumerate() {
+            for column in 0..width {
+                output[destination * width + column] += value.data[source * width + column];
+            }
+        }
+        Ok(NumericTensor::new(
+            vec![output_rows as i32, width as i32],
+            output,
+        ))
+    }
+}
+
+#[derive(Default)]
+struct IdentityRouteExchange {
+    calls: usize,
+}
+
+impl ExpertRouteExchange<NumericTensor> for IdentityRouteExchange {
+    type Error = Error;
+
+    fn exchange_tensor(
+        &mut self,
+        _: &eredu_runtime::CommunicationPeerCounts,
+        value: NumericTensor,
+    ) -> Result<NumericTensor, Self::Error> {
+        self.calls += 1;
+        Ok(value)
+    }
+
+    fn exchange_indices(
+        &mut self,
+        _: &eredu_runtime::CommunicationPeerCounts,
+        values: Vec<usize>,
+    ) -> Result<Vec<usize>, Self::Error> {
+        self.calls += 1;
+        Ok(values)
+    }
+}
+
+struct RoutedReferenceProvider {
+    tensor_rank: Option<usize>,
+    global_ids: Vec<usize>,
+    local_ids: Vec<usize>,
+    ordinary_calls: usize,
+    tensor_parallel_calls: usize,
+}
+
+impl AddressableExpertRouteProvider<NumericTensor> for RoutedReferenceProvider {
+    type Error = Error;
+
+    fn execute_addressable_routes(
+        &mut self,
+        request: AddressableExpertRouteRequest<'_, NumericTensor>,
+    ) -> Result<NumericTensor, Self::Error> {
+        self.ordinary_calls += 1;
+        self.global_ids = request.global_experts.to_vec();
+        self.local_ids = request.owner_local_experts.to_vec();
+        let width = request.input.shape[1] as usize;
+        let mut output = request.input.clone();
+        for row in 0..request.global_experts.len() {
+            assert_eq!(
+                request.addressable_bank_key(row).unwrap().member(),
+                request.global_experts[row]
+            );
+            let scale = request.coefficients.data[row] * (request.global_experts[row] + 1) as f32;
+            for column in 0..width {
+                output.data[row * width + column] *= scale;
+            }
+        }
+        Ok(output)
+    }
+
+    fn execute_addressable_routes_tensor_parallel(
+        &mut self,
+        request: AddressableExpertRouteRequest<'_, NumericTensor>,
+    ) -> Result<RoutedExpertTensorParallelOutput<NumericTensor>, Self::Error> {
+        self.tensor_parallel_calls += 1;
+        let Some(tensor_rank) = self.tensor_rank else {
+            return self
+                .execute_addressable_routes(request)
+                .map(RoutedExpertTensorParallelOutput::Complete);
+        };
+        self.global_ids = request.global_experts.to_vec();
+        self.local_ids = request.owner_local_experts.to_vec();
+        let width = request.input.shape[1] as usize;
+        let mut reducible = request.input.clone();
+        let mut bias = NumericTensor::zeros(request.input.shape.clone());
+        for row in 0..request.global_experts.len() {
+            let coefficient = request.coefficients.data[row];
+            for column in 0..width {
+                reducible.data[row * width + column] *= coefficient * (tensor_rank + 1) as f32;
+                bias.data[row * width + column] =
+                    coefficient * (request.global_experts[row] + 1) as f32;
+            }
+        }
+        Ok(RoutedExpertTensorParallelOutput::Partial(
+            eredu_nn::TensorParallelGroupedOutput::new(reducible, Some(bias)),
+        ))
+    }
+}
+
+fn mechanism_realization(
+    spec: GroupedGatedProductSpec,
+) -> ExpertRealizationPlan<GroupedGatedProductSpec> {
+    let topology = ParallelTopology::new(1, 1, 2, 1).unwrap();
+    let rank = ParallelRankTopology::new(topology, 1).unwrap();
+    ExpertRealizationPlan::balanced(
+        4,
+        rank,
+        BTreeMap::from([((ExecutionGroupId::new("text_decoder").unwrap(), 0), spec)]),
+    )
+    .unwrap()
+}
+
+fn mechanism_packing(
+    realization: &ExpertRealizationPlan<GroupedGatedProductSpec>,
+) -> (ExpertRoutePackingPlan, ExpertRouteCountPlan) {
+    let packing = ExpertRoutePackingPlan::new(realization, 2, 2, &[2, 3, 2, 3]).unwrap();
+    let counts = ExpertRouteCountPlan::from_consensus(
+        CollectiveGroupId::new(9),
+        1,
+        packing.send_counts().to_vec(),
+        vec![0, 0, 0, 4],
+    )
+    .unwrap();
+    (packing, counts)
+}
+
+#[test]
+fn qwen_partition_route_mechanism_combines_duplicates_with_zero_peer_rows() {
+    let args = qwen::model_args_from_config_value(&config("qwen3_moe", false)).unwrap();
+    let spec = qwen::expert_bank_spec(&args, 0)
+        .unwrap()
+        .with_group_geometry(2, args.moe_intermediate_size)
+        .unwrap();
+    let realization = mechanism_realization(spec);
+    let (packing, counts) = mechanism_packing(&realization);
+    assert_eq!(packing.send_counts(), [0, 4]);
+    let input = NumericTensor::new(vec![2, 2], vec![1.0, 2.0, 10.0, 20.0]);
+    let scores = NumericTensor::new(vec![2, 2], vec![0.5, 0.5, 0.25, 0.75]);
+    let coefficients = scores.clone();
+    let mut movement = RouteMovement::default();
+    let mut forward = IdentityRouteExchange::default();
+    let mut reverse = IdentityRouteExchange::default();
+    let mut provider = RoutedReferenceProvider {
+        tensor_rank: None,
+        global_ids: Vec::new(),
+        local_ids: Vec::new(),
+        ordinary_calls: 0,
+        tensor_parallel_calls: 0,
+    };
+    let output = eredu_architectures::execute_expert_route_exchange(
+        &realization,
+        &packing,
+        &counts,
+        &input,
+        &scores,
+        &coefficients,
+        0,
+        ExpertPass::Decode,
+        &mut movement,
+        &mut forward,
+        &mut reverse,
+        &mut provider,
+    )
+    .unwrap();
+    assert_tensor_close(
+        &output,
+        &NumericTensor::new(vec![2, 2], vec![3.5, 7.0, 37.5, 75.0]),
+        "Qwen duplicate route combination",
+    );
+    assert_eq!(provider.global_ids, [2, 3, 2, 3]);
+    assert_eq!(provider.local_ids, [0, 1, 0, 1]);
+    assert_eq!(
+        (provider.ordinary_calls, provider.tensor_parallel_calls),
+        (1, 0)
+    );
+    assert_eq!((forward.calls, reverse.calls, movement.scatters), (6, 2, 1));
+}
+
+#[test]
+fn pp2_ep2_route_exchange_uses_complete_provider_output_without_tp_reduction() {
+    let args = qwen::model_args_from_config_value(&config("qwen3_moe", false)).unwrap();
+    let topology = ParallelTopology::new(1, 2, 2, 1).unwrap();
+    let rank = (0..topology.world_size())
+        .map(|rank| ParallelRankTopology::new(topology, rank).unwrap())
+        .find(|rank| rank.pipeline_parallel_rank() == 1 && rank.expert_parallel_rank() == 1)
+        .unwrap();
+    let spec = qwen::expert_bank_spec(&args, 0)
+        .unwrap()
+        .with_group_geometry(2, args.moe_intermediate_size)
+        .unwrap();
+    let realization = ExpertRealizationPlan::balanced(
+        4,
+        rank,
+        BTreeMap::from([((ExecutionGroupId::new("text_decoder").unwrap(), 0), spec)]),
+    )
+    .unwrap();
+    let (packing, counts) = mechanism_packing(&realization);
+    let input = NumericTensor::new(vec![2, 2], vec![1.0, 2.0, 10.0, 20.0]);
+    let scores = NumericTensor::new(vec![2, 2], vec![0.5, 0.5, 0.25, 0.75]);
+    let coefficients = scores.clone();
+    let mut movement = RouteMovement::default();
+    let mut forward = IdentityRouteExchange::default();
+    let mut reverse = IdentityRouteExchange::default();
+    let mut provider = RoutedReferenceProvider {
+        tensor_rank: None,
+        global_ids: Vec::new(),
+        local_ids: Vec::new(),
+        ordinary_calls: 0,
+        tensor_parallel_calls: 0,
+    };
+
+    let output = eredu_architectures::execute_expert_route_exchange(
+        &realization,
+        &packing,
+        &counts,
+        &input,
+        &scores,
+        &coefficients,
+        0,
+        ExpertPass::Decode,
+        &mut movement,
+        &mut forward,
+        &mut reverse,
+        &mut provider,
+    )
+    .unwrap();
+
+    assert_tensor_close(
+        &output,
+        &NumericTensor::new(vec![2, 2], vec![3.5, 7.0, 37.5, 75.0]),
+        "PP2 x EP2 complete routed output",
+    );
+    assert_eq!(
+        (provider.ordinary_calls, provider.tensor_parallel_calls),
+        (1, 0)
+    );
+    assert_eq!((forward.calls, reverse.calls, movement.scatters), (6, 2, 1));
+}
+
+#[test]
+fn gpt_oss_partition_route_mechanism_keeps_weighted_bias_for_one_tp_add() {
+    let args = gpt_oss::model_args_from_config_value(&serde_json::json!({
+        "model_type": "gpt_oss",
+        "hidden_size": 32,
+        "intermediate_size": 64,
+        "num_hidden_layers": 1,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 8,
+        "vocab_size": 64,
+        "num_local_experts": 4,
+        "num_experts_per_tok": 2,
+        "rms_norm_eps": 0.00001,
+        "sliding_window": 128,
+        "max_position_embeddings": 4096,
+        "rope_theta": 150000.0,
+        "quantization_config": { "quant_method": "mxfp4" },
+        "swiglu_limit": 7.0
+    }))
+    .unwrap();
+    let spec = gpt_oss::expert_bank_spec(&args, 0)
+        .unwrap()
+        .with_group_geometry(2, args.intermediate_size / 2)
+        .unwrap();
+    let realization = mechanism_realization(spec);
+    let (packing, counts) = mechanism_packing(&realization);
+    let input = NumericTensor::new(vec![2, 2], vec![1.0, 2.0, 10.0, 20.0]);
+    let scores = NumericTensor::new(vec![2, 2], vec![0.5, 0.5, 0.25, 0.75]);
+    let coefficients = scores.clone();
+    let mut rank_outputs = Vec::new();
+    for tensor_rank in 0..2 {
+        let mut movement = RouteMovement::default();
+        let mut forward = IdentityRouteExchange::default();
+        let mut reverse = IdentityRouteExchange::default();
+        let mut provider = RoutedReferenceProvider {
+            tensor_rank: Some(tensor_rank),
+            global_ids: Vec::new(),
+            local_ids: Vec::new(),
+            ordinary_calls: 0,
+            tensor_parallel_calls: 0,
+        };
+        let output = eredu_architectures::execute_expert_route_exchange_tensor_parallel(
+            &realization,
+            &packing,
+            &counts,
+            &input,
+            &scores,
+            &coefficients,
+            0,
+            ExpertPass::Decode,
+            &mut movement,
+            &mut forward,
+            &mut reverse,
+            &mut provider,
+        )
+        .unwrap();
+        let RoutedExpertTensorParallelOutput::Partial(output) = output else {
+            panic!("GPT-OSS TP route mechanism collapsed its partial");
+        };
+        assert_eq!(
+            (provider.ordinary_calls, provider.tensor_parallel_calls),
+            (0, 1)
+        );
+        rank_outputs.push(output.into_parts());
+        assert_eq!((forward.calls, reverse.calls, movement.scatters), (6, 3, 2));
+    }
+    assert_eq!(
+        rank_outputs[0].1.as_ref().unwrap().data,
+        rank_outputs[1].1.as_ref().unwrap().data
+    );
+    let mut completed = rank_outputs[0].0.clone();
+    let bias = rank_outputs[0].1.as_ref().unwrap();
+    for index in 0..completed.data.len() {
+        completed.data[index] += rank_outputs[1].0.data[index] + bias.data[index];
+    }
+    assert_tensor_close(
+        &completed,
+        &NumericTensor::new(vec![2, 2], vec![6.5, 9.5, 33.75, 63.75]),
+        "GPT-OSS bias once after TP sum",
+    );
+    let mut wrong = completed.clone();
+    for (value, replicated_bias) in wrong
+        .data
+        .iter_mut()
+        .zip(rank_outputs[1].1.as_ref().unwrap().data.iter())
+    {
+        *value += replicated_bias;
+    }
+    assert_ne!(completed.data, wrong.data);
+}
+
+#[test]
+fn gemma4_composite_partition_preserves_tasks_boundary_values_and_prepared_identity() {
+    let family = gemma4::FamilyConfig::from_hf_json(
+        &serde_json::to_vec(&serde_json::json!({
+            "model_type":"gemma4_unified", "tie_word_embeddings":false,
+            "image_token_id":5, "audio_token_id":6,
+            "text_config":{
+                "model_type":"gemma4_text", "hidden_size":8,
+                "num_hidden_layers":2, "intermediate_size":10,
+                "num_attention_heads":2, "num_key_value_heads":2, "head_dim":4,
+                "rms_norm_eps":0.00001, "vocab_size":7,
+                "max_position_embeddings":64, "attention_k_eq_v":false,
+                "num_kv_shared_layers":0,
+                "hidden_size_per_layer_input":4,"vocab_size_per_layer_input":7,
+                "layer_types":["sliding_attention","full_attention"],
+                "sliding_window":4, "enable_moe_block":false,
+                "final_logit_softcapping":7.0
+            },
+            "vision_config":{
+                "hidden_size":8, "intermediate_size":10,
+                "num_hidden_layers":1, "num_attention_heads":2,
+                "num_key_value_heads":2, "head_dim":4, "patch_size":2,
+                "pooling_kernel_size":2, "position_embedding_size":2,
+                "rms_norm_eps":0.00001
+            },
+            "audio_config":{
+                "hidden_size":8, "num_hidden_layers":1,
+                "num_attention_heads":2, "output_proj_dims":8,
+                "conv_kernel_size":3, "attention_chunk_size":4,
+                "attention_context_left":5, "attention_context_right":0,
+                "attention_invalid_logits_value":-1000000000.0,
+                "attention_logit_cap":50.0, "residual_weight":0.5,
+                "rms_norm_eps":0.00001, "subsampling_conv_channels":[4,8]
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let context = NumericContext::default();
+    let architecture =
+        gemma4::LayeredModel::<NumericBackend>::new(family.clone(), &context).unwrap();
+    let vision_transport = <gemma4::LayeredModel<NumericBackend> as LayeredArchitecture<
+        NumericBackend,
+        DeviceState<NumericBackend, NumericHybridLayerState>,
+    >>::group_transport(&architecture, 0);
+    assert!(vision_transport.request_optional);
+    assert_eq!(
+        vision_transport.merge_destination,
+        eredu_runtime::ArchitectureMergeDestination::FirstPipelineOwner
+    );
+    let text_transport = <gemma4::LayeredModel<NumericBackend> as LayeredArchitecture<
+        NumericBackend,
+        DeviceState<NumericBackend, NumericHybridLayerState>,
+    >>::group_transport(&architecture, 2);
+    assert!(!text_transport.request_optional);
+    assert_eq!(
+        text_transport.merge_destination,
+        eredu_runtime::ArchitectureMergeDestination::LastOwner
+    );
+    let parameters = architecture.parameter_description(&context).unwrap();
+    let groups = parameters
+        .groups()
+        .iter()
+        .map(|owned| owned.group().clone())
+        .collect::<Vec<_>>();
+    let layout = numeric_local_layout(&groups, 2, 0).unwrap();
+    let complete_state = gemma4::local_geometry(&family, &layout)
+        .unwrap()
+        .state_layout()
+        .clone();
+    let state_plan =
+        ArchitectureStatePartitionPlan::new([ArchitectureStatePartitionRule::group_units(2, 0..2)]);
+
+    let first_ownership = PartitionOwnership::new(
+        true,
+        false,
+        [
+            "vision",
+            "vision_projection",
+            "audio",
+            "audio_projection",
+            "embedding",
+            "per_layer_embedding",
+            "per_layer_projection",
+            "per_layer_norm",
+        ],
+    )
+    .unwrap();
+    let first_geometry = gemma4::partition_local_geometry(
+        &family,
+        &layout,
+        [
+            (gemma4::VISION_EXECUTION_GROUP, 0..1),
+            (gemma4::AUDIO_EXECUTION_GROUP, 0..1),
+            (gemma4::TEXT_EXECUTION_GROUP, 0..1),
+        ],
+        &first_ownership,
+    )
+    .unwrap();
+    let boundary = gemma4::TextBoundarySchema::from_partition_args(&family.text, &first_geometry);
+    let first_partition = ArchitecturePartition::from_description(
+        &parameters,
+        [
+            (gemma4::VISION_EXECUTION_GROUP, 0..1),
+            (gemma4::AUDIO_EXECUTION_GROUP, 0..1),
+            (gemma4::TEXT_EXECUTION_GROUP, 0..1),
+        ],
+        first_ownership,
+        &complete_state,
+        &state_plan,
+        first_geometry,
+        boundary,
+    )
+    .unwrap();
+    let first =
+        gemma4::PartitionLocalFoundation::from_partition(&family, &first_partition).unwrap();
+    assert!(first
+        .parameter_targets()
+        .iter()
+        .any(|target| target == "model.vision_tower.patch_embedder.input_proj.weight"));
+    assert!(first
+        .parameter_targets()
+        .iter()
+        .any(|target| target.starts_with("model.embed_vision.")));
+    assert!(first
+        .parameter_targets()
+        .iter()
+        .any(|target| target.contains("layers.0")));
+    assert!(!first
+        .parameter_targets()
+        .iter()
+        .any(|target| target.contains("layers.1")));
+    assert!(!first
+        .parameter_targets()
+        .iter()
+        .any(|target| target == "lm_head.weight"));
+
+    let last_ownership = PartitionOwnership::new(false, true, ["norm", "output"]).unwrap();
+    let last_geometry = gemma4::partition_local_geometry(
+        &family,
+        &layout,
+        [(gemma4::TEXT_EXECUTION_GROUP, 1..2)],
+        &last_ownership,
+    )
+    .unwrap();
+    let last_boundary =
+        gemma4::TextBoundarySchema::from_partition_args(&family.text, &last_geometry);
+    let last_partition = ArchitecturePartition::from_description(
+        &parameters,
+        [(gemma4::TEXT_EXECUTION_GROUP, 1..2)],
+        last_ownership,
+        &complete_state,
+        &state_plan,
+        last_geometry,
+        last_boundary,
+    )
+    .unwrap();
+    let last = gemma4::PartitionLocalFoundation::from_partition(&family, &last_partition).unwrap();
+    assert_eq!(last_partition.state().unwrap().global_layer_offset(), 1);
+    assert!(last
+        .parameter_targets()
+        .iter()
+        .any(|target| target.contains("layers.1")));
+    assert!(last
+        .parameter_targets()
+        .iter()
+        .any(|target| target == "lm_head.weight"));
+    assert!(!last
+        .parameter_targets()
+        .iter()
+        .any(|target| target.contains("vision_tower")));
+
+    let auxiliary = NumericTensor::new([1, 2, 2, 2], (0..8).map(|value| value as f32).collect());
+    let encoded = eredu_runtime::ArchitectureBoundary::encode(
+        last_partition.boundary_schema(),
+        gemma4::TextBoundary::new(Some(auxiliary.clone())),
+    )
+    .unwrap();
+    let decoded = eredu_runtime::ArchitectureBoundary::decode(
+        last_partition.boundary_schema(),
+        encoded
+            .into_iter()
+            .map(eredu_runtime::ArchitectureBoundaryValue::into_parts)
+            .map(|(_, tensor)| tensor)
+            .collect(),
+    )
+    .unwrap();
+    assert_tensor_exact(
+        decoded.per_layer_input.as_ref().unwrap(),
+        &auxiliary,
+        "Gemma 4 partition auxiliary boundary",
+    );
+    assert!(eredu_runtime::ArchitectureBoundary::decode(
+        last_partition.boundary_schema(),
+        Vec::<NumericTensor>::new(),
+    )
+    .is_err());
+
+    let original = eredu_runtime::PreparedModelInput::new(
+        vec![eredu_runtime::PreparedInputPart::new(
+            eredu_core::InputModality::Text,
+            eredu_runtime::PreparedInputPayload::TokenIds(NumericTensor::token_ids(&[1, 2])),
+            [],
+        )
+        .unwrap()],
+        |tensor| eredu_runtime::PreparedInputInspector::identity(&NumericInputInspector, tensor),
+    )
+    .unwrap();
+    let admitted = <gemma4::LayeredModel<NumericBackend> as
+        eredu_architectures::composite_execution::CompositeArchitecture<
+            NumericBackend,
+            DeviceState<NumericBackend, NumericHybridLayerState>,
+        >>::admit_prepared_input(&family, &original, &NumericInputInspector)
+    .unwrap();
+    let prepared =
+        eredu_architectures::composite_execution::PreparedCompositeInput::new(&original, &admitted)
+            .unwrap();
+    let inactive = numeric_composite_optional_activity_at_begin(
+        gemma4::LayeredModel::<NumericBackend>::new_parallel(
+            family.clone(),
+            gemma4::local_geometry(&family, &layout).unwrap(),
+            &context,
+        )
+        .unwrap(),
+        &first_partition,
+        vec![
+            eredu_runtime::ArchitectureGroupKind::VisionEncoder,
+            eredu_runtime::ArchitectureGroupKind::AudioEncoder,
+            eredu_runtime::ArchitectureGroupKind::Decoder,
+        ],
+        prepared,
+    );
+    assert_eq!(inactive, [false, false, false]);
+
+    let media = eredu_runtime::PreparedModelInput::new(
+        vec![
+            eredu_runtime::PreparedInputPart::new(
+                eredu_core::InputModality::Text,
+                eredu_runtime::PreparedInputPayload::TokenIds(NumericTensor::token_ids(&[1])),
+                [],
+            )
+            .unwrap(),
+            eredu_runtime::PreparedInputPart::new_with_extents(
+                eredu_core::InputModality::Image,
+                eredu_runtime::PreparedInputPayload::Tensor(NumericTensor::zeros([1, 4, 12])),
+                [
+                    (
+                        eredu_core::InputMetadataKey::PatchGrid,
+                        NumericTensor::new([1, 3], vec![1.0, 2.0, 2.0]),
+                    ),
+                    (
+                        eredu_core::InputMetadataKey::PatchPositions,
+                        NumericTensor::zeros([1, 4, 2]),
+                    ),
+                ],
+                [eredu_core::InputExtent::PatchGrid {
+                    time: 1,
+                    height: 2,
+                    width: 2,
+                }],
+            )
+            .unwrap(),
+        ],
+        |tensor| eredu_runtime::PreparedInputInspector::identity(&NumericInputInspector, tensor),
+    )
+    .unwrap();
+    let media_admitted = <gemma4::LayeredModel<NumericBackend> as
+        eredu_architectures::composite_execution::CompositeArchitecture<
+            NumericBackend,
+            DeviceState<NumericBackend, NumericHybridLayerState>,
+        >>::admit_prepared_input(&family, &media, &NumericInputInspector)
+    .unwrap();
+    let active = numeric_composite_optional_activity_at_begin(
+        gemma4::LayeredModel::<NumericBackend>::new_parallel(
+            family.clone(),
+            gemma4::local_geometry(&family, &layout).unwrap(),
+            &context,
+        )
+        .unwrap(),
+        &first_partition,
+        vec![
+            eredu_runtime::ArchitectureGroupKind::VisionEncoder,
+            eredu_runtime::ArchitectureGroupKind::AudioEncoder,
+            eredu_runtime::ArchitectureGroupKind::Decoder,
+        ],
+        eredu_architectures::composite_execution::PreparedCompositeInput::new(
+            &media,
+            &media_admitted,
+        )
+        .unwrap(),
+    );
+    assert_eq!(active, [true, false, false]);
+    let changed = eredu_runtime::PreparedModelInput::new(
+        vec![eredu_runtime::PreparedInputPart::new(
+            eredu_core::InputModality::Text,
+            eredu_runtime::PreparedInputPayload::TokenIds(NumericTensor::token_ids(&[1])),
+            [],
+        )
+        .unwrap()],
+        |tensor| eredu_runtime::PreparedInputInspector::identity(&NumericInputInspector, tensor),
+    )
+    .unwrap();
+    assert!(
+        eredu_architectures::composite_execution::PreparedCompositeInput::new(&changed, &admitted)
+            .is_err()
+    );
+}
+
+fn run_numeric_gemma_composite_partitions(
+    config: &serde_json::Value,
+    inputs: &[eredu_runtime::PreparedModelInput<NumericTensor>],
+) -> (
+    Vec<Result<Vec<NumericTensor>, String>>,
+    Arc<NumericPartitionWorld>,
+) {
+    run_numeric_composite_partitions(config, inputs, ParallelTopology::new(1, 2, 1, 1).unwrap())
+}
+
+fn numeric_composite_parameter_description(
+    config: &serde_json::Value,
+) -> eredu_runtime::ArchitectureParameterDescription {
+    let context = NumericContext::default();
+    match config["model_type"].as_str().expect("composite model type") {
+        "gemma4_unified" => {
+            let mut family =
+                gemma4::FamilyConfig::from_hf_json(&serde_json::to_vec(config).unwrap()).unwrap();
+            if let Some(audio) = family.audio.as_mut() {
+                audio.output_projection_bias = false;
+            }
+            gemma4::LayeredModel::<NumericBackend>::new(family, &context)
+                .unwrap()
+                .parameter_description(&context)
+                .unwrap()
+        }
+        "muse_glimmer" => muse_glimmer::LayeredModel::<NumericBackend>::new(
+            muse_glimmer::DecoderConfig::from_hf_value(config).unwrap(),
+            &context,
+        )
+        .unwrap()
+        .parameter_description(&context)
+        .unwrap(),
+        "inkling_mm_model" => inkling::LayeredModel::<NumericBackend>::new(
+            inkling::ModelArgs::from_hf_json(&serde_json::to_vec(config).unwrap()).unwrap(),
+            &context,
+        )
+        .unwrap()
+        .parameter_description(&context)
+        .unwrap(),
+        "qwen3_5" => qwen::hybrid::ConditionalLayeredModel::<NumericBackend>::new(
+            qwen::hybrid::model_args_from_config_value(config).unwrap(),
+            &context,
+        )
+        .unwrap()
+        .parameter_description(&context)
+        .unwrap(),
+        other => panic!("unsupported numeric composite partition fixture {other}"),
+    }
+}
+
+fn run_numeric_composite_partitions(
+    config: &serde_json::Value,
+    inputs: &[eredu_runtime::PreparedModelInput<NumericTensor>],
+    topology: ParallelTopology,
+) -> (
+    Vec<Result<Vec<NumericTensor>, String>>,
+    Arc<NumericPartitionWorld>,
+) {
+    let artifact = numeric_composite_artifact(config);
+    let inspection =
+        Arc::new(eredu_architectures::configuration::inspect_artifact(artifact.path()).unwrap());
+    let requirements =
+        eredu_architectures::replicated_text::composite_text_requirements(&inspection).unwrap();
+    let selected_base = numeric_composite_selection(&requirements, &inputs[0]);
+    let description = numeric_composite_parameter_description(config);
+    let capabilities = numeric_partition_capabilities();
+    let world = Arc::new(NumericPartitionWorld::default());
+    let results = std::thread::scope(|scope| {
+        (0..topology.world_size())
+            .map(|rank| {
+                let inspection = Arc::clone(&inspection);
+                let selected_base = selected_base.clone();
+                let capabilities = capabilities.clone();
+                let description = description.clone();
+                let inputs = inputs.to_vec();
+                let world = Arc::clone(&world);
+                scope.spawn(move || {
+                    let admission = eredu_architectures::partitioned_execution::dispatch_partitioned_admission(
+                        &inspection,
+                        eredu_architectures::partitioned_execution::PartitionedSelectionRequest::new(
+                            topology,
+                            rank,
+                            1,
+                            8,
+                            eredu_runtime::PipelineActivationDtype::Float32,
+                        )
+                        .unwrap()
+                        .with_completion_policy(
+                            CommunicationCompletionPolicy::new(
+                                std::time::Duration::from_secs(2),
+                                CompletionCancellationMode::QuarantineUntilComplete,
+                            )
+                            .unwrap(),
+                        ),
+                        NumericCompositePartitionAdmission,
+                    )
+                    .map_err(|error| error.to_string())?;
+                    let selected = eredu_architectures::partitioned_execution::select_composite_partitioned_admission(
+                        admission,
+                        selected_base,
+                        &capabilities,
+                    )
+                    .map_err(|error| error.to_string())?;
+                    if eredu_architectures::composite_partitioned::composite_partitioned_production_decision(&selected)
+                        != eredu_architectures::composite_partitioned::CompositePartitionedProductionDecision::Resident
+                    {
+                        return Err("numeric composite fixture was not selected resident".into());
+                    }
+                    let rank_topology = ParallelRankTopology::new(topology, rank).unwrap();
+                    let layout = eredu_architectures::partitioned_execution::derive_partitioned_local_layout(
+                        &description,
+                        rank_topology,
+                    )
+                    .map_err(|error| error.to_string())?;
+                    let context = NumericContext::with_partition(layout, rank, Arc::clone(&world));
+                    let mut executable = eredu_architectures::composite_partitioned::visit_authoritative_composite_partition::<
+                        NumericBackend,
+                        DeviceState<NumericBackend, NumericHybridLayerState>,
+                        _,
+                    >(
+                        selected,
+                        &context,
+                        NumericCompositePartitionVisitor {
+                            world,
+                            context: context.clone(),
+                        },
+                    )
+                    .map_err(|error| error.to_string())?;
+                    inputs
+                        .iter()
+                        .enumerate()
+                        .map(|(index, input)| {
+                            executable
+                                .forward(input, index == 0)
+                                .map_err(|error| error.to_string())
+                        })
+                        .collect::<Result<Vec<_>, _>>()
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    (results, world)
+}
+
+struct NumericCompositeObservedResult {
+    outputs: Result<Vec<NumericTensor>, String>,
+    paths: Vec<String>,
+    positions_before: Vec<i32>,
+    positions_after: Vec<i32>,
+}
+
+fn run_numeric_composite_partitions_observed(
+    config: &serde_json::Value,
+    inputs: &[eredu_runtime::PreparedModelInput<NumericTensor>],
+    topology: ParallelTopology,
+    zero_path: Option<&str>,
+    replacement_value: Option<f32>,
+    fail_path: Option<&str>,
+) -> (
+    Vec<NumericCompositeObservedResult>,
+    Arc<NumericPartitionWorld>,
+) {
+    let artifact = numeric_composite_artifact(config);
+    let inspection =
+        Arc::new(eredu_architectures::configuration::inspect_artifact(artifact.path()).unwrap());
+    let requirements =
+        eredu_architectures::replicated_text::composite_text_requirements(&inspection).unwrap();
+    let selected_base = numeric_composite_selection(&requirements, &inputs[0]);
+    let description = numeric_composite_parameter_description(config);
+    let capabilities = numeric_partition_capabilities();
+    let world = Arc::new(NumericPartitionWorld::default());
+    let results = std::thread::scope(|scope| {
+        (0..topology.world_size())
+            .map(|rank| {
+                let inspection = Arc::clone(&inspection);
+                let selected_base = selected_base.clone();
+                let capabilities = capabilities.clone();
+                let description = description.clone();
+                let inputs = inputs.to_vec();
+                let world = Arc::clone(&world);
+                let zero_path = zero_path.map(str::to_owned);
+                let fail_path = fail_path.map(str::to_owned);
+                scope.spawn(move || {
+                    let admission = eredu_architectures::partitioned_execution::dispatch_partitioned_admission(
+                        &inspection,
+                        eredu_architectures::partitioned_execution::PartitionedSelectionRequest::new(
+                            topology,
+                            rank,
+                            1,
+                            8,
+                            eredu_runtime::PipelineActivationDtype::Float32,
+                        )
+                        .unwrap()
+                        .with_completion_policy(
+                            CommunicationCompletionPolicy::new(
+                                std::time::Duration::from_secs(2),
+                                CompletionCancellationMode::QuarantineUntilComplete,
+                            )
+                            .unwrap(),
+                        ),
+                        NumericCompositePartitionAdmission,
+                    )
+                    .unwrap();
+                    let selected = eredu_architectures::partitioned_execution::select_composite_partitioned_admission(
+                        admission,
+                        selected_base,
+                        &capabilities,
+                    )
+                    .unwrap();
+                    let rank_topology = ParallelRankTopology::new(topology, rank).unwrap();
+                    let layout = eredu_architectures::partitioned_execution::derive_partitioned_local_layout(
+                        &description,
+                        rank_topology,
+                    )
+                    .unwrap();
+                    let context = NumericContext::with_partition(layout, rank, Arc::clone(&world));
+                    let mut executable = eredu_architectures::composite_partitioned::visit_authoritative_composite_partition::<
+                        NumericBackend,
+                        DeviceState<NumericBackend, NumericHybridLayerState>,
+                        _,
+                    >(
+                        selected,
+                        &context,
+                        NumericCompositePartitionVisitor {
+                            world,
+                            context: context.clone(),
+                        },
+                    )
+                    .unwrap();
+                    let mut observer = NumericLifecycleObserver {
+                        zero_path,
+                        replacement_value,
+                        fail_path,
+                        ..Default::default()
+                    };
+                    let positions_before = executable.positions().unwrap();
+                    let outputs = inputs
+                        .iter()
+                        .enumerate()
+                        .map(|(index, input)| {
+                            executable
+                                .forward_observed(input, index == 0, &mut observer)
+                                .map_err(|error| error.to_string())
+                        })
+                        .collect::<Result<Vec<_>, _>>();
+                    let positions_after = executable.positions().unwrap();
+                    NumericCompositeObservedResult {
+                        outputs,
+                        paths: observer.paths,
+                        positions_before,
+                        positions_after,
+                    }
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    (results, world)
+}
+
+fn numeric_composite_production_decision(
+    config: &serde_json::Value,
+    topology: ParallelTopology,
+) -> eredu_architectures::composite_partitioned::CompositePartitionedProductionDecision {
+    let input = numeric_text_prepared_input(&[1, 2]);
+    let artifact = numeric_composite_artifact(config);
+    let inspection =
+        Arc::new(eredu_architectures::configuration::inspect_artifact(artifact.path()).unwrap());
+    let requirements =
+        eredu_architectures::replicated_text::composite_text_requirements(&inspection).unwrap();
+    let selected_base = numeric_composite_selection(&requirements, &input);
+    let admission = eredu_architectures::partitioned_execution::dispatch_partitioned_admission(
+        &inspection,
+        eredu_architectures::partitioned_execution::PartitionedSelectionRequest::new(
+            topology,
+            0,
+            1,
+            8,
+            eredu_runtime::PipelineActivationDtype::Float32,
+        )
+        .unwrap()
+        .with_completion_policy(
+            CommunicationCompletionPolicy::new(
+                std::time::Duration::from_secs(2),
+                CompletionCancellationMode::QuarantineUntilComplete,
+            )
+            .unwrap(),
+        ),
+        NumericCompositePartitionAdmission,
+    )
+    .unwrap();
+    let selected =
+        eredu_architectures::partitioned_execution::select_composite_partitioned_admission(
+            admission,
+            selected_base,
+            &numeric_partition_capabilities(),
+        )
+        .unwrap();
+    eredu_architectures::composite_partitioned::composite_partitioned_production_decision(&selected)
+}
+
+fn gemma_composite_decode_input(token: usize) -> eredu_runtime::PreparedModelInput<NumericTensor> {
+    eredu_runtime::PreparedModelInput::new(
+        vec![eredu_runtime::PreparedInputPart::new(
+            eredu_core::InputModality::Text,
+            eredu_runtime::PreparedInputPayload::TokenIds(NumericTensor::token_ids(&[token])),
+            [],
+        )
+        .unwrap()],
+        |tensor| eredu_runtime::PreparedInputInspector::identity(&NumericInputInspector, tensor),
+    )
+    .unwrap()
+}
+
+fn numeric_text_prepared_input(
+    tokens: &[usize],
+) -> eredu_runtime::PreparedModelInput<NumericTensor> {
+    eredu_runtime::PreparedModelInput::new(
+        vec![eredu_runtime::PreparedInputPart::new(
+            eredu_core::InputModality::Text,
+            eredu_runtime::PreparedInputPayload::TokenIds(NumericTensor::token_ids(tokens)),
+            [],
+        )
+        .unwrap()],
+        |tensor| eredu_runtime::PreparedInputInspector::identity(&NumericInputInspector, tensor),
+    )
+    .unwrap()
+}
+
+fn dense_muse_partition_fixture() -> serde_json::Value {
+    serde_json::json!({
+        "architectures":["MuseGlimmerForConditionalGeneration"],"model_type":"muse_glimmer",
+        "image_token_id":5,"video_token_id":6,"out_hidden_size":32,"projector_hidden_size":8,
+        "text_config":{"model_type":"muse_glimmer_text","hidden_size":8,"num_hidden_layers":2,
+          "intermediate_size":10,"num_attention_heads":2,"num_key_value_heads":2,"head_dim":4,
+          "rms_norm_eps":0.00001,"post_norm_eps":0.00001,"vocab_size":7,
+          "max_position_embeddings":64,"rope_theta":10000.0,
+          "layer_types":["sliding_attention","full_attention"],
+          "layer_rope_theta":[10000.0,0.0],"sliding_window":4,"tie_word_embeddings":false,
+          "hidden_act":"silu","attention_dropout":0.0,"qk_scale_factor":1.0,
+          "output_multiplier":1.0,"final_logit_softcapping":7.0,
+          "num_experts":0,"num_experts_per_tok":0,"moe_intermediate_size":0},
+        "vision_config":{"model_type":"muse_glimmer_vision","hidden_size":8,
+          "intermediate_size":10,"num_attention_heads":2,"num_hidden_layers":1,
+          "patch_size":2,"patch_temporal":1,"merge_size":2,"pos_emb_height":2,
+          "pos_emb_width":2,"max_position_embeddings":4,"layer_norm_eps":0.00001,
+          "hidden_act":"gelu","layer_types":["full_attention"],
+          "rope_parameters":{"rope_theta":10000.0,"rope_type":"default"}}
+    })
+}
+
+fn dense_inkling_partition_fixture() -> serde_json::Value {
+    serde_json::json!({
+        "model_type":"inkling_mm_model","image_token_id":5,
+        "text_config":{"hidden_size":16,"num_hidden_layers":2,"vocab_size":19,
+          "num_attention_heads":4,"num_key_value_heads":2,"head_dim":4,
+          "sliding_window_size":4,"local_layer_ids":[1],
+          "mlp_layer_types":["dense","dense"],"sconv_kernel_size":3,
+          "d_rel":2,"rel_extent":8,"intermediate_size":12,"dense_intermediate_size":12,
+          "n_routed_experts":3,"num_experts_per_tok":2,"n_shared_experts":1,
+          "unpadded_vocab_size":19},
+        "vision_config":{"text_hidden_size":16,"patch_size":40,
+          "temporal_patch_size":2,"num_channels":3,"num_hidden_layers":4}
+    })
+}
+
+fn routed_muse_partition_fixture() -> serde_json::Value {
+    let mut config = dense_muse_partition_fixture();
+    config["text_config"]["num_experts"] = 4.into();
+    config["text_config"]["num_experts_per_tok"] = 2.into();
+    config["text_config"]["moe_intermediate_size"] = 6.into();
+    config
+}
+
+fn routed_inkling_partition_fixture() -> serde_json::Value {
+    serde_json::json!({
+        "model_type":"inkling_mm_model","image_token_id":5,
+        "text_config":{"hidden_size":8,"num_hidden_layers":2,"vocab_size":19,
+          "num_attention_heads":2,"num_key_value_heads":2,"head_dim":4,
+          "sliding_window_size":4,"layer_types":["full_attention","full_attention"],
+          "mlp_layer_types":["moe","moe"],"sconv_kernel_size":3,
+          "d_rel":2,"rel_extent":8,"intermediate_size":12,"dense_intermediate_size":12,
+          "moe_intermediate_size":6,"n_routed_experts":4,"num_experts_per_tok":2,
+          "n_shared_experts":1,"unpadded_vocab_size":19},
+        "vision_config":{"text_hidden_size":8,"patch_size":40,
+          "temporal_patch_size":2,"num_channels":3,"num_hidden_layers":4}
+    })
+}
+
+fn inkling_routed_partition_projected_input() -> eredu_runtime::PreparedModelInput<NumericTensor> {
+    eredu_runtime::PreparedModelInput::new(
+        vec![
+            eredu_runtime::PreparedInputPart::new(
+                eredu_core::InputModality::Text,
+                eredu_runtime::PreparedInputPayload::TokenIds(NumericTensor::token_ids(&[1, 2])),
+                [],
+            )
+            .unwrap(),
+            eredu_runtime::PreparedInputPart::new(
+                eredu_core::InputModality::Image,
+                eredu_runtime::PreparedInputPayload::Embeddings(NumericTensor::new(
+                    [1, 1, 8],
+                    (0..8).map(|index| (index as f32 - 4.0) / 8.0).collect(),
+                )),
+                [],
+            )
+            .unwrap(),
+        ],
+        |tensor| eredu_runtime::PreparedInputInspector::identity(&NumericInputInspector, tensor),
+    )
+    .unwrap()
+}
+
+fn muse_partition_image_input() -> eredu_runtime::PreparedModelInput<NumericTensor> {
+    eredu_runtime::PreparedModelInput::new(
+        vec![
+            eredu_runtime::PreparedInputPart::new(
+                eredu_core::InputModality::Text,
+                eredu_runtime::PreparedInputPayload::TokenIds(NumericTensor::token_ids(&[1])),
+                [],
+            )
+            .unwrap(),
+            eredu_runtime::PreparedInputPart::new_with_extents(
+                eredu_core::InputModality::Image,
+                eredu_runtime::PreparedInputPayload::Tensor(NumericTensor::new(
+                    [4, 12],
+                    (0..48).map(|index| (index as f32 - 24.0) / 100.0).collect(),
+                )),
+                [(
+                    eredu_core::InputMetadataKey::PatchGrid,
+                    NumericTensor::new([1, 3], vec![1.0, 2.0, 2.0]),
+                )],
+                [eredu_core::InputExtent::PatchGrid {
+                    time: 1,
+                    height: 2,
+                    width: 2,
+                }],
+            )
+            .unwrap(),
+            eredu_runtime::PreparedInputPart::new(
+                eredu_core::InputModality::Text,
+                eredu_runtime::PreparedInputPayload::TokenIds(NumericTensor::token_ids(&[2])),
+                [],
+            )
+            .unwrap(),
+        ],
+        |tensor| eredu_runtime::PreparedInputInspector::identity(&NumericInputInspector, tensor),
+    )
+    .unwrap()
+}
+
+fn qwen_partition_image_input() -> eredu_runtime::PreparedModelInput<NumericTensor> {
+    eredu_runtime::PreparedModelInput::new(
+        vec![
+            eredu_runtime::PreparedInputPart::new(
+                eredu_core::InputModality::Text,
+                eredu_runtime::PreparedInputPayload::TokenIds(NumericTensor::token_ids(&[1])),
+                [],
+            )
+            .unwrap(),
+            eredu_runtime::PreparedInputPart::new_with_extents(
+                eredu_core::InputModality::Image,
+                eredu_runtime::PreparedInputPayload::Tensor(NumericTensor::new(
+                    [4, 24],
+                    (0..96).map(|index| (index as f32 - 48.0) / 100.0).collect(),
+                )),
+                [(
+                    eredu_core::InputMetadataKey::PatchGrid,
+                    NumericTensor::new([1, 3], vec![1.0, 2.0, 2.0]),
+                )],
+                [eredu_core::InputExtent::PatchGrid {
+                    time: 1,
+                    height: 2,
+                    width: 2,
+                }],
+            )
+            .unwrap(),
+        ],
+        |tensor| eredu_runtime::PreparedInputInspector::identity(&NumericInputInspector, tensor),
+    )
+    .unwrap()
+}
+
+fn inkling_partition_projected_input() -> eredu_runtime::PreparedModelInput<NumericTensor> {
+    eredu_runtime::PreparedModelInput::new(
+        vec![
+            eredu_runtime::PreparedInputPart::new(
+                eredu_core::InputModality::Text,
+                eredu_runtime::PreparedInputPayload::TokenIds(NumericTensor::token_ids(&[1, 2])),
+                [],
+            )
+            .unwrap(),
+            eredu_runtime::PreparedInputPart::new(
+                eredu_core::InputModality::Image,
+                eredu_runtime::PreparedInputPayload::Embeddings(NumericTensor::new(
+                    [1, 1, 16],
+                    (0..16).map(|index| (index as f32 - 8.0) / 16.0).collect(),
+                )),
+                [],
+            )
+            .unwrap(),
+        ],
+        |tensor| eredu_runtime::PreparedInputInspector::identity(&NumericInputInspector, tensor),
+    )
+    .unwrap()
+}
+
+#[test]
+fn gemma4_composite_partitioned_session_executes_optional_roots_pipeline_and_decode() {
+    let config = serde_json::json!({
+        "model_type":"gemma4_unified", "tie_word_embeddings":false,
+        "image_token_id":5, "audio_token_id":6,
+        "text_config":{
+            "model_type":"gemma4_text", "hidden_size":8,
+            "num_hidden_layers":2, "intermediate_size":10,
+            "num_attention_heads":2, "num_key_value_heads":2, "head_dim":4,
+            "rms_norm_eps":0.00001, "vocab_size":7,
+            "max_position_embeddings":64, "attention_k_eq_v":false,
+            "num_kv_shared_layers":0,
+            "layer_types":["sliding_attention","full_attention"],
+            "sliding_window":4, "enable_moe_block":false,
+            "final_logit_softcapping":7.0
+        },
+        "vision_config":{
+            "hidden_size":8, "intermediate_size":10,
+            "num_hidden_layers":1, "num_attention_heads":2,
+            "num_key_value_heads":2, "head_dim":4, "patch_size":2,
+            "pooling_kernel_size":2, "position_embedding_size":2,
+            "rms_norm_eps":0.00001
+        },
+        "audio_config":{
+            "hidden_size":8, "num_hidden_layers":1,
+            "num_attention_heads":2, "output_proj_dims":8,
+            "conv_kernel_size":3, "attention_chunk_size":4,
+            "attention_context_left":5, "attention_context_right":0,
+            "attention_invalid_logits_value":-1000000000.0,
+            "attention_logit_cap":50.0, "residual_weight":0.5,
+            "rms_norm_eps":0.00001, "subsampling_conv_channels":[4,8]
+        }
+    });
+    let inactive = eredu_runtime::PreparedModelInput::new(
+        vec![eredu_runtime::PreparedInputPart::new(
+            eredu_core::InputModality::Text,
+            eredu_runtime::PreparedInputPayload::TokenIds(NumericTensor::token_ids(&[1, 2])),
+            [],
+        )
+        .unwrap()],
+        |tensor| eredu_runtime::PreparedInputInspector::identity(&NumericInputInspector, tensor),
+    )
+    .unwrap();
+    let active = eredu_runtime::PreparedModelInput::new(
+        vec![
+            eredu_runtime::PreparedInputPart::new(
+                eredu_core::InputModality::Text,
+                eredu_runtime::PreparedInputPayload::TokenIds(NumericTensor::token_ids(&[1, 5])),
+                [],
+            )
+            .unwrap(),
+            eredu_runtime::PreparedInputPart::new_with_extents(
+                eredu_core::InputModality::Image,
+                eredu_runtime::PreparedInputPayload::Tensor(NumericTensor::new(
+                    [1, 4, 12],
+                    (0..48).map(|index| (index as f32 - 24.0) / 100.0).collect(),
+                )),
+                [
+                    (
+                        eredu_core::InputMetadataKey::PatchGrid,
+                        NumericTensor::new([1, 3], vec![1.0, 2.0, 2.0]),
+                    ),
+                    (
+                        eredu_core::InputMetadataKey::PatchPositions,
+                        NumericTensor::new([1, 4, 2], vec![0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0]),
+                    ),
+                ],
+                [eredu_core::InputExtent::PatchGrid {
+                    time: 1,
+                    height: 2,
+                    width: 2,
+                }],
+            )
+            .unwrap(),
+        ],
+        |tensor| eredu_runtime::PreparedInputInspector::identity(&NumericInputInspector, tensor),
+    )
+    .unwrap();
+    let decode = [
+        gemma_composite_decode_input(4),
+        gemma_composite_decode_input(5),
+    ];
+
+    for (label, prefill) in [("inactive", inactive), ("active", active)] {
+        let expected =
+            execute_numeric_composite_visitor(&config, &prefill, &NumericContext::default(), false)
+                .outputs;
+        let inputs = [prefill, decode[0].clone(), decode[1].clone()];
+        let (results, world) = run_numeric_gemma_composite_partitions(&config, &inputs);
+        if results.iter().any(Result::is_err) {
+            panic!("Gemma composite {label} failures: {results:?}");
+        }
+        for (rank, result) in results.into_iter().enumerate() {
+            let actual = result.unwrap_or_else(|error| panic!("{label} rank {rank}: {error}"));
+            for (step, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+                assert_tensor_exact(
+                    actual,
+                    expected,
+                    &format!("Gemma composite {label} rank {rank} step {step}"),
+                );
+            }
+        }
+        let trace = world.trace();
+        assert!(trace
+            .iter()
+            .any(|event| event.operation == NumericOpaqueOperation::PointToPoint));
+        assert!(trace
+            .iter()
+            .any(|event| event.operation == NumericOpaqueOperation::Broadcast));
+        assert!(trace
+            .iter()
+            .any(|event| event.operation == NumericOpaqueOperation::FailureAgreement));
+    }
+}
+
+#[test]
+fn remaining_dense_composites_run_tp_pp_through_the_ordinary_partition_session() {
+    let cases = [
+        (
+            "Muse-Glimmer",
+            dense_muse_partition_fixture(),
+            muse_partition_image_input(),
+        ),
+        (
+            "Inkling",
+            dense_inkling_partition_fixture(),
+            inkling_partition_projected_input(),
+        ),
+        (
+            "conditional Qwen",
+            conditional_qwen_partition_config(false),
+            qwen_partition_image_input(),
+        ),
+    ];
+    let topologies = [
+        ("TP2", ParallelTopology::new(2, 1, 1, 1).unwrap()),
+        ("PP2", ParallelTopology::new(1, 2, 1, 1).unwrap()),
+        ("TP2xPP2", ParallelTopology::new(2, 2, 1, 1).unwrap()),
+    ];
+    for (family, config, active) in cases {
+        for (topology_name, topology) in topologies {
+            for (activity, prefill) in [
+                ("inactive", numeric_text_prepared_input(&[1, 2])),
+                ("active", active.clone()),
+            ] {
+                let inputs = [
+                    prefill,
+                    numeric_text_prepared_input(&[4]),
+                    numeric_text_prepared_input(&[5]),
+                ];
+                let (results, world) = run_numeric_composite_partitions(&config, &inputs, topology);
+                if results.iter().any(Result::is_err) {
+                    panic!(
+                        "{family} {activity} {topology_name} failures: {results:?}; trace={:?}",
+                        world.trace(),
+                    );
+                }
+                let outputs = results.into_iter().map(Result::unwrap).collect::<Vec<_>>();
+                assert_eq!(outputs[0].len(), 3);
+                for rank in 1..outputs.len() {
+                    for (step, (left, right)) in outputs[0].iter().zip(&outputs[rank]).enumerate() {
+                        assert_tensor_exact(
+                            left,
+                            right,
+                            &format!("{family} {activity} {topology_name} publication step {step}"),
+                        );
+                    }
+                }
+                assert_eq!(world.materializations().len(), topology.world_size());
+                assert!(world.materializations().values().all(|tasks| *tasks > 0));
+                let cache_identities = world.prompt_cache_identities();
+                assert_eq!(cache_identities.len(), topology.world_size());
+                let fingerprints = cache_identities
+                    .values()
+                    .map(|identity| identity.architecture_fingerprint())
+                    .collect::<BTreeSet<_>>();
+                assert_eq!(fingerprints.len(), 1);
+                for (rank, identity) in cache_identities {
+                    let rank_topology = ParallelRankTopology::new(topology, rank).unwrap();
+                    assert_eq!(
+                        identity.topology().shard(),
+                        (topology.tensor() > 1)
+                            .then_some((topology.tensor(), rank_topology.tensor_parallel_rank(),)),
+                    );
+                    assert_eq!(
+                        identity.topology().stage(),
+                        (topology.pipeline() > 1).then_some((
+                            topology.pipeline(),
+                            rank_topology.pipeline_parallel_rank(),
+                        )),
+                    );
+                    assert_eq!(identity.topology().addressable(), None);
+                }
+            }
+        }
+    }
+
+    let topology = ParallelTopology::new(2, 1, 1, 1).unwrap();
+    let malformed = eredu_runtime::PreparedModelInput::new(
+        vec![eredu_runtime::PreparedInputPart::new(
+            eredu_core::InputModality::Image,
+            eredu_runtime::PreparedInputPayload::Tensor(NumericTensor::zeros([4, 12])),
+            [],
+        )
+        .unwrap()],
+        |tensor| eredu_runtime::PreparedInputInspector::identity(&NumericInputInspector, tensor),
+    )
+    .unwrap();
+    let inputs = [numeric_text_prepared_input(&[1, 2]), malformed];
+    let (failed, world) =
+        run_numeric_composite_partitions(&dense_muse_partition_fixture(), &inputs, topology);
+    assert!(failed.iter().all(Result::is_err));
+    let (_, _, _, commits) = world.lifecycle_counts();
+    assert_eq!(commits.values().sum::<usize>(), topology.world_size());
+}
+
+#[test]
+fn remaining_dense_composites_admit_only_rank_local_safe_tensor_topology() {
+    for (family, config) in [
+        ("Muse-Glimmer", dense_muse_partition_fixture()),
+        ("Inkling", dense_inkling_partition_fixture()),
+        ("conditional Qwen", conditional_qwen_partition_config(false)),
+    ] {
+        assert_eq!(
+            numeric_composite_production_decision(
+                &config,
+                ParallelTopology::new(2, 1, 1, 1).unwrap(),
+            ),
+            eredu_architectures::composite_partitioned::CompositePartitionedProductionDecision::Resident,
+            "{family} pure TP",
+        );
+        assert_eq!(
+            numeric_composite_production_decision(
+                &config,
+                ParallelTopology::new(1, 2, 1, 1).unwrap(),
+            ),
+            eredu_architectures::composite_partitioned::CompositePartitionedProductionDecision::Resident,
+            "{family} pure PP",
+        );
+        assert_eq!(
+            numeric_composite_production_decision(
+                &config,
+                ParallelTopology::new(2, 2, 1, 1).unwrap(),
+            ),
+            eredu_architectures::composite_partitioned::CompositePartitionedProductionDecision::Resident,
+            "{family} TPxPP",
+        );
+    }
+}
+
+#[test]
+fn routed_muse_and_inkling_use_the_ordinary_partition_session_across_admitted_axes() {
+    let cases = [
+        (
+            "Muse-Glimmer",
+            routed_muse_partition_fixture(),
+            muse_partition_image_input(),
+        ),
+        (
+            "Inkling",
+            routed_inkling_partition_fixture(),
+            inkling_routed_partition_projected_input(),
+        ),
+    ];
+    let topologies = [
+        ("TP2", ParallelTopology::new(2, 1, 1, 1).unwrap()),
+        ("PP2", ParallelTopology::new(1, 2, 1, 1).unwrap()),
+        ("EP2", ParallelTopology::new(1, 1, 2, 1).unwrap()),
+        ("TP2xEP2", ParallelTopology::new(2, 1, 2, 1).unwrap()),
+        ("TP2xPP2", ParallelTopology::new(2, 2, 1, 1).unwrap()),
+        ("PP2xEP2", ParallelTopology::new(1, 2, 2, 1).unwrap()),
+        ("TP2xPP2xEP2", ParallelTopology::new(2, 2, 2, 1).unwrap()),
+    ];
+    for (family, config, active) in cases {
+        for (topology_name, topology) in topologies {
+            for (activity, prefill) in [
+                ("inactive", numeric_text_prepared_input(&[1, 2])),
+                ("active", active.clone()),
+            ] {
+                let inputs = [
+                    prefill,
+                    numeric_text_prepared_input(&[4]),
+                    numeric_text_prepared_input(&[5]),
+                ];
+                let (results, world) = run_numeric_composite_partitions(&config, &inputs, topology);
+                if results.iter().any(Result::is_err) {
+                    panic!(
+                        "{family} {activity} {topology_name} routed failures: {results:?}; trace={:?}; lifecycle={:?}",
+                        world.trace(),
+                        world.lifecycle_counts(),
+                    );
+                }
+                let outputs = results.into_iter().map(Result::unwrap).collect::<Vec<_>>();
+                for rank in 1..outputs.len() {
+                    for (step, (expected, actual)) in
+                        outputs[0].iter().zip(&outputs[rank]).enumerate()
+                    {
+                        assert_tensor_exact(
+                            actual,
+                            expected,
+                            &format!("{family} {activity} {topology_name} rank {rank} step {step}"),
+                        );
+                    }
+                }
+                assert_eq!(world.materializations().len(), topology.world_size());
+                assert!(world.materializations().values().all(|tasks| *tasks > 0));
+                assert_eq!(world.prompt_cache_identities().len(), topology.world_size());
+            }
+        }
+    }
+}
+
+#[test]
+fn placed_routed_composite_observation_intervention_is_transactional() {
+    let config = routed_muse_partition_fixture();
+    let topology = ParallelTopology::new(1, 2, 2, 1).unwrap();
+    let inputs = [
+        muse_partition_image_input(),
+        numeric_text_prepared_input(&[4]),
+    ];
+    let (baseline, _) = run_numeric_composite_partitions(&config, &inputs, topology);
+    let baseline = baseline.into_iter().map(Result::unwrap).collect::<Vec<_>>();
+
+    let projector_path = eredu_core::VISION_PROJECTOR_OUTPUT_OBSERVATION_PATH;
+    let merge_path = eredu_core::MODALITY_MERGE_OUTPUT_OBSERVATION_PATH;
+    let (projected, _) = run_numeric_composite_partitions_observed(
+        &config,
+        &inputs,
+        topology,
+        Some(projector_path),
+        Some(0.75),
+        None,
+    );
+    for (rank, observed) in projected.into_iter().enumerate() {
+        let rank_topology = ParallelRankTopology::new(topology, rank).unwrap();
+        let outputs = observed.outputs.unwrap();
+        if rank_topology.pipeline_parallel_rank() == 0 {
+            assert_eq!(
+                observed
+                    .paths
+                    .iter()
+                    .filter(|path| path.as_str() == projector_path)
+                    .count(),
+                1,
+                "the placed projector must be replaced exactly once on rank {rank}: {:?}",
+                observed.paths,
+            );
+            let projector = observed
+                .paths
+                .iter()
+                .position(|path| path == projector_path)
+                .unwrap();
+            let merge = observed
+                .paths
+                .iter()
+                .position(|path| path == merge_path)
+                .unwrap();
+            assert!(projector < merge, "the merge must consume the replacement");
+        } else {
+            assert!(!observed.paths.iter().any(|path| path == projector_path));
+        }
+        assert_ne!(
+            outputs.first().unwrap().data,
+            baseline[rank].first().unwrap().data,
+            "projector replacement must reach the published downstream output",
+        );
+    }
+
+    let routed_output = "model.layers.1.output";
+    let (routed, _) = run_numeric_composite_partitions_observed(
+        &config,
+        &inputs[..1],
+        topology,
+        Some(routed_output),
+        None,
+        None,
+    );
+    for (rank, observed) in routed.into_iter().enumerate() {
+        let rank_topology = ParallelRankTopology::new(topology, rank).unwrap();
+        let outputs = observed.outputs.unwrap();
+        assert_eq!(
+            observed
+                .paths
+                .iter()
+                .filter(|path| path.as_str() == routed_output)
+                .count(),
+            usize::from(rank_topology.pipeline_parallel_rank() == 1),
+            "the placed routed unit output must be replaced exactly once on its owner",
+        );
+        assert_ne!(
+            outputs.first().unwrap().data,
+            baseline[rank].first().unwrap().data,
+            "routed output replacement must alter the published output",
+        );
+    }
+
+    let (failed, world) = run_numeric_composite_partitions_observed(
+        &config,
+        &inputs[..1],
+        topology,
+        None,
+        None,
+        Some(routed_output),
+    );
+    assert!(failed.iter().all(|result| result.outputs.is_err()));
+    assert!(failed
+        .iter()
+        .all(|result| result.positions_after == result.positions_before));
+    let (submissions, _, _, commits) = world.lifecycle_counts();
+    assert!(commits.is_empty(), "observer failure must roll state back");
+    assert_eq!(
+        submissions
+            .get(&NumericOpaqueOperation::Broadcast)
+            .copied()
+            .unwrap_or_default(),
+        0,
+        "observer failure must prevent output publication",
+    );
+}
+
+#[test]
+fn routed_composite_cross_stage_expert_exchange_is_resident() {
+    for (family, config) in [
+        ("Muse-Glimmer", routed_muse_partition_fixture()),
+        ("Inkling", routed_inkling_partition_fixture()),
+    ] {
+        assert_eq!(
+            numeric_composite_production_decision(
+                &config,
+                ParallelTopology::new(1, 2, 2, 1).unwrap(),
+            ),
+            eredu_architectures::composite_partitioned::CompositePartitionedProductionDecision::Resident,
+            "{family} PPxEP",
+        );
+        assert_eq!(
+            numeric_composite_production_decision(
+                &config,
+                ParallelTopology::new(2, 2, 2, 1).unwrap(),
+            ),
+            eredu_architectures::composite_partitioned::CompositePartitionedProductionDecision::Resident,
+            "{family} TPxPPxEP",
+        );
+    }
+}
+
+#[test]
+fn qwen_composites_admit_every_prediction_free_selected_topology_without_a_bridge() {
+    for (family, config) in [
+        ("Qwen3-VL dense", qwen_vl_partition_config(false)),
+        (
+            "conditional Qwen dense",
+            conditional_qwen_partition_config(false),
+        ),
+    ] {
+        for (topology_name, topology) in [
+            ("TP2", ParallelTopology::new(2, 1, 1, 1).unwrap()),
+            ("PP2", ParallelTopology::new(1, 2, 1, 1).unwrap()),
+            ("TP2xPP2", ParallelTopology::new(2, 2, 1, 1).unwrap()),
+        ] {
+            assert_eq!(
+                numeric_composite_production_decision(&config, topology),
+                eredu_architectures::composite_partitioned::CompositePartitionedProductionDecision::Resident,
+                "{family} {topology_name}",
+            );
+        }
+    }
+    for (family, config) in [
+        ("Qwen3-VL routed", qwen_vl_partition_config(true)),
+        (
+            "conditional Qwen routed",
+            conditional_qwen_partition_config(true),
+        ),
+    ] {
+        for (topology_name, topology) in [
+            ("TP2", ParallelTopology::new(2, 1, 1, 1).unwrap()),
+            ("PP2", ParallelTopology::new(1, 2, 1, 1).unwrap()),
+            ("EP2", ParallelTopology::new(1, 1, 2, 1).unwrap()),
+            ("TP2xPP2xEP2", ParallelTopology::new(2, 2, 2, 1).unwrap()),
+        ] {
+            assert_eq!(
+                numeric_composite_production_decision(&config, topology),
+                eredu_architectures::composite_partitioned::CompositePartitionedProductionDecision::Resident,
+                "{family} {topology_name}",
+            );
+        }
+    }
+}
+
+fn qwen_vl_partition_config(routed: bool) -> serde_json::Value {
+    let mut value = serde_json::json!({
+        "model_type": "qwen3_vl", "image_token_id": 5, "video_token_id": 6,
+        "tie_word_embeddings": false,
+        "text_config": {
+            "model_type": "qwen3_vl_text", "hidden_size": 16,
+            "num_hidden_layers": 2, "intermediate_size": 12,
+            "num_attention_heads": 2, "num_key_value_heads": 2, "head_dim": 8,
+            "rms_norm_eps": 0.000001, "vocab_size": 7,
+            "max_position_embeddings": 64, "rope_theta": 1000000.0,
+            "rope_scaling": {"mrope_section": [1, 1, 2], "mrope_interleaved": true}
+        },
+        "vision_config": {
+            "depth": 2, "hidden_size": 8, "intermediate_size": 12,
+            "num_heads": 2, "num_position_embeddings": 16,
+            "in_channels": 3, "patch_size": 2, "spatial_merge_size": 2,
+            "temporal_patch_size": 2, "out_hidden_size": 16,
+            "deepstack_visual_indexes": [0]
+        }
+    });
+    if routed {
+        value["model_type"] = "qwen3_vl_moe".into();
+        value["text_config"]["model_type"] = "qwen3_vl_moe_text".into();
+        value["text_config"]["intermediate_size"] = 0.into();
+        value["text_config"]["moe_intermediate_size"] = 12.into();
+        value["text_config"]["num_experts"] = 4.into();
+        value["text_config"]["num_experts_per_tok"] = 2.into();
+    }
+    value
+}
+
+#[test]
+fn qwen_vl_dense_partition_preserves_deepstack_state_and_prepared_identity() {
+    let args = qwen::vl::model_args_from_config_value(&qwen_vl_partition_config(false)).unwrap();
+    let context = NumericContext::default();
+    let architecture =
+        qwen::vl::LayeredModel::<NumericBackend>::new(args.clone(), &context).unwrap();
+    let vision_transport = <qwen::vl::LayeredModel<NumericBackend> as LayeredArchitecture<
+        NumericBackend,
+        DeviceState<NumericBackend, NumericHybridLayerState>,
+    >>::group_transport(&architecture, 0);
+    assert!(vision_transport.request_optional);
+    assert_eq!(
+        vision_transport.merge_destination,
+        eredu_runtime::ArchitectureMergeDestination::FirstPipelineOwner
+    );
+    let parameters = architecture.parameter_description(&context).unwrap();
+    let groups = parameters
+        .groups()
+        .iter()
+        .map(|owned| owned.group().clone())
+        .collect::<Vec<_>>();
+    let layout = numeric_local_layout(&groups, 2, 0).unwrap();
+    let complete_state = qwen::vl::local_geometry(&args, &layout)
+        .unwrap()
+        .state_layout()
+        .clone();
+    let state_plan =
+        ArchitectureStatePartitionPlan::new([ArchitectureStatePartitionRule::group_units(1, 0..2)]);
+    let first_ownership = PartitionOwnership::new(true, false, ["vision", "embedding"]).unwrap();
+    let first_geometry = qwen::vl::partition_local_geometry(
+        &args,
+        &layout,
+        [
+            (qwen::vl::VISION_EXECUTION_GROUP, 0..1),
+            (qwen::vl::TEXT_EXECUTION_GROUP, 0..1),
+        ],
+        &first_ownership,
+    )
+    .unwrap();
+    let first_partition = ArchitecturePartition::from_description(
+        &parameters,
+        [
+            (qwen::vl::VISION_EXECUTION_GROUP, 0..1),
+            (qwen::vl::TEXT_EXECUTION_GROUP, 0..1),
+        ],
+        first_ownership,
+        &complete_state,
+        &state_plan,
+        first_geometry,
+        qwen::vl::PipelineBoundarySchema::from_args(&args),
+    )
+    .unwrap();
+    let first =
+        qwen::vl::PartitionLocalFoundation::from_partition(&args, &first_partition).unwrap();
+    assert_eq!(first.geometry().vision_units(), Some(0..1));
+    assert_eq!(first.geometry().text_units(), 0..1);
+    assert_eq!(first.geometry().deepstack_layers(), [0]);
+    assert_eq!(first.geometry().merger_widths().len(), 2);
+    assert_eq!(first.geometry().static_roles(), ["vision", "embedding"]);
+    assert_eq!(first_partition.state().unwrap().global_layer_offset(), 0);
+    assert!(first
+        .parameter_targets()
+        .iter()
+        .any(|target| target == "model.visual.patch_embed.proj.weight"));
+    assert!(first
+        .parameter_targets()
+        .iter()
+        .any(|target| target.contains("model.visual.deepstack_merger_list.0")));
+    assert!(first
+        .parameter_targets()
+        .iter()
+        .any(|target| target.contains("model.visual.blocks.0")));
+    assert!(first
+        .parameter_targets()
+        .iter()
+        .any(|target| target.contains("language_model.layers.0")));
+    assert!(!first
+        .parameter_targets()
+        .iter()
+        .any(|target| target.contains("language_model.layers.1")));
+
+    let last_ownership = PartitionOwnership::new(false, true, ["norm", "output"]).unwrap();
+    let last_geometry = qwen::vl::partition_local_geometry(
+        &args,
+        &layout,
+        [
+            (qwen::vl::VISION_EXECUTION_GROUP, 1..2),
+            (qwen::vl::TEXT_EXECUTION_GROUP, 1..2),
+        ],
+        &last_ownership,
+    )
+    .unwrap();
+    let last_partition = ArchitecturePartition::from_description(
+        &parameters,
+        [
+            (qwen::vl::VISION_EXECUTION_GROUP, 1..2),
+            (qwen::vl::TEXT_EXECUTION_GROUP, 1..2),
+        ],
+        last_ownership,
+        &complete_state,
+        &state_plan,
+        last_geometry,
+        qwen::vl::PipelineBoundarySchema::from_args(&args),
+    )
+    .unwrap();
+    let last = qwen::vl::PartitionLocalFoundation::from_partition(&args, &last_partition).unwrap();
+    assert_eq!(last_partition.state().unwrap().global_layer_offset(), 1);
+    assert_eq!(last.geometry().static_roles(), ["norm", "output"]);
+    assert!(last
+        .parameter_targets()
+        .iter()
+        .any(|target| target.contains("model.visual.blocks.1")));
+    assert!(last
+        .parameter_targets()
+        .iter()
+        .any(|target| target.contains("language_model.layers.1")));
+    assert!(last
+        .parameter_targets()
+        .iter()
+        .any(|target| target == "lm_head.weight"));
+    assert!(!last
+        .parameter_targets()
+        .iter()
+        .any(|target| target == "model.visual.patch_embed.proj.weight"));
+
+    let schema = *last_partition.boundary_schema();
+    let encoded = eredu_runtime::ArchitectureBoundary::encode(
+        &schema,
+        qwen::vl::PipelineBoundary {
+            cosine: NumericTensor::zeros([2, 8]),
+            sine: NumericTensor::zeros([2, 8]),
+            position_delta: NumericTensor::zeros([1]),
+            deepstack: vec![NumericTensor::zeros([1, 2, 16])],
+        },
+    )
+    .unwrap();
+    assert_eq!(encoded.len(), 4);
+    assert!(eredu_runtime::ArchitectureBoundary::decode(&schema, encoded[..3].to_vec()).is_err());
+
+    let original = eredu_runtime::PreparedModelInput::new(
+        vec![
+            eredu_runtime::PreparedInputPart::new(
+                eredu_core::InputModality::Text,
+                eredu_runtime::PreparedInputPayload::TokenIds(NumericTensor::token_ids(&[1, 2])),
+                [],
+            )
+            .unwrap(),
+            eredu_runtime::PreparedInputPart::new_with_extents(
+                eredu_core::InputModality::Image,
+                eredu_runtime::PreparedInputPayload::Tensor(NumericTensor::zeros([4, 24])),
+                [(
+                    eredu_core::InputMetadataKey::PatchGrid,
+                    NumericTensor::new([1, 3], vec![1.0, 2.0, 2.0]),
+                )],
+                [eredu_core::InputExtent::PatchGrid {
+                    time: 1,
+                    height: 2,
+                    width: 2,
+                }],
+            )
+            .unwrap(),
+        ],
+        |tensor| eredu_runtime::PreparedInputInspector::identity(&NumericInputInspector, tensor),
+    )
+    .unwrap();
+    let admitted = <qwen::vl::LayeredModel<NumericBackend> as
+        eredu_architectures::composite_execution::CompositeArchitecture<
+            NumericBackend,
+            DeviceState<NumericBackend, NumericHybridLayerState>,
+        >>::admit_prepared_input(&args, &original, &NumericInputInspector)
+    .unwrap();
+    let prepared =
+        eredu_architectures::composite_execution::PreparedCompositeInput::new(&original, &admitted)
+            .unwrap();
+    let active = numeric_composite_optional_activity_at_begin(
+        qwen::vl::LayeredModel::<NumericBackend>::new_parallel(
+            args.clone(),
+            qwen::vl::local_geometry(&args, &layout).unwrap(),
+            &context,
+        )
+        .unwrap(),
+        &first_partition,
+        vec![
+            eredu_runtime::ArchitectureGroupKind::VisionEncoder,
+            eredu_runtime::ArchitectureGroupKind::Decoder,
+        ],
+        prepared,
+    );
+    assert_eq!(active, [true, false]);
+    let changed = eredu_runtime::PreparedModelInput::new(
+        vec![eredu_runtime::PreparedInputPart::new(
+            eredu_core::InputModality::Text,
+            eredu_runtime::PreparedInputPayload::TokenIds(NumericTensor::token_ids(&[1])),
+            [],
+        )
+        .unwrap()],
+        |tensor| eredu_runtime::PreparedInputInspector::identity(&NumericInputInspector, tensor),
+    )
+    .unwrap();
+    assert!(
+        eredu_architectures::composite_execution::PreparedCompositeInput::new(&changed, &admitted,)
+            .is_err()
+    );
+    let changed_admitted = <qwen::vl::LayeredModel<NumericBackend> as
+        eredu_architectures::composite_execution::CompositeArchitecture<
+            NumericBackend,
+            DeviceState<NumericBackend, NumericHybridLayerState>,
+        >>::admit_prepared_input(&args, &changed, &NumericInputInspector)
+    .unwrap();
+    let inactive = numeric_composite_optional_activity_at_begin(
+        qwen::vl::LayeredModel::<NumericBackend>::new_parallel(
+            args.clone(),
+            qwen::vl::local_geometry(&args, &layout).unwrap(),
+            &context,
+        )
+        .unwrap(),
+        &first_partition,
+        vec![
+            eredu_runtime::ArchitectureGroupKind::VisionEncoder,
+            eredu_runtime::ArchitectureGroupKind::Decoder,
+        ],
+        eredu_architectures::composite_execution::PreparedCompositeInput::new(
+            &changed,
+            &changed_admitted,
+        )
+        .unwrap(),
+    );
+    assert_eq!(inactive, [false, false]);
+}
+
+#[test]
+fn qwen_vl_moe_partition_binds_exact_routed_expert_authority() {
+    let args = qwen::vl::model_args_from_config_value(&qwen_vl_partition_config(true)).unwrap();
+    let context = NumericContext::default();
+    let seed = qwen::vl::LayeredModel::<NumericBackend>::new(args.clone(), &context).unwrap();
+    let parameters = seed.parameter_description(&context).unwrap();
+    let groups = parameters
+        .groups()
+        .iter()
+        .map(|owned| owned.group().clone())
+        .collect::<Vec<_>>();
+    let topology = ParallelTopology::new(2, 2, 2, 1).unwrap();
+    let rank = ParallelRankTopology::new(topology, 7).unwrap();
+    let layout = numeric_local_layout(&groups, 2, rank.tensor_parallel_rank()).unwrap();
+    let complete = qwen::vl::local_geometry(&args, &layout).unwrap();
+    let local_context = NumericContext::with_local_layout(layout.clone());
+    let architecture = qwen::vl::LayeredModel::<NumericBackend>::new_parallel(
+        args.clone(),
+        complete,
+        &local_context,
+    )
+    .unwrap();
+    let realization = qwen::vl::expert_realization_plan(&architecture, rank)
+        .unwrap()
+        .unwrap();
+    assert_eq!(realization.local_global_group_indices(), [2, 3]);
+    let ownership = PartitionOwnership::new(false, true, ["norm", "output"]).unwrap();
+    let geometry = qwen::vl::partition_local_routed_geometry(
+        &args,
+        &layout,
+        [
+            (qwen::vl::VISION_EXECUTION_GROUP, 1..2),
+            (qwen::vl::TEXT_EXECUTION_GROUP, 1..2),
+        ],
+        &ownership,
+        rank,
+        &realization,
+    )
+    .unwrap();
+    assert_eq!(geometry.vision_units(), Some(1..2));
+    assert_eq!(geometry.text_units(), 1..2);
+    assert_eq!(geometry.text_block(1).unwrap().num_experts, 2);
+    assert_eq!(geometry.text_block(1).unwrap().moe_intermediate_size, 6);
+    assert_eq!(geometry.expert_realization().unwrap(), &realization);
+
+    assert!(qwen::vl::partition_local_geometry(
+        &args,
+        &layout,
+        [(qwen::vl::TEXT_EXECUTION_GROUP, 1..2)],
+        &ownership,
+    )
+    .is_err());
+    let wrong_rank = ParallelRankTopology::new(topology, 6).unwrap();
+    assert!(qwen::vl::partition_local_routed_geometry(
+        &args,
+        &layout,
+        [(qwen::vl::TEXT_EXECUTION_GROUP, 1..2)],
+        &ownership,
+        wrong_rank,
+        &realization,
+    )
+    .is_err());
+}
+
+#[test]
+fn inkling_dense_partition_prepared_multimodal_identity_is_causal() {
+    let args = inkling::ModelArgs::from_hf_json(
+        &serde_json::to_vec(&serde_json::json!({
+            "model_type":"inkling_mm_model", "image_token_id":5,
+            "text_config":{
+                "hidden_size":16,"num_hidden_layers":2,"vocab_size":19,
+                "num_attention_heads":4,"num_key_value_heads":2,"head_dim":4,
+                "sliding_window_size":4,"local_layer_ids":[1],
+                "mlp_layer_types":["dense","dense"],"sconv_kernel_size":3,
+                "d_rel":2,"rel_extent":8,"intermediate_size":12,
+                "dense_intermediate_size":12,"n_routed_experts":3,
+                "num_experts_per_tok":2,"n_shared_experts":1,
+                "unpadded_vocab_size":19
+            },
+            "vision_config":{"text_hidden_size":16,"patch_size":40,
+                "temporal_patch_size":2,"num_channels":3,"num_hidden_layers":4}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let original = eredu_runtime::PreparedModelInput::new(
+        vec![
+            eredu_runtime::PreparedInputPart::new(
+                eredu_core::InputModality::Text,
+                eredu_runtime::PreparedInputPayload::TokenIds(NumericTensor::token_ids(&[1, 2])),
+                [],
+            )
+            .unwrap(),
+            eredu_runtime::PreparedInputPart::new(
+                eredu_core::InputModality::Image,
+                eredu_runtime::PreparedInputPayload::Embeddings(NumericTensor::zeros([1, 1, 16])),
+                [],
+            )
+            .unwrap(),
+        ],
+        |tensor| eredu_runtime::PreparedInputInspector::identity(&NumericInputInspector, tensor),
+    )
+    .unwrap();
+    let admitted = <inkling::LayeredModel<NumericBackend> as
+        eredu_architectures::composite_execution::CompositeArchitecture<
+            NumericBackend,
+            DeviceState<NumericBackend, NumericHybridLayerState>,
+        >>::admit_prepared_input(&args, &original, &NumericInputInspector)
+    .unwrap();
+    let prepared =
+        eredu_architectures::composite_execution::PreparedCompositeInput::new(&original, &admitted)
+            .unwrap();
+    let architecture =
+        inkling::LayeredModel::<NumericBackend>::new(args.clone(), &NumericContext::default())
+            .unwrap();
+    let ingress = <inkling::LayeredModel<NumericBackend> as
+        eredu_architectures::composite_execution::CompositeArchitecture<
+            NumericBackend,
+            DeviceState<NumericBackend, NumericHybridLayerState>,
+        >>::prepared_primary_ingress_collectives(&architecture, prepared, 2)
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        ingress,
+        vec![
+            eredu_architectures::composite_execution::CompositeTensorCollective::Sum {
+                shape: vec![1, 2, 16],
+            }
+        ]
+    );
+
+    let changed = eredu_runtime::PreparedModelInput::new(
+        vec![eredu_runtime::PreparedInputPart::new(
+            eredu_core::InputModality::Text,
+            eredu_runtime::PreparedInputPayload::TokenIds(NumericTensor::token_ids(&[1])),
+            [],
+        )
+        .unwrap()],
+        |tensor| eredu_runtime::PreparedInputInspector::identity(&NumericInputInspector, tensor),
+    )
+    .unwrap();
+    assert!(
+        eredu_architectures::composite_execution::PreparedCompositeInput::new(&changed, &admitted,)
+            .is_err()
+    );
+}
+
+fn conditional_qwen_partition_config(routed: bool) -> serde_json::Value {
+    let mut value = serde_json::json!({
+        "model_type": "qwen3_5", "image_token_id": 5, "video_token_id": 6,
+        "text_config": {
+            "model_type": "qwen3_5_text", "vocab_size": 7, "hidden_size": 8,
+            "num_hidden_layers": 2, "mtp_num_hidden_layers": 0,
+            "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 2,
+            "max_position_embeddings": 64, "linear_conv_kernel_dim": 2,
+            "linear_key_head_dim": 2, "linear_value_head_dim": 2,
+            "linear_num_key_heads": 2, "linear_num_value_heads": 2,
+            "intermediate_size": 10, "moe_intermediate_size": 4,
+            "shared_expert_intermediate_size": 4, "num_experts_per_tok": 1,
+            "num_experts": 2, "layer_types": ["full_attention", "linear_attention"],
+            "tie_word_embeddings": false
+        },
+        "vision_config": {
+            "depth": 2, "hidden_size": 8, "intermediate_size": 10,
+            "num_heads": 2, "num_position_embeddings": 16,
+            "in_channels": 3, "patch_size": 2, "spatial_merge_size": 2,
+            "temporal_patch_size": 2, "out_hidden_size": 8,
+            "deepstack_visual_indexes": [0]
+        }
+    });
+    if routed {
+        value["model_type"] = "qwen3_5_moe".into();
+        value["text_config"]["model_type"] = "qwen3_5_moe_text".into();
+        value["text_config"]["intermediate_size"] = 0.into();
+    }
+    value
+}
+
+#[test]
+fn conditional_qwen_dense_partition_preserves_deepstack_state_targets_and_identity() {
+    let parsed =
+        qwen::hybrid::model_args_from_config_value(&conditional_qwen_partition_config(false))
+            .unwrap();
+    let context = NumericContext::default();
+    let architecture =
+        qwen::hybrid::ConditionalLayeredModel::<NumericBackend>::new(parsed.clone(), &context)
+            .unwrap();
+    let parameters = architecture.parameter_description(&context).unwrap();
+    let groups = parameters
+        .groups()
+        .iter()
+        .map(|owned| owned.group().clone())
+        .collect::<Vec<_>>();
+    let layout = numeric_local_layout(&groups, 2, 0).unwrap();
+    let complete_state = qwen::hybrid::conditional_local_geometry(&parsed, &layout)
+        .unwrap()
+        .state_layout()
+        .clone();
+    let state_plan =
+        ArchitectureStatePartitionPlan::new([ArchitectureStatePartitionRule::group_units(1, 0..2)]);
+    let boundary = architecture.pipeline_boundary_schema();
+
+    let first_ownership = PartitionOwnership::new(true, false, ["vision", "embedding"]).unwrap();
+    let first_geometry = qwen::hybrid::conditional_partition_local_geometry(
+        &parsed,
+        &layout,
+        [
+            (qwen::hybrid::VISION_EXECUTION_GROUP, 0..1),
+            (decoder::TARGET_EXECUTION_GROUP, 0..1),
+        ],
+        &first_ownership,
+    )
+    .unwrap();
+    let first_partition = ArchitecturePartition::from_description(
+        &parameters,
+        [
+            (qwen::hybrid::VISION_EXECUTION_GROUP, 0..1),
+            (decoder::TARGET_EXECUTION_GROUP, 0..1),
+        ],
+        first_ownership,
+        &complete_state,
+        &state_plan,
+        first_geometry,
+        boundary,
+    )
+    .unwrap();
+    let first = qwen::hybrid::ConditionalPartitionLocalFoundation::from_partition(
+        &parsed,
+        &first_partition,
+    )
+    .unwrap();
+    assert_eq!(first.geometry().vision_units(), Some(0..1));
+    assert_eq!(first.geometry().target_units(), 0..1);
+    assert_eq!(first.geometry().deepstack_layers(), [0]);
+    assert_eq!(first.geometry().merger_widths().len(), 2);
+    assert_eq!(first.geometry().target(0).unwrap().num_attention_heads, 2);
+    assert_eq!(first_partition.state().unwrap().global_layer_offset(), 0);
+    assert!(first
+        .parameter_targets()
+        .iter()
+        .any(|target| target == "model.visual.patch_embed.proj.weight"));
+    assert!(first
+        .parameter_targets()
+        .iter()
+        .any(|target| target.contains("model.visual.deepstack_merger_list.0")));
+    assert!(first
+        .parameter_targets()
+        .iter()
+        .any(|target| target.starts_with("model.layers.0.")));
+    assert!(!first
+        .parameter_targets()
+        .iter()
+        .any(|target| target.starts_with("model.layers.1.")));
+
+    let last_ownership = PartitionOwnership::new(false, true, ["norm", "output"]).unwrap();
+    let last_geometry = qwen::hybrid::conditional_partition_local_geometry(
+        &parsed,
+        &layout,
+        [
+            (qwen::hybrid::VISION_EXECUTION_GROUP, 1..2),
+            (decoder::TARGET_EXECUTION_GROUP, 1..2),
+        ],
+        &last_ownership,
+    )
+    .unwrap();
+    let last_partition = ArchitecturePartition::from_description(
+        &parameters,
+        [
+            (qwen::hybrid::VISION_EXECUTION_GROUP, 1..2),
+            (decoder::TARGET_EXECUTION_GROUP, 1..2),
+        ],
+        last_ownership,
+        &complete_state,
+        &state_plan,
+        last_geometry,
+        boundary,
+    )
+    .unwrap();
+    let last =
+        qwen::hybrid::ConditionalPartitionLocalFoundation::from_partition(&parsed, &last_partition)
+            .unwrap();
+    assert_eq!(last_partition.state().unwrap().global_layer_offset(), 1);
+    assert_eq!(last.geometry().static_roles(), ["norm", "output"]);
+    assert!(last
+        .parameter_targets()
+        .iter()
+        .any(|target| target.starts_with("model.layers.1.")));
+    assert!(last
+        .parameter_targets()
+        .iter()
+        .any(|target| target == "lm_head.weight"));
+    assert!(!last
+        .parameter_targets()
+        .iter()
+        .any(|target| target == "model.visual.patch_embed.proj.weight"));
+
+    let original = eredu_runtime::PreparedModelInput::new(
+        vec![
+            eredu_runtime::PreparedInputPart::new(
+                eredu_core::InputModality::Text,
+                eredu_runtime::PreparedInputPayload::TokenIds(NumericTensor::token_ids(&[1, 2])),
+                [],
+            )
+            .unwrap(),
+            eredu_runtime::PreparedInputPart::new_with_extents(
+                eredu_core::InputModality::Image,
+                eredu_runtime::PreparedInputPayload::Tensor(NumericTensor::zeros([4, 24])),
+                [(
+                    eredu_core::InputMetadataKey::PatchGrid,
+                    NumericTensor::new([1, 3], vec![1.0, 2.0, 2.0]),
+                )],
+                [eredu_core::InputExtent::PatchGrid {
+                    time: 1,
+                    height: 2,
+                    width: 2,
+                }],
+            )
+            .unwrap(),
+        ],
+        |tensor| eredu_runtime::PreparedInputInspector::identity(&NumericInputInspector, tensor),
+    )
+    .unwrap();
+    let admitted = <qwen::hybrid::ConditionalLayeredModel<NumericBackend> as
+        eredu_architectures::composite_execution::CompositeArchitecture<
+            NumericBackend,
+            DeviceState<NumericBackend, NumericHybridLayerState>,
+        >>::admit_prepared_input(&parsed, &original, &NumericInputInspector)
+    .unwrap();
+    eredu_architectures::composite_execution::PreparedCompositeInput::new(&original, &admitted)
+        .unwrap();
+    let changed = eredu_runtime::PreparedModelInput::new(
+        vec![eredu_runtime::PreparedInputPart::new(
+            eredu_core::InputModality::Text,
+            eredu_runtime::PreparedInputPayload::TokenIds(NumericTensor::token_ids(&[1])),
+            [],
+        )
+        .unwrap()],
+        |tensor| eredu_runtime::PreparedInputInspector::identity(&NumericInputInspector, tensor),
+    )
+    .unwrap();
+    assert!(
+        eredu_architectures::composite_execution::PreparedCompositeInput::new(&changed, &admitted,)
+            .is_err()
+    );
+
+    let routed =
+        qwen::hybrid::model_args_from_config_value(&conditional_qwen_partition_config(true))
+            .unwrap();
+    assert!(qwen::hybrid::conditional_partition_local_geometry(
+        &routed,
+        &layout,
+        [(decoder::TARGET_EXECUTION_GROUP, 0..1)],
+        &PartitionOwnership::new(true, false, ["embedding"]).unwrap(),
+    )
+    .is_err());
+    let mut prediction = parsed.clone();
+    prediction.text.mtp_num_hidden_layers = 1;
+    assert!(qwen::hybrid::conditional_partition_local_geometry(
+        &prediction,
+        &layout,
+        [(decoder::TARGET_EXECUTION_GROUP, 0..1)],
+        &PartitionOwnership::new(true, false, ["embedding"]).unwrap(),
+    )
+    .is_err());
+}
+
+#[test]
+fn deepseek_prediction_free_boundaries_preserve_exact_roles_and_values() {
+    let v3 = deepseek::parse_v3_config(&serde_json::json!({
+        "model_type": "deepseek_v3", "hidden_size": 8,
+        "intermediate_size": 16, "moe_intermediate_size": 8,
+        "num_hidden_layers": 2, "num_attention_heads": 2,
+        "vocab_size": 16, "max_position_embeddings": 64,
+        "kv_lora_rank": 4, "qk_nope_head_dim": 2,
+        "qk_rope_head_dim": 2, "v_head_dim": 2,
+        "first_k_dense_replace": 1, "n_routed_experts": 4,
+        "n_shared_experts": 1, "num_experts_per_tok": 2,
+        "n_group": 2, "topk_group": 1, "num_nextn_predict_layers": 0
+    }))
+    .unwrap();
+    let tokens = NumericTensor::token_ids(&[1, 3]);
+    let embedded = NumericTensor::new([1, 2, 8], (0..16).map(|value| value as f32).collect());
+    let v3_schema = deepseek::v3::TargetBoundarySchema::from_args(&v3);
+    let v3_values = eredu_runtime::ArchitectureBoundary::encode(
+        &v3_schema,
+        deepseek::v3::TargetBoundary::new(tokens.clone(), embedded.clone()),
+    )
+    .unwrap();
+    assert_eq!(
+        v3_values
+            .iter()
+            .map(eredu_runtime::ArchitectureBoundaryValue::role)
+            .collect::<Vec<_>>(),
+        ["tokens", "embedded"]
+    );
+    let decoded = eredu_runtime::ArchitectureBoundary::decode(
+        &v3_schema,
+        v3_values
+            .into_iter()
+            .map(eredu_runtime::ArchitectureBoundaryValue::into_parts)
+            .map(|(_, tensor)| tensor)
+            .collect(),
+    )
+    .unwrap();
+    assert_tensor_exact(decoded.tokens(), &tokens, "DeepSeek-V3 boundary tokens");
+    assert_tensor_exact(
+        decoded.embedded(),
+        &embedded,
+        "DeepSeek-V3 boundary embeddings",
+    );
+
+    let v4 = deepseek::parse_v4_config(&serde_json::json!({
+        "model_type": "deepseek_v4", "hidden_size": 8,
+        "moe_intermediate_size": 8, "num_hidden_layers": 2,
+        "num_attention_heads": 2, "num_key_value_heads": 1, "head_dim": 4,
+        "qk_rope_head_dim": 2, "q_lora_rank": 4, "o_lora_rank": 2,
+        "o_groups": 2, "vocab_size": 16, "max_position_embeddings": 64,
+        "sliding_window": 8, "compress_ratios": [0, 4],
+        "index_n_heads": 2, "index_head_dim": 4, "index_topk": 1,
+        "hc_mult": 2, "hc_sinkhorn_iters": 2, "n_routed_experts": 4,
+        "n_shared_experts": 1, "num_experts_per_tok": 2,
+        "num_hash_layers": 0, "scoring_func": "sqrtsoftplus",
+        "topk_method": "noaux_tc", "norm_topk_prob": true,
+        "routed_scaling_factor": 1.0, "swiglu_limit": 4.0,
+        "num_nextn_predict_layers": 0
+    }))
+    .unwrap();
+    let v4_schema = deepseek::v4::TargetBoundarySchema::from_args(&v4).unwrap();
+    assert_eq!(v4_schema.activation_hidden_size(), 16);
+    let v4_values = eredu_runtime::ArchitectureBoundary::encode(
+        &v4_schema,
+        deepseek::v4::TargetBoundary::new(tokens.clone(), Vec::new()),
+    )
+    .unwrap();
+    assert_eq!(v4_values.len(), 1);
+    assert_eq!(v4_values[0].role(), "tokens");
+    assert_tensor_exact(
+        v4_values[0].tensor(),
+        &tokens,
+        "DeepSeek-V4 boundary tokens",
+    );
+    assert!(eredu_runtime::ArchitectureBoundary::decode(
+        &v4_schema,
+        vec![tokens.clone(), embedded],
+    )
+    .is_err());
 }

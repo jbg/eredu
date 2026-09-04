@@ -135,6 +135,23 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMoe<B> 
         shared_intermediate: i32,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
+        let spec = expert_bank_spec_at(
+            args,
+            &format!("{prefix}.experts"),
+            args.n_routed_experts,
+            routed_intermediate,
+        )?;
+        Self::new_at_with_spec(args, layer, prefix, spec, shared_intermediate, context)
+    }
+
+    pub(crate) fn new_at_with_spec(
+        args: &ModelArgs,
+        layer: usize,
+        prefix: &str,
+        spec: GroupedRelu2Spec,
+        shared_intermediate: i32,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
         let gate_weight = format!("{prefix}.gate.weight");
         let routing = TopKGroupSelectionSpec::new(
             args.n_routed_experts,
@@ -158,15 +175,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMoe<B> 
                 .map_err(Error::backend)?,
         )?;
         let gate = B::top_k_group_selector(selector, context)?;
-        let experts = B::grouped_relu2(
-            expert_bank_spec_at(
-                args,
-                &format!("{prefix}.experts"),
-                args.n_routed_experts,
-                routed_intermediate,
-            )?,
-            context,
-        )?;
+        let experts = B::grouped_relu2(spec, context)?;
         Ok(Self {
             layer,
             gate,

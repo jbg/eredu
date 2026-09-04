@@ -11,13 +11,11 @@ use eredu_checkpoint::{
 };
 use eredu_runtime::{
     DenseDiskStreamLoadOptions, DenseDiskStreamReport, DenseStreamTelemetry, DenseTransferSchedule,
-    ReplicatedTextMaterializationTask, StaticUnitBindings, WeightBinding, WeightLoweringKind,
-    DENSE_TRANSFER_WINDOW,
+    ReplicatedTextMaterializationTask, WeightBinding, WeightLoweringKind, DENSE_TRANSFER_WINDOW,
 };
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    ops::Range,
     path::Path,
     sync::Arc,
 };
@@ -396,12 +394,6 @@ pub(crate) struct PackedWeightCompanions {
     affine_companion_dtype: RecipeDtype,
 }
 
-impl PackedWeightCompanions {
-    pub(crate) fn companion_names(&self) -> impl Iterator<Item = &str> {
-        std::iter::once(self.scales_name.as_str()).chain(self.biases_name.as_deref())
-    }
-}
-
 pub(crate) fn packed_weight_companions<M>(
     module: &M,
     quantization: WeightQuantization,
@@ -659,6 +651,7 @@ fn collect_quantization_recipes(
 fn collect_exact_quantization_recipes<M>(
     store: &dyn eredu_checkpoint::store::CheckpointSource,
     source: &M,
+    source_layout: Option<&eredu_runtime::LocalModelLayout>,
     selected: &BTreeMap<String, PackedWeightCompanions>,
     requested: &BTreeMap<&str, &ReplicatedTextMaterializationTask>,
     recipes: &mut QuantizationRecipes,
@@ -701,10 +694,29 @@ where
                     "selected materialization task {name:?} is absent from its source module"
                 ))
             })?;
-        let recipe = task
+        let mut recipe = task
             .source_recipe()
             .map_err(|error| Error::Quantization(error.to_string()))?;
-        let metadata = recipe.infer(store)?;
+        let mut metadata = recipe.infer(store)?;
+        if let Some(layout) = source_layout {
+            let tensor = layout.tensor(task.name()).ok_or_else(|| {
+                Error::Quantization(format!(
+                    "selected materialization task {:?} has no source local placement",
+                    task.name()
+                ))
+            })?;
+            for placement in tensor
+                .additional_placements()
+                .iter()
+                .chain(std::iter::once(tensor.placement()))
+            {
+                let selection = stored_placement_selection(tensor, placement, metadata.shape())?;
+                if selection != TensorSelection::Full {
+                    recipe = recipe.select_bounded(store, selection)?;
+                    metadata = recipe.infer(store)?;
+                }
+            }
+        }
         if !matches!(
             metadata.dtype(),
             RecipeDtype::F16 | RecipeDtype::BF16 | RecipeDtype::F32
@@ -1111,6 +1123,7 @@ pub fn quantize_exact_replicated_text_tasks<SM, U>(
     target_static: &SM,
     source_units: &[U],
     target_units: &[U],
+    source_layout: Option<&eredu_runtime::LocalModelLayout>,
     quantization: WeightQuantization,
     tasks: &[&ReplicatedTextMaterializationTask],
     stream: &Stream,
@@ -1159,6 +1172,7 @@ where
     collect_exact_quantization_recipes(
         store.as_ref(),
         source_static,
+        source_layout,
         &exact_task_weight_companions(target_static, quantization, tasks)?,
         &requested,
         &mut recipes,
@@ -1168,6 +1182,7 @@ where
         collect_exact_quantization_recipes(
             store.as_ref(),
             source,
+            source_layout,
             &companions,
             &requested,
             &mut recipes,
@@ -1176,144 +1191,6 @@ where
 
     validate_exact_consumption(&requested_names, &recipes)?;
 
-    let targets = recipes
-        .into_iter()
-        .map(|(target, (recipe, companions))| {
-            let target = BoundedQuantizationTarget::from_recipe(
-                target,
-                companions.scales_name,
-                companions.biases_name,
-                recipe,
-            )?;
-            match quantization {
-                WeightQuantization::Affine(_) => {
-                    target.with_affine_companion_dtype(companions.affine_companion_dtype)
-                }
-                WeightQuantization::MxFp4 => Ok(target),
-                WeightQuantization::GgufIQuant { .. } => unreachable!(
-                    "load-time materialization rejects checkpoint-native GGUF encodings"
-                ),
-            }
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let working_set_bytes =
-        bounded_quantization_working_set(store.as_ref(), &targets, quantization)?;
-    let transformed = Arc::new(BoundedQuantizedWeightStore::create(
-        store,
-        BoundedQuantizationPlan::new(quantization, working_set_bytes, targets)?,
-        stream,
-    )?);
-    let report = transformed.report().clone();
-    let transformed: SharedCheckpointSource = transformed;
-    Ok((transformed, report))
-}
-
-/// Loads an adapter directly or through the shared bounded packed overlay.
-///
-/// This is the authoritative standalone materialization route for both
-/// SafeTensors and dense GGUF stores. Architecture code supplies semantic
-/// bindings through the adapter; residency sees only the resulting packed
-/// store and therefore budgets packed bytes rather than dense source bytes.
-pub struct PipelineStageQuantizationSelection<'a> {
-    static_roles: &'a [&'a str],
-    layer_groups: Vec<(usize, Range<usize>)>,
-}
-
-impl<'a> PipelineStageQuantizationSelection<'a> {
-    /// Returns the static parameter roles owned by this pipeline stage.
-    pub fn static_roles(&self) -> &'a [&'a str] {
-        self.static_roles
-    }
-
-    /// Creates a selection with one stage-local layer group.
-    pub fn new(static_roles: &'a [&'a str], layer_group: usize, layer_range: Range<usize>) -> Self {
-        Self {
-            static_roles,
-            layer_groups: vec![(layer_group, layer_range)],
-        }
-    }
-
-    /// Adds a non-empty stage-local layer group to the selection.
-    pub fn with_layer_group(mut self, layer_group: usize, layer_range: Range<usize>) -> Self {
-        if !layer_range.is_empty() {
-            self.layer_groups.push((layer_group, layer_range));
-        }
-        self
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn quantize_pipeline_stage_store_with<L, SU, Q, SL, TL, LB>(
-    store: SharedCheckpointSource,
-    selection: PipelineStageQuantizationSelection<'_>,
-    quantization: WeightQuantization,
-    stream: &Stream,
-    model_type: &str,
-    static_companions: BTreeMap<String, PackedWeightCompanions>,
-    source_static_units: SU,
-    quantizes_static_binding: Q,
-    mut source_layer: SL,
-    mut target_layer: TL,
-    mut layer_bindings: LB,
-) -> Result<(SharedCheckpointSource, WeightMaterializationReport), Error>
-where
-    L: Parameterized<crate::MlxTensor>,
-    SU: FnOnce(
-        &dyn eredu_checkpoint::store::CheckpointSource,
-    ) -> Result<Vec<StaticUnitBindings>, Error>,
-    Q: Fn(&WeightBinding) -> bool,
-    SL: FnMut(usize, usize, &Stream) -> Result<L, Error>,
-    TL: FnMut(usize, usize, &Stream) -> Result<L, Error>,
-    LB: FnMut(
-        usize,
-        usize,
-        &L,
-        &dyn eredu_checkpoint::store::CheckpointSource,
-    ) -> Result<Vec<WeightBinding>, Error>,
-{
-    let mut recipes = BTreeMap::new();
-    for unit in source_static_units(store.as_ref())? {
-        let selected_names = unit
-            .bindings()
-            .iter()
-            .filter(|binding| quantizes_static_binding(binding))
-            .map(|binding| binding.name().to_owned())
-            .collect::<BTreeSet<_>>();
-        let selected = static_companions
-            .iter()
-            .filter(|(name, _)| selected_names.contains(*name))
-            .map(|(name, companions)| (name.clone(), companions.clone()))
-            .collect::<BTreeMap<_, _>>();
-        collect_quantization_recipes(
-            store.as_ref(),
-            unit.bindings(),
-            &selected,
-            &mut recipes,
-            "pipeline load-time quantization",
-        )?;
-    }
-
-    for (group, range) in selection.layer_groups {
-        for index in range {
-            let source_layer = source_layer(group, index, stream)?;
-            let target_layer = target_layer(group, index, stream)?;
-            let selected = packed_weight_companions(&target_layer, quantization)?;
-            collect_quantization_recipes(
-                store.as_ref(),
-                &layer_bindings(group, index, &source_layer, store.as_ref())?,
-                &selected,
-                &mut recipes,
-                "pipeline load-time quantization",
-            )?;
-        }
-    }
-
-    if recipes.is_empty() {
-        return Err(Error::Quantization(format!(
-            "pipeline architecture adapter {} declared no floating matrix bindings for stage-local load-time quantization",
-            model_type
-        )));
-    }
     let targets = recipes
         .into_iter()
         .map(|(target, (recipe, companions))| {
@@ -1431,8 +1308,9 @@ fn bounded_quantization_working_set(
     Ok(output_bytes.max(minimum_tile_bytes))
 }
 
-fn stored_tensor_selection(
+fn stored_placement_selection(
     tensor: &eredu_runtime::LocalTensorLayout,
+    placement: &eredu_runtime::TensorPlacement,
     stored_shape: &[usize],
 ) -> Result<TensorSelection, Error> {
     use eredu_runtime::TensorPlacement;
@@ -1452,7 +1330,7 @@ fn stored_tensor_selection(
             })
     };
 
-    Ok(match tensor.placement() {
+    Ok(match placement {
         TensorPlacement::Replicated | TensorPlacement::Local => TensorSelection::Full,
         TensorPlacement::Shard { axis, index, parts } => {
             let stored = stored_shape[*axis];
@@ -1488,7 +1366,7 @@ fn stored_tensor_selection(
         TensorPlacement::Omit | TensorPlacement::Rank { .. } => {
             return Err(Error::Parallel(format!(
                 "execution-group binding has non-TP placement {:?}",
-                tensor.placement()
+                placement
             )))
         }
     })
@@ -1529,7 +1407,14 @@ pub fn shard_layer_bindings(
         // which is required when packed storage geometry differs from the
         // semantic weight geometry.
         if binding.recipe().is_none() && !store_keys.contains(binding.checkpoint_key()) {
-            let selection = stored_tensor_selection(tensor, tensor.global_shape())?;
+            if !tensor.additional_placements().is_empty() {
+                return Err(Error::Parallel(format!(
+                    "compound placement for {:?} requires an admitted checkpoint recipe",
+                    binding.name()
+                )));
+            }
+            let selection =
+                stored_placement_selection(tensor, tensor.placement(), tensor.global_shape())?;
             if selection == TensorSelection::Full {
                 output.push(binding);
                 continue;
@@ -1559,17 +1444,97 @@ pub fn shard_layer_bindings(
             output.push(sharded);
             continue;
         }
-        let recipe = binding.source_recipe();
-        let metadata = recipe.infer(store)?;
-        let selection = stored_tensor_selection(tensor, metadata.shape())?;
-        if selection == TensorSelection::Full {
+        let mut recipe = binding.source_recipe();
+        let mut selected = false;
+        for placement in tensor
+            .additional_placements()
+            .iter()
+            .chain(std::iter::once(tensor.placement()))
+        {
+            let metadata = recipe.infer(store)?;
+            let selection = stored_placement_selection(tensor, placement, metadata.shape())
+                .map_err(|error| {
+                    Error::Parallel(format!(
+                        "cannot place logical parameter {logical_target:?}: {error}"
+                    ))
+                })?;
+            if selection != TensorSelection::Full {
+                recipe = recipe.select_bounded(store, selection)?;
+                selected = true;
+            }
+        }
+        if !selected {
             output.push(binding);
             continue;
         }
-        let recipe = recipe.select_bounded(store, selection)?;
         let expected_bytes = recipe.infer(store)?.byte_len();
         let mut sharded = WeightBinding::from_recipe(binding.name(), recipe, expected_bytes)?;
         sharded = sharded.with_logical_target(logical_target)?;
+        if let Some((scales, biases)) = quantization_companions {
+            sharded = sharded.with_quantization_companions(scales, biases)?;
+        }
+        output.push(sharded);
+    }
+    Ok(output)
+}
+
+/// Applies only the primary physical placement to already member-selected bindings.
+///
+/// Independently addressable catalogs have already selected their expert member
+/// axis. Their remaining primary placement is the ordinary tensor-parallel
+/// projection selected by the architecture layout.
+pub fn shard_addressable_member_bindings(
+    bindings: Vec<WeightBinding>,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
+    layout: &eredu_runtime::LocalModelLayout,
+) -> Result<Vec<WeightBinding>, Error> {
+    let mut output = Vec::with_capacity(bindings.len());
+    for binding in bindings {
+        let logical_target = binding
+            .logical_target()
+            .ok_or_else(|| LayerwiseModelError::MissingParallelBindingTarget {
+                binding: binding.name().to_owned(),
+            })?
+            .to_owned();
+        let tensor = layout.tensor(&logical_target).ok_or_else(|| {
+            LayerwiseModelError::UnknownParallelBindingTarget {
+                binding: binding.name().to_owned(),
+                target: logical_target.clone(),
+            }
+        })?;
+        let mut recipe = binding.source_recipe();
+        let mut selected = false;
+        for placement in tensor
+            .additional_placements()
+            .iter()
+            .chain(std::iter::once(tensor.placement()))
+        {
+            let member_axis = match placement {
+                eredu_runtime::TensorPlacement::Shard { axis, .. }
+                | eredu_runtime::TensorPlacement::Range { axis, .. }
+                | eredu_runtime::TensorPlacement::Indices { axis, .. } => *axis == 0,
+                _ => false,
+            };
+            if member_axis {
+                continue;
+            }
+            let metadata = recipe.infer(store)?;
+            let selection = stored_placement_selection(tensor, placement, metadata.shape())?;
+            if selection != TensorSelection::Full {
+                recipe = recipe.select_bounded(store, selection)?;
+                selected = true;
+            }
+        }
+        if !selected {
+            output.push(binding);
+            continue;
+        }
+        let expected_bytes = recipe.infer(store)?.byte_len();
+        let quantization_companions = binding
+            .quantization_companions()
+            .map(|(scales, biases)| (scales.to_owned(), biases.to_owned()));
+        let mut sharded = WeightBinding::from_recipe(binding.name(), recipe, expected_bytes)?
+            .with_logical_target(logical_target)?;
         if let Some((scales, biases)) = quantization_companions {
             sharded = sharded.with_quantization_companions(scales, biases)?;
         }
@@ -1638,6 +1603,57 @@ mod shard_layer_bindings_tests {
             [2, 2]
         );
         assert_eq!(sharded[0].expected_bytes(), 16);
+    }
+
+    #[test]
+    fn compound_expert_and_tensor_placement_selects_both_source_axes() {
+        let store = MemoryWeightStore::from_safetensors([(
+            "experts.weight".to_owned(),
+            safetensors::Dtype::F32,
+            vec![4, 8, 2],
+            vec![0; 4 * 8 * 2 * size_of::<f32>()],
+        )])
+        .unwrap();
+        let mut layout = LocalModelLayout::default();
+        layout.insert(
+            "experts.weight".into(),
+            LocalTensorLayout::new(
+                "experts",
+                ParameterRole::ExpertIntermediate,
+                vec![4, 8, 2],
+                vec![2, 4, 2],
+                TensorPlacement::Shard {
+                    axis: 1,
+                    index: 0,
+                    parts: 2,
+                },
+                None,
+                None,
+                false,
+            )
+            .with_additional_placement(TensorPlacement::Range {
+                axis: 0,
+                start: 2,
+                end: 4,
+            }),
+        );
+        let binding = WeightBinding::new(
+            "weight",
+            "experts.weight",
+            TensorSelection::Full,
+            (4 * 8 * 2 * size_of::<f32>()) as u64,
+        )
+        .unwrap()
+        .with_logical_target("experts.weight")
+        .unwrap();
+
+        let sharded = shard_layer_bindings(vec![binding], &store, &layout).unwrap();
+
+        assert_eq!(
+            sharded[0].source_recipe().infer(&store).unwrap().shape(),
+            [2, 4, 2]
+        );
+        assert_eq!(sharded[0].expected_bytes(), 64);
     }
 
     #[test]

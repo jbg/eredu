@@ -13,7 +13,10 @@ pub type ModuleParamMut<'a> = NestedHashMap<Rc<str>, &'a mut Array>;
 /// Type alias for borrowed flattened module parameters.
 pub type FlattenedModuleParamRef<'a> = HashMap<Rc<str>, &'a Array>;
 
-/// Type alias for mutably borrowed flattened module parameters.
+#[cfg(all(
+    test,
+    any(feature = "cuda", all(feature = "metal", target_os = "macos"))
+))]
 pub type FlattenedModuleParamMut<'a> = HashMap<Rc<str>, &'a mut Array>;
 
 /// Trait for a neural network module.

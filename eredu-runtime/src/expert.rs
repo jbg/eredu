@@ -129,6 +129,149 @@ where
     ) -> Result<B::Tensor, Self::Error>;
 }
 
+/// Backend-neutral tensor movement needed by an expert-exchange protocol.
+///
+/// Architecture code supplies already validated row and flattened-route
+/// indices. Implementations retain tensor storage and completion ownership;
+/// they do not receive expert identities, topology, or model-family policy.
+pub trait ExpertRouteTensorMovement<T> {
+    /// Tensor movement failure.
+    type Error;
+
+    /// Returns the logical tensor shape without materializing its values.
+    fn shape(&self, value: &T) -> Vec<usize>;
+
+    /// Duplicates and reorders leading-axis rows in the supplied order.
+    fn gather_rows(&mut self, value: &T, rows: &[usize]) -> Result<T, Self::Error>;
+
+    /// Selects flattened route scalars and returns them as `[routes, 1]`.
+    fn gather_route_values(
+        &mut self,
+        value: &T,
+        flattened_routes: &[usize],
+    ) -> Result<T, Self::Error>;
+
+    /// Additively combines route rows into their architecture source rows.
+    ///
+    /// Every input row must be consumed exactly once. Repeated destination
+    /// rows are intentional and implement weighted routed-expert summation.
+    fn scatter_add_rows(
+        &mut self,
+        value: T,
+        destination_rows: &[usize],
+        output_rows: usize,
+    ) -> Result<T, Self::Error>;
+}
+
+/// Opaque variable-count transport used by architecture-owned expert routing.
+///
+/// Implementations must preserve peer-block and within-block order, validate
+/// every tensor against the selected communication requirement, and retain all
+/// native resources until the exact completion has finished.
+pub trait ExpertRouteExchange<T> {
+    /// Communication or metadata transport failure.
+    type Error;
+
+    /// Exchanges one tensor whose leading rows match the supplied peer counts.
+    fn exchange_tensor(
+        &mut self,
+        counts: &crate::CommunicationPeerCounts,
+        value: T,
+    ) -> Result<T, Self::Error>;
+
+    /// Exchanges one unsigned metadata value per leading tensor row.
+    fn exchange_indices(
+        &mut self,
+        counts: &crate::CommunicationPeerCounts,
+        values: Vec<usize>,
+    ) -> Result<Vec<usize>, Self::Error>;
+}
+
+/// Architecture-selected combination for one expert-exchange batch.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ExpertRouteCombination {
+    /// Apply each route coefficient once, then add routes targeting one token.
+    CoefficientWeightedSum,
+}
+
+/// One owner-local grouped batch submitted after expert exchange.
+pub struct AddressableExpertRouteRequest<'a, T> {
+    /// Global execution unit containing the addressable expert bank.
+    pub unit: usize,
+    /// Rows received from every source peer.
+    pub input: &'a T,
+    /// Checkpoint-global expert identity for every received row.
+    ///
+    /// Addressable storage keys must be derived from this identity. It is
+    /// deliberately kept separate from `owner_local_experts`, whose values
+    /// are valid only as indices into the rank-local grouped operator.
+    pub global_experts: &'a [usize],
+    /// Dense owner-local expert identity for every received row.
+    pub owner_local_experts: &'a [usize],
+    /// Selected router scores aligned one-for-one with received rows.
+    pub selected_scores: &'a T,
+    /// Final route coefficients aligned one-for-one with received rows.
+    pub coefficients: &'a T,
+    /// Prefill or decode execution classification.
+    pub pass: ExpertPass,
+    /// Storage access classification derived from `pass`.
+    pub access: ParameterBankAccess,
+    /// Architecture-declared route combination.
+    pub combination: ExpertRouteCombination,
+}
+
+impl<T> AddressableExpertRouteRequest<'_, T> {
+    /// Returns the only valid addressable-bank key for one routed row.
+    ///
+    /// The owner-local ID is intentionally not accepted here: it addresses the
+    /// compact grouped operator, not checkpoint-global storage.
+    pub fn addressable_bank_key(&self, row: usize) -> Option<ParameterBankKey> {
+        self.global_experts
+            .get(row)
+            .copied()
+            .map(|global| ParameterBankKey::new(self.unit, global))
+    }
+
+    /// Returns the rank-local grouped-operator ID for one routed row.
+    pub fn owner_local_execution_id(&self, row: usize) -> Option<usize> {
+        self.owner_local_experts.get(row).copied()
+    }
+}
+
+/// Local addressable grouped execution used by expert exchange.
+///
+/// The provider must consume every submitted row exactly once, select its
+/// corresponding owner-local expert, and apply its route coefficient exactly
+/// once. Acquired bank resources remain provider-owned until the returned
+/// tensor is natively complete.
+pub trait AddressableExpertRouteProvider<T> {
+    /// Acquisition or grouped execution failure.
+    type Error;
+
+    /// Executes one owner-local grouped batch.
+    fn execute_addressable_routes(
+        &mut self,
+        request: AddressableExpertRouteRequest<'_, T>,
+    ) -> Result<T, Self::Error>;
+
+    /// Executes one owner-local grouped batch while retaining tensor-parallel
+    /// reduction structure.
+    ///
+    /// Providers without rank-local TP work inherit complete-output behavior.
+    /// A TP provider overrides this method and returns its reducible activation
+    /// contribution plus the optional selection-weighted post-reduction bias.
+    /// The exchange protocol returns both values to their source-token order;
+    /// it must not add the bias before the caller's tensor all-sum.
+    fn execute_addressable_routes_tensor_parallel(
+        &mut self,
+        request: AddressableExpertRouteRequest<'_, T>,
+    ) -> Result<RoutedExpertTensorParallelOutput<T>, Self::Error> {
+        self.execute_addressable_routes(request)
+            .map(RoutedExpertTensorParallelOutput::Complete)
+    }
+}
+
 /// Exact generic request for an independently addressable bank acquisition.
 #[derive(Debug, Clone, Copy)]
 pub struct ParameterBankAcquisition<'a> {
@@ -234,6 +377,14 @@ pub struct RoutedExpertRequest<'a, T> {
     pub routes: &'a GroupSelection<T>,
     /// Whether this route batch belongs to prefill or decode.
     pub pass: ExpertPass,
+}
+
+impl<T> RoutedExpertRequest<'_, T> {
+    /// Projects architecture execution semantics into the storage workload
+    /// class exposed to backend parameter-bank mechanisms.
+    pub const fn parameter_bank_access(&self) -> ParameterBankAccess {
+        self.pass.parameter_bank_access()
+    }
 }
 
 /// Provider result that distinguishes complete outputs from rank-local TP work.
@@ -345,6 +496,20 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error>;
 
+    /// Executes destination-local rows that were already expanded to one
+    /// owner-local expert per row by the neutral expert exchange.
+    ///
+    /// The compact request deliberately has route cardinality one; providers
+    /// must not compare it with the architecture's original top-k cardinality.
+    fn forward_compact_grouped(
+        &mut self,
+        resident_bank: &mut B::GatedProductGroups,
+        request: RoutedExpertRequest<'_, B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error> {
+        self.forward_grouped(resident_bank, request, context)
+    }
+
     /// Executes one ReLU-squared route batch through the same residency boundary.
     fn forward_relu2_routed(
         &mut self,
@@ -367,6 +532,18 @@ where
         partitions: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<RoutedExpertTensorParallelOutput<B::Tensor>, Self::Error>;
+
+    /// Executes destination-local, one-expert-per-row contributions while
+    /// preserving the backend's TP reduction and post-bias structure.
+    fn forward_compact_grouped_tensor_parallel(
+        &mut self,
+        resident_bank: &mut B::GatedProductGroups,
+        request: RoutedExpertRequest<'_, B::Tensor>,
+        partitions: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<RoutedExpertTensorParallelOutput<B::Tensor>, Self::Error> {
+        self.forward_grouped_tensor_parallel(resident_bank, request, partitions, context)
+    }
 
     /// Executes a rank-local ReLU-squared contribution.
     fn forward_relu2_routed_tensor_parallel(

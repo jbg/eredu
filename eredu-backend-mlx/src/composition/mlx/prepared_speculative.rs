@@ -9,20 +9,156 @@ use eredu_core::{
     SpeculativeSemanticConstraint, SpeculativeSemanticState, SpeculativeTokenFilterController,
 };
 use eredu_runtime::{ConstrainedSampler, GenerationSampler, SpeculativeSampler};
-use safemlx::{error::Exception, Array};
+use safemlx::{error::Exception, transforms::async_eval_with_event, Array, Stream};
 
 use super::{
-    distributed::pipeline::PipelineEmbeddedMtpTarget,
     session::MlxSpeculativeSessionParts,
     speculative::{
-        embedded::DistributedEmbeddedMtpSampler,
         scheduler::{component_timing_enabled, MlxSpeculativeRuntime},
         MlxDrafter, MlxDrafterKind, MlxSpeculativeSampling, SpeculativeExecutionStreams,
     },
     Executable, MlxBackend, MlxModelInput,
 };
 use crate::backend::error::Error;
+use crate::backend::nn::tensor::TokenValidationScope;
 use crate::backend::runtime::generation::MlxSamplingBackend;
+use crate::backend::runtime::media::input::ModelInput;
+use crate::MlxTensor;
+
+struct NeutralEmbeddedPredictionTarget<'a> {
+    target: &'a mut dyn super::replicated_text::ErasedReplicatedTextExecutable,
+    depth: usize,
+}
+
+fn with_neutral_target_validation<T>(
+    operation: impl FnOnce() -> Result<T, Error>,
+) -> Result<T, Exception> {
+    let scope = TokenValidationScope::begin()?;
+    let output = operation().map_err(|error| Exception::custom(error.to_string()))?;
+    let validations = scope.finish();
+    if !validations.is_empty() {
+        async_eval_with_event(validations.arrays())?.synchronize()?;
+        validations.validate_completed()?;
+    }
+    Ok(output)
+}
+
+fn with_neutral_target_transaction<T>(
+    cache: &mut super::replicated_text::MlxPredictionTargetCache,
+    stream: &Stream,
+    operation: impl FnOnce(&mut super::replicated_text::MlxPredictionTargetCache) -> Result<T, Error>,
+) -> Result<T, Exception> {
+    let checkpoint = cache.clone();
+    match with_neutral_target_validation(|| operation(cache)) {
+        Ok(output) => Ok(output),
+        Err(error) => {
+            if let Err(restore) = cache.restore_checkpoint(&checkpoint, stream) {
+                return Err(Exception::custom(format!(
+                    "prediction target operation failed: {error}; rollback failed: {restore}"
+                )));
+            }
+            Err(error)
+        }
+    }
+}
+
+impl super::speculative::embedded::EmbeddedMtpTarget for NeutralEmbeddedPredictionTarget<'_> {
+    type Cache = super::replicated_text::MlxPredictionTargetCache;
+    type DraftCache = super::replicated_text::MlxPredictionDraftCache;
+
+    fn prefill_target(
+        &mut self,
+        input: ModelInput<'_>,
+        cache: &mut Self::Cache,
+        stream: &Stream,
+    ) -> Result<super::speculative::embedded::EmbeddedMtpOutput, Exception> {
+        with_neutral_target_transaction(cache, stream, |cache| {
+            self.target.prefill_prediction_target(input, cache)
+        })
+    }
+
+    fn verify_target(
+        &mut self,
+        tokens: &MlxTensor,
+        cache: &mut Self::Cache,
+        stream: &Stream,
+    ) -> Result<super::speculative::embedded::EmbeddedMtpOutput, Exception> {
+        with_neutral_target_transaction(cache, stream, |cache| {
+            self.target.verify_prediction_target(tokens, cache)
+        })
+    }
+
+    fn prefill_draft_cache(
+        &mut self,
+        output: &super::speculative::embedded::EmbeddedMtpOutput,
+        tokens: &MlxTensor,
+        cache: &mut Self::Cache,
+        _stream: &Stream,
+    ) -> Result<(), Exception> {
+        let checkpoint = cache.draft_cache();
+        match with_neutral_target_validation(|| {
+            self.target
+                .prefill_prediction_extension(output, tokens, cache)
+        }) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                cache.commit_draft_cache(&checkpoint);
+                Err(error)
+            }
+        }
+    }
+
+    fn draft_cache(&self, cache: &Self::Cache) -> Self::DraftCache {
+        cache.draft_cache()
+    }
+
+    fn commit_draft_cache(&self, cache: &mut Self::Cache, draft: &Self::DraftCache) {
+        cache.commit_draft_cache(draft);
+    }
+
+    fn restore_target_checkpoint(
+        cache: &mut Self::Cache,
+        checkpoint: &Self::Cache,
+        stream: &Stream,
+    ) -> Result<(), Exception> {
+        cache.restore_checkpoint(checkpoint, stream)
+    }
+
+    fn draft_logits(
+        &mut self,
+        hidden: &MlxTensor,
+        last_token: u32,
+        draft_index: usize,
+        cache: &mut Self::DraftCache,
+        stream: &Stream,
+    ) -> Result<(MlxTensor, MlxTensor), Exception> {
+        cache.with_extension(|cache| {
+            with_neutral_target_transaction(cache, stream, |cache| {
+                self.target
+                    .prediction_extension_logits(hidden, last_token, draft_index, cache)
+            })
+        })
+    }
+
+    fn advance_draft_cache(
+        &mut self,
+        hidden: &MlxTensor,
+        tokens: &MlxTensor,
+        cache: &mut Self::DraftCache,
+        stream: &Stream,
+    ) -> Result<(), Exception> {
+        cache.with_extension(|cache| {
+            with_neutral_target_transaction(cache, stream, |cache| {
+                self.target
+                    .advance_prediction_extension(hidden, tokens, cache)
+            })
+        })
+    }
+
+    fn max_draft_tokens(&self) -> usize {
+        self.depth
+    }
+}
 
 impl<'world> SpeculativeGenerationBackend for MlxBackend<'world> {
     type Drafter = MlxDrafter;
@@ -244,21 +380,24 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
         let lane_count = prepared_lanes.len();
         let model = match self.runtime.session_mut().speculative_parts_mut()? {
             MlxSpeculativeSessionParts::Complete { model, .. } => model,
-            MlxSpeculativeSessionParts::Pipeline { .. } => {
-                return Err(Error::Speculative(
-                    "external drafting is unavailable for pipeline sessions".into(),
-                ))
-            }
         };
         match (model, drafter.kind()) {
-            (Executable::Gemma4(_, target, _), MlxDrafterKind::Gemma4Assistant) => {
+            (Executable::ReplicatedText(_, target), MlxDrafterKind::Gemma4Assistant) => {
+                let capture = target
+                    .external_prediction_capture_request(drafter)?
+                    .ok_or_else(|| {
+                        Error::Speculative(
+                            "neutral target does not admit the Gemma external assistant".into(),
+                        )
+                    })?;
                 let mut caches = (0..lane_count)
-                    .map(|_| target.new_cache())
-                    .collect::<Vec<_>>();
+                    .map(|_| target.prepare_external_prediction_target_cache())
+                    .collect::<Result<Vec<_>, _>>()?;
                 let mut backend =
                     crate::composition::mlx::speculative::external::Gemma4ExternalExecutor::new(
-                        target,
+                        target.as_mut(),
                         drafter.gemma4_mut(),
+                        capture,
                     );
                 run_speculative_batch(
                     &mut backend,
@@ -270,13 +409,22 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
                 )
                 .map_err(|error| Error::Speculative(error.to_string()))
             }
-            (Executable::MuseGlimmer(_, target, _), MlxDrafterKind::MuseGlimmerDFlash) => {
+            (Executable::ReplicatedText(_, target), MlxDrafterKind::MuseGlimmerDFlash) => {
+                let capture = target
+                    .external_prediction_capture_request(drafter)?
+                    .ok_or_else(|| {
+                        Error::Speculative(
+                            "neutral target does not admit the Muse-Glimmer DFlash assistant"
+                                .into(),
+                        )
+                    })?;
                 let mut caches = (0..lane_count)
-                    .map(|_| target.new_cache())
-                    .collect::<Vec<_>>();
+                    .map(|_| target.prepare_external_prediction_target_cache())
+                    .collect::<Result<Vec<_>, _>>()?;
                 let mut backend = crate::composition::mlx::speculative::external::MuseGlimmerExternalExecutor::new(
-                    target,
+                    target.as_mut(),
                     drafter.muse_glimmer_mut(),
+                    capture,
                 );
                 run_speculative_batch(
                     &mut backend,
@@ -288,16 +436,14 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
                 )
                 .map_err(|error| Error::Speculative(error.to_string()))
             }
-            (model @ Executable::Gemma4(_, _, _), kind @ MlxDrafterKind::MuseGlimmerDFlash)
-            | (model @ Executable::MuseGlimmer(_, _, _), kind @ MlxDrafterKind::Gemma4Assistant)
-            | (
+            (
                 model @ (Executable::DeepSeek(_, _, _)
+                | Executable::Gemma4(_, _, _)
                 | Executable::GptOss(_, _, _)
                 | Executable::Inkling(_, _, _)
                 | Executable::KimiLinear(_, _, _)
                 | Executable::Lfm2(_, _, _)
-                | Executable::PartitionedLlama(_, _, _)
-                | Executable::ReplicatedText(_, _)
+                | Executable::MuseGlimmer(_, _, _)
                 | Executable::NemotronH(_, _, _)
                 | Executable::Qwen(_, _, _)
                 | Executable::Qwen3Next(_, _, _)
@@ -324,269 +470,36 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
         let prepared_lanes = self.prepare_speculative_batch_lanes(lanes)?;
         let lane_count = prepared_lanes.len();
         let streams = SpeculativeExecutionStreams::single(&stream);
-        match self.runtime.session_mut().speculative_parts_mut()? {
-            MlxSpeculativeSessionParts::Complete { model, execution } => {
-                if let Some(execution) = execution {
-                    let topology = model
-                        .parallel_info()
-                        .map(|info| info.topology())
-                        .ok_or_else(|| {
-                            Error::Speculative(
-                                "distributed embedded MTP requires selected topology".into(),
-                            )
-                        })?;
-                    if topology.pipeline_parallel_size() != 1
-                        || topology.expert_parallel_size() != 1
-                    {
-                        return Err(Error::Speculative(
-                            "complete-model embedded MTP requires pure tensor parallelism".into(),
-                        ));
-                    }
-                    super::distributed::topology::validate_session(topology, execution)?;
-                    let tensor = execution
-                        .partitioned_context(crate::backend::distributed::SHARD_GROUP_ID)?;
-                    let tensor_group = tensor.group().ok_or_else(|| {
-                        Error::Speculative(
-                            "distributed embedded MTP requires an active tensor subgroup".into(),
-                        )
-                    })?;
-                    let sampling_rank = topology
-                        .global_rank_for(eredu_core::ParallelCoordinates::new(
-                            0,
-                            0,
-                            0,
-                            topology.data_parallel_rank(),
-                        ))
-                        .map_err(|error| Error::Parallel(error.to_string()))?;
-                    let world = execution.world();
-                    let synchronized = |sampler| {
-                        DistributedEmbeddedMtpSampler::new(sampler, sampling_rank, world)
-                            .map_err(|error| Exception::custom(error.to_string()))
-                    };
-                    return match model {
-                        Executable::NemotronH(_, target, _) => {
-                            let mut caches = (0..lane_count)
-                                .map(|_| target.new_cache())
-                                .collect::<Vec<_>>();
-                            let mut target =
-                                crate::composition::nemotron_h::NemotronHTensorMtpTarget::new(
-                                    target,
-                                    tensor_group,
-                                );
-                            let mut backend = crate::composition::mlx::speculative::embedded::EmbeddedMtpExecutor::new(&mut target);
-                            run_speculative_batch(
-                                &mut backend,
-                                prepared_lanes,
-                                &mut caches,
-                                synchronized,
-                                streams,
-                                visitor,
-                            )
-                            .map_err(|error| Error::Speculative(error.to_string()))
-                        }
-                        Executable::Inkling(_, target, _) => {
-                            let mut caches = (0..lane_count)
-                                .map(|_| target.new_cache())
-                                .collect::<Vec<_>>();
-                            let mut target =
-                                crate::composition::inkling::InklingTensorMtpTarget::new(
-                                    target,
-                                    tensor_group,
-                                );
-                            let mut backend = crate::composition::mlx::speculative::embedded::EmbeddedMtpExecutor::new(&mut target);
-                            run_speculative_batch(
-                                &mut backend,
-                                prepared_lanes,
-                                &mut caches,
-                                synchronized,
-                                streams,
-                                visitor,
-                            )
-                            .map_err(|error| Error::Speculative(error.to_string()))
-                        }
-                        Executable::Qwen3Next(_, target, _) => {
-                            let mut caches = (0..lane_count)
-                                .map(|_| target.new_cache())
-                                .collect::<Vec<_>>();
-                            let mut backend = crate::composition::mlx::speculative::embedded::EmbeddedMtpExecutor::new(target);
-                            run_speculative_batch(
-                                &mut backend,
-                                prepared_lanes,
-                                &mut caches,
-                                synchronized,
-                                streams,
-                                visitor,
-                            )
-                            .map_err(|error| Error::Speculative(error.to_string()))
-                        }
-                        Executable::Qwen35(_, target, _) => {
-                            let mut caches = (0..lane_count)
-                                .map(|_| target.new_cache())
-                                .collect::<Vec<_>>();
-                            let mut backend = crate::composition::mlx::speculative::embedded::EmbeddedMtpExecutor::new(target);
-                            run_speculative_batch(
-                                &mut backend,
-                                prepared_lanes,
-                                &mut caches,
-                                synchronized,
-                                streams,
-                                visitor,
-                            )
-                            .map_err(|error| Error::Speculative(error.to_string()))
-                        }
-                        model @ (Executable::DeepSeek(_, _, _)
-                        | Executable::Gemma4(_, _, _)
-                        | Executable::GptOss(_, _, _)
-                        | Executable::KimiLinear(_, _, _)
-                        | Executable::Lfm2(_, _, _)
-                        | Executable::PartitionedLlama(_, _, _)
-                        | Executable::ReplicatedText(_, _)
-                        | Executable::MuseGlimmer(_, _, _)
-                        | Executable::Qwen(_, _, _)) => Err(Error::Speculative(format!(
-                            "distributed prepared-chat embedded MTP is unavailable for model type {} ({:?})",
-                            model.effective_model_type(),
-                            model.speculative_capability()
-                        ))),
-                    };
-                }
-                match model {
-            Executable::DeepSeek(_, target, _) => {
-                let mut caches = (0..lane_count)
-                    .map(|_| target.new_state())
-                    .collect::<Result<Vec<_>, _>>()?;
-                let mut backend =
-                    crate::composition::mlx::speculative::embedded::EmbeddedMtpExecutor::new(
-                        target.as_mut(),
-                    );
-                run_speculative_batch(
-                    &mut backend,
-                    prepared_lanes,
-                    &mut caches,
-                    Ok,
-                    streams,
-                    visitor,
-                )
-                .map_err(|error| Error::Speculative(error.to_string()))
-            }
-            Executable::NemotronH(_, target, _) => {
-                let mut caches = (0..lane_count)
-                    .map(|_| target.new_cache())
-                    .collect::<Vec<_>>();
-                let mut backend =
-                    crate::composition::mlx::speculative::embedded::EmbeddedMtpExecutor::new(
-                        target,
-                    );
-                run_speculative_batch(
-                    &mut backend,
-                    prepared_lanes,
-                    &mut caches,
-                    Ok,
-                    streams,
-                    visitor,
-                )
-                .map_err(|error| Error::Speculative(error.to_string()))
-            }
-            Executable::Inkling(_, target, _) => {
-                let mut caches = (0..lane_count)
-                    .map(|_| target.new_cache())
-                    .collect::<Vec<_>>();
-                let mut backend =
-                    crate::composition::mlx::speculative::embedded::EmbeddedMtpExecutor::new(
-                        target,
-                    );
-                run_speculative_batch(
-                    &mut backend,
-                    prepared_lanes,
-                    &mut caches,
-                    Ok,
-                    streams,
-                    visitor,
-                )
-                .map_err(|error| Error::Speculative(error.to_string()))
-            }
-            Executable::Qwen3Next(_, target, _) => {
-                let mut caches = (0..lane_count)
-                    .map(|_| target.new_cache())
-                    .collect::<Vec<_>>();
-                let mut backend =
-                    crate::composition::mlx::speculative::embedded::EmbeddedMtpExecutor::new(
-                        target,
-                    );
-                run_speculative_batch(
-                    &mut backend,
-                    prepared_lanes,
-                    &mut caches,
-                    Ok,
-                    streams,
-                    visitor,
-                )
-                .map_err(|error| Error::Speculative(error.to_string()))
-            }
-            Executable::Qwen35(_, target, _) => {
-                let mut caches = (0..lane_count)
-                    .map(|_| target.new_cache())
-                    .collect::<Vec<_>>();
-                let mut backend =
-                    crate::composition::mlx::speculative::embedded::EmbeddedMtpExecutor::new(
-                        target,
-                    );
-                run_speculative_batch(
-                    &mut backend,
-                    prepared_lanes,
-                    &mut caches,
-                    Ok,
-                    streams,
-                    visitor,
-                )
-                .map_err(|error| Error::Speculative(error.to_string()))
-            }
-            model @ (Executable::Gemma4(_, _, _)
-            | Executable::GptOss(_, _, _)
-            | Executable::KimiLinear(_, _, _)
-            | Executable::Lfm2(_, _, _)
-            | Executable::PartitionedLlama(_, _, _)
-            | Executable::ReplicatedText(_, _)
-            | Executable::MuseGlimmer(_, _, _)
-            | Executable::Qwen(_, _, _)) => Err(Error::Speculative(format!(
-                "scheduled prepared-chat embedded MTP batch is unavailable for model type {} ({:?})",
-                model.effective_model_type(),
-                model.speculative_capability()
-            ))),
-                }
-            }
-            MlxSpeculativeSessionParts::Pipeline { model, execution } => {
-                let mut caches = (0..lane_count)
-                    .map(|_| model.new_cache())
-                    .collect::<Result<Vec<_>, _>>()?;
-                let topology = model.stage_info().topology();
-                super::distributed::topology::validate_session(topology, execution)?;
-                let sampling_rank = topology
-                    .global_rank_for(eredu_core::ParallelCoordinates::new(
-                        0,
-                        topology.pipeline_parallel_size() - 1,
-                        0,
-                        topology.data_parallel_rank(),
-                    ))
-                    .map_err(|error| Error::Parallel(error.to_string()))?;
-                let world = execution.world();
-                let mut target = PipelineEmbeddedMtpTarget::new(model, execution);
-                let mut backend =
-                    crate::composition::mlx::speculative::embedded::EmbeddedMtpExecutor::new(
-                        &mut target,
-                    );
-                run_speculative_batch(
-                    &mut backend,
-                    prepared_lanes,
-                    &mut caches,
-                    |sampler| {
-                        DistributedEmbeddedMtpSampler::new(sampler, sampling_rank, world)
-                            .map_err(|error| Exception::custom(error.to_string()))
-                    },
-                    streams,
-                    visitor,
-                )
-                .map_err(|error| Error::Speculative(error.to_string()))
-            }
-        }
+        let MlxSpeculativeSessionParts::Complete { model, .. } =
+            self.runtime.session_mut().speculative_parts_mut()?;
+        let Executable::ReplicatedText(_, target) = model else {
+            return Err(Error::Speculative(format!(
+                "embedded prediction requires the selected neutral target, got {}",
+                model.effective_model_type()
+            )));
+        };
+        let depth = target.prediction_extension_depth().ok_or_else(|| {
+            Error::Speculative(
+                "neutral target has no installed prediction-extension contract".into(),
+            )
+        })?;
+        let mut caches = (0..lane_count)
+            .map(|_| target.prepare_prediction_target_cache())
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut target = NeutralEmbeddedPredictionTarget {
+            target: target.as_mut(),
+            depth,
+        };
+        let mut backend =
+            crate::composition::mlx::speculative::embedded::EmbeddedMtpExecutor::new(&mut target);
+        run_speculative_batch(
+            &mut backend,
+            prepared_lanes,
+            &mut caches,
+            Ok,
+            streams,
+            visitor,
+        )
+        .map_err(|error| Error::Speculative(error.to_string()))
     }
 }

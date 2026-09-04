@@ -68,9 +68,12 @@ pub use automatic::{
 };
 pub use backend::{
     load_model, prepare_inspected_model, BackendDescriptor, BackendError, BackendProvider,
-    BackendSession, CollectiveGroupDescriptor, CollectiveGroupId, CollectiveScope, Completion,
+    BackendSession, BoundedCompletion, BoundedCompletionOutcome, BoundedCompletionWait,
+    BoundedCompletionWaitError, BoundedSubmissionOutcome, CollectiveGroupDescriptor,
+    CollectiveGroupId, CollectiveScope, Completion, CompletionCancellationMode,
     ControlledTextGeneration, ControlledTextGenerationError, ControlledToken, DeviceCapabilities,
-    DeviceDescriptor, DistributedBackend, DistributedCapabilities, DistributedSession,
+    DeviceDescriptor, DistributedBackend, DistributedCapabilities, DistributedCommitEpoch,
+    DistributedCommitOutcome, DistributedCommitPhase, DistributedSession,
     DistributedSessionDescriptor, InspectableBackendSession, ModelCapabilityBackend,
     ModelLoadError, ModelLoadingBackend, ModelRuntime, MultimodalPreparationBackend,
     MultimodalPreparationFailure, PreparedModel, SessionCapabilities, SessionCapabilityError,

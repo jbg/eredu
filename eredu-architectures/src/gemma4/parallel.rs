@@ -4,10 +4,11 @@ use eredu_nn::{
     AttentionStateSource, AttentionValueSource, NeuralBackend, VocabularyParallelRange,
 };
 use eredu_runtime::{
-    expand_linear_format_parameter_groups, module_parameter_group, LocalModelLayout,
-    MemberSharding, ParallelPlanError, ParameterGroupSpec, ParameterMemberSpec, ParameterRole,
-    StateLayout, TensorPlacement,
+    expand_linear_format_parameter_groups, module_parameter_group, ArchitecturePartition,
+    LocalModelLayout, MemberSharding, ParallelPlanError, ParameterGroupSpec, ParameterMemberSpec,
+    ParameterRole, PartitionOwnership, StateLayout, TensorPlacement,
 };
+use std::ops::Range;
 
 use crate::linear_format::standard_parallel_linear_format;
 
@@ -80,6 +81,262 @@ pub struct LocalGeometry {
     vision_layers: usize,
     audio_layers: usize,
     architecture_fingerprint: String,
+}
+
+/// Exact TP-local and PP-local geometry for one Gemma 4 composite partition.
+///
+/// Optional media roots retain their own group-local ranges. Decoder state is
+/// kept complete until the architecture partition selects the text slice, so
+/// its architecture-global offset cannot be confused with a local ordinal.
+#[derive(Debug, Clone)]
+pub struct PartitionLocalGeometry {
+    vision_units: Option<Range<usize>>,
+    audio_units: Option<Range<usize>>,
+    text_units: Range<usize>,
+    text_blocks: Vec<ModelArgs>,
+    embedding_range: VocabularyParallelRange,
+    output_range: Option<VocabularyParallelRange>,
+    per_layer_range: Range<i32>,
+    complete_state_layout: StateLayout,
+    static_roles: Vec<String>,
+    architecture_fingerprint: String,
+}
+
+/// Validated architecture-owned handoff for one Gemma 4 composite partition.
+#[derive(Debug, Clone)]
+pub struct PartitionLocalFoundation {
+    geometry: PartitionLocalGeometry,
+    parameter_targets: Vec<String>,
+}
+
+impl PartitionLocalFoundation {
+    /// Validates group ownership, state offset, boundary schema, and selected tasks together.
+    pub fn from_partition(
+        args: &FamilyConfig,
+        partition: &ArchitecturePartition<PartitionLocalGeometry, super::TextBoundarySchema>,
+    ) -> Result<Self, ParallelPlanError> {
+        let geometry = partition.local_geometry();
+        geometry.validate_for(args)?;
+        let expected_groups = [
+            geometry
+                .vision_units()
+                .map(|range| (super::VISION_EXECUTION_GROUP, range)),
+            geometry
+                .audio_units()
+                .map(|range| (super::AUDIO_EXECUTION_GROUP, range)),
+            Some((super::TEXT_EXECUTION_GROUP, geometry.text_units())),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        let actual_groups = partition
+            .groups()
+            .iter()
+            .map(|group| (group.group().as_str(), group.global_units()))
+            .collect::<Vec<_>>();
+        if actual_groups != expected_groups {
+            return Err(invalid(
+                "Gemma 4 partition groups differ from family-local geometry",
+            ));
+        }
+        let state = partition
+            .state()
+            .ok_or_else(|| invalid("Gemma 4 text partition has no selected state"))?;
+        if state.global_layer_offset() != geometry.text_units.start
+            || state.layout() != &geometry.local_state_layout()?
+        {
+            return Err(invalid(
+                "Gemma 4 partition state differs from its text unit range",
+            ));
+        }
+        if partition.boundary_schema()
+            != &super::TextBoundarySchema::from_partition_args(&args.text, geometry)
+        {
+            return Err(invalid(
+                "Gemma 4 partition boundary differs from local media-channel geometry",
+            ));
+        }
+        let parameter_targets = partition
+            .parameter_bindings()
+            .iter()
+            .flat_map(|binding| binding.members())
+            .map(|member| member.target().to_owned())
+            .collect::<Vec<_>>();
+        Ok(Self {
+            geometry: geometry.clone(),
+            parameter_targets,
+        })
+    }
+
+    /// Exact family-local construction geometry.
+    pub const fn geometry(&self) -> &PartitionLocalGeometry {
+        &self.geometry
+    }
+
+    /// Canonical materialization targets selected for this rank.
+    pub fn parameter_targets(&self) -> &[String] {
+        &self.parameter_targets
+    }
+}
+
+impl PartitionLocalGeometry {
+    /// Architecture-global units owned from the optional vision root.
+    pub fn vision_units(&self) -> Option<Range<usize>> {
+        self.vision_units.clone()
+    }
+
+    /// Architecture-global units owned from the optional audio root.
+    pub fn audio_units(&self) -> Option<Range<usize>> {
+        self.audio_units.clone()
+    }
+
+    /// Architecture-global text units owned by this pipeline coordinate.
+    pub fn text_units(&self) -> Range<usize> {
+        self.text_units.clone()
+    }
+
+    /// TP-local configuration for one owned architecture-global text unit.
+    pub fn text_block(&self, global_unit: usize) -> Option<&ModelArgs> {
+        self.text_units
+            .contains(&global_unit)
+            .then(|| &self.text_blocks[global_unit - self.text_units.start])
+    }
+
+    /// Complete TP-local state geometry before PP slicing.
+    pub const fn complete_state_layout(&self) -> &StateLayout {
+        &self.complete_state_layout
+    }
+
+    /// Exact local state slice and its architecture-global offset.
+    pub fn local_state_layout(&self) -> Result<StateLayout, ParallelPlanError> {
+        self.complete_state_layout
+            .slice(self.text_units.clone())
+            .map_err(|error| invalid(error.to_string()))
+    }
+
+    /// Static roles selected for this pipeline coordinate.
+    pub fn static_roles(&self) -> &[String] {
+        &self.static_roles
+    }
+
+    /// Input-embedding vocabulary ownership for this tensor coordinate.
+    pub const fn embedding_range(&self) -> &VocabularyParallelRange {
+        &self.embedding_range
+    }
+
+    /// Untied output-head vocabulary ownership for this tensor coordinate.
+    pub const fn output_range(&self) -> Option<&VocabularyParallelRange> {
+        self.output_range.as_ref()
+    }
+
+    /// TP-local decoder-wide media-channel ownership.
+    pub fn per_layer_range(&self) -> Range<i32> {
+        self.per_layer_range.clone()
+    }
+
+    pub(super) fn validate_for(&self, args: &FamilyConfig) -> Result<(), ParallelPlanError> {
+        let text_count = args.text.num_hidden_layers();
+        let vision_count = args
+            .vision
+            .as_ref()
+            .map_or(0, |config| config.num_hidden_layers as usize);
+        let audio_count = args
+            .audio
+            .as_ref()
+            .map_or(0, |config| config.num_hidden_layers as usize);
+        if self.text_units.is_empty()
+            || self.text_units.end > text_count
+            || self.text_blocks.len() != self.text_units.len()
+            || self.architecture_fingerprint != args.architecture_fingerprint()
+        {
+            return Err(invalid(
+                "partition-local Gemma 4 geometry belongs to a different model or text range",
+            ));
+        }
+        validate_optional_range("vision", &self.vision_units, vision_count)?;
+        validate_optional_range("audio", &self.audio_units, audio_count)?;
+        for global in self.text_units.clone() {
+            if self.text_block(global).is_none() {
+                return Err(invalid("missing owned Gemma 4 text block"));
+            }
+        }
+        let expected_roles = expected_partition_static_roles(args, self);
+        if self.static_roles != expected_roles {
+            return Err(invalid(format!(
+                "partition-local Gemma 4 static roles {:?} differ from {:?}",
+                self.static_roles, expected_roles
+            )));
+        }
+        if self.complete_state_layout.len() != text_count {
+            return Err(invalid(
+                "partition-local Gemma 4 complete state length is invalid",
+            ));
+        }
+        self.local_state_layout()?;
+        Ok(())
+    }
+}
+
+fn validate_optional_range(
+    name: &str,
+    range: &Option<Range<usize>>,
+    count: usize,
+) -> Result<(), ParallelPlanError> {
+    if range
+        .as_ref()
+        .is_some_and(|range| range.is_empty() || range.end > count)
+    {
+        return Err(invalid(format!(
+            "Gemma 4 {name} partition range {range:?} exceeds {count} units"
+        )));
+    }
+    if count == 0 && range.is_some() {
+        return Err(invalid(format!(
+            "Gemma 4 partition owns an unconfigured {name} root"
+        )));
+    }
+    Ok(())
+}
+
+fn expected_partition_static_roles(
+    args: &FamilyConfig,
+    geometry: &PartitionLocalGeometry,
+) -> Vec<String> {
+    let mut roles = Vec::new();
+    if geometry
+        .vision_units
+        .as_ref()
+        .is_some_and(|range| range.start == 0)
+    {
+        roles.extend(["vision".into(), "vision_projection".into()]);
+    }
+    if geometry
+        .audio_units
+        .as_ref()
+        .is_some_and(|range| range.start == 0)
+    {
+        roles.extend(["audio".into(), "audio_projection".into()]);
+    }
+    if geometry.text_units.start == 0 {
+        roles.extend([
+            "embedding".into(),
+            "per_layer_embedding".into(),
+            "per_layer_projection".into(),
+            "per_layer_norm".into(),
+        ]);
+    }
+    if geometry.text_units.end == args.text.num_hidden_layers() {
+        roles.push("norm".into());
+        let output = if args.text.tie_word_embeddings {
+            "embedding"
+        } else {
+            "output"
+        };
+        if !roles.iter().any(|role| role == output) {
+            roles.push(output.into());
+        }
+    }
+    roles
 }
 
 impl LocalGeometry {
@@ -338,6 +595,104 @@ pub fn local_geometry(
             .as_ref()
             .map_or(0, |config| config.num_hidden_layers as usize),
         architecture_fingerprint: args.architecture_fingerprint(),
+    };
+    geometry.validate_for(args)?;
+    Ok(geometry)
+}
+
+/// Derives exact TP-local and PP-local Gemma 4 composite geometry.
+///
+/// Group ranges use the family execution-group identities. Missing optional
+/// roots are represented by omission; the text decoder must be present on
+/// every admitted pipeline coordinate.
+pub fn partition_local_geometry(
+    args: &FamilyConfig,
+    layout: &LocalModelLayout,
+    group_ranges: impl IntoIterator<Item = (impl AsRef<str>, Range<usize>)>,
+    ownership: &PartitionOwnership,
+) -> Result<PartitionLocalGeometry, ParallelPlanError> {
+    if args
+        .text
+        .layer_schedule
+        .iter()
+        .any(|policy| policy.feed_forward == FeedForwardPolicy::DenseWithSparseMoe)
+    {
+        return Err(invalid(
+            "partition-local Gemma 4 foundation does not admit routed text blocks",
+        ));
+    }
+    partition_local_geometry_impl(args, layout, group_ranges, ownership)
+}
+
+pub(crate) fn routed_partition_local_geometry(
+    args: &FamilyConfig,
+    layout: &LocalModelLayout,
+    group_ranges: impl IntoIterator<Item = (impl AsRef<str>, Range<usize>)>,
+    ownership: &PartitionOwnership,
+) -> Result<PartitionLocalGeometry, ParallelPlanError> {
+    if !args
+        .text
+        .layer_schedule
+        .iter()
+        .any(|policy| policy.feed_forward == FeedForwardPolicy::DenseWithSparseMoe)
+    {
+        return Err(invalid(
+            "routed Gemma 4 partition has no sparse text blocks",
+        ));
+    }
+    partition_local_geometry_impl(args, layout, group_ranges, ownership)
+}
+
+fn partition_local_geometry_impl(
+    args: &FamilyConfig,
+    layout: &LocalModelLayout,
+    group_ranges: impl IntoIterator<Item = (impl AsRef<str>, Range<usize>)>,
+    ownership: &PartitionOwnership,
+) -> Result<PartitionLocalGeometry, ParallelPlanError> {
+    let mut vision_units = None;
+    let mut audio_units = None;
+    let mut text_units = None;
+    for (group, range) in group_ranges {
+        if range.is_empty() {
+            return Err(invalid("Gemma 4 partition group range cannot be empty"));
+        }
+        let slot = match group.as_ref() {
+            super::VISION_EXECUTION_GROUP => &mut vision_units,
+            super::AUDIO_EXECUTION_GROUP => &mut audio_units,
+            super::TEXT_EXECUTION_GROUP => &mut text_units,
+            other => {
+                return Err(invalid(format!(
+                    "unknown Gemma 4 partition group {other:?}"
+                )))
+            }
+        };
+        if slot.replace(range).is_some() {
+            return Err(invalid("duplicate Gemma 4 partition group"));
+        }
+    }
+    let text_units = text_units
+        .ok_or_else(|| invalid("Gemma 4 partition must own a non-empty text decoder range"))?;
+    let complete = local_geometry(args, layout)?;
+    let text_blocks = text_units
+        .clone()
+        .map(|global| {
+            complete
+                .text_block(global)
+                .cloned()
+                .ok_or_else(|| invalid(format!("Gemma 4 has no local text block {global}")))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let geometry = PartitionLocalGeometry {
+        vision_units,
+        audio_units,
+        text_units,
+        text_blocks,
+        embedding_range: complete.embedding_range.clone(),
+        output_range: complete.output_range.clone(),
+        per_layer_range: complete.per_layer_range.clone(),
+        complete_state_layout: complete.state_layout.clone(),
+        static_roles: ownership.static_roles().to_vec(),
+        architecture_fingerprint: complete.architecture_fingerprint.clone(),
     };
     geometry.validate_for(args)?;
     Ok(geometry)
@@ -1005,6 +1360,103 @@ mod tests {
         assert_eq!(policy.num_key_value_heads.get(), 1);
         assert_eq!(policy.intermediate_size.get(), 16);
         assert_eq!(local.moe_intermediate_size, Some(4));
+    }
+
+    #[test]
+    fn partition_geometry_owns_optional_roots_text_state_and_static_roles_exactly() {
+        let family = family();
+        let layout = family_layout();
+        let first = PartitionOwnership::new(
+            true,
+            false,
+            [
+                "vision",
+                "vision_projection",
+                "audio",
+                "audio_projection",
+                "embedding",
+                "per_layer_embedding",
+                "per_layer_projection",
+                "per_layer_norm",
+            ],
+        )
+        .unwrap();
+        let first = partition_local_geometry(
+            &family,
+            &layout,
+            [
+                (super::super::VISION_EXECUTION_GROUP, 0..1),
+                (super::super::AUDIO_EXECUTION_GROUP, 0..1),
+                (super::super::TEXT_EXECUTION_GROUP, 0..1),
+            ],
+            &first,
+        )
+        .unwrap();
+        assert_eq!(first.vision_units(), Some(0..1));
+        assert_eq!(first.audio_units(), Some(0..1));
+        assert_eq!(first.text_units(), 0..1);
+        assert_eq!(first.local_state_layout().unwrap().len(), 1);
+        assert!(first.text_block(0).is_some());
+        assert!(first.text_block(1).is_none());
+
+        let last = PartitionOwnership::new(false, true, ["norm", "output"]).unwrap();
+        let last = partition_local_geometry(
+            &family,
+            &layout,
+            [(super::super::TEXT_EXECUTION_GROUP, 1..2)],
+            &last,
+        )
+        .unwrap();
+        assert_eq!(last.text_units(), 1..2);
+        assert_eq!(last.static_roles(), ["norm", "output"]);
+        assert_eq!(last.local_state_layout().unwrap().len(), 1);
+        assert_eq!(last.complete_state_layout().len(), 2);
+    }
+
+    #[test]
+    fn partition_geometry_rejects_bad_ranges_roles_and_task_drift_before_construction() {
+        let family = family();
+        let layout = family_layout();
+        let last = PartitionOwnership::new(false, true, ["norm", "output"]).unwrap();
+        assert!(partition_local_geometry(
+            &family,
+            &layout,
+            [(super::super::TEXT_EXECUTION_GROUP, 2..3)],
+            &last,
+        )
+        .is_err());
+        assert!(partition_local_geometry(
+            &family,
+            &layout,
+            [(super::super::VISION_EXECUTION_GROUP, 0..1)],
+            &last,
+        )
+        .is_err());
+        let wrong = PartitionOwnership::new(false, true, ["embedding"]).unwrap();
+        assert!(partition_local_geometry(
+            &family,
+            &layout,
+            [(super::super::TEXT_EXECUTION_GROUP, 1..2)],
+            &wrong,
+        )
+        .is_err());
+        let routed_family = FamilyConfig {
+            model_type: args().model_type.clone(),
+            text: args(),
+            vision: None,
+            image_token_id: None,
+            video_token_id: None,
+            audio: None,
+            audio_token_id: None,
+        };
+        let routed_error = partition_local_geometry(
+            &routed_family,
+            &LocalModelLayout::default(),
+            [(super::super::TEXT_EXECUTION_GROUP, 0..1)],
+            &PartitionOwnership::new(true, false, ["embedding"]).unwrap(),
+        )
+        .unwrap_err();
+        assert!(routed_error.to_string().contains("does not admit routed"));
     }
 
     #[test]

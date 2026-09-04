@@ -106,6 +106,89 @@ pub fn local_geometry(
     crate::decoder::local_geometry(args, layout, local_block_args)
 }
 
+/// Derives exact PP×TP×EP-local geometry from the selected routed realization.
+pub fn partition_local_routed_geometry(
+    args: &ModelArgs,
+    layout: &eredu_runtime::LocalModelLayout,
+    owned_units: std::ops::Range<usize>,
+    topology: eredu_core::ParallelRankTopology,
+    realization: &crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>,
+) -> Result<crate::decoder::PartitionLocalGeometry<ModelArgs>, ParallelPlanError> {
+    if !args.is_moe() {
+        return Err(ParallelPlanError::InvalidGroup(
+            "partition-local routed Qwen geometry requires Qwen3-MoE".into(),
+        ));
+    }
+    validate_routed_realization(args, topology, realization)?;
+    crate::decoder::partition_local_geometry_with(
+        args,
+        layout,
+        owned_units,
+        |args, layer, layout| {
+            let mut local = local_block_args(args, layer, layout)
+                .map_err(|error| eredu_nn::Error::backend(error.to_string()))?;
+            let spec = realization
+                .unit_spec(crate::decoder::TEXT_DECODER_EXECUTION_GROUP, layer)
+                .ok_or_else(|| {
+                    eredu_nn::Error::backend(format!(
+                        "selected routed Qwen realization omits unit {layer}"
+                    ))
+                })?;
+            let local_experts = i32::try_from(realization.local_global_group_indices().len())
+                .map_err(eredu_nn::Error::backend)?;
+            if spec.group_count() != local_experts
+                || spec.intermediate_dimensions() != local.moe_intermediate_size
+            {
+                return Err(eredu_nn::Error::backend(format!(
+                    "selected routed Qwen unit {layer} bank geometry drifted"
+                )));
+            }
+            local.num_experts = local_experts;
+            Ok(local)
+        },
+    )
+}
+
+fn validate_routed_realization(
+    args: &ModelArgs,
+    topology: eredu_core::ParallelRankTopology,
+    realization: &crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>,
+) -> Result<(), ParallelPlanError> {
+    let global_experts = usize::try_from(args.num_experts)
+        .map_err(|_| ParallelPlanError::InvalidGroup("Qwen expert count exceeds usize".into()))?;
+    let expected_local = eredu_core::balanced_contiguous_range(
+        global_experts,
+        topology.expert_parallel_size(),
+        topology.expert_parallel_rank(),
+        false,
+    )
+    .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?
+    .collect::<Vec<_>>();
+    if realization.global_expert_count() != global_experts
+        || realization.expert_parallel_size() != topology.expert_parallel_size()
+        || realization.expert_parallel_rank() != topology.expert_parallel_rank()
+        || realization.local_global_group_indices() != expected_local
+    {
+        return Err(ParallelPlanError::InvalidGroup(
+            "selected routed Qwen expert ownership differs from the Cartesian rank".into(),
+        ));
+    }
+    let layers = usize::try_from(args.num_hidden_layers)
+        .map_err(|_| ParallelPlanError::InvalidGroup("Qwen layer count exceeds usize".into()))?;
+    if realization.unit_specs().len() != layers
+        || (0..layers).any(|layer| {
+            realization
+                .unit_spec(crate::decoder::TEXT_DECODER_EXECUTION_GROUP, layer)
+                .is_none()
+        })
+    {
+        return Err(ParallelPlanError::InvalidGroup(
+            "selected routed Qwen realization unit schedule drifted".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Declares every rank-local placement group for one dense Qwen block.
 pub fn layer_parallel_parameter_groups<B: NeuralBackend>(
     block: &TransformerBlock<B>,

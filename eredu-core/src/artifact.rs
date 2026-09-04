@@ -374,6 +374,22 @@ impl<P> ArtifactInspection<P> {
     pub fn architecture_plan_mut(&mut self) -> &mut P {
         &mut self.architecture_plan
     }
+
+    /// Replaces architecture-owned state without changing admitted artifact facts.
+    ///
+    /// Architecture registries use this only for typed additive projections
+    /// whose original checkpoint admission remains authoritative.
+    pub fn map_architecture_plan<Q>(self, map: impl FnOnce(P) -> Q) -> ArtifactInspection<Q> {
+        ArtifactInspection {
+            path: self.path,
+            format: self.format,
+            configuration: self.configuration,
+            tensors: self.tensors,
+            safetensors_shards: self.safetensors_shards,
+            validated_gguf: self.validated_gguf,
+            architecture_plan: map(self.architecture_plan),
+        }
+    }
 }
 
 /// Requested load-time weight transformation.
@@ -515,6 +531,7 @@ impl<P> ModelPreparationPlan<P> {
     pub const fn admitted_session_capabilities(&self) -> crate::backend::SessionCapabilities {
         self.admitted_session_capabilities
     }
+
     /// Consumes the plan into the exact portable artifact admitted by inspection.
     ///
     /// Architecture state remains available through [`Self::inspection`] before

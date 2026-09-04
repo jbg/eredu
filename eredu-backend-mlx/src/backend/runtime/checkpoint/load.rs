@@ -3,25 +3,44 @@ use eredu_checkpoint::AffineQuantization;
 use eredu_checkpoint::WeightQuantization;
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     path::{Path, PathBuf},
 };
 
 use eredu_gguf::MetadataValue as GgufMetadataValue;
-use safemlx::{transforms::async_eval_with_event, Array, Stream};
+use safemlx::{Array, Stream};
 
 use crate::backend::error::Error;
+#[cfg(all(
+    test,
+    any(feature = "cuda", all(feature = "metal", target_os = "macos"))
+))]
 use crate::backend::runtime::checkpoint::quantization::quantize_tensor;
+#[cfg(all(
+    test,
+    any(feature = "cuda", all(feature = "metal", target_os = "macos"))
+))]
+use crate::module::FlattenedModuleParamMut;
 #[cfg(all(
     test,
     any(feature = "cuda", all(feature = "metal", target_os = "macos"))
 ))]
 use crate::module::PhysicalParameters;
 use crate::{
-    backend::runtime::checkpoint::gguf::GgufCheckpoint, module::FlattenedModuleParamMut,
+    backend::runtime::checkpoint::gguf::GgufCheckpoint,
     native_quantization::NativeQuantizationFormat,
 };
+#[cfg(all(
+    test,
+    any(feature = "cuda", all(feature = "metal", target_os = "macos"))
+))]
+use safemlx::transforms::async_eval_with_event;
 use safetensors::SafeTensors;
+#[cfg(all(
+    test,
+    any(feature = "cuda", all(feature = "metal", target_os = "macos"))
+))]
+use std::collections::HashSet;
 
 /// Copies decoded GGUF metadata into a name-addressable map.
 pub(crate) fn gguf_metadata(checkpoint: &GgufCheckpoint) -> HashMap<String, GgufMetadataValue> {
@@ -128,6 +147,10 @@ fn canonical_gguf_name(
 }
 
 /// Accumulates strict checkpoint-loading diagnostics across one or more files.
+#[cfg(all(
+    test,
+    any(feature = "cuda", all(feature = "metal", target_os = "macos"))
+))]
 #[derive(Debug, Clone, Default)]
 pub(crate) struct StrictLoadReport {
     loaded: HashSet<String>,
@@ -135,6 +158,10 @@ pub(crate) struct StrictLoadReport {
     shape_mismatches: Vec<String>,
 }
 
+#[cfg(all(
+    test,
+    any(feature = "cuda", all(feature = "metal", target_os = "macos"))
+))]
 impl StrictLoadReport {
     /// Records a checkpoint tensor successfully assigned to a parameter.
     fn record_loaded(&mut self, key: String) {
@@ -241,6 +268,10 @@ where
 }
 
 /// Strict-loads one exact checkpoint tensor identity into a module parameter.
+#[cfg(all(
+    test,
+    any(feature = "cuda", all(feature = "metal", target_os = "macos"))
+))]
 pub(crate) fn load_array_strict(
     params: &mut FlattenedModuleParamMut<'_>,
     key: String,
@@ -250,6 +281,10 @@ pub(crate) fn load_array_strict(
     load_array_for_parameter_strict(params, key.clone(), key, value, report);
 }
 
+#[cfg(all(
+    test,
+    any(feature = "cuda", all(feature = "metal", target_os = "macos"))
+))]
 fn load_array_for_parameter_strict(
     params: &mut FlattenedModuleParamMut<'_>,
     source_key: String,
@@ -283,12 +318,20 @@ fn load_array_for_parameter_strict(
 /// The caller obtains these identities from architecture parameter metadata;
 /// this loader never derives private slots or companion names.
 #[derive(Debug, Clone, Eq, PartialEq)]
+#[cfg(all(
+    test,
+    any(feature = "cuda", all(feature = "metal", target_os = "macos"))
+))]
 pub(in crate::backend::runtime::checkpoint) struct QuantizedLoadRecipe {
     weight: String,
     scales: String,
     biases: Option<String>,
 }
 
+#[cfg(all(
+    test,
+    any(feature = "cuda", all(feature = "metal", target_os = "macos"))
+))]
 impl QuantizedLoadRecipe {
     pub(in crate::backend::runtime::checkpoint) fn new(
         weight: impl Into<String>,
@@ -308,6 +351,10 @@ impl QuantizedLoadRecipe {
 /// Dense matrices are quantized and materialized one at a time as they are
 /// read, bounding the lazy graph and active allocation peak. A quantization
 /// recipe contains every exact destination; without one, loading is exact.
+#[cfg(all(
+    test,
+    any(feature = "cuda", all(feature = "metal", target_os = "macos"))
+))]
 pub(in crate::backend::runtime::checkpoint) fn load_array_quantized_strict(
     params: &mut FlattenedModuleParamMut<'_>,
     key: String,

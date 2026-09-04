@@ -10,23 +10,36 @@ use safemlx::{
 };
 
 use crate::{
-    backend::runtime::{
-        cache::state::{MlxHybridState, MlxKeyValueState},
-        media::input::ModelInput,
-    },
+    backend::runtime::media::input::ModelInput,
     composition::{
-        gemma4::{Gemma4AssistantModel, Gemma4Model, Gemma4SpeculativeOutput},
+        gemma4::Gemma4AssistantModel,
         mlx::{
+            replicated_text::{ErasedReplicatedTextExecutable, MlxPredictionTargetCache},
             speculative::{
                 scheduler::SpeculativeComponentTimings, MlxSpeculativeCompletion,
                 SpeculativeExecutionStreams,
             },
             MlxModelInput,
         },
-        muse_glimmer::{MuseGlimmerDFlashModel, MuseGlimmerModel, MuseGlimmerSpeculativeOutput},
+        muse_glimmer::MuseGlimmerDFlashModel,
     },
     MlxTensor,
 };
+use eredu_architectures::composite_execution::{
+    ExternalPredictionCaptureRequest, ExternalPredictionTargetCapture,
+    ExternalPredictionTargetOperation,
+};
+
+struct MuseGlimmerSpeculativeOutput {
+    logits: MlxTensor,
+    target_states: Vec<MlxTensor>,
+}
+
+struct Gemma4SpeculativeOutput {
+    logits: MlxTensor,
+    hidden: MlxTensor,
+    shared_kv: eredu_architectures::gemma4::SharedAttentionStates<MlxTensor>,
+}
 
 #[derive(Clone)]
 pub struct Gemma4TargetState {
@@ -57,17 +70,23 @@ pub struct MuseVerification {
 }
 
 /// Ordinary neutral Muse-Glimmer target plus its neutral DFlash assistant.
-pub struct MuseGlimmerExternalExecutor<'a> {
-    target: &'a mut MuseGlimmerModel,
+pub(crate) struct MuseGlimmerExternalExecutor<'a> {
+    target: &'a mut dyn ErasedReplicatedTextExecutable,
     assistant: &'a mut MuseGlimmerDFlashModel,
+    capture: ExternalPredictionCaptureRequest,
 }
 
 impl<'a> MuseGlimmerExternalExecutor<'a> {
-    pub fn new(
-        target: &'a mut MuseGlimmerModel,
+    pub(crate) fn new(
+        target: &'a mut dyn ErasedReplicatedTextExecutable,
         assistant: &'a mut MuseGlimmerDFlashModel,
+        capture: ExternalPredictionCaptureRequest,
     ) -> Self {
-        Self { target, assistant }
+        Self {
+            target,
+            assistant,
+            capture,
+        }
     }
 
     fn retained_context(
@@ -132,7 +151,11 @@ impl<'a> MuseGlimmerExternalExecutor<'a> {
     ) -> Result<Array, Exception> {
         let hidden = self
             .target
-            .embed_dflash_tokens(&MlxTensor::from_array(ids.clone()), streams.target())
+            .apply_external_prediction_target_operation(
+                ExternalPredictionTargetOperation::TokenEmbeddings(&MlxTensor::from_array(
+                    ids.clone(),
+                )),
+            )
             .map_err(|error| Exception::custom(error.to_string()))?
             .into_array();
         if !streams.is_split() {
@@ -166,7 +189,11 @@ impl<'a> MuseGlimmerExternalExecutor<'a> {
         };
         let logits = self
             .target
-            .project_dflash_logits(&MlxTensor::from_array(states.clone()), streams.target())
+            .apply_external_prediction_target_operation(
+                ExternalPredictionTargetOperation::ProjectLogits(&MlxTensor::from_array(
+                    states.clone(),
+                )),
+            )
             .map_err(|error| Exception::custom(error.to_string()))?
             .into_array();
         if !streams.is_split() {
@@ -200,10 +227,10 @@ impl<'a> MuseGlimmerExternalExecutor<'a> {
 
 impl SpeculativeExecutor for MuseGlimmerExternalExecutor<'_> {
     type Input = MlxModelInput;
-    type Cache = MlxKeyValueState;
+    type Cache = MlxPredictionTargetCache;
     type TargetState = MuseTargetState;
     type DraftState = MuseDraftState;
-    type CacheCheckpoint = MlxKeyValueState;
+    type CacheCheckpoint = MlxPredictionTargetCache;
     type Verification = MuseVerification;
     type Logits = Array;
     type Context<'a>
@@ -228,11 +255,20 @@ impl SpeculativeExecutor for MuseGlimmerExternalExecutor<'_> {
         Self: 'context,
     {
         input.with_borrowed(|input: ModelInput<'_>| {
-            let layers = self.assistant.target_layer_ids().to_vec();
-            let output = self
+            let (logits, capture) = self
                 .target
-                .forward_input_with_taps(input, cache, &layers, streams.target())
+                .prefill_external_prediction_target(input, &self.capture, cache)
                 .map_err(|error| Exception::custom(error.to_string()))?;
+            let ExternalPredictionTargetCapture::MuseGlimmerDFlash { target_states } = capture
+            else {
+                return Err(Exception::custom(
+                    "Muse-Glimmer target returned a different assistant capture",
+                ));
+            };
+            let output = MuseGlimmerSpeculativeOutput {
+                logits,
+                target_states,
+            };
             let sequence = output.logits.as_array().dim(1);
             if sequence <= 0 {
                 return Err(Exception::custom("Muse-Glimmer DFlash input is empty"));
@@ -242,7 +278,14 @@ impl SpeculativeExecutor for MuseGlimmerExternalExecutor<'_> {
                     .logits
                     .as_array()
                     .try_index_device((.., sequence - 1, ..), streams.target())?,
-                self.target_state(&output, None, cache.offset(), streams.target())?,
+                self.target_state(
+                    &output,
+                    None,
+                    cache
+                        .offset()
+                        .map_err(|error| Exception::custom(error.to_string()))?,
+                    streams.target(),
+                )?,
                 sequence as usize,
             ))
         })
@@ -319,9 +362,7 @@ impl SpeculativeExecutor for MuseGlimmerExternalExecutor<'_> {
     }
 
     fn checkpoint(cache: &Self::Cache) -> Self::CacheCheckpoint {
-        cache
-            .deep_clone_state()
-            .expect("validated Muse-Glimmer speculative state must be forkable")
+        cache.clone()
     }
 
     fn submit_verification(
@@ -334,16 +375,23 @@ impl SpeculativeExecutor for MuseGlimmerExternalExecutor<'_> {
         if streams.crosses_devices() {
             inputs = inputs.copy(streams.target())?;
         }
-        let layers = self.assistant.target_layer_ids().to_vec();
-        let output = self
+        let (logits, capture) = self
             .target
-            .verify_dflash(
+            .verify_external_prediction_target(
                 &MlxTensor::from_array(inputs.clone()),
+                &self.capture,
                 cache,
-                &layers,
-                streams.target(),
             )
             .map_err(|error| Exception::custom(error.to_string()))?;
+        let ExternalPredictionTargetCapture::MuseGlimmerDFlash { target_states } = capture else {
+            return Err(Exception::custom(
+                "Muse-Glimmer target returned a different assistant capture",
+            ));
+        };
+        let output = MuseGlimmerSpeculativeOutput {
+            logits,
+            target_states,
+        };
         let completion = MlxSpeculativeCompletion::submit(
             std::iter::once(output.logits.as_array())
                 .chain(output.target_states.iter().map(MlxTensor::as_array)),
@@ -379,9 +427,12 @@ impl SpeculativeExecutor for MuseGlimmerExternalExecutor<'_> {
         streams: SpeculativeExecutionStreams<'_>,
     ) -> Result<SpeculativeCommit<Self::TargetState>, Exception> {
         let input_len = output.inputs.dim(1) as usize;
+        let checkpoint_offset = checkpoint
+            .offset()
+            .map_err(|error| Exception::custom(error.to_string()))?;
         if verified_inputs > input_len
-            || draft_state.cache_len != checkpoint.offset()
-            || draft_state.draft_context.end != checkpoint.offset()
+            || draft_state.cache_len != checkpoint_offset
+            || draft_state.draft_context.end != checkpoint_offset
         {
             return Err(Exception::custom(
                 "Muse-Glimmer DFlash verification/checkpoint state mismatch",
@@ -393,7 +444,7 @@ impl SpeculativeExecutor for MuseGlimmerExternalExecutor<'_> {
                 MuseTargetState {
                     pending_context: None,
                     draft_context: Some(draft_state.draft_context),
-                    cache_len: checkpoint.offset(),
+                    cache_len: checkpoint_offset,
                 },
                 0,
             ));
@@ -405,23 +456,33 @@ impl SpeculativeExecutor for MuseGlimmerExternalExecutor<'_> {
             let inputs = output
                 .inputs
                 .try_index_device((.., ..verified_inputs as i32), streams.target())?;
-            let layers = self.assistant.target_layer_ids().to_vec();
-            let replayed = self
+            let (logits, capture) = self
                 .target
-                .verify_dflash(
+                .verify_external_prediction_target(
                     &MlxTensor::from_array(inputs),
+                    &self.capture,
                     cache,
-                    &layers,
-                    streams.target(),
                 )
                 .map_err(|error| Exception::custom(error.to_string()))?;
+            let ExternalPredictionTargetCapture::MuseGlimmerDFlash { target_states } = capture
+            else {
+                return Err(Exception::custom(
+                    "Muse-Glimmer target returned a different assistant capture",
+                ));
+            };
+            let replayed = MuseGlimmerSpeculativeOutput {
+                logits,
+                target_states,
+            };
             (replayed, verified_inputs)
         };
         Ok(SpeculativeCommit::new(
             self.target_state(
                 &retained,
                 Some(draft_state.draft_context),
-                cache.offset(),
+                cache
+                    .offset()
+                    .map_err(|error| Exception::custom(error.to_string()))?,
                 streams.target(),
             )?,
             replayed_tokens,
@@ -442,14 +503,23 @@ pub struct Gemma4Verification {
 }
 
 /// Ordinary neutral Gemma target plus its neutral external assistant.
-pub struct Gemma4ExternalExecutor<'a> {
-    target: &'a mut Gemma4Model,
+pub(crate) struct Gemma4ExternalExecutor<'a> {
+    target: &'a mut dyn ErasedReplicatedTextExecutable,
     assistant: &'a mut Gemma4AssistantModel,
+    capture: ExternalPredictionCaptureRequest,
 }
 
 impl<'a> Gemma4ExternalExecutor<'a> {
-    pub fn new(target: &'a mut Gemma4Model, assistant: &'a mut Gemma4AssistantModel) -> Self {
-        Self { target, assistant }
+    pub(crate) fn new(
+        target: &'a mut dyn ErasedReplicatedTextExecutable,
+        assistant: &'a mut Gemma4AssistantModel,
+        capture: ExternalPredictionCaptureRequest,
+    ) -> Self {
+        Self {
+            target,
+            assistant,
+            capture,
+        }
     }
 
     fn state_at(
@@ -534,7 +604,11 @@ impl<'a> Gemma4ExternalExecutor<'a> {
     ) -> Result<Array, Exception> {
         let embedding = self
             .target
-            .embed_draft_token(token, streams.target())
+            .apply_external_prediction_target_operation(
+                ExternalPredictionTargetOperation::TokenEmbeddings(&MlxTensor::from_array(
+                    Array::from_slice(&[token], &[1, 1]),
+                )),
+            )
             .map_err(|error| Exception::custom(error.to_string()))?
             .into_array();
         if !streams.is_split() {
@@ -553,10 +627,10 @@ impl<'a> Gemma4ExternalExecutor<'a> {
 
 impl SpeculativeExecutor for Gemma4ExternalExecutor<'_> {
     type Input = MlxModelInput;
-    type Cache = MlxHybridState;
+    type Cache = MlxPredictionTargetCache;
     type TargetState = Gemma4TargetState;
     type DraftState = eredu_architectures::gemma4::AssistantState<MlxTensor>;
-    type CacheCheckpoint = MlxHybridState;
+    type CacheCheckpoint = MlxPredictionTargetCache;
     type Verification = Gemma4Verification;
     type Logits = Array;
     type Context<'a>
@@ -585,10 +659,23 @@ impl SpeculativeExecutor for Gemma4ExternalExecutor<'_> {
         Self: 'context,
     {
         input.with_borrowed(|input: ModelInput<'_>| {
-            let output = self
+            let (logits, capture) = self
                 .target
-                .prefill_speculative(input, cache, streams.target())
+                .prefill_external_prediction_target(input, &self.capture, cache)
                 .map_err(|error| Exception::custom(error.to_string()))?;
+            let ExternalPredictionTargetCapture::Gemma4 { hidden, shared_kv } = capture else {
+                return Err(Exception::custom(
+                    "Gemma 4 target returned a different assistant capture",
+                ));
+            };
+            let output = Gemma4SpeculativeOutput {
+                logits,
+                hidden,
+                shared_kv: shared_kv
+                    .into_iter()
+                    .map(|(policy, keys, values)| (policy, (keys, values)))
+                    .collect(),
+            };
             let sequence = output.logits.as_array().dim(-2);
             if sequence <= 0 {
                 return Err(Exception::custom(
@@ -600,7 +687,14 @@ impl SpeculativeExecutor for Gemma4ExternalExecutor<'_> {
                     .logits
                     .as_array()
                     .try_index_device((.., sequence - 1, ..), streams.target())?,
-                Self::state_at(&output, sequence - 1, cache.offset(), streams.target())?,
+                Self::state_at(
+                    &output,
+                    sequence - 1,
+                    cache
+                        .offset()
+                        .map_err(|error| Exception::custom(error.to_string()))?,
+                    streams.target(),
+                )?,
                 sequence as usize,
             ))
         })
@@ -648,9 +742,7 @@ impl SpeculativeExecutor for Gemma4ExternalExecutor<'_> {
     }
 
     fn checkpoint(cache: &Self::Cache) -> Self::CacheCheckpoint {
-        cache
-            .deep_clone_state()
-            .expect("validated Gemma speculative state must be forkable")
+        cache.clone()
     }
 
     fn submit_verification(
@@ -663,14 +755,27 @@ impl SpeculativeExecutor for Gemma4ExternalExecutor<'_> {
         if streams.crosses_devices() {
             inputs = inputs.copy(streams.target())?;
         }
-        let output = self
+        let (logits, capture) = self
             .target
-            .verify_speculative(
+            .verify_external_prediction_target(
                 &MlxTensor::from_array(inputs.clone()),
+                &self.capture,
                 cache,
-                streams.target(),
             )
             .map_err(|error| Exception::custom(error.to_string()))?;
+        let ExternalPredictionTargetCapture::Gemma4 { hidden, shared_kv } = capture else {
+            return Err(Exception::custom(
+                "Gemma 4 target returned a different assistant capture",
+            ));
+        };
+        let output = Gemma4SpeculativeOutput {
+            logits,
+            hidden,
+            shared_kv: shared_kv
+                .into_iter()
+                .map(|(policy, keys, values)| (policy, (keys, values)))
+                .collect(),
+        };
         let completion = MlxSpeculativeCompletion::submit([output.logits.as_array()])?;
         Ok(Submission {
             output: Gemma4Verification { output, inputs },
@@ -713,7 +818,9 @@ impl SpeculativeExecutor for Gemma4ExternalExecutor<'_> {
                 Self::state_at(
                     &output.output,
                     verified_inputs as i32 - 1,
-                    cache.offset(),
+                    cache
+                        .offset()
+                        .map_err(|error| Exception::custom(error.to_string()))?,
                     streams.target(),
                 )?,
                 0,
@@ -724,15 +831,34 @@ impl SpeculativeExecutor for Gemma4ExternalExecutor<'_> {
         let retained = output
             .inputs
             .try_index_device((.., ..verified_inputs as i32), streams.target())?;
-        let replayed = self
+        let (logits, capture) = self
             .target
-            .verify_speculative(&MlxTensor::from_array(retained), cache, streams.target())
+            .verify_external_prediction_target(
+                &MlxTensor::from_array(retained),
+                &self.capture,
+                cache,
+            )
             .map_err(|error| Exception::custom(error.to_string()))?;
+        let ExternalPredictionTargetCapture::Gemma4 { hidden, shared_kv } = capture else {
+            return Err(Exception::custom(
+                "Gemma 4 target returned a different assistant capture",
+            ));
+        };
+        let replayed = Gemma4SpeculativeOutput {
+            logits,
+            hidden,
+            shared_kv: shared_kv
+                .into_iter()
+                .map(|(policy, keys, values)| (policy, (keys, values)))
+                .collect(),
+        };
         Ok(SpeculativeCommit::new(
             Self::state_at(
                 &replayed,
                 verified_inputs as i32 - 1,
-                cache.offset(),
+                cache
+                    .offset()
+                    .map_err(|error| Exception::custom(error.to_string()))?,
                 streams.target(),
             )?,
             verified_inputs,

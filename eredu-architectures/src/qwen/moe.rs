@@ -85,6 +85,54 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> RoutedGatedPr
             experts,
         })
     }
+
+    /// Builds a partition-local bank while preserving the global router axis.
+    pub fn new_partitioned(
+        global: &ModelArgs,
+        local: &ModelArgs,
+        layer: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        if !global.is_moe() || !local.is_moe() {
+            return Err(Error::backend(
+                "partitioned routed Qwen construction requires Qwen3-MoE",
+            ));
+        }
+        let prefix = format!("{}.layers.{layer}.mlp", global.parameter_root);
+        let routing = TopKGroupSelectionSpec::new(
+            global.num_experts,
+            global.num_experts_per_tok,
+            GroupScoring::Softmax,
+            global.norm_topk_prob,
+        )?;
+        let router_name = format!("{prefix}.gate.weight");
+        let router = B::top_k_group_selector(
+            TopKGroupSelectorSpec::new(
+                global.hidden_size,
+                ParameterSpec::trainable(&router_name).map_err(Error::backend)?,
+                crate::linear_format::standard_linear_format(
+                    &router_name,
+                    global.weight_quantization_for(&router_name).into(),
+                )?,
+                routing,
+            )?,
+            context,
+        )?;
+        let experts = B::grouped_gated_product(
+            localized_expert_bank_spec(
+                global,
+                layer,
+                local.num_experts,
+                local.moe_intermediate_size,
+            )?,
+            context,
+        )?;
+        Ok(Self {
+            layer,
+            router,
+            experts,
+        })
+    }
 }
 
 /// Returns the architecture-owned routed expert specification for one layer.
@@ -168,6 +216,44 @@ pub fn expert_realization_plan<B: GroupedNeuralBackend + eredu_nn::DistributedNe
     }
     crate::ExpertRealizationPlan::balanced(global_experts, topology, unit_specs)
         .map(Some)
+        .map_err(Error::backend)
+}
+
+/// Derives exact TP×EP-local expert geometry before native construction.
+pub fn partition_expert_realization_plan(
+    args: &ModelArgs,
+    layout: &eredu_runtime::LocalModelLayout,
+    topology: eredu_core::ParallelRankTopology,
+) -> Result<crate::ExpertRealizationPlan<GroupedGatedProductSpec>, Error> {
+    if !args.is_moe() {
+        return Err(Error::backend(
+            "partitioned expert planning requires routed Qwen geometry",
+        ));
+    }
+    let global_experts = usize::try_from(args.num_experts).map_err(Error::backend)?;
+    let local_experts = i32::try_from(
+        eredu_core::balanced_contiguous_range(
+            global_experts,
+            topology.expert_parallel_size(),
+            topology.expert_parallel_rank(),
+            false,
+        )
+        .map_err(Error::backend)?
+        .len(),
+    )
+    .map_err(Error::backend)?;
+    let layers = usize::try_from(args.num_hidden_layers).map_err(Error::backend)?;
+    let owner_group =
+        eredu_runtime::ExecutionGroupId::new("text_decoder").map_err(Error::backend)?;
+    let unit_specs = (0..layers)
+        .map(|layer| {
+            let local =
+                super::parallel::local_block_args(args, layer, layout).map_err(Error::backend)?;
+            localized_expert_bank_spec(args, layer, local_experts, local.moe_intermediate_size)
+                .map(|spec| ((owner_group.clone(), layer), spec))
+        })
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    crate::ExpertRealizationPlan::balanced(global_experts, topology, unit_specs)
         .map_err(Error::backend)
 }
 
@@ -319,6 +405,16 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> FeedForward<B
         } else {
             Mlp::new(args, layer, context).map(Self::Dense)
         }
+    }
+
+    /// Builds a routed partition with a global selector and owner-local bank.
+    pub fn new_partitioned(
+        global: &ModelArgs,
+        local: &ModelArgs,
+        layer: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        RoutedGatedProduct::new_partitioned(global, local, layer, context).map(Self::Routed)
     }
 
     /// Executes through a runtime-owned routed-expert provider.

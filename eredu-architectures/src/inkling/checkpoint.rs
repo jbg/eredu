@@ -1048,6 +1048,23 @@ pub fn static_safetensors_recipes<C: RecipeCatalog + ?Sized>(
     select_safetensors_recipe_group(args, catalog, None)
 }
 
+/// Selects exactly the architecture-owned recipes for the embedded MTP extension.
+///
+/// Prediction adapters materialize this module separately from the ordinary
+/// target architecture. Returning the exact recipe subset keeps released
+/// convolution and fused-linear layouts available without requiring the
+/// backend to infer checkpoint prefixes or silently ignore unrelated static
+/// recipes.
+pub fn mtp_safetensors_recipes<C: RecipeCatalog + ?Sized>(
+    args: &ModelArgs,
+    catalog: &C,
+) -> Result<BTreeMap<String, DerivedWeightRecipe>, String> {
+    Ok(safetensors_recipes(args, catalog)?
+        .into_iter()
+        .filter(|(target, _)| target.starts_with("model.mtp."))
+        .collect())
+}
+
 /// Selects the complete architecture-owned SafeTensors recipe group for one execution unit.
 ///
 /// `group` and `index` use the canonical Inkling execution layout: vision is group zero, audio is
@@ -1177,8 +1194,11 @@ pub fn expert_residency_catalog<C: RecipeCatalog + ?Sized>(
             let group = groups
                 .iter()
                 .find(|group| {
-                    group.role() == eredu_runtime::ParameterRole::ExpertIntermediate
-                        && group.logical_name() == logical_group
+                    matches!(
+                        group.role(),
+                        eredu_runtime::ParameterRole::ExpertIntermediate
+                            | eredu_runtime::ParameterRole::SharedExpertIntermediate
+                    ) && group.logical_name() == logical_group
                 })
                 .ok_or_else(|| {
                     format!(
@@ -1676,10 +1696,11 @@ mod tests {
 
     use super::{
         dense_w13_recipes, expert_residency_catalog, expert_w13_recipe, gguf_plan,
-        mmproj_gguf_plan, normalize_gguf_weight_formats, partition_mmproj_weight_formats,
-        safetensors_plan, safetensors_recipes, static_safetensors_recipes,
-        translate_gguf_weight_name, translate_gguf_weight_name_for_model,
-        translate_mmproj_weight_name, unit_safetensors_recipes, with_checkpoint_formats,
+        mmproj_gguf_plan, mtp_safetensors_recipes, normalize_gguf_weight_formats,
+        partition_mmproj_weight_formats, safetensors_plan, safetensors_recipes,
+        static_safetensors_recipes, translate_gguf_weight_name,
+        translate_gguf_weight_name_for_model, translate_mmproj_weight_name,
+        unit_safetensors_recipes, with_checkpoint_formats,
     };
     use crate::inkling::ModelArgs;
 
@@ -1873,7 +1894,8 @@ mod tests {
                 "sliding_window_size":8,"layer_types":["sliding_attention","full_attention"],
                 "mlp_layer_types":["dense","moe"],"sconv_kernel_size":4,
                 "d_rel":2,"rel_extent":16,"intermediate_size":32,
-                "n_routed_experts":4,"num_experts_per_tok":2,"n_shared_experts":1}
+                "n_routed_experts":4,"num_experts_per_tok":2,"n_shared_experts":1},
+              "mtp_config":{"num_nextn_predict_layers":1,"local_layer_ids":[]}
             }"#,
         )
         .unwrap();
@@ -1881,6 +1903,7 @@ mod tests {
         let dense = "model.llm.layers.0.mlp.w13_dn.weight";
         let routed = "model.llm.layers.1.mlp.experts.w13_weight";
         let shared = "model.llm.layers.1.mlp.shared_experts.shared_w13_weight";
+        let mtp = "model.mtp.layers.0.transformer_block.mlp.w13_dn.weight";
         let catalog = Catalog(BTreeMap::from([
             (
                 "model.llm.embed.weight".into(),
@@ -1890,12 +1913,19 @@ mod tests {
             (dense.into(), metadata(dense, vec![64, 16])),
             (routed.into(), metadata(routed, vec![4, 64, 16])),
             (shared.into(), metadata(shared, vec![1, 64, 16])),
+            (mtp.into(), metadata(mtp, vec![64, 16])),
         ]));
         let recipes = safetensors_recipes(&args, &catalog).unwrap();
         assert!(matches!(
             recipes.get("model.layers.0.attn_sconv.weight"),
             Some(DerivedWeightRecipe::Reshape { shape, .. }) if shape == &[16, 1, 4]
         ));
+
+        let prediction = mtp_safetensors_recipes(&args, &catalog).unwrap();
+        assert!(prediction.keys().all(|name| name.starts_with("model.mtp.")));
+        assert!(
+            prediction.contains_key("model.mtp.layers.0.transformer_block.dense.gate_proj.weight")
+        );
         assert!(matches!(
             recipes.get("model.layers.0.dense.gate_proj.weight"),
             Some(DerivedWeightRecipe::Source {
@@ -1915,7 +1945,11 @@ mod tests {
         let pinned = static_safetensors_recipes(&args, &catalog).unwrap();
         assert_eq!(
             pinned.keys().map(String::as_str).collect::<Vec<_>>(),
-            ["model.embed_tokens.weight"]
+            [
+                "model.embed_tokens.weight",
+                "model.mtp.layers.0.transformer_block.dense.gate_proj.weight",
+                "model.mtp.layers.0.transformer_block.dense.up_proj.weight",
+            ]
         );
         let dense_unit = unit_safetensors_recipes(&args, &catalog, 2, 0).unwrap();
         assert!(!dense_unit.is_empty());

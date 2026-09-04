@@ -4,7 +4,6 @@ use std::sync::Arc;
 
 use eredu_core::cache::PromptCacheTopology;
 use eredu_nn::{
-    multimodal::{assemble_ordered_inputs, OrderedInputPart},
     AuxiliaryConvolutionState, EmbeddingLookupPolicy, EmbeddingOperator, EmbeddingSpec, Error,
     GroupedNeuralBackend, Index, LinearOperator, LinearSpec, NormalizationConstructionSpec,
     NormalizationOperator, ParameterSpec, Parameterized, Tensor,
@@ -372,14 +371,127 @@ where
         crate::media_plan::admit_inkling_input(config, input, inspector)
     }
 
+    fn should_execute_prepared_group(
+        &self,
+        group: usize,
+        input: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
+    ) -> bool {
+        match group {
+            0 => input.admitted().parts().iter().any(|part| {
+                matches!(
+                    part,
+                    InklingInputPartPlan::Media {
+                        modality: eredu_core::InputModality::Image,
+                        ..
+                    }
+                )
+            }),
+            1 => input.admitted().parts().iter().any(|part| {
+                matches!(
+                    part,
+                    InklingInputPartPlan::Media {
+                        modality: eredu_core::InputModality::Audio,
+                        ..
+                    }
+                )
+            }),
+            2 => true,
+            _ => false,
+        }
+    }
+
+    fn prepared_group_collective_waves(
+        &self,
+        group: usize,
+        _input: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
+        tensor_partitions: usize,
+        pipeline_stages: usize,
+    ) -> Result<Option<Vec<Vec<crate::composite_execution::CompositeTensorCollective>>>, String>
+    {
+        // Inkling's hMLP units and projector are replicated equations even
+        // when their parameters are selected with TP-local ownership. The
+        // explicit empty schedule prevents the generic driver from inventing
+        // row reductions for this group.
+        Ok((group == 0 && tensor_partitions > 1 && pipeline_stages > 1)
+            .then(|| vec![Vec::new(); pipeline_stages]))
+    }
+
+    fn prepared_primary_ingress_collectives(
+        &self,
+        input: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
+        tensor_partitions: usize,
+    ) -> Result<Option<Vec<crate::composite_execution::CompositeTensorCollective>>, String> {
+        if tensor_partitions <= 1 {
+            return Ok(None);
+        }
+        input
+            .admitted()
+            .parts()
+            .iter()
+            .filter_map(|part| match part {
+                InklingInputPartPlan::TextTokens { positions } => Some(*positions),
+                InklingInputPartPlan::Projected { .. } | InklingInputPartPlan::Media { .. } => None,
+            })
+            .map(|positions| {
+                i32::try_from(positions)
+                    .map(
+                        |positions| crate::composite_execution::CompositeTensorCollective::Sum {
+                            shape: vec![1, positions, self.args.text_config.hidden_size],
+                        },
+                    )
+                    .map_err(|_| "Inkling text ingress positions exceed i32".to_owned())
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(Some)
+    }
+
+    fn routed_tensor_output_width(&self) -> Result<Option<usize>, Self::Error> {
+        usize::try_from(self.args.text_config.vocab_size)
+            .map(Some)
+            .map_err(|_| Error::backend("Inkling physical vocabulary width exceeds usize"))
+    }
+
+    fn prediction_target_capture(forward: &Self::ForwardContext) -> Option<&B::Tensor> {
+        forward.target_hidden()
+    }
+
+    fn prediction_target_placeholder_shape(
+        &self,
+        forward: &Self::ForwardContext,
+    ) -> Result<Option<Vec<i32>>, Self::Error> {
+        Ok(Some(vec![
+            forward.tokens().dim(0),
+            forward.tokens().dim(1),
+            self.args.text_config.hidden_size,
+        ]))
+    }
+
     fn begin_composite_forward<'a>(
         &mut self,
         input: PreparedCompositeInput<'a, B::Tensor, Self::InputPartPlan>,
         state: &mut S,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
-        prepare_input(input, context)?.with_model_input(|input| {
+        let prepared = prepare_input(input, context)?;
+        prepared.with_model_input(|input| {
             <Self as LayeredArchitecture<B, S>>::begin_forward(self, input, state, context)
+        })
+    }
+
+    fn begin_composite_forward_parallel<'a>(
+        &mut self,
+        input: PreparedCompositeInput<'a, B::Tensor, Self::InputPartPlan>,
+        state: &mut S,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error>
+    where
+        B: eredu_nn::TensorParallelGroupedNeuralBackend,
+    {
+        prepare_input(input, context)?.with_model_input(|input| {
+            <Self as ParallelLayeredArchitecture<B, S>>::begin_forward_parallel(
+                self, input, state, parallel, context,
+            )
         })
     }
 }
@@ -441,14 +553,18 @@ where
         P: RoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
     {
-        match (group, unit) {
+        let output = match (group, unit) {
             (2, Unit::Text(unit)) => self.forward_text_unit_with_provider(
                 index, unit, hidden, state, pass, provider, context,
             ),
             (_, unit) => <Self as LayeredArchitecture<B, S>>::forward_unit(
                 self, group, index, unit, hidden, state, forward, context,
             ),
+        }?;
+        if group == 2 && index + 1 == self.args.text_config.num_hidden_layers as usize {
+            forward.capture_target_hidden(output.clone());
         }
+        Ok(output)
     }
 }
 
@@ -475,14 +591,18 @@ where
         P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
     {
-        match (group, unit) {
+        let output = match (group, unit) {
             (2, Unit::Text(unit)) => self.forward_text_unit_parallel_with_provider(
                 index, unit, hidden, state, pass, provider, parallel, context,
             ),
             (_, unit) => <Self as ParallelLayeredArchitecture<B, S>>::forward_unit_parallel(
                 self, group, index, unit, hidden, state, forward, parallel, context,
             ),
+        }?;
+        if group == 2 && index + 1 == self.args.text_config.num_hidden_layers as usize {
+            forward.capture_target_hidden(output.clone());
         }
+        Ok(output)
     }
 }
 
@@ -525,6 +645,8 @@ pub struct LayeredModel<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBac
     args: ModelArgs,
     static_modules: StaticModules<B>,
     parallel_geometry: Option<Arc<LocalGeometry>>,
+    partition_state_offset: usize,
+    expert_realization: Option<Arc<crate::ExpertRealizationPlan<super::ExpertBankRealization>>>,
 }
 
 /// Architecture-owned target, embedded-prediction, and composite state geometry.
@@ -730,6 +852,8 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
             args,
             static_modules,
             parallel_geometry: None,
+            partition_state_offset: 0,
+            expert_realization: None,
         })
     }
 
@@ -749,7 +873,50 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
             args,
             static_modules,
             parallel_geometry: Some(geometry),
+            partition_state_offset: 0,
+            expert_realization: None,
         })
+    }
+
+    /// Retains the architecture-global ordinal of this pipeline partition's first text state.
+    pub(crate) fn with_partition_state_offset(mut self, offset: usize) -> Result<Self, Error> {
+        if offset >= self.args.text_config.num_hidden_layers as usize {
+            return Err(Error::backend(
+                "Inkling partition state offset is outside the target decoder",
+            ));
+        }
+        if self
+            .args
+            .mtp_config
+            .as_ref()
+            .is_some_and(|prediction| prediction.num_nextn_predict_layers > 0)
+        {
+            return Err(Error::backend(
+                "partitioned Inkling cannot attach embedded-prediction state",
+            ));
+        }
+        self.partition_state_offset = offset;
+        Ok(self)
+    }
+
+    fn local_state_ordinal(&self, global: usize) -> Result<usize, Error> {
+        global
+            .checked_sub(self.partition_state_offset)
+            .ok_or_else(|| Error::backend("Inkling unit precedes the partition state offset"))
+    }
+
+    /// Binds exact routed and replicated-shared compact banks to local text units.
+    pub fn with_expert_realization(
+        mut self,
+        realization: crate::ExpertRealizationPlan<super::ExpertBankRealization>,
+    ) -> Result<Self, Error> {
+        if !self.args.text_config.has_sparse_moe_layers() {
+            return Err(Error::backend(
+                "dense Inkling cannot bind an expert realization",
+            ));
+        }
+        self.expert_realization = Some(Arc::new(realization));
+        Ok(self)
     }
 
     /// Returns normalized family configuration.
@@ -879,6 +1046,18 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
     }
 
     fn accepts_execution_state(&self, layout: &StateLayout) -> Result<bool, Error> {
+        let complete = self.ingress_state_layout()?;
+        if self.partition_state_offset != 0 || layout.len() < complete.len() {
+            let end = self
+                .partition_state_offset
+                .checked_add(layout.len())
+                .ok_or_else(|| Error::backend("Inkling partition state interval overflow"))?;
+            let expected = complete
+                .slice(self.partition_state_offset..end)
+                .map_err(Error::backend)?;
+            let expected = composite_state_layout(&expected, None).map_err(Error::backend)?;
+            return Ok(layout == &expected);
+        }
         let layouts = self.state_layouts()?;
         Ok(layout == layouts.target() || layout == layouts.composite())
     }
@@ -899,7 +1078,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
     where
         S::LayerState: AuxiliaryConvolutionState<B::Tensor>,
     {
-        if state.layout().len() != self.args.text_config.num_hidden_layers as usize {
+        if !self.accepts_execution_state(state.layout())? {
             return Err(Error::backend("Inkling rank-local state layout mismatch"));
         }
         let hidden = self
@@ -937,7 +1116,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
     where
         S::LayerState: AuxiliaryConvolutionState<B::Tensor>,
     {
-        if state.layout().len() != self.args.text_config.num_hidden_layers as usize {
+        if !self.accepts_execution_state(state.layout())? {
             return Err(Error::backend("Inkling rank-local state layout mismatch"));
         }
         let mut next_embedding = text_embeddings.iter();
@@ -1038,7 +1217,11 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
     {
         unit.forward_parallel(
             hidden,
-            Some(state.layer(index).map_err(Error::backend)?),
+            Some(
+                state
+                    .layer(self.local_state_ordinal(index)?)
+                    .map_err(Error::backend)?,
+            ),
             parallel,
             context,
         )
@@ -1065,7 +1248,11 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
     {
         unit.forward_parallel_with_provider(
             hidden,
-            Some(state.layer(index).map_err(Error::backend)?),
+            Some(
+                state
+                    .layer(self.local_state_ordinal(index)?)
+                    .map_err(Error::backend)?,
+            ),
             pass,
             provider,
             parallel,
@@ -1290,7 +1477,11 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
     {
         unit.forward_with_provider(
             hidden,
-            Some(state.layer(index).map_err(Error::backend)?),
+            Some(
+                state
+                    .layer(self.local_state_ordinal(index)?)
+                    .map_err(Error::backend)?,
+            ),
             pass,
             provider,
             context,
@@ -1436,22 +1627,38 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
                 } => embeddings.push(value.clone()),
             }
         }
-        let ordered = parts
-            .iter()
-            .zip(&embeddings)
-            .map(|(part, embeddings)| OrderedInputPart {
-                token_ids: match part {
-                    PreparedPart::Text { tokens, .. }
-                    | PreparedPart::Image { tokens }
-                    | PreparedPart::Audio { tokens }
-                    | PreparedPart::Projected { tokens, .. } => tokens,
-                },
-                embeddings,
-            })
-            .collect::<Vec<_>>();
-        let hidden = assemble_ordered_inputs(&ordered, self.args.text_config.hidden_size, context)?
-            .embeddings;
+        let batch = parts
+            .first()
+            .map(prepared_part_tokens)
+            .ok_or_else(|| Error::backend("Inkling input has no ordered parts"))?
+            .dim(0);
+        for (index, (part, embeddings)) in parts.iter().zip(&embeddings).enumerate() {
+            let tokens = prepared_part_tokens(part);
+            if tokens.shape().len() != 2
+                || embeddings.shape().len() != 3
+                || tokens.dim(0) != batch
+                || embeddings.dim(0) != batch
+                || tokens.dim(1) != embeddings.dim(1)
+                || embeddings.dim(2) != self.args.text_config.hidden_size
+            {
+                return Err(Error::backend(format!(
+                    "Inkling ordered input part {index} has incompatible token/embedding shapes {:?} and {:?}",
+                    tokens.shape(),
+                    embeddings.shape()
+                )));
+            }
+        }
+        let hidden = B::Tensor::concatenate(&embeddings, 1, context)?;
         self.static_modules.embedding_norm.forward(&hidden, context)
+    }
+}
+
+fn prepared_part_tokens<T>(part: &PreparedPart<T>) -> &T {
+    match part {
+        PreparedPart::Text { tokens, .. }
+        | PreparedPart::Image { tokens }
+        | PreparedPart::Audio { tokens }
+        | PreparedPart::Projected { tokens, .. } => tokens,
     }
 }
 
@@ -1620,7 +1827,34 @@ where
                     })?,
                     None => &self.args.text_config,
                 };
-                Ok(Unit::Text(DecoderLayer::new(text, index, context)?))
+                let realization = self
+                    .expert_realization
+                    .as_ref()
+                    .and_then(|plan| plan.unit_spec(TEXT_EXECUTION_GROUP, index))
+                    .cloned();
+                if self.expert_realization.is_some()
+                    && self
+                        .args
+                        .text_config
+                        .layer_policy(index)
+                        .is_some_and(|policy| {
+                            policy.feed_forward == super::FeedForwardPolicy::SparseMoe
+                        })
+                    && realization.is_none()
+                {
+                    return Err(Error::backend(format!(
+                        "Inkling expert realization omits text unit {index}"
+                    )));
+                }
+                Ok(Unit::Text(match realization {
+                    Some(realization) => DecoderLayer::new_with_expert_realization(
+                        text,
+                        index,
+                        realization,
+                        context,
+                    )?,
+                    None => DecoderLayer::new(text, index, context)?,
+                }))
             }
             _ => Err(Error::backend("Inkling has three execution groups")),
         }
@@ -1707,6 +1941,22 @@ where
                 forward.audio_output.as_ref().map(|_| *audio),
                 context,
             ),
+            (2, dependencies)
+                if dependencies.len()
+                    == usize::from(forward.vision_output.is_some())
+                        + usize::from(forward.audio_output.is_some()) =>
+            {
+                let mut dependencies = dependencies.iter().copied();
+                let vision = forward
+                    .vision_output
+                    .as_ref()
+                    .and_then(|_| dependencies.next());
+                let audio = forward
+                    .audio_output
+                    .as_ref()
+                    .and_then(|_| dependencies.next());
+                self.assemble(&forward.parts, vision, audio, context)
+            }
             _ => Err(Error::backend("invalid Inkling execution dependencies")),
         }
     }
@@ -1733,7 +1983,11 @@ where
             (0, Unit::Vision(unit)) => unit.forward(hidden, context),
             (2, Unit::Text(unit)) => unit.forward(
                 hidden,
-                Some(state.layer(index).map_err(Error::backend)?),
+                Some(
+                    state
+                        .layer(self.local_state_ordinal(index)?)
+                        .map_err(Error::backend)?,
+                ),
                 context,
             ),
             _ => Err(Error::backend("Inkling unit/group mismatch")),
@@ -1887,7 +2141,11 @@ where
             (0, Unit::Vision(unit)) => unit.forward(hidden, context),
             (2, Unit::Text(unit)) => unit.forward_parallel(
                 hidden,
-                Some(state.layer(index).map_err(Error::backend)?),
+                Some(
+                    state
+                        .layer(self.local_state_ordinal(index)?)
+                        .map_err(Error::backend)?,
+                ),
                 parallel,
                 context,
             ),

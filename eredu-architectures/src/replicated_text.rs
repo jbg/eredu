@@ -931,7 +931,7 @@ pub(crate) fn validate_store_handoff(
     Ok(())
 }
 
-fn selected_formats(
+pub(crate) fn selected_formats(
     selected: &SelectedReplicatedTextRealization,
 ) -> HashMap<String, WeightQuantization> {
     selected
@@ -961,7 +961,7 @@ fn requirement_formats(
         .collect()
 }
 
-fn selected_linear_formats(
+pub(crate) fn selected_linear_formats(
     requirements: &ReplicatedTextRequirements,
     selected: &SelectedReplicatedTextRealization,
 ) -> HashMap<String, LinearFormat> {
@@ -990,11 +990,23 @@ fn requirement_linear_formats(
         .collect()
 }
 
-fn selected_llama_args(
+pub(crate) fn selected_llama_args(
     args: &crate::llama::ModelArgs,
     selected: &SelectedReplicatedTextRealization,
 ) -> Result<crate::llama::ModelArgs, String> {
     let formats = selected_formats(selected);
+    if formats.is_empty() {
+        Ok(args.clone())
+    } else {
+        crate::llama::with_checkpoint_formats(args, formats)
+    }
+}
+
+pub(crate) fn source_llama_args(
+    args: &crate::llama::ModelArgs,
+    selected: &SelectedReplicatedTextRealization,
+) -> Result<crate::llama::ModelArgs, String> {
+    let formats = requirement_formats(selected.requirements());
     if formats.is_empty() {
         Ok(args.clone())
     } else {
@@ -1007,6 +1019,18 @@ pub(crate) fn selected_qwen_args(
     selected: &SelectedReplicatedTextRealization,
 ) -> Result<crate::qwen::ModelArgs, String> {
     let formats = selected_formats(selected);
+    if formats.is_empty() {
+        Ok(args.clone())
+    } else {
+        crate::qwen::with_checkpoint_formats(args, formats)
+    }
+}
+
+pub(crate) fn source_qwen_args(
+    args: &crate::qwen::ModelArgs,
+    selected: &SelectedReplicatedTextRealization,
+) -> Result<crate::qwen::ModelArgs, String> {
+    let formats = requirement_formats(selected.requirements());
     if formats.is_empty() {
         Ok(args.clone())
     } else {
@@ -1764,6 +1788,95 @@ enum EligibleConfig<'a> {
 }
 
 impl EligibleConfig<'_> {
+    fn partitioned_boundary_schema(
+        &self,
+        topology: eredu_core::ParallelRankTopology,
+    ) -> Result<eredu_runtime::BoundaryWireSchema, String> {
+        use eredu_runtime::{ArchitectureBoundary, BoundaryTensorDimension as Dim};
+
+        let standard = |hidden| {
+            eredu_runtime::NoAuxiliaryBoundarySchema::new(hidden)
+                .wire_schema()
+                .map_err(|error| error.to_string())
+        };
+        match self {
+            Self::Llama(args) => standard(args.hidden_size),
+            Self::Qwen(args) => standard(args.hidden_size),
+            Self::Lfm2(args) => standard(args.hidden_size),
+            Self::KimiLinear(args) => standard(args.hidden_size),
+            Self::QwenHybrid(args) => standard(args.hidden_size),
+            Self::GptOss(args) => standard(args.hidden_size),
+            Self::Inkling(args) => standard(args.text_config.hidden_size),
+            Self::MuseGlimmer(args) => standard(args.hidden_size),
+            Self::NemotronH(args) => crate::nemotron_h::TargetBoundarySchema::from_args(args)
+                .wire_schema()
+                .map_err(|error| error.to_string()),
+            Self::DeepSeekV3(args) => crate::deepseek::v3::TargetBoundarySchema::from_args(args)
+                .wire_schema()
+                .map_err(|error| error.to_string()),
+            Self::DeepSeekV4(args) => crate::deepseek::v4::TargetBoundarySchema::from_args(args)
+                .map_err(|error| error.to_string())?
+                .wire_schema()
+                .map_err(|error| error.to_string()),
+            Self::QwenVl(args) => crate::qwen::vl::PipelineBoundarySchema::from_args(args)
+                .wire_schema()
+                .map_err(|error| error.to_string()),
+            Self::Gemma4(args) => {
+                let auxiliary =
+                    if args.text.hidden_size_per_layer_input > 0 {
+                        let width = usize::try_from(args.text.hidden_size_per_layer_input)
+                            .map_err(|_| "Gemma 4 per-layer input width is not positive")?;
+                        let range = eredu_core::balanced_contiguous_range(
+                            width,
+                            topology.tensor_parallel_size(),
+                            topology.tensor_parallel_rank(),
+                            false,
+                        )
+                        .map_err(|error| error.to_string())?;
+                        vec![eredu_runtime::BoundaryTensorSpec::new(
+                            "per_layer_input",
+                            [
+                                Dim::Batch,
+                                Dim::Sequence,
+                                Dim::Fixed(args.text.num_hidden_layers() as i32),
+                                Dim::Fixed(i32::try_from(range.len()).map_err(|_| {
+                                    "Gemma 4 local per-layer input width exceeds i32"
+                                })?),
+                            ],
+                            eredu_runtime::BoundaryTensorDtype::Activation,
+                        )]
+                    } else {
+                        Vec::new()
+                    };
+                eredu_runtime::BoundaryWireSchema::new(
+                    "gemma4.text",
+                    eredu_runtime::BoundaryTensorSpec::primary_activation(args.text.hidden_size),
+                    auxiliary,
+                )
+                .map_err(|error| error.to_string())
+            }
+            Self::QwenCompositeHybrid(args) => {
+                let deepstack = args
+                    .vision
+                    .as_ref()
+                    .ok_or_else(|| "conditional Qwen composite omitted vision geometry".to_owned())?
+                    .deepstack_layer_count();
+                eredu_runtime::BoundaryWireSchema::new(
+                    "qwen_conditional.decoder",
+                    eredu_runtime::BoundaryTensorSpec::primary_activation(args.text.hidden_size),
+                    (0..deepstack).map(|index| {
+                        eredu_runtime::BoundaryTensorSpec::new(
+                            format!("deepstack.{index}"),
+                            [Dim::Batch, Dim::Sequence, Dim::Fixed(args.text.hidden_size)],
+                            eredu_runtime::BoundaryTensorDtype::Activation,
+                        )
+                    }),
+                )
+                .map_err(|error| error.to_string())
+            }
+        }
+    }
+
     fn derived_recipes(
         &self,
         source: &dyn eredu_checkpoint::store::CheckpointSource,
@@ -1927,6 +2040,7 @@ impl EligibleConfig<'_> {
 
     fn canonical_parameter_name(&self, name: &str, aliases: &[String]) -> String {
         match self {
+            Self::Inkling(_) => aliases.first().cloned().unwrap_or_else(|| name.to_owned()),
             Self::NemotronH(_) => aliases
                 .iter()
                 .find(|alias| alias.starts_with("model.") || alias.starts_with("lm_head."))
@@ -2481,7 +2595,7 @@ impl EligibleConfig<'_> {
                     |name| Some(self.native_format(name)),
                     "model.embed_tokens.weight",
                 )?;
-                if args.text_config.n_routed_experts > 0 {
+                if args.text_config.has_sparse_moe_layers() {
                     let (plan, _) = inkling_replicated_expert_realization_plan(args)?;
                     insert_grouped_gated_linear_shapes(&mut shapes, &plan)?;
                 }
@@ -2771,7 +2885,9 @@ fn family_parameter_role(
 ) -> ReplicatedTextParameterRole {
     if companion {
         ReplicatedTextParameterRole::FormatCompanion
-    } else if name == config.embedding_name() {
+    } else if name == config.embedding_name()
+        || matches!(config, EligibleConfig::Inkling(_)) && name == "model.llm.embed.weight"
+    {
         ReplicatedTextParameterRole::Embedding
     } else if linear_shapes.contains_key(name)
         || (config.tied_embeddings() && name == "lm_head.weight")
@@ -4381,6 +4497,15 @@ impl PartialEq for CompositeTextRequirements {
 }
 
 impl CompositeTextRequirements {
+    /// The normalized artifact inspection that authoritatively selected these
+    /// requirements.
+    ///
+    /// Architecture-owned typed dispatch consumes this snapshot directly so
+    /// it never reparses artifacts or performs a second family selection.
+    pub const fn inspection(&self) -> &ArtifactInspection<ArtifactArchitecturePlan> {
+        &self.inspection
+    }
+
     /// Stable architecture/cache identity derived from normalized graph facts.
     pub fn architecture_identity(&self) -> &str {
         &self.architecture_identity
@@ -4768,7 +4893,7 @@ where
         A::Error: std::fmt::Display;
 }
 
-enum CompositeConfig<'a> {
+pub(crate) enum CompositeConfig<'a> {
     Gemma4(&'a crate::gemma4::FamilyConfig),
     Inkling(&'a crate::inkling::ModelArgs),
     Muse(&'a crate::muse_glimmer::DecoderConfig),
@@ -4821,7 +4946,7 @@ impl CompositeConfig<'_> {
     fn routed(&self) -> bool {
         match self {
             Self::Gemma4(args) => args.text.num_experts.is_some_and(|count| count > 0),
-            Self::Inkling(args) => args.text_config.n_routed_experts > 0,
+            Self::Inkling(args) => args.text_config.has_sparse_moe_layers(),
             Self::Muse(args) => args.num_experts > 0,
             Self::QwenVl(args) => args.text.is_moe(),
             Self::QwenHybrid(args) => args.text.is_moe(),
@@ -4927,11 +5052,15 @@ impl CompositeConfig<'_> {
                     vec![
                         media(
                             ArchitectureGroupKind::VisionEncoder,
-                            vec!["vision", "vision_projection"],
+                            args.vision
+                                .as_ref()
+                                .map_or_else(Vec::new, |_| vec!["vision", "vision_projection"]),
                         ),
                         media(
                             ArchitectureGroupKind::AudioEncoder,
-                            vec!["audio", "audio_projection"],
+                            args.audio
+                                .as_ref()
+                                .map_or_else(Vec::new, |_| vec!["audio", "audio_projection"]),
                         ),
                         decoder,
                     ],
@@ -5064,7 +5193,7 @@ impl CompositeConfig<'_> {
     }
 }
 
-fn composite_config(
+pub(crate) fn composite_config(
     plan: &ArtifactArchitecturePlan,
 ) -> Result<Option<CompositeConfig<'_>>, ReplicatedTextRequirementsError> {
     use crate::gguf_companion::GgufMediaProjectorConfig;
@@ -5105,6 +5234,64 @@ fn composite_config(
         _ => None,
     };
     Ok(config)
+}
+
+pub(crate) fn partitioned_boundary_schema(
+    inspection: &ArtifactInspection<ArtifactArchitecturePlan>,
+    topology: eredu_core::ParallelRankTopology,
+) -> Result<eredu_runtime::BoundaryWireSchema, ReplicatedTextRequirementsError> {
+    if let Some(config) = composite_config(inspection.architecture_plan())? {
+        return config
+            .requirement_config()
+            .partitioned_boundary_schema(topology)
+            .map_err(ReplicatedTextRequirementsError::InvalidArchitecture);
+    }
+    let plan = inspection.architecture_plan();
+    let config = match (
+        plan.safetensors_architecture().map(|plan| plan.model()),
+        plan.gguf_plan().map(|plan| plan.model()),
+    ) {
+        (Some(SafetensorsModelConfig::Qwen(args)), None) if args.is_moe() => {
+            EligibleConfig::Qwen(args)
+        }
+        (Some(SafetensorsModelConfig::Lfm2(args)), None) if args.has_sparse_moe_layers() => {
+            EligibleConfig::Lfm2(args)
+        }
+        (None, Some(GgufModelConfig::Lfm2(args))) if args.has_sparse_moe_layers() => {
+            EligibleConfig::Lfm2(args)
+        }
+        (Some(SafetensorsModelConfig::KimiLinear(args)), None)
+            if args.has_sparse_moe_layers() && args.num_nextn_predict_layers == 0 =>
+        {
+            EligibleConfig::KimiLinear(args)
+        }
+        (None, Some(GgufModelConfig::KimiLinear(args)))
+            if args.has_sparse_moe_layers() && args.num_nextn_predict_layers == 0 =>
+        {
+            EligibleConfig::KimiLinear(args)
+        }
+        (Some(SafetensorsModelConfig::NemotronH(args)), None)
+            if args.has_sparse_moe_layers() && args.num_nextn_predict_layers == 0 =>
+        {
+            EligibleConfig::NemotronH(args)
+        }
+        (None, Some(GgufModelConfig::NemotronH(args)))
+            if args.has_sparse_moe_layers() && args.num_nextn_predict_layers == 0 =>
+        {
+            EligibleConfig::NemotronH(args)
+        }
+        (Some(SafetensorsModelConfig::GptOss(args)), None) => EligibleConfig::GptOss(args),
+        (Some(SafetensorsModelConfig::DeepSeekV3(args)), None) => EligibleConfig::DeepSeekV3(args),
+        (Some(SafetensorsModelConfig::DeepSeekV4(args)), None) => EligibleConfig::DeepSeekV4(args),
+        (None, Some(GgufModelConfig::Qwen(args))) if args.is_moe() => EligibleConfig::Qwen(args),
+        (None, Some(GgufModelConfig::GptOss(args))) => EligibleConfig::GptOss(args),
+        (None, Some(GgufModelConfig::DeepSeekV3(args))) => EligibleConfig::DeepSeekV3(args),
+        (None, Some(GgufModelConfig::DeepSeekV4(args))) => EligibleConfig::DeepSeekV4(args),
+        _ => eligible_config(plan)?,
+    };
+    config
+        .partitioned_boundary_schema(topology)
+        .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)
 }
 
 fn composite_processor_requirements(
@@ -5520,7 +5707,7 @@ pub fn composite_text_requirements(
     })
 }
 
-fn qwen_vl_with_formats(
+pub(crate) fn qwen_vl_with_formats(
     args: &crate::qwen::vl::ModelArgs,
     formats: HashMap<String, LinearFormat>,
 ) -> Result<crate::qwen::vl::ModelArgs, String> {
@@ -5540,7 +5727,7 @@ fn qwen_vl_with_formats(
     Ok(target)
 }
 
-fn qwen_hybrid_composite_with_formats(
+pub(crate) fn qwen_hybrid_composite_with_formats(
     args: &crate::qwen::hybrid::ParsedHybridConfig,
     formats: HashMap<String, LinearFormat>,
 ) -> Result<crate::qwen::hybrid::ParsedHybridConfig, String> {
@@ -6887,6 +7074,24 @@ mod tests {
             eligible_config(resolved.architecture_plan()),
             Err(ReplicatedTextIneligibility::EmbeddedPrediction)
         ));
+
+        let (_root, inspection) = inspected_config(config);
+        let request = crate::partitioned_execution::PartitionedSelectionRequest::new(
+            eredu_core::ParallelTopology::new(2, 1, 1, 1).unwrap(),
+            0,
+            1,
+            32,
+            eredu_runtime::PipelineActivationDtype::Float32,
+        )
+        .unwrap()
+        .with_completion_policy(partitioned_test_completion_policy());
+        let error = crate::partitioned_execution::dispatch_partitioned_admission(
+            &inspection,
+            request,
+            CollectPartitionedAdmission,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("embedded prediction"));
     }
 
     #[test]
@@ -6902,6 +7107,312 @@ mod tests {
         assert_eq!(
             requirements,
             replicated_text_requirements(&inspection).unwrap()
+        );
+    }
+
+    #[derive(Debug)]
+    enum CollectedPartitionedAdmission {
+        Direct(crate::partitioned_execution::DirectPartitionedAdmission),
+        Routed(crate::partitioned_execution::RoutedPartitionedAdmission),
+        Composite(crate::partitioned_execution::CompositePartitionedAdmission),
+    }
+
+    struct CollectPartitionedAdmission;
+
+    fn partitioned_test_completion_policy() -> eredu_runtime::CommunicationCompletionPolicy {
+        eredu_runtime::CommunicationCompletionPolicy::new(
+            std::time::Duration::from_secs(30),
+            eredu_core::CompletionCancellationMode::QuarantineUntilComplete,
+        )
+        .unwrap()
+    }
+
+    impl crate::partitioned_execution::PartitionedAdmissionDispatcher for CollectPartitionedAdmission {
+        type Output = CollectedPartitionedAdmission;
+        type Error = std::convert::Infallible;
+
+        fn direct(
+            self,
+            requirements: crate::partitioned_execution::DirectPartitionedAdmission,
+        ) -> Result<Self::Output, Self::Error> {
+            Ok(CollectedPartitionedAdmission::Direct(requirements))
+        }
+
+        fn routed(
+            self,
+            requirements: crate::partitioned_execution::RoutedPartitionedAdmission,
+        ) -> Result<Self::Output, Self::Error> {
+            Ok(CollectedPartitionedAdmission::Routed(requirements))
+        }
+
+        fn composite(
+            self,
+            requirements: crate::partitioned_execution::CompositePartitionedAdmission,
+        ) -> Result<Self::Output, Self::Error> {
+            Ok(CollectedPartitionedAdmission::Composite(requirements))
+        }
+    }
+
+    #[test]
+    fn partitioned_admission_project_exact_rank_and_opaque_communication() {
+        let mut llama = config("llama");
+        llama["num_key_value_heads"] = serde_json::json!(2);
+        let (_root, inspection) = inspected_config(llama);
+        let request = crate::partitioned_execution::PartitionedSelectionRequest::new(
+            eredu_core::ParallelTopology::new(2, 1, 1, 1).unwrap(),
+            1,
+            1,
+            32,
+            eredu_runtime::PipelineActivationDtype::Float32,
+        )
+        .unwrap()
+        .with_completion_policy(partitioned_test_completion_policy());
+        let selected = crate::partitioned_execution::dispatch_partitioned_admission(
+            &inspection,
+            request,
+            CollectPartitionedAdmission,
+        )
+        .unwrap();
+        let CollectedPartitionedAdmission::Direct(requirements) = selected else {
+            panic!("dense Llama did not select direct partitioned execution");
+        };
+        assert_eq!(requirements.topology().global_rank(), 1);
+        assert_eq!(requirements.communication().rank(), 1);
+        assert_eq!(requirements.communication().groups().len(), 1);
+        assert_eq!(
+            requirements.communication().groups()[0].local_index(),
+            Some(1)
+        );
+        assert_eq!(requirements.boundary().primary().shape(), &[1, 32, 8]);
+        let operations = requirements.communication().groups()[0]
+            .requirements()
+            .operations();
+        assert_eq!(operations.len(), 4);
+        assert_eq!(
+            operations[0].operation(),
+            eredu_runtime::CommunicationOperation::AllReduceSum
+        );
+        assert_eq!(
+            operations[1].operation(),
+            eredu_runtime::CommunicationOperation::AllGatherUneven
+        );
+        assert_eq!(
+            operations[2].operation(),
+            eredu_runtime::CommunicationOperation::Broadcast
+        );
+        assert_eq!(
+            operations[3].operation(),
+            eredu_runtime::CommunicationOperation::FailureAgreement
+        );
+        let incomplete = eredu_runtime::CommunicationCapabilities::new([operations[0].clone()])
+            .unwrap()
+            .with_completion_capabilities(
+                eredu_runtime::CommunicationCompletionCapabilities::new([
+                    eredu_core::CompletionCancellationMode::QuarantineUntilComplete,
+                ])
+                .unwrap(),
+            );
+        assert!(incomplete
+            .validate_manifest(requirements.communication())
+            .unwrap_err()
+            .to_string()
+            .contains("AllGather"));
+        assert_eq!(
+            requirements.activation_dtype(),
+            eredu_runtime::PipelineActivationDtype::Float32
+        );
+    }
+
+    #[test]
+    fn partitioned_admission_reject_data_before_dispatch() {
+        let (_root, inspection) = inspected("llama");
+        let request = crate::partitioned_execution::PartitionedSelectionRequest::new(
+            eredu_core::ParallelTopology::new(1, 1, 1, 2).unwrap(),
+            0,
+            1,
+            32,
+            eredu_runtime::PipelineActivationDtype::Float32,
+        )
+        .unwrap()
+        .with_completion_policy(partitioned_test_completion_policy());
+        let error = crate::partitioned_execution::dispatch_partitioned_admission(
+            &inspection,
+            request,
+            CollectPartitionedAdmission,
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("data-parallel execution is not supported"));
+    }
+
+    #[test]
+    fn routed_partition_admits_expert_axis_with_exact_exchange_contract() {
+        let mut config = config("qwen3_moe");
+        config["num_experts"] = serde_json::json!(2);
+        config["num_experts_per_tok"] = serde_json::json!(1);
+        config["moe_intermediate_size"] = serde_json::json!(8);
+        let (_root, inspection) = inspected_config(config);
+        let request = crate::partitioned_execution::PartitionedSelectionRequest::new(
+            eredu_core::ParallelTopology::new(1, 1, 2, 1).unwrap(),
+            0,
+            1,
+            16,
+            eredu_runtime::PipelineActivationDtype::Float16,
+        )
+        .unwrap()
+        .with_completion_policy(partitioned_test_completion_policy());
+        let selected = crate::partitioned_execution::dispatch_partitioned_admission(
+            &inspection,
+            request,
+            CollectPartitionedAdmission,
+        )
+        .unwrap();
+        let CollectedPartitionedAdmission::Routed(requirements) = selected else {
+            panic!("Qwen3-MoE EP must retain routed admission");
+        };
+        let expert_group = requirements
+            .expert_group()
+            .expect("EP admission must select an opaque expert group");
+        let descriptor = requirements
+            .communication()
+            .groups()
+            .iter()
+            .find(|group| group.id() == expert_group)
+            .expect("selected expert group must be present");
+        assert_eq!(descriptor.members(), [0, 1]);
+        assert_eq!(descriptor.local_index(), Some(0));
+        assert_eq!(
+            descriptor
+                .requirements()
+                .operations()
+                .iter()
+                .map(eredu_runtime::CommunicationOperationRequirement::operation)
+                .collect::<Vec<_>>(),
+            [
+                eredu_runtime::CommunicationOperation::AllGatherEven,
+                eredu_runtime::CommunicationOperation::VariableAllToAll,
+            ]
+        );
+    }
+
+    #[test]
+    fn composite_partition_uses_architecture_boundary_and_pipeline_routes() {
+        let (_root, inspection) = inspected_config(gemma4_config());
+        let request = crate::partitioned_execution::PartitionedSelectionRequest::new(
+            eredu_core::ParallelTopology::new(1, 2, 1, 1).unwrap(),
+            0,
+            2,
+            12,
+            eredu_runtime::PipelineActivationDtype::Bfloat16,
+        )
+        .unwrap()
+        .with_completion_policy(partitioned_test_completion_policy());
+        let selected = crate::partitioned_execution::dispatch_partitioned_admission(
+            &inspection,
+            request,
+            CollectPartitionedAdmission,
+        )
+        .unwrap();
+        let CollectedPartitionedAdmission::Composite(requirements) = selected else {
+            panic!("Gemma 4 did not select composite partitioned execution");
+        };
+        assert_eq!(requirements.boundary().identity(), "gemma4.text");
+        assert_eq!(requirements.boundary().primary().shape(), &[2, 12, 16]);
+        assert!(!requirements.communication().routes().is_empty());
+        assert_eq!(
+            requirements.boundary_routes().len(),
+            requirements.communication().routes().len()
+        );
+        for (selected, descriptor) in requirements
+            .boundary_routes()
+            .iter()
+            .zip(requirements.communication().routes())
+        {
+            assert_eq!(selected.route().route, descriptor.id());
+            assert_eq!(selected.route().source_rank, descriptor.source());
+            assert_eq!(selected.route().destination_rank, descriptor.destination());
+            assert_eq!(selected.schema().identity(), "gemma4.text");
+            assert_eq!(
+                descriptor.boundary_contract().unwrap().schema(),
+                selected.schema().identity()
+            );
+        }
+        assert!(requirements
+            .communication()
+            .routes()
+            .iter()
+            .all(|route| route.requirement().operation()
+                == eredu_runtime::CommunicationOperation::SendReceive));
+    }
+
+    #[test]
+    fn composite_partition_rejects_route_endpoint_schema_and_cardinality_drift() {
+        let (_root, inspection) = inspected_config(gemma4_config());
+        let request = || {
+            crate::partitioned_execution::PartitionedSelectionRequest::new(
+                eredu_core::ParallelTopology::new(1, 2, 1, 1).unwrap(),
+                0,
+                2,
+                12,
+                eredu_runtime::PipelineActivationDtype::Bfloat16,
+            )
+            .unwrap()
+            .with_completion_policy(partitioned_test_completion_policy())
+        };
+        let admission = || {
+            let selected = crate::partitioned_execution::dispatch_partitioned_admission(
+                &inspection,
+                request(),
+                CollectPartitionedAdmission,
+            )
+            .unwrap();
+            let CollectedPartitionedAdmission::Composite(requirements) = selected else {
+                panic!("Gemma 4 did not select composite partitioned execution");
+            };
+            requirements
+        };
+
+        let mut cardinality = admission();
+        cardinality.test_boundary_routes_mut().pop().unwrap();
+        assert!(
+            crate::partitioned_execution::validate_selected_boundary_routes(&cardinality)
+                .unwrap_err()
+                .contains("cardinality")
+        );
+
+        let mut rank = admission();
+        rank.test_boundary_routes_mut()[0]
+            .test_route_mut()
+            .source_rank = usize::MAX;
+        assert!(
+            crate::partitioned_execution::validate_selected_boundary_routes(&rank)
+                .unwrap_err()
+                .contains("endpoints")
+        );
+
+        let mut group = admission();
+        group.test_boundary_routes_mut()[0]
+            .test_route_mut()
+            .source_group = usize::MAX;
+        assert!(
+            crate::partitioned_execution::validate_selected_boundary_routes(&group)
+                .unwrap_err()
+                .contains("execution-graph edge")
+        );
+
+        let mut schema = admission();
+        *schema.test_boundary_routes_mut()[0].test_schema_mut() =
+            eredu_runtime::ArchitectureBoundary::wire_schema(
+                &eredu_runtime::NoAuxiliaryBoundarySchema::new(1),
+            )
+            .unwrap()
+            .resolve(2, 12)
+            .unwrap();
+        assert!(
+            crate::partitioned_execution::validate_selected_boundary_routes(&schema)
+                .unwrap_err()
+                .contains("schema/cardinality")
         );
     }
 

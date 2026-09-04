@@ -94,7 +94,6 @@ impl Executable {
             Self::DeepSeek(_, _, _)
             | Self::GptOss(_, _, _)
             | Self::KimiLinear(_, _, _)
-            | Self::PartitionedLlama(_, _, _)
             | Self::ReplicatedText(_, _)
             | Self::Lfm2(_, _, _)
             | Self::NemotronH(_, _, _)
@@ -119,7 +118,6 @@ impl Executable {
                     capability::deepseek_v4(model.v4_args().expect("DeepSeek family"))
                 }
             }
-            Self::PartitionedLlama(_, model, _) => capability::llama(model.args()),
             Self::ReplicatedText(_, model) => Ok(model.capability_estimate().clone()),
             Self::Qwen(_, model, _) => capability::qwen(model.args()),
             Self::MuseGlimmer(_, model, _) => capability::muse_glimmer(model.args()),
@@ -201,16 +199,14 @@ fn prepared_media_accounting_with_plan(
     ))
 }
 
-pub fn model_capabilities(
-    session: &MlxModelSession<'_>,
-) -> Result<ModelCapabilities, CapabilityError> {
+pub fn model_capabilities(session: &MlxModelSession) -> Result<ModelCapabilities, CapabilityError> {
     session
         .capability_estimate()
         .map(|estimate| estimate.into_parts().0)
 }
 
 pub fn count_prepared_input(
-    session: &MlxModelSession<'_>,
+    session: &MlxModelSession,
     prepared: input::ModelInput<'_>,
     _stream: &Stream,
 ) -> Result<InputTokenCount, CapabilityError> {
@@ -268,7 +264,7 @@ pub fn count_prepared_input(
 }
 
 pub fn model_runtime_state(
-    session: &MlxModelSession<'_>,
+    session: &MlxModelSession,
     input: InputTokenCount,
     max_output_tokens: u64,
     batch_size: u64,
@@ -285,7 +281,7 @@ pub fn model_runtime_state(
 }
 
 pub fn static_model_memory(
-    session: &MlxModelSession<'_>,
+    session: &MlxModelSession,
 ) -> Result<StaticMemoryReport, CapabilityError> {
     let residency = session
         .residency_report()

@@ -231,6 +231,25 @@ pub struct ModelArgs {
 }
 
 impl ModelArgs {
+    /// Returns the ordinary target policy with embedded prediction removed.
+    ///
+    /// The complete admitted configuration remains the authority for MTP
+    /// parameters and state. This projection changes only extension-owned
+    /// scheduling, so the ordinary target can enter the neutral partitioned
+    /// constructor without duplicating its modules or cache.
+    pub fn prediction_target(&self) -> Result<Self, ConfigError> {
+        if self.num_nextn_predict_layers <= 0 {
+            return Err(invalid(
+                "Nemotron-H prediction target requires a positive MTP depth",
+            ));
+        }
+        let mut target = self.clone();
+        target.num_nextn_predict_layers = 0;
+        target.mtp_hybrid_override_pattern = None;
+        target.validate()?;
+        Ok(target)
+    }
+
     /// Validates the normalized target, MTP, recurrent, attention, and expert geometry.
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.model_type != "nemotron_h" {

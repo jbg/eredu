@@ -135,6 +135,11 @@ impl Drop for NativeGroup {
 }
 
 impl Group {
+    /// Returns whether two handles retain the same native communicator.
+    pub fn shares_native_handle(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.native, &other.native)
+    }
+
     pub(crate) fn from_owned_ptr(c_group: safemlx_sys::mlx_distributed_group) -> Self {
         Self {
             native: Rc::new(NativeGroup { c_group }),

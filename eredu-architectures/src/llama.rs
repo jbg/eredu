@@ -13,10 +13,11 @@ pub use config::{
 };
 
 pub use crate::decoder::{
-    cache_layout, cache_layout_with_key_value_heads, create_caches,
-    layer_parallel_parameter_groups, state_layout, static_parallel_parameter_groups,
-    validate_caches, Attention, AttentionInput, AttentionProjection, Config, ForwardContext,
-    LayeredInput, Mlp, StaticModules, TransformerBlock,
+    cache_layout, cache_layout_with_key_value_heads, create_caches, dense_parameter_description,
+    layer_parallel_parameter_groups, partition_local_geometry, state_layout,
+    static_parallel_parameter_groups, validate_caches, Attention, AttentionInput,
+    AttentionProjection, Config, ForwardContext, LayeredInput, Mlp, PartitionLocalGeometry,
+    PartitionStaticModules, StaticModules, TransformerBlock,
 };
 
 use eredu_nn::Error;
@@ -125,3 +126,25 @@ pub fn local_geometry(
 
 /// Shared dense-decoder lifecycle specialized to Llama configuration policy.
 pub type LayeredModel<B> = crate::decoder::LayeredModel<B, ModelArgs>;
+
+/// Genuinely pipeline-local neutral Llama/Mistral model.
+pub type PartitionedLayeredModel<B> = crate::decoder::PartitionedLayeredModel<B, ModelArgs>;
+
+impl crate::decoder::PartitionedConfig for ModelArgs {
+    fn set_local_geometry(
+        &mut self,
+        query_heads: i32,
+        key_value_heads: i32,
+        intermediate: i32,
+    ) -> Result<(), eredu_nn::Error> {
+        if query_heads <= 0 || key_value_heads <= 0 || intermediate <= 0 {
+            return Err(eredu_nn::Error::backend(
+                "local Llama geometry must be positive",
+            ));
+        }
+        self.num_attention_heads = query_heads;
+        self.num_key_value_heads = key_value_heads;
+        self.intermediate_size = intermediate;
+        Ok(())
+    }
+}

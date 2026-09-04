@@ -18,11 +18,15 @@ pub use config::{
     VlConfigError,
 };
 pub use model::{
-    prepare_input, ForwardContext, InputPart, LayeredModel, ModelInput, PipelineBoundary,
-    PipelineBoundarySchema, PipelinePartitionInput, PipelinePrepared, PipelineVisionState,
-    PreparedInput, StaticModules, Unit, TEXT_EXECUTION_GROUP, VISION_EXECUTION_GROUP,
+    prepare_input, vision_dependency_boundary_schema, vision_partition_boundary_schema,
+    ForwardContext, InputPart, LayeredModel, ModelInput, PipelineBoundary, PipelineBoundarySchema,
+    PipelinePartitionInput, PipelinePrepared, PipelineVisionState, PreparedInput, StaticModules,
+    Unit, TEXT_EXECUTION_GROUP, VISION_EXECUTION_GROUP,
 };
-pub use parallel::{local_geometry, LocalGeometry};
+pub use parallel::{
+    local_geometry, partition_local_geometry, partition_local_routed_geometry, LocalGeometry,
+    PartitionLocalFoundation, PartitionLocalGeometry,
+};
 pub use positions::{
     mrope_embeddings, mrope_values, multimodal_position_ids, position_ids_tensor, PositionPart,
 };

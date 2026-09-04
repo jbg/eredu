@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 
 use eredu_checkpoint::{recipe::DerivedWeightRecipe, store::CheckpointSource};
-use eredu_nn::{NeuralBackend, Parameterized};
+use eredu_nn::{NeuralBackend, Parameterized, Tensor};
 
 use crate::{
     observe_and_intervene, ActivationObserver, ExecutionGraph, ExecutionGroupSchedule,
@@ -656,6 +656,19 @@ where
         Vec::new()
     }
 
+    /// Borrows the exact ordinary-target value consumed by an additive prediction extension.
+    fn prediction_target_capture(_context: &Self::ForwardContext) -> Option<&B::Tensor> {
+        None
+    }
+
+    /// Declares the exact capture placeholder submitted by a non-output pipeline rank.
+    fn prediction_target_placeholder_shape(
+        &self,
+        _forward: &Self::ForwardContext,
+    ) -> Result<Option<Vec<i32>>, Self::Error> {
+        Ok(None)
+    }
+
     /// Declares how the complete mutable-state layout is divided among realized partitions.
     fn state_partition_plan(&self, layout: &StateLayout) -> crate::ArchitectureStatePartitionPlan;
 
@@ -1016,6 +1029,29 @@ where
     B: eredu_nn::GroupedNeuralBackend,
     S: RuntimeState<B>,
 {
+    /// Classifies routed storage access from architecture-visible unit input.
+    ///
+    /// Architectures with a nonstandard pass contract may override this
+    /// method; concrete backends must not derive the semantic pass.
+    fn expert_pass_for_unit(
+        &self,
+        _group: usize,
+        _index: usize,
+        hidden: &B::Tensor,
+        _forward: &Self::ForwardContext,
+    ) -> ExpertPass {
+        let sequence = hidden
+            .shape()
+            .get(hidden.shape().len().saturating_sub(2))
+            .copied()
+            .unwrap_or(1);
+        if sequence > 1 {
+            ExpertPass::Prefill
+        } else {
+            ExpertPass::Decode
+        }
+    }
+
     /// Returns the architecture-owned routing observation point for one unit.
     ///
     /// Architectures without observable routed work in the selected unit return
@@ -1046,6 +1082,29 @@ where
     where
         P: RoutedExpertProvider<B>,
         P::Error: std::fmt::Display;
+
+    /// Executes one unit with architecture-owned pass classification.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_unit_with_inferred_provider<P>(
+        &mut self,
+        group: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        provider: &mut P,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error>
+    where
+        P: RoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+    {
+        let pass = self.expert_pass_for_unit(group, index, hidden, forward);
+        self.forward_unit_with_provider(
+            group, index, unit, hidden, state, forward, pass, provider, context,
+        )
+    }
 
     /// Executes one provider-backed unit while exposing its architecture-owned
     /// routed/shared/combined observation stages.
@@ -1088,6 +1147,33 @@ where
                 group, index, unit, hidden, state, forward, pass, provider, context,
             ),
         }
+    }
+
+    /// Executes one observed provider-backed unit with architecture-owned pass
+    /// classification.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_unit_observed_with_inferred_provider<P, O>(
+        &mut self,
+        group: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        provider: &mut P,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Self::Error>
+    where
+        P: RoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+        O: ActivationObserver<B::Tensor, Self::Error> + ?Sized,
+        Self::Error: std::fmt::Display,
+    {
+        let pass = self.expert_pass_for_unit(group, index, hidden, forward);
+        self.forward_unit_observed_with_provider(
+            group, index, unit, hidden, state, forward, pass, provider, context, observer,
+        )
     }
 }
 
@@ -1378,7 +1464,7 @@ where
 }
 
 /// Failure-safe ownership of one policy forward and its current unit lease.
-struct LayerwisePolicyForward<'a, B, U, P>
+pub struct LayerwisePolicyForward<'a, B, U, P>
 where
     B: NeuralBackend,
     P: LayerwisePolicy<B, U>,
@@ -1395,7 +1481,8 @@ where
     B: NeuralBackend,
     P: LayerwisePolicy<B, U>,
 {
-    fn begin(
+    /// Begins one failure-safe policy transaction.
+    pub fn begin(
         policy: &'a mut P,
         initial: &B::Tensor,
         context: &'a <B::Tensor as eredu_nn::Tensor>::Context,
@@ -1413,7 +1500,8 @@ where
         })
     }
 
-    fn acquire<E, F>(
+    /// Acquires one unit and retains its lease until completion or abort.
+    pub fn acquire<E, F>(
         &mut self,
         ordinal: usize,
         address: crate::ExecutionUnitAddress,
@@ -1432,7 +1520,8 @@ where
             .2)
     }
 
-    fn complete<'value, StateValues, ContextValues>(
+    /// Completes and returns the currently active unit lease.
+    pub fn complete<'value, StateValues, ContextValues>(
         &mut self,
         output: &'value B::Tensor,
         state_values: StateValues,
@@ -1458,7 +1547,8 @@ where
         )
     }
 
-    fn finish(&mut self, output: &B::Tensor) -> Result<(), P::Error> {
+    /// Completes the transaction; dropping before this call aborts it.
+    pub fn finish(&mut self, output: &B::Tensor) -> Result<(), P::Error> {
         self.policy.finish(output, self.context)?;
         self.finished = true;
         Ok(())
@@ -1866,6 +1956,108 @@ where
                     state,
                     forward,
                     pass,
+                    provider,
+                    context,
+                    &mut **routed_observer.borrow_mut(),
+                )
+            },
+            &mut hook,
+        )
+    }
+
+    /// Runs provider-backed observed execution with architecture-owned pass
+    /// classification.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_with_inferred_provider_and_observer<'a, Provider, Observer>(
+        &mut self,
+        input: A::Input<'a>,
+        state: &mut S,
+        provider: &mut Provider,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        observer: &mut Observer,
+    ) -> Result<B::Tensor, LayerwiseRuntimeError<A::Error, P::Error>>
+    where
+        B: eredu_nn::GroupedNeuralBackend,
+        A: RoutedLayeredArchitecture<B, S>,
+        A::Error: std::fmt::Display,
+        Provider: RoutedExpertProvider<B>,
+        Provider::Error: std::fmt::Display,
+        Observer: ActivationObserver<B::Tensor, A::Error> + ?Sized,
+    {
+        self.forward_with_inferred_provider_and_observer_and_context(
+            input, state, provider, context, observer,
+        )
+        .map(|(output, _)| output)
+    }
+
+    /// Runs provider-backed observed execution with architecture-owned pass
+    /// classification while retaining forward resources.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_with_inferred_provider_and_observer_and_context<'a, Provider, Observer>(
+        &mut self,
+        input: A::Input<'a>,
+        state: &mut S,
+        provider: &mut Provider,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        observer: &mut Observer,
+    ) -> Result<(B::Tensor, A::ForwardContext), LayerwiseRuntimeError<A::Error, P::Error>>
+    where
+        B: eredu_nn::GroupedNeuralBackend,
+        A: RoutedLayeredArchitecture<B, S>,
+        A::Error: std::fmt::Display,
+        Provider: RoutedExpertProvider<B>,
+        Provider::Error: std::fmt::Display,
+        Observer: ActivationObserver<B::Tensor, A::Error> + ?Sized,
+    {
+        let graph = self
+            .architecture
+            .execution_graph()
+            .map_err(LayerwiseRuntimeError::Architecture)?;
+        let mut units = Vec::with_capacity(graph.groups().len());
+        let mut group_inputs = Vec::with_capacity(graph.groups().len());
+        let mut group_outputs = Vec::with_capacity(graph.groups().len());
+        for group in 0..graph.groups().len() {
+            let count = self
+                .architecture
+                .group_unit_count(group)
+                .map_err(LayerwiseRuntimeError::Architecture)?;
+            units.push(
+                (0..count)
+                    .map(|index| self.architecture.unit_path(group, index))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(LayerwiseRuntimeError::Architecture)?,
+            );
+            group_inputs.push(
+                self.architecture
+                    .group_input_observation_path(group)
+                    .map_err(LayerwiseRuntimeError::Architecture)?,
+            );
+            group_outputs.push(
+                self.architecture
+                    .group_output_observation_path(group)
+                    .map_err(LayerwiseRuntimeError::Architecture)?,
+            );
+        }
+        let observer = std::rc::Rc::new(std::cell::RefCell::new(observer));
+        let routed_observer = observer.clone();
+        let mut hook = ActivationObserverTraversalHook {
+            observer,
+            units,
+            group_inputs,
+            group_outputs,
+        };
+        self.forward_with_unit_executor_and_traversal_hook(
+            input,
+            state,
+            context,
+            |architecture, group, index, unit, hidden, state, forward, context| {
+                architecture.forward_unit_observed_with_inferred_provider(
+                    group,
+                    index,
+                    unit,
+                    hidden,
+                    state,
+                    forward,
                     provider,
                     context,
                     &mut **routed_observer.borrow_mut(),

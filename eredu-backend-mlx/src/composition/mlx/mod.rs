@@ -43,6 +43,8 @@ pub(crate) mod path_instrumentation {
         pub(crate) constructors: usize,
         pub(crate) unit_constructions: usize,
         pub(crate) materializations: usize,
+        pub(crate) local_static_bindings: usize,
+        pub(crate) excluded_local_static_parameters: usize,
         pub(crate) forwards: usize,
         pub(crate) state_publications: usize,
         pub(crate) completions: usize,
@@ -50,14 +52,40 @@ pub(crate) mod path_instrumentation {
 
     thread_local! {
         static COUNTS: Cell<Counts> = Cell::new(Counts::default());
+        static COMMUNICATION_REALIZATION_ATTEMPTS: Cell<usize> = const { Cell::new(0) };
+        static MANIFEST_COMMUNICATION_REALIZATION_ATTEMPTS: Cell<usize> = const { Cell::new(0) };
+        static NEUTRAL_PARTITIONED_CONSTRUCTIONS: Cell<usize> = const { Cell::new(0) };
+        static BOUNDED_UNIT_ACQUISITIONS: Cell<usize> = const { Cell::new(0) };
+        static VARIABLE_ALL_TO_ALL_SUBMISSIONS: Cell<usize> = const { Cell::new(0) };
     }
 
     pub(crate) fn reset() {
         COUNTS.set(Counts::default());
+        COMMUNICATION_REALIZATION_ATTEMPTS.set(0);
+        MANIFEST_COMMUNICATION_REALIZATION_ATTEMPTS.set(0);
+        NEUTRAL_PARTITIONED_CONSTRUCTIONS.set(0);
+        BOUNDED_UNIT_ACQUISITIONS.set(0);
+        VARIABLE_ALL_TO_ALL_SUBMISSIONS.set(0);
     }
 
     pub(crate) fn snapshot() -> Counts {
         COUNTS.get()
+    }
+
+    pub(crate) fn communication_realization_attempts() -> usize {
+        COMMUNICATION_REALIZATION_ATTEMPTS.get()
+    }
+
+    pub(crate) fn communication_realization_attempt() {
+        COMMUNICATION_REALIZATION_ATTEMPTS.with(|count| count.set(count.get() + 1));
+    }
+
+    pub(crate) fn manifest_communication_realization_attempts() -> usize {
+        MANIFEST_COMMUNICATION_REALIZATION_ATTEMPTS.get()
+    }
+
+    pub(crate) fn manifest_communication_realization_attempt() {
+        MANIFEST_COMMUNICATION_REALIZATION_ATTEMPTS.with(|count| count.set(count.get() + 1));
     }
 
     pub(crate) fn architecture_construction() {
@@ -66,6 +94,30 @@ pub(crate) mod path_instrumentation {
             counts.architecture_constructions += 1;
             cell.set(counts);
         });
+    }
+
+    pub(crate) fn neutral_partitioned_construction() {
+        NEUTRAL_PARTITIONED_CONSTRUCTIONS.with(|count| count.set(count.get() + 1));
+    }
+
+    pub(crate) fn neutral_partitioned_constructions() -> usize {
+        NEUTRAL_PARTITIONED_CONSTRUCTIONS.get()
+    }
+
+    pub(crate) fn bounded_unit_acquisitions() -> usize {
+        BOUNDED_UNIT_ACQUISITIONS.get()
+    }
+
+    pub(crate) fn bounded_unit_acquisition() {
+        BOUNDED_UNIT_ACQUISITIONS.with(|count| count.set(count.get() + 1));
+    }
+
+    pub(crate) fn variable_all_to_all_submissions() -> usize {
+        VARIABLE_ALL_TO_ALL_SUBMISSIONS.get()
+    }
+
+    pub(crate) fn variable_all_to_all_submission() {
+        VARIABLE_ALL_TO_ALL_SUBMISSIONS.with(|count| count.set(count.get() + 1));
     }
 
     pub(crate) fn payload_open() {
@@ -112,6 +164,15 @@ pub(crate) mod path_instrumentation {
         COUNTS.with(|cell| {
             let mut counts = cell.get();
             counts.materializations += 1;
+            cell.set(counts);
+        });
+    }
+
+    pub(crate) fn local_static_materialization(selected: usize, excluded: usize) {
+        COUNTS.with(|cell| {
+            let mut counts = cell.get();
+            counts.local_static_bindings += selected;
+            counts.excluded_local_static_parameters += excluded;
             cell.set(counts);
         });
     }

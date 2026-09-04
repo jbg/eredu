@@ -59,7 +59,22 @@ where
         layer: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        Self::new_at(args, layer, &format!("layers.{layer}"), context)
+        Self::new_at(args, layer, &format!("layers.{layer}"), None, context)
+    }
+
+    pub(crate) fn new_with_expert_spec(
+        args: &V4Args,
+        layer: usize,
+        expert_spec: eredu_nn::GroupedGatedProductSpec,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        Self::new_at(
+            args,
+            layer,
+            &format!("layers.{layer}"),
+            Some(expert_spec),
+            context,
+        )
     }
 
     /// Builds one appended DSpark block from the canonical prediction root.
@@ -69,13 +84,14 @@ where
         depth: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        Self::new_at(args, layer, &format!("mtp.{depth}"), context)
+        Self::new_at(args, layer, &format!("mtp.{depth}"), None, context)
     }
 
     pub(crate) fn new_at(
         args: &V4Args,
         layer: usize,
         root: &str,
+        expert_spec: Option<eredu_nn::GroupedGatedProductSpec>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
         args.validate().map_err(Error::backend)?;
@@ -111,10 +127,13 @@ where
         };
         Ok(Self {
             attention: V4Attention::new_at(args, layer, &format!("{root}.attn"), context)?,
-            feed_forward: RoutedPlusShared::new(
-                &super::v4::moe_policy_at(args, layer, &format!("{root}.ffn"))?,
-                context,
-            )?,
+            feed_forward: {
+                let policy = super::v4::moe_policy_at(args, layer, &format!("{root}.ffn"))?;
+                match expert_spec {
+                    Some(spec) => RoutedPlusShared::new_with_expert_spec(&policy, spec, context)?,
+                    None => RoutedPlusShared::new(&policy, context)?,
+                }
+            },
             attention_norm: norm(format!("{root}.attn_norm.weight"))?,
             feed_forward_norm: norm(format!("{root}.ffn_norm.weight"))?,
             attention_connection: connection("attn")?,
@@ -559,7 +578,25 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAtt
             .layer_schedule
             .get(layer)
             .ok_or_else(|| Error::backend(format!("missing V3 layer policy {layer}")))?;
-        Self::new_with_policy(args, layer, policy, context)
+        Self::new_with_policy(args, layer, policy, None, context)
+    }
+
+    pub(crate) fn new_with_expert_spec(
+        args: &V3Args,
+        layer: usize,
+        expert_spec: eredu_nn::GroupedGatedProductSpec,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        let policy = *args
+            .layer_schedule
+            .get(layer)
+            .ok_or_else(|| Error::backend(format!("missing V3 layer policy {layer}")))?;
+        if policy != LayerPolicy::SparseMoe {
+            return Err(Error::backend(format!(
+                "V3 expert realization names dense layer {layer}"
+            )));
+        }
+        Self::new_with_policy(args, layer, policy, Some(expert_spec), context)
     }
 
     pub(crate) fn new_prediction(
@@ -567,13 +604,14 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAtt
         layer: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        Self::new_with_policy(args, layer, LayerPolicy::SparseMoe, context)
+        Self::new_with_policy(args, layer, LayerPolicy::SparseMoe, None, context)
     }
 
     fn new_with_policy(
         args: &V3Args,
         layer: usize,
         policy: LayerPolicy,
+        expert_spec: Option<eredu_nn::GroupedGatedProductSpec>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
         let root = format!("model.layers.{layer}");
@@ -599,7 +637,12 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAtt
                     } else {
                         super::v3::prediction_moe_policy(args, layer)?
                     };
-                    V3FeedForward::Routed(RoutedPlusShared::new(&policy, context)?)
+                    V3FeedForward::Routed(match expert_spec {
+                        Some(spec) => {
+                            RoutedPlusShared::new_with_expert_spec(&policy, spec, context)?
+                        }
+                        None => RoutedPlusShared::new(&policy, context)?,
+                    })
                 }
             },
             input_norm: norm("input_layernorm")?,

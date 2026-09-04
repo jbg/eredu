@@ -1156,7 +1156,12 @@ pub fn expert_residency_catalog<C: RecipeCatalog + ?Sized>(
     let mut units = Vec::with_capacity(capacity);
     for layer in 0..layers {
         let unit_path = format!("model.layers.{layer}");
-        let bank = expert_recipes(catalog, layer)?;
+        let bank = match args.weight_convention {
+            super::WeightConvention::HuggingFace => {
+                safetensors_expert_recipes(catalog, args, layer)?
+            }
+            super::WeightConvention::Gguf => expert_recipes(catalog, layer)?,
+        };
         for expert in 0..experts {
             let selection = TensorSelection::Range {
                 axis: 0,

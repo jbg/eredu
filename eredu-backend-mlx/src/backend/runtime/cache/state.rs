@@ -1006,6 +1006,7 @@ impl ResettableRuntimeLayerState<MlxNeuralBackend> for MlxKeyValueLayerState {
 #[derive(Debug, Clone)]
 pub struct MlxKeyValueState {
     layout: StateLayout,
+    global_layer_start: usize,
     layers: Vec<MlxKeyValueLayerState>,
     paged_transaction_branch: bool,
 }
@@ -1097,6 +1098,14 @@ fn common_selected_placement(
 impl MlxKeyValueState {
     /// Creates contiguous execution-device state for every declared layer.
     pub fn device(layout: StateLayout) -> Result<Self, Exception> {
+        Self::device_with_global_layer_start(layout, 0)
+    }
+
+    /// Creates contiguous state addressed from an architecture-global layer.
+    pub fn device_with_global_layer_start(
+        layout: StateLayout,
+        global_layer_start: usize,
+    ) -> Result<Self, Exception> {
         let layers = layout
             .layers()
             .iter()
@@ -1111,6 +1120,7 @@ impl MlxKeyValueState {
             .collect::<Result<Vec<_>, Exception>>()?;
         Ok(Self {
             layout,
+            global_layer_start,
             layers,
             paged_transaction_branch: false,
         })
@@ -1122,18 +1132,32 @@ impl MlxKeyValueState {
         manager: CacheResidencyManager,
         rank: Option<CacheRankIdentity>,
     ) -> Result<Self, Exception> {
+        Self::paged_with_global_layer_start(layout, manager, rank, 0)
+    }
+
+    /// Creates block-addressable state addressed from an architecture-global layer.
+    pub fn paged_with_global_layer_start(
+        layout: StateLayout,
+        manager: CacheResidencyManager,
+        rank: Option<CacheRankIdentity>,
+        global_layer_start: usize,
+    ) -> Result<Self, Exception> {
         let layers = layout
             .layers()
             .iter()
             .enumerate()
             .map(|(layer, policy)| {
                 let window = key_value_window(layer, policy)?;
-                PagedKeyValueCache::new_with_layout(manager.clone(), layer, window, 0, rank)
+                let global_layer = global_layer_start.checked_add(layer).ok_or_else(|| {
+                    Exception::custom("key/value state global layer index overflowed")
+                })?;
+                PagedKeyValueCache::new_with_layout(manager.clone(), global_layer, window, 0, rank)
                     .map(MlxKeyValueLayerState::Paged)
             })
             .collect::<Result<Vec<_>, Exception>>()?;
         Ok(Self {
             layout,
+            global_layer_start,
             layers,
             paged_transaction_branch: false,
         })
@@ -1147,6 +1171,16 @@ impl MlxKeyValueState {
         selected: &SelectedStateRealization,
         manager: Option<CacheResidencyManager>,
         rank: Option<CacheRankIdentity>,
+    ) -> Result<Self, Exception> {
+        Self::from_selected_with_global_layer_start(selected, manager, rank, 0)
+    }
+
+    /// Creates selected state addressed from an architecture-global layer.
+    pub fn from_selected_with_global_layer_start(
+        selected: &SelectedStateRealization,
+        manager: Option<CacheResidencyManager>,
+        rank: Option<CacheRankIdentity>,
+        global_layer_start: usize,
     ) -> Result<Self, Exception> {
         let selected_layers = selected_state_layers(selected)?;
         let layout = selected.layout().clone();
@@ -1172,9 +1206,12 @@ impl MlxKeyValueState {
                                 "MLX paged key/value state has no residency manager at layer {layer}"
                             ))
                         })?;
+                        let global_layer = global_layer_start.checked_add(layer).ok_or_else(|| {
+                            Exception::custom("key/value state global layer index overflowed")
+                        })?;
                         PagedKeyValueCache::new_with_layout(
                             manager.clone(),
-                            layer,
+                            global_layer,
                             window,
                             0,
                             rank,
@@ -1192,6 +1229,7 @@ impl MlxKeyValueState {
             .collect::<Result<Vec<_>, Exception>>()?;
         Ok(Self {
             layout,
+            global_layer_start,
             layers,
             paged_transaction_branch: false,
         })
@@ -1223,6 +1261,7 @@ impl MlxKeyValueState {
     pub fn deep_clone_state(&self) -> Result<Self, Exception> {
         Ok(Self {
             layout: self.layout.clone(),
+            global_layer_start: self.global_layer_start,
             layers: self
                 .layers
                 .iter()
@@ -1234,6 +1273,7 @@ impl MlxKeyValueState {
 
     fn has_same_transaction_identity(&self, other: &Self) -> bool {
         self.layout == other.layout
+            && self.global_layer_start == other.global_layer_start
             && self.layers.len() == other.layers.len()
             && self
                 .layers
@@ -1255,7 +1295,10 @@ impl MlxKeyValueState {
         checkpoint: &Self,
         stream: &Stream,
     ) -> Result<(), Exception> {
-        if self.layout != checkpoint.layout || self.layers.len() != checkpoint.layers.len() {
+        if self.layout != checkpoint.layout
+            || self.global_layer_start != checkpoint.global_layer_start
+            || self.layers.len() != checkpoint.layers.len()
+        {
             return Err(Exception::custom(
                 "key/value state checkpoint layout does not match canonical state",
             ));
@@ -1955,6 +1998,7 @@ pub struct MlxHybridState {
     layout: StateLayout,
     global_layer_start: usize,
     layers: Vec<MlxHybridLayerState>,
+    manager: Option<CacheResidencyManager>,
 }
 
 impl MlxHybridState {
@@ -1978,6 +2022,7 @@ impl MlxHybridState {
             layout,
             global_layer_start,
             layers,
+            manager: None,
         })
     }
 
@@ -2012,6 +2057,7 @@ impl MlxHybridState {
             layout,
             global_layer_start,
             layers,
+            manager: Some(manager),
         })
     }
 
@@ -2059,6 +2105,7 @@ impl MlxHybridState {
             layout,
             global_layer_start,
             layers,
+            manager,
         })
     }
 
@@ -2069,10 +2116,12 @@ impl MlxHybridState {
 
     /// Borrows the paging manager shared by this state's attention components.
     pub fn residency_manager(&self) -> Option<&CacheResidencyManager> {
-        self.layers
-            .iter()
-            .filter_map(|layer| layer.attention.as_ref())
-            .find_map(MlxHybridAttentionState::manager)
+        self.manager.as_ref().or_else(|| {
+            self.layers
+                .iter()
+                .filter_map(|layer| layer.attention.as_ref())
+                .find_map(MlxHybridAttentionState::manager)
+        })
     }
 
     /// Borrows every native array retained by the complete hybrid state.
@@ -2162,6 +2211,7 @@ impl MlxHybridState {
                 .iter()
                 .map(MlxHybridLayerState::deep_clone_state)
                 .collect::<Result<_, _>>()?,
+            manager: self.manager.clone(),
         })
     }
 
@@ -2224,10 +2274,7 @@ impl MlxHybridState {
 
     /// Returns aggregate telemetry when this state contains paged attention.
     pub fn residency_report(&self) -> Result<Option<CacheResidencyReport>, Exception> {
-        self.layers
-            .iter()
-            .filter_map(|layer| layer.attention.as_ref())
-            .find_map(MlxHybridAttentionState::manager)
+        self.residency_manager()
             .map(CacheResidencyManager::report)
             .transpose()
             .map_err(|error| Exception::custom(error.to_string()))
@@ -2425,7 +2472,7 @@ impl MlxHybridState {
                 self.layers.len()
             )));
         }
-        let mut manager = None;
+        let mut manager = self.manager.clone();
         for (layer, (state, delta)) in self
             .layers
             .iter_mut()
@@ -2559,8 +2606,9 @@ mod semantic_transaction_tests {
     use super::*;
     use eredu_core::{
         cache::{
-            CacheRepresentation, MutableStateResidency, StateResidencyClass, StateTensorDimension,
-            StateTensorDtype, StateTensorPolicy,
+            CacheRepresentation, MutableStateResidency, PromptCacheModelIdentity,
+            PromptCacheStateSegment, PromptCacheTopology, StateResidencyClass,
+            StateTensorDimension, StateTensorDtype, StateTensorPolicy,
         },
         AttentionPolicy, LayerSchedule,
     };
@@ -2755,6 +2803,107 @@ mod semantic_transaction_tests {
         assert!(state.layers[0]
             .fixed
             .contains_key(&StateTensorRole::Recurrent));
+    }
+
+    #[test]
+    #[ignore = "requires MLX native array persistence"]
+    fn fixed_only_hybrid_prompt_cache_round_trips_without_attention() {
+        use crate::backend::runtime::cache::residency::{
+            load_prompt_cache_state_tensors, open_prompt_cache,
+        };
+        use crate::native::ExecutionContext;
+        use safemlx::{Device, DeviceType};
+
+        let role = StateTensorRole::Convolution { slot: 0 };
+        let fixed = StateTensorPolicy::new(
+            role,
+            vec![
+                StateTensorDimension::Batch,
+                StateTensorDimension::fixed(2).unwrap(),
+                StateTensorDimension::fixed(3).unwrap(),
+            ],
+            StateTensorDtype::Float32,
+            MutableStateResidency::AlwaysDeviceMutable,
+        )
+        .unwrap();
+        let layout = StateLayout::new(
+            LayerSchedule::new(1, vec![LayerCachePolicy::fixed_only(vec![fixed]).unwrap()])
+                .unwrap(),
+        )
+        .unwrap();
+        let paging = PagedCacheOptions::new(4, 1 << 20, 1 << 20, 1)
+            .unwrap()
+            .with_full_attention(true);
+        let selected = selected_state(
+            layout.clone(),
+            ReplicatedTextStateAccess::Fixed,
+            CacheResidencyPolicy::Paged(paging.clone()),
+        );
+        let mut state = MlxHybridState::from_selected(&selected, Some(manager()), None).unwrap();
+        let values = [1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        state.layers[0].fixed.insert(
+            role,
+            Some(MlxTensor::from_array(Array::from_slice(
+                &values,
+                &[1, 2, 3],
+            ))),
+        );
+        state.layers[0].fixed_offset = 3;
+
+        let segment = PromptCacheStateSegment::new("state", 0..1).unwrap();
+        let identity = PromptCacheModelIdentity::new(
+            "test-fixed-only",
+            "test-fixed-only",
+            "test-fixed-only-architecture",
+            1,
+            0,
+            1,
+            0,
+            PromptCacheTopology::default(),
+            layout.layers().clone(),
+            vec![0],
+            vec![segment],
+        )
+        .unwrap();
+        let descriptor = PromptCacheDescriptor::from_model_identity(
+            identity.clone(),
+            "test-fixed-only-checkpoint",
+            "tokens:1,2,3",
+            1,
+        )
+        .unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join("cache");
+        let tokens = [1_u32, 2, 3];
+        let manifest = state
+            .save_prompt_cache(
+                &destination,
+                descriptor.clone(),
+                &tokens,
+                &PromptCacheOptions::default(),
+            )
+            .unwrap();
+        assert!(manifest.blocks.is_empty());
+        assert_eq!(manifest.state_tensors.len(), 1);
+
+        let (restored_manager, manifest) =
+            open_prompt_cache(&destination, &descriptor, &identity, &tokens, paging).unwrap();
+        let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let stream = context.stream();
+        let tensors = load_prompt_cache_state_tensors(&destination, &manifest, stream).unwrap();
+        let mut restored =
+            MlxHybridState::from_selected(&selected, Some(restored_manager), None).unwrap();
+        restored
+            .restore_prompt_cache_state(tensors, 3, &[0])
+            .unwrap();
+        assert_eq!(restored.layers[0].position(), 3);
+        let restored = restored.layers[0].fixed[&role]
+            .as_ref()
+            .unwrap()
+            .as_array()
+            .evaluated()
+            .unwrap();
+        assert_eq!(restored.as_slice::<f32>(), values);
     }
 
     #[test]

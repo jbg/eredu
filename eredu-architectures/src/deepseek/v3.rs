@@ -182,6 +182,11 @@ pub struct ForwardContext<T> {
 }
 
 impl<T> ForwardContext<T> {
+    /// Borrows the token identity retained on every target pipeline rank.
+    pub const fn tokens(&self) -> &T {
+        &self.tokens
+    }
+
     /// Borrows the architecture-prepared target mask.
     pub const fn mask(&self) -> Option<&T> {
         self.mask.as_ref()
@@ -275,8 +280,14 @@ impl eredu_runtime::ArchitectureBoundary for TargetBoundarySchema {
     fn encode<T>(
         &self,
         boundary: Self::Boundary<T>,
-    ) -> Result<Vec<T>, eredu_runtime::ArchitectureBoundaryError> {
-        Ok(vec![boundary.tokens, boundary.embedded])
+    ) -> Result<
+        Vec<eredu_runtime::ArchitectureBoundaryValue<T>>,
+        eredu_runtime::ArchitectureBoundaryError,
+    > {
+        Ok(vec![
+            eredu_runtime::ArchitectureBoundaryValue::new("tokens", boundary.tokens)?,
+            eredu_runtime::ArchitectureBoundaryValue::new("embedded", boundary.embedded)?,
+        ])
     }
 
     fn decode<T>(
@@ -315,6 +326,7 @@ pub struct Model<
     groups: SequentialPredictionGroups,
     parallel_geometry: Option<Arc<super::parallel::V3LocalGeometry>>,
     expert_realization: Option<crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>>,
+    partition_target_start: usize,
 }
 
 impl<B> eredu_runtime::ArchitectureParameters<B> for Model<B>
@@ -389,6 +401,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAtt
             static_modules,
             parallel_geometry: None,
             expert_realization: None,
+            partition_target_start: 0,
         })
     }
 
@@ -417,6 +430,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAtt
             static_modules,
             parallel_geometry: Some(Arc::new(geometry)),
             expert_realization: None,
+            partition_target_start: 0,
         })
     }
 
@@ -439,6 +453,19 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAtt
         realization: crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>,
     ) {
         self.expert_realization = Some(realization);
+    }
+
+    /// Selects the architecture-global target-unit origin of a rank-local PP slice.
+    pub fn set_partition_target_start(&mut self, start: usize) {
+        self.partition_target_start = start;
+    }
+
+    fn target_state_ordinal(&self, index: usize) -> Result<usize, Error> {
+        index
+            .checked_sub(self.partition_target_start)
+            .ok_or_else(|| {
+                Error::backend("V3 target unit precedes the selected partition state slice")
+            })
     }
 
     /// Returns the normalized V3 arguments.
@@ -474,37 +501,57 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAtt
             .parallel_geometry
             .as_ref()
             .map_or(&self.args, |geometry| geometry.args());
+        let owner_group = if group == 0 {
+            "target".to_owned()
+        } else {
+            format!("mtp.{}", group - 1)
+        };
+        let selected_spec = self
+            .expert_realization
+            .as_ref()
+            .and_then(|realization| realization.unit_spec(&owner_group, index))
+            .cloned();
+        if group == 0
+            && self.expert_realization.is_some()
+            && args.layer_schedule.get(index) == Some(&LayerPolicy::SparseMoe)
+            && selected_spec.is_none()
+        {
+            return Err(Error::backend(format!(
+                "V3 expert realization has no bank for {owner_group}.{index}"
+            )));
+        }
         let mut unit = if group == 0 {
-            Unit::Target(V3Block::new(args, index, context)?)
+            let block = match selected_spec.clone() {
+                Some(spec) => V3Block::new_with_expert_spec(args, index, spec, context)?,
+                None => V3Block::new(args, index, context)?,
+            };
+            Unit::Target(block)
         } else {
             Unit::Prediction(V3PredictionLayer::new(args, group - 1, context)?)
         };
-        if let Some(realization) = &self.expert_realization {
-            let owner_group = if group == 0 {
-                "target".to_owned()
-            } else {
-                format!("mtp.{}", group - 1)
-            };
-            let spec = realization.unit_spec(&owner_group, index);
-            let feed_forward = match &mut unit {
-                Unit::Target(block) => &mut block.feed_forward,
-                Unit::Prediction(prediction) => &mut prediction.decoder.feed_forward,
-            };
-            match (feed_forward, spec) {
-                (super::block::V3FeedForward::Routed(moe), Some(spec)) => {
-                    moe.experts = B::grouped_gated_product(spec.clone(), context)?;
+        if group != 0 {
+            if let Some(realization) = &self.expert_realization {
+                let spec = realization.unit_spec(&owner_group, index);
+                let feed_forward = match &mut unit {
+                    Unit::Target(block) => &mut block.feed_forward,
+                    Unit::Prediction(prediction) => &mut prediction.decoder.feed_forward,
+                };
+                match (feed_forward, spec) {
+                    (super::block::V3FeedForward::Routed(moe), Some(spec)) => {
+                        moe.experts = B::grouped_gated_product(spec.clone(), context)?;
+                    }
+                    (super::block::V3FeedForward::Routed(_), None) => {
+                        return Err(Error::backend(format!(
+                            "V3 expert realization has no bank for {owner_group}.{index}"
+                        )));
+                    }
+                    (super::block::V3FeedForward::Dense(_), Some(_)) => {
+                        return Err(Error::backend(format!(
+                            "V3 expert realization names dense unit {owner_group}.{index}"
+                        )));
+                    }
+                    (super::block::V3FeedForward::Dense(_), None) => {}
                 }
-                (super::block::V3FeedForward::Routed(_), None) => {
-                    return Err(Error::backend(format!(
-                        "V3 expert realization has no bank for {owner_group}.{index}"
-                    )));
-                }
-                (super::block::V3FeedForward::Dense(_), Some(_)) => {
-                    return Err(Error::backend(format!(
-                        "V3 expert realization names dense unit {owner_group}.{index}"
-                    )));
-                }
-                (super::block::V3FeedForward::Dense(_), None) => {}
             }
         }
         Ok(unit)
@@ -879,7 +926,11 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAtt
             Unit::Target(unit) if group == 0 => unit.forward_with_provider(
                 hidden,
                 forward.mask.as_ref(),
-                Some(state.layer(index).map_err(Error::backend)?),
+                Some(
+                    state
+                        .layer(self.target_state_ordinal(index)?)
+                        .map_err(Error::backend)?,
+                ),
                 pass,
                 provider,
                 context,
@@ -935,7 +986,11 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAtt
             Unit::Target(unit) if group == 0 => unit.forward_parallel_with_provider(
                 hidden,
                 forward.mask.as_ref(),
-                Some(state.layer(index).map_err(Error::backend)?),
+                Some(
+                    state
+                        .layer(self.target_state_ordinal(index)?)
+                        .map_err(Error::backend)?,
+                ),
                 pass,
                 provider,
                 context,
@@ -988,7 +1043,11 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAtt
                 &format!("model.layers.{index}"),
                 hidden,
                 forward.mask.as_ref(),
-                Some(state.layer(index).map_err(Error::backend)?),
+                Some(
+                    state
+                        .layer(self.target_state_ordinal(index)?)
+                        .map_err(Error::backend)?,
+                ),
                 context,
                 observer,
             ),
@@ -1036,7 +1095,11 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAtt
                 &format!("model.layers.{index}"),
                 hidden,
                 forward.mask.as_ref(),
-                Some(state.layer(index).map_err(Error::backend)?),
+                Some(
+                    state
+                        .layer(self.target_state_ordinal(index)?)
+                        .map_err(Error::backend)?,
+                ),
                 pass,
                 provider,
                 context,
@@ -1131,6 +1194,21 @@ where
 
     fn prediction_execution_groups(&self) -> Vec<String> {
         self.groups.prediction_execution_groups()
+    }
+
+    fn prediction_target_capture(context: &Self::ForwardContext) -> Option<&B::Tensor> {
+        context.target_capture()
+    }
+
+    fn prediction_target_placeholder_shape(
+        &self,
+        forward: &Self::ForwardContext,
+    ) -> Result<Option<Vec<i32>>, Self::Error> {
+        Ok(Some(vec![
+            forward.tokens().dim(0),
+            forward.tokens().dim(1),
+            self.args.hidden_size,
+        ]))
     }
 
     fn state_partition_plan(
@@ -1586,6 +1664,30 @@ where
                 auxiliary: TargetBoundary::new(forward.tokens.clone(), forward.embedded.clone()),
             })
         }
+    }
+}
+
+impl<B, S> crate::partitioned_execution::TextPartitionArchitecture<B, S> for Model<B>
+where
+    B: eredu_nn::TensorParallelGroupedNeuralBackend
+        + eredu_nn::DistributedNeuralBackend
+        + BlockwiseAttentionBackend,
+    S: LayerRuntimeState<B>,
+    S::LayerState: CompressedAttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+{
+    fn partition_text_input<'a>(input: Self::Input<'a>) -> (&'a B::Tensor, Option<&'a B::Tensor>) {
+        match input {
+            EmbeddedInput::Target { tokens, mask } => (tokens, mask),
+            EmbeddedInput::Draft { .. }
+            | EmbeddedInput::DsparkContext { .. }
+            | EmbeddedInput::DsparkProposal { .. } => {
+                unreachable!("prediction-free V3 partition received prediction input")
+            }
+        }
+    }
+
+    fn partition_output_width(&self) -> i32 {
+        self.args.vocab_size
     }
 }
 

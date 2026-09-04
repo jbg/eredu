@@ -11,7 +11,7 @@ use eredu_backend_mlx::backend::{
 };
 use eredu_backend_mlx::native::{
     DeviceAssignment, MlxDrafter, MlxInspectionOptions, MlxModelInput, MlxModelOutput,
-    MlxModelSession, MlxParallelPlan, MlxRealtimeModel, MlxSessionCompletion,
+    MlxModelSession, MlxRealtimeModel, MlxSessionCompletion,
 };
 use eredu_backend_mlx::{MlxLoadRequest, MlxModelConfig, MlxTensor};
 use eredu_core::InspectableBackendSession;
@@ -49,8 +49,7 @@ fn composition_owned_native_types_have_one_public_native_path() {
     assert_public_type::<MlxInspectionOptions>();
     assert_public_type::<MlxModelInput>();
     assert_public_type::<MlxModelOutput>();
-    assert_public_type::<MlxModelSession<'static>>();
-    assert_public_type::<MlxParallelPlan>();
+    assert_public_type::<MlxModelSession>();
     assert_public_type::<MlxSessionCompletion>();
 }
 
@@ -58,7 +57,7 @@ fn composition_owned_native_types_have_one_public_native_path() {
 fn model_session_exposes_the_neutral_inspection_contract() {
     fn assert_inspectable<T: InspectableBackendSession<MlxBackend<'static>>>() {}
 
-    assert_inspectable::<MlxModelSession<'static>>();
+    assert_inspectable::<MlxModelSession>();
 }
 
 #[test]

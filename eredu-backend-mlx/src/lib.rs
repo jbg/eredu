@@ -65,7 +65,6 @@ pub mod native {
 
     pub use crate::backend::topology::DeviceAssignment;
     pub use crate::backend::{random::RandomState, ExecutionContext};
-    pub use crate::composition::mlx::distributed::topology::MlxParallelPlan;
     pub use crate::composition::mlx::realtime::personaplex_prompt::sine_frame as personaplex_sine_frame;
     pub use crate::composition::mlx::realtime::{
         MlxRealtimeBackend, MlxRealtimeCompletion, MlxRealtimeInput, MlxRealtimeModel,
@@ -109,16 +108,45 @@ pub mod native {
         crate::backend::MlxBackend::with_distributed_world(stream, weights_stream, world)
     }
 
-    /// Binds composition-owned semantic topology to otherwise ordinary model options.
+    /// Binds semantic topology, wire dtype, and maximum invocation geometry to model options.
+    ///
+    /// The batch and sequence limits resolve architecture-owned boundary
+    /// schemas during selection and must cover every later invocation.
     pub fn parallel_load_options(
-        topology: MlxParallelPlan,
+        topology: eredu_core::ParallelRankTopology,
+        device: DeviceAssignment,
         pipeline_wire: eredu_runtime::PipelineWireContract,
+        maximum_batch_size: i32,
+        maximum_sequence_length: i32,
+        completion_policy: eredu_runtime::CommunicationCompletionPolicy,
     ) -> crate::MlxLoadRequest {
-        crate::MlxLoadRequest::with_parallel(topology, pipeline_wire)
+        crate::MlxLoadRequest::with_parallel(
+            topology,
+            device,
+            pipeline_wire,
+            maximum_batch_size,
+            maximum_sequence_length,
+            completion_policy,
+        )
     }
 }
 
 mod tensor;
+
+#[cfg(test)]
+pub(crate) fn test_parallel_rank(
+    rank: usize,
+    tensor: usize,
+    pipeline: usize,
+    expert: usize,
+) -> eredu_core::ParallelRankTopology {
+    eredu_core::ParallelRankTopology::new(
+        eredu_core::ParallelTopology::new(tensor, pipeline, expert, 1)
+            .expect("test topology is valid"),
+        rank,
+    )
+    .expect("test rank belongs to topology")
+}
 
 #[cfg(test)]
 mod test_utils;

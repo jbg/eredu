@@ -584,15 +584,45 @@ pub struct SparseMlp<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBacken
 }
 
 impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMlp<B> {
+    fn shared_group_indices(
+        tokens: i32,
+        shared_count: i32,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        let capacity = usize::try_from(tokens)
+            .ok()
+            .and_then(|tokens| {
+                usize::try_from(shared_count)
+                    .ok()
+                    .and_then(|shared| tokens.checked_mul(shared))
+            })
+            .ok_or_else(|| Error::backend("Inkling shared route count overflowed"))?;
+        let mut indices = Vec::with_capacity(capacity);
+        for _ in 0..tokens {
+            indices.extend(0..shared_count);
+        }
+        B::Tensor::from_i32_slice(&indices, &[tokens, shared_count], context)
+    }
+
     fn new_at(
         args: &TextArgs,
         block_root: &str,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
         let prefix = format!("{block_root}.moe");
-        let bank = |field: &str, count| {
-            B::grouped_gated_product(expert_bank_spec_at(args, &prefix, field, count)?, context)
-        };
+        let routed = expert_bank_spec_at(args, &prefix, "experts", args.n_routed_experts)?;
+        let shared = expert_bank_spec_at(args, &prefix, "shared_experts", args.n_shared_experts)?;
+        Self::new_at_with_specs(args, block_root, routed, shared, context)
+    }
+
+    fn new_at_with_specs(
+        args: &TextArgs,
+        block_root: &str,
+        routed: GroupedGatedProductSpec,
+        shared: GroupedGatedProductSpec,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        let prefix = format!("{block_root}.moe");
         Ok(Self {
             routed_count: args.n_routed_experts,
             shared_count: args.n_shared_experts,
@@ -619,8 +649,8 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMlp<B> 
                 &[1],
                 context,
             )?,
-            routed_experts: bank("experts", args.n_routed_experts)?,
-            shared_experts: bank("shared_experts", args.n_shared_experts)?,
+            routed_experts: B::grouped_gated_product(routed, context)?,
+            shared_experts: B::grouped_gated_product(shared, context)?,
         })
     }
 
@@ -657,12 +687,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMlp<B> 
             .iter()
             .try_fold(1_i32, |tokens, dimension| tokens.checked_mul(*dimension))
             .ok_or_else(|| Error::backend("Inkling token count overflowed"))?;
-        let shared_ids = B::Tensor::from_i32_slice(
-            &(0..self.shared_count).collect::<Vec<_>>(),
-            &[1, self.shared_count],
-            context,
-        )?
-        .broadcast_to(&[tokens, self.shared_count], context)?;
+        let shared_ids = Self::shared_group_indices(tokens, self.shared_count, context)?;
         let shared = self.shared_experts.forward_grouped(
             hidden,
             &GroupSelection::new(
@@ -714,12 +739,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMlp<B> 
             .iter()
             .try_fold(1_i32, |tokens, dimension| tokens.checked_mul(*dimension))
             .ok_or_else(|| Error::backend("Inkling token count overflowed"))?;
-        let shared_ids = B::Tensor::from_i32_slice(
-            &(0..self.shared_count).collect::<Vec<_>>(),
-            &[1, self.shared_count],
-            context,
-        )?
-        .broadcast_to(&[tokens, self.shared_count], context)?;
+        let shared_ids = Self::shared_group_indices(tokens, self.shared_count, context)?;
         let shared = B::gated_product_groups_tensor_parallel(
             &mut self.shared_experts,
             hidden,
@@ -785,12 +805,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMlp<B> 
             .iter()
             .try_fold(1_i32, |tokens, dimension| tokens.checked_mul(*dimension))
             .ok_or_else(|| Error::backend("Inkling token count overflowed"))?;
-        let shared_ids = B::Tensor::from_i32_slice(
-            &(0..self.shared_count).collect::<Vec<_>>(),
-            &[1, self.shared_count],
-            context,
-        )?
-        .broadcast_to(&[tokens, self.shared_count], context)?;
+        let shared_ids = Self::shared_group_indices(tokens, self.shared_count, context)?;
         let shared_routes = GroupSelection::new(
             shared_ids,
             routes.always_on_coefficients().clone(),
@@ -862,12 +877,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMlp<B> 
             .iter()
             .try_fold(1_i32, |tokens, dimension| tokens.checked_mul(*dimension))
             .ok_or_else(|| Error::backend("Inkling token count overflowed"))?;
-        let shared_ids = B::Tensor::from_i32_slice(
-            &(0..self.shared_count).collect::<Vec<_>>(),
-            &[1, self.shared_count],
-            context,
-        )?
-        .broadcast_to(&[tokens, self.shared_count], context)?;
+        let shared_ids = Self::shared_group_indices(tokens, self.shared_count, context)?;
         let shared_routes = GroupSelection::new(
             shared_ids,
             routes.always_on_coefficients().clone(),
@@ -1080,6 +1090,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> DecoderLayer<
             layer,
             args.num_hidden_layers as usize + layer,
             context,
+            None,
         )
     }
 
@@ -1090,7 +1101,27 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> DecoderLayer<
         block_root: &str,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        Self::new_at_with_expert_layers(args, policy, block_root, 0, 0, context)
+        Self::new_at_with_expert_layers(args, policy, block_root, 0, 0, context, None)
+    }
+
+    pub(crate) fn new_with_expert_realization(
+        args: &TextArgs,
+        layer: usize,
+        realization: crate::inkling::ExpertBankRealization,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        let policy = args
+            .layer_policy(layer)
+            .ok_or_else(|| Error::backend(format!("missing Inkling layer policy {layer}")))?;
+        Self::new_at_with_expert_layers(
+            args,
+            policy,
+            &format!("model.layers.{layer}"),
+            layer,
+            args.num_hidden_layers as usize + layer,
+            context,
+            Some(realization),
+        )
     }
 
     fn new_at_with_expert_layers(
@@ -1100,6 +1131,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> DecoderLayer<
         layer: usize,
         shared_expert_layer: usize,
         context: &<B::Tensor as Tensor>::Context,
+        realization: Option<crate::inkling::ExpertBankRealization>,
     ) -> Result<Self, Error> {
         let prefix = block_root;
         let norm = |field: &str| {
@@ -1137,9 +1169,16 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> DecoderLayer<
                 FeedForwardPolicy::Dense => {
                     FeedForward::Dense(DenseMlp::new_at(args, block_root, context)?)
                 }
-                FeedForwardPolicy::SparseMoe => {
-                    FeedForward::Sparse(SparseMlp::new_at(args, block_root, context)?)
-                }
+                FeedForwardPolicy::SparseMoe => FeedForward::Sparse(match realization {
+                    Some(realization) => SparseMlp::new_at_with_specs(
+                        args,
+                        block_root,
+                        realization.routed,
+                        realization.shared,
+                        context,
+                    )?,
+                    None => SparseMlp::new_at(args, block_root, context)?,
+                }),
             },
             feed_forward_convolution: convolution("mlp_sconv")?,
         })
