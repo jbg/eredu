@@ -2559,7 +2559,7 @@ pub fn select_replicated_text_realization(
     })
 }
 
-fn placement_is_compatible(
+pub(crate) fn placement_is_compatible(
     component: &StateComponentPolicy,
     policy: &CacheResidencyPolicy,
     placement: StateComponentPlacement,

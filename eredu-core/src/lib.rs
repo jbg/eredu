@@ -121,13 +121,12 @@ pub use observation::{
     VISION_PROJECTOR_OUTPUT_OBSERVATION_PATH,
 };
 pub use realtime::{
-    load_realtime_model, load_realtime_model_with_options, RealtimeBackend, RealtimeCompletedStep,
-    RealtimeConfigError, RealtimeDecisionDiagnostics, RealtimeError, RealtimeFrameConvention,
-    RealtimeFrameForcing, RealtimeFrameScheduleState, RealtimeFrameSlot, RealtimeFrameTransition,
-    RealtimeInputFrame, RealtimeModel, RealtimeModelLoadingBackend, RealtimeOutputFrame,
-    RealtimeSampling, RealtimeScheduleError, RealtimeScheduler, RealtimeSession,
-    RealtimeSlotCoordinate, RealtimeSlotOccupancy, RealtimeSpeechConfig, RealtimeTargetDecision,
-    RealtimeTargetSource, RealtimeTemporalSource, MAX_REALTIME_FRAME_DELAY,
+    RealtimeConfigError, RealtimeDecisionDiagnostics, RealtimeError, RealtimeForcedSource,
+    RealtimeFrameConvention, RealtimeFrameForcing, RealtimeFrameScheduleState, RealtimeFrameSlot,
+    RealtimeFrameTransition, RealtimeInputDescriptorError, RealtimeInputFrame, RealtimeOutputFrame,
+    RealtimeSampling, RealtimeScheduleError, RealtimeSlotCoordinate, RealtimeSlotOccupancy,
+    RealtimeSpeechConfig, RealtimeTargetDecision, RealtimeTargetSource, RealtimeTemporalSource,
+    MAX_REALTIME_FRAME_DELAY,
 };
 pub use residency::{
     BackgroundPrefetchReport, PrefetchAdmission, PrefetchCompletion, PrefetchDemandObservation,

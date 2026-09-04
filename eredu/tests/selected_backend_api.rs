@@ -1,14 +1,13 @@
+use eredu::api::realtime::{
+    RealtimeInputFrame, RealtimePreparationPlan, RealtimeSampling, RequestId, SchedulerLimits,
+    SessionCapabilities,
+};
 use eredu::api::{
     inspect_local_model, LocalBackendError, LocalBackendFactory, LocalDevice,
     LocalInspectionOptions, LocalLoadOptions, LocalRealtimeBackendFactory, LocalRealtimeModel,
     LocalRealtimeScheduler,
 };
-use eredu_architectures::moshi::RealtimePreparationPlan;
-use eredu_core::scheduler::{RequestId, SchedulerLimits};
-use eredu_core::{
-    DevicePlan, ExecutionPlan, QuantizationRequest, RealtimeInputFrame, RealtimeSampling,
-    SessionCapabilities,
-};
+use eredu_core::{DevicePlan, ExecutionPlan, QuantizationRequest};
 
 fn operate_selected_realtime_backend(
     preparation: RealtimePreparationPlan,

@@ -40,17 +40,17 @@ eredu-gguf = { version = "0.1.0", path = "eredu-gguf" }
 safemlx-sys = { version = "0.2.1", path = "safemlx-sys", default-features = false }
 eredu-backend-mlx-macros = { version = "0.1.0", path = "eredu-backend-mlx-macros" }
 safemlx-internal-macros = { version = "0.2.0", path = "safemlx-internal-macros" }
-eredu = { version = "0.5.0", path = "eredu", default-features = false }
-eredu-core = { version = "0.4.0", path = "eredu-core" }
+eredu = { version = "0.6.0", path = "eredu", default-features = false }
+eredu-core = { version = "0.5.0", path = "eredu-core" }
 eredu-text = { version = "0.1.0", path = "eredu-text", default-features = false }
-eredu-checkpoint = { version = "0.2.0", path = "eredu-checkpoint" }
+eredu-checkpoint = { version = "0.3.0", path = "eredu-checkpoint" }
 eredu-nn = { version = "0.3.0", path = "eredu-nn", default-features = false }
 eredu-nn-macros = { version = "0.1.0", path = "eredu-nn-macros" }
-eredu-backend-mlx = { version = "0.6.0", path = "eredu-backend-mlx", default-features = false }
-eredu-runtime = { version = "0.6.0", path = "eredu-runtime" }
-eredu-architectures = { version = "0.6.0", path = "eredu-architectures" }
+eredu-backend-mlx = { version = "0.7.0", path = "eredu-backend-mlx", default-features = false }
+eredu-runtime = { version = "0.7.0", path = "eredu-runtime" }
+eredu-architectures = { version = "0.7.0", path = "eredu-architectures" }
 eredu-codec = { version = "0.2.0", path = "eredu-codec", default-features = false }
-eredu-evaluation = { version = "0.5.0", path = "eredu-evaluation" }
+eredu-evaluation = { version = "0.6.0", path = "eredu-evaluation" }
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

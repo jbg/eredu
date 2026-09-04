@@ -61,15 +61,15 @@ pub(crate) mod array {
 /// canonical [`safemlx`] paths and are not re-exported here. Reusable MLX
 /// backend facilities are organized under [`backend`].
 pub mod native {
+    pub use crate::composition::moshi::MlxRealtimeExecution;
     use safemlx::Stream;
 
+    pub use crate::backend::distributed::MlxRealtimeConsensusTransport;
     pub use crate::backend::topology::DeviceAssignment;
     pub use crate::backend::{random::RandomState, ExecutionContext};
-    pub use crate::composition::mlx::realtime::personaplex_prompt::sine_frame as personaplex_sine_frame;
     pub use crate::composition::mlx::realtime::{
-        MlxRealtimeBackend, MlxRealtimeCompletion, MlxRealtimeInput, MlxRealtimeModel,
-        MlxRealtimeModelIdentity, MlxRealtimeModelState, MlxRealtimeModelStateBranch,
-        MlxRealtimeOutput, MlxRealtimeSession, MlxRealtimeSessionBranch,
+        MlxRealtimeCompletion, MlxRealtimeExecutionContext, MlxRealtimeFrameCompletionMechanism,
+        MlxRealtimeFrameTensorMechanisms, MlxRealtimeHostObserver,
     };
     pub use crate::composition::mlx::speculative::MlxDrafter;
     pub use crate::composition::mlx::{

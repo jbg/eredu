@@ -1,8 +1,10 @@
 use std::{error::Error, path::Path, path::PathBuf};
 
+#[path = "support/realtime.rs"]
+mod realtime_support;
+
 use eredu_backend_mlx::native::ExecutionContext;
-use eredu_backend_mlx::{codec::mimi::load, native::MlxRealtimeBackend};
-use eredu_core::load_realtime_model;
+use eredu_backend_mlx::{codec::mimi::load, native::MlxRealtimeExecutionContext};
 use eredu_evaluation::{
     run_personaplex_quantization, PersonaPlexEvaluationOptions, PersonaPlexEvaluationPaths,
 };
@@ -49,8 +51,15 @@ fn main() -> Result<(), Box<dyn Error>> {
     )?;
     run_personaplex_quantization(&paths, &options, &mut mimi, stream, |artifact| {
         let preparation = eredu_architectures::moshi::prepare_realtime_model(artifact)?;
-        load_realtime_model(MlxRealtimeBackend::new(stream, weights_stream), preparation)
-            .map_err(Into::into)
+        let backend = MlxRealtimeExecutionContext::new(stream, weights_stream);
+        let model = realtime_support::load(
+            &backend,
+            preparation,
+            eredu_backend_mlx::MlxLoadRequest::default(),
+        )?;
+        Ok(realtime_support::SelectedRealtimeDriver::new(
+            backend, model,
+        ))
     })?;
     println!("evaluation={}", paths.output.display());
     Ok(())

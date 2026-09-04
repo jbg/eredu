@@ -18,9 +18,12 @@
 
 use std::{collections::HashMap, path::PathBuf};
 
-use eredu_backend_mlx::native::{ExecutionContext, MlxRealtimeBackend};
+#[path = "support/realtime.rs"]
+mod realtime_support;
+
+use eredu_backend_mlx::native::{ExecutionContext, MlxRealtimeExecutionContext};
 use eredu_backend_mlx::MlxTensor;
-use eredu_core::{load_realtime_model, ObservationSet, ObservationValue, RealtimeSampling};
+use eredu_core::{ObservationSet, ObservationValue, RealtimeSampling};
 use eredu_evaluation::{
     compare_observations, encoded_audio_frames, observe_i32_tensor, run_realtime_trace,
     ParityPolicy,
@@ -50,9 +53,17 @@ fn main() -> anyhow::Result<()> {
     let expected_emitted_steps = required(&fixture, "generation.expected_emitted_steps")?;
 
     let preparation = eredu_architectures::moshi::prepare_realtime_model(&model_dir)?;
-    let mut model =
-        load_realtime_model(MlxRealtimeBackend::new(stream, cpu.stream()), preparation)?;
-    let generated_audio_codebooks = model.speech_config().generated_audio_codebooks();
+    let backend = MlxRealtimeExecutionContext::new(stream, cpu.stream());
+    let model = realtime_support::load(
+        &backend,
+        preparation,
+        eredu_backend_mlx::MlxLoadRequest::default(),
+    )?;
+    let generated_audio_codebooks = model
+        .execution_config()
+        .frame_schedule()
+        .generated_audio_codebooks();
+    let mut model = realtime_support::SelectedRealtimeDriver::new(backend, model);
     let trace = run_realtime_trace(
         &mut model,
         encoded_audio_frames(&MlxTensor::from_array(input_audio.clone()), stream)?,

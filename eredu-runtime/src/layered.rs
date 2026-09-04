@@ -1280,7 +1280,7 @@ where
         hook: &mut H,
     ) -> Result<(B::Tensor, A::ForwardContext), A::Error>
     where
-        H: LayeredTraversalHook<B, A::ForwardContext, A::Error>,
+        H: LayeredTraversalHook<B, A::ForwardContext, A::Error> + ?Sized,
     {
         let forward = self.architecture.begin_forward(input, state, context)?;
         let initial = forward.hidden;
@@ -2143,7 +2143,7 @@ where
         hook: &mut H,
     ) -> Result<(B::Tensor, A::ForwardContext), LayerwiseRuntimeError<A::Error, P::Error>>
     where
-        H: LayeredTraversalHook<B, A::ForwardContext, A::Error>,
+        H: LayeredTraversalHook<B, A::ForwardContext, A::Error> + ?Sized,
     {
         self.forward_with_unit_executor_and_traversal_hook(
             input,
@@ -2176,7 +2176,7 @@ where
             &mut A::ForwardContext,
             &<B::Tensor as eredu_nn::Tensor>::Context,
         ) -> Result<B::Tensor, A::Error>,
-        H: LayeredTraversalHook<B, A::ForwardContext, A::Error>,
+        H: LayeredTraversalHook<B, A::ForwardContext, A::Error> + ?Sized,
     {
         let graph = self
             .architecture
@@ -2630,7 +2630,7 @@ where
     ) -> Result<(B::Tensor, A::ForwardContext), LayerwiseRuntimeError<A::Error, P::Error>>
     where
         A: ParallelLayeredArchitecture<B, S>,
-        H: LayeredTraversalHook<B, A::ForwardContext, A::Error>,
+        H: LayeredTraversalHook<B, A::ForwardContext, A::Error> + ?Sized,
     {
         self.forward_parallel_with_unit_executor_and_traversal_hook(
             input,
@@ -2669,7 +2669,7 @@ where
             &B::ParallelContext,
             &<B::Tensor as eredu_nn::Tensor>::Context,
         ) -> Result<B::Tensor, A::Error>,
-        H: LayeredTraversalHook<B, A::ForwardContext, A::Error>,
+        H: LayeredTraversalHook<B, A::ForwardContext, A::Error> + ?Sized,
     {
         let graph = self
             .architecture

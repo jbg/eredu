@@ -24,7 +24,10 @@ pub use parity::{
     ObservationParity, ParityComparison, ParityError, ParityMetrics, ParityPolicy, ParityReport,
     ParityRule,
 };
-pub use realtime::{encoded_audio_frames, run_realtime_trace, RealtimeTrace, RealtimeTraceError};
+pub use realtime::{
+    encoded_audio_frames, run_realtime_trace, RealtimeEvaluationDriver, RealtimeTrace,
+    RealtimeTraceError,
+};
 
 use std::{
     error::Error,
@@ -35,14 +38,11 @@ use std::{
 };
 
 use eredu_architectures::moshi::personaplex_prompt::{
-    wrap_system_prompt, AUDIO_TOKENS_PER_STREAM, SILENCE_TOKENS, SINE_TOKENS, TEXT_PADDING_TOKEN,
+    materialize_prompt_frames, released_conditioning_plan, wrap_system_prompt,
+    AUDIO_TOKENS_PER_STREAM, RELEASED_PROMPT_SILENCE_FRAMES,
 };
 use eredu_codec::mimi::Mimi;
-use eredu_core::{
-    scheduler::{RequestId, SchedulerLimits},
-    RealtimeBackend, RealtimeInputFrame, RealtimeModel, RealtimeOutputFrame, RealtimeSampling,
-    RealtimeScheduler,
-};
+use eredu_core::{RealtimeInputFrame, RealtimeOutputFrame, RealtimeSampling};
 use eredu_nn::Tensor;
 use sentencepiece_rs::SentencePieceProcessor;
 use serde::Serialize;
@@ -54,7 +54,6 @@ const FRAME_SAMPLES: usize = 1_920;
 const DEADLINE_MS: f64 = 1_000.0 / FRAME_RATE;
 const TAIL_ACTIVITY_FRAMES: usize = 3;
 const ACTIVE_AUDIO_DBFS: f64 = -40.0;
-const PROMPT_SILENCE_FRAMES: usize = 6;
 
 /// Default PersonaPlex system instruction used by the evaluator.
 pub const DEFAULT_TEXT_PROMPT: &str = "You are a wise and friendly teacher. Answer questions or provide advice in a clear and engaging way.";
@@ -101,10 +100,10 @@ impl Default for PersonaPlexEvaluationOptions {
 
 /// Runs the complete PersonaPlex dense-versus-quantized evaluation.
 ///
-/// The model loader is the only backend composition hook. Realtime inputs,
-/// outputs, forcing, sampling, scheduling, diagnostics, codec execution, and
-/// reporting use backend-neutral contracts.
-pub fn run_personaplex_quantization<B, T, L>(
+/// The driver loader is the only executable-composition hook. Realtime inputs,
+/// outputs, forcing, sampling, diagnostics, codec execution, and reporting use
+/// portable contracts.
+pub fn run_personaplex_quantization<D, T, L>(
     paths: &PersonaPlexEvaluationPaths,
     options: &PersonaPlexEvaluationOptions,
     mimi: &mut Mimi<T>,
@@ -112,9 +111,9 @@ pub fn run_personaplex_quantization<B, T, L>(
     mut load_model: L,
 ) -> Result<(), Box<dyn Error>>
 where
-    B: RealtimeBackend,
+    D: RealtimeEvaluationDriver,
     T: Tensor,
-    L: FnMut(&Path) -> Result<RealtimeModel<B>, Box<dyn Error>>,
+    L: FnMut(&Path) -> Result<D, Box<dyn Error>>,
 {
     if paths.output.exists() {
         return Err(invalid(format!(
@@ -269,7 +268,7 @@ where
 
     let metrics = json!({
         "format_version": 1,
-        "methodology": "Both models use the public backend-neutral realtime scheduler, forcing, sampling, and observation contracts.",
+        "methodology": "Both models use the portable realtime evaluation driver, forcing, sampling, and observation contracts.",
         "input": {
             "path": paths.input,
             "sample_rate": SAMPLE_RATE,
@@ -287,8 +286,8 @@ where
             "text_prompt": options.text_prompt,
             "wrapped_text_prompt": wrapped_text_prompt,
             "text_prompt_tokens": prompt.text_tokens.len(),
-            "silence_frames_after_voice": PROMPT_SILENCE_FRAMES,
-            "silence_frames_after_text": PROMPT_SILENCE_FRAMES,
+            "silence_frames_after_voice": RELEASED_PROMPT_SILENCE_FRAMES,
+            "silence_frames_after_text": RELEASED_PROMPT_SILENCE_FRAMES,
         },
         "codec_diagnostic": {
             "streaming_roundtrip": "input_codec_roundtrip.wav",
@@ -354,8 +353,8 @@ where
             "conditioning": {
                 "voice_prompt": prompt.voice_frames,
                 "text_prompt": prompt.text_tokens,
-                "silence_frames_after_voice": PROMPT_SILENCE_FRAMES,
-                "silence_frames_after_text": PROMPT_SILENCE_FRAMES,
+                "silence_frames_after_voice": RELEASED_PROMPT_SILENCE_FRAMES,
+                "silence_frames_after_text": RELEASED_PROMPT_SILENCE_FRAMES,
             },
             "sampling": {
                 "seed": options.sampling_seed,
@@ -374,10 +373,10 @@ where
     Ok(())
 }
 
-fn validate_personaplex_geometry<B: RealtimeBackend>(
-    model: &RealtimeModel<B>,
+fn validate_personaplex_geometry<D: RealtimeEvaluationDriver>(
+    driver: &D,
 ) -> Result<(), Box<dyn Error>> {
-    let config = model.speech_config();
+    let config = driver.speech_config();
     if config.input_audio_codebooks() != AUDIO_TOKENS_PER_STREAM
         || config.generated_audio_codebooks() != AUDIO_TOKENS_PER_STREAM
     {
@@ -414,18 +413,18 @@ struct ModelRun {
     latencies_ms: Vec<f64>,
 }
 
-fn run_model<B: RealtimeBackend>(
-    model: &mut RealtimeModel<B>,
+fn run_model<D: RealtimeEvaluationDriver>(
+    driver: &mut D,
     prompt: &PromptConditioning,
     input_tokens: &[Vec<i32>],
     sampling: RealtimeSampling,
     mode: RunMode<'_>,
 ) -> Result<ModelRun, Box<dyn Error>> {
-    let request = RequestId::new(0);
-    let mut scheduler = RealtimeScheduler::new(model, SchedulerLimits::new(1, 1)?)?;
-    scheduler.register_request(model, request, sampling)?;
-    for frame in prompt_frames(prompt) {
-        run_frame(model, &mut scheduler, request, frame)?;
+    driver
+        .start_trace(sampling)
+        .map_err(evaluation_driver_error::<D::Error>)?;
+    for frame in prompt_frames(prompt)? {
+        run_frame(driver, frame)?;
     }
     let mut frames = Vec::with_capacity(input_tokens.len());
     let mut emitted_audio = Vec::new();
@@ -446,7 +445,7 @@ fn run_model<B: RealtimeBackend>(
             }
         }
         let start = Instant::now();
-        let output = run_frame(model, &mut scheduler, request, frame)?;
+        let output = run_frame(driver, frame)?;
         latencies_ms.push(start.elapsed().as_secs_f64() * 1_000.0);
         if let Some(tokens) = output.output_audio_tokens() {
             emitted_audio.push(tokens.to_vec());
@@ -465,7 +464,9 @@ fn run_model<B: RealtimeBackend>(
                 .collect(),
         });
     }
-    scheduler.finish_request(request)?;
+    driver
+        .finish_trace()
+        .map_err(evaluation_driver_error::<D::Error>)?;
     Ok(ModelRun {
         frames,
         emitted_audio,
@@ -473,49 +474,51 @@ fn run_model<B: RealtimeBackend>(
     })
 }
 
-fn run_frame<B: RealtimeBackend>(
-    model: &mut RealtimeModel<B>,
-    scheduler: &mut RealtimeScheduler<B>,
-    request: RequestId,
+fn run_frame<D: RealtimeEvaluationDriver>(
+    driver: &mut D,
     frame: RealtimeInputFrame,
 ) -> Result<RealtimeOutputFrame, Box<dyn Error>> {
-    let input = model.backend().materialize_input(model.model(), &frame)?;
-    scheduler.enqueue(model, request, input)?;
-    loop {
-        if let Some(completed) = scheduler.run_queued(model)?.pop() {
-            return Ok(model.backend().observe_output(completed.output())?);
-        }
-        std::thread::yield_now();
-    }
+    driver
+        .evaluate_frame(frame)
+        .map_err(evaluation_driver_error::<D::Error>)
 }
 
-fn prompt_frames(prompt: &PromptConditioning) -> Vec<RealtimeInputFrame> {
-    let forced = |audio: Vec<i32>, text: i32| {
-        RealtimeInputFrame::new(1, SINE_TOKENS.to_vec())
-            .with_forced_generated_audio(audio)
-            .with_forced_text(vec![text])
-    };
-    let mut frames = prompt
+fn evaluation_driver_error<E>(error: E) -> Box<dyn Error>
+where
+    E: Error + Send + Sync + 'static,
+{
+    Box::new(error)
+}
+
+fn prompt_frames(prompt: &PromptConditioning) -> Result<Vec<RealtimeInputFrame>, Box<dyn Error>> {
+    if let Some(frame) = prompt
         .voice_frames
         .iter()
-        .cloned()
-        .map(|audio| forced(audio, TEXT_PADDING_TOKEN))
-        .collect::<Vec<_>>();
-    frames.extend(
-        std::iter::repeat_with(|| forced(SILENCE_TOKENS.to_vec(), TEXT_PADDING_TOKEN))
-            .take(PROMPT_SILENCE_FRAMES),
-    );
-    frames.extend(
-        prompt
-            .text_tokens
-            .iter()
-            .map(|token| forced(SILENCE_TOKENS.to_vec(), *token)),
-    );
-    frames.extend(
-        std::iter::repeat_with(|| forced(SILENCE_TOKENS.to_vec(), TEXT_PADDING_TOKEN))
-            .take(PROMPT_SILENCE_FRAMES),
-    );
-    frames
+        .find(|frame| frame.len() != AUDIO_TOKENS_PER_STREAM)
+    {
+        return Err(invalid(format!(
+            "PersonaPlex voice prompt frame must contain {AUDIO_TOKENS_PER_STREAM} tokens, got {}",
+            frame.len()
+        )));
+    }
+    let voice_frame_count = prompt.voice_frames.len();
+    let mut voice = Vec::with_capacity(AUDIO_TOKENS_PER_STREAM * voice_frame_count);
+    for codebook in 0..AUDIO_TOKENS_PER_STREAM {
+        voice.extend(prompt.voice_frames.iter().map(|frame| frame[codebook]));
+    }
+    let voice_shape =
+        (voice_frame_count > 0).then_some([1, AUDIO_TOKENS_PER_STREAM, voice_frame_count]);
+    let plan = released_conditioning_plan(
+        voice_shape.as_ref().map(|shape| shape.as_slice()),
+        &[1, prompt.text_tokens.len()],
+    )?;
+    Ok(materialize_prompt_frames(
+        &plan,
+        &voice,
+        voice_frame_count,
+        &prompt.text_tokens,
+        prompt.text_tokens.len(),
+    )?)
 }
 
 fn encode_pcm<T: Tensor>(
@@ -867,6 +870,74 @@ fn invalid(message: impl Into<String>) -> Box<dyn Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eredu_core::{RealtimeFrameConvention, RealtimeSpeechConfig};
+
+    struct PersonaRecordingDriver {
+        config: RealtimeSpeechConfig,
+        sampling: Vec<RealtimeSampling>,
+        frames: Vec<RealtimeInputFrame>,
+        finishes: usize,
+    }
+
+    impl PersonaRecordingDriver {
+        fn new() -> Self {
+            Self {
+                config: RealtimeSpeechConfig::new(
+                    16,
+                    8,
+                    8,
+                    8,
+                    eredu_architectures::moshi::personaplex_prompt::TEXT_PADDING_TOKEN,
+                    2_048,
+                    RealtimeFrameConvention::FeedbackAlignedHistory,
+                    vec![0; 17],
+                )
+                .unwrap(),
+                sampling: Vec::new(),
+                frames: Vec::new(),
+                finishes: 0,
+            }
+        }
+    }
+
+    impl RealtimeEvaluationDriver for PersonaRecordingDriver {
+        type Error = std::io::Error;
+
+        fn speech_config(&self) -> &RealtimeSpeechConfig {
+            &self.config
+        }
+
+        fn start_trace(&mut self, sampling: RealtimeSampling) -> Result<(), Self::Error> {
+            self.sampling.push(sampling);
+            Ok(())
+        }
+
+        fn evaluate_frame(
+            &mut self,
+            frame: RealtimeInputFrame,
+        ) -> Result<RealtimeOutputFrame, Self::Error> {
+            let text = frame
+                .forced_text_tokens()
+                .map_or_else(|| vec![7], <[i32]>::to_vec);
+            let audio = frame
+                .forced_generated_audio_tokens()
+                .map_or_else(|| vec![9; 8], <[i32]>::to_vec);
+            self.frames.push(frame);
+            Ok(RealtimeOutputFrame::new(
+                1,
+                text,
+                audio.clone(),
+                audio.clone(),
+                Some(audio),
+                Vec::new(),
+            ))
+        }
+
+        fn finish_trace(&mut self) -> Result<(), Self::Error> {
+            self.finishes += 1;
+            Ok(())
+        }
+    }
 
     #[test]
     fn identical_distribution_metrics_are_exact() {
@@ -885,15 +956,41 @@ mod tests {
             voice_frames: vec![vec![1; AUDIO_TOKENS_PER_STREAM]],
             text_tokens: vec![7, 8],
         };
-        let frames = prompt_frames(&prompt);
+        let frames = prompt_frames(&prompt).unwrap();
         assert_eq!(
             frames.len(),
-            1 + PROMPT_SILENCE_FRAMES + 2 + PROMPT_SILENCE_FRAMES
+            1 + RELEASED_PROMPT_SILENCE_FRAMES + 2 + RELEASED_PROMPT_SILENCE_FRAMES
         );
         assert_eq!(frames[0].forced_generated_audio_tokens(), Some(&[1; 8][..]));
         assert_eq!(
-            frames[1 + PROMPT_SILENCE_FRAMES].forced_text_tokens(),
+            frames[1 + RELEASED_PROMPT_SILENCE_FRAMES].forced_text_tokens(),
             Some(&[7][..])
         );
+    }
+
+    #[test]
+    fn personaplex_run_uses_the_evaluation_driver_for_prompt_and_live_frames() {
+        let prompt = PromptConditioning {
+            voice_frames: vec![vec![1; AUDIO_TOKENS_PER_STREAM]],
+            text_tokens: vec![7, 8],
+        };
+        let expected_prompt_frames = prompt_frames(&prompt).unwrap().len();
+        let mut driver = PersonaRecordingDriver::new();
+
+        let run = run_model(
+            &mut driver,
+            &prompt,
+            &[vec![3; AUDIO_TOKENS_PER_STREAM]],
+            RealtimeSampling::greedy(),
+            RunMode::Free,
+        )
+        .unwrap();
+
+        assert_eq!(driver.sampling, [RealtimeSampling::greedy()]);
+        assert_eq!(driver.frames.len(), expected_prompt_frames + 1);
+        assert_eq!(driver.finishes, 1);
+        assert_eq!(run.frames.len(), 1);
+        assert_eq!(run.frames[0].text_token, 7);
+        assert_eq!(run.emitted_audio, [vec![9; AUDIO_TOKENS_PER_STREAM]]);
     }
 }

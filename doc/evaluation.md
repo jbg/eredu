@@ -16,8 +16,9 @@ backend object names. Host materialization is always explicit:
   decode output;
 - `InspectableBackendSession` runs an explicitly instrumented prefill or
   decode pass and returns selected named activations;
-- `RealtimeBackend::observe_output` observes completed realtime tokens and
-  requested decision logits; and
+- realtime architecture observers intervene at declared temporal, layer,
+  decision-logit, and final-output seams, while runtime prepublication converts
+  completed tokens and diagnostics to the portable output frame; and
 - `eredu-nn::Tensor::to_f32_vec` and `to_i32_vec` are the neutral host-transfer
   operations used by codec and architecture-level tools.
 

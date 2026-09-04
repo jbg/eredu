@@ -4,8 +4,8 @@ use crate::backend::error::Error;
 use eredu_core::residency::AllocatorMemoryMetrics;
 
 pub use crate::composition::mlx::automatic::{
-    create_realtime_backend, discover_hardware, parameter_bank_telemetry, residency_telemetry,
-    speculative_decoding_telemetry, MlxBackendFactory, MlxRealtimeAdapter,
+    create_realtime_execution, discover_hardware, parameter_bank_telemetry, residency_telemetry,
+    speculative_decoding_telemetry, MlxBackendFactory,
 };
 pub use crate::composition::mlx::speculative::SpeculativeComponentTimingGuard;
 

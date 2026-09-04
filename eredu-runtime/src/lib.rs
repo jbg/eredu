@@ -43,6 +43,22 @@ pub mod partitioned_execution;
 pub mod prefetch;
 /// Atomic realtime model, schedule, sampler, and random-state transactions.
 pub mod realtime;
+/// Complete family-blind realtime frame coordination.
+pub mod realtime_executor;
+/// Portable realtime input validation before opaque token materialization.
+pub mod realtime_ingress;
+/// Neutral delayed-frame interpretation over opaque token mechanisms.
+pub mod realtime_interpreter;
+/// Family-blind construction of selected layered realtime models.
+pub mod realtime_model;
+/// Backend-neutral payload retention for delayed realtime coordinates.
+pub mod realtime_payload;
+/// Atomic model-state and delayed-payload-history transactions.
+pub mod realtime_payload_state;
+/// Family-blind realtime requirements, selection, and construction gating.
+pub mod realtime_selection;
+/// Backend-neutral realtime session ownership over the singular fair scheduler.
+pub mod realtime_session;
 /// Backend-neutral replicated-text execution and session ownership.
 pub mod replicated_session;
 /// Selection contracts for replicated text architectures.
@@ -189,6 +205,54 @@ pub use prefetch::{BackgroundPrefetchWorker, BackgroundPrefetchWorkerError};
 pub use realtime::{
     RealtimeCompletionAttachmentError, RealtimeFrameExecutionError, RealtimeFrameTransition,
     RealtimeGenerationBranch, RealtimeGenerationState, RealtimeGenerationTransactionError,
+};
+pub use realtime_executor::{
+    execute_realtime_frame, PreparedRealtimeFrameExecutor, PrepublicationRealtimeFrame,
+    RealtimeCompletionCreationError, RealtimeDecisionExecution, RealtimeFrameCompletionMechanism,
+    RealtimeFrameCoordinatorError, RealtimeFrameHostObserver, RealtimeHostOutputUnavailable,
+    RealtimePrepublicationError, SubmittedRealtimeFrame,
+};
+pub use realtime_ingress::{
+    MaterializedRealtimeInput, RealtimeHostTokenMaterializer, RealtimeIngressContract,
+    RealtimeIngressError, RealtimePayloadKind, RealtimeTokenKind, ValidatedRealtimeInput,
+};
+pub use realtime_interpreter::{
+    complete_realtime_frame, prepare_realtime_frame, CompletedRealtimeFrame, PreparedRealtimeFrame,
+    RealtimeFrameInterpretationError, RealtimeFrameTensorMechanisms,
+};
+pub use realtime_model::{
+    construct_realtime_model, ConstructedRealtimeExecution, ConstructedRealtimeModel,
+    PreparedRealtimeModelContract, RealizedRealtimePolicy, RealizedRealtimeState,
+    RealtimeArchitectureConstructionIdentity, RealtimeArchitectureIdentity,
+    RealtimeLayerwiseRuntime, RealtimeMaterializationComponent, RealtimeMaterializationTask,
+    RealtimeModelConstructionError, RealtimeModelConstructionMechanisms,
+    RealtimeModelContractError,
+};
+pub use realtime_payload::{
+    RealtimePayloadContract, RealtimePayloadContractError, RealtimePayloadEnvelope,
+    RealtimePayloadGeneration, RealtimePayloadHistory, RealtimePayloadHistoryError,
+    RealtimePayloadOwnerIdentity,
+};
+pub use realtime_payload_state::{
+    RealtimePayloadBranch, RealtimePayloadState, RealtimePayloadStateTransactionError,
+};
+pub use realtime_selection::{
+    select_and_prepare_realtime_realization, select_realtime_realization,
+    ConstructedRealtimeResources, PreparedRealtimeRealization, RealtimeArchitectureProof,
+    RealtimeArchitectureRequirements, RealtimeContractError, RealtimeExecutionRequirements,
+    RealtimeIdentity, RealtimeMechanism, RealtimeMechanismCapabilities,
+    RealtimeMechanismRequirements, RealtimeObservationRequirements, RealtimePreparationError,
+    RealtimeSelectionError, RealtimeSelectionIssue, RealtimeSelectionRequest,
+    RealtimeTopologyPolicy, RealtimeWeightComponentRequirement, RealtimeWeightComponentRole,
+    RealtimeWeightLoweringRequirement, SelectedRealtimeRealization,
+    SelectedRealtimeStateComponentRealization, SelectedRealtimeStateRealization,
+};
+pub use realtime_session::{
+    RealtimeHistoryGeneration, RealtimeModelOwnerIdentity, RealtimeModelSessionIdentity,
+    RealtimeSamplingReplacementError, RealtimeSamplingUpdateError, RealtimeSessionBranch,
+    RealtimeSessionError, RealtimeSessionExecutionError, RealtimeSessionIncarnation,
+    RealtimeSessionResumeError, RealtimeSessionScheduler, RealtimeSessionState,
+    RealtimeSessionTransactionError, ReleasedRealtimeSession,
 };
 pub use replicated_session::{
     construct_replicated_text_session, construct_replicated_text_session_with_execution,

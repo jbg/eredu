@@ -1,14 +1,39 @@
 //! Backend-neutral execution and observation of realtime traces.
 
 use eredu_core::{
-    scheduler::{RequestId, SchedulerLimits},
-    ObservationSet, ObservationValue, RealtimeBackend, RealtimeInputFrame, RealtimeModel,
-    RealtimeOutputFrame, RealtimeSampling, RealtimeScheduler, TensorObservation,
-    TensorObservationData,
+    ObservationSet, ObservationValue, RealtimeInputFrame, RealtimeOutputFrame, RealtimeSampling,
+    RealtimeSpeechConfig, TensorObservation, TensorObservationData,
 };
 use eredu_nn::Tensor;
+use std::error::Error;
 
 use crate::{observe_i32_tensor, EvidenceError};
+
+/// Evaluation-owned execution seam for one portable realtime trace.
+///
+/// Implementations are composition adapters: they may drive a native or
+/// reference executable, but evaluation only observes portable frames and
+/// sampling controls. In particular, this contract does not make a concrete
+/// tensor backend responsible for model, session, or scheduling policy.
+pub trait RealtimeEvaluationDriver {
+    /// Driver-specific execution failure.
+    type Error: Error + Send + Sync + 'static;
+
+    /// Portable token geometry used by this executable.
+    fn speech_config(&self) -> &RealtimeSpeechConfig;
+
+    /// Starts a fresh request-local trace with the supplied sampling controls.
+    fn start_trace(&mut self, sampling: RealtimeSampling) -> Result<(), Self::Error>;
+
+    /// Executes and observes one portable input frame.
+    fn evaluate_frame(
+        &mut self,
+        frame: RealtimeInputFrame,
+    ) -> Result<RealtimeOutputFrame, Self::Error>;
+
+    /// Finishes the active trace and releases its request-local state.
+    fn finish_trace(&mut self) -> Result<(), Self::Error>;
+}
 
 /// Completed portable outputs from one realtime request.
 #[derive(Debug, Clone)]
@@ -173,18 +198,18 @@ pub fn encoded_audio_frames<T: Tensor>(
         .collect()
 }
 
-/// Executes portable encoded frames through any realtime backend.
-pub fn run_realtime_trace<B>(
-    model: &mut RealtimeModel<B>,
+/// Executes portable encoded frames through an evaluation driver.
+pub fn run_realtime_trace<D>(
+    driver: &mut D,
     inputs: impl IntoIterator<Item = RealtimeInputFrame>,
     sampling: RealtimeSampling,
 ) -> Result<RealtimeTrace, Box<dyn std::error::Error + Send + Sync>>
 where
-    B: RealtimeBackend,
+    D: RealtimeEvaluationDriver,
 {
-    let request = RequestId::new(0);
-    let mut scheduler = RealtimeScheduler::new(model, SchedulerLimits::new(1, 1)?)?;
-    scheduler.register_request(model, request, sampling)?;
+    driver
+        .start_trace(sampling)
+        .map_err(boxed_driver_error::<D::Error>)?;
     let mut batch = None;
     let mut frames = Vec::new();
     for frame in inputs {
@@ -198,22 +223,28 @@ where
             None => batch = Some(frame.batch()),
             _ => {}
         }
-        let input = model.backend().materialize_input(model.model(), &frame)?;
-        scheduler.enqueue(model, request, input)?;
-        let output = loop {
-            if let Some(completed) = scheduler.run_queued(model)?.pop() {
-                break model.backend().observe_output(completed.output())?;
-            }
-            std::thread::yield_now();
-        };
-        frames.push(output);
+        frames.push(
+            driver
+                .evaluate_frame(frame)
+                .map_err(boxed_driver_error::<D::Error>)?,
+        );
     }
-    scheduler.finish_request(request)?;
+    let generated_audio_codebooks = driver.speech_config().generated_audio_codebooks();
+    driver
+        .finish_trace()
+        .map_err(boxed_driver_error::<D::Error>)?;
     Ok(RealtimeTrace {
         batch: batch.unwrap_or(1),
-        generated_audio_codebooks: model.speech_config().generated_audio_codebooks(),
+        generated_audio_codebooks,
         frames,
     })
+}
+
+fn boxed_driver_error<E>(error: E) -> Box<dyn Error + Send + Sync>
+where
+    E: Error + Send + Sync + 'static,
+{
+    Box::new(error)
 }
 
 fn transpose_frame_values<'a>(
@@ -293,6 +324,93 @@ pub enum RealtimeTraceError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eredu_core::RealtimeFrameConvention;
+
+    #[derive(Debug)]
+    struct RecordingDriver {
+        config: RealtimeSpeechConfig,
+        sampling: Option<RealtimeSampling>,
+        inputs: Vec<RealtimeInputFrame>,
+        finishes: usize,
+    }
+
+    impl RecordingDriver {
+        fn new() -> Self {
+            Self {
+                config: RealtimeSpeechConfig::new(
+                    4,
+                    2,
+                    2,
+                    2,
+                    0,
+                    0,
+                    RealtimeFrameConvention::FeedbackAlignedHistory,
+                    vec![0; 5],
+                )
+                .unwrap(),
+                sampling: None,
+                inputs: Vec::new(),
+                finishes: 0,
+            }
+        }
+    }
+
+    impl RealtimeEvaluationDriver for RecordingDriver {
+        type Error = std::io::Error;
+
+        fn speech_config(&self) -> &RealtimeSpeechConfig {
+            &self.config
+        }
+
+        fn start_trace(&mut self, sampling: RealtimeSampling) -> Result<(), Self::Error> {
+            self.sampling = Some(sampling);
+            Ok(())
+        }
+
+        fn evaluate_frame(
+            &mut self,
+            frame: RealtimeInputFrame,
+        ) -> Result<RealtimeOutputFrame, Self::Error> {
+            let value = i32::try_from(self.inputs.len()).unwrap();
+            let batch = frame.batch();
+            self.inputs.push(frame);
+            Ok(RealtimeOutputFrame::new(
+                batch,
+                vec![value; batch],
+                vec![value; batch * 2],
+                vec![value; batch * 2],
+                Some(vec![value; batch * 2]),
+                Vec::new(),
+            ))
+        }
+
+        fn finish_trace(&mut self) -> Result<(), Self::Error> {
+            self.finishes += 1;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn trace_runner_uses_only_the_portable_evaluation_driver() {
+        let sampling = RealtimeSampling::new(0.7, 0.8, 42).unwrap();
+        let mut driver = RecordingDriver::new();
+        let trace = run_realtime_trace(
+            &mut driver,
+            [
+                RealtimeInputFrame::new(1, vec![10, 11]),
+                RealtimeInputFrame::new(1, vec![12, 13]),
+            ],
+            sampling,
+        )
+        .unwrap();
+
+        assert_eq!(driver.sampling, Some(sampling));
+        assert_eq!(driver.inputs.len(), 2);
+        assert_eq!(driver.finishes, 1);
+        assert_eq!(trace.batch(), 1);
+        assert_eq!(trace.generated_audio_codebooks(), 2);
+        assert_eq!(trace.frames()[1].text_tokens(), [1]);
+    }
 
     #[test]
     fn trace_observations_transpose_frame_major_tokens() {

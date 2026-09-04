@@ -11,6 +11,7 @@
 mod media;
 mod metadata;
 mod portable;
+pub mod realtime;
 mod request;
 mod tokenizer;
 

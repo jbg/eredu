@@ -1,6 +1,6 @@
 [package]
 name = "eredu"
-version = "0.5.0"
+version = "0.6.0"
 edition.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -53,6 +53,10 @@ path = "tests/backend_conformance.rs"
 [[test]]
 name = "portable_facade"
 path = "tests/portable_facade.rs"
+
+[[test]]
+name = "portable_realtime_facade"
+path = "tests/portable_realtime_facade.rs"
 
 [[test]]
 name = "selected_backend_api"
@@ -115,3 +119,4 @@ llguidance = { version = "=1.7.6", default-features = false, features = ["ahash"
 
 [dev-dependencies]
 anyhow = "1"
+eredu-checkpoint.workspace = true

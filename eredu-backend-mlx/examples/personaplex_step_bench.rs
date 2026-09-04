@@ -2,17 +2,16 @@
 
 use std::{path::PathBuf, time::Instant};
 
-use eredu_backend_mlx::native::{
-    personaplex_sine_frame, ExecutionContext, MlxRealtimeBackend, MlxRealtimeInput,
-};
+#[path = "support/realtime.rs"]
+mod realtime_support;
+
+use eredu_architectures::moshi::personaplex_prompt::{AUDIO_TOKENS_PER_STREAM, SINE_TOKENS};
+use eredu_backend_mlx::native::{ExecutionContext, MlxRealtimeExecutionContext};
 use eredu_backend_mlx::MlxLoadRequest;
-use eredu_core::scheduler::{RequestId, SchedulerLimits};
+use eredu_core::scheduler::RequestId;
 use eredu_core::QuantizationRequest;
-use eredu_core::{
-    load_realtime_model, load_realtime_model_with_options, RealtimeModel, RealtimeSampling,
-    RealtimeScheduler,
-};
-use safemlx::{transforms::eval, Array, Device, DeviceType, Dtype, Stream};
+use eredu_core::RealtimeSampling;
+use safemlx::{Array, Device, DeviceType, Stream};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
@@ -43,8 +42,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if quantize_on_load {
         safemlx::memory::reset_peak_memory()?;
         let load_start = Instant::now();
-        let mut model = load_realtime_model_with_options(
-            MlxRealtimeBackend::new(stream, weights_stream),
+        let backend = MlxRealtimeExecutionContext::new(stream, weights_stream);
+        let mut model = realtime_support::load(
+            &backend,
             eredu_architectures::moshi::prepare_realtime_model(&model_dir)?,
             MlxLoadRequest::with_quantization(QuantizationRequest::Affine {
                 group_size: 64,
@@ -54,17 +54,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         stream.synchronize()?;
         println!("load_s={:.3}", load_start.elapsed().as_secs_f64());
         report_memory()?;
-        benchmark_model(&mut model, frames, stream)?;
+        benchmark_model(&backend, &mut model, frames, stream)?;
     } else {
         safemlx::memory::reset_peak_memory()?;
         let load_start = Instant::now();
         let preparation = eredu_architectures::moshi::prepare_realtime_model(&model_dir)?;
-        let mut model =
-            load_realtime_model(MlxRealtimeBackend::new(stream, weights_stream), preparation)?;
+        let backend = MlxRealtimeExecutionContext::new(stream, weights_stream);
+        let mut model = realtime_support::load(&backend, preparation, MlxLoadRequest::default())?;
         stream.synchronize()?;
         println!("load_s={:.3}", load_start.elapsed().as_secs_f64());
         report_memory()?;
-        benchmark_model(&mut model, frames, stream)?;
+        benchmark_model(&backend, &mut model, frames, stream)?;
     }
     Ok(())
 }
@@ -83,13 +83,15 @@ fn report_memory() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn benchmark_model(
-    model: &mut RealtimeModel<MlxRealtimeBackend>,
+    backend: &MlxRealtimeExecutionContext,
+    model: &mut realtime_support::PreparedRealtime,
     frames: i32,
     stream: &Stream,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let input = personaplex_sine_frame(1, stream)?;
-    let _ = run_steps(model, &input, 4, stream)?;
-    let result = run_steps(model, &input, frames, stream)?;
+    let input =
+        Array::from_slice(&SINE_TOKENS, &[1, AUDIO_TOKENS_PER_STREAM as i32]).copy(stream)?;
+    let _ = run_steps(backend, model, &input, 4, stream)?;
+    let result = run_steps(backend, model, &input, frames, stream)?;
     report(
         "personaplex_step",
         &result.latencies_ms,
@@ -106,39 +108,37 @@ struct StepBenchResult {
 }
 
 fn run_steps(
-    model: &mut RealtimeModel<MlxRealtimeBackend>,
+    backend: &MlxRealtimeExecutionContext,
+    model: &mut realtime_support::PreparedRealtime,
     input: &Array,
     frames: i32,
     stream: &Stream,
 ) -> Result<StepBenchResult, Box<dyn std::error::Error>> {
     let request = RequestId::new(1);
-    let mut scheduler = RealtimeScheduler::new(model, SchedulerLimits::new(1, 1)?)?;
-    scheduler.register_request(model, request, RealtimeSampling::greedy())?;
+    let mut scheduler =
+        realtime_support::scheduler(backend, model, request, RealtimeSampling::greedy())?;
     let mut latencies_ms = Vec::with_capacity(frames as usize);
     let mut emitted_frames = 0;
     let mut token_hash = 0xcbf29ce484222325u64;
 
     for _ in 0..frames {
         let start = Instant::now();
-        scheduler.enqueue(model, request, MlxRealtimeInput::encoded_audio(input))?;
-        let output = loop {
-            if let Some(output) = scheduler.run_queued(model)?.pop() {
-                break output.into_parts().1;
-            }
-            std::thread::yield_now();
-        };
-        if let Some(tokens) = output.output_audio_tokens() {
-            eval([output.text_token(), output.sampled_audio_tokens(), tokens])?;
+        let output = realtime_support::run_frame(
+            &mut scheduler,
+            backend,
+            model,
+            request,
+            realtime_support::frame(input)?,
+        )?;
+        if output.output_audio_tokens().is_some() {
             emitted_frames += 1;
-        } else {
-            eval([output.text_token(), output.sampled_audio_tokens()])?;
         }
         stream.synchronize()?;
         latencies_ms.push(start.elapsed().as_secs_f64() * 1_000.0);
-        hash_token_array(&mut token_hash, output.text_token())?;
-        hash_token_array(&mut token_hash, output.sampled_audio_tokens())?;
+        hash_token_slice(&mut token_hash, output.text_tokens());
+        hash_token_slice(&mut token_hash, output.sampled_audio_tokens());
         if let Some(tokens) = output.output_audio_tokens() {
-            hash_token_array(&mut token_hash, tokens)?;
+            hash_token_slice(&mut token_hash, tokens);
         } else {
             hash_value(&mut token_hash, u64::MAX);
         }
@@ -158,32 +158,10 @@ fn hash_value(hash: &mut u64, value: u64) {
     }
 }
 
-fn hash_token_array(hash: &mut u64, array: &Array) -> Result<(), Box<dyn std::error::Error>> {
-    let evaluated = array.evaluated()?;
-    match array.dtype() {
-        Dtype::Int32 => {
-            for &value in evaluated.as_slice::<i32>() {
-                hash_value(hash, value as i64 as u64);
-            }
-        }
-        Dtype::Uint32 => {
-            for &value in evaluated.as_slice::<u32>() {
-                hash_value(hash, u64::from(value));
-            }
-        }
-        Dtype::Int64 => {
-            for &value in evaluated.as_slice::<i64>() {
-                hash_value(hash, value as u64);
-            }
-        }
-        Dtype::Uint64 => {
-            for &value in evaluated.as_slice::<u64>() {
-                hash_value(hash, value);
-            }
-        }
-        dtype => return Err(format!("unexpected token dtype: {dtype:?}").into()),
+fn hash_token_slice(hash: &mut u64, tokens: &[i32]) {
+    for &value in tokens {
+        hash_value(hash, value as i64 as u64);
     }
-    Ok(())
 }
 
 fn report(name: &str, latencies_ms: &[f64], emitted_frames: i32, token_hash: u64) {

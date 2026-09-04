@@ -11,7 +11,7 @@ use eredu_backend_mlx::backend::{
 };
 use eredu_backend_mlx::native::{
     DeviceAssignment, MlxDrafter, MlxInspectionOptions, MlxModelInput, MlxModelOutput,
-    MlxModelSession, MlxRealtimeModel, MlxSessionCompletion,
+    MlxModelSession, MlxRealtimeExecution, MlxRealtimeExecutionContext, MlxSessionCompletion,
 };
 use eredu_backend_mlx::{MlxLoadRequest, MlxModelConfig, MlxTensor};
 use eredu_core::InspectableBackendSession;
@@ -62,8 +62,10 @@ fn model_session_exposes_the_neutral_inspection_contract() {
 
 #[test]
 fn native_realtime_adapter_exposes_architecture_owned_identity() {
-    let _: fn(&MlxRealtimeModel) -> eredu_architectures::moshi::EffectiveModelType =
-        MlxRealtimeModel::effective_model_type;
+    assert_public_type::<MlxRealtimeExecution>();
+    assert_public_type::<MlxRealtimeExecutionContext>();
+    assert_public_type::<eredu_architectures::moshi::MoshiRealtimeExecution<MlxRealtimeExecution>>(
+    );
 }
 
 #[test]

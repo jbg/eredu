@@ -1,17 +1,12 @@
 use std::{path::PathBuf, time::Instant};
 
+#[path = "support/realtime.rs"]
+mod realtime_support;
+
 use eredu_backend_mlx::native::ExecutionContext;
-use eredu_backend_mlx::{
-    codec::mimi::load,
-    native::{MlxRealtimeBackend, MlxRealtimeInput},
-    MlxTensor,
-};
+use eredu_backend_mlx::{codec::mimi::load, native::MlxRealtimeExecutionContext, MlxTensor};
 use eredu_codec::mimi::Mimi;
-use eredu_core::{
-    load_realtime_model,
-    scheduler::{RequestId, SchedulerLimits},
-    RealtimeModel, RealtimeSampling, RealtimeScheduler,
-};
+use eredu_core::{scheduler::RequestId, RealtimeSampling};
 use safemlx::{transforms::eval, Array, Device, DeviceType, Stream};
 
 const SAMPLE_RATE: f64 = 24_000.0;
@@ -49,9 +44,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let load_start = Instant::now();
     let preparation = eredu_architectures::moshi::prepare_realtime_model(&model_dir)?;
-    let mut model =
-        load_realtime_model(MlxRealtimeBackend::new(stream, weights_stream), preparation)?;
-    let config = model.speech_config();
+    let backend = MlxRealtimeExecutionContext::new(stream, weights_stream);
+    let mut model = realtime_support::load(
+        &backend,
+        preparation,
+        eredu_backend_mlx::MlxLoadRequest::default(),
+    )?;
+    let config = model.execution_config().frame_schedule();
     let input_audio_codebooks = config.input_audio_codebooks() as i32;
     let generated_audio_codebooks = config.generated_audio_codebooks() as i32;
     let depth_audio_codebooks = config.depth_audio_codebooks() as i32;
@@ -68,10 +67,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let pcm_frame = MlxTensor::from_array(Array::zeros::<f32>(&[1, 1, frame_samples], stream)?);
-    warmup(&mut model, &mut mimi, &pcm_frame, stream)?;
+    warmup(&backend, &mut model, &mut mimi, &pcm_frame, stream)?;
 
     let (elapsed, encoded_frames, emitted_frames) =
-        run_full_path(&mut model, &mut mimi, &pcm_frame, frames, stream)?;
+        run_full_path(&backend, &mut model, &mut mimi, &pcm_frame, frames, stream)?;
     println!("encoded_frames={encoded_frames} emitted_frames={emitted_frames}");
     report("full_path_pcm_to_pcm", elapsed, audio_s, frames);
 
@@ -79,25 +78,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn warmup(
-    model: &mut RealtimeModel<MlxRealtimeBackend>,
+    backend: &MlxRealtimeExecutionContext,
+    model: &mut realtime_support::PreparedRealtime,
     mimi: &mut Mimi<MlxTensor>,
     pcm_frame: &MlxTensor,
     stream: &Stream,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let _ = run_full_path(model, mimi, pcm_frame, 3, stream)?;
+    let _ = run_full_path(backend, model, mimi, pcm_frame, 3, stream)?;
     Ok(())
 }
 
 fn run_full_path(
-    model: &mut RealtimeModel<MlxRealtimeBackend>,
+    backend: &MlxRealtimeExecutionContext,
+    model: &mut realtime_support::PreparedRealtime,
     mimi: &mut Mimi<MlxTensor>,
     pcm_frame: &MlxTensor,
     frames: i32,
     stream: &Stream,
 ) -> Result<(f64, i32, i32), Box<dyn std::error::Error>> {
     let request = RequestId::new(1);
-    let mut scheduler = RealtimeScheduler::new(model, SchedulerLimits::new(1, 1)?)?;
-    scheduler.register_request(model, request, RealtimeSampling::greedy())?;
+    let mut scheduler =
+        realtime_support::scheduler(backend, model, request, RealtimeSampling::greedy())?;
     mimi.reset_encode_state();
     mimi.reset_decode_state();
 
@@ -109,28 +110,21 @@ fn run_full_path(
             continue;
         };
         encoded_frames += 1;
-        scheduler.enqueue(
+        let output = realtime_support::run_frame(
+            &mut scheduler,
+            backend,
             model,
             request,
-            MlxRealtimeInput::encoded_audio(input_tokens.as_array()),
+            realtime_support::frame(input_tokens.as_array())?,
         )?;
-        let output = scheduler
-            .run_queued(model)?
-            .pop()
-            .expect("one queued realtime frame")
-            .into_parts()
-            .1;
         if let Some(output_tokens) = output.output_audio_tokens() {
-            let output_tokens = MlxTensor::from_array(output_tokens.clone());
+            let output_tokens = MlxTensor::from_array(Array::from_slice(
+                output_tokens,
+                &[1, i32::try_from(output_tokens.len())?],
+            ));
             let pcm = mimi.decode_step(&output_tokens, stream)?;
-            eval([
-                output.text_token(),
-                output.sampled_audio_tokens(),
-                pcm.as_array(),
-            ])?;
+            eval([pcm.as_array()])?;
             emitted_frames += 1;
-        } else {
-            eval([output.text_token(), output.sampled_audio_tokens()])?;
         }
         stream.synchronize()?;
     }

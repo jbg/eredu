@@ -7,7 +7,6 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    convert::Infallible,
     io::Write,
     num::{NonZeroU8, NonZeroUsize},
     path::{Path, PathBuf},
@@ -26,12 +25,10 @@ use eredu::{
 use eredu_architectures::ModelKind;
 use eredu_core::{
     checkpoint::TensorDtype,
-    load_realtime_model_with_options,
     residency::{
         MemoryTier, OffloadConfig, OffloadPlan, OffloadUnitId, OffloadUnitSpec, ResidencyLedger,
         ResidencyPolicy,
     },
-    scheduler::{RequestId, SchedulerLimits, SemanticStateTransaction, WorkDescriptor},
     AdmissionRequest, AdmissionResult, ArtifactFormat, AutomaticPlanRequest, AutomaticPlanner,
     AutomaticPlanningBackend, AutomaticPlanningError, BackendDescriptor, BackendId,
     BackendProvider, BackendSession, BoundedResidencyRequirement, CacheStateStrategy,
@@ -45,9 +42,7 @@ use eredu_core::{
     ModelCapabilities, ModelCapabilityBackend, ModelLoadingBackend, ModelResourceProfile,
     ModelRuntime, MultimodalPreparationBackend, MultimodalPreparationFailure, MultimodalRequest,
     MultimodalSegment, ObservationSet, ObservationValue, Observed, PhysicalMemorySemantics,
-    PreparedModel, PreparedSpeculativeLane, RealizedDrafting, RealtimeBackend,
-    RealtimeFrameConvention, RealtimeInputFrame, RealtimeModelLoadingBackend, RealtimeOutputFrame,
-    RealtimeSampling, RealtimeScheduler, RealtimeSpeechConfig, ResidencyPlan, RgbImage,
+    PreparedModel, PreparedSpeculativeLane, RealizedDrafting, ResidencyPlan, RgbImage,
     RuntimeStateEstimate, SamplingPlacement, SemanticEvent, SessionCapabilities,
     SpeculativeCallbackPublisher, SpeculativeCapability, SpeculativeCommit, SpeculativeDraft,
     SpeculativeDraftRandomPosition, SpeculativeDraftSource, SpeculativeExecutor,
@@ -1754,269 +1749,10 @@ fn assert_prepared_generation_and_speculative_conformance() {
     );
 }
 
-#[derive(Clone)]
-struct MockRealtimeSession {
-    step: u32,
-    sampling: RealtimeSampling,
-    rollbacks: std::rc::Rc<std::cell::Cell<usize>>,
-    committed_step: std::rc::Rc<std::cell::Cell<u32>>,
-}
-
-impl SemanticStateTransaction for MockRealtimeSession {
-    type Branch = Self;
-    type Error = MockRealtimeError;
-
-    fn branch(&self) -> Result<Self::Branch, Self::Error> {
-        Ok(self.clone())
-    }
-
-    fn commit_branch(&mut self, branch: Self::Branch) -> Result<(), Self::Error> {
-        branch.committed_step.set(branch.step);
-        *self = branch;
-        Ok(())
-    }
-
-    fn discard_branch(branch: Self::Branch) -> Result<(), Self::Error> {
-        branch.rollbacks.set(branch.rollbacks.get() + 1);
-        Ok(())
-    }
-}
-
-struct MockFrame(Vec<u32>);
-
-impl WorkDescriptor for MockFrame {
-    type Error = Infallible;
-
-    fn encode_descriptor(&self, output: &mut Vec<u32>) -> Result<(), Self::Error> {
-        output.extend_from_slice(&self.0);
-        Ok(())
-    }
-}
-
-#[derive(Debug)]
-struct MockRealtimeError;
-
-impl std::fmt::Display for MockRealtimeError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("controlled realtime completion failure")
-    }
-}
-
-impl std::error::Error for MockRealtimeError {}
-
-struct RealtimeDone {
-    fail: bool,
-}
-
-impl Completion for RealtimeDone {
-    type Error = MockRealtimeError;
-
-    fn is_complete(&self) -> Result<bool, Self::Error> {
-        if self.fail {
-            Err(MockRealtimeError)
-        } else {
-            Ok(true)
-        }
-    }
-
-    fn wait(&self) -> Result<(), Self::Error> {
-        if self.fail {
-            Err(MockRealtimeError)
-        } else {
-            Ok(())
-        }
-    }
-}
-
-#[derive(Default)]
-struct MockRealtimeBackend {
-    fail_next_completion: std::cell::Cell<bool>,
-    rollbacks: std::rc::Rc<std::cell::Cell<usize>>,
-    committed_step: std::rc::Rc<std::cell::Cell<u32>>,
-}
-
-impl RealtimeBackend for MockRealtimeBackend {
-    type Model = u64;
-    type ModelIdentity = u64;
-    type Input = MockFrame;
-    type Output = u32;
-    type Session = MockRealtimeSession;
-    type Completion = RealtimeDone;
-    type Error = MockRealtimeError;
-
-    fn name(&self) -> &str {
-        "portable-mock-realtime"
-    }
-
-    fn model_identity(&self, model: &Self::Model) -> Self::ModelIdentity {
-        *model
-    }
-
-    fn session_capabilities(&self, _: &Self::Model) -> SessionCapabilities {
-        SessionCapabilities::new(true, true, false)
-    }
-
-    fn speech_config(&self, _: &Self::Model) -> RealtimeSpeechConfig {
-        RealtimeSpeechConfig::new(
-            2,
-            1,
-            1,
-            1,
-            0,
-            0,
-            RealtimeFrameConvention::FeedbackAlignedHistory,
-            vec![0, 0, 1],
-        )
-        .unwrap()
-    }
-
-    fn materialize_input(
-        &self,
-        _: &Self::Model,
-        frame: &RealtimeInputFrame,
-    ) -> Result<Self::Input, Self::Error> {
-        Ok(MockFrame(
-            frame
-                .input_audio_tokens()
-                .iter()
-                .map(|token| *token as u32)
-                .collect(),
-        ))
-    }
-
-    fn observe_output(&self, output: &Self::Output) -> Result<RealtimeOutputFrame, Self::Error> {
-        Ok(RealtimeOutputFrame::new(
-            1,
-            vec![*output as i32],
-            Vec::new(),
-            Vec::new(),
-            None,
-            Vec::new(),
-        ))
-    }
-
-    fn create_session(
-        &self,
-        _: &Self::Model,
-        sampling: RealtimeSampling,
-    ) -> Result<Self::Session, Self::Error> {
-        Ok(MockRealtimeSession {
-            step: 0,
-            sampling,
-            rollbacks: std::rc::Rc::clone(&self.rollbacks),
-            committed_step: std::rc::Rc::clone(&self.committed_step),
-        })
-    }
-
-    fn validate_session(&self, _: &Self::Model, _: &Self::Session) -> Result<(), Self::Error> {
-        Ok(())
-    }
-
-    fn validate_input(&self, _: &Self::Model, _: &Self::Input) -> Result<(), Self::Error> {
-        Ok(())
-    }
-
-    fn input_batch_size(&self, input: &Self::Input) -> usize {
-        input.0.len()
-    }
-
-    fn set_sampling(
-        &self,
-        session: &mut Self::Session,
-        sampling: RealtimeSampling,
-    ) -> Result<(), Self::Error> {
-        session.sampling = sampling;
-        Ok(())
-    }
-
-    fn submit_step(
-        &self,
-        model: &mut Self::Model,
-        session: &mut Self::Session,
-        input: &Self::Input,
-    ) -> Result<Submission<Self::Output, Self::Completion>, Self::Error> {
-        session.step += 1;
-        Ok(Submission {
-            output: *model as u32 + session.step + input.0.iter().sum::<u32>(),
-            completion: RealtimeDone {
-                fail: self.fail_next_completion.replace(false),
-            },
-        })
-    }
-}
-
-impl RealtimeModelLoadingBackend for MockRealtimeBackend {
-    type Preparation = u64;
-    type LoadOptions = u64;
-
-    fn materialize_realtime_model(
-        &self,
-        preparation: Self::Preparation,
-        _: Self::LoadOptions,
-    ) -> Result<Self::Model, Self::Error> {
-        Ok(preparation)
-    }
-}
-
-fn assert_realtime_conformance() {
-    let mut model =
-        load_realtime_model_with_options(MockRealtimeBackend::default(), 23, 0).unwrap();
-    assert_eq!(model.backend().name(), "portable-mock-realtime");
-    assert_eq!(*model.model(), 23);
-    assert!(model.session_capabilities().persistent_cache());
-    assert!(model.session_capabilities().output_observation());
-    assert!(!model.session_capabilities().activation_inspection());
-    assert_eq!(model.speech_config().generated_audio_codebooks(), 1);
-
-    let limits = SchedulerLimits::with_execution_bounds(1, 2, 1, 1, 1, usize::MAX).unwrap();
-    let mut scheduler = RealtimeScheduler::new(&model, limits).unwrap();
-    let request = RequestId::new(7);
-    scheduler
-        .register_request(&model, request, RealtimeSampling::greedy())
-        .unwrap();
-    let frame = RealtimeInputFrame::new(1, vec![2]);
-    let input = model
-        .backend()
-        .materialize_input(model.model(), &frame)
-        .unwrap();
-    scheduler.enqueue(&model, request, input).unwrap();
-    let completed = scheduler.run_queued(&mut model).unwrap();
-    assert_eq!(completed.len(), 1);
-    assert_eq!(completed.into_iter().next().unwrap().into_parts().1, 26);
-    assert_eq!(model.backend().committed_step.get(), 1);
-
-    let sampling = RealtimeSampling::new(0.5, 0.75, 11).unwrap();
-    scheduler
-        .set_request_sampling(&model, request, sampling)
-        .unwrap();
-
-    model.backend().fail_next_completion.set(true);
-    let failing_frame = RealtimeInputFrame::new(1, vec![100]);
-    let failing_input = model
-        .backend()
-        .materialize_input(model.model(), &failing_frame)
-        .unwrap();
-    scheduler.enqueue(&model, request, failing_input).unwrap();
-    let error = match scheduler.run_queued(&mut model) {
-        Ok(_) => panic!("controlled completion failure unexpectedly committed"),
-        Err(error) => error,
-    };
-    assert!(error
-        .to_string()
-        .contains("controlled realtime completion failure"));
-    assert_eq!(model.backend().rollbacks.get(), 1);
-    assert_eq!(
-        model.backend().committed_step.get(),
-        1,
-        "failed exact completion rolled back"
-    );
-}
-
 #[test]
 fn non_mlx_backend_conforms_to_the_complete_generic_facade() {
     assert_loading_generation_capability_and_multimodal_conformance();
     assert_prepared_generation_and_speculative_conformance();
-    assert_realtime_conformance();
     assert_session_observation_conformance();
 }
 

@@ -15,9 +15,12 @@
 
 use std::{collections::HashMap, path::PathBuf};
 
-use eredu_backend_mlx::native::{ExecutionContext, MlxRealtimeBackend};
+#[path = "support/realtime.rs"]
+mod realtime_support;
+
+use eredu_backend_mlx::native::{ExecutionContext, MlxRealtimeExecutionContext};
 use eredu_backend_mlx::MlxTensor;
-use eredu_core::{load_realtime_model, ObservationSet, ObservationValue, RealtimeSampling};
+use eredu_core::{ObservationSet, ObservationValue, RealtimeSampling};
 use eredu_evaluation::{
     compare_observations, encoded_audio_frames, observe_i32_tensor, run_realtime_trace,
     ParityPolicy,
@@ -40,8 +43,13 @@ fn main() -> anyhow::Result<()> {
     let stream = gpu.stream();
     let fixture = Array::load_safetensors(&fixture_path, cpu.stream())?;
     let preparation = eredu_architectures::moshi::prepare_realtime_model(&model_dir)?;
-    let mut model =
-        load_realtime_model(MlxRealtimeBackend::new(stream, cpu.stream()), preparation)?;
+    let backend = MlxRealtimeExecutionContext::new(stream, cpu.stream());
+    let model = realtime_support::load(
+        &backend,
+        preparation,
+        eredu_backend_mlx::MlxLoadRequest::default(),
+    )?;
+    let mut model = realtime_support::SelectedRealtimeDriver::new(backend, model);
     let input = required(&fixture, "generation.input_audio")?;
     let trace = run_realtime_trace(
         &mut model,

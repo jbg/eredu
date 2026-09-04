@@ -10,7 +10,7 @@ use crate::{
 };
 use eredu_core::{
     scheduler::SemanticStateTransaction, Completion, RealtimeFrameScheduleState,
-    RealtimeInputFrame, RealtimeScheduleError, RealtimeSpeechConfig,
+    RealtimeInputFrame, RealtimeSampling, RealtimeScheduleError, RealtimeSpeechConfig,
 };
 use std::marker::PhantomData;
 
@@ -23,6 +23,7 @@ use std::marker::PhantomData;
 pub struct RealtimeGenerationState<M, S, R, C> {
     model_state: M,
     schedule_state: RealtimeFrameScheduleState,
+    sampling: RealtimeSampling,
     samplers: Vec<S>,
     random_state: Option<R>,
     completion: PhantomData<fn() -> C>,
@@ -33,6 +34,7 @@ pub struct RealtimeGenerationState<M, S, R, C> {
 pub struct RealtimeGenerationBranch<MB, S, R, C> {
     model_state: MB,
     schedule_state: RealtimeFrameScheduleState,
+    sampling: RealtimeSampling,
     samplers: Vec<S>,
     random_state: Option<R>,
     completion: Option<C>,
@@ -120,6 +122,7 @@ where
     pub fn new(
         model_state: M,
         schedule: RealtimeSpeechConfig,
+        sampling: RealtimeSampling,
         samplers: Vec<S>,
         random_state: Option<R>,
     ) -> Result<Self, RealtimeGenerationTransactionError<M::Error, C::Error>> {
@@ -127,6 +130,7 @@ where
             model_state,
             &schedule,
             RealtimeFrameScheduleState::new(schedule.clone()),
+            sampling,
             samplers,
             random_state,
         )
@@ -140,6 +144,7 @@ where
         model_state: M,
         schedule: &RealtimeSpeechConfig,
         schedule_state: RealtimeFrameScheduleState,
+        sampling: RealtimeSampling,
         samplers: Vec<S>,
         random_state: Option<R>,
     ) -> Result<Self, RealtimeGenerationTransactionError<M::Error, C::Error>> {
@@ -148,6 +153,7 @@ where
         Ok(Self {
             model_state,
             schedule_state,
+            sampling,
             samplers,
             random_state,
             completion: PhantomData,
@@ -164,6 +170,11 @@ where
         &self.schedule_state
     }
 
+    /// Returns the exact portable sampling policy paired with sampler and RNG state.
+    pub const fn sampling(&self) -> RealtimeSampling {
+        self.sampling
+    }
+
     /// Borrows canonical sampler states in text-plus-depth order.
     pub fn samplers(&self) -> &[S] {
         &self.samplers
@@ -174,18 +185,17 @@ where
         self.random_state.as_ref()
     }
 
-    /// Replaces backend randomness while the canonical request is idle.
-    pub fn set_random_state(&mut self, random_state: Option<R>) {
-        self.random_state = random_state;
-    }
-
-    /// Replaces sampler state while the canonical request is idle.
-    pub fn set_samplers(
+    /// Atomically replaces portable controls, sampler state, and randomness while idle.
+    pub fn replace_sampling(
         &mut self,
+        sampling: RealtimeSampling,
         samplers: Vec<S>,
+        random_state: Option<R>,
     ) -> Result<(), RealtimeGenerationTransactionError<M::Error, C::Error>> {
         validate_sampler_cardinality(self.schedule_state.schedule(), samplers.len())?;
+        self.sampling = sampling;
         self.samplers = samplers;
+        self.random_state = random_state;
         Ok(())
     }
 
@@ -213,10 +223,21 @@ where
     {
         let mut branch = SemanticStateTransaction::branch(self)
             .map_err(RealtimeFrameExecutionError::Publication)?;
-        let (output, completion) = transition
-            .execute(frame, &mut branch)
-            .map_err(RealtimeFrameExecutionError::Transition)?;
-        branch.attach_submission_completion(completion)?;
+        let (output, completion) = match transition.execute(frame, &mut branch) {
+            Ok(submission) => submission,
+            Err(error) => {
+                if let Err(discard) = <Self as SemanticStateTransaction>::discard_branch(branch) {
+                    return Err(RealtimeFrameExecutionError::Publication(discard));
+                }
+                return Err(RealtimeFrameExecutionError::Transition(error));
+            }
+        };
+        if let Err(error) = branch.attach_submission_completion(completion) {
+            if let Err(discard) = <Self as SemanticStateTransaction>::discard_branch(branch) {
+                return Err(RealtimeFrameExecutionError::Publication(discard));
+            }
+            return Err(RealtimeFrameExecutionError::CompletionAttachment(error));
+        }
         SemanticStateTransaction::commit_branch(self, branch)
             .map_err(RealtimeFrameExecutionError::Publication)?;
         Ok(output)
@@ -241,6 +262,11 @@ where
 }
 
 impl<MB, S, R, C> RealtimeGenerationBranch<MB, S, R, C> {
+    /// Borrows the transition-local model/cache state.
+    pub const fn model_state(&self) -> &MB {
+        &self.model_state
+    }
+
     /// Mutably borrows the transition-local model/cache state.
     pub fn model_state_mut(&mut self) -> &mut MB {
         &mut self.model_state
@@ -251,9 +277,22 @@ impl<MB, S, R, C> RealtimeGenerationBranch<MB, S, R, C> {
         &self.schedule_state
     }
 
+    /// Returns branch-local portable sampling controls.
+    pub const fn sampling(&self) -> RealtimeSampling {
+        self.sampling
+    }
+
     /// Mutably borrows the transition-local delayed-frame state.
     pub fn schedule_state_mut(&mut self) -> &mut RealtimeFrameScheduleState {
         &mut self.schedule_state
+    }
+
+    /// Mutably borrows transition-local model/cache and schedule state together.
+    ///
+    /// Full-frame executors use this split to advance the schedule against the
+    /// same unpublished model branch without shortening either transaction.
+    pub fn state_parts_mut(&mut self) -> (&mut MB, &mut RealtimeFrameScheduleState) {
+        (&mut self.model_state, &mut self.schedule_state)
     }
 
     /// Borrows transition-local sampler states in text-plus-depth order.
@@ -264,6 +303,11 @@ impl<MB, S, R, C> RealtimeGenerationBranch<MB, S, R, C> {
     /// Borrows transition-local backend random state.
     pub const fn random_state(&self) -> Option<&R> {
         self.random_state.as_ref()
+    }
+
+    /// Returns whether this branch already represents one submitted transition.
+    pub const fn has_submission_completion(&self) -> bool {
+        self.completion.is_some()
     }
 
     /// Attaches the one exact completion returned by backend submission.
@@ -335,6 +379,7 @@ where
         Ok(RealtimeGenerationBranch {
             model_state: self.model_state.branch().map_err(Self::Error::Model)?,
             schedule_state: self.schedule_state.branch()?,
+            sampling: self.sampling,
             samplers: self.samplers.clone(),
             random_state: self.random_state.clone(),
             completion: None,
@@ -345,6 +390,7 @@ where
         let RealtimeGenerationBranch {
             model_state,
             schedule_state,
+            sampling,
             samplers,
             random_state,
             completion,
@@ -385,13 +431,24 @@ where
             .commit_branch(model_state)
             .map_err(Self::Error::Model)?;
         self.schedule_state.commit_branch(schedule_state)?;
+        self.sampling = sampling;
         self.samplers = samplers;
         self.random_state = random_state;
         Ok(())
     }
 
     fn discard_branch(branch: Self::Branch) -> Result<(), Self::Error> {
-        M::discard_branch(branch.model_state).map_err(Self::Error::Model)
+        let RealtimeGenerationBranch {
+            model_state,
+            completion,
+            ..
+        } = branch;
+        let completion_error = completion.and_then(|completion| completion.wait().err());
+        M::discard_branch(model_state).map_err(Self::Error::Model)?;
+        if let Some(error) = completion_error {
+            return Err(Self::Error::Completion(error));
+        }
+        Ok(())
     }
 
     fn permits_parallel_branches(&self) -> bool {
@@ -664,6 +721,7 @@ mod tests {
                 cache_offset: 2,
             },
             schedule(),
+            RealtimeSampling::greedy(),
             vec![StatefulSampler(0), StatefulSampler(5)],
             Some(7),
         )
@@ -867,20 +925,52 @@ mod tests {
         let mut state = TrackingState::new(
             TrackingModel(rollbacks.clone()),
             schedule(),
+            RealtimeSampling::greedy(),
             vec![StatefulSampler(0), StatefulSampler(0)],
             None,
         )
         .unwrap();
 
-        TrackingState::discard_branch(state.branch().unwrap()).unwrap();
+        struct FailingTransition;
+
+        impl RealtimeFrameTransition<TrackingModel, StatefulSampler, i32, MockCompletion>
+            for FailingTransition
+        {
+            type Output = ();
+            type Error = ModelError;
+
+            fn execute(
+                &mut self,
+                _frame: &RealtimeInputFrame,
+                _branch: &mut RealtimeGenerationBranch<
+                    TrackingModel,
+                    StatefulSampler,
+                    i32,
+                    MockCompletion,
+                >,
+            ) -> Result<(Self::Output, MockCompletion), Self::Error> {
+                Err(ModelError)
+            }
+        }
+
+        assert!(matches!(
+            state.execute_frame_transition(
+                &RealtimeInputFrame::new(1, vec![9]),
+                &mut FailingTransition,
+            ),
+            Err(RealtimeFrameExecutionError::Transition(ModelError))
+        ));
         assert_eq!(rollbacks.get(), 1);
+
+        TrackingState::discard_branch(state.branch().unwrap()).unwrap();
+        assert_eq!(rollbacks.get(), 2);
 
         let missing_completion = state.branch().unwrap();
         assert!(matches!(
             state.commit_branch(missing_completion),
             Err(RealtimeGenerationTransactionError::MissingCompletion)
         ));
-        assert_eq!(rollbacks.get(), 2);
+        assert_eq!(rollbacks.get(), 3);
     }
 
     #[test]
@@ -919,6 +1009,7 @@ mod tests {
                 },
                 &schedule(),
                 RealtimeFrameScheduleState::new(other),
+                RealtimeSampling::greedy(),
                 vec![StatefulSampler(0), StatefulSampler(0)],
                 Some(0),
             ),
@@ -933,6 +1024,7 @@ mod tests {
                     cache_offset: 2,
                 },
                 schedule(),
+                RealtimeSampling::greedy(),
                 vec![StatefulSampler(0)],
                 Some(0),
             ),
@@ -1055,5 +1147,36 @@ mod tests {
             branch.attach_submission_completion(MockCompletion::new(CompletionOutcome::Success).0),
             Err(RealtimeCompletionAttachmentError::AlreadyAttached)
         );
+    }
+
+    #[test]
+    fn sampling_replacement_binds_controls_samplers_and_randomness_atomically() {
+        let mut state = state();
+        let sampling = RealtimeSampling::new(0.25, 0.75, 42)
+            .unwrap()
+            .with_top_k(Some(3), Some(5))
+            .unwrap();
+        assert!(matches!(
+            state.replace_sampling(sampling, vec![StatefulSampler(9)], Some(11)),
+            Err(RealtimeGenerationTransactionError::SamplerCardinality {
+                expected: 2,
+                actual: 1
+            })
+        ));
+        assert_eq!(state.sampling(), RealtimeSampling::greedy());
+        assert_eq!(state.samplers(), [StatefulSampler(0), StatefulSampler(5)]);
+        assert_eq!(state.random_state(), Some(&7));
+
+        state
+            .replace_sampling(
+                sampling,
+                vec![StatefulSampler(9), StatefulSampler(10)],
+                Some(11),
+            )
+            .unwrap();
+        assert_eq!(state.sampling(), sampling);
+        assert_eq!(state.samplers(), [StatefulSampler(9), StatefulSampler(10)]);
+        assert_eq!(state.random_state(), Some(&11));
+        assert_eq!(state.branch().unwrap().sampling(), sampling);
     }
 }

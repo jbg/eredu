@@ -93,8 +93,10 @@ prompt-cache types because it exposes no prompt-cache operation.
 The selected adapter exposes only facade-owned causal and realtime model,
 planning, drafting, scheduler, completed-step, and error wrappers. The realtime
 factory loads an architecture-owned preparation directly into the facade model.
-The facade materializes portable inputs and observes portable outputs while
-concrete associated types and handle-oriented constructors remain private.
+The facade submits portable input frames to the neutral runtime scheduler and
+receives portable output frames only after the runtime-owned transition has
+completed and committed. Concrete mechanism types and handle-oriented
+constructors remain private.
 Explicit native sessions and token handles remain backend-author concerns;
 streams and distributed collective groups come directly from `safemlx`.
 
@@ -148,13 +150,15 @@ execution must include any replacement it supplies. Family adapters and
 topology executors finalize logits through
 `eredu_runtime::observe_model_logits`; pipeline execution does so on the
 logits-owning rank before submitting its completion. Realtime applications
-likewise exchange portable host token frames and observations through
-`RealtimeBackend::materialize_input` and `RealtimeBackend::observe_output`.
-Realtime backends report the exact loaded route's fail-closed
-`SessionCapabilities`; realtime loading validates requested capabilities before
-checkpoint payload materialization just as ordinary model loading does. A
-realtime route must not advertise named activation inspection unless it exposes
-the corresponding inspection contract.
+likewise exchange portable host token frames through the facade. Runtime ingress
+validates their exact batch and token geometry before a backend conversion
+mechanism can create native tensors. Runtime prepublication waits for the exact
+backend completion, performs host observation, and commits the model, schedule,
+history, samplers, randomness, and output as one transition. Realtime selection
+validates the exact loaded route's fail-closed mechanism and observation
+capabilities before checkpoint payload materialization. A realtime route must
+not advertise a named observation or intervention unless its architecture
+execution exposes the corresponding seam.
 Distributed inspection is rank-local: every rank participates in the same
 production collective and point-to-point execution, each rank returns only the
 globally named units it owns, and only the logits-owning rank returns
@@ -1295,12 +1299,16 @@ mechanisms, and erases the completed typed session.
 Realtime prompt protocols follow the same ownership rule. The neutral Moshi
 architecture declares PersonaPlex's released silence, sine-conditioning, and
 text-padding tokens, system-text framing, accepted prompt geometry, and
-ordered forced-frame plan. A concrete backend only slices and materializes
-native arrays from that plan and enqueues the resulting frames; it does not
-redeclare PersonaPlex application policy. Realtime model identity is likewise
-architecture-owned: backend models return the Moshi architecture's
-`EffectiveModelType` directly. Backend adapters must not re-export or wrap that
-type; direct consumers import it from `eredu_architectures::moshi`.
+ordered forced-frame plan. Architecture code resolves that plan against
+validated host token storage and produces portable forced frames in enqueue
+order. The common runtime ingress later performs family-blind host-to-tensor
+conversion; a concrete backend does not match PersonaPlex prompt sources or
+redeclare its application policy. Realtime model identity is likewise
+architecture-owned. The selected architecture wrapper retains the source and
+execution configurations plus the authoritative neutral realization; concrete
+mechanisms are bound beneath that wrapper and do not restate a family identity.
+Family metadata such as `EffectiveModelType` remains in
+`eredu_architectures::moshi`.
 
 Realtime artifact loading also crosses the backend boundary as a neutral
 architecture preparation. Moshi inspection parses optional native defaults or
@@ -1311,6 +1319,65 @@ backends consume that plan and load tensor payloads; checkpoint-layout identity
 names the physical Moshi or PersonaPlex SafeTensors namespace and never a
 concrete backend. Backends do not receive a raw artifact path or reinterpret
 family configuration and filename policy.
+
+Realtime inspection derives one exact architecture requirement from this
+metadata-only preparation. It includes separate source and execution
+identities, per-parameter lowerings, immutable and mutable residency, speech
+schedule and state geometry, topology and rank, finite invocation bounds,
+observation seams, completion policy, and every required generic mechanism.
+Family-blind selection compares that requirement with an independently reported
+backend capability set before payload access, module or state allocation, or
+route-owned queue and group realization. The resulting selected realization is
+the sole input to construction; construction cannot reselect a format,
+residency, topology, or state profile from caller options. The selected local adapter also
+completes this inspection and selection before it realizes an MLX device or
+creates execution and weight-materialization streams.
+
+Typed Moshi architecture dispatch builds static, temporal, and depth modules
+and passes them to `eredu_runtime::construct_realtime_model`. Resident and
+bounded policies share that constructor and its `RealtimeLayerwiseRuntime`;
+pure tensor parallelism wraps the same selected traversal in the partitioned
+runtime. The implementation backend binds generic tensors,
+operators, stores, state, streams, and collectives, then performs only a final
+opaque erasure of the already constructed executable. Its public native handle
+is this mechanism bundle, not a prepared Moshi model or semantic realtime
+state, session, or scheduler.
+
+`eredu-runtime` owns the complete frame lifecycle. Validated portable ingress,
+typed coordinate payload history, schedule advancement, delayed temporal
+resolution, forcing, sequential text/depth decisions, output alignment, and
+history pruning execute once in the shared coordinator. The coordinator
+branches model/cache state, history, schedule, samplers, and randomness as one
+transaction. Moshi architecture composition enables its proven fully-forced
+depth-tail omission; the neutral decision driver disables that optimization
+when diagnostics are requested or any remaining decision is not forced.
+`RealtimeSessionScheduler` is the only fair request lifecycle for
+single and concurrent sessions, including deadlines, cancellation,
+release/resume, and idle-only sampling replacement. Architecture observation
+hooks compose with layered traversal and sequential decisions, so replacements
+at declared temporal, layer, decision-logit, and final-output seams affect the
+actual downstream transition rather than a diagnostic copy.
+
+The MLX completion mechanism retains native input, output, diagnostics, history,
+state, checkpoint stores, streams, and collective ownership. Runtime
+prepublication waits for that exact completion and validates native token
+scopes before host observation; only then may the scheduler publish the branch
+and its portable output. Failed event creation synchronously drains retained
+roots before returning, while delayed or failed completion remains quarantined
+and cannot expose host output. These completion rules are mechanism-specific;
+the commit and visibility rules remain backend-neutral.
+
+Distributed realtime turns use the same neutral scheduler transaction. Before
+submission, bounded consensus compares the topology-wide selected model
+identity—including selected state realization and observation policy—rank
+ordering, work descriptor, request, and portable frame on every participant. A
+second bounded consensus round agrees the exact submission count and any local
+submission failure. Following native completion and host observation, an output consensus round
+compares each local outcome and a digest of the complete portable output. A
+descriptor or output disagreement, peer execution or completion failure, or
+indeterminate consensus discards every unpublished branch; only topology-wide
+completed output agreement permits any rank to publish. The MLX transport
+supplies only bounded word gathering and its retained native completion.
 
 The Moshi pure tensor-parallel realtime extension is selected by the
 architecture as a rank-local handoff. Architecture code validates its narrow

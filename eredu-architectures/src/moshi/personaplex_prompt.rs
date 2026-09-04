@@ -6,6 +6,8 @@
 
 /// Number of Mimi codebooks per side in PersonaPlex's dual-stream layout.
 pub const AUDIO_TOKENS_PER_STREAM: usize = 8;
+/// Released PersonaPlex conditioning pads each prompt segment with silence.
+pub const RELEASED_PROMPT_SILENCE_FRAMES: usize = 6;
 /// PersonaPlex uses the tokenizer's existing pad id during prompt forcing.
 pub const TEXT_PADDING_TOKEN: i32 = 3;
 /// PersonaPlex audio tokens used for an agent-side silence frame.
@@ -81,6 +83,34 @@ pub enum PromptPlanError {
         /// Text prompt batch dimension.
         text_batch: usize,
     },
+    /// Voice token storage does not match its declared dense geometry.
+    #[error(
+        "PersonaPlex voice prompt storage must contain {expected} tokens for [batch, 8, frames], got {actual}"
+    )]
+    VoiceStorageMismatch {
+        /// Required number of tokens.
+        expected: usize,
+        /// Supplied number of tokens.
+        actual: usize,
+    },
+    /// Text token storage does not match its declared dense geometry.
+    #[error(
+        "PersonaPlex text prompt storage must contain {expected} tokens for [batch, frames], got {actual}"
+    )]
+    TextStorageMismatch {
+        /// Required number of tokens.
+        expected: usize,
+        /// Supplied number of tokens.
+        actual: usize,
+    },
+    /// A plan refers outside the declared voice or text frame extent.
+    #[error("PersonaPlex prompt plan refers to unavailable {kind} frame {index}")]
+    MissingFrame {
+        /// Prompt source kind.
+        kind: &'static str,
+        /// Missing frame index.
+        index: usize,
+    },
 }
 
 /// Wraps text prompt content with PersonaPlex system tags if absent.
@@ -155,6 +185,123 @@ pub fn system_prompt_plan(
     Ok(voice)
 }
 
+/// Declares the released voice/silence/text/silence conditioning sequence.
+pub fn released_conditioning_plan(
+    voice_shape: Option<&[usize]>,
+    text_shape: &[usize],
+) -> Result<PromptBatchPlan, PromptPlanError> {
+    let mut text = text_prompt_plan(text_shape)?;
+    let padding = PromptFramePlan {
+        agent_audio: AgentAudioSource::Silence,
+        text: TextSource::Padding,
+        force_generated_audio: true,
+        forced_generated_audio_codebooks: None,
+        force_text: true,
+    };
+    let mut frames = Vec::new();
+    if let Some(shape) = voice_shape {
+        let voice = voice_prompt_plan(shape)?;
+        if voice.batch != text.batch {
+            return Err(PromptPlanError::BatchMismatch {
+                voice_batch: voice.batch,
+                text_batch: text.batch,
+            });
+        }
+        frames.extend(voice.frames);
+        frames.extend(std::iter::repeat_n(padding, RELEASED_PROMPT_SILENCE_FRAMES));
+    }
+    frames.append(&mut text.frames);
+    frames.extend(std::iter::repeat_n(padding, RELEASED_PROMPT_SILENCE_FRAMES));
+    Ok(PromptBatchPlan {
+        batch: text.batch,
+        frames,
+    })
+}
+
+/// Materializes an ordered prompt plan into portable scheduler frames.
+///
+/// Voice storage is dense `[batch, 8, voice_frames]` and text storage is dense
+/// `[batch, text_frames]`. The returned values contain no backend tensors.
+pub fn materialize_prompt_frames(
+    plan: &PromptBatchPlan,
+    voice_tokens: &[i32],
+    voice_frames: usize,
+    text_tokens: &[i32],
+    text_frames: usize,
+) -> Result<Vec<eredu_core::RealtimeInputFrame>, PromptPlanError> {
+    let expected_voice = plan
+        .batch
+        .saturating_mul(AUDIO_TOKENS_PER_STREAM)
+        .saturating_mul(voice_frames);
+    if voice_tokens.len() != expected_voice {
+        return Err(PromptPlanError::VoiceStorageMismatch {
+            expected: expected_voice,
+            actual: voice_tokens.len(),
+        });
+    }
+    let expected_text = plan.batch.saturating_mul(text_frames);
+    if text_tokens.len() != expected_text {
+        return Err(PromptPlanError::TextStorageMismatch {
+            expected: expected_text,
+            actual: text_tokens.len(),
+        });
+    }
+
+    plan.frames
+        .iter()
+        .map(|frame| {
+            let mut input_audio = Vec::with_capacity(plan.batch * AUDIO_TOKENS_PER_STREAM);
+            let mut generated_audio = Vec::with_capacity(plan.batch * AUDIO_TOKENS_PER_STREAM);
+            let mut text = Vec::with_capacity(plan.batch);
+            for batch in 0..plan.batch {
+                input_audio.extend(SINE_TOKENS);
+                match frame.agent_audio {
+                    AgentAudioSource::Silence => generated_audio.extend(SILENCE_TOKENS),
+                    AgentAudioSource::VoiceFrame(index) => {
+                        if index >= voice_frames {
+                            return Err(PromptPlanError::MissingFrame {
+                                kind: "voice",
+                                index,
+                            });
+                        }
+                        generated_audio.extend((0..AUDIO_TOKENS_PER_STREAM).map(|codebook| {
+                            voice_tokens[batch * AUDIO_TOKENS_PER_STREAM * voice_frames
+                                + codebook * voice_frames
+                                + index]
+                        }));
+                    }
+                }
+                text.push(match frame.text {
+                    TextSource::Padding => TEXT_PADDING_TOKEN,
+                    TextSource::PromptFrame(index) => {
+                        if index >= text_frames {
+                            return Err(PromptPlanError::MissingFrame {
+                                kind: "text",
+                                index,
+                            });
+                        }
+                        text_tokens[batch * text_frames + index]
+                    }
+                });
+            }
+            let mut portable = eredu_core::RealtimeInputFrame::new(plan.batch, input_audio);
+            if frame.force_generated_audio {
+                portable = match frame.forced_generated_audio_codebooks {
+                    Some(mask) => portable.with_partially_forced_generated_audio(
+                        generated_audio,
+                        mask.into_iter().collect(),
+                    ),
+                    None => portable.with_forced_generated_audio(generated_audio),
+                };
+            }
+            if frame.force_text {
+                portable = portable.with_forced_text(text);
+            }
+            Ok(portable)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,5 +374,38 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("batches must match"), "{error}");
+    }
+
+    #[test]
+    fn materialization_follows_plan_order_and_validates_storage() {
+        let plan = system_prompt_plan(Some(&[1, 8, 2]), &[1, 2]).unwrap();
+        let voice = (0..16).collect::<Vec<_>>();
+        let frames = materialize_prompt_frames(&plan, &voice, 2, &[41, 42], 2).unwrap();
+        assert_eq!(frames.len(), 4);
+        assert_eq!(frames[0].forced_generated_audio_tokens().unwrap()[0], 0);
+        assert_eq!(frames[1].forced_generated_audio_tokens().unwrap()[0], 1);
+        assert_eq!(frames[2].forced_text_tokens(), Some(&[41][..]));
+        assert_eq!(frames[3].forced_text_tokens(), Some(&[42][..]));
+        assert!(frames
+            .iter()
+            .all(|frame| frame.input_audio_tokens() == SINE_TOKENS));
+
+        let error = materialize_prompt_frames(&plan, &voice[..15], 2, &[41, 42], 2)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("must contain 16 tokens"), "{error}");
+    }
+
+    #[test]
+    fn released_conditioning_includes_both_silence_boundaries() {
+        let plan = released_conditioning_plan(Some(&[1, 8, 1]), &[1, 2]).unwrap();
+        assert_eq!(
+            plan.frames.len(),
+            1 + RELEASED_PROMPT_SILENCE_FRAMES + 2 + RELEASED_PROMPT_SILENCE_FRAMES
+        );
+        assert_eq!(
+            plan.frames[1 + RELEASED_PROMPT_SILENCE_FRAMES].text,
+            TextSource::PromptFrame(0)
+        );
     }
 }

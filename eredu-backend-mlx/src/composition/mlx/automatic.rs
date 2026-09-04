@@ -2,25 +2,23 @@
 
 use std::{num::NonZeroUsize, path::Path};
 
-use eredu_core::scheduler::SemanticStateTransaction;
 use eredu_core::{
     AutomaticPlanningBackend, AutomaticPlanningError, BackendId, BoundedResidencyRequirement,
     CandidateAdmission, DevicePlan, DraftPlacementPlan, DraftingPlan, DurationSeconds,
     ExecutionPlan, ExecutionPlanBackendFactory, ExecutionPlanTarget, ExpertCacheTelemetry,
     ExternalDraftArtifact, HardwareBackendProfile, HardwareDeviceProfile, HardwareMemorySemantics,
     HardwareProfile, InspectionSeverity, ModelResourceProfile, ModelRuntime, Observed,
-    PhysicalMemorySemantics, QuantizationRequest, RealizedDrafting, RealtimeBackend,
-    RealtimeInputFrame, RealtimeModelLoadingBackend, RealtimeOutputFrame, RealtimeSampling,
-    RealtimeSpeechConfig, ResidencyPlan, ResidencyTelemetry, SpeculativeDecodingTelemetry,
-    SpeculativeDraftSource, SpeculativeGenerationBackend, SpeculativeStats, Submission,
-    TransferTelemetry, WeightTransformationPlan, AUTOMATIC_SCHEMA_VERSION,
+    PhysicalMemorySemantics, QuantizationRequest, RealizedDrafting, ResidencyPlan,
+    ResidencyTelemetry, SpeculativeDecodingTelemetry, SpeculativeDraftSource,
+    SpeculativeGenerationBackend, SpeculativeStats, TransferTelemetry, WeightTransformationPlan,
+    AUTOMATIC_SCHEMA_VERSION,
 };
 use safemlx::{Device, DeviceType, Stream};
 
 use super::{
     capability::available_memory,
     inspection::{inspect_model, MlxInspectionOptions},
-    realtime::MlxRealtimeBackend,
+    realtime::MlxRealtimeExecutionContext,
     speculative::MlxDrafter,
     MlxBackend, MlxLoadRequest,
 };
@@ -57,134 +55,34 @@ impl MlxBackendFactory {
     }
 }
 
-/// Realtime MLX adapter without native device or stream accessors.
+/// Selects and materializes one single-device realtime execution route.
 ///
-/// The facade stores this concrete adapter while applications operate it only
-/// through facade-owned model and scheduler wrappers. Backend-author tools use
-/// [`crate::native::MlxRealtimeBackend`] when they need explicit native handles.
-#[derive(Clone)]
-pub struct MlxRealtimeAdapter {
-    backend: MlxRealtimeBackend,
-}
-
-impl RealtimeModelLoadingBackend for MlxRealtimeAdapter {
-    type Preparation = eredu_architectures::moshi::RealtimePreparationPlan;
-    type LoadOptions = MlxLoadRequest;
-
-    fn materialize_realtime_model(
-        &self,
-        preparation: Self::Preparation,
-        options: Self::LoadOptions,
-    ) -> Result<Self::Model, Self::Error> {
-        self.backend
-            .materialize_realtime_model(preparation, options)
-    }
-}
-
-impl RealtimeBackend for MlxRealtimeAdapter {
-    type Model = <MlxRealtimeBackend as RealtimeBackend>::Model;
-    type ModelIdentity = <MlxRealtimeBackend as RealtimeBackend>::ModelIdentity;
-    type Input = <MlxRealtimeBackend as RealtimeBackend>::Input;
-    type Output = <MlxRealtimeBackend as RealtimeBackend>::Output;
-    type Session = <MlxRealtimeBackend as RealtimeBackend>::Session;
-    type Completion = <MlxRealtimeBackend as RealtimeBackend>::Completion;
-    type Error = Error;
-
-    fn name(&self) -> &str {
-        self.backend.name()
-    }
-
-    fn model_identity(&self, model: &Self::Model) -> Self::ModelIdentity {
-        self.backend.model_identity(model)
-    }
-
-    fn session_capabilities(&self, model: &Self::Model) -> eredu_core::SessionCapabilities {
-        self.backend.session_capabilities(model)
-    }
-
-    fn model_identity_mismatch(
-        &self,
-        expected: &Self::ModelIdentity,
-        actual: &Self::ModelIdentity,
-    ) -> Option<String> {
-        self.backend.model_identity_mismatch(expected, actual)
-    }
-
-    fn speech_config(&self, model: &Self::Model) -> RealtimeSpeechConfig {
-        self.backend.speech_config(model)
-    }
-
-    fn materialize_input(
-        &self,
-        model: &Self::Model,
-        frame: &RealtimeInputFrame,
-    ) -> Result<Self::Input, Self::Error> {
-        self.backend.materialize_input(model, frame)
-    }
-
-    fn observe_output(&self, output: &Self::Output) -> Result<RealtimeOutputFrame, Self::Error> {
-        self.backend.observe_output(output)
-    }
-
-    fn create_session(
-        &self,
-        model: &Self::Model,
-        sampling: RealtimeSampling,
-    ) -> Result<Self::Session, Self::Error> {
-        self.backend.create_session(model, sampling)
-    }
-
-    fn validate_session(
-        &self,
-        model: &Self::Model,
-        session: &Self::Session,
-    ) -> Result<(), Self::Error> {
-        self.backend.validate_session(model, session)
-    }
-
-    fn validate_input(&self, model: &Self::Model, input: &Self::Input) -> Result<(), Self::Error> {
-        self.backend.validate_input(model, input)
-    }
-
-    fn input_batch_size(&self, input: &Self::Input) -> usize {
-        self.backend.input_batch_size(input)
-    }
-
-    fn set_sampling(
-        &self,
-        session: &mut Self::Session,
-        sampling: RealtimeSampling,
-    ) -> Result<(), Self::Error> {
-        self.backend.set_sampling(session, sampling)
-    }
-
-    fn submit_step(
-        &self,
-        model: &mut Self::Model,
-        session: &mut <Self::Session as SemanticStateTransaction>::Branch,
-        input: &Self::Input,
-    ) -> Result<Submission<Self::Output, Self::Completion>, Self::Error> {
-        self.backend.submit_step(model, session, input)
-    }
-
-    fn retained_resources(&self, completion: &Self::Completion) -> usize {
-        self.backend.retained_resources(completion)
-    }
-}
-
-/// Creates a single-device realtime adapter from a portable device plan.
-///
-/// Application facades use this factory boundary to keep native MLX streams
-/// out of their public API. Backend-author code that needs explicit streams or
-/// collective groups constructs [`crate::native::MlxRealtimeBackend`] directly instead.
-pub fn create_realtime_backend(device: &DevicePlan) -> Result<MlxRealtimeAdapter, Error> {
+/// Architecture inspection and exact capability selection complete before
+/// this function realizes a native device or creates execution and weight
+/// streams. The returned context exposes mechanism operations only; the model
+/// remains in its architecture-owned selected wrapper.
+pub fn create_realtime_execution(
+    preparation: eredu_architectures::moshi::RealtimePreparationPlan,
+    device: &DevicePlan,
+    options: MlxLoadRequest,
+) -> Result<
+    (
+        MlxRealtimeExecutionContext,
+        eredu_architectures::moshi::MoshiRealtimeExecution<
+            crate::composition::moshi::MlxRealtimeExecution,
+        >,
+    ),
+    Error,
+> {
+    let selected =
+        MlxRealtimeExecutionContext::select_realtime_execution(preparation, &options, false)?;
     let realized =
         mlx_device(device).map_err(|error| Error::AutomaticPlanning(error.to_string()))?;
     let stream = Stream::try_new_with_device(&realized.device)?;
     let weights_stream = Stream::try_new_with_device(&Device::new(DeviceType::Cpu, 0))?;
-    Ok(MlxRealtimeAdapter {
-        backend: MlxRealtimeBackend::new(&stream, &weights_stream),
-    })
+    let context = MlxRealtimeExecutionContext::new(&stream, &weights_stream);
+    let execution = context.materialize_realtime_execution(selected, options)?;
+    Ok((context, execution))
 }
 
 /// Discovers hardware facts visible to the MLX adapter.
@@ -843,6 +741,24 @@ fn planning_backend_error(
 mod tests {
     use super::*;
     use eredu_core::BackendProvider as _;
+
+    #[test]
+    fn realtime_capability_rejection_precedes_device_and_stream_realization() {
+        let directory = tempfile::tempdir().expect("tiny realtime artifact directory");
+        super::super::realtime::tests::write_tiny_native_artifact(directory.path(), None);
+        let preparation = eredu_architectures::moshi::prepare_realtime_model(directory.path())
+            .expect("tiny realtime artifact is valid");
+        let device = DevicePlan::new("mlx", "gpu:0").expect("portable device name is valid");
+        let options = MlxLoadRequest::default().with_required_session_capabilities(
+            eredu_core::SessionCapabilities::default().with_activation_inspection(true),
+        );
+
+        let error = match create_realtime_execution(preparation, &device, options) {
+            Ok(_) => panic!("unsupported activation observation must reject selection"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("activation_inspection"));
+    }
 
     #[test]
     fn mlx_discovery_always_reports_cpu() {

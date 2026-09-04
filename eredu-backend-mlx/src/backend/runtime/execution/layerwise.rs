@@ -11,7 +11,8 @@ use eredu_checkpoint::{
 };
 use eredu_runtime::{
     DenseDiskStreamLoadOptions, DenseDiskStreamReport, DenseStreamTelemetry, DenseTransferSchedule,
-    ReplicatedTextMaterializationTask, WeightBinding, WeightLoweringKind, DENSE_TRANSFER_WINDOW,
+    RealtimeMaterializationTask, ReplicatedTextMaterializationTask, WeightBinding,
+    WeightLoweringKind, DENSE_TRANSFER_WINDOW,
 };
 
 use std::{
@@ -1211,6 +1212,134 @@ where
             }
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let working_set_bytes =
+        bounded_quantization_working_set(store.as_ref(), &targets, quantization)?;
+    let transformed = Arc::new(BoundedQuantizedWeightStore::create(
+        store,
+        BoundedQuantizationPlan::new(quantization, working_set_bytes, targets)?,
+        stream,
+    )?);
+    let report = transformed.report().clone();
+    let transformed: SharedCheckpointSource = transformed;
+    Ok((transformed, report))
+}
+
+/// Builds a bounded packed overlay from architecture-selected realtime tasks.
+///
+/// Source recipes and physical output names come exclusively from the selected
+/// contract. Target modules are inspected only to verify that those exact
+/// primary and companion handles exist with the native dtypes required by MLX.
+pub fn quantize_exact_realtime_tasks<SM, U>(
+    store: SharedCheckpointSource,
+    target_static: &SM,
+    target_units: &[U],
+    quantization: WeightQuantization,
+    tasks: &[RealtimeMaterializationTask],
+    stream: &Stream,
+) -> Result<(SharedCheckpointSource, WeightMaterializationReport), Error>
+where
+    SM: Parameterized<crate::MlxTensor>,
+    U: Parameterized<crate::MlxTensor>,
+{
+    let mut available = packed_weight_companions(target_static, quantization)?;
+    for unit in target_units {
+        for (target, companions) in packed_weight_companions(unit, quantization)? {
+            if available.insert(target.clone(), companions).is_some() {
+                return Err(Error::Quantization(format!(
+                    "selected realtime packed target {target:?} appears in more than one module"
+                )));
+            }
+        }
+    }
+    let mut recipes = BTreeMap::new();
+    for task in tasks.iter().filter(|task| {
+        matches!(
+            task.lowering().kind(),
+            WeightLoweringKind::Transform | WeightLoweringKind::DerivedTransform
+        )
+    }) {
+        let target = task.lowering().target().as_str();
+        if task
+            .lowering()
+            .descriptor()
+            .executable()
+            .weight_quantization()
+            != Some(quantization)
+        {
+            return Err(Error::Quantization(format!(
+                "selected realtime transform {target:?} does not match its executable format"
+            )));
+        }
+        let companions = available.remove(target).ok_or_else(|| {
+            Error::Quantization(format!(
+                "selected realtime transform {target:?} has no native packed target"
+            ))
+        })?;
+        let scale = task.lowering().scale().ok_or_else(|| {
+            Error::Quantization(format!(
+                "selected realtime transform {target:?} has no scale component"
+            ))
+        })?;
+        if scale.target().as_str() != companions.scales_name {
+            return Err(Error::Quantization(format!(
+                "selected realtime transform {target:?} scale identity differs from native target"
+            )));
+        }
+        let selected_bias = task
+            .lowering()
+            .affine_bias()
+            .map(|component| component.target().as_str());
+        if selected_bias != companions.biases_name.as_deref() {
+            return Err(Error::Quantization(format!(
+                "selected realtime transform {target:?} bias identity differs from native target"
+            )));
+        }
+        let primary = task.lowering().primary();
+        let recipe = primary.recipe().ok_or_else(|| {
+            Error::Quantization(format!(
+                "selected realtime transform {target:?} has no source recipe"
+            ))
+        })?;
+        if recipes
+            .insert(target.to_owned(), (recipe.clone(), companions))
+            .is_some()
+        {
+            return Err(Error::Quantization(format!(
+                "selected realtime transform {target:?} appears more than once"
+            )));
+        }
+    }
+    if recipes.is_empty() {
+        return Err(Error::Quantization(
+            "selected realtime transform contains no packed matrix tasks".into(),
+        ));
+    }
+    if !available.is_empty() {
+        return Err(Error::Quantization(format!(
+            "native packed modules contain unselected realtime targets: {:?}",
+            available.keys().collect::<Vec<_>>()
+        )));
+    }
+    let targets = recipes
+        .into_iter()
+        .map(|(target, (recipe, companions))| {
+            let target = BoundedQuantizationTarget::from_recipe(
+                target,
+                companions.scales_name,
+                companions.biases_name,
+                recipe,
+            )?;
+            match quantization {
+                WeightQuantization::Affine(_) => {
+                    target.with_affine_companion_dtype(companions.affine_companion_dtype)
+                }
+                WeightQuantization::MxFp4 => Ok(target),
+                WeightQuantization::GgufIQuant { .. } => unreachable!(
+                    "load-time materialization rejects checkpoint-native GGUF encodings"
+                ),
+            }
+        })
+        .collect::<Result<Vec<_>, Error>>()?;
     let working_set_bytes =
         bounded_quantization_working_set(store.as_ref(), &targets, quantization)?;
     let transformed = Arc::new(BoundedQuantizedWeightStore::create(

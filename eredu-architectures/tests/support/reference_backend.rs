@@ -5,6 +5,7 @@ struct ReferenceTensor(Vec<i32>);
 struct ReferenceTrace {
     linear_outputs: Vec<(String, Vec<i32>)>,
     embedding_lookups: Vec<(String, Vec<i32>)>,
+    sampled_logits: Vec<Vec<i32>>,
     rotary_offsets: Vec<i32>,
     sliding_attention: Vec<(i32, i32)>,
     causal_masks: Vec<(i32, i32, Option<i32>)>,
@@ -1202,11 +1203,14 @@ impl SamplingBackend for ReferenceBackend {
     }
 
     fn sample_raw(
-        _: &Self::Logits,
+        logits: &Self::Logits,
         _: f32,
         random: Option<&mut Self::RandomState>,
         _: &Self::Context,
     ) -> Result<Self::Token, Self::Error> {
+        REFERENCE_TRACE.with(|trace| {
+            trace.borrow_mut().sampled_logits.push(logits.0.clone());
+        });
         if let Some(random) = random {
             *random += 1;
         }

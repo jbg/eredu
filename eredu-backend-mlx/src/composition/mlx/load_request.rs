@@ -263,6 +263,27 @@ impl MlxLoadRequest {
         }
     }
 
+    /// Completion policy selected for realtime work, including local async evaluation.
+    pub(crate) fn realtime_completion_policy(
+        &self,
+    ) -> Result<eredu_runtime::CommunicationCompletionPolicy, Error> {
+        if self.parallel.is_some() {
+            return self.communication_completion_policy()?.ok_or_else(|| {
+                Error::Parallel("parallel realtime completion policy is missing".into())
+            });
+        }
+        self.communication_completion.map_or_else(
+            || {
+                eredu_runtime::CommunicationCompletionPolicy::new(
+                    std::time::Duration::from_secs(30),
+                    eredu_core::CompletionCancellationMode::QuarantineUntilComplete,
+                )
+                .map_err(|error| Error::Parallel(error.to_string()))
+            },
+            Ok,
+        )
+    }
+
     pub(crate) fn weight_quantization(&self) -> Result<Option<WeightQuantization>, Error> {
         self.quantization
             .map(|request| match request {
@@ -281,19 +302,6 @@ impl MlxLoadRequest {
                 )),
             })
             .transpose()
-    }
-
-    pub(crate) fn validate_replicated(&self) -> Result<(), Error> {
-        if self
-            .parallel_topology()
-            .is_some_and(|topology| !topology.is_replicated())
-        {
-            return Err(Error::Parallel(
-                "replicated MLX model loading requires a replicated topology; construct a distributed MlxBackend and MlxModelSession for partitioned execution"
-                    .into(),
-            ));
-        }
-        Ok(())
     }
 
     /// Converts these MLX load options into the portable preparation policy.

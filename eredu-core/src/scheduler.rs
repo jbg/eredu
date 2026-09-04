@@ -1,12 +1,13 @@
 //! Fair transactional scheduling independent of event and tensor runtimes.
 
 use crate::consensus::{
-    agree_deadline_candidates_bounded, agree_disposition_status_bounded, resolve_completions,
-    validate_schedule, BoundedConsensusTransport, CompletionObservation, CompletionResolution,
-    ConsensusTransport, ScheduledWork,
+    agree_deadline_candidates_bounded, agree_disposition_status_bounded,
+    agree_submission_status_bounded, resolve_output_completions_bounded, validate_schedule_bounded,
+    BoundedConsensusTransport, CompletionObservation, CompletionResolution, ScheduledWork,
 };
 use crate::BoundedCompletionWait;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     time::{Duration, Instant},
@@ -231,6 +232,12 @@ pub trait TransitionOutput {
 
     /// Explicitly retained resource count.
     fn retained_resources(&self) -> usize;
+}
+
+/// Completed output that can prove rank agreement before distributed publication.
+pub trait DistributedTransitionOutput: TransitionOutput {
+    /// Appends every portable output field in stable semantic order.
+    fn encode_distributed_output(&self, output: &mut Vec<u32>) -> Result<(), String>;
 }
 
 #[derive(Debug)]
@@ -791,10 +798,11 @@ impl<W, S: SemanticStateTransaction, O: TransitionOutput> Scheduler<W, S, O> {
         T: BoundedConsensusTransport,
         <T::Completion as crate::Completion>::Error: std::fmt::Display,
         E: std::error::Error,
+        O: DistributedTransitionOutput,
     {
         self.ensure_ready()?;
         self.expire_deadlines_distributed(protocol, transport, wait, now)?;
-        let mut progress = self.poll_distributed(protocol, transport, now)?;
+        let mut progress = self.poll_distributed(protocol, transport, wait, now)?;
         self.prepare_bounded(self.limits.max_new_submissions_per_turn, now)?;
         let plan = self
             .prepared
@@ -810,17 +818,47 @@ impl<W, S: SemanticStateTransaction, O: TransitionOutput> Scheduler<W, S, O> {
                 descriptor: &work.descriptor,
             })
             .collect::<Vec<_>>();
-        if let Err(error) = validate_schedule(transport, &plan, self.drain_cycles, protocol) {
+        let submission_cycle = self.drain_cycles;
+        if let Err(error) =
+            validate_schedule_bounded(transport, &plan, submission_cycle, protocol, wait)
+        {
             self.poison(error.to_string(), now);
             return Err(SchedulerError::Consensus(error.to_string()));
         }
-        progress.newly_submitted = match self.submit_prepared(now, execute) {
-            Ok(count) => count,
-            Err(error) => {
-                self.poison(error.to_string(), now);
-                return Err(error);
+        let planned_count = plan.len();
+        drop(plan);
+        let before = self.submitted.len();
+        let submission = self.submit_prepared(now, execute);
+        let locally_submitted = self.submitted.len().saturating_sub(before);
+        let local_success = submission.is_ok();
+        let agreed = agree_submission_status_bounded(
+            transport,
+            protocol,
+            submission_cycle,
+            planned_count,
+            locally_submitted,
+            local_success,
+            wait,
+        );
+        match agreed {
+            Ok(true) => {
+                progress.newly_submitted = submission
+                    .expect("topology-wide successful submission retains the local count");
             }
-        };
+            Ok(false) => {
+                let reason = "backend submission failed or diverged on at least one rank";
+                self.poison(reason.into(), now);
+                return Err(SchedulerError::DistributedCompletion(reason.into()));
+            }
+            Err(error) => {
+                let reason = submission.err().map_or_else(
+                    || error.to_string(),
+                    |submission| format!("{error}; local submission also failed: {submission}"),
+                );
+                self.poison(reason.clone(), now);
+                return Err(SchedulerError::Consensus(reason));
+            }
+        }
         Ok(progress)
     }
 
@@ -1146,25 +1184,51 @@ impl<W, S: SemanticStateTransaction, O: TransitionOutput> Scheduler<W, S, O> {
         }
     }
 
-    fn poll_distributed<T: ConsensusTransport>(
+    fn poll_distributed<T: BoundedConsensusTransport>(
         &mut self,
         protocol: u64,
         transport: &T,
+        wait: BoundedCompletionWait,
         now: Instant,
-    ) -> Result<SchedulerProgress<W, O>, SchedulerError> {
+    ) -> Result<SchedulerProgress<W, O>, SchedulerError>
+    where
+        <T::Completion as crate::Completion>::Error: std::fmt::Display,
+        O: DistributedTransitionOutput,
+    {
         let local = self
             .submitted
             .iter()
             .map(|work| {
-                let status = match work.output.is_complete() {
-                    Ok(false) => CompletionObservation::Incomplete,
-                    Ok(true) => CompletionObservation::Complete,
-                    Err(_) => CompletionObservation::Failed,
+                let (status, output) = match work.output.is_complete() {
+                    Ok(false) => (CompletionObservation::Incomplete, [0; 8]),
+                    Ok(true) => {
+                        let mut descriptor = Vec::new();
+                        match work.output.encode_distributed_output(&mut descriptor) {
+                            Ok(()) => {
+                                let mut digest = Sha256::new();
+                                for word in descriptor {
+                                    digest.update(word.to_le_bytes());
+                                }
+                                let digest = digest.finalize();
+                                let output = std::array::from_fn(|index| {
+                                    let start = index * 4;
+                                    u32::from_le_bytes(
+                                        digest[start..start + 4]
+                                            .try_into()
+                                            .expect("SHA-256 has eight complete u32 words"),
+                                    )
+                                });
+                                (CompletionObservation::Complete, output)
+                            }
+                            Err(_) => (CompletionObservation::Failed, [0; 8]),
+                        }
+                    }
+                    Err(_) => (CompletionObservation::Failed, [0; 8]),
                 };
-                (work.id, status)
+                (work.id, status, output)
             })
             .collect::<Vec<_>>();
-        let global = match resolve_completions(transport, protocol, &local) {
+        let global = match resolve_output_completions_bounded(transport, protocol, &local, wait) {
             Ok(global) => global,
             Err(error) => {
                 self.poison(error.to_string(), now);
@@ -1552,6 +1616,7 @@ pub enum SchedulerError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::consensus::ConsensusTransport;
     use std::{
         cell::{Cell, RefCell},
         collections::VecDeque,
@@ -1612,6 +1677,13 @@ mod tests {
 
         fn retained_resources(&self) -> usize {
             2
+        }
+    }
+
+    impl DistributedTransitionOutput for Output {
+        fn encode_distributed_output(&self, output: &mut Vec<u32>) -> Result<(), String> {
+            output.push(0);
+            Ok(())
         }
     }
 
@@ -1863,6 +1935,38 @@ mod tests {
     }
 
     #[test]
+    fn distributed_submission_failure_is_agreed_before_any_rank_can_publish() {
+        let transport = ScriptedTransport::new(
+            2,
+            vec![
+                GatherStep::default(),
+                GatherStep::default(),
+                GatherStep::default(),
+                GatherStep {
+                    replacements: vec![(1, 5, 1), (1, 6, 1)],
+                },
+            ],
+        );
+        let mut scheduler = scheduler();
+        let request = RequestId::new(404);
+        scheduler.register(request, State::default()).unwrap();
+        let work = scheduler.enqueue(request, 1).unwrap();
+        let error = scheduler
+            .run_distributed_turn(
+                0xFA11,
+                &transport,
+                consensus_wait(),
+                Instant::now(),
+                |_, _, _| Err::<Output, _>(std::io::Error::other("local submission failed")),
+            )
+            .unwrap_err();
+        assert!(matches!(error, SchedulerError::DistributedCompletion(_)));
+        assert!(scheduler.report().poisoned);
+        assert_eq!(scheduler.report().completed_work, 0);
+        assert_eq!(scheduler.work_lifecycle(work), Some(WorkLifecycle::Failed));
+    }
+
+    #[test]
     fn deadlines_batches_and_fairness_are_backend_neutral() {
         let mut scheduler = scheduler();
         let first = RequestId::new(10);
@@ -1954,6 +2058,7 @@ mod tests {
                 GatherStep::default(),
                 GatherStep::default(),
                 GatherStep::default(),
+                GatherStep::default(),
                 GatherStep {
                     replacements: vec![(1, 4, 99)],
                 },
@@ -2020,9 +2125,11 @@ mod tests {
                 GatherStep::default(),
                 GatherStep::default(),
                 GatherStep::default(),
+                GatherStep::default(),
                 GatherStep {
                     replacements: vec![(1, 7, 2), (2, 7, 0)],
                 },
+                GatherStep::default(),
                 GatherStep::default(),
                 GatherStep::default(),
                 GatherStep {
@@ -2082,6 +2189,55 @@ mod tests {
             scheduler.request_status(request),
             Some(RequestStatus::Failed)
         );
+    }
+
+    #[test]
+    fn distributed_output_disagreement_publishes_nothing() {
+        let transport = ScriptedTransport::new(
+            2,
+            vec![
+                GatherStep::default(),
+                GatherStep::default(),
+                GatherStep::default(),
+                GatherStep::default(),
+                GatherStep::default(),
+                GatherStep {
+                    replacements: vec![(1, 8, 99)],
+                },
+            ],
+        );
+        let mut scheduler = scheduler();
+        let request = RequestId::new(405);
+        scheduler.register(request, State::default()).unwrap();
+        scheduler.enqueue(request, 1).unwrap();
+        scheduler
+            .run_distributed_turn(
+                0x0A11,
+                &transport,
+                consensus_wait(),
+                Instant::now(),
+                |_, _, _| {
+                    Ok::<_, Infallible>(Output {
+                        complete: Rc::new(Cell::new(true)),
+                        fail: false,
+                    })
+                },
+            )
+            .unwrap();
+        let error = scheduler
+            .run_distributed_turn(
+                0x0A11,
+                &transport,
+                consensus_wait(),
+                Instant::now(),
+                |_, _, _| -> Result<Output, Infallible> {
+                    unreachable!("no additional work is queued")
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(error, SchedulerError::Consensus(_)));
+        assert_eq!(scheduler.report().completed_work, 0);
+        assert!(scheduler.report().poisoned);
     }
 
     #[test]

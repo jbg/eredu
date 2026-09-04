@@ -637,6 +637,33 @@ impl eredu_core::BoundedCompletion for Done {
     }
 }
 
+#[test]
+fn realtime_coordinate_history_compiles_without_a_concrete_backend() {
+    let schedule = eredu_core::RealtimeSpeechConfig::new(
+        2,
+        1,
+        1,
+        1,
+        99,
+        31,
+        eredu_core::RealtimeFrameConvention::FeedbackAlignedHistory,
+        vec![0, 0, 1],
+    )
+    .unwrap();
+    let contract = eredu_runtime::RealtimePayloadContract::new(
+        schedule.clone(),
+        1,
+        eredu_runtime::TokenDomain::new(100),
+        eredu_runtime::TokenDomain::new(32),
+        eredu_runtime::RealtimePayloadGeneration::new(1).unwrap(),
+        eredu_runtime::RealtimePayloadOwnerIdentity::new(1).unwrap(),
+    )
+    .unwrap();
+    let mut history = eredu_runtime::RealtimePayloadHistory::<FakeTensor>::new(schedule);
+    history.bind_or_validate_contract(&contract).unwrap();
+    assert_eq!(history.contract(), Some(&contract));
+}
+
 impl Completion for CommunicationDone {
     type Error = FakeCommunicationError;
 

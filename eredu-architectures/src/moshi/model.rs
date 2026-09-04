@@ -285,6 +285,15 @@ impl<T> ForwardContext<T> {
         self.temporal_output = Some(temporal);
         self.text_logits = Some(text_logits);
     }
+
+    /// Replaces complete text logits at the declared decision boundary.
+    ///
+    /// Realtime observation uses this before the sequential decision driver,
+    /// so the intervened value is the one actually consumed by sampling and
+    /// retained through completion.
+    pub fn replace_text_logits(&mut self, text_logits: T) {
+        self.text_logits = Some(text_logits);
+    }
 }
 
 /// Builds the exact persistent-temporal plus frame-local-depth state layout.
@@ -326,6 +335,38 @@ pub struct LayeredModel<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     config: MoshiConfig,
     static_modules: StaticModules<B>,
     parallel_geometry: Option<super::LocalGeometry>,
+    parallel_execution_identity: Option<String>,
+}
+
+impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend>
+    eredu_runtime::RealtimeArchitectureIdentity for LayeredModel<B>
+{
+    fn realtime_construction_identity(
+        &self,
+    ) -> Result<eredu_runtime::RealtimeArchitectureConstructionIdentity, String> {
+        let fingerprint = self.config.architecture_fingerprint();
+        let identity = |value: String| {
+            eredu_runtime::RealtimeIdentity::new(value).map_err(|error| error.to_string())
+        };
+        Ok(
+            eredu_runtime::RealtimeArchitectureConstructionIdentity::new(
+                identity(format!("moshi.realtime:{fingerprint}"))?,
+                identity(format!("moshi.schedule:{fingerprint}"))?,
+                identity(match &self.parallel_execution_identity {
+                    Some(execution) => format!("moshi.state:{execution}"),
+                    None if self.parallel_geometry.is_none() => {
+                        format!("moshi.state:{fingerprint};replicated")
+                    }
+                    None => {
+                        return Err(
+                            "Moshi tensor-parallel architecture has no selected execution identity"
+                                .into(),
+                        )
+                    }
+                })?,
+            ),
+        )
+    }
 }
 
 impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> eredu_runtime::ArchitectureParameters<B>
@@ -416,6 +457,7 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<B> {
             config,
             static_modules,
             parallel_geometry: None,
+            parallel_execution_identity: None,
         })
     }
 
@@ -433,7 +475,21 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<B> {
             config,
             static_modules,
             parallel_geometry: Some(geometry),
+            parallel_execution_identity: None,
         })
+    }
+
+    /// Builds unloaded rank-local modules paired with the exact selected
+    /// tensor-parallel execution identity.
+    pub fn new_selected_parallel(
+        config: MoshiConfig,
+        geometry: super::LocalGeometry,
+        execution_identity: String,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        let mut model = Self::new_parallel(config, geometry, context)?;
+        model.parallel_execution_identity = Some(execution_identity);
+        Ok(model)
     }
 
     /// Borrows normalized architecture policy.

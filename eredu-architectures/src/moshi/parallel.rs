@@ -3,6 +3,7 @@
 use std::{collections::BTreeMap, ops::Range};
 
 use crate::decoder::{self, Config as _};
+use eredu_checkpoint::LinearFormat;
 use eredu_core::{checkpoint::TensorDtype, ParallelRankTopology};
 use eredu_nn::NeuralBackend;
 use eredu_runtime::{
@@ -32,6 +33,83 @@ pub struct MoshiCollectiveCount {
     pub all_gather: usize,
 }
 
+/// Exact architecture declaration for one matrix and its physical encoding.
+///
+/// This preserves the semantic dense shape separately from the selected
+/// executable representation so generic materializers never have to recover
+/// format or companion policy from a parameter name.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct MoshiMatrixContract {
+    target: String,
+    logical_shape: Vec<usize>,
+    physical_shape: Vec<usize>,
+    format: LinearFormat,
+    packed_axis: Option<usize>,
+    scale: Option<String>,
+    affine_bias: Option<String>,
+}
+
+impl MoshiMatrixContract {
+    /// Canonical primary parameter target.
+    pub fn target(&self) -> &str {
+        &self.target
+    }
+
+    /// Architecture-semantic dense matrix shape.
+    pub fn logical_shape(&self) -> &[usize] {
+        &self.logical_shape
+    }
+
+    /// Physical executable weight shape before rank-local selection.
+    pub fn physical_shape(&self) -> &[usize] {
+        &self.physical_shape
+    }
+
+    /// Exact executable encoding selected by the architecture.
+    pub const fn format(&self) -> LinearFormat {
+        self.format
+    }
+
+    /// Architecture-declared packing axis, when encoded.
+    pub const fn packed_axis(&self) -> Option<usize> {
+        self.packed_axis
+    }
+
+    /// Exact scale companion target, when present.
+    pub fn scale(&self) -> Option<&str> {
+        self.scale.as_deref()
+    }
+
+    /// Exact affine-bias companion target, when present.
+    pub fn affine_bias(&self) -> Option<&str> {
+        self.affine_bias.as_deref()
+    }
+}
+
+/// Complete Moshi parameter topology plus exact primary-matrix formats.
+#[derive(Debug, Clone)]
+pub struct MoshiParameterContract {
+    description: ArchitectureParameterDescription,
+    matrices: BTreeMap<String, MoshiMatrixContract>,
+}
+
+impl MoshiParameterContract {
+    /// Complete neutral ownership and sharding description.
+    pub const fn description(&self) -> &ArchitectureParameterDescription {
+        &self.description
+    }
+
+    /// Exact primary matrix contracts keyed by canonical target.
+    pub const fn matrices(&self) -> &BTreeMap<String, MoshiMatrixContract> {
+        &self.matrices
+    }
+
+    /// Consumes this contract into its complete parameter description.
+    pub fn into_description(self) -> ArchitectureParameterDescription {
+        self.description
+    }
+}
+
 /// Architecture-selected rank-local Moshi tensor-parallel handoff.
 ///
 /// The concrete backend receives exact placement, family geometry, and opaque
@@ -39,6 +117,7 @@ pub struct MoshiCollectiveCount {
 /// semantic parallel axis while constructing the local model.
 #[derive(Debug, Clone)]
 pub struct MoshiParallelSelection {
+    topology: eredu_core::ParallelTopology,
     layout: LocalModelLayout,
     geometry: LocalGeometry,
     communication: CommunicationManifest,
@@ -48,6 +127,11 @@ pub struct MoshiParallelSelection {
 }
 
 impl MoshiParallelSelection {
+    /// Selected pure tensor-parallel topology.
+    pub const fn topology(&self) -> eredu_core::ParallelTopology {
+        self.topology
+    }
+
     /// Exact architecture-authored physical placement for this rank.
     pub const fn layout(&self) -> &LocalModelLayout {
         &self.layout
@@ -173,15 +257,34 @@ pub fn select_parallel_execution<'a>(
             .max(config.audio_vocabulary_size()),
     )
     .map_err(|_| ParallelPlanError::InvalidGroup("Moshi vocabulary exceeds usize".into()))?;
-    let local_vocabulary = geometry
-        .vocabulary_ranges
-        .values()
-        .map(Range::len)
+    let local_vocabulary = std::iter::once("text_linear.weight".to_owned())
+        .chain(
+            (0..config.frame_schedule().depth_audio_codebooks())
+                .map(|slice| format!("depformer.slices.{slice}.linear_out.weight")),
+        )
+        .map(|target| {
+            geometry
+                .vocabulary_range(&target)
+                .map(Range::len)
+                .ok_or_else(|| {
+                    ParallelPlanError::InvalidTensor(format!(
+                        "Moshi local output vocabulary is missing {target}"
+                    ))
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
         .max()
         .ok_or_else(|| {
-            ParallelPlanError::InvalidTensor("Moshi local vocabulary is empty".into())
+            ParallelPlanError::InvalidTensor("Moshi local output vocabulary is empty".into())
         })?;
-    let local_logit_elements = tokens.checked_mul(local_vocabulary).ok_or_else(|| {
+    let local_vocabulary_bound = global_vocabulary.div_ceil(topology.tensor());
+    if local_vocabulary > local_vocabulary_bound {
+        return Err(ParallelPlanError::InvalidTensor(
+            "Moshi local vocabulary exceeds the common tensor-group bound".into(),
+        ));
+    }
+    let local_logit_elements = tokens.checked_mul(local_vocabulary_bound).ok_or_else(|| {
         ParallelPlanError::InvalidGroup("Moshi local logit bound overflowed".into())
     })?;
     let complete_logit_elements = tokens.checked_mul(global_vocabulary).ok_or_else(|| {
@@ -273,6 +376,7 @@ pub fn select_parallel_execution<'a>(
         rank.tensor_parallel_size()
     );
     Ok(MoshiParallelSelection {
+        topology,
         layout,
         geometry,
         communication,
@@ -292,6 +396,13 @@ pub fn select_parallel_execution<'a>(
 pub fn parameter_description(
     config: &MoshiConfig,
 ) -> Result<ArchitectureParameterDescription, ParallelPlanError> {
+    Ok(parameter_contract(config)?.into_description())
+}
+
+/// Describes complete Moshi ownership together with exact executable formats.
+pub fn parameter_contract(
+    config: &MoshiConfig,
+) -> Result<MoshiParameterContract, ParallelPlanError> {
     let dimension = |label: &str, value: i32| {
         usize::try_from(value)
             .map_err(|_| ParallelPlanError::InvalidTensor(format!("Moshi {label} exceeds usize")))
@@ -428,11 +539,43 @@ pub fn parameter_description(
     }
 
     let mut expanded = Vec::with_capacity(owned.len());
+    let mut matrices = BTreeMap::new();
     for tagged in owned {
         let owner = tagged.owner().clone();
-        let [group] = eredu_runtime::expand_linear_format_parameter_groups(
-            vec![tagged.into_group()],
-            |member| {
+        let group = tagged.into_group();
+        let mut declared = BTreeMap::new();
+        for member in group
+            .members()
+            .iter()
+            .filter(|member| member.global_shape().len() >= 2)
+        {
+            let format = config
+                .temporal()
+                .weight_quantization(member.target())
+                .into();
+            let declaration =
+                crate::linear_format::standard_parallel_linear_format(member, format)?;
+            let scale = declaration
+                .as_ref()
+                .and_then(|format| format.scale())
+                .map(|parameter| parameter.id.as_str().to_owned());
+            let affine_bias = declaration
+                .as_ref()
+                .and_then(|format| format.affine_bias())
+                .map(|parameter| parameter.id.as_str().to_owned());
+            declared.insert(
+                member.target().to_owned(),
+                (
+                    member.global_shape().to_vec(),
+                    format,
+                    (format != LinearFormat::Dense).then_some(member.global_shape().len() - 1),
+                    scale,
+                    affine_bias,
+                ),
+            );
+        }
+        let [group] =
+            eredu_runtime::expand_linear_format_parameter_groups(vec![group], |member| {
                 crate::linear_format::standard_parallel_linear_format(
                     member,
                     config
@@ -440,18 +583,42 @@ pub fn parameter_description(
                         .weight_quantization(member.target())
                         .into(),
                 )
-            },
-        )?
-        .try_into()
-        .expect("one Moshi group expands to one group");
+            })?
+            .try_into()
+            .expect("one Moshi group expands to one group");
+        for (target, (logical_shape, format, packed_axis, scale, affine_bias)) in declared {
+            let primary = group
+                .members()
+                .iter()
+                .find(|member| member.target() == target)
+                .expect("linear-format expansion retains the primary target");
+            let contract = MoshiMatrixContract {
+                target: target.clone(),
+                logical_shape,
+                physical_shape: primary.global_shape().to_vec(),
+                format,
+                packed_axis,
+                scale,
+                affine_bias,
+            };
+            if matrices.insert(target.clone(), contract).is_some() {
+                return Err(ParallelPlanError::InvalidTensor(format!(
+                    "Moshi parameter contract repeats matrix {target:?}"
+                )));
+            }
+        }
         expanded.push(OwnedParameterGroupSpec::new(owner, group));
     }
     let expected = expanded
         .iter()
         .map(|tagged| tagged.group().clone())
         .collect::<Vec<_>>();
-    ArchitectureParameterDescription::new(&graph, &layout, expected, expanded)
-        .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))
+    let description = ArchitectureParameterDescription::new(&graph, &layout, expected, expanded)
+        .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
+    Ok(MoshiParameterContract {
+        description,
+        matrices,
+    })
 }
 
 fn symbolic_block_parameter_groups(
@@ -1298,8 +1465,8 @@ mod tests {
                 "n_q":4, "dep_q":3, "generated_audio_codebooks":2, "card":64,
                 "num_heads":4, "num_layers":2, "dim_feedforward":48,
                 "causal":true, "context":7, "max_period":10000.0,
-                "positional_embedding":"rope", "depformer_dim":24,
-                "depformer_dim_feedforward":36, "depformer_num_heads":4,
+                "positional_embedding":"rope", "depformer_dim":32,
+                "depformer_dim_feedforward":48, "depformer_num_heads":4,
                 "depformer_num_layers":2, "depformer_context":3,
                 "depformer_max_period":10000.0, "depformer_pos_emb":"none",
                 "delays":[0,0,1,2,1]
@@ -1676,5 +1843,31 @@ mod tests {
         );
         let error = local_geometry(&config, &layout, std::iter::empty()).unwrap_err();
         assert!(error.to_string().contains("fused QKV width"));
+    }
+
+    #[test]
+    fn parameter_contract_preserves_semantic_and_physical_matrix_formats() {
+        let dense = parameter_contract(&tiny_config()).unwrap();
+        let dense_output = dense.matrices().get("text_linear.weight").unwrap();
+        assert_eq!(dense_output.logical_shape(), &[101, 32]);
+        assert_eq!(dense_output.physical_shape(), &[101, 32]);
+        assert_eq!(dense_output.format(), LinearFormat::Dense);
+        assert_eq!(dense_output.packed_axis(), None);
+        assert_eq!(dense_output.scale(), None);
+        assert_eq!(dense_output.affine_bias(), None);
+
+        let quantization = eredu_checkpoint::WeightQuantization::Affine(
+            eredu_checkpoint::AffineQuantization::new(16, 4).unwrap(),
+        );
+        let packed_config = tiny_config()
+            .with_native_quantization(Some(quantization))
+            .unwrap();
+        let packed = parameter_contract(&packed_config).unwrap();
+        let packed_output = packed.matrices().get("text_linear.weight").unwrap();
+        assert_eq!(packed_output.logical_shape(), &[101, 32]);
+        assert_eq!(packed_output.physical_shape(), &[101, 4]);
+        assert_eq!(packed_output.packed_axis(), Some(1));
+        assert_eq!(packed_output.scale(), Some("text_linear.scales"));
+        assert_eq!(packed_output.affine_bias(), Some("text_linear.biases"));
     }
 }

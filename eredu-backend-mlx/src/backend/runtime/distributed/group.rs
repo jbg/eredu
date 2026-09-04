@@ -20,11 +20,13 @@ use std::cell::Cell;
 #[cfg(test)]
 thread_local! {
     static NATIVE_COLLECTIVE_SUBMISSIONS: Cell<usize> = const { Cell::new(0) };
+    static CONTRACTED_COLLECTIVE_SUBMISSIONS: Cell<usize> = const { Cell::new(0) };
 }
 
 #[cfg(test)]
 pub(crate) fn reset_native_collective_submissions() {
     NATIVE_COLLECTIVE_SUBMISSIONS.with(|count| count.set(0));
+    CONTRACTED_COLLECTIVE_SUBMISSIONS.with(|count| count.set(0));
 }
 
 #[cfg(test)]
@@ -32,9 +34,19 @@ pub(crate) fn native_collective_submissions() -> usize {
     NATIVE_COLLECTIVE_SUBMISSIONS.with(Cell::get)
 }
 
-fn record_native_collective_submission() {
+#[cfg(test)]
+pub(crate) fn contracted_collective_submissions() -> usize {
+    CONTRACTED_COLLECTIVE_SUBMISSIONS.with(Cell::get)
+}
+
+fn record_native_collective_submission(_group: &Group) {
     #[cfg(test)]
-    NATIVE_COLLECTIVE_SUBMISSIONS.with(|count| count.set(count.get() + 1));
+    {
+        NATIVE_COLLECTIVE_SUBMISSIONS.with(|count| count.set(count.get() + 1));
+        if _group.contract.is_some() {
+            CONTRACTED_COLLECTIVE_SUBMISSIONS.with(|count| count.set(count.get() + 1));
+        }
+    }
 }
 
 /// A native MLX group or a backend-owned logical subgroup of one native world.
@@ -625,7 +637,7 @@ fn logical_all_gather_stacked(input: &Array, group: &Group, stream: &Stream) -> 
 }
 
 fn all_sum_unchecked(input: &Array, group: &Group, stream: &Stream) -> Result<Array> {
-    record_native_collective_submission();
+    record_native_collective_submission(group);
     match group.logical {
         Some(_) => logical_all_sum(input, group, stream),
         None => native::all_sum(input, &group.native, stream),
@@ -713,7 +725,7 @@ pub(crate) fn all_gather_unchecked(
     group: &Group,
     stream: impl AsRef<Stream>,
 ) -> Result<Array> {
-    record_native_collective_submission();
+    record_native_collective_submission(group);
     let stream = stream.as_ref();
     let output = if group.logical.is_none() {
         native::all_gather(input, &group.native, stream)?
@@ -951,7 +963,7 @@ pub fn all_to_all_v(
         setup.check()?;
     }
     let stream = stream.as_ref();
-    record_native_collective_submission();
+    record_native_collective_submission(group);
     if group.logical.is_none() {
         let output = native::all_to_all_v(input, send_counts, recv_counts, &group.native, stream)?;
         validate_all_to_all_output(&output, input, expected_rows, group)?;

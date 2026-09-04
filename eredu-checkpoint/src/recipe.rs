@@ -830,6 +830,17 @@ impl DerivedWeightRecipe {
         keys.into_iter().collect()
     }
 
+    /// Returns source checkpoint keys in recipe traversal order with repetitions.
+    ///
+    /// This is the exact source-occurrence contract for consumers whose
+    /// execution or identity depends on operand order. Use [`Self::source_keys`]
+    /// when only a deterministic unique dependency set is required.
+    pub fn source_occurrences(&self) -> Vec<&str> {
+        let mut occurrences = Vec::new();
+        self.collect_source_occurrences(&mut occurrences);
+        occurrences
+    }
+
     fn collect_source_keys<'a>(&'a self, keys: &mut BTreeSet<&'a str>) {
         match self {
             Self::Source { key, .. } => {
@@ -847,6 +858,24 @@ impl DerivedWeightRecipe {
             | Self::View { input, .. }
             | Self::NegLog { input }
             | Self::SubtractOne { input } => input.collect_source_keys(keys),
+        }
+    }
+
+    fn collect_source_occurrences<'a>(&'a self, occurrences: &mut Vec<&'a str>) {
+        match self {
+            Self::Source { key, .. } => occurrences.push(key),
+            Self::Concatenate { inputs, .. } | Self::Stack { inputs, .. } => {
+                for input in inputs {
+                    input.collect_source_occurrences(occurrences);
+                }
+            }
+            Self::Select { input, .. }
+            | Self::Reshape { input, .. }
+            | Self::Transpose { input, .. }
+            | Self::Cast { input, .. }
+            | Self::View { input, .. }
+            | Self::NegLog { input }
+            | Self::SubtractOne { input } => input.collect_source_occurrences(occurrences),
         }
     }
 
@@ -2022,6 +2051,17 @@ mod tests {
         assert_eq!(metadata.dtype(), &RecipeDtype::F16);
         assert_eq!(metadata.byte_len(), 18);
         assert_eq!(recipe.source_keys(), ["left", "right"]);
+
+        let ordered = DerivedWeightRecipe::Stack {
+            axis: 0,
+            inputs: vec![
+                DerivedWeightRecipe::source("right", TensorSelection::Full),
+                DerivedWeightRecipe::source("left", TensorSelection::Full),
+                DerivedWeightRecipe::source("right", TensorSelection::Full),
+            ],
+        };
+        assert_eq!(ordered.source_keys(), ["left", "right"]);
+        assert_eq!(ordered.source_occurrences(), ["right", "left", "right"]);
     }
 
     #[test]

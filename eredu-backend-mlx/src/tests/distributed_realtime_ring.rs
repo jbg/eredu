@@ -1,6 +1,7 @@
 #![cfg(unix)]
 
 use std::{
+    cell::Cell,
     net::TcpListener,
     path::Path,
     process::{Child, Command, Output, Stdio},
@@ -11,14 +12,17 @@ use std::{
 
 use crate::{
     backend::DeviceAssignment,
-    native::{MlxRealtimeBackend, MlxRealtimeInput},
+    native::{
+        MlxRealtimeCompletion, MlxRealtimeConsensusTransport, MlxRealtimeExecutionContext,
+        MlxRealtimeHostObserver, RandomState,
+    },
     MlxLoadRequest,
 };
 use eredu_architectures::moshi::{MoshiCollectiveCount, MoshiConfig};
 use eredu_core::scheduler::{RequestId, SchedulerLimits};
-use eredu_core::{
-    load_realtime_model, load_realtime_model_with_options, RealtimeModel, RealtimeSampling,
-    RealtimeScheduler,
+use eredu_core::{RealtimeInputFrame, RealtimeSampling};
+use eredu_runtime::{
+    GenerationSampler, RealtimeGenerationState, RealtimePayloadState, RealtimeSessionScheduler,
 };
 use safemlx::{
     distributed::{self, Backend},
@@ -29,8 +33,13 @@ const WORKER_RANK: &str = "EREDU_MOSHI_RING_WORKER";
 const MODEL_WORKER_RANK: &str = "EREDU_MOSHI_RING_MODEL_WORKER";
 const MODEL_WORKER_FIXTURE: &str = "EREDU_MOSHI_RING_MODEL_FIXTURE";
 const MODEL_WORKER_PROFILE: &str = "EREDU_MOSHI_RING_MODEL_PROFILE";
+const MODEL_WORKER_DISAGREE: &str = "EREDU_MOSHI_RING_MODEL_DISAGREE";
 const NATIVE_FIXTURE: &str = "EREDU_MOSHI_NATIVE_FIXTURE";
 const PERSONAPLEX_FIXTURE: &str = "EREDU_MOSHI_PERSONAPLEX_FIXTURE";
+
+type PreparedRingRealtime = eredu_architectures::moshi::MoshiRealtimeExecution<
+    crate::composition::moshi::MlxRealtimeExecution,
+>;
 
 fn balanced_widths(total: usize) -> [usize; 2] {
     [total.div_ceil(2), total / 2]
@@ -121,25 +130,57 @@ fn moshi_ring_collective_worker() {
     assert_eq!(observed_all_gather, oracle.all_gather);
 }
 
-fn push_tokens(serialized: &mut Vec<i32>, value: &Array) {
-    let value = value.evaluated().unwrap();
-    let values = value.as_slice::<i32>();
+fn push_tokens(serialized: &mut Vec<i32>, values: &[i32]) {
     serialized.push(i32::try_from(values.len()).unwrap());
     serialized.extend_from_slice(values);
 }
 
-fn run_forced_and_greedy_sequence(model: &mut RealtimeModel<MlxRealtimeBackend>) -> Vec<i32> {
-    let stream = model.backend().stream().clone();
-    let schedule = model.speech_config();
+type NativeScheduler = RealtimeSessionScheduler<
+    eredu_runtime::RealtimePayloadState<
+        crate::backend::runtime::cache::state::MlxKeyValueState,
+        crate::MlxTensor,
+    >,
+    GenerationSampler,
+    RandomState,
+    MlxRealtimeCompletion,
+    eredu_runtime::PrepublicationRealtimeFrame<
+        crate::MlxTensor,
+        MlxRealtimeCompletion,
+        MlxRealtimeHostObserver,
+    >,
+>;
+
+fn run_forced_and_greedy_sequence(
+    backend: &MlxRealtimeExecutionContext,
+    model: &mut PreparedRingRealtime,
+    consensus: Option<&MlxRealtimeConsensusTransport>,
+) -> Vec<i32> {
+    let stream = backend.stream().clone();
+    let schedule = model.execution_config().frame_schedule().clone();
     let input_codebooks = schedule.input_audio_codebooks();
     let generated_codebooks = schedule.generated_audio_codebooks();
     let request = RequestId::new(7);
-    let mut scheduler = RealtimeScheduler::new(model, SchedulerLimits::new(1, 1).unwrap()).unwrap();
+    let mut scheduler = NativeScheduler::new(
+        eredu_runtime::RealtimeModelSessionIdentity::from_selected(model.selected()),
+        SchedulerLimits::new(1, 1).unwrap(),
+    )
+    .unwrap();
+    let sampling = RealtimeSampling::greedy();
+    let samplers =
+        eredu_architectures::moshi::realtime_generation_samplers(&schedule, sampling).unwrap();
+    let model_state = RealtimePayloadState::fresh(
+        backend.new_realtime_model_state(model).unwrap(),
+        schedule.clone(),
+    );
+    let random = backend.realize_random_state(None).unwrap();
     scheduler
-        .register_request(model, request, RealtimeSampling::greedy())
+        .register(
+            request,
+            RealtimeGenerationState::new(model_state, schedule.clone(), sampling, samplers, random)
+                .unwrap(),
+        )
         .unwrap();
 
-    let forced_text = Array::from_slice(&[1_i32], &[1, 1]);
     let forced_audio = Array::from_slice(
         &(0..generated_codebooks)
             .map(|codebook| i32::try_from(codebook + 2).unwrap())
@@ -151,30 +192,44 @@ fn run_forced_and_greedy_sequence(model: &mut RealtimeModel<MlxRealtimeBackend>)
         .collect::<Vec<_>>();
     let mut serialized = Vec::new();
     for frame in 0..4 {
-        let input = Array::from_slice(
-            &(0..input_codebooks)
-                .map(|codebook| i32::try_from((frame + codebook) % 7).unwrap())
-                .collect::<Vec<_>>(),
-            &[1, i32::try_from(input_codebooks).unwrap()],
-        );
+        let input = (0..input_codebooks)
+            .map(|codebook| i32::try_from((frame + codebook) % 7).unwrap())
+            .collect::<Vec<_>>();
         let input = match frame {
-            0 | 3 => MlxRealtimeInput::encoded_audio(&input),
-            1 => MlxRealtimeInput::encoded_audio(&input)
-                .with_forced_text(&forced_text)
-                .with_forced_generated_audio(&forced_audio),
-            2 => MlxRealtimeInput::encoded_audio(&input)
-                .with_forced_text(&forced_text)
-                .with_partially_forced_generated_audio(&forced_audio, partial_mask.clone()),
+            0 | 3 => RealtimeInputFrame::new(1, input),
+            1 => RealtimeInputFrame::new(1, input)
+                .with_forced_text(vec![1])
+                .with_forced_generated_audio(
+                    forced_audio.evaluated().unwrap().as_slice::<i32>().to_vec(),
+                ),
+            2 => RealtimeInputFrame::new(1, input)
+                .with_forced_text(vec![1])
+                .with_partially_forced_generated_audio(
+                    forced_audio.evaluated().unwrap().as_slice::<i32>().to_vec(),
+                    partial_mask.clone(),
+                ),
             _ => unreachable!(),
         };
-        scheduler.enqueue(model, request, input).unwrap();
+        scheduler.enqueue(request, input).unwrap();
         let output = loop {
-            if let Some(output) = scheduler.run_queued(model).unwrap().pop() {
-                break output.into_parts().1;
+            let mut progress = match consensus {
+                Some(transport) => scheduler.run_distributed_turn(
+                    0x4d4f_5348_4954_5032,
+                    transport,
+                    Instant::now(),
+                    |_, frame, branch| backend.submit_realtime_frame(model, frame, branch),
+                ),
+                None => scheduler.run_local_turn(Instant::now(), |_, frame, branch| {
+                    backend.submit_realtime_frame(model, frame, branch)
+                }),
+            }
+            .unwrap();
+            if let Some((_, _, output)) = progress.committed.pop() {
+                break output.into_host_output().unwrap();
             }
             thread::yield_now();
         };
-        push_tokens(&mut serialized, output.text_token());
+        push_tokens(&mut serialized, output.text_tokens());
         push_tokens(&mut serialized, output.sampled_audio_tokens());
         match output.output_audio_tokens() {
             Some(tokens) => {
@@ -184,31 +239,102 @@ fn run_forced_and_greedy_sequence(model: &mut RealtimeModel<MlxRealtimeBackend>)
             None => serialized.push(0),
         }
     }
-    scheduler.finish_request(request).unwrap();
+    scheduler.finish(request).unwrap();
     stream.synchronize().unwrap();
     serialized
 }
 
-fn assert_sequence_collective_oracle(config: &MoshiConfig) {
+fn sequence_collective_oracle(config: &MoshiConfig) -> usize {
     let temporal_layers = usize::try_from(config.temporal().num_hidden_layers()).unwrap();
     let depth_layers = usize::try_from(config.depth_template().num_hidden_layers()).unwrap();
     let embedding_tables = config.frame_schedule().total_audio_codebooks() + 1;
     let generated = config.frame_schedule().generated_audio_codebooks();
-    // The first frame is initialization-only. The next frames are fully
-    // forced, forced except for the first generated codebook, and greedy.
-    for executed_depth_slices in [0, 1, generated] {
-        let actual =
-            eredu_architectures::moshi::collective_count(config, executed_depth_slices).unwrap();
-        assert_eq!(
-            actual,
-            MoshiCollectiveCount {
-                all_sum: embedding_tables
-                    + 2 * temporal_layers
-                    + executed_depth_slices * (1 + 2 * depth_layers),
-                all_gather: 1 + executed_depth_slices,
-            }
-        );
-    }
+    // Absolute-delay schedules initialize without model work. Feedback-aligned
+    // schedules execute the first unforced frame greedily. The remaining frames
+    // are fully forced, forced except for the first generated codebook, and greedy.
+    let first = match config.frame_schedule().frame_convention() {
+        eredu_core::realtime::RealtimeFrameConvention::FeedbackAlignedHistory => Some(generated),
+        eredu_core::realtime::RealtimeFrameConvention::AbsoluteDelayedSlots => None,
+        convention => panic!("unsupported synthetic Ring frame convention {convention:?}"),
+    };
+    first
+        .into_iter()
+        .chain([0, 1, generated])
+        .map(|executed_depth_slices| {
+            let actual =
+                eredu_architectures::moshi::collective_count(config, executed_depth_slices)
+                    .unwrap();
+            assert_eq!(
+                actual,
+                MoshiCollectiveCount {
+                    all_sum: embedding_tables
+                        + 2 * temporal_layers
+                        + executed_depth_slices * (1 + 2 * depth_layers),
+                    all_gather: 1 + executed_depth_slices,
+                }
+            );
+            actual.all_sum + actual.all_gather
+        })
+        .sum()
+}
+
+fn assert_schedule_disagreement_submits_nothing(
+    backend: &MlxRealtimeExecutionContext,
+    model: &mut PreparedRingRealtime,
+    consensus: &MlxRealtimeConsensusTransport,
+    rank: usize,
+) {
+    let schedule = model.execution_config().frame_schedule().clone();
+    let sampling = RealtimeSampling::greedy();
+    let samplers =
+        eredu_architectures::moshi::realtime_generation_samplers(&schedule, sampling).unwrap();
+    let model_state = RealtimePayloadState::fresh(
+        backend.new_realtime_model_state(model).unwrap(),
+        schedule.clone(),
+    );
+    let mut scheduler = NativeScheduler::new(
+        eredu_runtime::RealtimeModelSessionIdentity::from_selected(model.selected()),
+        SchedulerLimits::new(1, 1).unwrap(),
+    )
+    .unwrap();
+    let request = RequestId::new(99);
+    scheduler
+        .register(
+            request,
+            RealtimeGenerationState::new(model_state, schedule.clone(), sampling, samplers, None)
+                .unwrap(),
+        )
+        .unwrap();
+    let mut input = vec![0; schedule.input_audio_codebooks()];
+    input[0] = i32::try_from(rank).unwrap();
+    scheduler
+        .enqueue(request, RealtimeInputFrame::new(1, input))
+        .unwrap();
+
+    let submissions = Cell::new(0usize);
+    let result = scheduler.run_distributed_turn(
+        0x4d4f_5348_4954_5032,
+        consensus,
+        Instant::now(),
+        |_, frame, branch| {
+            submissions.set(submissions.get() + 1);
+            backend.submit_realtime_frame(model, frame, branch)
+        },
+    );
+    let error = match result {
+        Ok(_) => panic!("rank {rank} accepted a divergent realtime schedule"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(error, eredu_core::scheduler::SchedulerError::Consensus(_)),
+        "rank {rank} returned an unexpected disagreement error: {error}"
+    );
+    assert_eq!(submissions.get(), 0, "rank {rank} submitted divergent work");
+    assert_eq!(
+        scheduler.report().completed_work,
+        0,
+        "rank {rank} published divergent work"
+    );
 }
 
 #[test]
@@ -219,57 +345,88 @@ fn moshi_ring_model_parity_worker() {
     let expected_rank: usize = rank.to_string_lossy().parse().unwrap();
     let fixture = std::env::var_os(MODEL_WORKER_FIXTURE).unwrap();
     let expected_profile = std::env::var(MODEL_WORKER_PROFILE).unwrap();
-    let group = Arc::new(crate::backend::runtime::distributed::Group::uncontracted(
-        &distributed::init(true, Backend::Ring).unwrap(),
-    ));
-    assert_eq!((group.rank(), group.size()), (expected_rank, 2));
     let device = DeviceAssignment::new(DeviceType::Cpu, 0);
-    let stream = Stream::new_with_device(&device.device().unwrap());
-    let weights_stream = Stream::new_with_device(&device.device().unwrap());
-
-    let mut replicated = load_realtime_model(
-        MlxRealtimeBackend::new(&stream, &weights_stream),
+    let replicated_options = MlxLoadRequest::default();
+    let replicated_selected = MlxRealtimeExecutionContext::select_realtime_execution(
         eredu_architectures::moshi::prepare_realtime_model(Path::new(&fixture)).unwrap(),
+        &replicated_options,
+        false,
     )
     .unwrap();
-    assert_eq!(
-        replicated.model().effective_model_type().as_str(),
-        expected_profile
-    );
-    let config = replicated.model().config().clone();
-    let expected = run_forced_and_greedy_sequence(&mut replicated);
-    drop(replicated);
-
     let topology = eredu_core::ParallelRankTopology::new(
         eredu_core::ParallelTopology::new(2, 1, 1, 1).unwrap(),
         expected_rank,
     )
     .unwrap();
-    let backend = MlxRealtimeBackend::new(&stream, &weights_stream)
-        .with_tensor_parallel_group(Arc::clone(&group));
-    let mut parallel = load_realtime_model_with_options(
-        backend,
+    let parallel_options = MlxLoadRequest::with_parallel(
+        topology,
+        device,
+        eredu_runtime::PipelineWireContract::new(eredu_runtime::PipelineActivationDtype::Float32),
+        1,
+        4096,
+        MlxLoadRequest::test_communication_completion_policy(),
+    );
+    let parallel_selected = MlxRealtimeExecutionContext::select_realtime_execution(
         eredu_architectures::moshi::prepare_realtime_model(Path::new(&fixture)).unwrap(),
-        MlxLoadRequest::with_parallel(
-            topology,
-            device,
-            eredu_runtime::PipelineWireContract::new(
-                eredu_runtime::PipelineActivationDtype::Float32,
-            ),
-            1,
-            4096,
-            MlxLoadRequest::test_communication_completion_policy(),
-        ),
+        &parallel_options,
+        true,
     )
     .unwrap();
+
+    // Exact replicated and TP selection both finish before the worker realizes
+    // a native group, device, stream, checkpoint payload, module, or state.
+    let group = Arc::new(crate::backend::runtime::distributed::Group::uncontracted(
+        &distributed::init(true, Backend::Ring).unwrap(),
+    ));
+    assert_eq!((group.rank(), group.size()), (expected_rank, 2));
+    let stream = Stream::new_with_device(&device.device().unwrap());
+    let weights_stream = Stream::new_with_device(&device.device().unwrap());
+
+    let replicated_backend = MlxRealtimeExecutionContext::new(&stream, &weights_stream);
+    let mut replicated = replicated_backend
+        .materialize_realtime_execution(replicated_selected, replicated_options)
+        .unwrap();
     assert_eq!(
-        parallel.model().effective_model_type().as_str(),
+        replicated
+            .execution_config()
+            .effective_model_type()
+            .as_str(),
         expected_profile
     );
-    assert_eq!(parallel.model().config(), &config);
-    let actual = run_forced_and_greedy_sequence(&mut parallel);
+    let config = replicated.execution_config().clone();
+    let expected = run_forced_and_greedy_sequence(&replicated_backend, &mut replicated, None);
+    drop(replicated);
+
+    let backend = MlxRealtimeExecutionContext::new(&stream, &weights_stream)
+        .with_tensor_parallel_group(Arc::clone(&group));
+    let mut parallel = backend
+        .materialize_realtime_execution(parallel_selected, parallel_options)
+        .unwrap();
+    assert_eq!(
+        parallel.execution_config().effective_model_type().as_str(),
+        expected_profile
+    );
+    assert_eq!(parallel.execution_config(), &config);
+    let consensus = MlxRealtimeConsensusTransport::new(group.native_group(), &stream);
+    if std::env::var_os(MODEL_WORKER_DISAGREE).is_some() {
+        assert_schedule_disagreement_submits_nothing(
+            &backend,
+            &mut parallel,
+            &consensus,
+            expected_rank,
+        );
+        return;
+    }
+    crate::backend::runtime::distributed::reset_native_collective_submissions();
+    let actual = run_forced_and_greedy_sequence(&backend, &mut parallel, Some(&consensus));
+    let model_collectives =
+        crate::backend::runtime::distributed::contracted_collective_submissions();
     assert_eq!(actual, expected, "rank {expected_rank} TP output drifted");
-    assert_sequence_collective_oracle(&config);
+    assert_eq!(
+        model_collectives,
+        sequence_collective_oracle(&config),
+        "rank {expected_rank} production TP collective count drifted"
+    );
 
     // Vocab-parallel projections already gather canonical logits internally.
     // Gather the committed frame transcript once more so both ranks prove
@@ -412,6 +569,10 @@ fn run_model_parity_fixture(fixture_variable: &str, profile: &str) {
         "{fixture_variable} does not exist: {}",
         Path::new(&fixture).display()
     );
+    run_model_parity_path(Path::new(&fixture), profile, false);
+}
+
+fn run_model_parity_path(fixture: &Path, profile: &str, disagree: bool) {
     assert!(
         distributed::is_available(Backend::Ring),
         "{profile} Ring parity requires the MLX Ring backend when this ignored test is explicitly enabled"
@@ -431,24 +592,25 @@ fn run_model_parity_fixture(fixture_variable: &str, profile: &str) {
     let executable = std::env::current_exe().unwrap();
     let mut children = ChildGuard(Vec::with_capacity(2));
     for rank in 0..2 {
-        children.0.push(
-            Command::new(&executable)
-                .args([
-                    "--exact",
-                    "tests::distributed_realtime_ring::moshi_ring_model_parity_worker",
-                    "--nocapture",
-                ])
-                .env(MODEL_WORKER_RANK, rank.to_string())
-                .env(MODEL_WORKER_FIXTURE, &fixture)
-                .env(MODEL_WORKER_PROFILE, profile)
-                .env("MLX_RANK", rank.to_string())
-                .env("MLX_HOSTFILE", &hostfile)
-                .env_remove("MLX_RING_VERBOSE")
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .unwrap(),
-        );
+        let mut command = Command::new(&executable);
+        command
+            .args([
+                "--exact",
+                "tests::distributed_realtime_ring::moshi_ring_model_parity_worker",
+                "--nocapture",
+            ])
+            .env(MODEL_WORKER_RANK, rank.to_string())
+            .env(MODEL_WORKER_FIXTURE, fixture)
+            .env(MODEL_WORKER_PROFILE, profile)
+            .env("MLX_RANK", rank.to_string())
+            .env("MLX_HOSTFILE", &hostfile)
+            .env_remove("MLX_RING_VERBOSE")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if disagree {
+            command.env(MODEL_WORKER_DISAGREE, "1");
+        }
+        children.0.push(command.spawn().unwrap());
     }
 
     let deadline = Instant::now() + Duration::from_secs(15 * 60);
@@ -486,6 +648,25 @@ fn run_model_parity_fixture(fixture_variable: &str, profile: &str) {
         "{profile} model Ring parity failed (timed_out={timed_out}):\n{}",
         failures.join("\n\n")
     );
+}
+
+/// Executes the selected synthetic model through replicated and pure-TP paths.
+#[test]
+#[ignore = "spawns two local Ring ranks and executes a synthetic selected model"]
+fn moshi_ring_tp2_synthetic_model_parity() {
+    let fixture = tempfile::tempdir().unwrap();
+    crate::composition::mlx::realtime::tests::write_tiny_native_artifact(fixture.path(), None);
+    run_model_parity_path(fixture.path(), "moshi", false);
+}
+
+/// Proves a real two-rank Ring schedule disagreement reaches consensus before
+/// either selected MLX executor is invoked or any frame is published.
+#[test]
+#[ignore = "spawns two local Ring ranks and executes a synthetic selected model"]
+fn moshi_ring_tp2_schedule_disagreement_publishes_nothing() {
+    let fixture = tempfile::tempdir().unwrap();
+    crate::composition::mlx::realtime::tests::write_tiny_native_artifact(fixture.path(), None);
+    run_model_parity_path(fixture.path(), "moshi", true);
 }
 
 /// Optional production-model gate. Set `EREDU_MOSHI_NATIVE_FIXTURE`

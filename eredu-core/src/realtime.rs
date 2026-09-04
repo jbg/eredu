@@ -1,16 +1,11 @@
-//! Backend-generic realtime token-session execution and scheduling.
+//! Portable realtime token frames, schedules, and facade errors.
 
 use crate::{
-    backend::{Completion, Submission},
     observation::{ObservationError, TensorObservation, TensorObservationData},
-    scheduler::{
-        RequestId, RequestStatus, Scheduler, SchedulerCapabilities, SchedulerError,
-        SchedulerLimits, SchedulerReport, SemanticStateTransaction, TransitionOutput,
-        WorkDescriptor, WorkId,
-    },
+    scheduler::{SchedulerError, SemanticStateTransaction, WorkDescriptor, WorkId},
 };
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, fmt::Debug, time::Instant};
+use std::collections::BTreeMap;
 
 /// Largest admitted text or audio delay in one portable realtime schedule.
 ///
@@ -362,9 +357,19 @@ pub enum RealtimeTemporalSource {
 /// How one text or depth-codebook decision is resolved.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 #[non_exhaustive]
+pub enum RealtimeForcedSource {
+    /// The forcing payload belongs to the currently submitted portable frame.
+    CurrentInput,
+    /// The forcing payload was retained at the target coordinate by an earlier frame.
+    Retained,
+}
+
+/// How one text or depth-codebook decision is resolved.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum RealtimeTargetSource {
     /// Caller forcing resolves this decision.
-    Forced,
+    Forced(RealtimeForcedSource),
     /// The model sampler resolves this decision.
     Sampled,
     /// An already placed input, forced value, or padding resolves the decision.
@@ -610,7 +615,7 @@ impl RealtimeFrameScheduleState {
             .checked_sub(schedule.text_delay())
             .map(|position| coordinate(position, RealtimeFrameSlot::Text));
         let text_source = if forcing.text {
-            RealtimeTargetSource::Forced
+            RealtimeTargetSource::Forced(RealtimeForcedSource::CurrentInput)
         } else {
             RealtimeTargetSource::Sampled
         };
@@ -653,7 +658,7 @@ impl RealtimeFrameScheduleState {
                     slot,
                     coordinate: target_coordinate,
                     source: if forced {
-                        RealtimeTargetSource::Forced
+                        RealtimeTargetSource::Forced(RealtimeForcedSource::CurrentInput)
                     } else {
                         RealtimeTargetSource::Sampled
                     },
@@ -754,9 +759,10 @@ impl RealtimeFrameScheduleState {
             {
                 let coordinate = coordinate(frontier, slot);
                 let (source, occupancy) = match self.occupied.get(&coordinate).copied() {
-                    Some(RealtimeSlotOccupancy::Forced) => {
-                        (RealtimeTargetSource::Forced, RealtimeSlotOccupancy::Forced)
-                    }
+                    Some(RealtimeSlotOccupancy::Forced) => (
+                        RealtimeTargetSource::Forced(RealtimeForcedSource::Retained),
+                        RealtimeSlotOccupancy::Forced,
+                    ),
                     Some(occupancy) => (RealtimeTargetSource::Existing(occupancy), occupancy),
                     None => (
                         RealtimeTargetSource::Sampled,
@@ -1080,6 +1086,67 @@ impl RealtimeInputFrame {
     }
 }
 
+impl WorkDescriptor for RealtimeInputFrame {
+    type Error = RealtimeInputDescriptorError;
+
+    fn encode_descriptor(&self, output: &mut Vec<u32>) -> Result<(), Self::Error> {
+        output.push(descriptor_len(self.batch)?);
+        encode_i32_descriptor(&self.input_audio_tokens, output)?;
+        encode_optional_i32_descriptor(self.forced_generated_audio_tokens.as_deref(), output)?;
+        match self.forced_generated_audio_codebooks.as_deref() {
+            Some(mask) => {
+                output.push(1);
+                output.push(descriptor_len(mask.len())?);
+                output.extend(mask.iter().copied().map(u32::from));
+            }
+            None => output.push(0),
+        }
+        encode_optional_i32_descriptor(self.forced_text_tokens.as_deref(), output)?;
+        output.push(u32::from(self.retain_diagnostics));
+        Ok(())
+    }
+}
+
+fn encode_i32_descriptor(
+    values: &[i32],
+    output: &mut Vec<u32>,
+) -> Result<(), RealtimeInputDescriptorError> {
+    output.push(descriptor_len(values.len())?);
+    output.extend(
+        values
+            .iter()
+            .map(|value| u32::from_ne_bytes(value.to_ne_bytes())),
+    );
+    Ok(())
+}
+
+fn encode_optional_i32_descriptor(
+    values: Option<&[i32]>,
+    output: &mut Vec<u32>,
+) -> Result<(), RealtimeInputDescriptorError> {
+    match values {
+        Some(values) => {
+            output.push(1);
+            encode_i32_descriptor(values, output)
+        }
+        None => {
+            output.push(0);
+            Ok(())
+        }
+    }
+}
+
+fn descriptor_len(value: usize) -> Result<u32, RealtimeInputDescriptorError> {
+    u32::try_from(value).map_err(|_| RealtimeInputDescriptorError { value })
+}
+
+/// A portable realtime work descriptor exceeded its stable wire representation.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, thiserror::Error)]
+#[error("realtime input descriptor length {value} exceeds the u32 wire range")]
+pub struct RealtimeInputDescriptorError {
+    value: usize,
+}
+
 /// Materialized logits for one ordered realtime decision.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RealtimeDecisionDiagnostics {
@@ -1177,281 +1244,44 @@ impl RealtimeOutputFrame {
     }
 }
 
-/// High-level contract implemented once per realtime execution backend.
-///
-/// Codec frames, generated outputs, cache/session state, model values, and
-/// completions are opaque associated types. Core schedules complete realtime
-/// steps and never models tensor operations or exposes native streams.
-pub trait RealtimeBackend {
-    /// Backend-owned loaded realtime model.
-    type Model;
-    /// Stable identity used to reject cross-model session handoff.
-    type ModelIdentity: Clone + Debug + Eq;
-    /// Backend-owned encoded frame or prompt transition.
-    type Input: WorkDescriptor;
-    /// Backend-owned generated text/audio frame.
-    type Output;
-    /// Request-local cache, delayed streams, sampler, and random state.
-    type Session: SemanticStateTransaction<Error = Self::Error>;
-    /// Exact completion retaining submitted input/output resources.
-    type Completion: Completion<Error = Self::Error>;
-    /// Structured backend failure.
-    type Error: std::error::Error + Send + Sync + 'static;
+impl WorkDescriptor for RealtimeOutputFrame {
+    type Error = RealtimeInputDescriptorError;
 
-    /// Stable backend name used for scheduler capability telemetry.
-    fn name(&self) -> &str;
-    /// Returns the complete model identity.
-    fn model_identity(&self, model: &Self::Model) -> Self::ModelIdentity;
-    /// Returns fail-closed capabilities of the exact loaded realtime session.
-    fn session_capabilities(&self, model: &Self::Model) -> crate::SessionCapabilities;
-    /// Describes the first material difference between two model identities.
-    fn model_identity_mismatch(
-        &self,
-        expected: &Self::ModelIdentity,
-        actual: &Self::ModelIdentity,
-    ) -> Option<String> {
-        (expected != actual).then(|| "model identity".into())
-    }
-    /// Returns portable codec geometry.
-    fn speech_config(&self, model: &Self::Model) -> RealtimeSpeechConfig;
-    /// Materializes a portable encoded or forced frame for this backend.
-    fn materialize_input(
-        &self,
-        model: &Self::Model,
-        frame: &RealtimeInputFrame,
-    ) -> Result<Self::Input, Self::Error>;
-    /// Materializes tokens and requested diagnostics from one completed output.
-    fn observe_output(&self, output: &Self::Output) -> Result<RealtimeOutputFrame, Self::Error>;
-    /// Creates one request-local session.
-    fn create_session(
-        &self,
-        model: &Self::Model,
-        sampling: RealtimeSampling,
-    ) -> Result<Self::Session, Self::Error>;
-    /// Validates a released session before attaching it to this model.
-    fn validate_session(
-        &self,
-        model: &Self::Model,
-        session: &Self::Session,
-    ) -> Result<(), Self::Error>;
-    /// Validates one backend-owned input frame against model geometry.
-    fn validate_input(&self, model: &Self::Model, input: &Self::Input) -> Result<(), Self::Error>;
-    /// Returns the stable batch dimension of a validated input.
-    fn input_batch_size(&self, input: &Self::Input) -> usize;
-    /// Replaces request-local sampling and randomness state.
-    fn set_sampling(
-        &self,
-        session: &mut Self::Session,
-        sampling: RealtimeSampling,
-    ) -> Result<(), Self::Error>;
-    /// Submits one complete temporal/depth transition.
-    fn submit_step(
-        &self,
-        model: &mut Self::Model,
-        session: &mut <Self::Session as SemanticStateTransaction>::Branch,
-        input: &Self::Input,
-    ) -> Result<Submission<Self::Output, Self::Completion>, Self::Error>;
-    /// Number of backend resources explicitly retained by a completion.
-    fn retained_resources(&self, _completion: &Self::Completion) -> usize {
-        0
-    }
-}
-
-/// Materialization contract for an architecture-prepared realtime model.
-///
-/// Architecture code inspects the artifact and produces [`Self::Preparation`]
-/// before this boundary. The selected backend consumes that neutral plan and
-/// owns only device-specific materialization.
-pub trait RealtimeModelLoadingBackend: RealtimeBackend + Sized {
-    /// Architecture-owned, backend-neutral artifact preparation.
-    type Preparation;
-    /// Backend-specific materialization policy.
-    type LoadOptions;
-
-    /// Materializes one architecture-prepared realtime model.
-    fn materialize_realtime_model(
-        &self,
-        preparation: Self::Preparation,
-        options: Self::LoadOptions,
-    ) -> Result<Self::Model, Self::Error>;
-}
-
-/// Materializes an architecture-prepared realtime model using default policy.
-pub fn load_realtime_model<B>(
-    backend: B,
-    preparation: B::Preparation,
-) -> Result<RealtimeModel<B>, B::Error>
-where
-    B: RealtimeModelLoadingBackend,
-    B::LoadOptions: Default,
-{
-    load_realtime_model_with_options(backend, preparation, B::LoadOptions::default())
-}
-
-/// Materializes an architecture-prepared realtime model using explicit policy.
-pub fn load_realtime_model_with_options<B: RealtimeModelLoadingBackend>(
-    backend: B,
-    preparation: B::Preparation,
-    options: B::LoadOptions,
-) -> Result<RealtimeModel<B>, B::Error> {
-    let model = backend.materialize_realtime_model(preparation, options)?;
-    Ok(RealtimeModel::new(backend, model))
-}
-
-/// Selected realtime backend and its loaded model.
-pub struct RealtimeModel<B: RealtimeBackend> {
-    backend: B,
-    model: B::Model,
-}
-
-impl<B: RealtimeBackend> RealtimeModel<B> {
-    /// Binds one loaded model to its execution backend.
-    pub const fn new(backend: B, model: B::Model) -> Self {
-        Self { backend, model }
-    }
-    /// Borrows the selected backend.
-    pub const fn backend(&self) -> &B {
-        &self.backend
-    }
-    /// Borrows the backend-owned model.
-    pub const fn model(&self) -> &B::Model {
-        &self.model
-    }
-    /// Mutably borrows the backend-owned model.
-    pub fn model_mut(&mut self) -> &mut B::Model {
-        &mut self.model
-    }
-    /// Portable codec-token geometry.
-    pub fn speech_config(&self) -> RealtimeSpeechConfig {
-        self.backend.speech_config(&self.model)
-    }
-    /// Fail-closed capabilities of the exact loaded realtime session.
-    pub fn session_capabilities(&self) -> crate::SessionCapabilities {
-        self.backend.session_capabilities(&self.model)
-    }
-    /// Consumes the runtime into backend and model values.
-    pub fn into_parts(self) -> (B, B::Model) {
-        (self.backend, self.model)
-    }
-}
-
-/// Request-local realtime state released from a scheduler.
-pub struct RealtimeSession<B: RealtimeBackend> {
-    model_identity: B::ModelIdentity,
-    state: B::Session,
-    batch_size: Option<usize>,
-}
-
-/// Unpublished request-local branch passed to one backend submission.
-pub struct RealtimeSessionBranch<B: RealtimeBackend> {
-    state: <B::Session as SemanticStateTransaction>::Branch,
-    batch_size: Option<usize>,
-}
-
-impl<B: RealtimeBackend> RealtimeSession<B> {
-    /// Borrows backend-owned request state.
-    pub const fn state(&self) -> &B::Session {
-        &self.state
-    }
-    /// Mutably borrows backend-owned request state.
-    pub fn state_mut(&mut self) -> &mut B::Session {
-        &mut self.state
-    }
-    /// Committed batch dimension, when at least one frame was accepted.
-    pub const fn batch_size(&self) -> Option<usize> {
-        self.batch_size
-    }
-}
-
-impl<B: RealtimeBackend> SemanticStateTransaction for RealtimeSession<B> {
-    type Branch = RealtimeSessionBranch<B>;
-    type Error = B::Error;
-
-    fn branch(&self) -> Result<Self::Branch, Self::Error> {
-        Ok(RealtimeSessionBranch {
-            state: self.state.branch()?,
-            batch_size: self.batch_size,
-        })
-    }
-
-    fn commit_branch(&mut self, branch: Self::Branch) -> Result<(), Self::Error> {
-        self.state.commit_branch(branch.state)?;
-        self.batch_size = branch.batch_size;
+    fn encode_descriptor(&self, output: &mut Vec<u32>) -> Result<(), Self::Error> {
+        output.push(descriptor_len(self.batch)?);
+        encode_i32_descriptor(&self.text_tokens, output)?;
+        encode_i32_descriptor(&self.decision_audio_tokens, output)?;
+        encode_i32_descriptor(&self.sampled_audio_tokens, output)?;
+        encode_optional_i32_descriptor(self.output_audio_tokens.as_deref(), output)?;
+        output.push(descriptor_len(self.diagnostics.len())?);
+        for diagnostic in &self.diagnostics {
+            output.push(descriptor_len(diagnostic.prediction())?);
+            output.push(descriptor_len(diagnostic.shape().len())?);
+            for &dimension in diagnostic.shape() {
+                output.push(descriptor_len(dimension)?);
+            }
+            output.push(descriptor_len(diagnostic.logits().len())?);
+            output.extend(diagnostic.logits().iter().map(|value| value.to_bits()));
+        }
         Ok(())
     }
-
-    fn discard_branch(branch: Self::Branch) -> Result<(), Self::Error> {
-        B::Session::discard_branch(branch.state)
-    }
 }
 
-struct RealtimeTransition<B: RealtimeBackend> {
-    backend_name: String,
-    retained_resources: usize,
-    output: B::Output,
-    completion: B::Completion,
-}
-
-impl<B: RealtimeBackend> TransitionOutput for RealtimeTransition<B> {
-    type Error = B::Error;
-
-    fn is_complete(&self) -> Result<bool, Self::Error> {
-        self.completion.is_complete()
-    }
-    fn backend_name(&self) -> Option<String> {
-        Some(self.backend_name.clone())
-    }
-    fn retained_resources(&self) -> usize {
-        self.retained_resources
-    }
-}
-
-/// One committed realtime transition and its scheduler identity.
-pub struct RealtimeCompletedStep<O> {
-    work: WorkId,
-    output: O,
-}
-
-impl<O> RealtimeCompletedStep<O> {
-    /// Scheduler-assigned work identity.
-    pub const fn work(&self) -> WorkId {
-        self.work
-    }
-    /// Borrows the backend-owned generated frame.
-    pub const fn output(&self) -> &O {
-        &self.output
-    }
-    /// Consumes this completion.
-    pub fn into_parts(self) -> (WorkId, O) {
-        (self.work, self.output)
-    }
-}
-
-/// Realtime coordination failure with structured backend context.
+/// Realtime coordination failure with structured execution context.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum RealtimeError<E: std::error::Error + 'static> {
-    /// Selected backend rejected model, session, input, or execution.
-    #[error("realtime backend failed: {0}")]
-    Backend(#[source] E),
+    /// Selected mechanisms rejected model, session, input, or execution.
+    #[error("realtime execution failed: {0}")]
+    Execution(#[source] E),
     /// Generic scheduler lifecycle or capacity failure.
     #[error(transparent)]
     Scheduler(#[from] SchedulerError),
-    /// A runtime or released session belongs to a different model.
+    /// A runtime or released session belongs to a different selected realization.
     #[error("realtime model {component} does not match the scheduler model")]
     ModelMismatch {
         /// Backend-defined identity component that differs.
         component: String,
-    },
-    /// A request changed its batch size after its first accepted frame.
-    #[error("realtime request {request} changed batch size from {expected} to {actual}")]
-    BatchSize {
-        /// Request identity.
-        request: u64,
-        /// Committed batch size.
-        expected: usize,
-        /// New input batch size.
-        actual: usize,
     },
     /// A bounded drain must permit at least one frame.
     #[error("realtime scheduler frame bound must be positive")]
@@ -1474,569 +1304,9 @@ pub enum RealtimeError<E: std::error::Error + 'static> {
     },
 }
 
-/// Fair bounded realtime scheduler generic over the selected backend.
-pub struct RealtimeScheduler<B: RealtimeBackend> {
-    model_identity: B::ModelIdentity,
-    scheduler: Scheduler<B::Input, RealtimeSession<B>, RealtimeTransition<B>>,
-}
-
-impl<B: RealtimeBackend> RealtimeScheduler<B> {
-    /// Binds an empty scheduler to one selected model.
-    pub fn new(
-        model: &RealtimeModel<B>,
-        limits: SchedulerLimits,
-    ) -> Result<Self, RealtimeError<B::Error>> {
-        Ok(Self {
-            model_identity: model.backend.model_identity(&model.model),
-            scheduler: Scheduler::new(limits)?,
-        })
-    }
-
-    fn validate_model(&self, model: &RealtimeModel<B>) -> Result<(), RealtimeError<B::Error>> {
-        let actual = model.backend.model_identity(&model.model);
-        if let Some(component) = model
-            .backend
-            .model_identity_mismatch(&self.model_identity, &actual)
-        {
-            return Err(RealtimeError::ModelMismatch { component });
-        }
-        Ok(())
-    }
-
-    /// Registers a request with fresh backend-owned state.
-    pub fn register_request(
-        &mut self,
-        model: &RealtimeModel<B>,
-        request: RequestId,
-        sampling: RealtimeSampling,
-    ) -> Result<(), RealtimeError<B::Error>> {
-        self.validate_model(model)?;
-        self.scheduler.validate_registration(request)?;
-        let state = model
-            .backend
-            .create_session(&model.model, sampling)
-            .map_err(RealtimeError::Backend)?;
-        self.scheduler.register(
-            request,
-            RealtimeSession {
-                model_identity: self.model_identity.clone(),
-                state,
-                batch_size: None,
-            },
-        )?;
-        Ok(())
-    }
-
-    /// Registers a previously released request session.
-    pub fn register_request_with_session(
-        &mut self,
-        model: &RealtimeModel<B>,
-        request: RequestId,
-        session: RealtimeSession<B>,
-    ) -> Result<(), RealtimeError<B::Error>> {
-        self.validate_model(model)?;
-        self.scheduler.validate_registration(request)?;
-        if let Some(component) = model
-            .backend
-            .model_identity_mismatch(&self.model_identity, &session.model_identity)
-        {
-            return Err(RealtimeError::ModelMismatch { component });
-        }
-        model
-            .backend
-            .validate_session(&model.model, &session.state)
-            .map_err(RealtimeError::Backend)?;
-        self.scheduler.register(request, session)?;
-        Ok(())
-    }
-
-    /// Enqueues one encoded or forced frame.
-    pub fn enqueue(
-        &mut self,
-        model: &RealtimeModel<B>,
-        request: RequestId,
-        input: B::Input,
-    ) -> Result<WorkId, RealtimeError<B::Error>> {
-        self.enqueue_with_deadline(model, request, input, None)
-    }
-
-    /// Enqueues one frame with an optional absolute deadline.
-    pub fn enqueue_with_deadline(
-        &mut self,
-        model: &RealtimeModel<B>,
-        request: RequestId,
-        input: B::Input,
-        deadline: Option<Instant>,
-    ) -> Result<WorkId, RealtimeError<B::Error>> {
-        self.validate_model(model)?;
-        model
-            .backend
-            .validate_input(&model.model, &input)
-            .map_err(RealtimeError::Backend)?;
-        let batch = model.backend.input_batch_size(&input);
-        self.validate_batch(request, batch)?;
-        let work = self
-            .scheduler
-            .enqueue_with_deadline(request, input, deadline)?;
-        self.scheduler
-            .request_state_mut(request)?
-            .batch_size
-            .get_or_insert(batch);
-        Ok(work)
-    }
-
-    /// Atomically enqueues ordered frames.
-    pub fn enqueue_batch(
-        &mut self,
-        model: &RealtimeModel<B>,
-        request: RequestId,
-        inputs: Vec<B::Input>,
-    ) -> Result<Vec<WorkId>, RealtimeError<B::Error>> {
-        self.validate_model(model)?;
-        let mut expected = self
-            .scheduler
-            .request_state(request)
-            .ok_or(SchedulerError::UnknownRequest(request))?
-            .batch_size;
-        for input in &inputs {
-            model
-                .backend
-                .validate_input(&model.model, input)
-                .map_err(RealtimeError::Backend)?;
-            let actual = model.backend.input_batch_size(input);
-            if let Some(expected) = expected {
-                if actual != expected {
-                    return Err(RealtimeError::BatchSize {
-                        request: request.value(),
-                        expected,
-                        actual,
-                    });
-                }
-            } else {
-                expected = Some(actual);
-            }
-        }
-        let work = self.scheduler.enqueue_batch(request, inputs)?;
-        if let Some(batch) = expected {
-            self.scheduler
-                .request_state_mut(request)?
-                .batch_size
-                .get_or_insert(batch);
-        }
-        Ok(work)
-    }
-
-    fn validate_batch(
-        &self,
-        request: RequestId,
-        actual: usize,
-    ) -> Result<(), RealtimeError<B::Error>> {
-        let state = self
-            .scheduler
-            .request_state(request)
-            .ok_or(SchedulerError::UnknownRequest(request))?;
-        if let Some(expected) = state.batch_size {
-            if expected != actual {
-                return Err(RealtimeError::BatchSize {
-                    request: request.value(),
-                    expected,
-                    actual,
-                });
-            }
-        }
-        Ok(())
-    }
-
-    /// Advances one unbounded fair scheduling turn.
-    pub fn run_queued(
-        &mut self,
-        model: &mut RealtimeModel<B>,
-    ) -> Result<Vec<RealtimeCompletedStep<B::Output>>, RealtimeError<B::Error>> {
-        self.run_bounded(model, usize::MAX)
-    }
-
-    /// Advances at most `max_frames` fair-ordered transitions.
-    pub fn run_bounded(
-        &mut self,
-        model: &mut RealtimeModel<B>,
-        max_frames: usize,
-    ) -> Result<Vec<RealtimeCompletedStep<B::Output>>, RealtimeError<B::Error>> {
-        self.validate_model(model)?;
-        if max_frames == 0 {
-            return Err(RealtimeError::EmptyRunBound);
-        }
-        let now = Instant::now();
-        let mut progress = self.scheduler.poll_completions(now);
-        self.scheduler.prepare_bounded(max_frames, now)?;
-        let backend_name = model.backend.name().to_owned();
-        let backend = &model.backend;
-        let backend_model = &mut model.model;
-        progress.newly_submitted = self.scheduler.submit_prepared(
-            now,
-            |_, input, session| -> Result<RealtimeTransition<B>, B::Error> {
-                let submission = backend.submit_step(backend_model, &mut session.state, input)?;
-                let retained_resources = backend.retained_resources(&submission.completion);
-                Ok(RealtimeTransition {
-                    backend_name: backend_name.clone(),
-                    retained_resources,
-                    output: submission.output,
-                    completion: submission.completion,
-                })
-            },
-        )?;
-        let completed = self.scheduler.poll_completions(now);
-        progress.committed.extend(completed.committed);
-        progress.failed.extend(completed.failed);
-        if let Some((work, failure)) = progress.failed.first() {
-            return Err(RealtimeError::Asynchronous {
-                work: *work,
-                message: failure.to_string(),
-            });
-        }
-        Ok(progress
-            .committed
-            .into_iter()
-            .map(|(work, _, transition)| RealtimeCompletedStep {
-                work,
-                output: transition.output,
-            })
-            .collect())
-    }
-
-    /// Completes one request and drops its backend session.
-    pub fn finish_request(&mut self, request: RequestId) -> Result<(), RealtimeError<B::Error>> {
-        self.scheduler.finish(request)?;
-        Ok(())
-    }
-    /// Cancels one request and discards queued frames.
-    pub fn cancel_request(&mut self, request: RequestId) -> Result<(), RealtimeError<B::Error>> {
-        self.scheduler.cancel(request)?;
-        Ok(())
-    }
-    /// Releases an idle request for persistence or resumption.
-    pub fn release_request(
-        &mut self,
-        request: RequestId,
-    ) -> Result<RealtimeSession<B>, RealtimeError<B::Error>> {
-        Ok(self.scheduler.release(request)?)
-    }
-    /// Removes a terminal identity for explicit reuse.
-    pub fn forget_terminal_request(
-        &mut self,
-        request: RequestId,
-    ) -> Result<RequestStatus, RealtimeError<B::Error>> {
-        Ok(self.scheduler.forget_terminal(request)?)
-    }
-    /// Lifecycle state for a known request.
-    pub fn request_status(&self, request: RequestId) -> Option<RequestStatus> {
-        self.scheduler.request_status(request)
-    }
-    /// Queued frame count for one request.
-    pub fn queued_for_request(&self, request: RequestId) -> usize {
-        self.scheduler.queued_for_request(request)
-    }
-    /// Replaces sampling controls for an idle active request.
-    pub fn set_request_sampling(
-        &mut self,
-        model: &RealtimeModel<B>,
-        request: RequestId,
-        sampling: RealtimeSampling,
-    ) -> Result<(), RealtimeError<B::Error>> {
-        self.validate_model(model)?;
-        let queued = self.scheduler.queued_for_request(request);
-        if queued != 0 {
-            return Err(RealtimeError::SamplingWhileQueued {
-                request: request.value(),
-                queued,
-            });
-        }
-        let state = self.scheduler.request_state_mut(request)?;
-        model
-            .backend
-            .set_sampling(&mut state.state, sampling)
-            .map_err(RealtimeError::Backend)
-    }
-    /// Generic occupancy and lifecycle telemetry.
-    pub fn report(&self) -> SchedulerReport {
-        self.scheduler.report()
-    }
-    /// Configured bounds and observed backend capabilities.
-    pub fn capabilities(&self) -> SchedulerCapabilities {
-        self.scheduler.capabilities()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::convert::Infallible;
-
-    #[derive(Clone)]
-    struct MockSession {
-        step: u32,
-        sampling: RealtimeSampling,
-    }
-    impl SemanticStateTransaction for MockSession {
-        type Branch = Self;
-        type Error = Infallible;
-        fn branch(&self) -> Result<Self, Self::Error> {
-            Ok(self.clone())
-        }
-        fn commit_branch(&mut self, branch: Self) -> Result<(), Self::Error> {
-            *self = branch;
-            Ok(())
-        }
-    }
-
-    #[derive(Clone)]
-    struct Frame(Vec<u32>);
-    impl WorkDescriptor for Frame {
-        type Error = Infallible;
-        fn encode_descriptor(&self, output: &mut Vec<u32>) -> Result<(), Self::Error> {
-            output.extend_from_slice(&self.0);
-            Ok(())
-        }
-    }
-
-    struct Done;
-    impl Completion for Done {
-        type Error = Infallible;
-        fn is_complete(&self) -> Result<bool, Self::Error> {
-            Ok(true)
-        }
-        fn wait(&self) -> Result<(), Self::Error> {
-            Ok(())
-        }
-    }
-
-    struct MockBackend;
-    impl RealtimeBackend for MockBackend {
-        type Model = u64;
-        type ModelIdentity = u64;
-        type Input = Frame;
-        type Output = u32;
-        type Session = MockSession;
-        type Completion = Done;
-        type Error = Infallible;
-
-        fn name(&self) -> &str {
-            "mock-realtime"
-        }
-        fn model_identity(&self, model: &u64) -> u64 {
-            *model
-        }
-        fn session_capabilities(&self, _: &u64) -> crate::SessionCapabilities {
-            crate::SessionCapabilities::new(true, true, false)
-        }
-        fn speech_config(&self, _: &u64) -> RealtimeSpeechConfig {
-            RealtimeSpeechConfig::new(
-                2,
-                1,
-                1,
-                1,
-                0,
-                0,
-                RealtimeFrameConvention::FeedbackAlignedHistory,
-                vec![0, 0, 1],
-            )
-            .unwrap()
-        }
-        fn materialize_input(
-            &self,
-            _: &u64,
-            frame: &RealtimeInputFrame,
-        ) -> Result<Frame, Infallible> {
-            Ok(Frame(
-                frame
-                    .input_audio_tokens()
-                    .iter()
-                    .map(|token| *token as u32)
-                    .collect(),
-            ))
-        }
-        fn observe_output(&self, output: &u32) -> Result<RealtimeOutputFrame, Infallible> {
-            Ok(RealtimeOutputFrame::new(
-                1,
-                vec![*output as i32],
-                Vec::new(),
-                Vec::new(),
-                None,
-                Vec::new(),
-            ))
-        }
-        fn create_session(
-            &self,
-            _: &u64,
-            sampling: RealtimeSampling,
-        ) -> Result<MockSession, Infallible> {
-            Ok(MockSession { step: 0, sampling })
-        }
-        fn validate_session(&self, _: &u64, _: &MockSession) -> Result<(), Infallible> {
-            Ok(())
-        }
-        fn validate_input(&self, _: &u64, _: &Frame) -> Result<(), Infallible> {
-            Ok(())
-        }
-        fn input_batch_size(&self, input: &Frame) -> usize {
-            input.0.len()
-        }
-        fn set_sampling(
-            &self,
-            session: &mut MockSession,
-            sampling: RealtimeSampling,
-        ) -> Result<(), Infallible> {
-            session.sampling = sampling;
-            Ok(())
-        }
-        fn submit_step(
-            &self,
-            model: &mut u64,
-            session: &mut MockSession,
-            input: &Frame,
-        ) -> Result<Submission<u32, Done>, Infallible> {
-            session.step += 1;
-            Ok(Submission {
-                output: *model as u32 + session.step + input.0.iter().sum::<u32>(),
-                completion: Done,
-            })
-        }
-    }
-
-    impl RealtimeModelLoadingBackend for MockBackend {
-        type Preparation = u64;
-        type LoadOptions = u64;
-
-        fn materialize_realtime_model(
-            &self,
-            preparation: Self::Preparation,
-            _: Self::LoadOptions,
-        ) -> Result<Self::Model, Self::Error> {
-            Ok(preparation)
-        }
-    }
-
-    #[test]
-    fn selected_backend_materializes_architecture_preparation() {
-        let model = load_realtime_model_with_options(MockBackend, 37, 0).unwrap();
-        assert_eq!(*model.model(), 37);
-        assert_eq!(model.backend().name(), "mock-realtime");
-        assert_eq!(
-            model.session_capabilities(),
-            crate::SessionCapabilities::new(true, true, false)
-        );
-    }
-
-    #[test]
-    fn mock_backend_runs_fair_realtime_sessions_without_accelerator_types() {
-        let mut model = RealtimeModel::new(MockBackend, 10);
-        let limits = SchedulerLimits::with_execution_bounds(2, 4, 2, 2, 1, usize::MAX).unwrap();
-        let mut scheduler = RealtimeScheduler::new(&model, limits).unwrap();
-        let first = RequestId::new(1);
-        let second = RequestId::new(2);
-        scheduler
-            .register_request(&model, first, RealtimeSampling::greedy())
-            .unwrap();
-        scheduler
-            .register_request(&model, second, RealtimeSampling::greedy())
-            .unwrap();
-        scheduler.enqueue(&model, first, Frame(vec![1])).unwrap();
-        scheduler.enqueue(&model, second, Frame(vec![2])).unwrap();
-        assert!(matches!(
-            scheduler.set_request_sampling(
-                &model,
-                first,
-                RealtimeSampling::new(0.5, 0.5, 7).unwrap()
-            ),
-            Err(RealtimeError::SamplingWhileQueued { .. })
-        ));
-        assert_eq!(
-            scheduler
-                .run_queued(&mut model)
-                .unwrap()
-                .into_iter()
-                .map(|step| step.into_parts().1)
-                .collect::<Vec<_>>(),
-            vec![12, 13]
-        );
-        let updated = RealtimeSampling::new(0.5, 0.5, 7).unwrap();
-        scheduler
-            .set_request_sampling(&model, first, updated)
-            .unwrap();
-        assert_eq!(
-            scheduler.release_request(first).unwrap().state().sampling,
-            updated
-        );
-    }
-
-    #[test]
-    fn portable_scheduler_lifecycle_rejects_mismatch_and_preserves_resumed_state() {
-        let mut model = RealtimeModel::new(MockBackend, 10);
-        let other_model = RealtimeModel::new(MockBackend, 11);
-        let limits = SchedulerLimits::with_execution_bounds(2, 4, 2, 2, 1, usize::MAX).unwrap();
-        let mut scheduler = RealtimeScheduler::new(&model, limits).unwrap();
-
-        let cancelled = RequestId::new(10);
-        scheduler
-            .register_request(&model, cancelled, RealtimeSampling::greedy())
-            .unwrap();
-        scheduler
-            .enqueue(&model, cancelled, Frame(vec![1]))
-            .unwrap();
-        assert!(matches!(
-            scheduler.enqueue(&model, cancelled, Frame(vec![1, 2])),
-            Err(RealtimeError::BatchSize {
-                request: 10,
-                expected: 1,
-                actual: 2,
-            })
-        ));
-        assert_eq!(scheduler.queued_for_request(cancelled), 1);
-        scheduler.cancel_request(cancelled).unwrap();
-        assert_eq!(
-            scheduler.request_status(cancelled),
-            Some(RequestStatus::Cancelled)
-        );
-        assert_eq!(scheduler.queued_for_request(cancelled), 0);
-
-        assert!(matches!(
-            scheduler.register_request(
-                &other_model,
-                RequestId::new(11),
-                RealtimeSampling::greedy()
-            ),
-            Err(RealtimeError::ModelMismatch { .. })
-        ));
-
-        let original = RequestId::new(20);
-        scheduler
-            .register_request(&model, original, RealtimeSampling::greedy())
-            .unwrap();
-        scheduler.enqueue(&model, original, Frame(vec![2])).unwrap();
-        assert_eq!(scheduler.run_queued(&mut model).unwrap()[0].output(), &13);
-        let released = scheduler.release_request(original).unwrap();
-        assert_eq!(released.state().step, 1);
-        assert_eq!(released.batch_size(), Some(1));
-
-        let resumed = RequestId::new(21);
-        scheduler
-            .register_request_with_session(&model, resumed, released)
-            .unwrap();
-        scheduler.enqueue(&model, resumed, Frame(vec![3])).unwrap();
-        assert_eq!(scheduler.run_queued(&mut model).unwrap()[0].output(), &15);
-        let released = scheduler.release_request(resumed).unwrap();
-        assert_eq!(released.state().step, 2);
-
-        let mut other_scheduler = RealtimeScheduler::new(&other_model, limits).unwrap();
-        assert!(matches!(
-            other_scheduler.register_request_with_session(
-                &other_model,
-                RequestId::new(22),
-                released
-            ),
-            Err(RealtimeError::ModelMismatch { .. })
-        ));
-    }
-
     #[test]
     fn sampling_and_speech_config_validate_portably() {
         assert!(RealtimeSampling::new(f32::NAN, 0.0, 0).is_err());
@@ -2159,8 +1429,14 @@ mod tests {
         assert_eq!(second.frontier(), 1);
         assert_eq!(second.next_frontier(), 2);
         assert_eq!(second.output().unwrap().len(), 8);
-        assert_eq!(second.targets()[0].source(), RealtimeTargetSource::Forced);
-        assert_eq!(second.targets()[1].source(), RealtimeTargetSource::Forced);
+        assert_eq!(
+            second.targets()[0].source(),
+            RealtimeTargetSource::Forced(RealtimeForcedSource::CurrentInput)
+        );
+        assert_eq!(
+            second.targets()[1].source(),
+            RealtimeTargetSource::Forced(RealtimeForcedSource::CurrentInput)
+        );
         assert_eq!(second.targets()[2].source(), RealtimeTargetSource::Sampled);
         assert!(matches!(
             second.temporal_inputs()[2],
@@ -2202,11 +1478,11 @@ mod tests {
         assert_eq!(first_model.targets().len(), 17);
         assert_eq!(
             first_model.targets()[0].source(),
-            RealtimeTargetSource::Forced
+            RealtimeTargetSource::Forced(RealtimeForcedSource::Retained)
         );
         assert_eq!(
             first_model.targets()[1].source(),
-            RealtimeTargetSource::Forced
+            RealtimeTargetSource::Forced(RealtimeForcedSource::Retained)
         );
         assert_eq!(
             first_model.targets()[2].source(),
@@ -2280,5 +1556,25 @@ mod tests {
             Err(RealtimeScheduleError::MissingSlot { .. })
         ));
         assert_eq!(missing, missing_before);
+    }
+
+    #[test]
+    fn portable_input_frame_has_one_exact_scheduler_descriptor() {
+        let frame = RealtimeInputFrame::new(1, vec![-1])
+            .with_partially_forced_generated_audio(vec![5], vec![true])
+            .with_forced_text(vec![3])
+            .with_diagnostics();
+        let mut descriptor = Vec::new();
+        frame.encode_descriptor(&mut descriptor).unwrap();
+        assert_eq!(
+            descriptor,
+            vec![1, 1, u32::MAX, 1, 1, 5, 1, 1, 1, 1, 1, 3, 1,]
+        );
+
+        let mut changed = Vec::new();
+        RealtimeInputFrame::new(1, vec![0])
+            .encode_descriptor(&mut changed)
+            .unwrap();
+        assert_ne!(descriptor, changed);
     }
 }

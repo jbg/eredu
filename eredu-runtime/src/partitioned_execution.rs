@@ -2301,7 +2301,7 @@ where
         hook: &mut H,
     ) -> PartitionedTraversalResult<B::Tensor, A::ForwardContext, A::Error, ExecutionPolicy::Error>
     where
-        H: LayeredTraversalHook<B, A::ForwardContext, A::Error>,
+        H: LayeredTraversalHook<B, A::ForwardContext, A::Error> + ?Sized,
     {
         if !self.plan.routes.is_empty()
             || self.plan.publication.is_some()
@@ -2377,7 +2377,7 @@ where
         hook: &mut H,
     ) -> PartitionedTraversalResult<B::Tensor, A::ForwardContext, A::Error, ExecutionPolicy::Error>
     where
-        H: LayeredTraversalHook<B, A::ForwardContext, A::Error>,
+        H: LayeredTraversalHook<B, A::ForwardContext, A::Error> + ?Sized,
     {
         match self {
             Self::Direct(runtime) => runtime
@@ -2394,6 +2394,14 @@ where
         match self {
             Self::Direct(runtime) => runtime.policy(),
             Self::Partitioned(runtime) => runtime.traversal_executor().runtime().policy(),
+        }
+    }
+
+    /// Borrows the selected local architecture independently of realization kind.
+    pub fn architecture(&self) -> &A {
+        match self {
+            Self::Direct(runtime) => runtime.architecture(),
+            Self::Partitioned(runtime) => runtime.traversal_executor().runtime().architecture(),
         }
     }
 }

@@ -11,7 +11,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use eredu_core::{RealtimeBackend as _, RealtimeModelLoadingBackend as _, TokenOutput as _};
+use eredu_core::TokenOutput as _;
 
 /// Discovers hardware available to the selected local backend.
 pub fn discover_local_hardware() -> eredu_core::HardwareProfile {
@@ -21,6 +21,37 @@ pub fn discover_local_hardware() -> eredu_core::HardwareProfile {
 type SelectedBackend = eredu_backend_mlx::backend::MlxBackend<'static>;
 type SelectedDrafter = eredu_backend_mlx::native::MlxDrafter;
 type SelectedPrompt = <SelectedBackend as eredu_core::TextGenerationBackend>::Prompt;
+type SelectedRealtimeState = eredu_runtime::RealtimePayloadState<
+    eredu_backend_mlx::backend::runtime::cache::state::MlxKeyValueState,
+    eredu_backend_mlx::MlxTensor,
+>;
+type SelectedRealtimeSampler = eredu_runtime::GenerationSampler;
+type SelectedRealtimeRandom = eredu_backend_mlx::native::RandomState;
+type SelectedRealtimeCompletion = eredu_backend_mlx::native::MlxRealtimeCompletion;
+type SelectedRealtimeGeneration = eredu_runtime::RealtimeGenerationState<
+    SelectedRealtimeState,
+    SelectedRealtimeSampler,
+    SelectedRealtimeRandom,
+    SelectedRealtimeCompletion,
+>;
+type SelectedRealtimeTransition = eredu_runtime::PrepublicationRealtimeFrame<
+    eredu_backend_mlx::MlxTensor,
+    SelectedRealtimeCompletion,
+    eredu_backend_mlx::native::MlxRealtimeHostObserver,
+>;
+type SelectedRealtimeScheduler = eredu_runtime::RealtimeSessionScheduler<
+    SelectedRealtimeState,
+    SelectedRealtimeSampler,
+    SelectedRealtimeRandom,
+    SelectedRealtimeCompletion,
+    SelectedRealtimeTransition,
+>;
+type SelectedReleasedRealtimeSession = eredu_runtime::ReleasedRealtimeSession<
+    SelectedRealtimeState,
+    SelectedRealtimeSampler,
+    SelectedRealtimeRandom,
+    SelectedRealtimeCompletion,
+>;
 
 /// Automatic planner and execution-plan factory for the selected local backend.
 ///
@@ -847,14 +878,19 @@ impl LocalRealtimeBackendFactory {
     ) -> Result<LocalRealtimeModel, LocalBackendError> {
         let device = local_device_plan(self.device)
             .map_err(|error| LocalBackendError::new("device planning", error))?;
-        let backend = eredu_backend_mlx::create_realtime_backend(&device)
-            .map_err(|error| LocalBackendError::new("realtime backend creation", error))?;
-        let model = backend
-            .materialize_realtime_model(preparation, options.into_backend())
-            .map_err(|error| LocalBackendError::new("realtime model loading", error))?;
-        Ok(LocalRealtimeModel {
-            inner: eredu_core::RealtimeModel::new(backend, model),
-        })
+        let (backend, execution) = eredu_backend_mlx::create_realtime_execution(
+            preparation,
+            &device,
+            options.into_backend(),
+        )
+        .map_err(|error| LocalBackendError::new("realtime model loading", error))?;
+        let selected = execution.selected().clone();
+        let model = crate::api::realtime::PreparedRealtimeModel::new(
+            execution,
+            &selected,
+            crate::SessionCapabilities::new(true, true, false),
+        );
+        Ok(LocalRealtimeModel { backend, model })
     }
 }
 
@@ -870,35 +906,80 @@ impl Default for LocalRealtimeBackendFactory {
 /// [`LocalRealtimeScheduler`] to submit portable [`crate::RealtimeInputFrame`]
 /// values and observe portable [`crate::RealtimeOutputFrame`] values.
 pub struct LocalRealtimeModel {
-    inner: eredu_core::RealtimeModel<eredu_backend_mlx::MlxRealtimeAdapter>,
+    backend: eredu_backend_mlx::native::MlxRealtimeExecutionContext,
+    model: crate::api::realtime::PreparedRealtimeModel<
+        eredu_architectures::moshi::MoshiRealtimeExecution<
+            eredu_backend_mlx::native::MlxRealtimeExecution,
+        >,
+    >,
 }
 
 impl LocalRealtimeModel {
     /// Name of the selected execution backend.
     pub fn backend_name(&self) -> &str {
-        self.inner.backend().name()
+        "mlx"
     }
 
     /// Portable codec-token geometry for this model.
     pub fn speech_config(&self) -> crate::RealtimeSpeechConfig {
-        self.inner.speech_config()
+        self.model.session_identity().schedule().clone()
     }
 
     /// Fail-closed capabilities of the exact loaded realtime session.
     pub fn session_capabilities(&self) -> crate::SessionCapabilities {
-        self.inner.session_capabilities()
+        self.model.session_capabilities()
+    }
+
+    fn realize_sampling(
+        &self,
+        sampling: crate::RealtimeSampling,
+    ) -> Result<(Vec<SelectedRealtimeSampler>, Option<SelectedRealtimeRandom>), LocalBackendError>
+    {
+        let schedule = self.speech_config();
+        let samplers =
+            eredu_architectures::moshi::realtime_generation_samplers(&schedule, sampling)
+                .map_err(|error| LocalBackendError::new("realtime sampler construction", error))?;
+        let random = self
+            .backend
+            .realize_random_state(sampling.is_stochastic().then_some(sampling.seed()))
+            .map_err(|error| LocalBackendError::new("realtime random-state creation", error))?;
+        Ok((samplers, random))
+    }
+
+    fn create_generation(
+        &self,
+        sampling: crate::RealtimeSampling,
+    ) -> Result<SelectedRealtimeGeneration, LocalBackendError> {
+        let schedule = self.speech_config();
+        let model_state = self
+            .backend
+            .new_realtime_model_state(self.model.mechanism())
+            .map_err(|error| LocalBackendError::new("realtime model-state creation", error))?;
+        let payload_state =
+            eredu_runtime::RealtimePayloadState::fresh(model_state, schedule.clone());
+        let (samplers, random) = self.realize_sampling(sampling)?;
+        eredu_runtime::RealtimeGenerationState::new(
+            payload_state,
+            schedule,
+            sampling,
+            samplers,
+            random,
+        )
+        .map_err(|error| LocalBackendError::new("realtime generation-state creation", error))
     }
 }
 
 /// Request-local selected-backend state released from a realtime scheduler.
 pub struct LocalRealtimeSession {
-    inner: eredu_core::RealtimeSession<eredu_backend_mlx::MlxRealtimeAdapter>,
+    inner: SelectedReleasedRealtimeSession,
 }
 
 impl LocalRealtimeSession {
     /// Committed batch dimension, when at least one frame was accepted.
     pub fn batch_size(&self) -> Option<usize> {
-        self.inner.batch_size()
+        self.inner
+            .committed_batch()
+            .map(std::num::NonZeroUsize::get)
     }
 }
 
@@ -927,10 +1008,11 @@ impl LocalRealtimeCompletedStep {
 
 /// Fair bounded realtime scheduler for a [`LocalRealtimeModel`].
 ///
-/// This facade materializes portable host token frames before execution and
-/// observes completed backend outputs before returning them to the caller.
+/// This facade queues portable host token frames unchanged. Native
+/// materialization occurs only on an unpublished session branch, and host
+/// observation must succeed before that branch is committed.
 pub struct LocalRealtimeScheduler {
-    inner: eredu_core::RealtimeScheduler<eredu_backend_mlx::MlxRealtimeAdapter>,
+    inner: SelectedRealtimeScheduler,
 }
 
 impl LocalRealtimeScheduler {
@@ -940,9 +1022,24 @@ impl LocalRealtimeScheduler {
         limits: crate::SchedulerLimits,
     ) -> Result<Self, eredu_core::RealtimeError<LocalBackendError>> {
         Ok(Self {
-            inner: eredu_core::RealtimeScheduler::new(&model.inner, limits)
-                .map_err(map_local_realtime_error)?,
+            inner: eredu_runtime::RealtimeSessionScheduler::new(
+                model.model.session_identity().clone(),
+                limits,
+            )?,
         })
+    }
+
+    fn validate_model(
+        &self,
+        model: &LocalRealtimeModel,
+    ) -> Result<(), eredu_core::RealtimeError<LocalBackendError>> {
+        if self.inner.model_identity() == model.model.session_identity() {
+            Ok(())
+        } else {
+            Err(eredu_core::RealtimeError::ModelMismatch {
+                component: "selected realtime realization".into(),
+            })
+        }
     }
 
     /// Registers a request with fresh selected-backend state.
@@ -952,9 +1049,14 @@ impl LocalRealtimeScheduler {
         request: crate::RequestId,
         sampling: crate::RealtimeSampling,
     ) -> Result<(), eredu_core::RealtimeError<LocalBackendError>> {
+        self.validate_model(model)?;
+        let generation = model
+            .create_generation(sampling)
+            .map_err(eredu_core::RealtimeError::Execution)?;
         self.inner
-            .register_request(&model.inner, request, sampling)
-            .map_err(map_local_realtime_error)
+            .register(request, generation)
+            .map(|_| ())
+            .map_err(map_local_realtime_session_error)
     }
 
     /// Registers a previously released request session.
@@ -964,12 +1066,16 @@ impl LocalRealtimeScheduler {
         request: crate::RequestId,
         session: LocalRealtimeSession,
     ) -> Result<(), eredu_core::RealtimeError<LocalBackendError>> {
-        self.inner
-            .register_request_with_session(&model.inner, request, session.inner)
-            .map_err(map_local_realtime_error)
+        self.validate_model(model)?;
+        self.inner.resume(request, session.inner).map_err(|error| {
+            eredu_core::RealtimeError::Execution(LocalBackendError::new(
+                "realtime session resumption",
+                error,
+            ))
+        })
     }
 
-    /// Materializes and enqueues one portable host token frame.
+    /// Enqueues one portable host token frame without native materialization.
     pub fn enqueue(
         &mut self,
         model: &LocalRealtimeModel,
@@ -979,7 +1085,7 @@ impl LocalRealtimeScheduler {
         self.enqueue_with_deadline(model, request, frame, None)
     }
 
-    /// Materializes and enqueues one frame with an absolute deadline.
+    /// Enqueues one portable frame with an absolute deadline.
     pub fn enqueue_with_deadline(
         &mut self,
         model: &LocalRealtimeModel,
@@ -987,46 +1093,23 @@ impl LocalRealtimeScheduler {
         frame: crate::RealtimeInputFrame,
         deadline: Option<Instant>,
     ) -> Result<crate::WorkId, eredu_core::RealtimeError<LocalBackendError>> {
-        let input = model
-            .inner
-            .backend()
-            .materialize_input(model.inner.model(), &frame)
-            .map_err(|error| {
-                eredu_core::RealtimeError::Backend(LocalBackendError::new(
-                    "realtime input materialization",
-                    error,
-                ))
-            })?;
+        self.validate_model(model)?;
         self.inner
-            .enqueue_with_deadline(&model.inner, request, input, deadline)
-            .map_err(map_local_realtime_error)
+            .enqueue_with_deadline(request, frame, deadline)
+            .map_err(Into::into)
     }
 
-    /// Atomically materializes and enqueues ordered portable host token frames.
+    /// Atomically enqueues ordered portable host token frames.
     pub fn enqueue_batch(
         &mut self,
         model: &LocalRealtimeModel,
         request: crate::RequestId,
         frames: Vec<crate::RealtimeInputFrame>,
     ) -> Result<Vec<crate::WorkId>, eredu_core::RealtimeError<LocalBackendError>> {
-        let inputs = frames
-            .iter()
-            .map(|frame| {
-                model
-                    .inner
-                    .backend()
-                    .materialize_input(model.inner.model(), frame)
-                    .map_err(|error| {
-                        eredu_core::RealtimeError::Backend(LocalBackendError::new(
-                            "realtime input materialization",
-                            error,
-                        ))
-                    })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        self.validate_model(model)?;
         self.inner
-            .enqueue_batch(&model.inner, request, inputs)
-            .map_err(map_local_realtime_error)
+            .enqueue_batch(request, frames)
+            .map_err(Into::into)
     }
 
     /// Advances one unbounded fair scheduling turn and observes completed frames.
@@ -1034,11 +1117,7 @@ impl LocalRealtimeScheduler {
         &mut self,
         model: &mut LocalRealtimeModel,
     ) -> Result<Vec<LocalRealtimeCompletedStep>, eredu_core::RealtimeError<LocalBackendError>> {
-        let completed = self
-            .inner
-            .run_queued(&mut model.inner)
-            .map_err(map_local_realtime_error)?;
-        observe_realtime_steps(model, completed)
+        self.run_bounded(model, usize::MAX)
     }
 
     /// Advances at most `max_frames` transitions and observes completed frames.
@@ -1047,11 +1126,38 @@ impl LocalRealtimeScheduler {
         model: &mut LocalRealtimeModel,
         max_frames: usize,
     ) -> Result<Vec<LocalRealtimeCompletedStep>, eredu_core::RealtimeError<LocalBackendError>> {
-        let completed = self
-            .inner
-            .run_bounded(&mut model.inner, max_frames)
-            .map_err(map_local_realtime_error)?;
-        observe_realtime_steps(model, completed)
+        self.validate_model(model)?;
+        if max_frames == 0 {
+            return Err(eredu_core::RealtimeError::EmptyRunBound);
+        }
+        let backend = &model.backend;
+        let native_model = model.model.mechanism_mut();
+        let progress =
+            self.inner
+                .run_local_bounded(Instant::now(), max_frames, |_, frame, branch| {
+                    backend.submit_realtime_frame(native_model, frame, branch)
+                })?;
+        if let Some((work, failure)) = progress.failed.first() {
+            return Err(eredu_core::RealtimeError::Asynchronous {
+                work: *work,
+                message: failure.to_string(),
+            });
+        }
+        progress
+            .committed
+            .into_iter()
+            .map(|(work, _, transition)| {
+                transition
+                    .into_host_output()
+                    .map(|output| LocalRealtimeCompletedStep { work, output })
+                    .map_err(|error| {
+                        eredu_core::RealtimeError::Execution(LocalBackendError::new(
+                            "realtime host observation",
+                            error,
+                        ))
+                    })
+            })
+            .collect()
     }
 
     /// Completes one request and drops its backend session.
@@ -1059,9 +1165,7 @@ impl LocalRealtimeScheduler {
         &mut self,
         request: crate::RequestId,
     ) -> Result<(), eredu_core::RealtimeError<LocalBackendError>> {
-        self.inner
-            .finish_request(request)
-            .map_err(map_local_realtime_error)
+        self.inner.finish(request).map_err(Into::into)
     }
 
     /// Cancels one request and discards queued frames.
@@ -1069,9 +1173,7 @@ impl LocalRealtimeScheduler {
         &mut self,
         request: crate::RequestId,
     ) -> Result<(), eredu_core::RealtimeError<LocalBackendError>> {
-        self.inner
-            .cancel_request(request)
-            .map_err(map_local_realtime_error)
+        self.inner.cancel(request).map_err(Into::into)
     }
 
     /// Releases an idle request for persistence or resumption.
@@ -1080,10 +1182,7 @@ impl LocalRealtimeScheduler {
         request: crate::RequestId,
     ) -> Result<LocalRealtimeSession, eredu_core::RealtimeError<LocalBackendError>> {
         Ok(LocalRealtimeSession {
-            inner: self
-                .inner
-                .release_request(request)
-                .map_err(map_local_realtime_error)?,
+            inner: self.inner.release(request)?,
         })
     }
 
@@ -1092,9 +1191,7 @@ impl LocalRealtimeScheduler {
         &mut self,
         request: crate::RequestId,
     ) -> Result<crate::RequestStatus, eredu_core::RealtimeError<LocalBackendError>> {
-        self.inner
-            .forget_terminal_request(request)
-            .map_err(map_local_realtime_error)
+        self.inner.forget_terminal(request).map_err(Into::into)
     }
 
     /// Lifecycle state for a known request.
@@ -1114,9 +1211,24 @@ impl LocalRealtimeScheduler {
         request: crate::RequestId,
         sampling: crate::RealtimeSampling,
     ) -> Result<(), eredu_core::RealtimeError<LocalBackendError>> {
+        self.validate_model(model)?;
+        let queued = self.inner.queued_for_request(request);
+        if queued != 0 {
+            return Err(eredu_core::RealtimeError::SamplingWhileQueued {
+                request: request.value(),
+                queued,
+            });
+        }
         self.inner
-            .set_request_sampling(&model.inner, request, sampling)
-            .map_err(map_local_realtime_error)
+            .replace_sampling(request, sampling, |sampling| {
+                model.realize_sampling(sampling)
+            })
+            .map_err(|error| {
+                eredu_core::RealtimeError::Execution(LocalBackendError::new(
+                    "realtime sampling replacement",
+                    error,
+                ))
+            })
     }
 
     /// Generic occupancy and lifecycle telemetry.
@@ -1130,59 +1242,15 @@ impl LocalRealtimeScheduler {
     }
 }
 
-fn observe_realtime_steps(
-    model: &LocalRealtimeModel,
-    completed: Vec<eredu_core::RealtimeCompletedStep<eredu_backend_mlx::native::MlxRealtimeOutput>>,
-) -> Result<Vec<LocalRealtimeCompletedStep>, eredu_core::RealtimeError<LocalBackendError>> {
-    completed
-        .into_iter()
-        .map(|step| {
-            let (work, output) = step.into_parts();
-            let output = model
-                .inner
-                .backend()
-                .observe_output(&output)
-                .map_err(|error| {
-                    eredu_core::RealtimeError::Backend(LocalBackendError::new(
-                        "realtime output observation",
-                        error,
-                    ))
-                })?;
-            Ok(LocalRealtimeCompletedStep { work, output })
-        })
-        .collect()
-}
-
-fn map_local_realtime_error(
-    error: eredu_core::RealtimeError<eredu_backend_mlx::backend::error::Error>,
+fn map_local_realtime_session_error(
+    error: eredu_runtime::RealtimeSessionError,
 ) -> eredu_core::RealtimeError<LocalBackendError> {
     match error {
-        eredu_core::RealtimeError::Backend(error) => {
-            eredu_core::RealtimeError::Backend(LocalBackendError::new("realtime execution", error))
-        }
-        eredu_core::RealtimeError::Scheduler(error) => eredu_core::RealtimeError::Scheduler(error),
-        eredu_core::RealtimeError::ModelMismatch { component } => {
-            eredu_core::RealtimeError::ModelMismatch { component }
-        }
-        eredu_core::RealtimeError::BatchSize {
-            request,
-            expected,
-            actual,
-        } => eredu_core::RealtimeError::BatchSize {
-            request,
-            expected,
-            actual,
-        },
-        eredu_core::RealtimeError::EmptyRunBound => eredu_core::RealtimeError::EmptyRunBound,
-        eredu_core::RealtimeError::SamplingWhileQueued { request, queued } => {
-            eredu_core::RealtimeError::SamplingWhileQueued { request, queued }
-        }
-        eredu_core::RealtimeError::Asynchronous { work, message } => {
-            eredu_core::RealtimeError::Asynchronous { work, message }
-        }
-        error => {
-            eredu_core::RealtimeError::Backend(LocalBackendError::new("realtime execution", error))
-        }
+        eredu_runtime::RealtimeSessionError::Scheduler(error) => error.into(),
+        error => eredu_core::RealtimeError::Execution(LocalBackendError::new(
+            "realtime session registration",
+            error,
+        )),
     }
 }
 

@@ -9,6 +9,16 @@ use std::{
 
 use serde::{de::MapAccess, Deserialize, Deserializer};
 
+use crate::{
+    recipe::RecipeCatalog,
+    store::{StoreError, TensorMetadata},
+    validation::{CatalogTensorMetadata, SafetensorsCatalog},
+    StoredDtype,
+};
+use safetensors::tensor::{Dtype, Metadata};
+
+const MAX_HEADER_BYTES: u64 = 100_000_000;
+
 /// One canonically resolved SafeTensors checkpoint shard set.
 ///
 /// Discovery parses an optional Hugging Face index exactly once, requires its
@@ -116,6 +126,111 @@ impl SafetensorsShards {
     /// `None` denotes a direct file or an unindexed `model.safetensors` file.
     pub fn tensor_locations(&self) -> Option<&BTreeMap<String, PathBuf>> {
         self.tensor_locations.as_ref()
+    }
+}
+
+/// Exact header-only metadata for one strictly admitted SafeTensors shard set.
+///
+/// Construction performs strict [`SafetensorsShards`] discovery and reads only
+/// each shard's eight-byte header length and JSON header. Tensor payload bytes
+/// are never read. The retained shard set can later be passed literally to
+/// [`crate::store::SafetensorsWeightStore::open_admitted`].
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct SafetensorsMetadataCatalog {
+    shards: SafetensorsShards,
+    tensors: BTreeMap<String, TensorMetadata>,
+}
+
+impl SafetensorsMetadataCatalog {
+    /// Discovers an exact shard set and validates all tensor metadata from headers only.
+    pub fn discover(path: impl AsRef<Path>) -> Result<Self, SafetensorsShardError> {
+        let shards = SafetensorsShards::discover(path)?;
+        let mut tensors = BTreeMap::new();
+        for shard in shards.payload_paths() {
+            for (name, metadata) in read_tensor_metadata(shard)? {
+                if tensors.insert(name.clone(), metadata).is_some() {
+                    return Err(malformed_shard(
+                        shard,
+                        format!("tensor {name:?} occurs in more than one admitted shard"),
+                    ));
+                }
+            }
+        }
+        if let Some(locations) = shards.tensor_locations() {
+            if let Some(name) = tensors.keys().find(|name| !locations.contains_key(*name)) {
+                return Err(malformed_shard(
+                    tensors[name]
+                        .backing_shard
+                        .as_deref()
+                        .expect("SafeTensors metadata retains shard provenance"),
+                    format!("tensor {name:?} is absent from the admitted index"),
+                ));
+            }
+            for (name, expected_shard) in locations {
+                let actual_shard = tensors
+                    .get(name)
+                    .and_then(|metadata| metadata.backing_shard.as_ref());
+                if actual_shard != Some(expected_shard) {
+                    return Err(malformed_shard(
+                        expected_shard,
+                        format!(
+                            "indexed tensor {name:?} retained unexpected shard provenance {actual_shard:?}"
+                        ),
+                    ));
+                }
+            }
+        }
+        Ok(Self { shards, tensors })
+    }
+
+    /// Returns the strictly admitted shard set used to build this catalog.
+    pub const fn shards(&self) -> &SafetensorsShards {
+        &self.shards
+    }
+
+    /// Clones the admitted shards for deferred payload-store construction.
+    pub fn admitted_shards(&self) -> SafetensorsShards {
+        self.shards.clone()
+    }
+
+    /// Consumes the catalog into its admitted shards.
+    pub fn into_admitted_shards(self) -> SafetensorsShards {
+        self.shards
+    }
+
+    /// Returns exact tensor metadata in deterministic name order.
+    pub const fn tensors(&self) -> &BTreeMap<String, TensorMetadata> {
+        &self.tensors
+    }
+
+    /// Returns exact metadata for one admitted tensor.
+    pub fn tensor(&self, name: &str) -> Option<&TensorMetadata> {
+        self.tensors.get(name)
+    }
+}
+
+impl SafetensorsCatalog for SafetensorsMetadataCatalog {
+    fn keys(&self) -> Vec<String> {
+        self.tensors.keys().cloned().collect()
+    }
+
+    fn metadata(&self, key: &str) -> Result<CatalogTensorMetadata, String> {
+        self.tensors
+            .get(key)
+            .map(|metadata| CatalogTensorMetadata {
+                shape: metadata.logical_shape.clone(),
+                stored_dtype: metadata.stored_dtype.clone(),
+            })
+            .ok_or_else(|| format!("unknown SafeTensors tensor {key:?}"))
+    }
+}
+
+impl RecipeCatalog for SafetensorsMetadataCatalog {
+    fn tensor_metadata(&self, key: &str) -> Result<TensorMetadata, StoreError> {
+        self.tensors
+            .get(key)
+            .cloned()
+            .ok_or_else(|| StoreError::UnknownTensor { key: key.into() })
     }
 }
 
@@ -229,8 +344,6 @@ fn validate_indexed_shards(
 }
 
 fn read_tensor_names(path: &Path) -> Result<BTreeSet<String>, SafetensorsShardError> {
-    const MAX_HEADER_BYTES: u64 = 100_000_000;
-
     let mut file = File::open(path).map_err(|error| io_error(path, error))?;
     let file_len = file
         .metadata()
@@ -263,6 +376,100 @@ fn read_tensor_names(path: &Path) -> Result<BTreeSet<String>, SafetensorsShardEr
         .into_keys()
         .filter(|name| name != "__metadata__")
         .collect())
+}
+
+fn read_tensor_metadata(
+    path: &Path,
+) -> Result<BTreeMap<String, TensorMetadata>, SafetensorsShardError> {
+    let mut file = File::open(path).map_err(|error| io_error(path, error))?;
+    let file_len = file
+        .metadata()
+        .map_err(|error| io_error(path, error))?
+        .len();
+    let mut length = [0_u8; 8];
+    file.read_exact(&mut length)
+        .map_err(|error| malformed_shard(path, error.to_string()))?;
+    let header_len = u64::from_le_bytes(length);
+    if header_len > MAX_HEADER_BYTES {
+        return Err(malformed_shard(
+            path,
+            format!("header exceeds {MAX_HEADER_BYTES} bytes"),
+        ));
+    }
+    let payload_start = 8_u64
+        .checked_add(header_len)
+        .ok_or_else(|| malformed_shard(path, "header length overflow"))?;
+    if payload_start > file_len {
+        return Err(malformed_shard(path, "header exceeds shard length"));
+    }
+    let header_len_usize = usize::try_from(header_len)
+        .map_err(|_| malformed_shard(path, "header length overflows usize"))?;
+    let mut header = vec![0_u8; header_len_usize];
+    file.read_exact(&mut header)
+        .map_err(|error| malformed_shard(path, error.to_string()))?;
+    let metadata: Metadata = serde_json::from_slice(&header)
+        .map_err(|error| malformed_shard(path, error.to_string()))?;
+    let encoded_len = u64::try_from(metadata.data_len())
+        .map_err(|_| malformed_shard(path, "encoded payload length overflows u64"))?;
+    let expected_file_len = payload_start
+        .checked_add(encoded_len)
+        .ok_or_else(|| malformed_shard(path, "shard length overflow"))?;
+    if expected_file_len != file_len {
+        return Err(malformed_shard(
+            path,
+            format!(
+                "header describes {encoded_len} payload bytes, but shard length provides {}",
+                file_len - payload_start
+            ),
+        ));
+    }
+    metadata
+        .tensors()
+        .into_iter()
+        .map(|(name, info)| {
+            let encoded_byte_len = info
+                .data_offsets
+                .1
+                .checked_sub(info.data_offsets.0)
+                .and_then(|length| u64::try_from(length).ok())
+                .ok_or_else(|| malformed_shard(path, format!("tensor {name:?} length overflow")))?;
+            Ok((
+                name.clone(),
+                TensorMetadata {
+                    name,
+                    logical_shape: info.shape.clone(),
+                    physical_shape: info.shape.clone(),
+                    stored_dtype: stored_dtype(info.dtype),
+                    encoded_byte_len,
+                    backing_shard: Some(path.to_path_buf()),
+                },
+            ))
+        })
+        .collect()
+}
+
+fn stored_dtype(dtype: Dtype) -> StoredDtype {
+    match dtype {
+        Dtype::BOOL => StoredDtype::Bool,
+        Dtype::U8 => StoredDtype::U8,
+        Dtype::I8 => StoredDtype::I8,
+        Dtype::I16 => StoredDtype::I16,
+        Dtype::U16 => StoredDtype::U16,
+        Dtype::F16 => StoredDtype::F16,
+        Dtype::BF16 => StoredDtype::BF16,
+        Dtype::I32 => StoredDtype::I32,
+        Dtype::U32 => StoredDtype::U32,
+        Dtype::F32 => StoredDtype::F32,
+        Dtype::F64 => StoredDtype::F64,
+        Dtype::I64 => StoredDtype::I64,
+        Dtype::U64 => StoredDtype::U64,
+        Dtype::C64 => StoredDtype::C64,
+        Dtype::F8_E4M3 => StoredDtype::F8E4M3,
+        Dtype::F4 => StoredDtype::F4,
+        Dtype::F8_E8M0 => StoredDtype::F8E8M0,
+        Dtype::F8_E5M2 => StoredDtype::F8E5M2,
+        other => StoredDtype::Other(format!("{other:?}")),
+    }
 }
 
 fn malformed_shard(path: &Path, message: impl Into<String>) -> SafetensorsShardError {
@@ -335,8 +542,12 @@ fn io_error(path: &Path, error: std::io::Error) -> SafetensorsShardError {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+
     use super::*;
     use safetensors::{tensor::serialize_to_file, tensor::TensorView, Dtype};
+
+    use crate::store::{SafetensorsWeightStore, WeightStore};
 
     fn write_index(root: &Path, contents: &str) {
         std::fs::write(root.join("model.safetensors.index.json"), contents).unwrap();
@@ -349,6 +560,131 @@ mod tests {
             path,
         )
         .unwrap();
+    }
+
+    fn write_header_and_sparse_payload(path: &Path, header: serde_json::Value, payload_len: u64) {
+        let mut header = serde_json::to_vec(&header).unwrap();
+        header.resize(header.len().next_multiple_of(8), b' ');
+        let mut file = File::create(path).unwrap();
+        file.write_all(&(header.len() as u64).to_le_bytes())
+            .unwrap();
+        file.write_all(&header).unwrap();
+        file.set_len(8 + header.len() as u64 + payload_len).unwrap();
+    }
+
+    #[test]
+    fn metadata_catalog_reads_a_huge_sparse_shard_header_without_payload_materialization() {
+        let root = tempfile::tempdir().unwrap();
+        let shard = root.path().join("huge.safetensors");
+        let payload_len = 8_u64 << 30;
+        write_header_and_sparse_payload(
+            &shard,
+            serde_json::json!({
+                "huge": {
+                    "dtype": "U8",
+                    "shape": [payload_len],
+                    "data_offsets": [0, payload_len]
+                }
+            }),
+            payload_len,
+        );
+
+        let catalog = SafetensorsMetadataCatalog::discover(&shard).unwrap();
+        let metadata = catalog.tensor("huge").unwrap();
+        assert_eq!(metadata.logical_shape, [payload_len as usize]);
+        assert_eq!(metadata.physical_shape, [payload_len as usize]);
+        assert_eq!(metadata.stored_dtype, StoredDtype::U8);
+        assert_eq!(metadata.encoded_byte_len, payload_len);
+        assert_eq!(
+            metadata.backing_shard.as_deref(),
+            Some(shard.canonicalize().unwrap().as_path())
+        );
+    }
+
+    #[test]
+    fn metadata_catalog_retains_exact_indexed_provenance_and_admitted_shards() {
+        let root = tempfile::tempdir().unwrap();
+        let left = root.path().join("left.safetensors");
+        let right = root.path().join("right.safetensors");
+        write_shard(&left, "left");
+        write_shard(&right, "right");
+        write_index(
+            root.path(),
+            r#"{"weight_map":{"right":"right.safetensors","left":"left.safetensors"}}"#,
+        );
+
+        let catalog = SafetensorsMetadataCatalog::discover(root.path()).unwrap();
+        let admitted = SafetensorsShards::discover(root.path()).unwrap();
+        assert_eq!(catalog.shards(), &admitted);
+        assert_eq!(catalog.admitted_shards(), admitted);
+        assert_eq!(
+            catalog.tensor("left").unwrap().backing_shard.as_deref(),
+            Some(left.canonicalize().unwrap().as_path())
+        );
+        assert_eq!(
+            catalog.tensor("right").unwrap().backing_shard.as_deref(),
+            Some(right.canonicalize().unwrap().as_path())
+        );
+        assert_eq!(
+            SafetensorsCatalog::keys(&catalog),
+            vec!["left".to_owned(), "right".to_owned()]
+        );
+        assert_eq!(
+            SafetensorsCatalog::metadata(&catalog, "left").unwrap(),
+            CatalogTensorMetadata {
+                shape: vec![1],
+                stored_dtype: StoredDtype::U8,
+            }
+        );
+        assert_eq!(
+            RecipeCatalog::tensor_metadata(&catalog, "right").unwrap(),
+            catalog.tensor("right").unwrap().clone()
+        );
+        let store = SafetensorsWeightStore::open_admitted(catalog.admitted_shards(), 1).unwrap();
+        assert_eq!(
+            WeightStore::keys(&store),
+            vec!["left".to_owned(), "right".to_owned()]
+        );
+    }
+
+    #[test]
+    fn metadata_catalog_rejects_invalid_offsets_and_file_lengths() {
+        let root = tempfile::tempdir().unwrap();
+        let offsets = root.path().join("offsets.safetensors");
+        write_header_and_sparse_payload(
+            &offsets,
+            serde_json::json!({
+                "bad": {
+                    "dtype": "U8",
+                    "shape": [1],
+                    "data_offsets": [1, 2]
+                }
+            }),
+            2,
+        );
+        assert!(matches!(
+            SafetensorsMetadataCatalog::discover(&offsets),
+            Err(SafetensorsShardError::MalformedShard { .. })
+        ));
+
+        let truncated = root.path().join("truncated.safetensors");
+        write_header_and_sparse_payload(
+            &truncated,
+            serde_json::json!({
+                "bad": {
+                    "dtype": "U8",
+                    "shape": [4],
+                    "data_offsets": [0, 4]
+                }
+            }),
+            3,
+        );
+        let error = SafetensorsMetadataCatalog::discover(&truncated).unwrap_err();
+        assert!(matches!(
+            error,
+            SafetensorsShardError::MalformedShard { .. }
+        ));
+        assert!(error.to_string().contains("provides 3"));
     }
 
     #[test]
