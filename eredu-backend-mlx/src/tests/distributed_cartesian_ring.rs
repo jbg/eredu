@@ -7,7 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::composition::expert_dispatch::{AllToAllVPlan, RoutedTransport};
+use crate::tests::support::expert_dispatch::{AllToAllVPlan, RoutedTransport};
 use crate::MlxTensor;
 use eredu_core::{
     checkpoint::TensorDtype, BoundedSubmissionOutcome, CollectiveScope, CompletionCancellationMode,

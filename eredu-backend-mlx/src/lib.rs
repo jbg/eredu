@@ -146,9 +146,6 @@ pub(crate) fn test_parallel_rank(
 }
 
 #[cfg(test)]
-mod test_utils;
-
-#[cfg(test)]
 mod tests;
 
 pub use tensor::MlxTensor;

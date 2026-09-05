@@ -30,6 +30,34 @@ The crate never depends on the `eredu` facade. MLX arrays, streams, devices,
 events, groups, and exceptions do not appear in neutral core or facade
 signatures.
 
+## Internal module organization
+
+The implementation follows the ownership boundary above without making its
+private layout part of the public API:
+
+- `backend::nn` contains reusable MLX neural mechanisms. Its `shared` module
+  separates parameter adapters, ordinary operators, submission and
+  communication, the core neutral-backend implementation, and additive
+  grouped or hyper extensions. Packed grouped operations and native
+  quantization are divided by operation and lowering responsibility.
+- `backend::runtime` contains native storage and execution mechanisms. Cache
+  modules separate state representations from residency lifecycle and I/O;
+  checkpoint modules separate source leases, materialization, recipes, and
+  bounded transformation; residency modules separate catalogs, acquisition,
+  movement, and telemetry; distributed modules separate handles, operations,
+  completion ownership, manifest realization, and placement.
+- `composition::mlx` is the private adapter layer. Cold selection and selected
+  materialization are separate from completed session erasure. Replicated-text
+  composition keeps capability adaptation, state mechanisms, prediction,
+  session completion, dense or routed binding, partitioned binding, and
+  format lowering in focused modules.
+- Crate-private validation support lives under `src/tests/support`. The Ring
+  pipeline coverage keeps process launching, worker protocol, artifact
+  fixtures, and execution suites separate from production composition.
+
+These modules exchange typed neutral plans and concrete MLX mechanisms. They
+do not introduce dynamic dispatch into tensor operations or per-unit execution.
+
 ## Materialization and execution
 
 Runtime modules implement checkpoint materialization, sampling, cache storage,

@@ -15,12 +15,12 @@ use crate::{
         AddressableParameterBank, BankAccessClass, ParameterBankEntry,
         ParameterBankKey as BackendParameterBankKey,
     },
-    composition::expert_dispatch::{
+    module::PhysicalParam,
+    tests::support::expert_dispatch::{
         dispatch_replicated_with, dispatch_sharded, profile_expert_parallel_timings, AllToAllVPlan,
         DispatchedRoutes, ExpertAssignment, LocalExpertBank, RoutedTransport, ShardedRouteBlocks,
     },
-    composition::grouped_provider::{execute_selections_bounded, ParameterBankSelection},
-    module::PhysicalParam,
+    tests::support::grouped_provider::{execute_selections_bounded, ParameterBankSelection},
 };
 use eredu_checkpoint::store::{SafetensorsWeightStore, TensorSelection};
 use eredu_core::{residency::OffloadConfig, ParallelRankTopology, ParallelTopology};

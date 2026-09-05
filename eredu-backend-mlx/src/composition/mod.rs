@@ -1,12 +1,5 @@
 //! Cold-path architecture/backend composition selected by public loaders.
 
-#[cfg(test)]
-pub(crate) mod grouped_provider;
-// Standalone exchange harnesses are available only to crate-internal validation.
-#[cfg(test)]
-#[allow(dead_code)]
-pub(crate) mod expert_dispatch;
-
 use safemlx::error::Exception;
 use safemlx::Array;
 
@@ -101,9 +94,6 @@ fn select_architecture_expert_units(
 
 pub mod mlx;
 pub mod moshi;
-
-#[cfg(test)]
-pub(crate) mod checkpoint_fixtures;
 
 #[cfg(test)]
 #[path = "tests/mlx_architecture_conformance.rs"]

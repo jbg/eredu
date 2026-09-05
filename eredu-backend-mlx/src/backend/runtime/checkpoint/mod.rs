@@ -22,11 +22,11 @@ pub mod binding;
 pub mod bounded_quantization;
 /// GGUF checkpoint access and bounded MLX tensor materialization.
 pub mod gguf;
-/// Strict checkpoint loading and validation.
-pub(crate) mod load;
 /// Generic affine checkpoint quantization and conversion.
 pub mod quantization;
 /// Composable checkpoint-derived weight recipes.
 pub mod recipe;
 /// Persistent lazy checkpoint tensor storage.
 pub mod store;
+#[cfg(test)]
+pub(crate) mod test_support;
