@@ -1,11 +1,12 @@
 //! Production MLX composition for the backend-neutral Moshi-family model.
 
-use std::{collections::BTreeMap, path::Path, sync::Arc};
+use std::{collections::BTreeMap, sync::Arc};
 
 use eredu_architectures::moshi::{self, MoshiConfig};
 use eredu_checkpoint::store::{
-    CheckpointSource, ResolvedCheckpointSource, SharedCheckpointSource, TensorSelection,
+    CheckpointSource, PreparedCheckpointSource, ResolvedCheckpointSource, SharedCheckpointSource,
 };
+use eredu_core::artifact::{fingerprint_filesystem_artifact, ArtifactFile, ArtifactIdentity};
 use eredu_nn::Parameterized;
 use eredu_runtime::{
     construct_realtime_model, ConstructedRealtimeExecution, DenseDiskStreamReport,
@@ -22,14 +23,11 @@ use crate::backend::{
     nn::shared::MlxNeuralBackend,
     runtime::{
         cache::state::MlxKeyValueState,
-        checkpoint::artifact::{fingerprint_artifact, ArtifactFile, LoadedArtifactIdentity},
         execution::{
             generic::{
                 prepare_layerwise_policy_with_bindings, MlxLayerwisePolicy, MlxResidentPolicy,
             },
-            layerwise::{
-                open_safetensors_weight_store, quantize_exact_realtime_tasks, shard_layer_bindings,
-            },
+            layerwise::{quantize_exact_realtime_tasks, shard_layer_bindings},
         },
         generation::MlxSamplingBackend,
     },
@@ -257,7 +255,6 @@ impl<U> MlxRealtimeConstructionMechanisms<U> {
         self.metadata.as_ref()
     }
 }
-
 fn selected_task_bindings(
     tasks: &[RealtimeMaterializationTask],
     store: &dyn CheckpointSource,
@@ -269,61 +266,9 @@ fn selected_task_bindings(
     ),
     Error,
 > {
-    let mut pinned = Vec::new();
-    let mut units = BTreeMap::<ParameterGroupOwner, Vec<WeightBinding>>::new();
-    for task in tasks {
-        let destination = match task.owner() {
-            ParameterGroupOwner::StaticRole(_) | ParameterGroupOwner::StaticAnyOf(_) => &mut pinned,
-            ParameterGroupOwner::ExecutionUnit { .. } => {
-                units.entry(task.owner().clone()).or_default()
-            }
-            _ => {
-                return Err(Error::ArchitectureModel(
-                    "unsupported future realtime parameter owner".into(),
-                ))
-            }
-        };
-        let transformed = matches!(
-            task.lowering().kind(),
-            eredu_runtime::WeightLoweringKind::Transform
-                | eredu_runtime::WeightLoweringKind::DerivedTransform
-        );
-        for component in task.components() {
-            let requirement = component.requirement();
-            let target = requirement.target().as_str();
-            let binding = if transformed {
-                let metadata = store.source_metadata(target)?;
-                WeightBinding::new(
-                    target,
-                    target,
-                    TensorSelection::Full,
-                    metadata.encoded_byte_len,
-                )?
-            } else {
-                let output = component.recipe_output().ok_or_else(|| {
-                    Error::ArchitectureModel(format!(
-                        "selected MLX recipe component {target:?} has no exact output metadata"
-                    ))
-                })?;
-                match requirement.recipe_owner() {
-                    Some(owner) if owner != requirement.target() => {
-                        WeightBinding::alias(target, owner.as_str(), output.byte_len())?
-                    }
-                    _ => WeightBinding::from_recipe(
-                        target,
-                        component.recipe().cloned().ok_or_else(|| {
-                            Error::ArchitectureModel(format!(
-                                "selected MLX component {target:?} has no source recipe"
-                            ))
-                        })?,
-                        output.byte_len(),
-                    )?,
-                }
-            }
-            .with_logical_target(task.lowering().target().as_str())?;
-            destination.push(binding);
-        }
-    }
+    let (mut pinned, mut units) = eredu_runtime::realtime_task_binding_plan(tasks, store)
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?
+        .into_parts();
     if let Some(layout) = local_layout {
         pinned = shard_layer_bindings(pinned, store, layout)?;
         for bindings in units.values_mut() {
@@ -356,6 +301,11 @@ where
         selected: &SelectedRealtimeRealization,
         context: &Stream,
     ) -> Result<(), Self::Error> {
+        eredu_runtime::preflight_realtime_materialization_tasks::<MlxNeuralBackend>(
+            tasks,
+            self.store.as_ref(),
+        )
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         if source_architecture.is_some() || source_units.is_some() {
             let quantization = self.transform.ok_or_else(|| {
                 Error::ArchitectureModel(
@@ -437,6 +387,11 @@ where
         selected: &SelectedRealtimeRealization,
         context: &Stream,
     ) -> Result<RealizedRealtimePolicy<Self::BoundedPolicy>, Self::Error> {
+        eredu_runtime::preflight_realtime_materialization_tasks::<MlxNeuralBackend>(
+            tasks,
+            self.store.as_ref(),
+        )
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         if source_architecture.is_some() {
             let quantization = self.transform.ok_or_else(|| {
                 Error::ArchitectureModel(
@@ -522,7 +477,7 @@ where
 /// erases only the concrete MLX traversal and resource mechanisms needed by
 /// that handle.
 pub struct MlxRealtimeExecution {
-    artifact_identity: LoadedArtifactIdentity,
+    artifact_identity: ArtifactIdentity,
     metadata: LayerwiseModelMetadata,
     execution: Box<dyn ErasedRealtimeExecutionContract>,
     resources: Arc<SelectedRealtimeResources>,
@@ -558,7 +513,7 @@ impl MlxRealtimeExecution {
     }
 
     /// Identity of the checkpoint payload bound to these mechanisms.
-    pub fn artifact_identity(&self) -> &LoadedArtifactIdentity {
+    pub fn artifact_identity(&self) -> &ArtifactIdentity {
         &self.artifact_identity
     }
 
@@ -587,7 +542,7 @@ impl MlxRealtimeExecution {
 }
 
 struct SelectedMoshiRealtimeMechanismVisitor {
-    artifact_identity: LoadedArtifactIdentity,
+    artifact_identity: ArtifactIdentity,
     transform: Option<eredu_checkpoint::WeightQuantization>,
     target_quantization: Option<eredu_checkpoint::WeightQuantization>,
     effective_model_type: String,
@@ -738,14 +693,43 @@ pub fn materialize_selected(
     weights_stream: &Stream,
 ) -> Result<moshi::MoshiRealtimeExecution<MlxRealtimeExecution>, Error> {
     let execution_descriptor = prepared.execution_descriptor();
-    let model_dir = prepared.artifact_root().to_owned();
-    let source_path = prepared.checkpoint_source().to_owned();
     let checkpoint_plan = prepared.checkpoint_plan().clone();
+    let admitted_resolution = prepared.resolved_checkpoint_plan().clone();
+    let admitted_shards = prepared.admitted_shards().cloned().ok_or_else(|| {
+        Error::ArchitectureModel(
+            "selected Moshi path artifact omitted its admitted SafeTensors shard set".into(),
+        )
+    })?;
+    let source_metadata = prepared.source_metadata().clone();
     let source_config = prepared.source_config().clone();
     let target_config = prepared.execution_config().clone();
     let selected = prepared.selected().clone();
     let (transform, target_quantization) = selected_quantization(&selected)?;
     let effective_model_type = target_config.effective_model_type().as_str().to_owned();
+    let artifact_identity = artifact_identity(&admitted_shards, &source_config)?;
+    let source_store = PreparedCheckpointSource::open_admitted_safetensors(
+        admitted_shards,
+        source_metadata,
+        selected.residency().max_cached_shards(),
+    )?;
+    let checkpoint_contract = eredu_checkpoint::validation::resolve_safetensors_plan(
+        &source_store as &dyn CheckpointSource,
+        &checkpoint_plan,
+    )
+    .map_err(|validation| {
+        Error::ArchitectureModel(format!(
+            "selected Moshi checkpoint contract no longer resolves: {validation:?}"
+        ))
+    })?;
+    if checkpoint_contract != admitted_resolution {
+        return Err(Error::ArchitectureModel(
+            "selected Moshi checkpoint resolution changed after preparation".into(),
+        ));
+    }
+    let store: SharedCheckpointSource = Arc::new(ResolvedCheckpointSource::new(
+        Arc::new(source_store),
+        checkpoint_contract,
+    ));
     let distributed = prepared
         .parallel()
         .map(|parallel| {
@@ -761,22 +745,6 @@ pub fn materialize_selected(
             )
         })
         .transpose()?;
-    let artifact_identity = artifact_identity(&model_dir, &source_path, &source_config)?;
-    let source_store =
-        open_safetensors_weight_store(&source_path, selected.residency().max_cached_shards())?;
-    let checkpoint_contract = eredu_checkpoint::validation::resolve_safetensors_plan(
-        source_store.as_ref(),
-        &checkpoint_plan,
-    )
-    .map_err(|validation| {
-        Error::ArchitectureModel(format!(
-            "selected Moshi checkpoint contract no longer resolves: {validation:?}"
-        ))
-    })?;
-    let store: SharedCheckpointSource = Arc::new(ResolvedCheckpointSource::new(
-        source_store,
-        checkpoint_contract,
-    ));
     let resources = Arc::new(SelectedRealtimeResources {
         _store: Arc::clone(&store),
         _world: world.clone(),
@@ -861,24 +829,17 @@ fn selected_quantization(
 }
 
 fn artifact_identity(
-    model_dir: &Path,
-    source: &Path,
+    shards: &eredu_checkpoint::safetensors::SafetensorsShards,
     config: &MoshiConfig,
-) -> Result<LoadedArtifactIdentity, Error> {
-    let paths = if source.is_dir() {
-        crate::backend::runtime::checkpoint::load::safetensors_files(source)?
-    } else {
-        vec![source.to_owned()]
-    };
-    let files = paths.into_iter().map(|path| {
-        let logical = path
-            .strip_prefix(model_dir)
-            .unwrap_or(&path)
-            .to_string_lossy()
-            .into_owned();
-        ArtifactFile::new(logical, path)
-    });
-    fingerprint_artifact(config.effective_model_type().as_str(), files)
+) -> Result<ArtifactIdentity, Error> {
+    let files = shards
+        .logical_payload_paths()
+        .iter()
+        .map(|(logical, path)| ArtifactFile::new(logical, path));
+    Ok(fingerprint_filesystem_artifact(
+        config.effective_model_type().as_str(),
+        files,
+    )?)
 }
 
 #[cfg(test)]

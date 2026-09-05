@@ -230,118 +230,41 @@ pub fn entries_from_selected_members(
     members: &[eredu_runtime::AddressableBankMember],
     store: &dyn eredu_checkpoint::store::CheckpointSource,
 ) -> Result<SelectedAddressableEntries, Error> {
+    let plans =
+        eredu_runtime::plan_addressable_bank_bindings(members, store, |_task, recipe, source| {
+            crate::backend::runtime::checkpoint::recipe::lower_mxfp4_recipe(recipe, source)
+        })
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let mut entries = Vec::with_capacity(plans.len());
     let mut transformations = BTreeMap::new();
-    let entries = members
-        .iter()
-        .map(|member| {
-            let key = ParameterBankKey::new(member.key().unit(), member.key().member());
-            let bindings = member
-                .parameters()
-                .iter()
-                .map(|parameter| {
-                    let task = parameter.task();
-                    for source in task.sources() {
-                        let provenance = store.source_provenance(source)?;
-                        let metadata = store.source_metadata(source)?;
-                        let physical = task
-                            .physical_sources()
-                            .iter()
-                            .find(|physical| physical.catalog_key() == source)
-                            .ok_or_else(|| {
-                                Error::ArchitectureModel(format!(
-                                    "addressable task {:?} source {source:?} has no selected physical provenance",
-                                    task.name()
-                                ))
-                            })?;
-                        if provenance.catalog_key != physical.catalog_key()
-                            || provenance.physical_tensor != physical.tensor()
-                            || provenance.output != physical.output()
-                            || provenance.backing_shard.as_deref() != Some(physical.shard())
-                            || provenance.source_encoding != *physical.source_encoding()
-                            || metadata.encoded_byte_len != physical.encoded_byte_len()
-                        {
-                            return Err(Error::ArchitectureModel(format!(
-                                "addressable task {:?} source provenance differs from the selected task",
-                                task.name()
-                            )));
-                        }
-                    }
-                    let mut recipe = parameter.recipe().clone();
-                    let inferred = recipe.infer(store)?;
-                    if &inferred != parameter.source_output() {
-                        return Err(Error::ArchitectureModel(format!(
-                            "addressable task {:?} member-local recipe output drifted",
-                            task.name()
-                        )));
-                    }
-                    if task.executable() == eredu_checkpoint::LinearFormat::MxFp4
-                        && inferred.dtype() == &eredu_checkpoint::recipe::RecipeDtype::F4
-                        && parameter.quantization_companions().is_none()
-                    {
-                        recipe = crate::backend::runtime::checkpoint::recipe::lower_mxfp4_recipe(
-                            recipe, store,
-                        )?;
-                    }
-                    let metadata = recipe.infer(store)?;
-                    let mut selected =
-                        WeightBinding::from_recipe(parameter.binding_name(), recipe, metadata.byte_len())?
-                            .with_logical_target(task.name())?;
-                    if let Some(companions) = parameter.quantization_companions() {
-                        let quantization = task.executable().weight_quantization().ok_or_else(|| {
-                            Error::ArchitectureModel(format!(
-                                "addressable transformed task {:?} has no packed format",
-                                task.name()
-                            ))
-                        })?;
-                        transformations.insert(
-                            (key, parameter.binding_name().to_owned()),
-                            SelectedBindingTransform {
-                                quantization,
-                                companion_dtype: parameter.source_output().dtype().clone(),
-                            },
-                        );
-                        selected = selected.with_quantization_companions(
-                            companions.scale(),
-                            companions.affine_bias().map(str::to_owned),
-                        )?;
-                    }
-                    Ok(selected)
-                })
-                .collect::<Result<Vec<_>, Error>>()?;
-            let bytes = bindings.iter().try_fold(0u64, |total, binding| {
-                total.checked_add(binding.expected_bytes()).ok_or_else(|| {
-                    Error::ArchitectureModel(format!(
-                        "addressable member {:?} source byte total overflowed",
-                        member.key()
-                    ))
-                })
-            })?;
-            ParameterBankEntry::new(key, OffloadUnit::new(key.unit_id(), bindings)?, bytes)
-                .map_err(Into::into)
-        })
-        .collect::<Result<Vec<_>, Error>>()?;
-    let expected_bytes: BTreeMap<ParameterBankKey, u64> = members
-        .iter()
-        .map(|member| {
-            (
-                ParameterBankKey::new(member.key().unit(), member.key().member()),
-                member.selected_bytes(),
-            )
-        })
-        .collect();
-    let placements = members
-        .iter()
-        .map(|member| {
-            (
-                ParameterBankKey::new(member.key().unit(), member.key().member()),
-                member.placement().clone(),
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
-    if placements.len() != members.len() || expected_bytes.len() != members.len() {
-        return Err(Error::ArchitectureModel(
-            "selected addressable members contain duplicate bank keys".into(),
-        ));
+    let mut expected_bytes = BTreeMap::new();
+    let mut placements = BTreeMap::new();
+    for plan in plans {
+        let (key, bindings, transforms, selected_bytes, placement) = plan.into_parts();
+        let key = ParameterBankKey::new(key.unit(), key.member());
+        let source_bytes = bindings.iter().try_fold(0u64, |total, binding| {
+            total.checked_add(binding.expected_bytes()).ok_or_else(|| {
+                Error::ArchitectureModel(format!(
+                    "addressable member {key:?} source byte total overflowed"
+                ))
+            })
+        })?;
+        for (binding, transform) in transforms {
+            transformations.insert(
+                (key, binding),
+                SelectedBindingTransform {
+                    quantization: transform.quantization(),
+                    companion_dtype: transform.companion_dtype().clone(),
+                },
+            );
+        }
+        entries.push(ParameterBankEntry::new(
+            key,
+            OffloadUnit::new(key.unit_id(), bindings)?,
+            source_bytes,
+        )?);
+        expected_bytes.insert(key, selected_bytes);
+        placements.insert(key, placement);
     }
     Ok(SelectedAddressableEntries {
         entries,
@@ -350,7 +273,6 @@ pub fn entries_from_selected_members(
         placements,
     })
 }
-
 /// Result of replacing dense entry bindings with a disk-backed packed overlay.
 pub(crate) struct QuantizedParameterBankCatalog {
     /// Store supplying synthetic packed bindings and delegating all other keys.
@@ -388,29 +310,6 @@ pub(crate) fn quantize_entry_catalog(
         max_working_set_bytes,
         source_stream,
     )
-}
-
-fn merge_materialization_report(
-    total: &mut WeightMaterializationReport,
-    next: WeightMaterializationReport,
-) {
-    total.admitted_working_set_bytes = total
-        .admitted_working_set_bytes
-        .max(next.admitted_working_set_bytes);
-    total.transformed_weights += next.transformed_weights;
-    total.source_tiles += next.source_tiles;
-    total.peak_in_flight_tiles = total.peak_in_flight_tiles.max(next.peak_in_flight_tiles);
-    total.source_bytes_read += next.source_bytes_read;
-    total.output_bytes += next.output_bytes;
-    total.peak_planned_working_set_bytes = total
-        .peak_planned_working_set_bytes
-        .max(next.peak_planned_working_set_bytes);
-    total.largest_source_tile_bytes = total
-        .largest_source_tile_bytes
-        .max(next.largest_source_tile_bytes);
-    total.largest_output_tile_bytes = total
-        .largest_output_tile_bytes
-        .max(next.largest_output_tile_bytes);
 }
 
 fn selected_transformation_formats(
@@ -456,7 +355,7 @@ fn quantize_selected_entry_catalog(
         )?;
         source = transformed.store;
         entries = transformed.entries;
-        merge_materialization_report(&mut report, transformed.report);
+        report.merge(transformed.report);
     }
     Ok(QuantizedParameterBankCatalog {
         store: source,
@@ -909,6 +808,22 @@ pub struct SharedAddressableParameterBank {
     inner: Arc<Mutex<AddressableParameterBank>>,
 }
 
+fn preflight_selected_entry_bindings(
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
+    entries: &[ParameterBankEntry],
+) -> Result<(), AddressableParameterBankError> {
+    for entry in entries {
+        eredu_runtime::preflight_bindings::<crate::backend::nn::shared::MlxNeuralBackend>(
+            store,
+            entry.unit.bindings(),
+        )
+        .map_err(|error| AddressableParameterBankError::Transformation {
+            source: Box::new(Error::ArchitectureModel(error.to_string())),
+        })?;
+    }
+    Ok(())
+}
+
 impl SharedAddressableParameterBank {
     /// Wraps one selected native bank for shared provider/telemetry ownership.
     pub fn new(bank: AddressableParameterBank) -> Self {
@@ -985,6 +900,7 @@ impl AddressableParameterBank {
         O: Into<ParameterBankOptions>,
     {
         let options = options.into();
+        preflight_selected_entry_bindings(store.as_ref(), &selected.entries)?;
         let selected_keys = selected
             .entries
             .iter()
@@ -2185,6 +2101,34 @@ mod tests {
                 ParameterBankEntry::new(identity, unit, 16).unwrap()
             })
             .collect()
+    }
+
+    #[test]
+    fn bank_preflight_rejects_every_entry_before_payload_reads_or_transforms() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = [0u8; 2];
+        serialize_to_file(
+            [(
+                "unsupported",
+                TensorView::new(StoredDtype::F8_E5M2, vec![2], &bytes).unwrap(),
+            )],
+            None,
+            &dir.path().join("model.safetensors"),
+        )
+        .unwrap();
+        let store = SafetensorsWeightStore::open(dir.path()).unwrap();
+        let key = ParameterBankKey::new(0, 0);
+        let unit = OffloadUnit::new(
+            key.unit_id(),
+            [WeightBinding::new("weight", "unsupported", TensorSelection::Full, 2).unwrap()],
+        )
+        .unwrap();
+        let entry = ParameterBankEntry::new(key, unit, 2).unwrap();
+        assert!(matches!(
+            preflight_selected_entry_bindings(&store, &[entry]),
+            Err(AddressableParameterBankError::Transformation { .. })
+        ));
+        assert_eq!(store.source_diagnostics().unwrap().physical_reads, 0);
     }
 
     #[test]

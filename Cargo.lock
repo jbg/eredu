@@ -507,7 +507,7 @@ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 
 [[package]]
 name = "eredu"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "eredu-architectures",
@@ -527,11 +527,12 @@ dependencies = [
 
 [[package]]
 name = "eredu-architectures"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "eredu-checkpoint",
  "eredu-core",
  "eredu-gguf",
+ "eredu-media",
  "eredu-nn",
  "eredu-runtime",
  "safetensors",
@@ -544,7 +545,7 @@ dependencies = [
 
 [[package]]
 name = "eredu-backend-mlx"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -560,10 +561,8 @@ dependencies = [
  "eredu-text",
  "float_eq",
  "half",
- "image",
  "pretty_assertions",
  "ref-cast",
- "rustfft",
  "safemlx",
  "safetensors",
  "serde",
@@ -585,19 +584,20 @@ dependencies = [
 
 [[package]]
 name = "eredu-checkpoint"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "eredu-gguf",
  "safetensors",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror",
 ]
 
 [[package]]
 name = "eredu-cli"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -613,7 +613,7 @@ dependencies = [
 
 [[package]]
 name = "eredu-codec"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "eredu-checkpoint",
  "eredu-nn",
@@ -625,7 +625,7 @@ dependencies = [
 
 [[package]]
 name = "eredu-core"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "eredu-checkpoint",
  "eredu-gguf",
@@ -638,7 +638,7 @@ dependencies = [
 
 [[package]]
 name = "eredu-evaluation"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "clap",
  "eredu-architectures",
@@ -672,8 +672,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "eredu-media"
+version = "0.1.0"
+dependencies = [
+ "eredu-core",
+ "image",
+ "rustfft",
+ "thiserror",
+]
+
+[[package]]
 name = "eredu-nn"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "eredu-checkpoint",
  "eredu-nn-macros",
@@ -691,7 +701,7 @@ dependencies = [
 
 [[package]]
 name = "eredu-runtime"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "eredu-checkpoint",
  "eredu-core",

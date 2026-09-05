@@ -223,7 +223,7 @@ impl<Provider, Movement> SelectedCompositePartitionUnitStrategy<Provider, Moveme
     pub(crate) fn routed_from_prepared_grouped_plan(
         provider: Provider,
         realization: crate::routed_text::RoutedGroupedPlan,
-        expert_group: Option<eredu_runtime::CommunicationGroupId>,
+        expert_group: Option<eredu_core::CollectiveGroupId>,
         movement: Movement,
     ) -> Self {
         Self::Routed(RoutedPipelinePartitionUnitStrategy::from_grouped_plan(
@@ -238,7 +238,7 @@ impl<Provider, Movement> SelectedCompositePartitionUnitStrategy<Provider, Moveme
     pub fn routed<E>(
         provider: Provider,
         realization: crate::ExpertRealizationPlan<E>,
-        expert_group: Option<eredu_runtime::CommunicationGroupId>,
+        expert_group: Option<eredu_core::CollectiveGroupId>,
         movement: Movement,
     ) -> Self
     where
@@ -256,9 +256,9 @@ impl<Provider, Movement> SelectedCompositePartitionUnitStrategy<Provider, Moveme
     pub fn routed_with_collective_waves<E>(
         provider: Provider,
         realization: crate::ExpertRealizationPlan<E>,
-        expert_group: eredu_runtime::CommunicationGroupId,
+        expert_group: eredu_core::CollectiveGroupId,
         movement: Movement,
-        tensor_group: Option<eredu_runtime::CommunicationGroupId>,
+        tensor_group: Option<eredu_core::CollectiveGroupId>,
         collective_waves: RoutedExpertCollectiveWaveSchedule,
     ) -> Result<Self, String>
     where
@@ -278,9 +278,9 @@ impl<Provider, Movement> SelectedCompositePartitionUnitStrategy<Provider, Moveme
     pub(crate) fn routed_with_prepared_collective_waves(
         provider: Provider,
         realization: crate::routed_text::RoutedGroupedPlan,
-        expert_group: eredu_runtime::CommunicationGroupId,
+        expert_group: eredu_core::CollectiveGroupId,
         movement: Movement,
-        tensor_group: Option<eredu_runtime::CommunicationGroupId>,
+        tensor_group: Option<eredu_core::CollectiveGroupId>,
         collective_waves: RoutedExpertCollectiveWaveSchedule,
     ) -> Self {
         Self::Routed(RoutedPipelinePartitionUnitStrategy {
@@ -473,7 +473,7 @@ where
     primary_group: usize,
     first_state_ordinal: usize,
     parallel: Option<B::ParallelContext>,
-    tensor_group: Option<eredu_runtime::CommunicationGroupId>,
+    tensor_group: Option<eredu_core::CollectiveGroupId>,
     pipeline_stages: usize,
     allocator: F,
     activation_dtype: PipelineActivationDtype,
@@ -493,7 +493,7 @@ pub(crate) struct PreparedCompositeExecutorStructure {
     group_kinds: Vec<ArchitectureGroupKind>,
     primary_group: usize,
     first_state_ordinal: usize,
-    tensor_group: Option<eredu_runtime::CommunicationGroupId>,
+    tensor_group: Option<eredu_core::CollectiveGroupId>,
     pipeline_stages: usize,
     activation_dtype: PipelineActivationDtype,
     route_schemas: std::collections::BTreeMap<CommunicationRouteId, ResolvedBoundaryWireSchema>,
@@ -509,7 +509,7 @@ impl PreparedCompositeExecutorStructure {
         activation_dtype: PipelineActivationDtype,
         route_schemas: impl IntoIterator<Item = (CommunicationRouteId, ResolvedBoundaryWireSchema)>,
         publication: PublicationValueDescriptor,
-        tensor_group: Option<eredu_runtime::CommunicationGroupId>,
+        tensor_group: Option<eredu_core::CollectiveGroupId>,
         topology: eredu_core::ParallelRankTopology,
     ) -> Result<Self, String>
     where
@@ -712,7 +712,7 @@ where
     /// composite collective schedules.
     pub fn with_collective_topology(
         mut self,
-        tensor_group: Option<eredu_runtime::CommunicationGroupId>,
+        tensor_group: Option<eredu_core::CollectiveGroupId>,
         pipeline_stages: usize,
     ) -> Result<Self, eredu_nn::Error> {
         if pipeline_stages == 0 {
@@ -2165,7 +2165,7 @@ where
     parallel: Option<B::ParallelContext>,
     provider: Provider,
     realization: crate::routed_text::RoutedGroupedPlan,
-    expert_group: Option<eredu_runtime::CommunicationGroupId>,
+    expert_group: Option<eredu_core::CollectiveGroupId>,
     movement: Movement,
 }
 
@@ -2186,7 +2186,7 @@ where
         parallel: Option<B::ParallelContext>,
         provider: Provider,
         realization: crate::routed_text::RoutedGroupedPlan,
-        expert_group: Option<eredu_runtime::CommunicationGroupId>,
+        expert_group: Option<eredu_core::CollectiveGroupId>,
         movement: Movement,
     ) -> Self {
         Self {
@@ -2205,7 +2205,7 @@ where
         parallel: Option<B::ParallelContext>,
         provider: Provider,
         realization: crate::ExpertRealizationPlan<E>,
-        expert_group: Option<eredu_runtime::CommunicationGroupId>,
+        expert_group: Option<eredu_core::CollectiveGroupId>,
         movement: Movement,
     ) -> Self
     where
@@ -2497,7 +2497,7 @@ where
 {
     provider: &'a mut Provider,
     realization: &'a crate::routed_text::RoutedGroupedPlan,
-    expert_group: eredu_runtime::CommunicationGroupId,
+    expert_group: eredu_core::CollectiveGroupId,
     movement: &'a mut Movement,
     communication: &'a eredu_runtime::PartitionCommunication<B, G, R, I>,
     communication_executor: &'a B::Executor,
@@ -3653,9 +3653,9 @@ where
 #[allow(clippy::too_many_arguments)]
 fn participate_inactive_routed_wave<B, G, R, I, F>(
     realization: &crate::routed_text::RoutedGroupedPlan,
-    expert_group: eredu_runtime::CommunicationGroupId,
+    expert_group: eredu_core::CollectiveGroupId,
     collective_waves: &RoutedExpertCollectiveWaveSchedule,
-    tensor_group: Option<eredu_runtime::CommunicationGroupId>,
+    tensor_group: Option<eredu_core::CollectiveGroupId>,
     wave: usize,
     communication: &eredu_runtime::PartitionCommunication<B, G, R, I>,
     communication_executor: &B::Executor,
@@ -3993,9 +3993,9 @@ where
 pub struct RoutedPipelinePartitionUnitStrategy<Provider, Movement> {
     provider: Provider,
     realization: crate::routed_text::RoutedGroupedPlan,
-    expert_group: Option<eredu_runtime::CommunicationGroupId>,
+    expert_group: Option<eredu_core::CollectiveGroupId>,
     movement: Movement,
-    tensor_group: Option<eredu_runtime::CommunicationGroupId>,
+    tensor_group: Option<eredu_core::CollectiveGroupId>,
     collective_waves: Option<RoutedExpertCollectiveWaveSchedule>,
 }
 
@@ -4004,7 +4004,7 @@ impl<Provider, Movement> RoutedPipelinePartitionUnitStrategy<Provider, Movement>
     pub fn from_grouped_plan(
         provider: Provider,
         realization: crate::routed_text::RoutedGroupedPlan,
-        expert_group: Option<eredu_runtime::CommunicationGroupId>,
+        expert_group: Option<eredu_core::CollectiveGroupId>,
         movement: Movement,
     ) -> Self {
         Self {
@@ -4021,9 +4021,9 @@ impl<Provider, Movement> RoutedPipelinePartitionUnitStrategy<Provider, Movement>
     pub fn from_grouped_plan_with_collective_waves(
         provider: Provider,
         realization: crate::routed_text::RoutedGroupedPlan,
-        expert_group: eredu_runtime::CommunicationGroupId,
+        expert_group: eredu_core::CollectiveGroupId,
         movement: Movement,
-        tensor_group: Option<eredu_runtime::CommunicationGroupId>,
+        tensor_group: Option<eredu_core::CollectiveGroupId>,
         collective_waves: RoutedExpertCollectiveWaveSchedule,
     ) -> Result<Self, String> {
         if realization.expert_parallel_size() <= 1 {
@@ -4049,7 +4049,7 @@ impl<Provider, Movement> RoutedPipelinePartitionUnitStrategy<Provider, Movement>
     pub fn new<E>(
         provider: Provider,
         realization: crate::ExpertRealizationPlan<E>,
-        expert_group: Option<eredu_runtime::CommunicationGroupId>,
+        expert_group: Option<eredu_core::CollectiveGroupId>,
         movement: Movement,
     ) -> Self
     where
@@ -4069,9 +4069,9 @@ impl<Provider, Movement> RoutedPipelinePartitionUnitStrategy<Provider, Movement>
     pub fn new_with_collective_waves<E>(
         provider: Provider,
         realization: crate::ExpertRealizationPlan<E>,
-        expert_group: eredu_runtime::CommunicationGroupId,
+        expert_group: eredu_core::CollectiveGroupId,
         movement: Movement,
-        tensor_group: Option<eredu_runtime::CommunicationGroupId>,
+        tensor_group: Option<eredu_core::CollectiveGroupId>,
         collective_waves: RoutedExpertCollectiveWaveSchedule,
     ) -> Result<Self, String>
     where
@@ -5178,9 +5178,9 @@ pub struct PartitionedAdmission<R> {
     boundary: ResolvedBoundaryWireSchema,
     boundary_routes: Vec<SelectedPartitionBoundaryRoute>,
     communication: CommunicationManifest,
-    session_group: Option<eredu_runtime::CommunicationGroupId>,
-    tensor_group: Option<eredu_runtime::CommunicationGroupId>,
-    expert_group: Option<eredu_runtime::CommunicationGroupId>,
+    session_group: Option<eredu_core::CollectiveGroupId>,
+    tensor_group: Option<eredu_core::CollectiveGroupId>,
+    expert_group: Option<eredu_core::CollectiveGroupId>,
 }
 
 /// One selected semantic pipeline route paired with its exact wire schema.
@@ -5281,17 +5281,17 @@ impl<R> PartitionedAdmission<R> {
     }
 
     /// Exact opaque world/session group selected for publication and commit.
-    pub const fn session_group(&self) -> Option<eredu_runtime::CommunicationGroupId> {
+    pub const fn session_group(&self) -> Option<eredu_core::CollectiveGroupId> {
         self.session_group
     }
 
     /// Exact opaque tensor group selected for this rank.
-    pub const fn tensor_group(&self) -> Option<eredu_runtime::CommunicationGroupId> {
+    pub const fn tensor_group(&self) -> Option<eredu_core::CollectiveGroupId> {
         self.tensor_group
     }
 
     /// Exact opaque expert group selected for this rank.
-    pub const fn expert_group(&self) -> Option<eredu_runtime::CommunicationGroupId> {
+    pub const fn expert_group(&self) -> Option<eredu_core::CollectiveGroupId> {
         self.expert_group
     }
 
@@ -5905,9 +5905,9 @@ fn communication_manifest(
     (
         CommunicationManifest,
         Vec<SelectedPartitionBoundaryRoute>,
-        Option<eredu_runtime::CommunicationGroupId>,
-        Option<eredu_runtime::CommunicationGroupId>,
-        Option<eredu_runtime::CommunicationGroupId>,
+        Option<eredu_core::CollectiveGroupId>,
+        Option<eredu_core::CollectiveGroupId>,
+        Option<eredu_core::CollectiveGroupId>,
     ),
     String,
 > {
@@ -6500,9 +6500,9 @@ fn partitioned_admission<R, F>(
     boundary: ResolvedBoundaryWireSchema,
     boundary_routes: Vec<SelectedPartitionBoundaryRoute>,
     communication: CommunicationManifest,
-    session_group: Option<eredu_runtime::CommunicationGroupId>,
-    tensor_group: Option<eredu_runtime::CommunicationGroupId>,
-    expert_group: Option<eredu_runtime::CommunicationGroupId>,
+    session_group: Option<eredu_core::CollectiveGroupId>,
+    tensor_group: Option<eredu_core::CollectiveGroupId>,
+    expert_group: Option<eredu_core::CollectiveGroupId>,
     state_layout: Option<&eredu_runtime::StateLayout>,
     text: F,
 ) -> Result<PartitionedAdmission<R>, String>
@@ -7023,17 +7023,17 @@ impl<R, Q, G, W> BoundPartitionedAdmission<R, Q, G, W> {
     }
 
     /// Exact opaque world/session group selected for publication and commit.
-    pub const fn session_group(&self) -> Option<eredu_runtime::CommunicationGroupId> {
+    pub const fn session_group(&self) -> Option<eredu_core::CollectiveGroupId> {
         self.selected.requirements.session_group
     }
 
     /// Exact opaque tensor group selected for this rank.
-    pub const fn tensor_group(&self) -> Option<eredu_runtime::CommunicationGroupId> {
+    pub const fn tensor_group(&self) -> Option<eredu_core::CollectiveGroupId> {
         self.selected.requirements.tensor_group
     }
 
     /// Exact opaque expert group selected for this rank.
-    pub const fn expert_group(&self) -> Option<eredu_runtime::CommunicationGroupId> {
+    pub const fn expert_group(&self) -> Option<eredu_core::CollectiveGroupId> {
         self.selected.requirements.expert_group
     }
 
@@ -10943,13 +10943,13 @@ where
 enum PreparedRoutedUnitStrategy {
     Local {
         realization: crate::routed_text::RoutedGroupedPlan,
-        expert_group: Option<eredu_runtime::CommunicationGroupId>,
-        tensor_group: Option<eredu_runtime::CommunicationGroupId>,
+        expert_group: Option<eredu_core::CollectiveGroupId>,
+        tensor_group: Option<eredu_core::CollectiveGroupId>,
     },
     Pipeline {
         realization: crate::routed_text::RoutedGroupedPlan,
-        expert_group: Option<eredu_runtime::CommunicationGroupId>,
-        tensor_group: Option<eredu_runtime::CommunicationGroupId>,
+        expert_group: Option<eredu_core::CollectiveGroupId>,
+        tensor_group: Option<eredu_core::CollectiveGroupId>,
         collective_waves: Option<RoutedExpertCollectiveWaveSchedule>,
     },
 }
@@ -10962,8 +10962,8 @@ enum PreparedRoutedUnitStrategy {
 /// communication, provider, movement, allocation, and execution mechanisms.
 pub struct PreparedRoutedExecutionHandoff {
     execution_plan: eredu_runtime::PartitionedExecutionPlan,
-    communication_tensor_group: Option<eredu_runtime::CommunicationGroupId>,
-    sampling_group: eredu_runtime::CommunicationGroupId,
+    communication_tensor_group: Option<eredu_core::CollectiveGroupId>,
+    sampling_group: eredu_core::CollectiveGroupId,
     activation_dtype: eredu_runtime::PipelineActivationDtype,
     provider_routes_per_token: usize,
     strategy: PreparedRoutedUnitStrategy,
@@ -10972,7 +10972,7 @@ pub struct PreparedRoutedExecutionHandoff {
 impl PreparedRoutedExecutionHandoff {
     fn provider_route_cardinality(
         routes_per_token: usize,
-        expert_group: Option<eredu_runtime::CommunicationGroupId>,
+        expert_group: Option<eredu_core::CollectiveGroupId>,
     ) -> Result<usize, String> {
         if routes_per_token == 0 {
             return Err("routed execution requires at least one route per token".into());
@@ -10985,8 +10985,8 @@ impl PreparedRoutedExecutionHandoff {
     }
 
     fn validate_pipeline_recipe(
-        expert_group: Option<eredu_runtime::CommunicationGroupId>,
-        tensor_group: Option<eredu_runtime::CommunicationGroupId>,
+        expert_group: Option<eredu_core::CollectiveGroupId>,
+        tensor_group: Option<eredu_core::CollectiveGroupId>,
         collective_waves: Option<&RoutedExpertCollectiveWaveSchedule>,
     ) -> Result<(), String> {
         if expert_group.is_some() != collective_waves.is_some() {
@@ -11111,12 +11111,12 @@ impl PreparedRoutedExecutionHandoff {
     }
 
     /// Opaque tensor-group identity used only to realize communication.
-    pub const fn communication_tensor_group(&self) -> Option<eredu_runtime::CommunicationGroupId> {
+    pub const fn communication_tensor_group(&self) -> Option<eredu_core::CollectiveGroupId> {
         self.communication_tensor_group
     }
 
     /// Opaque publication group identity used only to realize communication.
-    pub const fn sampling_group(&self) -> eredu_runtime::CommunicationGroupId {
+    pub const fn sampling_group(&self) -> eredu_core::CollectiveGroupId {
         self.sampling_group
     }
 
@@ -11862,7 +11862,7 @@ mod tests {
         assert_eq!(
             PreparedRoutedExecutionHandoff::provider_route_cardinality(
                 0,
-                Some(eredu_runtime::CommunicationGroupId::new(71)),
+                Some(eredu_core::CollectiveGroupId::new(71)),
             )
             .unwrap_err(),
             "routed execution requires at least one route per token"
@@ -11873,7 +11873,7 @@ mod tests {
     fn routed_execution_handoff_rejects_omitted_expert_wave_before_mechanism_binding() {
         assert_eq!(
             PreparedRoutedExecutionHandoff::validate_pipeline_recipe(
-                Some(eredu_runtime::CommunicationGroupId::new(71)),
+                Some(eredu_core::CollectiveGroupId::new(71)),
                 None,
                 None,
             )

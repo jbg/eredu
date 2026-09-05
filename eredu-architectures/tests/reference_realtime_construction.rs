@@ -7,7 +7,10 @@ use std::{
     num::NonZeroUsize,
     ops::{Deref, DerefMut},
     rc::Rc,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, Instant},
 };
 
@@ -19,13 +22,15 @@ use eredu_checkpoint::{
     recipe::RecipeCatalog,
     schema::StoredDtypeConstraint,
     store::{
-        CheckpointLease, CheckpointSource, SharedCheckpointSource, StoreError, TensorMetadata,
-        TensorReadRequest, WeightStoreBackend, WeightStoreDiagnostics,
+        CheckpointLease, CheckpointSource, MemoryWeightStore, PreparedCheckpointSource,
+        PreparedTensorSource, SharedCheckpointSource, StoreError, TensorMetadata,
+        TensorReadRequest, TensorSelection, WeightStoreBackend, WeightStoreDiagnostics,
     },
     validation::{CatalogTensorMetadata, SafetensorsCatalog},
     StoredDtype,
 };
 use eredu_core::{
+    artifact::{fingerprint_filesystem_artifact, ArtifactFile},
     scheduler::{RequestId, RequestStatus, SchedulerLimits, SemanticStateTransaction},
     Completion, CompletionCancellationMode, ParallelRankTopology, ParallelTopology,
     QuantizationRequest, RealtimeInputFrame, RealtimeSampling, SessionCapabilities, TokenFilter,
@@ -111,6 +116,14 @@ impl MetadataCheckpointSource {
             })
             .collect();
         Self { tensors }
+    }
+
+    fn with_causal_value(mut self, parameter: impl Into<String>, value: i32) -> Self {
+        self.tensors
+            .get_mut(&parameter.into())
+            .expect("causal reference parameter exists")
+            .backing_shard = Some(format!("causal:{value}").into());
+        self
     }
 }
 
@@ -378,6 +391,7 @@ struct ConstructionTrace {
 struct ReferenceConstructionMechanisms {
     trace: Rc<RefCell<ConstructionTrace>>,
     store: SharedCheckpointSource,
+    independent_authority: Option<Rc<IndependentAuthorityResources>>,
 }
 
 struct StaticMaterializationBinder<'a> {
@@ -422,6 +436,27 @@ where
         selected: &eredu_runtime::SelectedRealtimeRealization,
         _context: &(),
     ) -> Result<(), Self::Error> {
+        if let Some(authority) = &self.independent_authority {
+            let selected_elements = match &authority.placement {
+                TensorSelection::Range { start, end, .. } => end - start,
+                TensorSelection::Indices { indices, .. } => indices.len(),
+                TensorSelection::Contiguous { shape, .. } => shape.iter().product(),
+                TensorSelection::Full => authority
+                    .bound_module
+                    .weight
+                    .0
+                    .iter()
+                    .map(|dimension| usize::try_from(*dimension).unwrap())
+                    .product(),
+            };
+            assert_eq!(
+                authority.bound_module.weight,
+                ReferenceTensor(vec![i32::try_from(selected_elements).unwrap()])
+            );
+            authority
+                .construction_uses
+                .set(authority.construction_uses.get() + 1);
+        }
         let transforms = tasks
             .iter()
             .filter(|task| {
@@ -594,6 +629,79 @@ struct ConstructionVisitor {
     residency: LayerWeightResidency,
     expects_transform: bool,
     text_cardinality: i32,
+    inspection_authority: Option<IndependentSessionAuthority>,
+}
+
+#[derive(Clone)]
+struct IndependentBoundModule {
+    weight: ReferenceTensor,
+}
+
+fn independent_parameter_metadata() -> ParameterMetadata {
+    ParameterMetadata {
+        id: eredu_nn::ParameterId::new("weight").unwrap(),
+        trainable: false,
+        alias_of: None,
+        group: None,
+        linear_companion: None,
+        linear_companion_of: None,
+    }
+}
+
+impl Parameterized<ReferenceTensor> for IndependentBoundModule {
+    fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
+    where
+        V: ParameterVisitor<'a, ReferenceTensor>,
+    {
+        visitor.visit(independent_parameter_metadata(), &self.weight);
+    }
+
+    fn visit_parameters_mut<'a, V>(&'a mut self, visitor: &mut V)
+    where
+        V: ParameterVisitorMut<'a, ReferenceTensor>,
+    {
+        visitor.visit_mut(independent_parameter_metadata(), &mut self.weight);
+    }
+
+    fn set_trainable(&mut self, _trainable: bool) {}
+}
+
+struct IndependentAuthorityResources {
+    bound_module: IndependentBoundModule,
+    placement: TensorSelection,
+    communication: eredu_runtime::PreparedCommunicationRealization,
+    construction_uses: Cell<usize>,
+    group_callbacks: Cell<usize>,
+    route_callbacks: Cell<usize>,
+    bound_value_trace: RefCell<Vec<i32>>,
+    causal_value: i32,
+    executed_outputs: RefCell<Vec<(ReferenceTensor, ReferenceTensor)>>,
+    group_resources: RefCell<Vec<MockCommunicationResource>>,
+    route_resources: RefCell<Vec<MockCommunicationResource>>,
+    omit_route_resources: bool,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct MockCommunicationResource {
+    ordinal: usize,
+    world_wave: bool,
+}
+
+struct IndependentSessionAuthority {
+    inspection: eredu_core::ArtifactInspection<()>,
+    admission: eredu_core::PreparationAdmission,
+    admitted_report: eredu_core::ModelInspectionReport,
+    resources: Rc<IndependentAuthorityResources>,
+    realized: Rc<RefCell<Option<IndependentRealizedSession>>>,
+}
+
+#[derive(Debug)]
+struct IndependentRealizedSession {
+    capabilities: SessionCapabilities,
+    report: eredu_core::ModelInspectionReport,
+    scheduler_capabilities: eredu_core::scheduler::SchedulerCapabilities,
+    scheduler_report: eredu_core::scheduler::SchedulerReport,
+    executed_outputs: Vec<(ReferenceTensor, ReferenceTensor)>,
 }
 
 impl MoshiRealtimeArchitectureVisitor<ReferenceBackend, ReferenceState> for ConstructionVisitor {
@@ -617,6 +725,10 @@ impl MoshiRealtimeArchitectureVisitor<ReferenceBackend, ReferenceState> for Cons
         A::Error: std::fmt::Display,
     {
         assert!(self.started.get());
+        let independent_authority = self
+            .inspection_authority
+            .as_ref()
+            .map(|authority| authority.resources.clone());
         let architecture = prepared.take_architecture();
         let source_architecture = prepared.take_source_architecture();
         assert_eq!(source_architecture.is_some(), self.expects_transform);
@@ -634,6 +746,7 @@ impl MoshiRealtimeArchitectureVisitor<ReferenceBackend, ReferenceState> for Cons
             ReferenceConstructionMechanisms {
                 trace: trace.clone(),
                 store,
+                independent_authority,
             },
             &(),
         )
@@ -694,8 +807,17 @@ impl MoshiRealtimeArchitectureVisitor<ReferenceBackend, ReferenceState> for Cons
         let mut executor = moshi::MoshiPreparedRealtimeFrameExecutor::new(execution);
         let mut host = ReferenceFrameTensorMechanisms;
         let mut tensors = ReferenceFrameTensorMechanisms;
+        let authority_value = self
+            .inspection_authority
+            .as_ref()
+            .map_or(1, |authority| authority.resources.bound_module.weight.0[0]);
+        let causal_step = self
+            .inspection_authority
+            .as_ref()
+            .map_or(1, |authority| authority.resources.causal_value);
         let mut completion = ReferenceFrameCompletionMechanism {
             expected_text_cardinality: self.text_cardinality,
+            expected_text_frames: authority_value,
             ..ReferenceFrameCompletionMechanism::default()
         };
         type ReferenceOutput = SubmittedRealtimeFrame<ReferenceTensor, ReferenceCompletion>;
@@ -722,7 +844,7 @@ impl MoshiRealtimeArchitectureVisitor<ReferenceBackend, ReferenceState> for Cons
                 (0..2)
                     .map(|_| {
                         RealtimeInputFrame::new(1, vec![1; schedule.input_audio_codebooks()])
-                            .with_forced_text(vec![1])
+                            .with_forced_text(vec![authority_value])
                             .with_diagnostics()
                     })
                     .collect(),
@@ -731,6 +853,53 @@ impl MoshiRealtimeArchitectureVisitor<ReferenceBackend, ReferenceState> for Cons
         let observed_frames = Rc::new(Cell::new(0));
         clear_reference_trace();
         for _ in 0..2 {
+            if observed_frames.get() == 0 {
+                if let Some(authority) = &self.inspection_authority {
+                    let groups = authority.resources.communication.try_create_groups(
+                        |descriptor, world_wave| {
+                            authority
+                                .resources
+                                .group_callbacks
+                                .set(authority.resources.group_callbacks.get() + 1);
+                            Ok::<_, String>(MockCommunicationResource {
+                                ordinal: descriptor.creation_order(),
+                                world_wave,
+                            })
+                        },
+                    )?;
+                    let mut routes = authority.resources.communication.try_create_routes(
+                        |descriptor, world_wave| {
+                            authority
+                                .resources
+                                .route_callbacks
+                                .set(authority.resources.route_callbacks.get() + 1);
+                            Ok::<_, String>(MockCommunicationResource {
+                                ordinal: descriptor.submission_order(),
+                                world_wave,
+                            })
+                        },
+                    )?;
+                    if authority.resources.omit_route_resources {
+                        routes.clear();
+                    }
+                    *authority.resources.group_resources.borrow_mut() = groups;
+                    *authority.resources.route_resources.borrow_mut() = routes;
+                }
+            }
+            if let Some(authority) = &self.inspection_authority {
+                if authority.resources.group_resources.borrow().len()
+                    != authority.resources.communication.manifest().groups().len()
+                    || authority.resources.route_resources.borrow().len()
+                        != authority.resources.communication.manifest().routes().len()
+                {
+                    return Err("prepared communication resources are incomplete".into());
+                }
+                authority
+                    .resources
+                    .bound_value_trace
+                    .borrow_mut()
+                    .push(authority_value);
+            }
             let observed_frames = observed_frames.clone();
             sessions
                 .run_local_turn(Instant::now(), |_, frame, branch| {
@@ -751,6 +920,12 @@ impl MoshiRealtimeArchitectureVisitor<ReferenceBackend, ReferenceState> for Cons
                             &(),
                         )
                         .map_err(|error| std::io::Error::other(error.to_string()))?;
+                    if let Some(authority) = &self.inspection_authority {
+                        authority.resources.executed_outputs.borrow_mut().push((
+                            output.frame().text().clone(),
+                            output.frame().sampled_audio().clone(),
+                        ));
+                    }
                     if !output.frame().diagnostics().is_empty() {
                         assert_eq!(output.frame().text(), &ReferenceTensor(vec![1, 1]));
                         assert_eq!(
@@ -781,7 +956,7 @@ impl MoshiRealtimeArchitectureVisitor<ReferenceBackend, ReferenceState> for Cons
         let random_after_sampled = *generation.random_state().unwrap();
         assert_eq!(
             random_after_sampled,
-            7 + i32::try_from(completion.retained_calls).unwrap()
+            7 + causal_step * i32::try_from(completion.retained_calls).unwrap()
         );
 
         let incarnation = sessions.request_state(request).unwrap().incarnation();
@@ -804,7 +979,7 @@ impl MoshiRealtimeArchitectureVisitor<ReferenceBackend, ReferenceState> for Cons
             .enqueue(
                 resumed_request,
                 RealtimeInputFrame::new(1, vec![1; schedule.input_audio_codebooks()])
-                    .with_forced_text(vec![1])
+                    .with_forced_text(vec![authority_value])
                     .with_forced_generated_audio(vec![1; schedule.generated_audio_codebooks()])
                     .with_diagnostics(),
             )
@@ -840,9 +1015,54 @@ impl MoshiRealtimeArchitectureVisitor<ReferenceBackend, ReferenceState> for Cons
             .saturating_sub(1);
         assert_eq!(
             random_after_forced,
-            random_after_sampled + i32::try_from(unforced_depth_tail).unwrap()
+            random_after_sampled + causal_step * i32::try_from(unforced_depth_tail).unwrap()
         );
         assert_eq!(resumed.schedule_state().frontier(), 3);
+        if let Some(authority) = self.inspection_authority {
+            let realized_capabilities = SessionCapabilities::new(
+                sessions.request_state(resumed_request).is_some(),
+                completion.calls > 0,
+                observed_frames.get() > 0 && !reference_trace().linear_outputs.is_empty(),
+            );
+            assert_eq!(
+                realized_capabilities,
+                authority.admission.session_capabilities()
+            );
+            let resources = &authority.resources;
+            let realized_report = eredu_core::finalize_realized_model_inspection(
+                &authority.admitted_report,
+                eredu_core::RealizedInspectionOutcomes {
+                    artifact_authority: authority.inspection.path()
+                        == authority.admitted_report.path,
+                    binding: resources.construction_uses.get() > 0
+                        && resources.bound_module.weight == ReferenceTensor(vec![authority_value]),
+                    construction: {
+                        let construction = trace.borrow();
+                        construction.materialization_calls == 1 && construction.state_calls == 1
+                    },
+                    communication: resources.group_callbacks.get()
+                        == resources.communication.manifest().groups().len()
+                        && resources.route_callbacks.get()
+                            == resources.communication.manifest().routes().len(),
+                    execution: observed_frames.get() > 0
+                        && completion.calls > 0
+                        && resources
+                            .bound_value_trace
+                            .borrow()
+                            .iter()
+                            .all(|value| *value == authority_value),
+                    session: realized_capabilities,
+                },
+            );
+            assert_eq!(realized_report, authority.admitted_report);
+            *authority.realized.borrow_mut() = Some(IndependentRealizedSession {
+                capabilities: realized_capabilities,
+                report: realized_report,
+                scheduler_capabilities: sessions.capabilities(),
+                scheduler_report: sessions.report(),
+                executed_outputs: resources.executed_outputs.borrow().clone(),
+            });
+        }
         Ok(ConstructionSummary {
             task_count,
             unit_count: expected_units,
@@ -898,7 +1118,11 @@ impl MoshiRealtimeArchitectureVisitor<ReferenceBackend, ReferenceState> for Obse
             architecture,
             None,
             contract,
-            ReferenceConstructionMechanisms { trace, store },
+            ReferenceConstructionMechanisms {
+                trace,
+                store,
+                independent_authority: None,
+            },
             &(),
         )
         .map_err(|error| error.to_string())?;
@@ -1214,8 +1438,31 @@ fn run_reference_scenario(
     residency: LayerWeightResidency,
     quantization: Option<QuantizationRequest>,
 ) -> ConstructionSummary {
+    try_run_reference_scenario_with_authority(config, residency, quantization, None).unwrap()
+}
+
+fn run_reference_scenario_with_authority(
+    config: MoshiConfig,
+    residency: LayerWeightResidency,
+    quantization: Option<QuantizationRequest>,
+    inspection_authority: Option<IndependentSessionAuthority>,
+) -> ConstructionSummary {
+    try_run_reference_scenario_with_authority(config, residency, quantization, inspection_authority)
+        .unwrap()
+}
+
+fn try_run_reference_scenario_with_authority(
+    config: MoshiConfig,
+    residency: LayerWeightResidency,
+    quantization: Option<QuantizationRequest>,
+    inspection_authority: Option<IndependentSessionAuthority>,
+) -> Result<ConstructionSummary, String> {
     let ingress = moshi::realtime_ingress_contract(&config).unwrap();
-    let store = Arc::new(MetadataCheckpointSource::from_config(&config));
+    let mut store = MetadataCheckpointSource::from_config(&config);
+    if let Some(authority) = &inspection_authority {
+        store = store.with_causal_value("text_linear.weight", authority.resources.causal_value);
+    }
+    let store = Arc::new(store);
     let selection_complete = Rc::new(Cell::new(false));
     let started = Rc::new(Cell::new(false));
     let prepared = selected(&config, &store, request(quantization, residency));
@@ -1233,9 +1480,10 @@ fn run_reference_scenario(
                 residency,
                 expects_transform: quantization.is_some(),
                 text_cardinality: config.text_vocabulary_size(),
+                inspection_authority,
             },
         )
-        .unwrap();
+        .map_err(|error| error.to_string())?;
     assert!(started.get());
     assert!(summary.task_count > 0);
     assert!(summary.committed_attention_offset > 0);
@@ -1243,7 +1491,7 @@ fn run_reference_scenario(
     assert!(summary.executed_frames >= 1);
     assert!(summary.random_after_forced >= summary.random_after_sampled);
     assert_eq!(summary.resumed_frontier, 3);
-    summary
+    Ok(summary)
 }
 
 fn run_observation_scenario(
@@ -1391,6 +1639,7 @@ fn selection_and_store_validation_precede_reference_construction() {
                 residency: LayerWeightResidency::FullyResident,
                 expects_transform: false,
                 text_cardinality: config.text_vocabulary_size(),
+                inspection_authority: None,
             },
         )
         .unwrap_err();
@@ -1428,7 +1677,11 @@ impl MoshiRealtimeArchitectureVisitor<ReferenceBackend, ReferenceState>
             replicated,
             None,
             contract,
-            ReferenceConstructionMechanisms { trace, store },
+            ReferenceConstructionMechanisms {
+                trace,
+                store,
+                independent_authority: None,
+            },
             &(),
         )
         .err()
@@ -1560,6 +1813,592 @@ pub(crate) fn load_time_affine_transform_reaches_typed_construction_and_frame_ex
         }),
     );
     assert_eq!(summary.unit_count, 2);
+}
+
+#[derive(Default)]
+struct ArtifactSourceCounters {
+    metadata_reads: AtomicUsize,
+    provenance_reads: AtomicUsize,
+    payload_reads: AtomicUsize,
+}
+
+impl ArtifactSourceCounters {
+    fn reset(&self) {
+        self.metadata_reads.store(0, Ordering::SeqCst);
+        self.provenance_reads.store(0, Ordering::SeqCst);
+        self.payload_reads.store(0, Ordering::SeqCst);
+    }
+}
+
+struct IndependentArtifactSource {
+    inner: MemoryWeightStore,
+    metadata: Mutex<TensorMetadata>,
+    counters: Arc<ArtifactSourceCounters>,
+}
+
+impl IndependentArtifactSource {
+    fn new(counters: Arc<ArtifactSourceCounters>) -> Self {
+        let bytes = [1.0_f32, 2.0]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let inner = MemoryWeightStore::from_safetensors([(
+            "weight".into(),
+            safetensors::Dtype::F32,
+            vec![2],
+            bytes,
+        )])
+        .unwrap();
+        Self {
+            inner,
+            metadata: Mutex::new(TensorMetadata {
+                name: "weight".into(),
+                logical_shape: vec![2],
+                physical_shape: vec![2],
+                stored_dtype: StoredDtype::F32,
+                encoded_byte_len: 8,
+                backing_shard: None,
+            }),
+            counters,
+        }
+    }
+
+    fn replace_metadata(&self, metadata: TensorMetadata) {
+        *self.metadata.lock().unwrap() = metadata;
+    }
+}
+
+impl CheckpointSource for IndependentArtifactSource {
+    fn source_keys(&self) -> Vec<String> {
+        vec!["weight".into()]
+    }
+
+    fn source_metadata(&self, key: &str) -> Result<TensorMetadata, StoreError> {
+        self.counters.metadata_reads.fetch_add(1, Ordering::SeqCst);
+        if key != "weight" {
+            return Err(StoreError::UnknownTensor { key: key.into() });
+        }
+        Ok(self.metadata.lock().unwrap().clone())
+    }
+
+    fn acquire_lease(&self, request: TensorReadRequest) -> Result<CheckpointLease, StoreError> {
+        self.counters.payload_reads.fetch_add(1, Ordering::SeqCst);
+        self.inner.acquire_lease(request)
+    }
+
+    fn source_diagnostics(&self) -> Result<WeightStoreDiagnostics, StoreError> {
+        self.inner.source_diagnostics()
+    }
+
+    fn source_provenance(
+        &self,
+        key: &str,
+    ) -> Result<eredu_checkpoint::store::TensorSourceProvenance, StoreError> {
+        self.counters
+            .provenance_reads
+            .fetch_add(1, Ordering::SeqCst);
+        let metadata = self.source_metadata(key)?;
+        Ok(eredu_checkpoint::store::TensorSourceProvenance {
+            catalog_key: key.into(),
+            physical_tensor: key.into(),
+            output: key.into(),
+            backing_shard: metadata.backing_shard,
+            source_encoding: eredu_checkpoint::SourceTensorEncoding::Safetensors(
+                metadata.stored_dtype,
+            ),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct IndependentInspectionResolver;
+
+impl eredu_core::ModelConfigurationResolver for IndependentInspectionResolver {
+    type ArtifactPlan = ();
+
+    fn resolve_safetensors(
+        &self,
+        json: &serde_json::Value,
+    ) -> Result<eredu_core::ResolvedModelConfiguration<()>, eredu_core::artifact::ArtifactError>
+    {
+        let model_type = json
+            .get("model_type")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                eredu_core::artifact::ArtifactError::InvalidArtifact(
+                    "independent fixture requires model_type".into(),
+                )
+            })?;
+        Ok(eredu_core::ResolvedModelConfiguration::new(
+            eredu_core::ModelConfiguration::new(
+                model_type,
+                model_type,
+                "independent-reference",
+                eredu_core::LoadingProtocol::Model,
+                Some(json.clone()),
+            )?,
+            (),
+        ))
+    }
+
+    fn resolve_gguf(
+        &self,
+        _architecture: &str,
+        _checkpoint: &eredu_gguf::Checkpoint,
+    ) -> Result<eredu_core::ResolvedModelConfiguration<()>, eredu_core::artifact::ArtifactError>
+    {
+        Err(eredu_core::artifact::ArtifactError::InvalidArtifact(
+            "independent fixture admits safetensors only".into(),
+        ))
+    }
+
+    fn gguf_companion_requirements(
+        &self,
+        _architecture: &str,
+        _checkpoint: &eredu_gguf::Checkpoint,
+    ) -> Result<Vec<eredu_core::GgufCompanionRequirement>, eredu_core::artifact::ArtifactError>
+    {
+        Ok(Vec::new())
+    }
+}
+
+#[derive(Default)]
+struct BoundedAdapterCounters {
+    artifact_identity: AtomicUsize,
+    image_processing: AtomicUsize,
+    audio_processing: AtomicUsize,
+    inspection_admission: AtomicUsize,
+    placement_communication: AtomicUsize,
+    prepared_source: AtomicUsize,
+    binding: AtomicUsize,
+    session: AtomicUsize,
+}
+
+#[derive(Default)]
+struct BoundedIndependentAdapter {
+    counters: BoundedAdapterCounters,
+}
+
+impl BoundedIndependentAdapter {
+    fn run(&self) {
+        let first = tempfile::tempdir().unwrap();
+        let relocated = tempfile::tempdir().unwrap();
+        let first_path = first.path().join("model.safetensors");
+        let relocated_path = relocated.path().join("model.safetensors");
+        std::fs::write(&first_path, b"exact checkpoint bytes").unwrap();
+        std::fs::write(&relocated_path, b"exact checkpoint bytes").unwrap();
+        let identity = fingerprint_filesystem_artifact(
+            "independent-reference",
+            [ArtifactFile::new("weights", &first_path)],
+        )
+        .unwrap();
+        assert_eq!(
+            identity,
+            fingerprint_filesystem_artifact(
+                "independent-reference",
+                [ArtifactFile::new("weights", &relocated_path)],
+            )
+            .unwrap()
+        );
+        std::fs::write(&relocated_path, b"changed checkpoint content").unwrap();
+        assert_ne!(
+            identity,
+            fingerprint_filesystem_artifact(
+                "independent-reference",
+                [ArtifactFile::new("weights", &relocated_path)],
+            )
+            .unwrap()
+        );
+        self.counters
+            .artifact_identity
+            .fetch_add(1, Ordering::SeqCst);
+
+        let image = eredu_media::image::RgbImageView::packed(&[10, 20, 30], 1, 1).unwrap();
+        let resized = eredu_media::image::resize_rgb8_bicubic(image, 2, 2).unwrap();
+        assert_eq!(
+            resized.pixels(),
+            &[10, 20, 30, 10, 20, 30, 10, 20, 30, 10, 20, 30]
+        );
+        self.counters
+            .image_processing
+            .fetch_add(1, Ordering::SeqCst);
+        let waveform = eredu_media::audio::AudioWaveform::new(
+            &[0.0, 0.25, -0.25, 0.5, 0.0, -0.5, 0.25, 0.0],
+            8,
+        )
+        .unwrap();
+        let audio = eredu_media::audio::extract_log_mel(
+            waveform,
+            &eredu_media::audio::LogMelConfig {
+                sample_rate: 8,
+                frame_length: 4,
+                hop_length: 2,
+                fft_length: 4,
+                mel_bins: 2,
+                min_frequency: 0.0,
+                max_frequency: 4.0,
+                mel_floor: 1e-6,
+                max_samples: 8,
+                pad_to_multiple: 2,
+            },
+        )
+        .unwrap();
+        assert_eq!(audio.values.len(), audio.frames * audio.mel_bins);
+        assert!(audio.values.iter().all(|value| value.is_finite()));
+        self.counters
+            .audio_processing
+            .fetch_add(1, Ordering::SeqCst);
+
+        std::fs::write(
+            first.path().join("config.json"),
+            br#"{"model_type":"independent_reference"}"#,
+        )
+        .unwrap();
+        let tensor_bytes = [1.0_f32, 2.0]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let tensor =
+            safetensors::tensor::TensorView::new(safetensors::Dtype::F32, vec![2], &tensor_bytes)
+                .unwrap();
+        safetensors::tensor::serialize_to_file(
+            [("weight", tensor)],
+            None,
+            &first.path().join("model.safetensors"),
+        )
+        .unwrap();
+        let artifact_inspection =
+            eredu_core::inspect_artifact(first.path(), &IndependentInspectionResolver).unwrap();
+
+        let policy =
+            eredu_core::PreparationPolicy::new(None, eredu_core::ResidencyRequest::LayerwiseHost)
+                .with_required_session_capabilities(SessionCapabilities::new(true, true, true));
+        let request = eredu_core::PreparationAdmissionRequest::new(
+            eredu_core::LoadingProtocol::Model,
+            eredu_core::ArtifactFormat::SafeTensors,
+            policy,
+            eredu_core::ArchitecturePreparationCapabilities::new(
+                false,
+                false,
+                false,
+                false,
+                false,
+                eredu_core::InputModalities {
+                    text: true,
+                    image: false,
+                    audio: true,
+                    video: false,
+                },
+            ),
+        )
+        .with_exact_completion(true);
+        let mechanisms = eredu_core::PreparationMechanismCapabilities::new(true, false)
+            .with_residency(eredu_core::ResidencyRequest::LayerwiseHost, true)
+            .with_input_modalities(eredu_core::InputModalities {
+                text: true,
+                image: false,
+                audio: true,
+                video: false,
+            })
+            .with_exact_completion(true)
+            .with_session(SessionCapabilities::new(true, true, true));
+        let admission = eredu_core::admit_preparation(request, mechanisms).unwrap();
+        let admitted_report = eredu_core::assemble_portable_model_inspection(
+            &artifact_inspection,
+            admission,
+            eredu_core::InputModalities {
+                text: true,
+                image: false,
+                audio: true,
+                video: false,
+            },
+            None,
+            Some((
+                true,
+                eredu_core::MediaFeatureAvailability {
+                    image: true,
+                    audio: true,
+                },
+            )),
+        );
+        assert_eq!(admitted_report.preparation_admission, Some(admission));
+        self.counters
+            .inspection_admission
+            .fetch_add(1, Ordering::SeqCst);
+
+        let rank = eredu_runtime::PlacementRank::new(4, 0).unwrap();
+        let mut placement = eredu_runtime::PlacementPlan::new(rank);
+        placement
+            .insert_expected(
+                "weight",
+                vec![2],
+                eredu_runtime::TensorPlacement::Shard {
+                    axis: 0,
+                    index: 0,
+                    parts: 2,
+                },
+            )
+            .unwrap();
+        let selection = match placement.resolve("weight", &[2]).unwrap() {
+            eredu_runtime::ResolvedTensorPlacement::Selection(selection) => selection,
+            other => panic!("expected a nontrivial placed selection, got {other:?}"),
+        };
+        let topology = ParallelTopology::new(2, 2, 1, 1).unwrap();
+        let all_reduce = eredu_runtime::CommunicationOperationRequirement::tensors(
+            eredu_runtime::CommunicationOperation::AllReduceSum,
+            [eredu_core::checkpoint::TensorDtype::F32],
+            eredu_runtime::CommunicationTensorLimits::new(1, 2, 1024, None).unwrap(),
+            true,
+        )
+        .unwrap();
+        let send_receive = eredu_runtime::CommunicationOperationRequirement::tensors(
+            eredu_runtime::CommunicationOperation::SendReceive,
+            [eredu_core::checkpoint::TensorDtype::F32],
+            eredu_runtime::CommunicationTensorLimits::new(1, 2, 1024, None).unwrap(),
+            true,
+        )
+        .unwrap();
+        let communication = eredu_runtime::TopologyCommunicationPlan::new()
+            .with_completion_policy(
+                CommunicationCompletionPolicy::new(
+                    Duration::from_secs(1),
+                    CompletionCancellationMode::QuarantineUntilComplete,
+                )
+                .unwrap(),
+            )
+            .with_tensor_groups(
+                eredu_runtime::CommunicationGroupRequirements::new([all_reduce.clone()]).unwrap(),
+            )
+            .with_pipeline_routes(send_receive.clone())
+            .unwrap();
+        let manifests =
+            eredu_runtime::project_all_communication_manifests(topology, &communication).unwrap();
+        eredu_runtime::validate_compatible_communication_manifests(&manifests).unwrap();
+        assert_eq!(manifests.len(), 4);
+        assert!(manifests
+            .iter()
+            .all(|manifest| !manifest.groups().is_empty()));
+        assert!(manifests
+            .iter()
+            .all(|manifest| !manifest.routes().is_empty()));
+        let communication_capabilities =
+            eredu_runtime::CommunicationCapabilities::new([all_reduce, send_receive])
+                .unwrap()
+                .with_completion_capabilities(
+                    CommunicationCompletionCapabilities::new([
+                        CompletionCancellationMode::QuarantineUntilComplete,
+                    ])
+                    .unwrap(),
+                );
+        let prepared_communication = eredu_runtime::prepare_communication_realization(
+            &manifests[0],
+            &manifests,
+            &communication_capabilities,
+            eredu_runtime::CommunicationTopologyCapabilities::FullyConnected,
+        )
+        .unwrap();
+        self.counters
+            .placement_communication
+            .fetch_add(1, Ordering::SeqCst);
+
+        let counters = Arc::new(ArtifactSourceCounters::default());
+        let source = Arc::new(IndependentArtifactSource::new(Arc::clone(&counters)));
+        let metadata = source.source_metadata("weight").unwrap();
+        let provenance = source.source_provenance("weight").unwrap();
+        counters.reset();
+        clear_reference_trace();
+        let shared: SharedCheckpointSource = source.clone();
+        let prepared = PreparedCheckpointSource::new(
+            shared,
+            BTreeMap::from([(
+                "weight".into(),
+                PreparedTensorSource {
+                    metadata: metadata.clone(),
+                    provenance,
+                },
+            )]),
+        )
+        .unwrap();
+        self.counters.prepared_source.fetch_add(1, Ordering::SeqCst);
+        assert!(counters.metadata_reads.load(Ordering::SeqCst) > 0);
+        assert!(counters.provenance_reads.load(Ordering::SeqCst) > 0);
+        assert_eq!(counters.payload_reads.load(Ordering::SeqCst), 0);
+        assert_eq!(reference_trace().parameter_materializations, 0);
+
+        let mut substituted = metadata.clone();
+        substituted.logical_shape = vec![1, 2];
+        source.replace_metadata(substituted);
+        counters.reset();
+        clear_reference_trace();
+        let binding = WeightBinding::new("weight", "weight", selection.clone(), 4).unwrap();
+        assert!(materialize_bindings::<ReferenceBackend>(
+            &prepared,
+            std::slice::from_ref(&binding),
+            &()
+        )
+        .is_err());
+        assert!(counters.metadata_reads.load(Ordering::SeqCst) > 0);
+        assert_eq!(counters.payload_reads.load(Ordering::SeqCst), 0);
+        assert_eq!(reference_trace().parameter_materializations, 0);
+
+        source.replace_metadata(metadata);
+        counters.reset();
+        clear_reference_trace();
+        let materialized = materialize_bindings::<ReferenceBackend>(&prepared, &[binding], &())
+            .expect("independent backend materializes through the canonical prepared source");
+        assert_eq!(materialized.len(), 1);
+        assert_eq!(counters.payload_reads.load(Ordering::SeqCst), 1);
+        assert_eq!(reference_trace().parameter_materializations, 1);
+        self.counters.binding.fetch_add(1, Ordering::SeqCst);
+        let mut bound_module = IndependentBoundModule {
+            weight: ReferenceTensor(vec![1]),
+        };
+        bind_materialized_unit::<ReferenceBackend, _>(&mut bound_module, materialized).unwrap();
+        assert_eq!(bound_module.weight, ReferenceTensor(vec![1]));
+        let make_resources = |causal_value, omit_route_resources| {
+            Rc::new(IndependentAuthorityResources {
+                bound_module: bound_module.clone(),
+                placement: selection.clone(),
+                communication: prepared_communication.clone(),
+                construction_uses: Cell::new(0),
+                group_callbacks: Cell::new(0),
+                route_callbacks: Cell::new(0),
+                bound_value_trace: RefCell::new(Vec::new()),
+                causal_value,
+                executed_outputs: RefCell::new(Vec::new()),
+                group_resources: RefCell::new(Vec::new()),
+                route_resources: RefCell::new(Vec::new()),
+                omit_route_resources,
+            })
+        };
+        let resources = make_resources(2, false);
+
+        let realized = Rc::new(RefCell::new(None));
+        let summary = run_reference_scenario_with_authority(
+            tiny_config(),
+            LayerWeightResidency::LayerwiseHost(Default::default()),
+            None,
+            Some(IndependentSessionAuthority {
+                inspection: artifact_inspection.clone(),
+                admission,
+                admitted_report: admitted_report.clone(),
+                resources: resources.clone(),
+                realized: realized.clone(),
+            }),
+        );
+        assert_eq!(summary.state_layers, 2);
+        let realized = realized
+            .borrow_mut()
+            .take()
+            .expect("the constructed and executed session must publish realized authority");
+        assert_eq!(realized.capabilities, admission.session_capabilities());
+        assert_eq!(realized.report, admitted_report);
+        assert!(resources.construction_uses.get() > 0);
+        assert_eq!(
+            resources.group_callbacks.get(),
+            resources.communication.manifest().groups().len()
+        );
+        assert_eq!(
+            resources.route_callbacks.get(),
+            resources.communication.manifest().routes().len()
+        );
+        assert_eq!(resources.bound_value_trace.borrow().as_slice(), &[1, 1]);
+        assert_eq!(
+            realized.scheduler_capabilities.limits.max_active_requests,
+            1
+        );
+        assert!(!realized
+            .scheduler_capabilities
+            .non_preemptible_interval
+            .is_empty());
+        assert!(realized.scheduler_report.submitted_work > 0);
+        assert_eq!(realized.executed_outputs.len(), 2);
+
+        let alternative_resources = make_resources(3, false);
+        let alternative_realized = Rc::new(RefCell::new(None));
+        let alternative_summary = run_reference_scenario_with_authority(
+            tiny_config(),
+            LayerWeightResidency::LayerwiseHost(Default::default()),
+            None,
+            Some(IndependentSessionAuthority {
+                inspection: artifact_inspection.clone(),
+                admission,
+                admitted_report: admitted_report.clone(),
+                resources: alternative_resources.clone(),
+                realized: alternative_realized.clone(),
+            }),
+        );
+        let alternative_realized = alternative_realized.borrow_mut().take().unwrap();
+        assert_ne!(
+            summary.random_after_sampled,
+            alternative_summary.random_after_sampled
+        );
+        assert_ne!(
+            summary.random_after_forced,
+            alternative_summary.random_after_forced
+        );
+        assert_eq!(alternative_realized.executed_outputs.len(), 2);
+        assert_eq!(alternative_realized.report, admitted_report);
+        assert!(alternative_resources.construction_uses.get() > 0);
+        assert_eq!(
+            alternative_resources.group_callbacks.get(),
+            alternative_resources
+                .communication
+                .manifest()
+                .groups()
+                .len()
+        );
+        assert_eq!(
+            alternative_resources.route_callbacks.get(),
+            alternative_resources
+                .communication
+                .manifest()
+                .routes()
+                .len()
+        );
+        let missing_resources = make_resources(4, true);
+        let missing_realized = Rc::new(RefCell::new(None));
+        let error = try_run_reference_scenario_with_authority(
+            tiny_config(),
+            LayerWeightResidency::LayerwiseHost(Default::default()),
+            None,
+            Some(IndependentSessionAuthority {
+                inspection: artifact_inspection,
+                admission,
+                admitted_report: admitted_report.clone(),
+                resources: missing_resources.clone(),
+                realized: missing_realized.clone(),
+            }),
+        )
+        .unwrap_err();
+        assert!(error.contains("prepared communication resources are incomplete"));
+        assert!(missing_realized.borrow().is_none());
+        assert!(missing_resources.route_resources.borrow().is_empty());
+        self.counters.session.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[test]
+fn bounded_independent_adapter_consumes_the_complete_neutral_preparation_stack() {
+    let adapter = BoundedIndependentAdapter::default();
+    adapter.run();
+    assert_eq!(adapter.counters.artifact_identity.load(Ordering::SeqCst), 1);
+    assert_eq!(adapter.counters.image_processing.load(Ordering::SeqCst), 1);
+    assert_eq!(adapter.counters.audio_processing.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        adapter.counters.inspection_admission.load(Ordering::SeqCst),
+        1
+    );
+    assert_eq!(
+        adapter
+            .counters
+            .placement_communication
+            .load(Ordering::SeqCst),
+        1
+    );
+    assert_eq!(adapter.counters.prepared_source.load(Ordering::SeqCst), 1);
+    assert_eq!(adapter.counters.binding.load(Ordering::SeqCst), 1);
+    assert_eq!(adapter.counters.session.load(Ordering::SeqCst), 1);
 }
 
 #[cfg(test)]

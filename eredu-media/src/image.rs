@@ -1,8 +1,16 @@
 //! Shared decoded-image validation and transforms.
 
+#[cfg(feature = "image")]
 use image::{imageops::FilterType, ImageBuffer, Rgb};
 
-use crate::backend::error::Error;
+use crate::{MediaError, ProcessedMediaDtype};
+
+/// Memory order of a normalized RGB output buffer.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum NormalizedImageLayout {
+    /// Contiguous `[channels, height, width]` order.
+    ChannelsHeightWidth,
+}
 
 /// Borrowed RGB8 image pixels.
 #[derive(Debug, Clone, Copy)]
@@ -15,7 +23,7 @@ pub struct RgbImageView<'a> {
 
 impl<'a> RgbImageView<'a> {
     /// Creates an RGB8 image view with tightly packed rows.
-    pub fn packed(pixels: &'a [u8], width: u32, height: u32) -> Result<Self, Error> {
+    pub fn packed(pixels: &'a [u8], width: u32, height: u32) -> Result<Self, MediaError> {
         let row_stride = width as usize * 3;
         Self::with_row_stride(pixels, width, height, row_stride)
     }
@@ -26,24 +34,24 @@ impl<'a> RgbImageView<'a> {
         width: u32,
         height: u32,
         row_stride: usize,
-    ) -> Result<Self, Error> {
+    ) -> Result<Self, MediaError> {
         if width == 0 || height == 0 {
-            return Err(Error::Processor(format!(
+            return Err(MediaError::invalid(format!(
                 "image dimensions must be positive, got {width}x{height}"
             )));
         }
         let packed_stride = width as usize * 3;
         if row_stride < packed_stride {
-            return Err(Error::Processor(format!(
+            return Err(MediaError::invalid(format!(
                 "RGB8 row stride {row_stride} is smaller than packed row size {packed_stride}"
             )));
         }
         let required = row_stride
             .checked_mul(height.saturating_sub(1) as usize)
             .and_then(|prefix| prefix.checked_add(packed_stride))
-            .ok_or_else(|| Error::Processor("image buffer dimensions overflow".to_string()))?;
+            .ok_or_else(|| MediaError::invalid("image buffer dimensions overflow"))?;
         if pixels.len() < required {
-            return Err(Error::Processor(format!(
+            return Err(MediaError::invalid(format!(
                 "RGB8 image requires at least {required} bytes, got {}",
                 pixels.len()
             )));
@@ -117,7 +125,7 @@ impl RgbImage {
 }
 
 /// Owned normalized image in channel-first `[channels, height, width]` order.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct NormalizedImage {
     data: Vec<f32>,
     channels: usize,
@@ -126,6 +134,21 @@ pub struct NormalizedImage {
 }
 
 impl NormalizedImage {
+    /// Scalar dtype of every value.
+    pub const fn dtype(&self) -> ProcessedMediaDtype {
+        ProcessedMediaDtype::F32
+    }
+
+    /// Explicit memory layout.
+    pub const fn layout(&self) -> NormalizedImageLayout {
+        NormalizedImageLayout::ChannelsHeightWidth
+    }
+
+    /// Logical `[channels, height, width]` shape.
+    pub const fn shape(&self) -> [usize; 3] {
+        [self.channels, self.height, self.width]
+    }
+
     /// Returns normalized channel-first pixels.
     pub fn data(&self) -> &[f32] {
         &self.data
@@ -157,9 +180,28 @@ pub fn resize_rgb8_bicubic(
     image: RgbImageView<'_>,
     width: u32,
     height: u32,
-) -> Result<RgbImage, Error> {
+) -> Result<RgbImage, MediaError> {
+    #[cfg(feature = "image")]
+    {
+        resize_rgb8_bicubic_enabled(image, width, height)
+    }
+    #[cfg(not(feature = "image"))]
+    {
+        let _ = (image, width, height);
+        Err(MediaError::invalid(
+            "Catmull-Rom RGB resize requires the `image` feature",
+        ))
+    }
+}
+
+#[cfg(feature = "image")]
+fn resize_rgb8_bicubic_enabled(
+    image: RgbImageView<'_>,
+    width: u32,
+    height: u32,
+) -> Result<RgbImage, MediaError> {
     if width == 0 || height == 0 {
-        return Err(Error::Processor(format!(
+        return Err(MediaError::invalid(format!(
             "resize dimensions must be positive, got {width}x{height}"
         )));
     }
@@ -172,7 +214,7 @@ pub fn resize_rgb8_bicubic(
     }
     let source =
         ImageBuffer::<Rgb<u8>, Vec<u8>>::from_raw(image.width, image.height, image.packed_pixels())
-            .ok_or_else(|| Error::Processor("failed to construct RGB8 image buffer".to_string()))?;
+            .ok_or_else(|| MediaError::invalid("failed to construct RGB8 image buffer"))?;
     let resized = image::imageops::resize(&source, width, height, FilterType::CatmullRom);
     Ok(RgbImage {
         pixels: resized.into_raw(),
@@ -186,9 +228,28 @@ pub fn resize_rgb8_lanczos3(
     image: RgbImageView<'_>,
     width: u32,
     height: u32,
-) -> Result<RgbImage, Error> {
+) -> Result<RgbImage, MediaError> {
+    #[cfg(feature = "image")]
+    {
+        resize_rgb8_lanczos3_enabled(image, width, height)
+    }
+    #[cfg(not(feature = "image"))]
+    {
+        let _ = (image, width, height);
+        Err(MediaError::invalid(
+            "Lanczos3 RGB resize requires the `image` feature",
+        ))
+    }
+}
+
+#[cfg(feature = "image")]
+fn resize_rgb8_lanczos3_enabled(
+    image: RgbImageView<'_>,
+    width: u32,
+    height: u32,
+) -> Result<RgbImage, MediaError> {
     if width == 0 || height == 0 {
-        return Err(Error::Processor(format!(
+        return Err(MediaError::invalid(format!(
             "resize dimensions must be positive, got {width}x{height}"
         )));
     }
@@ -201,7 +262,7 @@ pub fn resize_rgb8_lanczos3(
     }
     let source =
         ImageBuffer::<Rgb<u8>, Vec<u8>>::from_raw(image.width, image.height, image.packed_pixels())
-            .ok_or_else(|| Error::Processor("failed to construct RGB8 image buffer".to_string()))?;
+            .ok_or_else(|| MediaError::invalid("failed to construct RGB8 image buffer"))?;
     let resized = image::imageops::resize(&source, width, height, FilterType::Lanczos3);
     Ok(RgbImage {
         pixels: resized.into_raw(),
@@ -216,14 +277,19 @@ pub fn rescale_and_normalize_rgb8(
     rescale_factor: f32,
     mean: [f32; 3],
     std: [f32; 3],
-) -> Result<NormalizedImage, Error> {
+) -> Result<NormalizedImage, MediaError> {
     if !rescale_factor.is_finite() {
-        return Err(Error::Processor(format!(
+        return Err(MediaError::invalid(format!(
             "image rescale factor must be finite, got {rescale_factor}"
         )));
     }
+    if mean.iter().any(|value| !value.is_finite()) {
+        return Err(MediaError::invalid(format!(
+            "image normalization means must be finite, got {mean:?}"
+        )));
+    }
     if std.iter().any(|value| *value == 0.0 || !value.is_finite()) {
-        return Err(Error::Processor(format!(
+        return Err(MediaError::invalid(format!(
             "image normalization standard deviations must be finite and nonzero, got {std:?}"
         )));
     }
@@ -235,7 +301,13 @@ pub fn rescale_and_normalize_rgb8(
         for x in 0..width {
             for channel in 0..3 {
                 let value = row[x * 3 + channel] as f32 * rescale_factor;
-                data[(channel * height + y) * width + x] = (value - mean[channel]) / std[channel];
+                let normalized = (value - mean[channel]) / std[channel];
+                if !normalized.is_finite() {
+                    return Err(MediaError::invalid(
+                        "image normalization produced a non-finite value",
+                    ));
+                }
+                data[(channel * height + y) * width + x] = normalized;
             }
         }
     }
@@ -247,9 +319,11 @@ pub fn rescale_and_normalize_rgb8(
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "image"))]
 mod tests {
-    use super::{rescale_and_normalize_rgb8, resize_rgb8_bicubic, RgbImageView};
+    use super::{
+        rescale_and_normalize_rgb8, resize_rgb8_bicubic, resize_rgb8_lanczos3, RgbImageView,
+    };
 
     #[test]
     fn image_view_honors_row_stride() {
@@ -265,5 +339,39 @@ mod tests {
         let view = RgbImageView::with_row_stride(&pixels, 1, 2, 4).unwrap();
         let resized = resize_rgb8_bicubic(view, 1, 2).unwrap();
         assert_eq!(resized.pixels(), &[1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn catmull_rom_and_lanczos3_match_characterized_pixels() {
+        let pixels = [255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255];
+        let view = RgbImageView::packed(&pixels, 2, 2).unwrap();
+        let bicubic = resize_rgb8_bicubic(view, 3, 3).unwrap();
+        let lanczos = resize_rgb8_lanczos3(view, 3, 3).unwrap();
+        assert_eq!(
+            bicubic.pixels(),
+            [
+                255, 0, 0, 127, 127, 0, 0, 255, 0, 127, 0, 127, 128, 128, 128, 128, 255, 128, 0, 0,
+                255, 128, 128, 255, 255, 255, 255,
+            ]
+        );
+        assert_eq!(
+            lanczos.pixels(),
+            [
+                255, 0, 0, 128, 128, 0, 0, 255, 0, 128, 0, 128, 128, 128, 128, 128, 255, 128, 0, 0,
+                255, 128, 128, 255, 255, 255, 255,
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_views_resize_and_normalization() {
+        assert!(RgbImageView::packed(&[], 0, 1).is_err());
+        assert!(RgbImageView::with_row_stride(&[0; 6], 2, 1, 5).is_err());
+        assert!(RgbImageView::with_row_stride(&[0; 5], 2, 1, 6).is_err());
+        let view = RgbImageView::packed(&[0, 0, 0], 1, 1).unwrap();
+        assert!(resize_rgb8_bicubic(view, 0, 1).is_err());
+        assert!(rescale_and_normalize_rgb8(view, f32::NAN, [0.0; 3], [1.0; 3]).is_err());
+        assert!(rescale_and_normalize_rgb8(view, 1.0, [f32::NAN; 3], [1.0; 3]).is_err());
+        assert!(rescale_and_normalize_rgb8(view, 1.0, [0.0; 3], [0.0; 3]).is_err());
     }
 }

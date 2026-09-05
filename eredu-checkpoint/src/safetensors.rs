@@ -29,6 +29,7 @@ pub(crate) const MAX_HEADER_BYTES: u64 = 100_000_000;
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct SafetensorsShards {
     payload_paths: Vec<PathBuf>,
+    logical_payload_paths: BTreeMap<String, PathBuf>,
     tensor_locations: Option<BTreeMap<String, PathBuf>>,
 }
 
@@ -61,7 +62,8 @@ impl SafetensorsShards {
         }
         let payload = canonicalize(path)?;
         Ok(Self {
-            payload_paths: vec![payload],
+            payload_paths: vec![payload.clone()],
+            logical_payload_paths: BTreeMap::from([("weights".into(), payload)]),
             tensor_locations: None,
         })
     }
@@ -72,7 +74,8 @@ impl SafetensorsShards {
         if !index_path.exists() {
             let payload = admit_payload(&root.join("model.safetensors"), &access_root)?;
             return Ok(Self {
-                payload_paths: vec![payload],
+                payload_paths: vec![payload.clone()],
+                logical_payload_paths: BTreeMap::from([("weights".into(), payload)]),
                 tensor_locations: None,
             });
         }
@@ -92,6 +95,7 @@ impl SafetensorsShards {
         }
 
         let mut payload_paths = BTreeSet::new();
+        let mut logical_payload_paths = BTreeMap::new();
         let mut tensor_locations = BTreeMap::new();
         for (tensor, relative) in index.weight_map.0 {
             if tensor.is_empty() {
@@ -103,10 +107,12 @@ impl SafetensorsShards {
             let relative = validate_relative_shard_path(Path::new(&relative))?;
             let payload = admit_payload(&root.join(relative), &access_root)?;
             payload_paths.insert(payload.clone());
+            logical_payload_paths.insert(relative.to_string_lossy().into_owned(), payload.clone());
             tensor_locations.insert(tensor, payload);
         }
         Ok(Self {
             payload_paths: payload_paths.into_iter().collect(),
+            logical_payload_paths,
             tensor_locations: Some(tensor_locations),
         })
     }
@@ -114,6 +120,15 @@ impl SafetensorsShards {
     /// Returns the canonical, deterministically ordered payload paths.
     pub fn payload_paths(&self) -> &[PathBuf] {
         &self.payload_paths
+    }
+
+    /// Returns location-independent logical shard roles paired with admitted paths.
+    ///
+    /// Indexed artifacts retain the relative member names from the admitted
+    /// index even when snapshot symlinks resolve outside the submitted
+    /// directory. Direct artifacts use the stable semantic role `weights`.
+    pub fn logical_payload_paths(&self) -> &BTreeMap<String, PathBuf> {
+        &self.logical_payload_paths
     }
 
     /// Consumes the discovery result into canonical payload paths.
@@ -899,5 +914,9 @@ mod tests {
 
         let shards = SafetensorsShards::discover(&snapshot).unwrap();
         assert_eq!(shards.payload_paths(), [blob.canonicalize().unwrap()]);
+        assert_eq!(
+            shards.logical_payload_paths(),
+            &BTreeMap::from([("weights".into(), blob.canonicalize().unwrap())])
+        );
     }
 }

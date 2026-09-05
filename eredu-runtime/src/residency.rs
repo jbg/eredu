@@ -38,6 +38,32 @@ pub struct WeightMaterializationReport {
     pub largest_output_tile_bytes: u64,
 }
 
+impl WeightMaterializationReport {
+    /// Merges one independent materialization pass into this aggregate.
+    ///
+    /// Additive counters retain the total work while capacity and peak fields
+    /// retain the greatest requirement observed by any pass.
+    pub fn merge(&mut self, next: Self) {
+        self.admitted_working_set_bytes = self
+            .admitted_working_set_bytes
+            .max(next.admitted_working_set_bytes);
+        self.transformed_weights += next.transformed_weights;
+        self.source_tiles += next.source_tiles;
+        self.peak_in_flight_tiles = self.peak_in_flight_tiles.max(next.peak_in_flight_tiles);
+        self.source_bytes_read += next.source_bytes_read;
+        self.output_bytes += next.output_bytes;
+        self.peak_planned_working_set_bytes = self
+            .peak_planned_working_set_bytes
+            .max(next.peak_planned_working_set_bytes);
+        self.largest_source_tile_bytes = self
+            .largest_source_tile_bytes
+            .max(next.largest_source_tile_bytes);
+        self.largest_output_tile_bytes = self
+            .largest_output_tile_bytes
+            .max(next.largest_output_tile_bytes);
+    }
+}
+
 /// Immutable residency-control and checkpoint-storage telemetry snapshot.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ResidencyReport {

@@ -7,8 +7,8 @@ and an execution backend. It is intended for backend authors and maintainers of
 ## Dependency direction
 
 ```text
-eredu-core        eredu-checkpoint        eredu-nn
-        \                |                /    \
+eredu-core / eredu-checkpoint / eredu-nn / eredu-media
+                           |
                      eredu-runtime ---- eredu-codec
                            |
                    eredu-architectures
@@ -25,9 +25,12 @@ transforms, serialization, host-resource observations, and accelerator/runtime
 handles. It owns no
 framework abstractions: neural-network modules, quantization policy, mutable
 execution state, GGUF materialization, and composed backend operations belong
-to `eredu-backend-mlx`. This includes logical distributed subgroups and
-axis-aware gathers composed over MLX's native collective primitives;
+to `eredu-backend-mlx`. This includes native distributed groups and axis-aware
+gathers composed over MLX's native collective primitives;
 `safemlx::distributed` exposes only MLX-native groups and communication calls.
+Logical rank placement, communication manifests, routes, validation, and
+realization-wave proofs belong to `eredu-runtime`; the MLX backend realizes
+only the prepared native groups and routes.
 Model-family construction and equations remain in
 `eredu-architectures`; MLX-specific realization remains in
 `eredu-backend-mlx`.
@@ -38,6 +41,10 @@ Concrete backends implement general checkpoint materialization, recipe,
 completion, and binding mechanisms without depending on a codec family.
 Application composition combines a prepared codec artifact with those generic
 mechanisms and receives the ordinary neutral codec type.
+`eredu-media` owns deterministic host audio, image, and video validation and
+processing. Its image and audio implementations are optional portable
+features. Architecture-owned processor requests select the semantics; a
+backend converts the resulting owned buffers to native tensors.
 The workspace forbids unsafe Rust in every package except the native `safemlx`
 wrapper, its raw `safemlx-sys` bindings, and the `eredu-ios` C-ABI example.
 Unsafe MLX and operating-system calls remain encapsulated by safe `safemlx`
@@ -61,8 +68,9 @@ the [MLX backend](../eredu-backend-mlx/doc/README.md).
 Backend-internal
 fixtures and composition tests are crate-private unit tests; published crates
 expose no test-support feature or fixture namespace. The facade does not
-directly depend on `eredu-nn` or `eredu-checkpoint`. Media processing is enabled
-only through concrete image or audio capabilities. Backend feature diagnostics
+directly depend on `eredu-nn`, `eredu-checkpoint`, or `eredu-media`. Portable
+media algorithms are enabled through narrowly forwarded image or audio
+features; a concrete backend feature adds only native conversion. Backend feature diagnostics
 name the active public spelling; published Cargo features are selectable API,
 not a privacy mechanism.
 
@@ -87,7 +95,8 @@ backend consumers import neutral contracts from their owning crates.
 The facade does not re-export dependency-owned types. Architecture identities
 and preparation plans come from `eredu-architectures`; artifact, execution,
 generation, media, realtime, scheduler, and prompt-cache contracts come from
-`eredu-core`; tokenizer contracts come from `eredu-text`; and runtime
+`eredu-core`; processed host media buffers come from `eredu-media`; tokenizer
+contracts come from `eredu-text`; and runtime
 infrastructure comes from `eredu-runtime`. This gives every public type one
 canonical import path and prevents a facade release from committing to aliases
 for operations it does not own. In particular, the facade exposes no
@@ -203,17 +212,25 @@ examples; they do not live under the facade.
 Portable crates split tensor-independent ownership by responsibility:
 
 - `eredu-checkpoint` owns canonical SafeTensors index parsing, exact
-  index-to-shard-header validation, and shard-path admission. Inspection and
+  index-to-shard-header validation, shard-path admission, and stable
+  filesystem-backed content fingerprinting. Inspection and
   conversion tooling consume strict discovery, while neutral stores consume
   the same parsed and admitted catalog but validate each opened payload header
   exactly and lazily, so selective loads detect every mismatch in a local shard
-  without reading remote-only shards. None reinterpret
-  `weight_map`;
-- artifact identity, header inspection, the model-configuration resolver
-  contract, tensor catalogs, and preparation plans live in `eredu-core`;
-- validated attention schedules and parallel topologies;
-- model capabilities, resource requirements, admission decisions, execution
-  plans, and telemetry schemas;
+  without reading remote-only shards. None reinterpret `weight_map`.
+  `PreparedCheckpointSource` binds exact catalog, provenance, admitted shard
+  identity snapshots, selections, and lease geometry without retaining a file
+  descriptor per shard. After complete recipe and destination preflight, the
+  requested shard is reopened and validated, and matching reads admit only the
+  exact selected ranges; immutable cached bytes back every published lease;
+- the canonical in-memory content identity value and logical-member combining
+  algorithm, header inspection, the
+  model-configuration resolver contract, tensor catalogs, preparation plans,
+  backend mechanism-capability admission, and reusable inspection-report
+  assembly live in `eredu-core`;
+- portable host audio, image, and video processing lives in `eredu-media`;
+- validated attention schedules, parallel topologies, model capabilities,
+  resource requirements, execution plans, and telemetry schemas;
 - generation budgets, committed-token order, finish reasons, cancellation,
   semantic output events, and constrained-token filters;
 - speculative proposal, verification, acceptance, rollback, and publication
@@ -224,8 +241,11 @@ Portable crates split tensor-independent ownership by responsibility:
   generations, and I/O coordination;
 - prompt-cache identity, manifests, compatibility, and catalog validation;
 - decoded image, audio, and video values plus ordered multimodal requests; and
-- distributed scopes, topology membership, placement, consensus messages, and
-  operation capability descriptions.
+- distributed scopes, topology membership, consensus messages, and operation
+  capability descriptions; and
+- canonical parameter-binding plans, generic module binding, logical tensor
+  placement, communication-manifest validation, task partitioning, report
+  aggregation, and reusable session construction live in `eredu-runtime`.
 
 The facade owns text-tokenizer reconstruction, chat-template interpretation,
 and generation-termination policy, including EOS metadata from model sidecars
@@ -255,14 +275,26 @@ only the selected assistant tasks, and bind the selected native placement; they
 decide neither tokenizer nor architecture compatibility.
 
 `eredu-runtime` owns statically dispatched resident and bounded execution,
-parameter binding, residency, mutable state, exact completion, distributed-plan
-realization, and generation-facing causal-model contracts.
+the singular declarative parameter-binding and logical placement plans,
+generic module binding, residency, mutable state, exact completion, neutral
+communication preparation, reusable session construction, and
+generation-facing causal-model contracts. Backends retain native recipe
+lowering, tensors, storage, streams, completions, groups, transfers, and
+collective scheduling.
 
 `eredu-architectures` owns model-family configuration, checkpoint contracts,
 parameter topology, module construction, state geometry, parallel semantic
 plans, and the complete embedding/layer/output lifecycle. Architecture code is
 generic over `NeuralBackend` and passes backend-native tensor handles through
 unchanged.
+
+Portable preparation admission keeps architecture requirements, admitted
+artifact facts, caller policy, and backend mechanism capabilities as separate
+inputs. `eredu-core` intersects them once into an immutable retained admission
+or a structured rejection before payload access and native resource creation.
+Inspection and realized sessions assemble capability and readiness reports from
+that same retained admission; a backend may discover support facts but does not
+recompute the portable decision after resources exist.
 
 Replicated text composition has one checked cross-crate construction flow and
 one backend-neutral execution/session implementation. `eredu-architectures`
@@ -711,6 +743,14 @@ neutral `Parameterized` topology, including when native storage uses private
 module slots. Generic binding, residency, and distributed-planning utilities
 accept that topology rather than a backend module's raw physical parameter
 tree, consume its exact identities, and never normalize path segments. A
+single `eredu-runtime` binding-plan vocabulary records the stable target,
+expected shape, dtype and bytes, direct or derived source, explicit source
+sharing, overlays, exclusions, and rank ownership. Its generic
+`ParameterBackend` orchestration preflights every recipe and immutable/mutable
+module traversal before payload or native work, completes all materialization,
+then validates and publishes the whole binding atomically. Layerwise and
+addressable-bank executors reuse the same declarations while retaining their
+backend-owned leases, storage, movement, and scheduling. A
 concrete backend must not expose its physical-slot traversal, parameter
 wrappers, training/freezing state, or nested parameter maps as a second public
 parameter framework. Composition-facing backend types implement only the
@@ -1304,11 +1344,14 @@ Audio feature plans specify the analysis window, exact padding and frame-count
 convention, frequency bounds, mel scale and normalization, spectrum value, and
 logarithm as well as their dimensions and floors.
 `PreparedProcessor` interprets that plan over `ProcessorMechanisms`. The
-mechanisms normalize pixels, extract requested audio features, inspect small
-metadata values, and construct native tensors; architecture code owns frame
+architecture layer first executes every host transformation through
+`eredu-media`, validating the complete input before any native conversion.
+`ProcessorMechanisms` receives typed processed buffers and constructs native
+tensors or inspects small native metadata values; architecture code owns frame
 selection, patch packing, framing order, metadata, and the ordered
-`PreparedModelInput`. A new backend therefore supplies media and tensor
-mechanisms without implementing a family processor.
+`PreparedModelInput`. A new backend therefore supplies tensor conversion and
+inspection mechanisms without implementing preprocessing mathematics or a
+family processor.
 
 Replicated composite selection combines the exact replicated-text realization
 with one `SelectedProcessorExecution`. It admits raw media, prepared tensors,
@@ -2309,8 +2352,11 @@ after exact event completion. Unsupported distributed graphs fail during
 architecture admission before manifest realization, payload access, or native
 group construction; there is no backend pipeline or expert bridge fallback.
 
-Opaque MLX setup acquires the process runtime lock through the manifest's
-absolute submission deadline and rechecks it immediately before the first
+Neutral communication preparation first proves complete compatible manifests,
+operation capabilities, logical reachability, and complete-world group and
+route waves without creating native resources. Opaque MLX setup then acquires
+the process runtime lock through the prepared manifest's absolute submission
+deadline and rechecks it immediately before the first
 array, frame, or collective graph mutation. Lock contention therefore fails
 before native submission and poisons the one partition-communication authority.
 Manifest-owned subgroup realization never enters upstream MLX's synchronous,
@@ -2319,8 +2365,8 @@ world handle. A logical view may use a world-wide operation only when manifest
 consensus proves that the creation batch partitions every world rank into
 same-requirement groups; non-neighbor route relays additionally require a
 disjoint, contract-identical route batch covering the world. Partial,
-overlapping, optional, or contract-mismatched batches fail before native
-submission. A variable all-to-all in such a proven wave expands each logical
+overlapping, optional, unreachable, or contract-mismatched batches fail in
+neutral preparation before any native callback. A variable all-to-all in such a proven wave expands each logical
 peer-count vector into world-rank order with exact zero counts for nonmembers,
 submits one native world operation on every rank, and restores the opaque
 member order after exact event completion. All ranks must invoke creation-order
@@ -2424,6 +2470,9 @@ builds:
   the same target drives the distinct neutral speculative and realtime
   lifecycles, including Moshi and PersonaPlex; a synthetic typed architecture
   extension reaches those existing mechanisms without a backend family case;
+  bounded independent adapters also consume canonical artifact/prepared-source,
+  host-media, binding, admission/report, replicated-session, and logical
+  placement facilities without implementing those algorithms;
 - native facade integration tests compile the published facade target normally,
   while backend composition coverage remains in crate-private backend unit
   tests; and

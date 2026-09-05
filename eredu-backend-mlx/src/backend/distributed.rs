@@ -624,8 +624,8 @@ impl DistributedSession for MlxDistributedSession {
 
     fn descriptor(&self) -> DistributedSessionDescriptor {
         DistributedSessionDescriptor::new(
-            self.communicators.realization().world_size(),
-            self.communicators.realization().global_rank(),
+            self.communicators.world_size(),
+            self.communicators.global_rank(),
             self.communicators.descriptors(),
         )
         .expect("MLX collective realization is validated")
@@ -771,7 +771,7 @@ impl eredu_core::consensus::ConsensusTransport for MlxDistributedSession {
     type Error = Error;
 
     fn participant_count(&self) -> usize {
-        self.communicators.realization().world_size()
+        self.communicators.world_size()
     }
 
     fn all_gather_words(&self, local: &[u32]) -> Result<Vec<u32>, Self::Error> {

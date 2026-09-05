@@ -902,14 +902,11 @@ pub trait ModelLoadingBackend: BackendProvider {
         policy: PreparationPolicy,
     ) -> Result<Self::SelectedPreparation, Self::Error>;
 
-    /// Derives exact session capabilities from header/configuration state only.
-    fn session_capabilities(
+    /// Returns the exact session report retained by the authoritative selection.
+    fn selected_session_capabilities(
         &self,
-        inspection: &ArtifactInspection<
-            <Self::ConfigurationResolver as ModelConfigurationResolver>::ArtifactPlan,
-        >,
-        policy: PreparationPolicy,
-    ) -> Result<SessionCapabilities, Self::Error>;
+        selected: &Self::SelectedPreparation,
+    ) -> SessionCapabilities;
 
     /// Binds a neutral preparation plan and its authoritative selected
     /// realization to backend-owned materialization input.
@@ -1009,9 +1006,7 @@ pub fn prepare_inspected_model<B: ModelLoadingBackend>(
     let selected = backend
         .select_preparation(&inspection, &options, policy)
         .map_err(ModelLoadError::Backend)?;
-    let capabilities = backend
-        .session_capabilities(&inspection, policy)
-        .map_err(ModelLoadError::Backend)?;
+    let capabilities = backend.selected_session_capabilities(&selected);
     policy
         .validate_session_capabilities(&capabilities)
         .map_err(ModelLoadError::SessionCapability)?;
@@ -1989,6 +1984,7 @@ mod tests {
 
     #[derive(Default)]
     struct LoadingMock {
+        selections: std::sync::atomic::AtomicUsize,
         materializations: std::sync::atomic::AtomicUsize,
     }
     struct LoadingMockSession;
@@ -2165,15 +2161,16 @@ mod tests {
             options: &Self::LoadOptions,
             _: PreparationPolicy,
         ) -> Result<Self::SelectedPreparation, Self::Error> {
+            self.selections
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(*options)
         }
 
-        fn session_capabilities(
+        fn selected_session_capabilities(
             &self,
-            _: &ArtifactInspection,
-            _: PreparationPolicy,
-        ) -> Result<SessionCapabilities, Self::Error> {
-            Ok(SessionCapabilities::default())
+            _: &Self::SelectedPreparation,
+        ) -> SessionCapabilities {
+            SessionCapabilities::default()
         }
 
         fn model_config(
@@ -2436,6 +2433,12 @@ mod tests {
             ModelLoadError::SessionCapability(error)
                 if error.capability() == "activation_inspection"
         ));
+        assert_eq!(
+            backend
+                .selections
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
         assert_eq!(
             backend
                 .materializations

@@ -1,6 +1,6 @@
 [package]
 name = "eredu-backend-mlx"
-version = "0.9.0"
+version = "0.10.0"
 edition.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -49,8 +49,8 @@ accelerate = ["safemlx/accelerate"]
 metal = ["safemlx/metal"]
 cuda = ["safemlx/cuda"]
 nccl = ["cuda", "safemlx/nccl"]
-image = ["dep:image"]
-audio = ["dep:rustfft"]
+image = ["eredu-architectures/image"]
+audio = ["eredu-architectures/audio"]
 
 [lints]
 workspace = true
@@ -70,8 +70,6 @@ safetensors = "0.8"
 half.workspace = true
 sha2.workspace = true
 thiserror = "2"
-image = { version = "0.25", default-features = false, optional = true }
-rustfft = { version = "6", optional = true }
 smallvec = "1"
 ref-cast = "1"
 

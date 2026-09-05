@@ -1,45 +1,24 @@
 //! Side-effect-free MLX model artifact compatibility inspection.
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    path::{Path, PathBuf},
-};
+#[cfg(test)]
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 use crate::backend::runtime::checkpoint::gguf::GgufCheckpoint;
 #[cfg(test)]
 use eredu_architectures::GgufArchitecture;
+#[cfg(test)]
+use eredu_core::inspection::artifact_modalities;
+#[cfg(test)]
+use eredu_core::ArtifactModality;
+#[cfg(test)]
+use eredu_core::InputModalities;
 use eredu_core::{
-    checkpoint::TensorDtype, ArtifactFormat, ArtifactModality, ArtifactTensorEncoding,
-    InputModalities, InspectionIssue, InspectionIssueCode, InspectionReadiness,
-    InspectionRequirement, InspectionSeverity, ModelInspectionReport, Observed,
+    ArtifactFormat, InspectionIssueCode, InspectionReadiness, InspectionSeverity,
+    ModelInspectionReport,
 };
 
 use super::*;
-
-fn inspected_stored_dtype(dtype: &TensorDtype) -> eredu_checkpoint::StoredDtype {
-    use eredu_checkpoint::StoredDtype;
-    match dtype {
-        TensorDtype::Bool => StoredDtype::Bool,
-        TensorDtype::U8 => StoredDtype::U8,
-        TensorDtype::I8 => StoredDtype::I8,
-        TensorDtype::I16 => StoredDtype::I16,
-        TensorDtype::U16 => StoredDtype::U16,
-        TensorDtype::F16 => StoredDtype::F16,
-        TensorDtype::Bf16 => StoredDtype::BF16,
-        TensorDtype::I32 => StoredDtype::I32,
-        TensorDtype::U32 => StoredDtype::U32,
-        TensorDtype::F32 => StoredDtype::F32,
-        TensorDtype::F64 => StoredDtype::F64,
-        TensorDtype::I64 => StoredDtype::I64,
-        TensorDtype::U64 => StoredDtype::U64,
-        TensorDtype::Complex64 => StoredDtype::C64,
-        TensorDtype::Encoded(name) if name == "F8_E4M3" => StoredDtype::F8E4M3,
-        TensorDtype::Encoded(name) if name == "F4" => StoredDtype::F4,
-        TensorDtype::Encoded(name) if name == "F8_E8M0" => StoredDtype::F8E8M0,
-        TensorDtype::Encoded(name) if name == "F8_E5M2" => StoredDtype::F8E5M2,
-        TensorDtype::Encoded(name) => StoredDtype::Other(name.clone()),
-    }
-}
 
 /// Options applied while inspecting a model artifact.
 #[derive(Debug, Clone, Default)]
@@ -65,10 +44,11 @@ fn validate_exact_preparation(
         eredu_architectures::processor_plan::ArtifactArchitecturePlan,
     >,
     options: &MlxInspectionOptions,
-) -> Result<(), Error> {
+) -> Result<eredu_core::PreparationAdmission, Error> {
     let load = options.load();
     let policy = load.preparation_policy()?;
-    super::loading::select_preparation(inspection, load, policy).map(drop)
+    super::loading::select_preparation(inspection, load, policy)
+        .map(|selected| selected.admission())
 }
 
 /// Inspects a local SafeTensors model directory or GGUF checkpoint without
@@ -136,24 +116,9 @@ fn is_gguf_file(path: &Path) -> bool {
         .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
 }
 
-fn record_embedded_drafting(
-    report: &mut ModelInspectionReport,
-    capabilities: eredu_architectures::preparation::ArchitectureCapabilities,
-) {
-    report.resources.embedded_draft_layers = capabilities.embedded_draft_layers().map_or_else(
-        || Observed::unsupported("artifact convention does not expose embedded drafting"),
-        |layers| Observed::exact(layers, "normalized architecture configuration"),
-    );
-}
-
 fn prepared_projector(validated: &eredu_core::ValidatedGguf) -> Option<PathBuf> {
     let companion = validated.companion(&eredu_core::GgufCompanionRole::MediaProjector)?;
     Some(companion.path().to_owned())
-}
-
-fn mark_portable_gguf_admitted(report: &mut ModelInspectionReport) {
-    report.structural_binding = InspectionReadiness::Ready;
-    report.model_loadability = InspectionReadiness::Ready;
 }
 
 fn inspect_safetensors(path: &Path, options: MlxInspectionOptions) -> ModelInspectionReport {
@@ -176,70 +141,38 @@ fn inspect_selected_safetensors(
     options: MlxInspectionOptions,
 ) -> ModelInspectionReport {
     let path = portable.path();
-    let configuration = portable.configuration();
     let architecture_plan = portable.architecture_plan();
-    let catalog = portable.tensors();
-    report.container = InspectionReadiness::Ready;
-    report.model_family = Some(configuration.family().to_owned());
-    report.architecture = Some(configuration.effective_model_type().to_owned());
-    report.architecture_support = InspectionReadiness::Ready;
-    report.structural_binding = InspectionReadiness::Ready;
-    report.model_loadability = InspectionReadiness::Ready;
-    report.tensor_count = Some(catalog.len());
-    let mut shards = BTreeSet::new();
-    let mut encodings = BTreeSet::new();
-    let mut stored_tensor_bytes = Some(0_u64);
-    let mut largest_stored_tensor_bytes = 0_u64;
-    for tensor in catalog.descriptors() {
-        encodings.insert(format!("{:?}", inspected_stored_dtype(&tensor.dtype)));
-        if let Some(storage) = &tensor.storage {
-            shards.insert(storage.member.clone());
-            stored_tensor_bytes =
-                stored_tensor_bytes.and_then(|total| total.checked_add(storage.length));
-            largest_stored_tensor_bytes = largest_stored_tensor_bytes.max(storage.length);
-        } else {
-            stored_tensor_bytes = None;
-        }
-    }
-    report.checkpoint_shards = Some(shards.len());
-    report.tensor_encodings = encodings
-        .into_iter()
-        .map(|name| ArtifactTensorEncoding {
-            name,
-            ggml_type_code: None,
-        })
-        .collect();
-    match stored_tensor_bytes {
-        Some(total) => {
-            report.resources.stored_tensor_bytes =
-                Observed::exact(total, "authoritative SafeTensors tensor catalog");
-            report.resources.largest_stored_tensor_bytes = Observed::exact(
-                largest_stored_tensor_bytes,
-                "authoritative SafeTensors tensor catalog",
-            );
-        }
-        None => {
-            report.resources.stored_tensor_bytes =
-                Observed::unavailable("SafeTensors payload-byte catalog was incomplete");
-            report.resources.largest_stored_tensor_bytes =
-                Observed::unavailable("SafeTensors payload-byte catalog was incomplete");
-        }
-    }
-
     match eredu_architectures::preparation::prepared_safetensors_capabilities(
         architecture_plan
             .safetensors_architecture()
             .expect("SafeTensors inspection must retain its validated architecture plan"),
     ) {
-        Ok(capabilities) => {
-            record_embedded_drafting(&mut report, capabilities);
-            report.expected_modalities = artifact_modalities(capabilities.input_modalities());
-            match validate_exact_preparation(portable, &options) {
-                Ok(()) => report.requested_load = InspectionReadiness::Ready,
-                Err(error) => reject_load_policy(&mut report, &error),
+        Ok(capabilities) => match validate_exact_preparation(portable, &options) {
+            Ok(admission) => {
+                report = eredu_core::assemble_portable_model_inspection(
+                    portable,
+                    admission,
+                    capabilities.input_modalities(),
+                    capabilities.embedded_draft_layers(),
+                    Some((
+                        architecture_plan.has_processor(),
+                        eredu_core::MediaFeatureAvailability {
+                            image: cfg!(feature = "image"),
+                            audio: cfg!(feature = "audio"),
+                        },
+                    )),
+                );
             }
-            inspect_safetensors_media(&mut report, architecture_plan);
-        }
+            Err(error) => {
+                report.record_artifact_inspection(portable);
+                report.record_architecture_capabilities(
+                    capabilities.input_modalities(),
+                    capabilities.embedded_draft_layers(),
+                );
+                reject_load_policy(&mut report, &error);
+                inspect_safetensors_media(&mut report, architecture_plan);
+            }
+        },
         Err(error) => {
             report.architecture_support = InspectionReadiness::Invalid;
             report.model_loadability = InspectionReadiness::Invalid;
@@ -366,59 +299,6 @@ fn inspect_selected_gguf(
         .gguf_architecture()
         .expect("GGUF inspection must retain its architecture-owned identity");
     let checkpoint = GgufCheckpoint::from_portable(validated.checkpoint().clone());
-    report.container = InspectionReadiness::Ready;
-    report.model_family = Some(gguf_architecture.model_kind().canonical_name().into());
-    report.architecture = Some(gguf_architecture.metadata_name().into());
-    report.architecture_support = InspectionReadiness::Ready;
-    mark_portable_gguf_admitted(&mut report);
-    report.checkpoint_shards = Some(checkpoint.catalog().shards().len());
-    report.tensor_count = Some(checkpoint.catalog().logical_outputs().count());
-    report.gguf_versions = Some(
-        checkpoint
-            .catalog()
-            .shards()
-            .iter()
-            .map(|shard| shard.version())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect(),
-    );
-    report.tensor_encodings = checkpoint
-        .catalog()
-        .tensors()
-        .map(|tensor| tensor.descriptor().ggml_type)
-        .map(|encoding| (encoding.code(), format!("{encoding:?}")))
-        .collect::<BTreeMap<_, _>>()
-        .into_iter()
-        .map(|(code, name)| ArtifactTensorEncoding {
-            name,
-            ggml_type_code: Some(code),
-        })
-        .collect();
-    let mut stored_tensor_bytes = Some(0_u64);
-    let mut largest_stored_tensor_bytes = 0_u64;
-    for tensor in checkpoint.catalog().tensors() {
-        let bytes = tensor.descriptor().byte_len;
-        stored_tensor_bytes = stored_tensor_bytes.and_then(|total| total.checked_add(bytes));
-        largest_stored_tensor_bytes = largest_stored_tensor_bytes.max(bytes);
-    }
-    match stored_tensor_bytes {
-        Some(total) => {
-            report.resources.stored_tensor_bytes =
-                Observed::exact(total, "validated GGUF tensor descriptors");
-            report.resources.largest_stored_tensor_bytes = Observed::exact(
-                largest_stored_tensor_bytes,
-                "validated GGUF tensor descriptors",
-            );
-        }
-        None => {
-            report.resources.stored_tensor_bytes =
-                Observed::unavailable("GGUF payload-byte total overflowed u64");
-            report.resources.largest_stored_tensor_bytes =
-                Observed::unavailable("GGUF payload-byte catalog was incomplete");
-        }
-    }
-
     let metadata = crate::backend::runtime::checkpoint::load::gguf_metadata(&checkpoint);
     let composite_plan =
         eredu_architectures::preparation::gguf_composite_artifact_plan(gguf_architecture);
@@ -428,25 +308,50 @@ fn inspect_selected_gguf(
             .gguf_plan()
             .expect("GGUF inspection must retain its validated architecture plan"),
     );
-    record_embedded_drafting(&mut report, capabilities);
-    match validate_exact_preparation(portable, &options) {
-        Ok(()) => match options
+    let admitted = match validate_exact_preparation(portable, &options) {
+        Ok(admission) => match options
             .load()
             .weight_quantization()
             .and_then(|quantization| {
                 validate_gguf_quantization_source(&checkpoint, &metadata, quantization)
             }) {
-            Ok(()) => report.requested_load = InspectionReadiness::Ready,
-            Err(error) => reject_load_policy(&mut report, &error),
+            Ok(()) => Ok(admission),
+            Err(error) => Err(error),
         },
-        Err(error) => reject_load_policy(&mut report, &error),
+        Err(error) => Err(error),
+    };
+    match admitted {
+        Ok(admission) => {
+            report = eredu_core::assemble_portable_model_inspection(
+                portable,
+                admission,
+                capabilities.input_modalities(),
+                capabilities.embedded_draft_layers(),
+                None,
+            );
+        }
+        Err(error) => {
+            report.record_artifact_inspection(portable);
+            report.record_architecture_capabilities(
+                capabilities.input_modalities(),
+                capabilities.embedded_draft_layers(),
+            );
+            reject_load_policy(&mut report, &error);
+        }
     }
     let composition = inspect_gguf_projector(&mut report, path, composite_plan, validated);
-    report.expected_modalities = artifact_modalities(composite_plan.input_modalities(composition));
+    report.expected_modalities =
+        eredu_core::inspection::artifact_modalities(composite_plan.input_modalities(composition));
     if composition
         == eredu_architectures::preparation::GgufArtifactComposition::ValidatedMediaProjector
     {
-        report.multimodal = multimodal_feature_readiness(&report.expected_modalities);
+        report.multimodal = eredu_core::media_feature_readiness(
+            &report.expected_modalities,
+            eredu_core::MediaFeatureAvailability {
+                image: cfg!(feature = "image"),
+                audio: cfg!(feature = "audio"),
+            },
+        );
     }
 
     report
@@ -457,103 +362,7 @@ fn reject_portable_gguf(
     path: &Path,
     error: &eredu_core::artifact::ArtifactError,
 ) {
-    let detail = error.to_string();
-    let missing_media_projector = matches!(
-        error,
-        eredu_core::artifact::ArtifactError::MissingRequiredGgufCompanion {
-            role: eredu_core::GgufCompanionRole::MediaProjector,
-            ..
-        }
-    );
-    let (code, container, architecture, structural, type_code) = match error {
-        eredu_core::artifact::ArtifactError::UnsupportedGgufArchitecture(name) => {
-            report.architecture = Some(name.clone());
-            (
-                InspectionIssueCode::UnsupportedArchitecture,
-                InspectionReadiness::Ready,
-                InspectionReadiness::Unsupported,
-                InspectionReadiness::Unsupported,
-                None,
-            )
-        }
-        eredu_core::artifact::ArtifactError::MissingGgufArchitecture => (
-            InspectionIssueCode::InvalidConfiguration,
-            InspectionReadiness::Ready,
-            InspectionReadiness::Invalid,
-            InspectionReadiness::Invalid,
-            None,
-        ),
-        eredu_core::artifact::ArtifactError::MissingRequiredGgufCompanion {
-            role: eredu_core::GgufCompanionRole::MediaProjector,
-            ..
-        } => (
-            InspectionIssueCode::MissingMediaProjector,
-            InspectionReadiness::Ready,
-            InspectionReadiness::Ready,
-            InspectionReadiness::Unverified,
-            None,
-        ),
-        eredu_core::artifact::ArtifactError::InvalidArtifact(_)
-        | eredu_core::artifact::ArtifactError::InvalidArchitecturePlan(_)
-        | eredu_core::artifact::ArtifactError::DuplicateTensor(_)
-        | eredu_core::artifact::ArtifactError::Catalog(_) => (
-            InspectionIssueCode::InvalidConfiguration,
-            InspectionReadiness::Ready,
-            InspectionReadiness::Unverified,
-            InspectionReadiness::Invalid,
-            None,
-        ),
-        eredu_core::artifact::ArtifactError::Gguf(error) => {
-            let type_code = error.unsupported_tensor_type_code();
-            (
-                if type_code.is_some() {
-                    InspectionIssueCode::UnsupportedTensorEncoding
-                } else {
-                    InspectionIssueCode::InvalidContainer
-                },
-                InspectionReadiness::Invalid,
-                InspectionReadiness::Unverified,
-                InspectionReadiness::Unverified,
-                type_code,
-            )
-        }
-        _ => (
-            InspectionIssueCode::InvalidContainer,
-            InspectionReadiness::Invalid,
-            InspectionReadiness::Unverified,
-            InspectionReadiness::Unverified,
-            None,
-        ),
-    };
-    report.container = container;
-    report.architecture_support = architecture;
-    report.structural_binding = structural;
-    report.model_loadability = if missing_media_projector {
-        InspectionReadiness::Missing
-    } else if architecture == InspectionReadiness::Unsupported {
-        InspectionReadiness::Unsupported
-    } else {
-        InspectionReadiness::Invalid
-    };
-    report.requested_load = report.model_loadability;
-    if missing_media_projector {
-        report.multimodal = InspectionReadiness::Missing;
-        report.requirements.push(InspectionRequirement {
-            code: InspectionIssueCode::MissingMediaProjector,
-            readiness: InspectionReadiness::Missing,
-            detail: detail.clone(),
-            path: None,
-        });
-    }
-    report.issues.push(InspectionIssue {
-        code,
-        severity: InspectionSeverity::Error,
-        detail,
-        path: Some(path.to_path_buf()),
-        metadata_key: None,
-        tensor_name: None,
-        tensor_type_code: type_code,
-    });
+    eredu_core::reject_portable_artifact_inspection(report, path, error);
 }
 
 fn inspect_gguf_projector(
@@ -565,59 +374,22 @@ fn inspect_gguf_projector(
     use eredu_architectures::preparation::{
         GgufArtifactComposition, GgufMediaProjectorRequirement,
     };
-
-    let requirement = plan.media_projector_requirement();
-    match (requirement, prepared_projector(validated)) {
-        (GgufMediaProjectorRequirement::NotApplicable, _) => {
-            report.multimodal = InspectionReadiness::NotApplicable;
-            GgufArtifactComposition::ModelOnly
+    let requirement = match plan.media_projector_requirement() {
+        GgufMediaProjectorRequirement::NotApplicable => {
+            eredu_core::MediaProjectorRequirement::NotApplicable
         }
-        (_, Some(projector)) => {
-            report.requirements.push(InspectionRequirement {
-                code: InspectionIssueCode::MissingMediaProjector,
-                readiness: InspectionReadiness::Ready,
-                detail: "portable admission validated the architecture-declared media projector"
-                    .into(),
-                path: Some(projector),
-            });
-            GgufArtifactComposition::ValidatedMediaProjector
-        }
-        (GgufMediaProjectorRequirement::Optional, None) => {
-            report.multimodal = InspectionReadiness::Missing;
-            report.requirements.push(InspectionRequirement {
-                code: InspectionIssueCode::MissingMediaProjector,
-                readiness: InspectionReadiness::Missing,
-                detail: "text loading is available, but media input requires an architecture-declared sibling projector GGUF".into(),
-                path: None,
-            });
-            report.issue(
-                InspectionIssueCode::MissingMediaProjector,
-                InspectionSeverity::Warning,
-                "no sibling media projector was admitted; text loading remains available",
-                Some(path.to_path_buf()),
-            );
-            GgufArtifactComposition::ModelOnly
-        }
-        (GgufMediaProjectorRequirement::Required, None) => {
-            report.multimodal = InspectionReadiness::Missing;
-            report.model_loadability = InspectionReadiness::Invalid;
-            report.requested_load = InspectionReadiness::Invalid;
-            report.requirements.push(InspectionRequirement {
-                code: InspectionIssueCode::MissingMediaProjector,
-                readiness: InspectionReadiness::Missing,
-                detail:
-                    "architecture preparation requires a validated sibling media projector GGUF"
-                        .into(),
-                path: None,
-            });
-            report.issue(
-                InspectionIssueCode::MissingMediaProjector,
-                InspectionSeverity::Error,
-                "portable admission omitted an architecture-required media projector",
-                Some(path.to_path_buf()),
-            );
-            GgufArtifactComposition::ModelOnly
-        }
+        GgufMediaProjectorRequirement::Optional => eredu_core::MediaProjectorRequirement::Optional,
+        GgufMediaProjectorRequirement::Required => eredu_core::MediaProjectorRequirement::Required,
+    };
+    if eredu_core::record_media_projector_inspection(
+        report,
+        path,
+        requirement,
+        prepared_projector(validated),
+    ) {
+        GgufArtifactComposition::ValidatedMediaProjector
+    } else {
+        GgufArtifactComposition::ModelOnly
     }
 }
 
@@ -625,64 +397,20 @@ fn inspect_safetensors_media(
     report: &mut ModelInspectionReport,
     plan: &eredu_architectures::processor_plan::ArtifactArchitecturePlan,
 ) {
-    let feature_readiness = multimodal_feature_readiness(&report.expected_modalities);
-    if feature_readiness == InspectionReadiness::NotApplicable {
-        report.multimodal = InspectionReadiness::NotApplicable;
+    eredu_core::record_processor_inspection(
+        report,
+        plan.has_processor(),
+        eredu_core::MediaFeatureAvailability {
+            image: cfg!(feature = "image"),
+            audio: cfg!(feature = "audio"),
+        },
+    );
+}
+fn reject_load_policy(report: &mut ModelInspectionReport, error: &Error) {
+    if let Error::PreparationAdmission(error) = error {
+        report.reject_preparation_admission(*error);
         return;
     }
-    if plan.has_processor() {
-        report.multimodal = feature_readiness;
-        report.requirements.push(InspectionRequirement {
-            code: InspectionIssueCode::MissingProcessor,
-            readiness: report.multimodal,
-            detail: if feature_readiness == InspectionReadiness::Ready {
-                "authoritative processor plan and required media build features are available"
-                    .into()
-            } else {
-                "authoritative processor plan is available, but required image/audio processing features are not enabled".into()
-            },
-            path: None,
-        });
-    } else {
-        report.multimodal = InspectionReadiness::Missing;
-        report.issue(
-            InspectionIssueCode::MissingProcessor,
-            InspectionSeverity::Warning,
-            "authoritative architecture inspection admitted no media processor",
-            Some(report.path.clone()),
-        );
-    }
-}
-
-fn multimodal_feature_readiness(expected_modalities: &[ArtifactModality]) -> InspectionReadiness {
-    if expected_modalities == [ArtifactModality::Text] {
-        return InspectionReadiness::NotApplicable;
-    }
-    let features_available = expected_modalities.iter().all(|modality| match modality {
-        ArtifactModality::Text => true,
-        ArtifactModality::Image | ArtifactModality::Video => cfg!(feature = "image"),
-        ArtifactModality::Audio => cfg!(feature = "audio"),
-    });
-    if features_available {
-        InspectionReadiness::Ready
-    } else {
-        InspectionReadiness::Unsupported
-    }
-}
-
-fn artifact_modalities(modalities: InputModalities) -> Vec<ArtifactModality> {
-    [
-        (modalities.text, ArtifactModality::Text),
-        (modalities.image, ArtifactModality::Image),
-        (modalities.video, ArtifactModality::Video),
-        (modalities.audio, ArtifactModality::Audio),
-    ]
-    .into_iter()
-    .filter_map(|(enabled, modality)| enabled.then_some(modality))
-    .collect()
-}
-
-fn reject_load_policy(report: &mut ModelInspectionReport, error: &Error) {
     report.requested_load = InspectionReadiness::Unsupported;
     let (code, detail) = match error {
         Error::Quantization(detail) => (
@@ -865,7 +593,8 @@ mod tests {
     fn text_only_architecture_skips_processor_and_media_feature_requirements() {
         let mut report =
             ModelInspectionReport::unverified(Path::new("unused"), ArtifactFormat::SafeTensors);
-        report.expected_modalities = artifact_modalities(InputModalities::TEXT);
+        report.expected_modalities =
+            eredu_core::inspection::artifact_modalities(InputModalities::TEXT);
         let plan = eredu_core::ModelConfigurationResolver::resolve_safetensors(
             &eredu_architectures::configuration::MODEL_CONFIGURATIONS,
             &serde_json::json!({
@@ -1060,7 +789,13 @@ mod tests {
 
         let modalities = gguf_composite_artifact_plan(GgufArchitecture::Gemma4)
             .input_modalities(GgufArtifactComposition::ValidatedMediaProjector);
-        let readiness = multimodal_feature_readiness(&artifact_modalities(modalities));
+        let readiness = eredu_core::media_feature_readiness(
+            &artifact_modalities(modalities),
+            eredu_core::MediaFeatureAvailability {
+                image: cfg!(feature = "image"),
+                audio: cfg!(feature = "audio"),
+            },
+        );
 
         assert_eq!(
             readiness,
@@ -1084,6 +819,37 @@ mod tests {
         assert_eq!(report.architecture_support, InspectionReadiness::Ready);
         assert_eq!(report.architecture.as_deref(), Some("llama"));
         assert_eq!(report.tensor_count, Some(11));
+        let admission = report
+            .preparation_admission
+            .expect("loadable inspection retains its exact admission");
+        assert_eq!(
+            admission.session_capabilities(),
+            eredu_core::SessionCapabilities::new(true, true, true)
+        );
+    }
+
+    #[test]
+    fn inspection_reports_the_neutral_admission_rejection() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("model.gguf");
+        write_minimal_llama_gguf(&path, true, None);
+        let options = MlxInspectionOptions::new(MlxLoadRequest::default().with_weight_residency(
+            eredu_runtime::WeightResidency::with_independent_parameter_banks(
+                eredu_runtime::OrdinaryWeightResidency::FullyResident,
+                eredu_runtime::ParameterBankLoadOptions::default(),
+            ),
+        ));
+
+        let report = inspect_model(&path, options).unwrap();
+
+        assert_eq!(report.requested_load, InspectionReadiness::Unsupported);
+        assert!(report.preparation_admission.is_none());
+        assert!(report.issues.iter().any(|issue| {
+            issue.code == InspectionIssueCode::UnsupportedResidencyPolicy
+                && issue
+                    .detail
+                    .contains("independently addressable parameter banks")
+        }));
     }
 
     #[test]

@@ -9,14 +9,17 @@ struct ReferenceTrace {
     rotary_offsets: Vec<i32>,
     sliding_attention: Vec<(i32, i32)>,
     causal_masks: Vec<(i32, i32, Option<i32>)>,
+    parameter_materializations: usize,
 }
 
 thread_local! {
     static REFERENCE_TRACE: RefCell<ReferenceTrace> = RefCell::new(ReferenceTrace::default());
+    static REFERENCE_CAUSAL_VALUE: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
 }
 
 fn clear_reference_trace() {
     REFERENCE_TRACE.with(|trace| *trace.borrow_mut() = ReferenceTrace::default());
+    REFERENCE_CAUSAL_VALUE.with(|value| value.set(0));
 }
 
 fn reference_trace() -> ReferenceTrace {
@@ -35,7 +38,11 @@ impl eredu_nn::Tensor for ReferenceTensor {
     type Context = ();
 
     fn shape(&self) -> &[i32] {
-        &self.0
+        if self.0.last().is_some_and(|value| *value < -1_000) {
+            &self.0[..self.0.len() - 1]
+        } else {
+            &self.0
+        }
     }
 
     fn unloaded_f32(shape: &[i32], _: &()) -> Result<Self, Error> {
@@ -285,6 +292,11 @@ impl Parameterized<ReferenceTensor> for ReferenceLinear {
 
 impl LinearOperator<ReferenceTensor> for ReferenceLinear {
     fn forward(&mut self, input: &ReferenceTensor, _: &()) -> Result<ReferenceTensor, Error> {
+        if self.metadata.id.as_str() == "text_linear.weight" {
+            if let Some(encoded) = self.weight.0.last().filter(|value| **value < -1_000) {
+                REFERENCE_CAUSAL_VALUE.with(|value| value.set(-1_000 - *encoded));
+            }
+        }
         let output = input.with_last(self.output);
         REFERENCE_TRACE.with(|trace| {
             trace
@@ -1069,6 +1081,7 @@ impl ParameterBackend for ReferenceBackend {
         _: &(),
     ) -> Result<Self::Materialization, Self::ParameterError> {
         use eredu_checkpoint::store::EncodedTensorLease;
+        REFERENCE_TRACE.with(|trace| trace.borrow_mut().parameter_materializations += 1);
         Ok(ReferenceTensor(
             lease
                 .output_shape()
@@ -1083,14 +1096,27 @@ impl ParameterBackend for ReferenceBackend {
         source: &dyn eredu_checkpoint::store::CheckpointSource,
         _: &(),
     ) -> Result<Self::Materialization, Self::ParameterError> {
+        REFERENCE_TRACE.with(|trace| trace.borrow_mut().parameter_materializations += 1);
         let metadata = recipe.infer(source).expect("validated reference recipe");
-        Ok(ReferenceTensor(
-            metadata
-                .shape
-                .iter()
-                .map(|dimension| *dimension as i32)
-                .collect(),
-        ))
+        let mut value = metadata
+            .shape
+            .iter()
+            .map(|dimension| *dimension as i32)
+            .collect::<Vec<_>>();
+        let causal = recipe.source_keys().into_iter().find_map(|key| {
+            source
+                .source_metadata(key)
+                .ok()?
+                .backing_shard?
+                .to_str()?
+                .strip_prefix("causal:")?
+                .parse::<i32>()
+                .ok()
+        });
+        if let Some(causal) = causal {
+            value.push(-1_000 - causal);
+        }
+        Ok(ReferenceTensor(value))
     }
 
     fn materialized_weight(materialization: &Self::Materialization) -> &Self::MaterializedWeight {
@@ -1113,7 +1139,12 @@ impl ParameterBackend for ReferenceBackend {
         parameter: &Self::Parameter,
         weight: &Self::MaterializedWeight,
     ) -> Result<(), Self::ParameterError> {
-        assert_eq!(parameter.0, weight.0);
+        let shape = if weight.0.last().is_some_and(|value| *value < -1_000) {
+            &weight.0[..weight.0.len() - 1]
+        } else {
+            weight.0.as_slice()
+        };
+        assert_eq!(parameter.0, shape);
         Ok(())
     }
 
@@ -1218,9 +1249,14 @@ impl SamplingBackend for ReferenceBackend {
             trace.borrow_mut().sampled_logits.push(logits.0.clone());
         });
         if let Some(random) = random {
-            *random += 1;
+            *random += REFERENCE_CAUSAL_VALUE.with(|value| value.get().max(1));
         }
-        Ok(ReferenceTensor(vec![1, 1]))
+        let causal = REFERENCE_CAUSAL_VALUE.with(std::cell::Cell::get);
+        let mut token = vec![1, 1];
+        if causal > 0 {
+            token.push(-1_000 - causal);
+        }
+        Ok(ReferenceTensor(token))
     }
 
     fn sample_processed(

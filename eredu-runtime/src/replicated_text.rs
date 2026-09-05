@@ -543,6 +543,9 @@ pub struct ReplicatedTextParameterRequirement {
     linear_companion: Option<(eredu_nn::LinearCompanionRole, String)>,
     /// Exact architecture output names used when this weight is transformed.
     transform_companions: Option<(String, String)>,
+    /// Exact stored dtypes which the architecture permits a native companion
+    /// slot to accept during binding.
+    permitted_native_source_dtypes: Vec<eredu_checkpoint::recipe::RecipeDtype>,
 }
 
 impl ReplicatedTextParameterRequirement {
@@ -653,7 +656,23 @@ impl ReplicatedTextParameterRequirement {
             transform,
             linear_companion: None,
             transform_companions: None,
+            permitted_native_source_dtypes: Vec::new(),
         })
+    }
+
+    /// Explicitly permits exact source dtypes for this architecture parameter.
+    pub fn with_permitted_native_source_dtypes(
+        mut self,
+        dtypes: Vec<eredu_checkpoint::recipe::RecipeDtype>,
+    ) -> Self {
+        self.permitted_native_source_dtypes =
+            dtypes.into_iter().fold(Vec::new(), |mut out, dtype| {
+                if !out.contains(&dtype) {
+                    out.push(dtype);
+                }
+                out
+            });
+        self
     }
 
     /// Attaches the exact encoded-linear primary relationship selected by the architecture.
@@ -775,6 +794,11 @@ impl ReplicatedTextParameterRequirement {
         self.transform_companions
             .as_ref()
             .map(|(scale, bias)| (scale.as_str(), bias.as_str()))
+    }
+
+    /// Returns explicitly permitted native source dtypes.
+    pub fn permitted_native_source_dtypes(&self) -> &[eredu_checkpoint::recipe::RecipeDtype] {
+        &self.permitted_native_source_dtypes
     }
 
     /// Returns the architecture-native executable format.
@@ -954,6 +978,7 @@ pub struct ReplicatedTextRequirements {
     auxiliary_parameters: Vec<ReplicatedTextParameterRequirement>,
     derived_recipes: BTreeMap<String, eredu_checkpoint::recipe::DerivedWeightRecipe>,
     derived_recipe_outputs: BTreeMap<String, eredu_checkpoint::recipe::RecipeMetadata>,
+    shared_source_keys: BTreeSet<String>,
     grouped_operations: Vec<GroupedOperationRequirement>,
 }
 
@@ -1023,6 +1048,7 @@ impl ReplicatedTextRequirements {
             auxiliary_parameters: Vec::new(),
             derived_recipes: BTreeMap::new(),
             derived_recipe_outputs: BTreeMap::new(),
+            shared_source_keys: BTreeSet::new(),
             grouped_operations: Vec::new(),
         })
     }
@@ -1072,10 +1098,43 @@ impl ReplicatedTextRequirements {
         recipes: BTreeMap<String, eredu_checkpoint::recipe::DerivedWeightRecipe>,
         outputs: BTreeMap<String, eredu_checkpoint::recipe::RecipeMetadata>,
     ) -> Result<Self, ReplicatedTextContractError> {
+        self.set_derived_recipes(recipes, outputs, BTreeSet::new())?;
+        Ok(self)
+    }
+
+    /// Attaches exact derivations together with architecture-declared physical
+    /// sources which intentionally feed more than one logical destination.
+    pub fn with_derived_recipes_and_shared_sources(
+        mut self,
+        recipes: BTreeMap<String, eredu_checkpoint::recipe::DerivedWeightRecipe>,
+        outputs: BTreeMap<String, eredu_checkpoint::recipe::RecipeMetadata>,
+        shared_source_keys: BTreeSet<String>,
+    ) -> Result<Self, ReplicatedTextContractError> {
+        self.set_derived_recipes(recipes, outputs, shared_source_keys)?;
+        Ok(self)
+    }
+
+    fn set_derived_recipes(
+        &mut self,
+        recipes: BTreeMap<String, eredu_checkpoint::recipe::DerivedWeightRecipe>,
+        outputs: BTreeMap<String, eredu_checkpoint::recipe::RecipeMetadata>,
+        shared_source_keys: BTreeSet<String>,
+    ) -> Result<(), ReplicatedTextContractError> {
         if recipes.keys().ne(outputs.keys()) {
             return Err(ReplicatedTextContractError::invalid(
                 "derived recipe targets and inferred outputs differ",
             ));
+        }
+        for source in &shared_source_keys {
+            let claims = recipes
+                .values()
+                .filter(|recipe| recipe.source_keys().contains(&source.as_str()))
+                .count();
+            if claims < 2 {
+                return Err(ReplicatedTextContractError::invalid(format!(
+                    "declared shared source {source:?} is not claimed by multiple derived targets"
+                )));
+            }
         }
         for target in recipes.keys() {
             let recipe = recipes
@@ -1110,7 +1169,8 @@ impl ReplicatedTextRequirements {
         }
         self.derived_recipes = recipes;
         self.derived_recipe_outputs = outputs;
-        Ok(self)
+        self.shared_source_keys = shared_source_keys;
+        Ok(())
     }
 
     /// Returns the normalized architecture identity bound during admission.
@@ -1187,6 +1247,10 @@ impl ReplicatedTextRequirements {
         &self,
     ) -> &BTreeMap<String, eredu_checkpoint::recipe::RecipeMetadata> {
         &self.derived_recipe_outputs
+    }
+    /// Returns physical sources explicitly declared as shared by the architecture.
+    pub fn shared_source_keys(&self) -> &BTreeSet<String> {
+        &self.shared_source_keys
     }
     /// Returns exact grouped operations required before construction.
     pub fn grouped_operations(&self) -> &[GroupedOperationRequirement] {
@@ -1606,7 +1670,114 @@ pub struct ReplicatedTextMaterializationTask {
     lowering_descriptor: WeightLoweringDescriptor,
     derived_recipe: Option<eredu_checkpoint::recipe::DerivedWeightRecipe>,
     derived_output: Option<eredu_checkpoint::recipe::RecipeMetadata>,
+    shared_source_keys: BTreeSet<String>,
+    permitted_native_source_dtypes: Vec<eredu_checkpoint::recipe::RecipeDtype>,
     output_companions: Vec<ReplicatedTextOutputCompanion>,
+}
+
+/// Index-based partition of exact materialization tasks by construction owner.
+///
+/// Indices refer to the input task slice used to create the plan. Keeping the
+/// plan free of borrowed or erased task values lets concrete backends retain
+/// their own statically dispatched construction path.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ReplicatedTextMaterializationPartitionPlan {
+    task_count: usize,
+    static_tasks: Vec<usize>,
+    unit_tasks: Vec<Vec<usize>>,
+}
+
+impl ReplicatedTextMaterializationPartitionPlan {
+    /// Returns the number of tasks from which this plan was derived.
+    pub const fn task_count(&self) -> usize {
+        self.task_count
+    }
+
+    /// Returns indices owned by architecture-static modules.
+    pub fn static_task_indices(&self) -> &[usize] {
+        &self.static_tasks
+    }
+
+    /// Returns task-index partitions in local flattened execution-unit order.
+    pub fn unit_task_indices(&self) -> &[Vec<usize>] {
+        &self.unit_tasks
+    }
+
+    /// Borrows static tasks from the exact slice used to construct this plan.
+    pub fn static_tasks<'a>(
+        &self,
+        tasks: &'a [ReplicatedTextMaterializationTask],
+    ) -> Result<Vec<&'a ReplicatedTextMaterializationTask>, ReplicatedTextContractError> {
+        self.validate_task_slice(tasks)?;
+        Ok(self
+            .static_tasks
+            .iter()
+            .map(|index| &tasks[*index])
+            .collect())
+    }
+
+    /// Borrows unit tasks from the exact slice used to construct this plan.
+    pub fn unit_tasks<'a>(
+        &self,
+        tasks: &'a [ReplicatedTextMaterializationTask],
+    ) -> Result<Vec<Vec<&'a ReplicatedTextMaterializationTask>>, ReplicatedTextContractError> {
+        self.validate_task_slice(tasks)?;
+        Ok(self
+            .unit_tasks
+            .iter()
+            .map(|indices| indices.iter().map(|index| &tasks[*index]).collect())
+            .collect())
+    }
+
+    fn validate_task_slice(
+        &self,
+        tasks: &[ReplicatedTextMaterializationTask],
+    ) -> Result<(), ReplicatedTextContractError> {
+        if tasks.len() != self.task_count {
+            return Err(ReplicatedTextContractError::invalid(format!(
+                "materialization partition plan expects {} tasks, got {}",
+                self.task_count,
+                tasks.len()
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// One executable-format group of transforming task indices.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ReplicatedTextTransformGroup {
+    quantization: eredu_checkpoint::WeightQuantization,
+    task_indices: Vec<usize>,
+}
+
+impl ReplicatedTextTransformGroup {
+    /// Returns the packed output format shared by every task in this group.
+    pub const fn quantization(&self) -> eredu_checkpoint::WeightQuantization {
+        self.quantization
+    }
+
+    /// Returns transforming task indices in original task order.
+    pub fn task_indices(&self) -> &[usize] {
+        &self.task_indices
+    }
+
+    /// Borrows this group's tasks from the original task slice.
+    pub fn tasks<'a>(
+        &self,
+        tasks: &'a [ReplicatedTextMaterializationTask],
+    ) -> Result<Vec<&'a ReplicatedTextMaterializationTask>, ReplicatedTextContractError> {
+        self.task_indices
+            .iter()
+            .map(|index| {
+                tasks.get(*index).ok_or_else(|| {
+                    ReplicatedTextContractError::invalid(
+                        "transform group was applied to a different materialization task slice",
+                    )
+                })
+            })
+            .collect()
+    }
 }
 
 /// Architecture-declared output companion for one materialized linear weight.
@@ -1775,6 +1946,8 @@ impl ReplicatedTextMaterializationTask {
             lowering_descriptor,
             derived_recipe: None,
             derived_output: None,
+            shared_source_keys: BTreeSet::new(),
+            permitted_native_source_dtypes: Vec::new(),
             output_companions: Vec::new(),
         })
     }
@@ -1858,6 +2031,16 @@ impl ReplicatedTextMaterializationTask {
     /// Returns every architecture-admitted alias.
     pub fn aliases(&self) -> &[String] {
         &self.aliases
+    }
+
+    /// Returns architecture-declared physical sources shared by logical outputs.
+    pub fn shared_source_keys(&self) -> &BTreeSet<String> {
+        &self.shared_source_keys
+    }
+
+    /// Returns exact source dtypes explicitly permitted for native binding.
+    pub fn permitted_native_source_dtypes(&self) -> &[eredu_checkpoint::recipe::RecipeDtype] {
+        &self.permitted_native_source_dtypes
     }
 
     /// Returns the exact admitted source encoding.
@@ -1970,6 +2153,168 @@ impl ReplicatedTextMaterializationTask {
             ))),
         }
     }
+}
+
+/// Partitions exact tasks against the architecture-global execution layout.
+pub fn plan_replicated_text_materialization_tasks(
+    tasks: &[ReplicatedTextMaterializationTask],
+    layout: &ExecutionUnitLayout,
+) -> Result<ReplicatedTextMaterializationPartitionPlan, ReplicatedTextContractError> {
+    let mut static_tasks = Vec::new();
+    let mut unit_tasks = vec![Vec::new(); layout.len()];
+    for (task_index, task) in tasks.iter().enumerate() {
+        match task.owner() {
+            ReplicatedTextParameterOwner::StaticRole(_) => static_tasks.push(task_index),
+            ReplicatedTextParameterOwner::ExecutionUnit { group, unit } => {
+                let group_index = (0..layout.group_count())
+                    .find(|index| {
+                        layout
+                            .group_id(*index)
+                            .is_some_and(|id| id.as_str() == group)
+                    })
+                    .ok_or_else(|| {
+                        ReplicatedTextContractError::invalid(format!(
+                            "exact task {:?} names unknown execution group {group:?}",
+                            task.name()
+                        ))
+                    })?;
+                let ordinal = layout.ordinal(group_index, *unit).ok_or_else(|| {
+                    ReplicatedTextContractError::invalid(format!(
+                        "exact task {:?} names unknown unit {unit} in group {group:?}",
+                        task.name()
+                    ))
+                })?;
+                unit_tasks[ordinal].push(task_index);
+            }
+        }
+    }
+    Ok(ReplicatedTextMaterializationPartitionPlan {
+        task_count: tasks.len(),
+        static_tasks,
+        unit_tasks,
+    })
+}
+
+/// Partitions exact tasks into one retained rank-local execution-unit order.
+pub fn plan_local_replicated_text_materialization_tasks(
+    tasks: &[ReplicatedTextMaterializationTask],
+    global_layout: &ExecutionUnitLayout,
+    addresses: &[crate::ExecutionUnitAddress],
+) -> Result<ReplicatedTextMaterializationPartitionPlan, ReplicatedTextContractError> {
+    if addresses.is_empty() {
+        return Err(ReplicatedTextContractError::invalid(
+            "local partition has no selected execution units",
+        ));
+    }
+    let mut seen = BTreeSet::new();
+    for address in addresses {
+        if global_layout.address(
+            global_layout
+                .ordinal(address.group(), address.index())
+                .unwrap_or(usize::MAX),
+        ) != Some(*address)
+        {
+            return Err(ReplicatedTextContractError::invalid(format!(
+                "local partition names unknown global unit {}.{}",
+                address.group(),
+                address.index()
+            )));
+        }
+        if !seen.insert((address.group(), address.index())) {
+            return Err(ReplicatedTextContractError::invalid(format!(
+                "local partition repeats global unit {}.{}",
+                address.group(),
+                address.index()
+            )));
+        }
+    }
+
+    let mut static_tasks = Vec::new();
+    let mut unit_tasks = vec![Vec::new(); addresses.len()];
+    for (task_index, task) in tasks.iter().enumerate() {
+        match task.owner() {
+            ReplicatedTextParameterOwner::StaticRole(_) => static_tasks.push(task_index),
+            ReplicatedTextParameterOwner::ExecutionUnit { group, unit } => {
+                let local = addresses
+                    .iter()
+                    .position(|address| {
+                        global_layout
+                            .group_id(address.group())
+                            .is_some_and(|id| id.as_str() == group)
+                            && address.index() == *unit
+                    })
+                    .ok_or_else(|| {
+                        ReplicatedTextContractError::invalid(format!(
+                            "local task {:?} has no owned global unit {group}.{unit}",
+                            task.name()
+                        ))
+                    })?;
+                unit_tasks[local].push(task_index);
+            }
+        }
+    }
+    Ok(ReplicatedTextMaterializationPartitionPlan {
+        task_count: tasks.len(),
+        static_tasks,
+        unit_tasks,
+    })
+}
+
+/// Returns every primary and companion produced by local transformation.
+pub fn locally_materialized_replicated_text_outputs(
+    tasks: &[ReplicatedTextMaterializationTask],
+) -> BTreeSet<String> {
+    tasks
+        .iter()
+        .filter(|task| {
+            matches!(
+                task.lowering(),
+                WeightLoweringKind::Transform | WeightLoweringKind::DerivedTransform
+            )
+        })
+        .flat_map(|task| {
+            std::iter::once(task.name().to_owned()).chain(
+                task.output_companions()
+                    .iter()
+                    .map(|companion| companion.name().to_owned()),
+            )
+        })
+        .collect()
+}
+
+/// Groups transforming tasks by exact packed output format.
+///
+/// Groups and indices preserve first-observed task order. Direct tasks are not
+/// included, and a transforming task without a packed format fails closed.
+pub fn group_replicated_text_transform_tasks(
+    tasks: &[ReplicatedTextMaterializationTask],
+) -> Result<Vec<ReplicatedTextTransformGroup>, ReplicatedTextContractError> {
+    let mut groups = Vec::<ReplicatedTextTransformGroup>::new();
+    for (task_index, task) in tasks.iter().enumerate().filter(|(_, task)| {
+        matches!(
+            task.lowering(),
+            WeightLoweringKind::Transform | WeightLoweringKind::DerivedTransform
+        )
+    }) {
+        let quantization = task.executable().weight_quantization().ok_or_else(|| {
+            ReplicatedTextContractError::invalid(format!(
+                "selected materialization task {:?} has no packed output format",
+                task.name()
+            ))
+        })?;
+        if let Some(group) = groups
+            .iter_mut()
+            .find(|group| group.quantization == quantization)
+        {
+            group.task_indices.push(task_index);
+        } else {
+            groups.push(ReplicatedTextTransformGroup {
+                quantization,
+                task_indices: vec![task_index],
+            });
+        }
+    }
+    Ok(groups)
 }
 
 /// Computes the exact executable storage charged to one selected task.
@@ -2148,6 +2493,10 @@ fn build_materialization_tasks(
                 lowering_descriptor,
                 derived_recipe,
                 derived_output,
+                shared_source_keys: requirements.shared_source_keys().clone(),
+                permitted_native_source_dtypes: requirement
+                    .permitted_native_source_dtypes()
+                    .to_vec(),
                 output_companions: Vec::new(),
             })
         })

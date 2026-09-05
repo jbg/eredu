@@ -1,6 +1,6 @@
 [package]
 name = "eredu"
-version = "0.8.0"
+version = "0.9.0"
 edition.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -94,8 +94,8 @@ cuda = ["eredu-backend-mlx?/cuda"]
 esaxx_fast = ["tokenizers/esaxx_fast", "eredu-text/esaxx_fast"]
 onig = ["tokenizers/onig", "eredu-text/onig"]
 nccl = ["cuda", "eredu-backend-mlx?/nccl"]
-image = ["eredu-backend-mlx?/image"]
-audio = ["eredu-backend-mlx?/audio"]
+image = ["eredu-architectures/image", "eredu-backend-mlx?/image"]
+audio = ["eredu-architectures/audio", "eredu-backend-mlx?/audio"]
 
 [lints]
 workspace = true

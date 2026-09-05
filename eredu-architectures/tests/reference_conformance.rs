@@ -130,6 +130,7 @@ fn conformance_routed_resident_and_addressable_production() {
 }
 
 fn conformance_composite_production_and_family_dispatch() {
+    numeric::non_mlx_processor_uses_exact_neutral_media_before_native_lowering();
     assert_eq!(
         numeric::run_reference_conformance_composite_families()
             .into_iter()

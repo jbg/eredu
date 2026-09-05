@@ -11,7 +11,7 @@ use std::{
     sync::Arc,
 };
 
-use eredu_nn::{ParameterMetadata, ParameterVisitorMut, Parameterized};
+use eredu_nn::Parameterized;
 use eredu_runtime::LayerwiseAcquireError;
 use eredu_runtime::{
     LayeredArchitecture, LayerwisePolicy, OffloadUnit, RuntimeState, WeightBinding,
@@ -570,61 +570,7 @@ fn populate_parameterized<M: Parameterized<MlxTensor>>(
     module: &mut M,
     lease: &ResidentUnitLease,
 ) -> Result<(), Error> {
-    struct Binder<'a> {
-        lease: &'a ResidentUnitLease,
-        resident: &'a BTreeSet<String>,
-        visited: BTreeSet<String>,
-        error: Option<String>,
-    }
-    impl<'a, 'value> ParameterVisitorMut<'value, MlxTensor> for Binder<'a> {
-        fn visit_mut(&mut self, metadata: ParameterMetadata, parameter: &'value mut MlxTensor) {
-            if self.error.is_some() {
-                return;
-            }
-            let name = metadata.id.to_string();
-            if !self.resident.contains(&name) {
-                return;
-            }
-            let value = match self.lease.device_value(&name) {
-                Ok(value) => value,
-                Err(error) => {
-                    self.error = Some(error.to_string());
-                    return;
-                }
-            };
-            if parameter.as_array().shape() != value.shape() {
-                self.error = Some(format!(
-                    "resident parameter {name:?} has shape {:?}, expected {:?}",
-                    value.shape(),
-                    parameter.as_array().shape()
-                ));
-                return;
-            }
-            *parameter = MlxTensor::from_array(value.clone());
-            self.visited.insert(name);
-        }
-    }
-    let resident = lease
-        .binding_names()
-        .map(str::to_owned)
-        .collect::<BTreeSet<_>>();
-    let mut binder = Binder {
-        lease,
-        resident: &resident,
-        visited: BTreeSet::new(),
-        error: None,
-    };
-    module.visit_parameters_mut(&mut binder);
-    if let Some(error) = binder.error {
-        return Err(Error::Parallel(error));
-    }
-    if binder.visited != resident {
-        return Err(Error::Parallel(format!(
-            "static resident bindings {:?} do not match parameter topology {:?}",
-            resident, binder.visited
-        )));
-    }
-    Ok(())
+    populate_module_from_lease(module, lease).map_err(Error::from)
 }
 
 fn largest_window_bytes(layer_bytes: &[u64], depth: usize) -> Result<u64, Error> {

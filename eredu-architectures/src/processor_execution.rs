@@ -1,67 +1,23 @@
 //! Architecture-owned execution of retained media processor plans.
 
 use eredu_core::{
-    InputExtent, InputMetadataKey, InputModality, Media, PreparedInputError, RgbImage,
-    TokenizedMultimodalRequest, TokenizedMultimodalSegment,
+    checkpoint::TensorDtype, InputExtent, InputMetadataKey, InputModality, InputTensorIdentity,
+    Media, PreparedInputError, RgbImage, TokenizedMultimodalRequest, TokenizedMultimodalSegment,
 };
+use eredu_media::audio::{AudioWaveform, LeadingSlaneyLogMelConfig, LogMelConfig};
+use eredu_media::{audio::LogMelFeatures, image::NormalizedImage};
 use eredu_runtime::{
     observe_and_intervene, ActivationObserver, PreparedInputInspector, PreparedInputPart,
     PreparedInputPayload, PreparedModelInput,
 };
 
+use crate::processor_plan::RgbResample;
 use crate::processor_plan::{
     ArtifactArchitecturePlan, Gemma4AudioPlan, Gemma4ImagePlan, Gemma4ProcessorPlan,
     Gemma4VideoPlan, InklingAudioPlan, InklingImagePlan, InklingProcessorPlan, MusePatchPlan,
     MuseProcessorPlan, MuseVideoPlan, ProcessorPlanError, QwenImagePlan, QwenPatchPlan,
     QwenProcessorPlan, QwenVideoPlan, RgbTransformPlan,
 };
-
-/// Owned normalized RGB values in channel-first order.
-#[derive(Debug, Clone, PartialEq)]
-pub struct NormalizedRgb {
-    values: Vec<f32>,
-    width: usize,
-    height: usize,
-}
-
-impl NormalizedRgb {
-    /// Validates normalized channel-first RGB values.
-    pub fn new(values: Vec<f32>, width: usize, height: usize) -> Result<Self, String> {
-        let expected = width
-            .checked_mul(height)
-            .and_then(|pixels| pixels.checked_mul(3))
-            .ok_or_else(|| "normalized RGB geometry overflowed".to_owned())?;
-        if width == 0
-            || height == 0
-            || values.len() != expected
-            || values.iter().any(|value| !value.is_finite())
-        {
-            return Err(format!(
-                "normalized RGB values do not match 3x{height}x{width} finite geometry"
-            ));
-        }
-        Ok(Self {
-            values,
-            width,
-            height,
-        })
-    }
-
-    /// Image width.
-    pub const fn width(&self) -> usize {
-        self.width
-    }
-
-    /// Image height.
-    pub const fn height(&self) -> usize {
-        self.height
-    }
-
-    /// One channel-first value.
-    pub fn get(&self, channel: usize, y: usize, x: usize) -> f32 {
-        self.values[(channel * self.height + y) * self.width + x]
-    }
-}
 
 /// Fully specified model-independent log-mel operation.
 #[derive(Debug, Clone, PartialEq)]
@@ -110,19 +66,6 @@ pub enum AudioFeatureRequest {
     },
 }
 
-/// Host audio features returned by a generic mechanism.
-#[derive(Debug, Clone, PartialEq)]
-pub struct AudioFeatures {
-    /// Row-major feature values.
-    pub values: Vec<f32>,
-    /// Valid-frame mask.
-    pub mask: Vec<bool>,
-    /// Feature frame count.
-    pub frames: usize,
-    /// Feature width.
-    pub bins: usize,
-}
-
 /// Optional primitive failure distinguishing capability denial from execution failure.
 #[derive(Debug, thiserror::Error)]
 pub enum OptionalProcessorMechanism<E: std::fmt::Display> {
@@ -134,19 +77,12 @@ pub enum OptionalProcessorMechanism<E: std::fmt::Display> {
     Backend(E),
 }
 
-/// Generic host-media and tensor mechanisms used by processor execution.
+/// Backend-native tensor mechanisms used after portable processing succeeds.
 pub trait ProcessorMechanisms: PreparedInputInspector<Self::Tensor> {
     /// Native tensor handle.
     type Tensor;
     /// Mechanism failure.
     type Error: std::fmt::Display;
-
-    /// Applies one exact resize, rescale, and normalization request.
-    fn normalize_rgb(
-        &mut self,
-        image: &RgbImage,
-        plan: RgbTransformPlan,
-    ) -> Result<NormalizedRgb, Self::Error>;
 
     /// Constructs a native unsigned token tensor.
     fn tensor_u32(&mut self, values: &[u32], shape: &[usize]) -> Result<Self::Tensor, Self::Error>;
@@ -157,15 +93,6 @@ pub trait ProcessorMechanisms: PreparedInputInspector<Self::Tensor> {
     /// Constructs a native signed metadata tensor.
     fn tensor_i32(&mut self, values: &[i32], shape: &[usize]) -> Result<Self::Tensor, Self::Error>;
 
-    /// Extracts exact generic audio features when the additive mechanism is implemented.
-    fn audio_features(
-        &mut self,
-        _audio: &eredu_core::Audio,
-        _request: &AudioFeatureRequest,
-    ) -> Result<AudioFeatures, OptionalProcessorMechanism<Self::Error>> {
-        Err(OptionalProcessorMechanism::Unavailable("audio features"))
-    }
-
     /// Constructs a native Boolean metadata tensor when implemented.
     fn tensor_bool(
         &mut self,
@@ -173,6 +100,239 @@ pub trait ProcessorMechanisms: PreparedInputInspector<Self::Tensor> {
         _shape: &[usize],
     ) -> Result<Self::Tensor, OptionalProcessorMechanism<Self::Error>> {
         Err(OptionalProcessorMechanism::Unavailable("Boolean tensor"))
+    }
+}
+
+trait ProcessorOperations: PreparedInputInspector<Self::Tensor> {
+    type Tensor;
+    type Error: std::fmt::Display;
+
+    fn normalize_rgb(
+        &mut self,
+        image: &RgbImage,
+        plan: RgbTransformPlan,
+    ) -> Result<NormalizedImage, Self::Error>;
+    fn tensor_u32(&mut self, values: &[u32], shape: &[usize]) -> Result<Self::Tensor, Self::Error>;
+    fn tensor_f32(&mut self, values: &[f32], shape: &[usize]) -> Result<Self::Tensor, Self::Error>;
+    fn tensor_i32(&mut self, values: &[i32], shape: &[usize]) -> Result<Self::Tensor, Self::Error>;
+    fn audio_features(
+        &mut self,
+        audio: &eredu_core::Audio,
+        request: &AudioFeatureRequest,
+    ) -> Result<LogMelFeatures, OptionalProcessorMechanism<Self::Error>>;
+    fn tensor_bool(
+        &mut self,
+        values: &[bool],
+        shape: &[usize],
+    ) -> Result<Self::Tensor, OptionalProcessorMechanism<Self::Error>>;
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum HostTensor {
+    U32 {
+        values: Vec<u32>,
+        shape: Vec<usize>,
+    },
+    F32 {
+        values: Vec<f32>,
+        shape: Vec<usize>,
+    },
+    I32 {
+        values: Vec<i32>,
+        shape: Vec<usize>,
+    },
+    Bool {
+        values: Vec<bool>,
+        shape: Vec<usize>,
+    },
+}
+
+impl HostTensor {
+    fn identity(&self) -> Result<InputTensorIdentity, PreparedInputError> {
+        let (dtype, shape) = match self {
+            Self::U32 { shape, .. } => (TensorDtype::U32, shape),
+            Self::F32 { shape, .. } => (TensorDtype::F32, shape),
+            Self::I32 { shape, .. } => (TensorDtype::I32, shape),
+            Self::Bool { shape, .. } => (TensorDtype::Bool, shape),
+        };
+        InputTensorIdentity::new(dtype, shape.clone())
+    }
+}
+
+#[derive(Default)]
+struct HostProcessorMechanisms;
+
+impl PreparedInputInspector<HostTensor> for HostProcessorMechanisms {
+    fn identity(&self, tensor: &HostTensor) -> Result<InputTensorIdentity, PreparedInputError> {
+        tensor.identity()
+    }
+
+    fn i32_values(&self, tensor: &HostTensor) -> Result<Vec<i32>, eredu_core::CapabilityError> {
+        match tensor {
+            HostTensor::I32 { values, .. } => Ok(values.clone()),
+            _ => Err(eredu_core::CapabilityError::Observation(
+                "processor metadata is not an i32 buffer".into(),
+            )),
+        }
+    }
+
+    fn bool_values(&self, tensor: &HostTensor) -> Result<Vec<bool>, eredu_core::CapabilityError> {
+        match tensor {
+            HostTensor::Bool { values, .. } => Ok(values.clone()),
+            _ => Err(eredu_core::CapabilityError::Observation(
+                "processor metadata is not a Boolean buffer".into(),
+            )),
+        }
+    }
+}
+
+fn host_tensor_len(shape: &[usize]) -> Result<usize, eredu_media::MediaError> {
+    shape.iter().try_fold(1usize, |size, dimension| {
+        size.checked_mul(*dimension).ok_or_else(|| {
+            eredu_media::MediaError::Invalid("processor buffer geometry overflowed".into())
+        })
+    })
+}
+
+impl ProcessorOperations for HostProcessorMechanisms {
+    type Tensor = HostTensor;
+    type Error = eredu_media::MediaError;
+
+    fn normalize_rgb(
+        &mut self,
+        image: &RgbImage,
+        plan: RgbTransformPlan,
+    ) -> Result<NormalizedImage, Self::Error> {
+        use eredu_media::image::{
+            rescale_and_normalize_rgb8, resize_rgb8_bicubic, resize_rgb8_lanczos3, RgbImageView,
+        };
+        let source = RgbImageView::packed(image.pixels(), image.width(), image.height())?;
+        let width = u32::try_from(plan.width)
+            .map_err(|_| eredu_media::MediaError::Invalid("RGB target width exceeds u32".into()))?;
+        let height = u32::try_from(plan.height).map_err(|_| {
+            eredu_media::MediaError::Invalid("RGB target height exceeds u32".into())
+        })?;
+        let resized = match plan.resample {
+            RgbResample::Bicubic => resize_rgb8_bicubic(source, width, height)?,
+            RgbResample::Lanczos3 => resize_rgb8_lanczos3(source, width, height)?,
+        };
+        rescale_and_normalize_rgb8(resized.as_view(), plan.rescale_factor, plan.mean, plan.std)
+    }
+
+    fn tensor_u32(&mut self, values: &[u32], shape: &[usize]) -> Result<HostTensor, Self::Error> {
+        if host_tensor_len(shape)? != values.len() {
+            return Err(eredu_media::MediaError::Invalid(
+                "u32 processor buffer does not match its shape".into(),
+            ));
+        }
+        Ok(HostTensor::U32 {
+            values: values.to_vec(),
+            shape: shape.to_vec(),
+        })
+    }
+
+    fn tensor_f32(&mut self, values: &[f32], shape: &[usize]) -> Result<HostTensor, Self::Error> {
+        if host_tensor_len(shape)? != values.len() || values.iter().any(|value| !value.is_finite())
+        {
+            return Err(eredu_media::MediaError::Invalid(
+                "f32 processor buffer does not match its finite shape".into(),
+            ));
+        }
+        Ok(HostTensor::F32 {
+            values: values.to_vec(),
+            shape: shape.to_vec(),
+        })
+    }
+
+    fn tensor_i32(&mut self, values: &[i32], shape: &[usize]) -> Result<HostTensor, Self::Error> {
+        if host_tensor_len(shape)? != values.len() {
+            return Err(eredu_media::MediaError::Invalid(
+                "i32 processor buffer does not match its shape".into(),
+            ));
+        }
+        Ok(HostTensor::I32 {
+            values: values.to_vec(),
+            shape: shape.to_vec(),
+        })
+    }
+
+    fn audio_features(
+        &mut self,
+        audio: &eredu_core::Audio,
+        request: &AudioFeatureRequest,
+    ) -> Result<LogMelFeatures, OptionalProcessorMechanism<Self::Error>> {
+        use eredu_media::audio::{extract_leading_slaney_log_mel, extract_log_mel};
+        let waveform = AudioWaveform::new(audio.samples(), audio.sample_rate())
+            .map_err(OptionalProcessorMechanism::Backend)?;
+        match request {
+            AudioFeatureRequest::SemicausalHtk {
+                sample_rate,
+                frame_length,
+                hop_length,
+                fft_length,
+                mel_bins,
+                min_frequency,
+                max_frequency,
+                mel_floor,
+                max_samples,
+                pad_to_multiple,
+            } => extract_log_mel(
+                waveform,
+                &LogMelConfig {
+                    sample_rate: *sample_rate,
+                    frame_length: *frame_length,
+                    hop_length: *hop_length,
+                    fft_length: *fft_length,
+                    mel_bins: *mel_bins,
+                    min_frequency: *min_frequency,
+                    max_frequency: *max_frequency,
+                    mel_floor: *mel_floor,
+                    max_samples: *max_samples,
+                    pad_to_multiple: *pad_to_multiple,
+                },
+            ),
+            AudioFeatureRequest::LeadingSlaney {
+                sample_rate,
+                fft_length,
+                hop_length,
+                leading_zeros,
+                mel_bins,
+                min_frequency,
+                max_frequency,
+                energy_floor,
+            } => extract_leading_slaney_log_mel(
+                waveform,
+                &LeadingSlaneyLogMelConfig {
+                    sample_rate: *sample_rate,
+                    fft_length: *fft_length,
+                    hop_length: *hop_length,
+                    leading_zeros: *leading_zeros,
+                    mel_bins: *mel_bins,
+                    min_frequency: *min_frequency,
+                    max_frequency: *max_frequency,
+                    energy_floor: *energy_floor,
+                },
+            ),
+        }
+        .map_err(OptionalProcessorMechanism::Backend)
+    }
+
+    fn tensor_bool(
+        &mut self,
+        values: &[bool],
+        shape: &[usize],
+    ) -> Result<HostTensor, OptionalProcessorMechanism<Self::Error>> {
+        if host_tensor_len(shape).map_err(OptionalProcessorMechanism::Backend)? != values.len() {
+            return Err(OptionalProcessorMechanism::Backend(
+                eredu_media::MediaError::Invalid(
+                    "Boolean processor buffer does not match its shape".into(),
+                ),
+            ));
+        }
+        Ok(HostTensor::Bool {
+            values: values.to_vec(),
+            shape: shape.to_vec(),
+        })
     }
 }
 
@@ -224,12 +384,21 @@ impl PreparedProcessor {
         M: ProcessorMechanisms,
         E: std::fmt::Display,
     {
-        match &self.kind {
-            ProcessorKind::Gemma4(plan) => prepare_gemma4(plan, request, mechanisms, encode_text),
-            ProcessorKind::Inkling(plan) => prepare_inkling(plan, request, mechanisms),
-            ProcessorKind::Muse(plan) => prepare_muse(plan, request, mechanisms, encode_text),
-            ProcessorKind::Qwen(plan) => prepare_qwen(plan, request, mechanisms, encode_text),
+        let mut host_mechanisms = HostProcessorMechanisms;
+        let host = match &self.kind {
+            ProcessorKind::Gemma4(plan) => {
+                prepare_gemma4(plan, request, &mut host_mechanisms, encode_text)
+            }
+            ProcessorKind::Inkling(plan) => prepare_inkling(plan, request, &mut host_mechanisms),
+            ProcessorKind::Muse(plan) => {
+                prepare_muse(plan, request, &mut host_mechanisms, encode_text)
+            }
+            ProcessorKind::Qwen(plan) => {
+                prepare_qwen(plan, request, &mut host_mechanisms, encode_text)
+            }
         }
+        .map_err(host_execution_error)?;
+        lower_host_input(host, mechanisms)
     }
 
     /// Executes processor semantics and exposes every final payload and metadata tensor before
@@ -295,6 +464,96 @@ impl PreparedProcessor {
     }
 }
 
+fn host_execution_error<E: std::fmt::Display, M: std::fmt::Display>(
+    error: ProcessorExecutionError<E, eredu_media::MediaError>,
+) -> ProcessorExecutionError<E, M> {
+    match error {
+        ProcessorExecutionError::Plan(error) => ProcessorExecutionError::Plan(error),
+        ProcessorExecutionError::Text(error) => ProcessorExecutionError::Text(error),
+        ProcessorExecutionError::Mechanism(error) => {
+            ProcessorExecutionError::Plan(error.to_string())
+        }
+        ProcessorExecutionError::Prepared(error) => ProcessorExecutionError::Prepared(error),
+    }
+}
+
+fn lower_host_tensor<M, E>(
+    tensor: &HostTensor,
+    mechanisms: &mut M,
+) -> Result<M::Tensor, ProcessorExecutionError<E, M::Error>>
+where
+    M: ProcessorMechanisms,
+    E: std::fmt::Display,
+{
+    match tensor {
+        HostTensor::U32 { values, shape } => mechanisms
+            .tensor_u32(values, shape)
+            .map_err(ProcessorExecutionError::Mechanism),
+        HostTensor::F32 { values, shape } => mechanisms
+            .tensor_f32(values, shape)
+            .map_err(ProcessorExecutionError::Mechanism),
+        HostTensor::I32 { values, shape } => mechanisms
+            .tensor_i32(values, shape)
+            .map_err(ProcessorExecutionError::Mechanism),
+        HostTensor::Bool { values, shape } => mechanisms
+            .tensor_bool(values, shape)
+            .map_err(optional_mechanism_error),
+    }
+}
+
+fn lower_host_input<M, E>(
+    host: PreparedModelInput<HostTensor>,
+    mechanisms: &mut M,
+) -> Result<PreparedModelInput<M::Tensor>, ProcessorExecutionError<E, M::Error>>
+where
+    M: ProcessorMechanisms,
+    E: std::fmt::Display,
+{
+    if host.parts().iter().any(|part| {
+        !matches!(
+            part.payload(),
+            PreparedInputPayload::TokenIds(_)
+                | PreparedInputPayload::Tensor(_)
+                | PreparedInputPayload::Embeddings(_)
+        )
+    }) {
+        return Err(ProcessorExecutionError::Plan(
+            "host processor emitted an unsupported payload kind".into(),
+        ));
+    }
+    let mut parts = Vec::with_capacity(host.len());
+    for part in host.parts() {
+        let payload = match part.payload() {
+            PreparedInputPayload::TokenIds(value) => {
+                PreparedInputPayload::TokenIds(lower_host_tensor(value, mechanisms)?)
+            }
+            PreparedInputPayload::Tensor(value) => {
+                PreparedInputPayload::Tensor(lower_host_tensor(value, mechanisms)?)
+            }
+            PreparedInputPayload::Embeddings(value) => {
+                PreparedInputPayload::Embeddings(lower_host_tensor(value, mechanisms)?)
+            }
+            _ => unreachable!("payload kinds were preflighted before native lowering"),
+        };
+        let metadata = part
+            .metadata()
+            .iter()
+            .map(|(key, tensor)| lower_host_tensor(tensor, mechanisms).map(|tensor| (*key, tensor)))
+            .collect::<Result<Vec<_>, _>>()?;
+        parts.push(
+            PreparedInputPart::new_with_extents(
+                part.modality(),
+                payload,
+                metadata,
+                part.extents().iter().copied(),
+            )
+            .map_err(ProcessorExecutionError::Prepared)?,
+        );
+    }
+    PreparedModelInput::new(parts, |tensor| mechanisms.identity(tensor))
+        .map_err(ProcessorExecutionError::Prepared)
+}
+
 /// Failure from architecture processor semantics, text encoding, or a mechanism.
 #[derive(Debug, thiserror::Error)]
 pub enum ProcessorExecutionError<E, M>
@@ -345,7 +604,7 @@ fn push_tokens<M, E>(
     mechanisms: &mut M,
 ) -> Result<(), ProcessorExecutionError<E, M::Error>>
 where
-    M: ProcessorMechanisms,
+    M: ProcessorOperations,
     E: std::fmt::Display,
 {
     if ids.is_empty() {
@@ -372,7 +631,7 @@ fn prepare_gemma4<M, E>(
     encode_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, E>,
 ) -> Result<PreparedModelInput<M::Tensor>, ProcessorExecutionError<E, M::Error>>
 where
-    M: ProcessorMechanisms,
+    M: ProcessorOperations,
     E: std::fmt::Display,
 {
     let mut parts = Vec::new();
@@ -425,7 +684,7 @@ fn gemma4_audio<M, E>(
     mechanisms: &mut M,
 ) -> Result<PreparedInputPart<M::Tensor>, ProcessorExecutionError<E, M::Error>>
 where
-    M: ProcessorMechanisms,
+    M: ProcessorOperations,
     E: std::fmt::Display,
 {
     let request = AudioFeatureRequest::SemicausalHtk {
@@ -443,9 +702,9 @@ where
     let features = mechanisms
         .audio_features(audio, &request)
         .map_err(optional_mechanism_error)?;
-    if features.values.len() != features.frames.saturating_mul(features.bins)
+    if features.values.len() != features.frames.saturating_mul(features.mel_bins)
         || features.mask.len() != features.frames
-        || features.bins != plan.mel_bins
+        || features.mel_bins != plan.mel_bins
     {
         return Err(ProcessorExecutionError::Plan(
             "audio mechanism returned inconsistent feature geometry".into(),
@@ -453,7 +712,7 @@ where
     }
     let valid_frames = features.mask.iter().filter(|valid| **valid).count();
     let payload = mechanisms
-        .tensor_f32(&features.values, &[1, features.frames, features.bins])
+        .tensor_f32(&features.values, &[1, features.frames, features.mel_bins])
         .map_err(mechanism_error)?;
     let mask = mechanisms
         .tensor_bool(&features.mask, &[1, features.frames])
@@ -475,15 +734,8 @@ where
     M: std::fmt::Display,
 {
     let first = video.frames().first().expect("decoded video is non-empty");
-    if video
-        .frames()
-        .iter()
-        .any(|frame| frame.width() != first.width() || frame.height() != first.height())
-    {
-        return Err(ProcessorExecutionError::Plan(
-            "decoded video frames have inconsistent geometry".into(),
-        ));
-    }
+    eredu_media::video::validate_video(video)
+        .map_err(|error| ProcessorExecutionError::Plan(error.to_string()))?;
     Ok(first)
 }
 
@@ -494,7 +746,7 @@ fn gemma4_image<M, E>(
     mechanisms: &mut M,
 ) -> Result<PreparedInputPart<M::Tensor>, ProcessorExecutionError<E, M::Error>>
 where
-    M: ProcessorMechanisms,
+    M: ProcessorOperations,
     E: std::fmt::Display,
 {
     let image = mechanisms
@@ -535,7 +787,7 @@ fn push_gemma4_video<M, E>(
     encode_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, E>,
 ) -> Result<(), ProcessorExecutionError<E, M::Error>>
 where
-    M: ProcessorMechanisms,
+    M: ProcessorOperations,
     E: std::fmt::Display,
 {
     for frame in &plan.frames {
@@ -563,7 +815,7 @@ where
 type Gemma4Packed = (Vec<f32>, Vec<i32>, [i32; 3], [usize; 3], Vec<usize>);
 
 fn pack_gemma4<E, M>(
-    image: &NormalizedRgb,
+    image: &NormalizedImage,
     patch_size: usize,
     max_patches: usize,
 ) -> Result<Gemma4Packed, ProcessorExecutionError<E, M>>
@@ -633,7 +885,7 @@ fn prepare_inkling<M, E>(
     mechanisms: &mut M,
 ) -> Result<PreparedModelInput<M::Tensor>, ProcessorExecutionError<E, M::Error>>
 where
-    M: ProcessorMechanisms,
+    M: ProcessorOperations,
     E: std::fmt::Display,
 {
     let mut parts = Vec::new();
@@ -671,7 +923,7 @@ fn inkling_image<M, E>(
     mechanisms: &mut M,
 ) -> Result<PreparedInputPart<M::Tensor>, ProcessorExecutionError<E, M::Error>>
 where
-    M: ProcessorMechanisms,
+    M: ProcessorOperations,
     E: std::fmt::Display,
 {
     let width = image.width() as usize;
@@ -734,7 +986,7 @@ fn inkling_audio<M, E>(
     mechanisms: &mut M,
 ) -> Result<PreparedInputPart<M::Tensor>, ProcessorExecutionError<E, M::Error>>
 where
-    M: ProcessorMechanisms,
+    M: ProcessorOperations,
     E: std::fmt::Display,
 {
     let request = AudioFeatureRequest::LeadingSlaney {
@@ -750,8 +1002,8 @@ where
     let features = mechanisms
         .audio_features(audio, &request)
         .map_err(optional_mechanism_error)?;
-    if features.values.len() != features.frames.saturating_mul(features.bins)
-        || features.bins != plan.mel_bins
+    if features.values.len() != features.frames.saturating_mul(features.mel_bins)
+        || features.mel_bins != plan.mel_bins
     {
         return Err(ProcessorExecutionError::Plan(
             "audio mechanism returned inconsistent Inkling feature geometry".into(),
@@ -776,7 +1028,7 @@ where
         })
         .collect::<Vec<_>>();
     let payload = mechanisms
-        .tensor_i32(&ids, &[1, features.frames, features.bins])
+        .tensor_i32(&ids, &[1, features.frames, features.mel_bins])
         .map_err(mechanism_error)?;
     let mask_values = vec![true; features.frames];
     let mask = mechanisms
@@ -798,7 +1050,7 @@ fn prepare_muse<M, E>(
     encode_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, E>,
 ) -> Result<PreparedModelInput<M::Tensor>, ProcessorExecutionError<E, M::Error>>
 where
-    M: ProcessorMechanisms,
+    M: ProcessorOperations,
     E: std::fmt::Display,
 {
     let mut parts = Vec::new();
@@ -862,7 +1114,7 @@ fn push_muse_video<M, E>(
     encode_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, E>,
 ) -> Result<(), ProcessorExecutionError<E, M::Error>>
 where
-    M: ProcessorMechanisms,
+    M: ProcessorOperations,
     E: std::fmt::Display,
 {
     push_tokens(
@@ -907,7 +1159,7 @@ fn muse_image<M, E>(
     mechanisms: &mut M,
 ) -> Result<PreparedInputPart<M::Tensor>, ProcessorExecutionError<E, M::Error>>
 where
-    M: ProcessorMechanisms,
+    M: ProcessorOperations,
     E: std::fmt::Display,
 {
     let frames = frames
@@ -934,7 +1186,7 @@ where
 }
 
 fn pack_muse<E, M>(
-    frames: &[NormalizedRgb],
+    frames: &[NormalizedImage],
     config: MusePatchPlan,
     duplicate_image: bool,
 ) -> Result<(Vec<f32>, Vec<usize>, [i32; 3]), ProcessorExecutionError<E, M>>
@@ -1005,7 +1257,7 @@ fn prepare_qwen<M, E>(
     encode_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, E>,
 ) -> Result<PreparedModelInput<M::Tensor>, ProcessorExecutionError<E, M::Error>>
 where
-    M: ProcessorMechanisms,
+    M: ProcessorOperations,
     E: std::fmt::Display,
 {
     let mut parts = Vec::new();
@@ -1023,16 +1275,7 @@ where
                 push_tokens(&mut parts, &[image_plan.framing.end_token_id], mechanisms)?;
             }
             TokenizedMultimodalSegment::Media(Media::Video(video)) => {
-                let first = video.frames().first().expect("decoded video is non-empty");
-                if video
-                    .frames()
-                    .iter()
-                    .any(|frame| frame.width() != first.width() || frame.height() != first.height())
-                {
-                    return Err(ProcessorExecutionError::Plan(
-                        "decoded video frames have inconsistent geometry".into(),
-                    ));
-                }
+                let first = consistent_video_frame(video)?;
                 let video_plan = plan
                     .video(
                         video.frames().len(),
@@ -1061,7 +1304,7 @@ fn qwen_image<M, E>(
     mechanisms: &mut M,
 ) -> Result<PreparedInputPart<M::Tensor>, ProcessorExecutionError<E, M::Error>>
 where
-    M: ProcessorMechanisms,
+    M: ProcessorOperations,
     E: std::fmt::Display,
 {
     let image = mechanisms
@@ -1090,7 +1333,7 @@ fn push_qwen_video<M, E>(
     encode_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, E>,
 ) -> Result<(), ProcessorExecutionError<E, M::Error>>
 where
-    M: ProcessorMechanisms,
+    M: ProcessorOperations,
     E: std::fmt::Display,
 {
     for group in &plan.groups {
@@ -1128,7 +1371,7 @@ where
 }
 
 fn pack_qwen<E, M>(
-    frames: &[NormalizedRgb],
+    frames: &[NormalizedImage],
     config: QwenPatchPlan,
     duplicate_image: bool,
 ) -> Result<(Vec<f32>, Vec<usize>, [i32; 3]), ProcessorExecutionError<E, M>>
@@ -1225,7 +1468,7 @@ where
     Ok((values, vec![patch_count, patch_width], grid))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "image", feature = "audio"))]
 mod tests {
     use std::{cell::Cell, convert::Infallible};
 
@@ -1247,7 +1490,6 @@ mod tests {
 
     #[derive(Default)]
     struct TestMechanisms {
-        normalizations: Cell<usize>,
         tensors: Cell<usize>,
     }
 
@@ -1271,29 +1513,6 @@ mod tests {
     impl ProcessorMechanisms for TestMechanisms {
         type Tensor = TestTensor;
         type Error = &'static str;
-
-        fn normalize_rgb(
-            &mut self,
-            image: &RgbImage,
-            plan: RgbTransformPlan,
-        ) -> Result<NormalizedRgb, Self::Error> {
-            self.normalizations.set(self.normalizations.get() + 1);
-            let mut values = vec![0.0; plan.width * plan.height * 3];
-            for y in 0..plan.height {
-                for x in 0..plan.width {
-                    let source_y = y * image.height() as usize / plan.height;
-                    let source_x = x * image.width() as usize / plan.width;
-                    for channel in 0..3 {
-                        let raw = image.pixels()
-                            [(source_y * image.width() as usize + source_x) * 3 + channel]
-                            as f32;
-                        values[(channel * plan.height + y) * plan.width + x] =
-                            (raw * plan.rescale_factor - plan.mean[channel]) / plan.std[channel];
-                    }
-                }
-            }
-            NormalizedRgb::new(values, plan.width, plan.height).map_err(|_| "invalid normalized")
-        }
 
         fn tensor_u32(
             &mut self,
@@ -1343,31 +1562,6 @@ mod tests {
             })
         }
 
-        fn audio_features(
-            &mut self,
-            _: &eredu_core::Audio,
-            request: &AudioFeatureRequest,
-        ) -> Result<AudioFeatures, OptionalProcessorMechanism<Self::Error>> {
-            match request {
-                AudioFeatureRequest::SemicausalHtk { mel_bins, .. } => Ok(AudioFeatures {
-                    values: vec![0.25; 3 * mel_bins],
-                    mask: vec![true, true, false],
-                    frames: 3,
-                    bins: *mel_bins,
-                }),
-                AudioFeatureRequest::LeadingSlaney { mel_bins, .. } => {
-                    let mut values = vec![-8.0; 2 * mel_bins];
-                    values[*mel_bins] = 3.0;
-                    Ok(AudioFeatures {
-                        values,
-                        mask: vec![true; 2],
-                        frames: 2,
-                        bins: *mel_bins,
-                    })
-                }
-            }
-        }
-
         fn tensor_bool(
             &mut self,
             values: &[bool],
@@ -1406,6 +1600,58 @@ mod tests {
     }
 
     #[test]
+    fn later_plan_failure_precedes_all_native_tensor_work() {
+        let audio = eredu_core::Audio::new(vec![0.0; 320], 16_000).unwrap();
+        let request = MultimodalRequest::new(vec![
+            MultimodalSegment::TokenIds(vec![7]),
+            MultimodalSegment::Media(Media::Audio(audio)),
+        ])
+        .unwrap()
+        .tokenize::<Infallible>(|_| unreachable!())
+        .unwrap();
+        let mut mechanisms = TestMechanisms::default();
+        let error = qwen_processor()
+            .prepare(&request, &mut mechanisms, &mut |_| {
+                Ok::<_, Infallible>(Vec::new())
+            })
+            .unwrap_err();
+
+        assert!(matches!(error, ProcessorExecutionError::Plan(_)));
+        assert_eq!(mechanisms.tensors.get(), 0);
+    }
+
+    #[test]
+    fn later_host_media_failure_precedes_all_native_tensor_work() {
+        let model = br#"{
+            "boa_token_id":43,"eoa_token_id":44,"audio_config":{}
+        }"#;
+        let processor = PreparedProcessor {
+            kind: ProcessorKind::Gemma4(
+                Gemma4ProcessorPlan::from_hf_json(model, None, None)
+                    .unwrap()
+                    .unwrap(),
+            ),
+        };
+        let audio = eredu_core::Audio::new(vec![0.0; 320], 8_000).unwrap();
+        let request = MultimodalRequest::new(vec![
+            MultimodalSegment::TokenIds(vec![7]),
+            MultimodalSegment::Media(Media::Audio(audio)),
+        ])
+        .unwrap()
+        .tokenize::<Infallible>(|_| unreachable!())
+        .unwrap();
+        let mut mechanisms = TestMechanisms::default();
+        let error = processor
+            .prepare(&request, &mut mechanisms, &mut |_| {
+                Ok::<_, Infallible>(Vec::new())
+            })
+            .unwrap_err();
+
+        assert!(matches!(error, ProcessorExecutionError::Plan(_)));
+        assert_eq!(mechanisms.tensors.get(), 0);
+    }
+
+    #[test]
     fn qwen_image_execution_owns_framing_patch_order_and_identity() {
         let request = MultimodalRequest::new(vec![
             MultimodalSegment::TokenIds(vec![7]),
@@ -1433,7 +1679,6 @@ mod tests {
             [1, 2, 2]
         );
         assert_eq!(prepared.identity().len(), prepared.len());
-        assert_eq!(mechanisms.normalizations.get(), 1);
         assert_eq!(mechanisms.tensors.get(), 6);
     }
 
@@ -1518,7 +1763,6 @@ mod tests {
         assert_eq!(prepared.len(), 3);
         assert_eq!(prepared.parts()[1].modality(), InputModality::Video);
         assert_eq!(prepared.parts()[1].payload().value().shape, [4, 24]);
-        assert_eq!(mechanisms.normalizations.get(), 2);
     }
 
     #[test]
@@ -1592,15 +1836,15 @@ mod tests {
         assert_eq!(prepared.len(), 3);
         assert_eq!(prepared.parts()[0].payload().value().i32_values, [43]);
         let audio = &prepared.parts()[1];
-        assert_eq!(audio.payload().value().shape, [1, 3, 128]);
+        assert_eq!(audio.payload().value().shape, [1, 2, 128]);
         assert_eq!(
             audio
                 .metadata_value(InputMetadataKey::AudioMask)
                 .unwrap()
                 .bool_values,
-            [true, true, false]
+            [true, false]
         );
-        assert_eq!(audio.extents(), [InputExtent::AudioValidFrames(2)]);
+        assert_eq!(audio.extents(), [InputExtent::AudioValidFrames(1)]);
         assert_eq!(prepared.parts()[2].payload().value().i32_values, [44]);
     }
 
@@ -1648,7 +1892,7 @@ mod tests {
         let audio = &prepared.parts()[3];
         assert_eq!(audio.payload().value().shape, [1, 2, 80]);
         assert_eq!(audio.payload().value().i32_values[0], 0);
-        assert_eq!(audio.payload().value().i32_values[80], 3);
+        assert_eq!(audio.payload().value().i32_values[80], 0);
         assert_eq!(audio.extents(), [InputExtent::AudioValidFrames(2)]);
     }
 

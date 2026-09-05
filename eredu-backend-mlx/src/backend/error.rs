@@ -28,6 +28,10 @@ pub enum Error {
     #[error(transparent)]
     Artifact(#[from] eredu_core::artifact::ArtifactError),
 
+    /// Portable architecture, artifact, request, and mechanism admission failed.
+    #[error(transparent)]
+    PreparationAdmission(#[from] eredu_core::PreparationAdmissionError),
+
     /// The selected realtime session lacks a required capability.
     #[error(transparent)]
     SessionCapability(#[from] eredu_core::SessionCapabilityError),

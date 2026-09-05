@@ -7,6 +7,8 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+/// Portable architecture, artifact, request, and backend mechanism admission.
+pub mod admission;
 /// Portable artifact inspection and model-preparation planning.
 pub mod artifact;
 /// Validated decoder attention schedules.
@@ -46,6 +48,10 @@ pub mod speculative;
 /// Parallel topology and placement planning.
 pub mod topology;
 
+pub use admission::{
+    admit_preparation, ArchitecturePreparationCapabilities, PreparationAdmission,
+    PreparationAdmissionError, PreparationAdmissionRequest, PreparationMechanismCapabilities,
+};
 pub use artifact::{
     gguf_u32_metadata_values, inspect_artifact, plan_model_preparation, resolve_gguf_companions,
     validate_preparation_policy, ArtifactFormat, ArtifactInspection, GgufCompanionEncoding,
@@ -109,8 +115,12 @@ pub use input::{
     InputTensorIdentity, PreparedInputError, PreparedInputIdentity,
 };
 pub use inspection::{
-    ArtifactModality, ArtifactTensorEncoding, InspectionIssue, InspectionIssueCode,
-    InspectionReadiness, InspectionRequirement, InspectionSeverity, ModelInspectionReport,
+    assemble_portable_model_inspection, finalize_realized_model_inspection,
+    media_feature_readiness, record_media_projector_inspection, record_processor_inspection,
+    reject_portable_artifact_inspection, ArtifactModality, ArtifactTensorEncoding, InspectionIssue,
+    InspectionIssueCode, InspectionReadiness, InspectionRequirement, InspectionSeverity,
+    MediaFeatureAvailability, MediaProjectorRequirement, ModelInspectionReport,
+    RealizedInspectionOutcomes,
 };
 pub use media::{
     Audio, Media, MediaBinding, MediaRequestError, MultimodalRequest, MultimodalSegment, RgbImage,

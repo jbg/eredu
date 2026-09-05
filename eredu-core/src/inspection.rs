@@ -1,8 +1,15 @@
 //! Portable model-artifact inspection results.
 
-use crate::{ArtifactFormat, ModelResourceProfile};
+use crate::{
+    artifact::ArtifactError, ArtifactFormat, ArtifactInspection, GgufCompanionRole,
+    InputModalities, ModelResourceProfile, Observed, PreparationAdmission,
+    PreparationAdmissionError, SessionCapabilities,
+};
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::{Path, PathBuf},
+};
 
 /// A readiness result that preserves distinct failure modes.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
@@ -22,6 +29,199 @@ pub enum InspectionReadiness {
     Unverified,
     /// The capability does not apply.
     NotApplicable,
+}
+
+/// Mechanism observations required to finalize an admitted inspection report.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct RealizedInspectionOutcomes {
+    /// The admitted artifact remained authoritative through construction.
+    pub artifact_authority: bool,
+    /// Canonical bindings were published into the constructed module.
+    pub binding: bool,
+    /// Native-independent model construction completed.
+    pub construction: bool,
+    /// The selected communication realization was exercised.
+    pub communication: bool,
+    /// At least one session operation completed and was observed.
+    pub execution: bool,
+    /// Facilities actually observed on the constructed session.
+    pub session: SessionCapabilities,
+}
+
+/// Finalizes readiness from actual construction and execution observations.
+///
+/// Artifact identity and descriptive fields remain those admitted by the
+/// portable report. Readiness is recomputed from realized mechanisms, so a
+/// backend adapter cannot prove realization by replaying artifact inspection.
+pub fn finalize_realized_model_inspection(
+    admitted: &ModelInspectionReport,
+    outcomes: RealizedInspectionOutcomes,
+) -> ModelInspectionReport {
+    let mut report = admitted.clone();
+    let admission = admitted.preparation_admission;
+    let session_matches =
+        admission.is_some_and(|value| value.session_capabilities() == outcomes.session);
+    report.container = if outcomes.artifact_authority {
+        InspectionReadiness::Ready
+    } else {
+        InspectionReadiness::Invalid
+    };
+    report.architecture_support = if outcomes.construction {
+        InspectionReadiness::Ready
+    } else {
+        InspectionReadiness::Invalid
+    };
+    report.structural_binding = if outcomes.binding {
+        InspectionReadiness::Ready
+    } else {
+        InspectionReadiness::Invalid
+    };
+    report.model_loadability = if outcomes.artifact_authority
+        && outcomes.binding
+        && outcomes.construction
+        && outcomes.communication
+        && outcomes.execution
+    {
+        InspectionReadiness::Ready
+    } else {
+        InspectionReadiness::Invalid
+    };
+    report.requested_load =
+        if report.model_loadability == InspectionReadiness::Ready && session_matches {
+            InspectionReadiness::Ready
+        } else {
+            InspectionReadiness::Unsupported
+        };
+    report
+}
+
+/// Assembles the portable portion of a model inspection report from one
+/// authoritative artifact admission and its exact preparation admission.
+///
+/// This is the canonical adapter surface for backend-independent callers: all
+/// readiness derived from artifact headers, architecture capabilities, load
+/// policy, and portable media facilities is recorded here rather than rebuilt
+/// by individual backends or integration adapters.
+pub fn assemble_portable_model_inspection<P>(
+    inspection: &ArtifactInspection<P>,
+    admission: PreparationAdmission,
+    modalities: InputModalities,
+    embedded_draft_layers: Option<usize>,
+    processor: Option<(bool, MediaFeatureAvailability)>,
+) -> ModelInspectionReport {
+    let mut report = ModelInspectionReport::unverified(inspection.path(), inspection.format());
+    report.record_artifact_inspection(inspection);
+    report.record_architecture_capabilities(modalities, embedded_draft_layers);
+    if let Some((has_processor, availability)) = processor {
+        record_processor_inspection(&mut report, has_processor, availability);
+    }
+    report.record_preparation_admission(admission);
+    report
+}
+
+/// Records one failed portable artifact inspection without backend policy.
+pub fn reject_portable_artifact_inspection(
+    report: &mut ModelInspectionReport,
+    path: &Path,
+    error: &ArtifactError,
+) {
+    let detail = error.to_string();
+    let missing_media_projector = matches!(
+        error,
+        ArtifactError::MissingRequiredGgufCompanion {
+            role: GgufCompanionRole::MediaProjector,
+            ..
+        }
+    );
+    let (code, container, architecture, structural, type_code) = match error {
+        ArtifactError::UnsupportedGgufArchitecture(name) => {
+            report.architecture = Some(name.clone());
+            (
+                InspectionIssueCode::UnsupportedArchitecture,
+                InspectionReadiness::Ready,
+                InspectionReadiness::Unsupported,
+                InspectionReadiness::Unsupported,
+                None,
+            )
+        }
+        ArtifactError::MissingGgufArchitecture => (
+            InspectionIssueCode::InvalidConfiguration,
+            InspectionReadiness::Ready,
+            InspectionReadiness::Invalid,
+            InspectionReadiness::Invalid,
+            None,
+        ),
+        ArtifactError::MissingRequiredGgufCompanion {
+            role: GgufCompanionRole::MediaProjector,
+            ..
+        } => (
+            InspectionIssueCode::MissingMediaProjector,
+            InspectionReadiness::Ready,
+            InspectionReadiness::Ready,
+            InspectionReadiness::Unverified,
+            None,
+        ),
+        ArtifactError::InvalidArtifact(_)
+        | ArtifactError::InvalidArchitecturePlan(_)
+        | ArtifactError::DuplicateTensor(_)
+        | ArtifactError::Catalog(_) => (
+            InspectionIssueCode::InvalidConfiguration,
+            InspectionReadiness::Ready,
+            InspectionReadiness::Unverified,
+            InspectionReadiness::Invalid,
+            None,
+        ),
+        ArtifactError::Gguf(error) => {
+            let type_code = error.unsupported_tensor_type_code();
+            (
+                if type_code.is_some() {
+                    InspectionIssueCode::UnsupportedTensorEncoding
+                } else {
+                    InspectionIssueCode::InvalidContainer
+                },
+                InspectionReadiness::Invalid,
+                InspectionReadiness::Unverified,
+                InspectionReadiness::Unverified,
+                type_code,
+            )
+        }
+        _ => (
+            InspectionIssueCode::InvalidContainer,
+            InspectionReadiness::Invalid,
+            InspectionReadiness::Unverified,
+            InspectionReadiness::Unverified,
+            None,
+        ),
+    };
+    report.container = container;
+    report.architecture_support = architecture;
+    report.structural_binding = structural;
+    report.model_loadability = if missing_media_projector {
+        InspectionReadiness::Missing
+    } else if architecture == InspectionReadiness::Unsupported {
+        InspectionReadiness::Unsupported
+    } else {
+        InspectionReadiness::Invalid
+    };
+    report.requested_load = report.model_loadability;
+    if missing_media_projector {
+        report.multimodal = InspectionReadiness::Missing;
+        report.requirements.push(InspectionRequirement {
+            code: InspectionIssueCode::MissingMediaProjector,
+            readiness: InspectionReadiness::Missing,
+            detail: detail.clone(),
+            path: None,
+        });
+    }
+    report.issues.push(InspectionIssue {
+        code,
+        severity: InspectionSeverity::Error,
+        detail,
+        path: Some(path.to_path_buf()),
+        metadata_key: None,
+        tensor_name: None,
+        tensor_type_code: type_code,
+    });
 }
 
 /// Severity attached to an inspection issue.
@@ -99,7 +299,7 @@ pub struct InspectionIssue {
     /// Human-readable actionable detail.
     pub detail: String,
     /// Relevant artifact or sidecar path.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<PathBuf>,
     /// Relevant metadata key.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -188,6 +388,9 @@ pub struct ModelInspectionReport {
     pub model_loadability: InspectionReadiness,
     /// Compatibility with backend preparation options.
     pub requested_load: InspectionReadiness,
+    /// Exact portable preparation admission selected from immutable cold facts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preparation_admission: Option<PreparationAdmission>,
     /// Combined model and tokenizer readiness for raw text generation.
     pub text_generation: InspectionReadiness,
     /// Tokenizer reconstruction/readiness.
@@ -225,6 +428,7 @@ impl ModelInspectionReport {
             structural_binding: InspectionReadiness::Unverified,
             model_loadability: InspectionReadiness::Unverified,
             requested_load: InspectionReadiness::Unverified,
+            preparation_admission: None,
             text_generation: InspectionReadiness::Unverified,
             tokenizer: InspectionReadiness::Unverified,
             chat_template: InspectionReadiness::Unverified,
@@ -249,6 +453,152 @@ impl ModelInspectionReport {
                 .any(|issue| issue.code == InspectionIssueCode::ValidationUnavailableUntilLoad)
     }
 
+    /// Applies reusable header/catalog facts from one admitted portable inspection.
+    pub fn record_artifact_inspection<P>(&mut self, inspection: &ArtifactInspection<P>) {
+        self.path = inspection.path().to_owned();
+        self.artifact_format = inspection.format();
+        self.model_family = Some(inspection.configuration().family().to_owned());
+        self.architecture = Some(inspection.configuration().effective_model_type().to_owned());
+        self.container = InspectionReadiness::Ready;
+        self.architecture_support = InspectionReadiness::Ready;
+        self.structural_binding = InspectionReadiness::Ready;
+        self.model_loadability = InspectionReadiness::Ready;
+        self.tensor_count = Some(inspection.tensors().len());
+
+        let (shards, encodings, stored_bytes, largest_bytes, gguf_versions) =
+            if let Some(validated) = inspection.validated_gguf() {
+                let checkpoint = validated.checkpoint();
+                let encodings = checkpoint
+                    .tensors()
+                    .map(|tensor| tensor.descriptor().ggml_type)
+                    .map(|encoding| (encoding.code(), format!("{encoding:?}")))
+                    .collect::<BTreeMap<_, _>>()
+                    .into_iter()
+                    .map(|(code, name)| ArtifactTensorEncoding {
+                        name,
+                        ggml_type_code: Some(code),
+                    })
+                    .collect();
+                let mut total = Some(0_u64);
+                let mut largest = 0_u64;
+                for tensor in checkpoint.tensors() {
+                    let bytes = tensor.descriptor().byte_len;
+                    total = total.and_then(|value| value.checked_add(bytes));
+                    largest = largest.max(bytes);
+                }
+                let versions = checkpoint
+                    .shards()
+                    .iter()
+                    .map(|shard| shard.version())
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect();
+                (
+                    checkpoint.shards().len(),
+                    encodings,
+                    total,
+                    largest,
+                    Some(versions),
+                )
+            } else {
+                let mut shards = BTreeSet::new();
+                let mut encodings = BTreeSet::new();
+                let mut total = Some(0_u64);
+                let mut largest = 0_u64;
+                for tensor in inspection.tensors().descriptors() {
+                    encodings.insert(safetensors_encoding_name(&tensor.dtype));
+                    if let Some(storage) = &tensor.storage {
+                        shards.insert(storage.member.clone());
+                        total = total.and_then(|value| value.checked_add(storage.length));
+                        largest = largest.max(storage.length);
+                    } else {
+                        total = None;
+                    }
+                }
+                (
+                    shards.len(),
+                    encodings
+                        .into_iter()
+                        .map(|name| ArtifactTensorEncoding {
+                            name,
+                            ggml_type_code: None,
+                        })
+                        .collect(),
+                    total,
+                    largest,
+                    None,
+                )
+            };
+        self.checkpoint_shards = Some(shards);
+        self.tensor_encodings = encodings;
+        self.gguf_versions = gguf_versions;
+        self.resources.model_family = self.model_family.clone();
+        self.resources.architecture = self.architecture.clone();
+        self.resources.tensor_count = self.tensor_count;
+        self.resources.checkpoint_shards = self.checkpoint_shards;
+        match stored_bytes {
+            Some(total) => {
+                self.resources.stored_tensor_bytes =
+                    Observed::exact(total, "authoritative portable tensor catalog");
+                self.resources.largest_stored_tensor_bytes =
+                    Observed::exact(largest_bytes, "authoritative portable tensor catalog");
+            }
+            None => {
+                self.resources.stored_tensor_bytes =
+                    Observed::unavailable("portable payload-byte catalog was incomplete");
+                self.resources.largest_stored_tensor_bytes =
+                    Observed::unavailable("portable payload-byte catalog was incomplete");
+            }
+        }
+    }
+
+    /// Records the exact successful cold admission used by later realization.
+    pub fn record_preparation_admission(&mut self, admission: PreparationAdmission) {
+        self.preparation_admission = Some(admission);
+        self.requested_load = InspectionReadiness::Ready;
+    }
+
+    /// Records architecture-owned modality and embedded-drafting facts.
+    pub fn record_architecture_capabilities(
+        &mut self,
+        modalities: InputModalities,
+        embedded_draft_layers: Option<usize>,
+    ) {
+        self.expected_modalities = artifact_modalities(modalities);
+        self.resources.embedded_draft_layers = embedded_draft_layers.map_or_else(
+            || Observed::unsupported("artifact convention does not expose embedded drafting"),
+            |layers| Observed::exact(layers, "normalized architecture configuration"),
+        );
+    }
+
+    /// Records one stable portable admission rejection.
+    pub fn reject_preparation_admission(&mut self, error: PreparationAdmissionError) {
+        use PreparationAdmissionError as Admission;
+        self.preparation_admission = None;
+        self.requested_load = InspectionReadiness::Unsupported;
+        let code = match error {
+            Admission::UnsupportedQuantization(_) => {
+                InspectionIssueCode::UnsupportedQuantizationRequest
+            }
+            Admission::UnsupportedResidency(_) | Admission::ArchitectureParameterBanks => {
+                InspectionIssueCode::UnsupportedResidencyPolicy
+            }
+            Admission::ArchitectureParallelAxis(_) | Admission::BackendParallelAxis(_) => {
+                InspectionIssueCode::UnsupportedParallelTopology
+            }
+            Admission::ArchitectureInputModality(_) | Admission::BackendInputModality(_) => {
+                InspectionIssueCode::MissingProcessor
+            }
+            _ => InspectionIssueCode::UnsupportedArchitecture,
+        };
+        self.issue(
+            code,
+            InspectionSeverity::Error,
+            error.to_string(),
+            Some(self.path.clone()),
+        );
+    }
+
     /// Adds a structured issue with an optional artifact path.
     pub fn issue(
         &mut self,
@@ -269,6 +619,167 @@ impl ModelInspectionReport {
     }
 }
 
+fn safetensors_encoding_name(dtype: &crate::checkpoint::TensorDtype) -> String {
+    use crate::checkpoint::TensorDtype;
+    match dtype {
+        TensorDtype::Bf16 => "BF16".into(),
+        TensorDtype::Complex64 => "C64".into(),
+        TensorDtype::Encoded(name) if name == "F8_E4M3" => "F8E4M3".into(),
+        TensorDtype::Encoded(name) if name == "F4" => "F4".into(),
+        TensorDtype::Encoded(name) if name == "F8_E8M0" => "F8E8M0".into(),
+        TensorDtype::Encoded(name) if name == "F8_E5M2" => "F8E5M2".into(),
+        TensorDtype::Encoded(name) => format!("Other({name:?})"),
+        dtype => format!("{dtype:?}"),
+    }
+}
+
+/// Converts portable modality flags into stable inspection report values.
+pub fn artifact_modalities(modalities: InputModalities) -> Vec<ArtifactModality> {
+    [
+        (modalities.text, ArtifactModality::Text),
+        (modalities.image, ArtifactModality::Image),
+        (modalities.video, ArtifactModality::Video),
+        (modalities.audio, ArtifactModality::Audio),
+    ]
+    .into_iter()
+    .filter_map(|(enabled, modality)| enabled.then_some(modality))
+    .collect()
+}
+
+/// Portable availability of optional host-media processors.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct MediaFeatureAvailability {
+    /// Image and video host processing is linked.
+    pub image: bool,
+    /// Audio host processing is linked.
+    pub audio: bool,
+}
+
+/// Architecture-owned requirement for a GGUF media projector.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum MediaProjectorRequirement {
+    /// No projector applies.
+    NotApplicable,
+    /// Text remains available when the projector is absent.
+    Optional,
+    /// Model loading requires a projector.
+    Required,
+}
+
+/// Computes portable host-feature readiness for declared modalities.
+pub fn media_feature_readiness(
+    expected: &[ArtifactModality],
+    availability: MediaFeatureAvailability,
+) -> InspectionReadiness {
+    if expected == [ArtifactModality::Text] {
+        return InspectionReadiness::NotApplicable;
+    }
+    if expected.iter().all(|modality| match modality {
+        ArtifactModality::Text => true,
+        ArtifactModality::Image | ArtifactModality::Video => availability.image,
+        ArtifactModality::Audio => availability.audio,
+    }) {
+        InspectionReadiness::Ready
+    } else {
+        InspectionReadiness::Unsupported
+    }
+}
+
+/// Records portable processor and host-feature readiness in one report.
+pub fn record_processor_inspection(
+    report: &mut ModelInspectionReport,
+    has_processor: bool,
+    availability: MediaFeatureAvailability,
+) {
+    let feature_readiness = media_feature_readiness(&report.expected_modalities, availability);
+    if feature_readiness == InspectionReadiness::NotApplicable {
+        report.multimodal = feature_readiness;
+        return;
+    }
+    if has_processor {
+        report.multimodal = feature_readiness;
+        report.requirements.push(InspectionRequirement {
+            code: InspectionIssueCode::MissingProcessor,
+            readiness: feature_readiness,
+            detail: if feature_readiness == InspectionReadiness::Ready {
+                "authoritative processor plan and required host-media features are available".into()
+            } else {
+                "authoritative processor plan is available, but required host-media features are not enabled".into()
+            },
+            path: None,
+        });
+    } else {
+        report.multimodal = InspectionReadiness::Missing;
+        report.issue(
+            InspectionIssueCode::MissingProcessor,
+            InspectionSeverity::Warning,
+            "authoritative architecture inspection admitted no media processor",
+            Some(report.path.clone()),
+        );
+    }
+}
+
+/// Records a validated or absent GGUF projector and returns whether it was selected.
+pub fn record_media_projector_inspection(
+    report: &mut ModelInspectionReport,
+    artifact_path: &Path,
+    requirement: MediaProjectorRequirement,
+    projector: Option<PathBuf>,
+) -> bool {
+    match (requirement, projector) {
+        (MediaProjectorRequirement::NotApplicable, _) => {
+            report.multimodal = InspectionReadiness::NotApplicable;
+            false
+        }
+        (_, Some(path)) => {
+            report.requirements.push(InspectionRequirement {
+                code: InspectionIssueCode::MissingMediaProjector,
+                readiness: InspectionReadiness::Ready,
+                detail: "portable admission validated the architecture-declared media projector"
+                    .into(),
+                path: Some(path),
+            });
+            true
+        }
+        (MediaProjectorRequirement::Optional, None) => {
+            report.multimodal = InspectionReadiness::Missing;
+            report.requirements.push(InspectionRequirement {
+                code: InspectionIssueCode::MissingMediaProjector,
+                readiness: InspectionReadiness::Missing,
+                detail: "text loading is available, but media input requires an architecture-declared sibling projector GGUF".into(),
+                path: None,
+            });
+            report.issue(
+                InspectionIssueCode::MissingMediaProjector,
+                InspectionSeverity::Warning,
+                "no sibling media projector was admitted; text loading remains available",
+                Some(artifact_path.to_path_buf()),
+            );
+            false
+        }
+        (MediaProjectorRequirement::Required, None) => {
+            report.multimodal = InspectionReadiness::Missing;
+            report.model_loadability = InspectionReadiness::Invalid;
+            report.requested_load = InspectionReadiness::Invalid;
+            report.requirements.push(InspectionRequirement {
+                code: InspectionIssueCode::MissingMediaProjector,
+                readiness: InspectionReadiness::Missing,
+                detail:
+                    "architecture preparation requires a validated sibling media projector GGUF"
+                        .into(),
+                path: None,
+            });
+            report.issue(
+                InspectionIssueCode::MissingMediaProjector,
+                InspectionSeverity::Error,
+                "portable admission omitted an architecture-required media projector",
+                Some(artifact_path.to_path_buf()),
+            );
+            false
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -280,5 +791,20 @@ mod tests {
         let json = serde_json::to_string(&report).unwrap();
         let decoded: ModelInspectionReport = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded, report);
+    }
+
+    #[test]
+    fn neutral_admission_rejection_has_a_stable_report_code() {
+        let mut report =
+            ModelInspectionReport::unverified(Path::new("model"), ArtifactFormat::SafeTensors);
+        report.reject_preparation_admission(PreparationAdmissionError::BackendParallelAxis(
+            crate::ParallelAxis::Pipeline,
+        ));
+        assert_eq!(report.requested_load, InspectionReadiness::Unsupported);
+        assert!(report.preparation_admission.is_none());
+        assert_eq!(
+            report.issues[0].code,
+            InspectionIssueCode::UnsupportedParallelTopology
+        );
     }
 }

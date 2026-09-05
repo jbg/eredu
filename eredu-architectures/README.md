@@ -10,6 +10,10 @@ Concrete backends retain control of tensors, storage, graph construction,
 kernel fusion, streams, caches, and collectives. This keeps every model family
 available without enabling a concrete backend or native runtime.
 
+Architecture-owned processor requests are executed as portable host
+transformations through `eredu-media`; a concrete backend receives only the
+validated processed buffer and lowers it to its native tensor type.
+
 Most applications should use
 [`eredu`](https://github.com/jbg/eredu/tree/main/eredu). Backend authors and
 model-family integrations can use this crate with `eredu-runtime` and

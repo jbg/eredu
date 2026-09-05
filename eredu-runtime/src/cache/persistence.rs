@@ -2,7 +2,7 @@
 
 use eredu_core::cache::{
     CacheBlockId, CacheRepresentation, PromptCacheBlock, PromptCacheError, PromptCacheManifest,
-    PromptCacheStateTensor, PROMPT_CACHE_SCHEMA_VERSION,
+    PromptCacheStateTensor, PromptCacheTopology, PROMPT_CACHE_SCHEMA_VERSION,
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -26,6 +26,26 @@ pub const MAX_PROMPT_CACHE_SHARD_HEADER_BYTES: u64 = 1024 * 1024;
 pub const PROMPT_CACHE_GENERATIONS_DIRECTORY: &str = ".generations";
 /// Atomic pointer to the active immutable generation.
 pub const PROMPT_CACHE_CURRENT_FILE: &str = "CURRENT";
+
+/// Resolves the canonical rank-local prompt-cache storage directory.
+///
+/// Replicated cache state remains at `root`; distributed state is isolated by
+/// all three semantic rank coordinates, using `x` for inactive axes.
+pub fn prompt_cache_rank_path(root: &Path, topology: &PromptCacheTopology) -> PathBuf {
+    let coordinate = |axis: Option<(usize, usize)>| {
+        axis.map_or_else(|| "x".to_owned(), |(_, rank)| rank.to_string())
+    };
+    if topology.cache_rank_identity().is_none() {
+        root.to_path_buf()
+    } else {
+        root.join(format!(
+            "rank-p{}-t{}-e{}",
+            coordinate(topology.stage()),
+            coordinate(topology.shard()),
+            coordinate(topology.addressable())
+        ))
+    }
+}
 
 /// Filesystem, catalog, and publication failures for a reusable prompt cache.
 #[derive(Debug, thiserror::Error)]

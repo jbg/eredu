@@ -10,7 +10,7 @@ pub mod distributed;
 pub mod execution;
 /// MLX token sampling.
 pub mod generation;
-/// MLX tensor inputs and media preprocessing.
+/// MLX tensor inputs and processed-media conversion.
 pub mod media;
 /// MLX weight-residency execution.
 pub mod residency;

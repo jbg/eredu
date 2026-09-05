@@ -4,7 +4,15 @@
 //! materializes tensor payloads or creates a device/runtime object.
 
 use crate::checkpoint::{TensorCatalog, TensorDescriptor, TensorDtype, TensorStorage};
-use eredu_checkpoint::safetensors::SafetensorsShards;
+pub use eredu_checkpoint::artifact::ArtifactFile;
+use eredu_checkpoint::{
+    artifact::{fingerprint_artifact_files, ArtifactFingerprintError, ArtifactMemberFingerprint},
+    safetensors::SafetensorsShards,
+    store::{
+        PreparedCheckpointSource, ResolvedCheckpointSource, SharedCheckpointSource, TensorMetadata,
+    },
+    StoredDtype,
+};
 use eredu_gguf::{Checkpoint as GgufCheckpoint, GgmlType, MetadataValue};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -13,7 +21,188 @@ use std::{
     fs::File,
     io::Read,
     path::{Path, PathBuf},
+    sync::Arc,
 };
+
+/// Content-exact identity of one ordered logical artifact.
+///
+/// The representation is intentionally independent of filesystem location and
+/// metadata. Its digest covers the identity domain, sorted logical file roles,
+/// exact byte lengths, and exact file content.
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+pub struct ArtifactIdentity([u8; 32]);
+
+impl ArtifactIdentity {
+    /// Returns the raw SHA-256 digest.
+    pub const fn digest(self) -> [u8; 32] {
+        self.0
+    }
+}
+
+impl std::fmt::Display for ArtifactIdentity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "sha256:{}", hex_digest(&self.0))
+    }
+}
+
+impl std::fmt::Debug for ArtifactIdentity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, formatter)
+    }
+}
+
+/// Exact in-memory identity facts for one logical artifact member.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ArtifactMemberIdentity {
+    logical_role: String,
+    length: u64,
+    digest: [u8; 32],
+}
+
+impl ArtifactMemberIdentity {
+    /// Creates one exact logical member identity.
+    pub fn new(logical_role: impl Into<String>, length: u64, digest: [u8; 32]) -> Self {
+        Self {
+            logical_role: logical_role.into(),
+            length,
+            digest,
+        }
+    }
+
+    /// Stable role used in the artifact layout.
+    pub fn logical_role(&self) -> &str {
+        &self.logical_role
+    }
+
+    /// Exact member byte length.
+    pub const fn length(&self) -> u64 {
+        self.length
+    }
+
+    /// Exact member content digest.
+    pub const fn digest(&self) -> [u8; 32] {
+        self.digest
+    }
+}
+
+impl From<ArtifactMemberFingerprint> for ArtifactMemberIdentity {
+    fn from(member: ArtifactMemberFingerprint) -> Self {
+        Self::new(member.logical_role(), member.length(), member.digest())
+    }
+}
+
+/// Fingerprints exact content under one explicit semantic domain.
+///
+/// Input order is immaterial: logical roles are sorted canonically. Empty
+/// domains, empty roles, empty artifacts, and duplicate roles are rejected.
+pub fn fingerprint_artifact(
+    domain: &str,
+    members: impl IntoIterator<Item = ArtifactMemberIdentity>,
+) -> Result<ArtifactIdentity, ArtifactError> {
+    if domain.is_empty() {
+        return Err(ArtifactError::InvalidArtifactIdentity(
+            "artifact identity domain must not be empty".into(),
+        ));
+    }
+    let mut members = members.into_iter().collect::<Vec<_>>();
+    if members.is_empty() {
+        return Err(ArtifactError::InvalidArtifactIdentity(
+            "artifact identity requires at least one file".into(),
+        ));
+    }
+    if members.iter().any(|member| member.logical_role.is_empty()) {
+        return Err(ArtifactError::InvalidArtifactIdentity(
+            "artifact member has an empty logical role".into(),
+        ));
+    }
+    members.sort_unstable_by(|left, right| left.logical_role.cmp(&right.logical_role));
+    if let Some(pair) = members
+        .windows(2)
+        .find(|pair| pair[0].logical_role == pair[1].logical_role)
+    {
+        return Err(ArtifactError::InvalidArtifactIdentity(format!(
+            "duplicate artifact logical role {:?}",
+            pair[0].logical_role
+        )));
+    }
+
+    let mut hasher = sha2::Sha256::new();
+    hash_identity_component(&mut hasher, b"eredu-checkpoint-artifact-v2");
+    hash_identity_component(&mut hasher, domain.as_bytes());
+    use sha2::Digest as _;
+    hasher.update((members.len() as u64).to_le_bytes());
+    for member in members {
+        hash_identity_component(&mut hasher, member.logical_role.as_bytes());
+        hasher.update(member.length.to_le_bytes());
+        hasher.update(member.digest);
+    }
+    Ok(ArtifactIdentity(hasher.finalize().into()))
+}
+
+/// Fingerprints filesystem members through checkpoint-owned stable I/O and
+/// applies the canonical in-memory identity algorithm.
+pub fn fingerprint_filesystem_artifact(
+    domain: &str,
+    files: impl IntoIterator<Item = ArtifactFile>,
+) -> Result<ArtifactIdentity, ArtifactError> {
+    fingerprint_artifact(
+        domain,
+        fingerprint_artifact_files(files)?
+            .into_iter()
+            .map(ArtifactMemberIdentity::from),
+    )
+}
+
+/// Fingerprints the exact SafeTensors members admitted during inspection.
+///
+/// Member names come from the admitted index (or the submitted direct-file
+/// name), so relocation of an otherwise identical artifact does not affect
+/// the identity.
+pub fn fingerprint_safetensors_artifact(
+    domain: &str,
+    shards: &SafetensorsShards,
+) -> Result<ArtifactIdentity, ArtifactError> {
+    fingerprint_filesystem_artifact(
+        domain,
+        shards
+            .logical_payload_paths()
+            .iter()
+            .map(|(role, path)| ArtifactFile::new(role, path)),
+    )
+}
+
+/// Fingerprints the exact GGUF split members admitted by the portable parser.
+///
+/// Logical roles derive solely from validated split numbers rather than
+/// filenames or filesystem locations.
+pub fn fingerprint_gguf_artifact(
+    domain: &str,
+    checkpoint: &GgufCheckpoint,
+) -> Result<ArtifactIdentity, ArtifactError> {
+    fingerprint_filesystem_artifact(
+        domain,
+        checkpoint
+            .shards()
+            .iter()
+            .map(|shard| ArtifactFile::new(format!("split/{:05}", shard.split_no()), shard.path())),
+    )
+}
+
+fn hash_identity_component(hasher: &mut sha2::Sha256, value: &[u8]) {
+    use sha2::Digest as _;
+    hasher.update((value.len() as u64).to_le_bytes());
+    hasher.update(value);
+}
+
+fn hex_digest(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        output.push(DIGITS[usize::from(byte >> 4)] as char);
+        output.push(DIGITS[usize::from(byte & 0x0f)] as char);
+    }
+    output
+}
 
 /// Backend-neutral loader contract required by an inspected artifact.
 ///
@@ -587,6 +776,76 @@ pub enum ModelArtifact {
     },
 }
 
+/// Opens an admitted SafeTensors artifact through the canonical prepared source.
+///
+/// The exact shard set comes from header-only inspection. This function does
+/// not rediscover a directory or index, and it validates the current headers
+/// against the retained portable catalog before applying the already admitted
+/// checkpoint resolution. Tensor payloads remain unopened until a later
+/// selected materialization requests a lease.
+pub fn open_prepared_safetensors_artifact(
+    tensors: &TensorCatalog,
+    shards: SafetensorsShards,
+    resolution: eredu_checkpoint::validation::ResolvedCheckpointPlan,
+    max_cached_shards: usize,
+) -> Result<SharedCheckpointSource, ArtifactError> {
+    let catalog = tensors
+        .descriptors()
+        .map(|tensor| {
+            let storage = tensor.storage.as_ref().ok_or_else(|| {
+                ArtifactError::InvalidArtifact(format!(
+                    "prepared SafeTensors tensor {:?} has no storage provenance",
+                    tensor.name
+                ))
+            })?;
+            let stored_dtype = tensor_dtype_to_stored(&tensor.dtype);
+            Ok((
+                tensor.name.clone(),
+                TensorMetadata {
+                    name: tensor.name.clone(),
+                    logical_shape: tensor.shape.clone(),
+                    physical_shape: tensor.shape.clone(),
+                    stored_dtype,
+                    encoded_byte_len: storage.length,
+                    backing_shard: Some(PathBuf::from(&storage.member)),
+                },
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>, ArtifactError>>()?;
+    let prepared =
+        PreparedCheckpointSource::open_admitted_safetensors(shards, catalog, max_cached_shards)?;
+    Ok(Arc::new(ResolvedCheckpointSource::new(
+        Arc::new(prepared),
+        resolution,
+    )))
+}
+
+fn tensor_dtype_to_stored(dtype: &TensorDtype) -> StoredDtype {
+    match dtype {
+        TensorDtype::Bool => StoredDtype::Bool,
+        TensorDtype::U8 => StoredDtype::U8,
+        TensorDtype::I8 => StoredDtype::I8,
+        TensorDtype::I16 => StoredDtype::I16,
+        TensorDtype::U16 => StoredDtype::U16,
+        TensorDtype::F16 => StoredDtype::F16,
+        TensorDtype::Bf16 => StoredDtype::BF16,
+        TensorDtype::I32 => StoredDtype::I32,
+        TensorDtype::U32 => StoredDtype::U32,
+        TensorDtype::F32 => StoredDtype::F32,
+        TensorDtype::F64 => StoredDtype::F64,
+        TensorDtype::I64 => StoredDtype::I64,
+        TensorDtype::U64 => StoredDtype::U64,
+        TensorDtype::Complex64 => StoredDtype::C64,
+        TensorDtype::Encoded(name) => match name.as_str() {
+            "F8_E4M3" => StoredDtype::F8E4M3,
+            "F4" => StoredDtype::F4,
+            "F8_E8M0" => StoredDtype::F8E8M0,
+            "F8_E5M2" => StoredDtype::F8E5M2,
+            _ => StoredDtype::Other(name.clone()),
+        },
+    }
+}
+
 /// Inspect a local artifact without loading tensor payloads.
 pub fn inspect_artifact<R: ModelConfigurationResolver>(
     path: impl AsRef<Path>,
@@ -1027,6 +1286,9 @@ fn is_gguf(path: &Path) -> bool {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ArtifactError {
+    /// Artifact identity domain, membership, or logical roles are invalid.
+    #[error("invalid artifact identity: {0}")]
+    InvalidArtifactIdentity(String),
     /// Artifact path does not exist.
     #[error("model artifact does not exist: {0}")]
     MissingArtifact(PathBuf),
@@ -1067,6 +1329,12 @@ pub enum ArtifactError {
     /// Canonical SafeTensors shard discovery or path admission failed.
     #[error(transparent)]
     SafetensorsShards(#[from] eredu_checkpoint::safetensors::SafetensorsShardError),
+    /// Filesystem-backed stable content fingerprinting failed.
+    #[error(transparent)]
+    ArtifactFingerprint(#[from] ArtifactFingerprintError),
+    /// Prepared checkpoint source validation or acquisition failed.
+    #[error(transparent)]
+    CheckpointStore(#[from] eredu_checkpoint::store::StoreError),
     /// Requested quantization transformation is unavailable for the artifact.
     #[error("unsupported model quantization policy: {0}")]
     UnsupportedQuantizationPolicy(String),
@@ -1095,6 +1363,205 @@ mod tests {
     use super::*;
     use eredu_gguf::{GgmlType, MetadataArray, TensorInput, Writer};
     use std::io::Write;
+
+    #[test]
+    fn artifact_identity_rejects_empty_and_duplicate_layouts() {
+        assert!(matches!(
+            fingerprint_artifact("", [ArtifactMemberIdentity::new("weights", 7, [1; 32])]),
+            Err(ArtifactError::InvalidArtifactIdentity(_))
+        ));
+        assert!(matches!(
+            fingerprint_artifact("model", std::iter::empty::<ArtifactMemberIdentity>()),
+            Err(ArtifactError::InvalidArtifactIdentity(_))
+        ));
+        assert!(matches!(
+            fingerprint_artifact("model", [ArtifactMemberIdentity::new("", 7, [1; 32])]),
+            Err(ArtifactError::InvalidArtifactIdentity(_))
+        ));
+        assert!(matches!(
+            fingerprint_artifact(
+                "model",
+                [
+                    ArtifactMemberIdentity::new("weights", 7, [1; 32]),
+                    ArtifactMemberIdentity::new("weights", 7, [1; 32]),
+                ],
+            ),
+            Err(ArtifactError::InvalidArtifactIdentity(_))
+        ));
+    }
+
+    #[test]
+    fn artifact_identity_is_order_and_location_independent_but_domain_and_layout_exact() {
+        let first = tempfile::tempdir().unwrap();
+        let relocated = tempfile::tempdir().unwrap();
+        for directory in [first.path(), relocated.path()] {
+            std::fs::write(directory.join("a"), b"first").unwrap();
+            std::fs::write(directory.join("b"), b"second").unwrap();
+        }
+        let fingerprint = |root: &Path, domain: &str, reversed: bool| {
+            let mut files = vec![
+                ArtifactFile::new("decoder", root.join("a")),
+                ArtifactFile::new("projector", root.join("b")),
+            ];
+            if reversed {
+                files.reverse();
+            }
+            fingerprint_filesystem_artifact(domain, files).unwrap()
+        };
+        let identity = fingerprint(first.path(), "model", false);
+        assert_eq!(identity, fingerprint(first.path(), "model", true));
+        assert_eq!(identity, fingerprint(relocated.path(), "model", false));
+        assert_ne!(identity, fingerprint(first.path(), "assistant", false));
+        assert_ne!(
+            identity,
+            fingerprint_filesystem_artifact(
+                "model",
+                [
+                    ArtifactFile::new("decoder-renamed", first.path().join("a")),
+                    ArtifactFile::new("projector", first.path().join("b")),
+                ],
+            )
+            .unwrap()
+        );
+        assert_eq!(format!("{identity:?}"), identity.to_string());
+        assert_eq!(identity.to_string().len(), 71);
+    }
+
+    #[test]
+    fn artifact_identity_includes_exact_content_and_length() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("weights");
+        let identify = || {
+            fingerprint_filesystem_artifact("model", [ArtifactFile::new("weights", &path)]).unwrap()
+        };
+        std::fs::write(&path, b"a").unwrap();
+        let short = identify();
+        std::fs::write(&path, b"b").unwrap();
+        assert_ne!(short, identify());
+        std::fs::write(&path, b"a\0").unwrap();
+        assert_ne!(short, identify());
+    }
+
+    #[test]
+    fn admitted_safetensors_identity_is_relocation_independent_and_content_exact() {
+        let first = tempfile::tempdir().unwrap();
+        let relocated = tempfile::tempdir().unwrap();
+        write_safetensors_fixture(first.path(), "llama");
+        write_safetensors_fixture(relocated.path(), "llama");
+        let first_path = first.path().join("original-name.safetensors");
+        let relocated_path = relocated.path().join("renamed.safetensors");
+        std::fs::rename(first.path().join("model.safetensors"), &first_path).unwrap();
+        std::fs::rename(relocated.path().join("model.safetensors"), &relocated_path).unwrap();
+        let first_shards = SafetensorsShards::discover(&first_path).unwrap();
+        let relocated_shards = SafetensorsShards::discover(&relocated_path).unwrap();
+        let identify = |shards: &SafetensorsShards| {
+            fingerprint_safetensors_artifact("speculative-test", shards).unwrap()
+        };
+        let original = identify(&first_shards);
+        assert_eq!(original, identify(&relocated_shards));
+
+        let payload = relocated_path;
+        let mut bytes = std::fs::read(&payload).unwrap();
+        let last = bytes.last_mut().unwrap();
+        *last ^= 0x01;
+        std::fs::write(&payload, bytes).unwrap();
+        assert_ne!(original, identify(&relocated_shards));
+    }
+
+    #[test]
+    fn admitted_gguf_identity_uses_split_roles_and_exact_content() {
+        let first = tempfile::tempdir().unwrap();
+        let relocated = tempfile::tempdir().unwrap();
+        let write = |path: &Path| {
+            let data = 1.0_f32.to_le_bytes();
+            Writer::default()
+                .write(
+                    File::create(path).unwrap(),
+                    &BTreeMap::from([(
+                        "general.architecture".into(),
+                        MetadataValue::String("llama".into()),
+                    )]),
+                    &[TensorInput {
+                        name: "weight",
+                        dimensions: &[1],
+                        ggml_type: GgmlType::F32,
+                        data: &data,
+                    }],
+                )
+                .unwrap();
+        };
+        let first_path = first.path().join("first-name.gguf");
+        let relocated_path = relocated.path().join("different-name.gguf");
+        write(&first_path);
+        write(&relocated_path);
+        let first_checkpoint = GgufCheckpoint::open(&first_path).unwrap();
+        let relocated_checkpoint = GgufCheckpoint::open(&relocated_path).unwrap();
+        let original = fingerprint_gguf_artifact("speculative-test", &first_checkpoint).unwrap();
+        assert_eq!(
+            original,
+            fingerprint_gguf_artifact("speculative-test", &relocated_checkpoint).unwrap()
+        );
+
+        let mut bytes = std::fs::read(&relocated_path).unwrap();
+        *bytes.last_mut().unwrap() ^= 0x01;
+        std::fs::write(&relocated_path, bytes).unwrap();
+        assert_ne!(
+            original,
+            fingerprint_gguf_artifact("speculative-test", &relocated_checkpoint).unwrap()
+        );
+    }
+
+    #[test]
+    fn canonical_prepared_safetensors_open_rejects_substitution_without_payload_reads() {
+        use eredu_checkpoint::{
+            schema::{
+                CatalogPolicy, SafetensorsCheckpointPlan, SafetensorsTensorConstraint,
+                StoredDtypeConstraint,
+            },
+            store::SafetensorsWeightStore,
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        write_safetensors_fixture(directory.path(), "llama");
+        let inspection = inspect_artifact(directory.path(), &FixtureResolver).unwrap();
+        let shards = inspection.safetensors_shards().unwrap().clone();
+        let plan = SafetensorsCheckpointPlan::new(
+            "fixture",
+            vec![SafetensorsTensorConstraint::required(
+                "token_embd.weight",
+                vec![2, 2],
+                StoredDtypeConstraint::Exact(StoredDtype::F32),
+            )],
+            Vec::new(),
+            CatalogPolicy::strict(),
+        )
+        .unwrap();
+        let store = SafetensorsWeightStore::open_admitted(shards.clone(), 1).unwrap();
+        let resolution =
+            eredu_checkpoint::validation::resolve_safetensors_plan(&store, &plan).unwrap();
+        let prepared = open_prepared_safetensors_artifact(
+            inspection.tensors(),
+            shards.clone(),
+            resolution.clone(),
+            1,
+        )
+        .unwrap();
+        assert_eq!(prepared.source_diagnostics().unwrap().physical_reads, 0);
+
+        let header = br#"{"token_embd.weight":{"dtype":"F32","shape":[4],"data_offsets":[0,16]}}"#;
+        let mut file = File::create(directory.path().join("model.safetensors")).unwrap();
+        file.write_all(&(header.len() as u64).to_le_bytes())
+            .unwrap();
+        file.write_all(header).unwrap();
+        file.write_all(&[0_u8; 16]).unwrap();
+        drop(file);
+        assert!(matches!(
+            open_prepared_safetensors_artifact(inspection.tensors(), shards, resolution, 1,),
+            Err(ArtifactError::CheckpointStore(
+                eredu_checkpoint::store::StoreError::PreparedCatalogMismatch { .. }
+            ))
+        ));
+    }
 
     struct FixtureResolver;
 

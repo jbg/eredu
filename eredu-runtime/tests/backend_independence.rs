@@ -9,15 +9,16 @@ use std::{
     },
 };
 
+use eredu_checkpoint::{LinearFormat, SourceTensorEncoding, StoredDtype};
 use eredu_core::{
     cache::{
         LayerCachePolicy, MutableStateResidency, StateTensorDimension, StateTensorDtype,
         StateTensorPolicy, StateTensorRole,
     },
     checkpoint::TensorDtype,
-    AttentionPolicy, Completion, DistributedCommitEpoch, DistributedCommitOutcome,
-    DistributedCommitPhase, InputModality, InputTensorIdentity, LayerSchedule, Submission,
-    TokenFilter,
+    AttentionPolicy, CollectiveGroupId, Completion, DistributedCommitEpoch,
+    DistributedCommitOutcome, DistributedCommitPhase, InputModality, InputTensorIdentity,
+    LayerSchedule, Submission, TokenFilter,
 };
 use eredu_nn::{
     AttentionCache, AttentionMask, AttentionRequest, EmbeddingOperator, EmbeddingSpec, Error,
@@ -27,7 +28,7 @@ use eredu_nn::{
     RotarySpec, Tensor,
 };
 use eredu_runtime::{
-    bind_materialized_unit, construct_replicated_text_session,
+    bind_materialized_unit, build_module_binding_plan, construct_replicated_text_session,
     construct_replicated_text_session_with_runtime, materialize_bindings,
     materialize_selected_bindings, prepare_layered_text_contract,
     prepare_partitioned_session_runtime, prepare_replicated_text_contract,
@@ -36,17 +37,18 @@ use eredu_runtime::{
     ArchitectureGroupTransport, ArchitectureMergeDestination, ArchitectureParameterDescription,
     ArchitectureParameters, ArchitecturePartition, ArchitectureStateFactory,
     BackendMechanismCapabilities, BarrierBackend, CacheResidencyPolicy, CollectiveBackend,
-    CommunicationBackend, CommunicationGroupDescriptor, CommunicationGroupId,
-    CommunicationGroupRequirements, CommunicationManifest, CommunicationOperation,
-    CommunicationOperationRequirement, CommunicationRouteDescriptor, CommunicationRouteId,
-    CommunicationTensorLimits, CommunicationTensorMetadata, CompositeLayeredTraversalHook,
-    DeviceState, DistributedExecutionPhase, ExecutionGraph, ExecutionGroupSpec, ExecutionResidency,
+    CommunicationBackend, CommunicationGroupDescriptor, CommunicationGroupRequirements,
+    CommunicationManifest, CommunicationOperation, CommunicationOperationRequirement,
+    CommunicationRouteDescriptor, CommunicationRouteId, CommunicationTensorLimits,
+    CommunicationTensorMetadata, CompositeLayeredTraversalHook, DeviceState,
+    DistributedExecutionPhase, ExecutionGraph, ExecutionGroupSpec, ExecutionResidency,
     ExecutionUnitAddress, ExecutionUnitLayout, FailureAgreementBackend, LayerWeightResidency,
     LayeredArchitecture, LayeredForwardState, LayeredPartitionDriver, LayeredPartitionInput,
     LayeredPartitionOutput, LayeredTraversalHook, LayeredTraversalPoint, LayeredUnitAction,
-    LayerwisePolicy, LayerwiseRuntime, NoAuxiliaryBoundary, NoAuxiliaryBoundarySchema,
-    NoBoundaryTransport, NoCommitAgreement, NoOutputPublisher, OpaqueBoundaryTransport,
-    OpaqueCommitAgreement, OpaqueFailureAgreement, ParallelLayeredArchitecture, ParameterBackend,
+    LayerwisePolicy, LayerwiseRuntime, LocalModelLayout, LocalTensorLayout, NoAuxiliaryBoundary,
+    NoAuxiliaryBoundarySchema, NoBoundaryTransport, NoCommitAgreement, NoOutputPublisher,
+    OpaqueBoundaryTransport, OpaqueCommitAgreement, OpaqueFailureAgreement,
+    ParallelLayeredArchitecture, ParameterBackend, ParameterBindingTarget, ParameterRole,
     PartitionBoundaryRoute, PartitionBoundaryTransport, PartitionCommitAgreement,
     PartitionCommunication, PartitionOutputPublication, PartitionOutputPublisher,
     PartitionOwnership, PartitionedExecutionPlan, PartitionedGroupExecutor,
@@ -65,8 +67,9 @@ use eredu_runtime::{
     StateComponentMechanism, StateComponentPlacement, StateError, StateLayout,
     StateMechanismCapabilities, StateSegmentId, StateSegmentLifetime, StateSegmentSpec,
     StaticParameterVisitor, StaticParameterVisitorMut, SubmissionBackend, SumReductionBackend,
-    TokenDomain, TransactionalPromptCacheMechanisms, TransferBackend, UnevenGatherBackend,
-    WeightBinding, WeightLoweringCapability, WeightLoweringKind, WeightResidencyMechanism,
+    TensorPlacement, TokenDomain, TransactionalPromptCacheMechanisms, TransferBackend,
+    UnevenGatherBackend, WeightBinding, WeightLoweringCapability, WeightLoweringKind,
+    WeightResidencyMechanism,
 };
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -933,7 +936,7 @@ impl CommunicationTensorMetadata<FakeBackend> for PipelineTensorMetadata {
 #[test]
 fn uneven_gather_validates_distinct_input_and_completed_result_limits() {
     UNEVEN_GATHER_CALLS.with(|calls| calls.set(0));
-    let group_id = CommunicationGroupId::new(1);
+    let group_id = CollectiveGroupId::new(1);
     let requirement = CommunicationOperationRequirement::tensors(
         CommunicationOperation::AllGatherUneven,
         [TensorDtype::F32],
@@ -1045,8 +1048,8 @@ fn partition_communication_rejects_swapped_native_resource_identities() {
         .unwrap()])
         .unwrap()
     };
-    let first = CommunicationGroupId::new(1);
-    let second = CommunicationGroupId::new(2);
+    let first = CollectiveGroupId::new(1);
+    let second = CollectiveGroupId::new(2);
     let manifest = CommunicationManifest::new(
         1,
         0,
@@ -1089,7 +1092,7 @@ fn route_test_communication(
         true,
     )
     .unwrap();
-    let group_id = CommunicationGroupId::new(1);
+    let group_id = CollectiveGroupId::new(1);
     let groups = with_failure_agreement
         .then(|| {
             CommunicationGroupDescriptor::new(
@@ -1241,7 +1244,7 @@ fn agreement_deadline_after_completed_transfer_poisons_later_route_use() {
     let error = OpaqueFailureAgreement
         .agree_phase(
             &communication,
-            CommunicationGroupId::new(1),
+            CollectiveGroupId::new(1),
             DistributedExecutionPhase::BoundarySourceReady(CommunicationRouteId::new(9)),
             true,
             &(),
@@ -1275,7 +1278,7 @@ fn recovery_agreement_cannot_bypass_a_healthy_communication_authority() {
     let error = OpaqueFailureAgreement
         .agree_phase_after_prior_failure(
             &communication,
-            CommunicationGroupId::new(1),
+            CollectiveGroupId::new(1),
             DistributedExecutionPhase::Execution,
             true,
             &(),
@@ -1309,7 +1312,7 @@ fn final_agreement_submission_and_completion_failures_are_indeterminate_and_pois
         }
         let first = OpaqueFailureAgreement.commit(
             &communication,
-            CommunicationGroupId::new(1),
+            CollectiveGroupId::new(1),
             DistributedCommitEpoch::FIRST,
             &(),
         );
@@ -1323,12 +1326,7 @@ fn final_agreement_submission_and_completion_failures_are_indeterminate_and_pois
         let calls = FAILURE_AGREEMENT_COUNT.get();
         let retry_epoch = DistributedCommitEpoch::FIRST.next().unwrap();
         assert!(OpaqueFailureAgreement
-            .commit(
-                &communication,
-                CommunicationGroupId::new(1),
-                retry_epoch,
-                &(),
-            )
+            .commit(&communication, CollectiveGroupId::new(1), retry_epoch, &(),)
             .is_indeterminate());
         assert_eq!(FAILURE_AGREEMENT_COUNT.get(), calls);
     }
@@ -1614,6 +1612,166 @@ fn neutral_loader_materializes_and_binds_the_fake_backend() {
     assert_eq!(module.weight, FakeTensor(vec![2, 2]));
 }
 
+#[test]
+fn independent_backend_consumes_canonical_binding_and_placement_plans() {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use eredu_checkpoint::{
+        recipe::{DerivedWeightRecipe, RecipeDtype},
+        store::{MemoryWeightStore, TensorSelection},
+    };
+    use eredu_runtime::{place_weight_bindings, BindingPlan, BindingPlanError, PlannedBinding};
+
+    let store = MemoryWeightStore::from_safetensors([(
+        "weight".to_owned(),
+        safetensors::Dtype::F32,
+        vec![2, 2],
+        vec![0; 16],
+    )])
+    .unwrap();
+    let module = FakeModule {
+        weight: FakeTensor(vec![2, 2]),
+    };
+    let plan = build_module_binding_plan(
+        &module,
+        "",
+        &store,
+        BTreeMap::new(),
+        BTreeSet::new(),
+        |_| false,
+        |parameter| {
+            Some(ParameterBindingTarget {
+                shape: parameter.0.iter().map(|value| *value as usize).collect(),
+                dtype: RecipeDtype::F32,
+                permitted_source_dtypes: Vec::new(),
+            })
+        },
+    )
+    .unwrap();
+    let bindings = plan.build_bindings(&store).unwrap();
+    assert_eq!(bindings.len(), 1);
+    assert_eq!(bindings[0].logical_target(), Some("weight"));
+
+    let mut layout = LocalModelLayout::default();
+    layout.insert(
+        "weight".into(),
+        LocalTensorLayout::new(
+            "weight",
+            ParameterRole::ColumnProjection,
+            vec![2, 2],
+            vec![1, 2],
+            TensorPlacement::Shard {
+                axis: 0,
+                index: 1,
+                parts: 2,
+            },
+            None,
+            None,
+            false,
+        ),
+    );
+    let placed = place_weight_bindings(bindings, &store, &layout).unwrap();
+    assert_eq!(placed[0].expected_bytes(), 8);
+    assert_eq!(
+        placed[0].source_recipe(),
+        DerivedWeightRecipe::source(
+            "weight",
+            TensorSelection::Range {
+                axis: 0,
+                start: 1,
+                end: 2,
+            },
+        )
+    );
+
+    let declarations = vec![
+        PlannedBinding::direct("left", "weight", vec![2, 2], RecipeDtype::F32),
+        PlannedBinding::direct("right", "weight", vec![2, 2], RecipeDtype::F32),
+    ];
+    assert!(matches!(
+        BindingPlan::new(declarations.clone()),
+        Err(BindingPlanError::DuplicateSourceClaim { .. })
+    ));
+    let shared =
+        BindingPlan::allowing_shared_sources(declarations, BTreeSet::from(["weight".to_owned()]))
+            .unwrap();
+    assert_eq!(shared.source_keys(), ["weight"]);
+
+    let rank = eredu_runtime::PlacementRank::new(6, 4).unwrap();
+    let mut distributed = eredu_runtime::PlacementPlan::new(rank);
+    distributed
+        .insert_expected(
+            "tensor_parallel",
+            vec![6, 4],
+            TensorPlacement::Shard {
+                axis: 0,
+                index: 2,
+                parts: 3,
+            },
+        )
+        .unwrap();
+    distributed.insert("pipeline_owner", TensorPlacement::Rank { rank: 5 });
+    distributed.insert(
+        "expert_members",
+        TensorPlacement::Indices {
+            axis: 0,
+            indices: vec![3, 1],
+        },
+    );
+    distributed.validate().unwrap();
+    assert_eq!(
+        distributed.resolve("tensor_parallel", &[6, 4]).unwrap(),
+        eredu_runtime::ResolvedTensorPlacement::Selection(TensorSelection::Range {
+            axis: 0,
+            start: 4,
+            end: 6,
+        })
+    );
+    assert_eq!(
+        distributed.resolve("pipeline_owner", &[2]).unwrap(),
+        eredu_runtime::ResolvedTensorPlacement::Omit
+    );
+    assert_eq!(
+        distributed.resolve("expert_members", &[4, 2]).unwrap(),
+        eredu_runtime::ResolvedTensorPlacement::Selection(TensorSelection::Indices {
+            axis: 0,
+            indices: vec![3, 1],
+        })
+    );
+}
+
+#[test]
+fn binding_dtype_conversion_requires_an_explicit_target_declaration() {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use eredu_checkpoint::{recipe::RecipeDtype, store::MemoryWeightStore};
+    use eredu_runtime::{BindingPlan, BindingPlanError, PlannedBinding};
+
+    let store = MemoryWeightStore::from_safetensors([(
+        "weight".to_owned(),
+        safetensors::Dtype::F16,
+        vec![2],
+        vec![0; 4],
+    )])
+    .unwrap();
+    let declaration = PlannedBinding::direct("weight", "weight", vec![2], RecipeDtype::F32);
+    assert!(matches!(
+        BindingPlan::new(vec![declaration.clone()])
+            .unwrap()
+            .build_bindings(&store),
+        Err(BindingPlanError::DtypeMismatch { .. })
+    ));
+    let converted = BindingPlan::with_explicit_exceptions(
+        vec![declaration],
+        BTreeSet::new(),
+        BTreeMap::from([("weight".to_owned(), vec![RecipeDtype::F16])]),
+    )
+    .unwrap()
+    .build_bindings(&store)
+    .unwrap();
+    assert_eq!(converted.len(), 1);
+}
+
 struct CountingSource {
     inner: eredu_checkpoint::store::MemoryWeightStore,
     leases: Arc<AtomicUsize>,
@@ -1893,6 +2051,7 @@ fn device_state_retention_uses_local_ordinal_with_nonzero_partition_offset() {
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
 struct ReplicatedSessionCounts {
     materializations: usize,
+    materialization_reports: usize,
     resident_policies: usize,
     bounded_policies: usize,
     unit_constructions: usize,
@@ -2872,7 +3031,7 @@ fn named_frame_local_segment_resets_without_touching_persistent_state() {
     );
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct FakeUnit {
     marker: i32,
 }
@@ -2896,6 +3055,7 @@ impl std::ops::DerefMut for RecordingLease {
     }
 }
 
+#[derive(Clone)]
 struct RecordingPolicy {
     units: Vec<Option<FakeUnit>>,
     addresses: Vec<(usize, usize, usize)>,
@@ -3018,12 +3178,16 @@ struct ReferencePromptCacheSaveTransaction {
     published: bool,
 }
 
+type PreparedPartitionObservation = Rc<RefCell<Option<(Vec<usize>, Vec<Vec<usize>>)>>>;
+
 struct ReferenceTextMechanisms {
     tasks: Rc<RefCell<Vec<ReplicatedTextMaterializationTask>>>,
     completions: Rc<RefCell<Vec<FakeTensor>>>,
     counters: ReplicatedSessionCounters,
     fail_completion: Rc<Cell<bool>>,
     fail_checkpoint: bool,
+    fail_construction_report: bool,
+    prepared_partition: Option<PreparedPartitionObservation>,
     prompt_cache: Option<ReferencePromptCache>,
 }
 
@@ -3045,6 +3209,63 @@ where
     type StateReport = Vec<i32>;
     type ExecutionReport = (LayerWeightResidency, bool);
     type Error = &'static str;
+
+    fn take_materialization_report(
+        &mut self,
+    ) -> Result<Option<eredu_runtime::WeightMaterializationReport>, Self::Error> {
+        self.counters
+            .update(|counts| counts.materialization_reports += 1);
+        if self.fail_construction_report {
+            return Err("injected construction report failure");
+        }
+        let tasks = self.tasks.borrow();
+        Ok(Some(eredu_runtime::WeightMaterializationReport {
+            transformed_weights: tasks
+                .iter()
+                .filter(|task| {
+                    matches!(
+                        task.lowering(),
+                        WeightLoweringKind::Transform | WeightLoweringKind::DerivedTransform
+                    )
+                })
+                .count(),
+            source_tiles: tasks.len(),
+            output_bytes: u64::try_from(tasks.len()).unwrap(),
+            ..Default::default()
+        }))
+    }
+
+    fn prepare_partition_materialization(
+        &mut self,
+        architecture: &mut A,
+        global_layout: &eredu_runtime::ExecutionUnitLayout,
+        addresses: &[eredu_runtime::ExecutionUnitAddress],
+        task_partition: &eredu_runtime::ReplicatedTextMaterializationPartitionPlan,
+        units: &mut [FakeUnit],
+        source_architecture: Option<&mut A>,
+        source_units: Option<&mut [FakeUnit]>,
+        tasks: &[ReplicatedTextMaterializationTask],
+        addressable_parameters: &[String],
+        context: &(),
+    ) -> Result<(), Self::Error> {
+        if let Some(recorded) = &self.prepared_partition {
+            *recorded.borrow_mut() = Some((
+                task_partition.static_task_indices().to_vec(),
+                task_partition.unit_task_indices().to_vec(),
+            ));
+        }
+        let _ = addresses;
+        self.prepare_materialization(
+            architecture,
+            global_layout,
+            units,
+            source_architecture,
+            source_units,
+            tasks,
+            addressable_parameters,
+            context,
+        )
+    }
 
     fn prepare_materialization(
         &mut self,
@@ -3799,12 +4020,57 @@ impl
     }
 }
 
+struct IndependentAdmissionAdapter;
+
+impl IndependentAdmissionAdapter {
+    fn admit(&self, residency: LayerWeightResidency) -> eredu_core::PreparationAdmission {
+        let residency = match residency {
+            LayerWeightResidency::FullyResident => eredu_core::ResidencyRequest::FullyResident,
+            LayerWeightResidency::LayerwiseHost(_) => eredu_core::ResidencyRequest::LayerwiseHost,
+            LayerWeightResidency::DenseDiskStream(_) => {
+                eredu_core::ResidencyRequest::DenseDiskStream
+            }
+            _ => panic!("independent adapter received an unknown residency mechanism"),
+        };
+        let policy = eredu_core::PreparationPolicy::new(None, residency)
+            .with_required_session_capabilities(eredu_core::SessionCapabilities::new(
+                true, true, true,
+            ));
+        let request = eredu_core::PreparationAdmissionRequest::new(
+            eredu_core::LoadingProtocol::Model,
+            eredu_core::ArtifactFormat::SafeTensors,
+            policy,
+            eredu_core::ArchitecturePreparationCapabilities::new(
+                false,
+                false,
+                false,
+                false,
+                false,
+                eredu_core::InputModalities::TEXT,
+            ),
+        )
+        .with_exact_completion(true);
+        let mechanisms = eredu_core::PreparationMechanismCapabilities::new(true, false)
+            .with_residency(residency, true)
+            .with_input_modalities(eredu_core::InputModalities::TEXT)
+            .with_exact_completion(true)
+            .with_session(eredu_core::SessionCapabilities::new(true, true, true));
+        eredu_core::admit_preparation(request, mechanisms).unwrap()
+    }
+}
+
 #[test]
 fn production_replicated_text_constructor_executes_reference_mechanisms() {
     for residency in [
         LayerWeightResidency::FullyResident,
         LayerWeightResidency::LayerwiseHost(Default::default()),
     ] {
+        let adapter = IndependentAdmissionAdapter;
+        let admission = adapter.admit(residency);
+        assert_eq!(
+            admission.session_capabilities(),
+            eredu_core::SessionCapabilities::new(true, true, true)
+        );
         let counters = ReplicatedSessionCounters::default();
         let architecture = OrdinaryTextFixture {
             static_modules: FakeOperator,
@@ -3830,6 +4096,8 @@ fn production_replicated_text_constructor_executes_reference_mechanisms() {
             counters: counters.clone(),
             fail_completion: Rc::clone(&fail_completion),
             fail_checkpoint: false,
+            fail_construction_report: false,
+            prepared_partition: None,
             prompt_cache: None,
         };
         let mut session = construct_replicated_text_session::<_, FakeBackend, _>(
@@ -3850,6 +4118,7 @@ fn production_replicated_text_constructor_executes_reference_mechanisms() {
             counters.snapshot(),
             ReplicatedSessionCounts {
                 materializations: 1,
+                materialization_reports: 1,
                 resident_policies: expected_policy_counts.0,
                 bounded_policies: expected_policy_counts.1,
                 unit_constructions: 1,
@@ -3859,6 +4128,13 @@ fn production_replicated_text_constructor_executes_reference_mechanisms() {
         );
 
         assert_eq!(tasks.borrow().len(), 1);
+        assert_eq!(
+            session
+                .materialization_report()
+                .expect("neutral driver retains the mechanism report")
+                .source_tiles,
+            1
+        );
         let task = &tasks.borrow()[0];
         assert_eq!(task.name(), "decoder.weight");
         assert_eq!(task.sources(), ["decoder.weight"]);
@@ -3934,6 +4210,57 @@ fn production_replicated_text_constructor_executes_reference_mechanisms() {
 }
 
 #[test]
+fn construction_report_failure_precedes_state_and_policy_native_work() {
+    let counters = ReplicatedSessionCounters::default();
+    let architecture = OrdinaryTextFixture {
+        static_modules: FakeOperator,
+        trace: Vec::new(),
+        counters: counters.clone(),
+        inconsistent_transport: false,
+        inconsistent_identity: false,
+    };
+    let selected = selected_reference_text(&architecture, LayerWeightResidency::FullyResident);
+    let expected_identity = selected.requirements().architecture_identity().to_owned();
+    let contract = prepare_replicated_text_contract::<
+        _,
+        FakeBackend,
+        DeviceState<FakeBackend, FakeLayerState>,
+    >(&architecture, None, selected, &expected_identity, &())
+    .unwrap();
+    let error = match construct_replicated_text_session::<_, FakeBackend, _>(
+        architecture,
+        None,
+        contract,
+        ReferenceTextMechanisms {
+            tasks: Rc::new(RefCell::new(Vec::new())),
+            completions: Rc::new(RefCell::new(Vec::new())),
+            counters: counters.clone(),
+            fail_completion: Rc::new(Cell::new(false)),
+            fail_checkpoint: false,
+            fail_construction_report: true,
+            prepared_partition: None,
+            prompt_cache: None,
+        },
+        &(),
+    ) {
+        Ok(_) => panic!("the mechanism report failure must abort construction"),
+        Err(error) => error,
+    };
+    assert!(error
+        .to_string()
+        .contains("injected construction report failure"));
+    assert_eq!(
+        counters.snapshot(),
+        ReplicatedSessionCounts {
+            materializations: 1,
+            materialization_reports: 1,
+            unit_constructions: 1,
+            ..Default::default()
+        }
+    );
+}
+
+#[test]
 fn prediction_target_capture_uses_one_authoritative_transaction_and_publication() {
     let counters = ReplicatedSessionCounters::default();
     let architecture = PredictionCaptureFixture(OrdinaryTextFixture {
@@ -3964,6 +4291,8 @@ fn prediction_target_capture_uses_one_authoritative_transaction_and_publication(
             counters: counters.clone(),
             fail_completion: Rc::new(Cell::new(false)),
             fail_checkpoint: false,
+            fail_construction_report: false,
+            prepared_partition: None,
             prompt_cache: Some(Rc::clone(&prompt_cache)),
         },
         &(),
@@ -4069,10 +4398,23 @@ fn production_partitioned_constructor_reuses_session_rollback_and_stateless_rank
     )
     .unwrap();
     let fail_after_state = Rc::new(Cell::new(false));
-    let commit_group = CommunicationGroupId::new(1);
+    let commit_group = CollectiveGroupId::new(1);
     let commit_requirements =
         CommunicationGroupRequirements::new([CommunicationOperationRequirement::barrier(true)])
             .unwrap();
+    let materialized_tasks = Rc::new(RefCell::new(Vec::new()));
+    let prepared_partition = Rc::new(RefCell::new(None));
+    let fail_completion = Rc::new(Cell::new(false));
+    let mut mechanisms = ReferenceTextMechanisms {
+        tasks: Rc::clone(&materialized_tasks),
+        completions: Rc::new(RefCell::new(Vec::new())),
+        counters: counters.clone(),
+        fail_completion: Rc::clone(&fail_completion),
+        fail_checkpoint: false,
+        fail_construction_report: false,
+        prepared_partition: Some(Rc::clone(&prepared_partition)),
+        prompt_cache: None,
+    };
     let binding = prepare_partitioned_session_runtime::<_, FakeBackend, _, _, _, _, Infallible, _>(
         architecture,
         selected,
@@ -4096,9 +4438,26 @@ fn production_partitioned_constructor_reuses_session_rollback_and_stateless_rank
         eredu_core::cache::PromptCacheTopology::default(),
         ReplicatedTextOutputSelection::LastSequencePosition,
         &(),
-        |input, _selected, _context| {
-            let (architecture, partition, manifest, tasks) = input.into_parts();
-            assert_eq!(tasks.len(), 1);
+        |input, selected, context| {
+            let prepared = eredu_runtime::prepare_default_partitioned_runtime(
+                input,
+                None,
+                LocalModelLayout::default(),
+                None,
+                selected,
+                &eredu_core::cache::PromptCacheTopology::default(),
+                eredu_runtime::PartitionedUnitScope::Owned,
+                &[],
+                &mut mechanisms,
+                context,
+            )
+            .unwrap();
+            let (architecture, partition, manifest, mut execution_policy, bounded, state) =
+                prepared.into_parts();
+            assert!(bounded.is_none());
+            let unit = execution_policy.units[0]
+                .take()
+                .expect("neutral driver constructed the selected local unit");
             let driver = LayeredPartitionDriver::new(&partition, 0, 0..1).unwrap();
             let plan = PartitionedExecutionPlan::new(
                 architecture.execution_graph().unwrap(),
@@ -4117,15 +4476,11 @@ fn production_partitioned_constructor_reuses_session_rollback_and_stateless_rank
                 FakeTensorMetadata,
             )
             .unwrap();
-            let state = DeviceState::create(partition.state().unwrap().layout().clone(), |_, _| {
-                Ok::<_, Infallible>(FakeLayerState(0))
-            })
-            .unwrap();
             let runtime = PartitionedTextRuntime::new(
                 plan,
                 ReferencePartitionExecutor {
                     architecture,
-                    unit: FakeUnit { marker: 5 },
+                    unit,
                     fail_after_state: Rc::clone(&fail_after_state),
                 },
                 communication,
@@ -4141,15 +4496,6 @@ fn production_partitioned_constructor_reuses_session_rollback_and_stateless_rank
         },
     )
     .unwrap();
-    let fail_completion = Rc::new(Cell::new(false));
-    let mechanisms = ReferenceTextMechanisms {
-        tasks: Rc::new(RefCell::new(Vec::new())),
-        completions: Rc::new(RefCell::new(Vec::new())),
-        counters: counters.clone(),
-        fail_completion: Rc::clone(&fail_completion),
-        fail_checkpoint: false,
-        prompt_cache: None,
-    };
     let mut session = construct_replicated_text_session_with_runtime::<
         OrdinaryTextFixture,
         FakeBackend,
@@ -4157,6 +4503,14 @@ fn production_partitioned_constructor_reuses_session_rollback_and_stateless_rank
         Strategy,
     >(binding, mechanisms, Strategy::new())
     .unwrap();
+
+    assert_eq!(materialized_tasks.borrow().len(), 1);
+    assert_eq!(materialized_tasks.borrow()[0].name(), "decoder.weight");
+    assert_eq!(
+        *prepared_partition.borrow(),
+        Some((Vec::new(), vec![vec![0]]))
+    );
+    assert_eq!(session.materialization_report().unwrap().source_tiles, 1);
 
     assert_eq!(
         session.decode(&FakeTensor(vec![3]), &()).unwrap(),
@@ -4315,6 +4669,8 @@ fn production_partitioned_constructor_reuses_session_rollback_and_stateless_rank
         counters,
         fail_completion: Rc::new(Cell::new(false)),
         fail_checkpoint: false,
+        fail_construction_report: false,
+        prepared_partition: None,
         prompt_cache: None,
     };
     let mut stateless_session = construct_replicated_text_session_with_runtime::<
@@ -4354,7 +4710,7 @@ where
     fn agree_phase(
         &mut self,
         _: &PartitionCommunication<FakeBackend, (), (), I>,
-        _: CommunicationGroupId,
+        _: CollectiveGroupId,
         phase: DistributedExecutionPhase,
         local_success: bool,
         _: &(),
@@ -4366,7 +4722,7 @@ where
     fn commit(
         &mut self,
         _: &PartitionCommunication<FakeBackend, (), (), I>,
-        _: CommunicationGroupId,
+        _: CollectiveGroupId,
         epoch: DistributedCommitEpoch,
         _: &(),
     ) -> DistributedCommitOutcome {
@@ -4428,7 +4784,7 @@ where
     fn agree_phase(
         &mut self,
         communication: &PartitionCommunication<FakeBackend, (), (), I>,
-        group: CommunicationGroupId,
+        group: CollectiveGroupId,
         phase: DistributedExecutionPhase,
         local_success: bool,
         executor: &(),
@@ -4459,7 +4815,7 @@ where
     fn commit(
         &mut self,
         communication: &PartitionCommunication<FakeBackend, (), (), I>,
-        group: CommunicationGroupId,
+        group: CollectiveGroupId,
         epoch: DistributedCommitEpoch,
         executor: &(),
     ) -> DistributedCommitOutcome {
@@ -4628,7 +4984,7 @@ fn run_partitioned_agreement_rank_with(
             eredu_core::cache::PromptCacheTopology::default(),
         )
         .unwrap();
-    let group = CommunicationGroupId::new(41);
+    let group = CollectiveGroupId::new(41);
     let manifest = CommunicationManifest::new(
         2,
         rank,
@@ -4725,6 +5081,8 @@ fn run_partitioned_agreement_rank_with(
             LocalPartitionFailure::Completion
         ))),
         fail_checkpoint: matches!(local_failure, LocalPartitionFailure::Checkpoint),
+        fail_construction_report: false,
+        prepared_partition: None,
         prompt_cache: Some(Rc::clone(&prompt_cache)),
     };
     let mut session = construct_replicated_text_session_with_runtime::<
@@ -4852,7 +5210,7 @@ fn partitioned_cache_control_session(
         1,
     )
     .unwrap();
-    let group = CommunicationGroupId::new(41);
+    let group = CollectiveGroupId::new(41);
     let manifest = CommunicationManifest::new(
         2,
         rank,
@@ -4947,6 +5305,8 @@ fn partitioned_cache_control_session(
         counters: counters.clone(),
         fail_completion: Rc::new(Cell::new(false)),
         fail_checkpoint: false,
+        fail_construction_report: false,
+        prepared_partition: None,
         prompt_cache: mechanism_available.then(|| Rc::clone(&prompt_cache)),
     };
     let session = construct_replicated_text_session_with_runtime::<
@@ -5699,7 +6059,7 @@ fn partitioned_runtime_rejects_publication_and_agreement_manifest_perturbations_
         TestPhaseAgreement,
     >;
 
-    let group = CommunicationGroupId::new(57);
+    let group = CollectiveGroupId::new(57);
     for (requirements, operation) in [
         (
             CommunicationGroupRequirements::new([
@@ -5936,6 +6296,8 @@ fn production_partitioned_middle_stage_completes_source_before_send_and_fences_d
         counters,
         fail_completion: Rc::new(Cell::new(false)),
         fail_checkpoint: false,
+        fail_construction_report: false,
+        prepared_partition: None,
         prompt_cache: None,
     };
     let mut session = construct_replicated_text_session_with_runtime::<
@@ -6072,7 +6434,7 @@ fn assert_destination_preparation_failure_is_agreed_before_transfer(
         true,
     )
     .unwrap();
-    let group = CommunicationGroupId::new(1);
+    let group = CollectiveGroupId::new(1);
     let manifest = CommunicationManifest::new(
         2,
         1,
@@ -6173,6 +6535,8 @@ fn assert_destination_preparation_failure_is_agreed_before_transfer(
         counters,
         fail_completion: Rc::new(Cell::new(false)),
         fail_checkpoint: false,
+        fail_construction_report: false,
+        prepared_partition: None,
         prompt_cache: None,
     };
     let mut session = construct_replicated_text_session_with_runtime::<
@@ -7269,6 +7633,8 @@ fn production_composite_input_reuses_the_shared_session_lifecycle() {
             counters: counters.clone(),
             fail_completion: Rc::clone(&fail_completion),
             fail_checkpoint: false,
+            fail_construction_report: false,
+            prepared_partition: None,
             prompt_cache: Some(Rc::clone(&prompt_cache)),
         };
         let mut session = construct_replicated_text_session::<_, FakeBackend, _>(
@@ -7832,7 +8198,7 @@ fn opaque_communication_projection_drives_backend_independent_callbacks() {
     )
     .unwrap();
     let group_requirements =
-        eredu_runtime::CommunicationGroupRequirements::new([tensor_requirement]).unwrap();
+        eredu_runtime::CommunicationGroupRequirements::new([tensor_requirement.clone()]).unwrap();
     let route_requirement = eredu_runtime::CommunicationOperationRequirement::tensors(
         eredu_runtime::CommunicationOperation::SendReceive,
         [TensorDtype::F32],
@@ -7841,15 +8207,31 @@ fn opaque_communication_projection_drives_backend_independent_callbacks() {
     )
     .unwrap();
     let plan = eredu_runtime::TopologyCommunicationPlan::new()
+        .with_completion_policy(test_completion_policy())
         .with_tensor_groups(group_requirements)
-        .with_pipeline_routes(route_requirement)
+        .with_pipeline_routes(route_requirement.clone())
         .unwrap();
-    let manifest = eredu_runtime::project_all_communication_manifests(topology, &plan)
-        .unwrap()
-        .remove(0);
+    let manifests = eredu_runtime::project_all_communication_manifests(topology, &plan).unwrap();
+    let capabilities =
+        eredu_runtime::CommunicationCapabilities::new([tensor_requirement, route_requirement])
+            .unwrap()
+            .with_completion_capabilities(
+                eredu_runtime::CommunicationCompletionCapabilities::new([
+                    eredu_core::CompletionCancellationMode::QuarantineUntilComplete,
+                ])
+                .unwrap(),
+            );
+    let prepared = eredu_runtime::prepare_communication_realization(
+        &manifests[0],
+        &manifests,
+        &capabilities,
+        eredu_runtime::CommunicationTopologyCapabilities::FullyConnected,
+    )
+    .unwrap();
 
-    let local_groups = manifest
-        .try_create_groups(|descriptor| {
+    let local_groups = prepared
+        .try_create_groups(|descriptor, world_wave| {
+            assert!(!world_wave);
             Ok::<_, Infallible>(
                 descriptor
                     .collective_descriptor()
@@ -7862,8 +8244,9 @@ fn opaque_communication_projection_drives_backend_independent_callbacks() {
         [(eredu_core::CollectiveGroupId::new(1), vec![0, 1], 0)]
     );
 
-    let routes = manifest
-        .try_create_routes(|descriptor| {
+    let routes = prepared
+        .try_create_routes(|descriptor, world_wave| {
+            assert!(!world_wave);
             Ok::<_, Infallible>((
                 descriptor.id(),
                 descriptor.source(),
@@ -7896,5 +8279,201 @@ fn communication_extensions_require_only_the_selected_operation() {
             members: vec![2, 5],
             value: vec![7, 9],
         }]
+    );
+}
+
+fn independent_materialization_task(
+    name: &str,
+    owner: ReplicatedTextParameterOwner,
+    executable: LinearFormat,
+    lowering: WeightLoweringKind,
+) -> ReplicatedTextMaterializationTask {
+    let source_encoding = SourceTensorEncoding::Safetensors(StoredDtype::F16);
+    let source = ReplicatedTextPhysicalSource::new(
+        name,
+        name,
+        "/independent/model.safetensors",
+        name,
+        source_encoding.clone(),
+        2,
+    )
+    .unwrap();
+    let shape = vec![8, 32];
+    let descriptor = eredu_runtime::WeightLoweringDescriptor::new(
+        source_encoding,
+        executable,
+        shape.clone(),
+        shape.clone(),
+        Some(1),
+    )
+    .unwrap();
+    ReplicatedTextMaterializationTask::from_exact_source(
+        name,
+        source,
+        Vec::new(),
+        shape.clone(),
+        shape,
+        ReplicatedTextParameterRole::LinearWeight,
+        owner,
+        executable,
+        lowering,
+        descriptor,
+    )
+    .unwrap()
+}
+
+#[test]
+fn independent_backend_uses_retained_materialization_plans_and_transform_outputs() {
+    let graph = ExecutionGraph::new(vec![ExecutionGroupSpec::root("decoder")], "decoder").unwrap();
+    let layout = ExecutionUnitLayout::new(&graph, [2]).unwrap();
+    let static_task = independent_materialization_task(
+        "embedding.weight",
+        ReplicatedTextParameterOwner::StaticRole("embedding".into()),
+        LinearFormat::Dense,
+        WeightLoweringKind::Direct,
+    );
+    let direct_task = independent_materialization_task(
+        "layers.0.weight",
+        ReplicatedTextParameterOwner::ExecutionUnit {
+            group: "decoder".into(),
+            unit: 0,
+        },
+        LinearFormat::Dense,
+        WeightLoweringKind::Direct,
+    );
+    let transform_task = independent_materialization_task(
+        "layers.1.weight",
+        ReplicatedTextParameterOwner::ExecutionUnit {
+            group: "decoder".into(),
+            unit: 1,
+        },
+        LinearFormat::MxFp4,
+        WeightLoweringKind::Transform,
+    )
+    .with_output_companions(vec![eredu_runtime::ReplicatedTextOutputCompanion::new(
+        "layers.1.scales",
+        eredu_nn::LinearCompanionRole::Scale,
+        vec![8, 1],
+        eredu_runtime::ParameterGroupOwner::execution_unit(
+            eredu_runtime::ExecutionGroupId::new("decoder").unwrap(),
+            1,
+        ),
+    )
+    .unwrap()])
+    .unwrap();
+    let tasks = vec![static_task, direct_task, transform_task];
+
+    let plan = eredu_runtime::plan_replicated_text_materialization_tasks(&tasks, &layout).unwrap();
+    assert_eq!(plan.task_count(), 3);
+    assert_eq!(plan.static_task_indices(), [0]);
+    assert_eq!(plan.unit_task_indices(), [vec![1], vec![2]]);
+    assert_eq!(
+        plan.static_tasks(&tasks).unwrap()[0].name(),
+        "embedding.weight"
+    );
+    assert_eq!(
+        plan.unit_tasks(&tasks).unwrap()[1][0].name(),
+        "layers.1.weight"
+    );
+    assert!(plan.static_tasks(&tasks[..2]).is_err());
+
+    let local_tasks = vec![tasks[0].clone(), tasks[2].clone()];
+    let local = eredu_runtime::plan_local_replicated_text_materialization_tasks(
+        &local_tasks,
+        &layout,
+        &[layout.address(1).unwrap()],
+    )
+    .unwrap();
+    assert_eq!(local.static_task_indices(), [0]);
+    assert_eq!(local.unit_task_indices(), [vec![1]]);
+
+    let outputs = eredu_runtime::locally_materialized_replicated_text_outputs(&tasks);
+    assert_eq!(
+        outputs.into_iter().collect::<Vec<_>>(),
+        ["layers.1.scales".to_string(), "layers.1.weight".to_string()]
+    );
+    let groups = eredu_runtime::group_replicated_text_transform_tasks(&tasks).unwrap();
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].task_indices(), [2]);
+    assert_eq!(
+        groups[0].tasks(&tasks).unwrap()[0].name(),
+        "layers.1.weight"
+    );
+}
+
+#[test]
+fn independent_materialization_helpers_fail_closed_and_merge_numeric_counters() {
+    let graph = ExecutionGraph::new(vec![ExecutionGroupSpec::root("decoder")], "decoder").unwrap();
+    let layout = ExecutionUnitLayout::new(&graph, [1]).unwrap();
+    let unknown = independent_materialization_task(
+        "layers.4.weight",
+        ReplicatedTextParameterOwner::ExecutionUnit {
+            group: "decoder".into(),
+            unit: 4,
+        },
+        LinearFormat::Dense,
+        WeightLoweringKind::Direct,
+    );
+    assert!(
+        eredu_runtime::plan_replicated_text_materialization_tasks(&[unknown], &layout).is_err()
+    );
+    assert!(
+        eredu_runtime::plan_local_replicated_text_materialization_tasks(&[], &layout, &[]).is_err()
+    );
+    let dense_transform = independent_materialization_task(
+        "bad.weight",
+        ReplicatedTextParameterOwner::StaticRole("output".into()),
+        LinearFormat::Dense,
+        WeightLoweringKind::Transform,
+    );
+    assert!(eredu_runtime::group_replicated_text_transform_tasks(&[dense_transform]).is_err());
+
+    let mut total = eredu_runtime::WeightMaterializationReport {
+        admitted_working_set_bytes: 64,
+        transformed_weights: 2,
+        source_tiles: 3,
+        peak_in_flight_tiles: 2,
+        source_bytes_read: 100,
+        output_bytes: 25,
+        peak_planned_working_set_bytes: 48,
+        largest_source_tile_bytes: 32,
+        largest_output_tile_bytes: 8,
+    };
+    total.merge(eredu_runtime::WeightMaterializationReport {
+        admitted_working_set_bytes: 32,
+        transformed_weights: 5,
+        source_tiles: 7,
+        peak_in_flight_tiles: 4,
+        source_bytes_read: 200,
+        output_bytes: 50,
+        peak_planned_working_set_bytes: 56,
+        largest_source_tile_bytes: 16,
+        largest_output_tile_bytes: 12,
+    });
+    assert_eq!(total.admitted_working_set_bytes, 64);
+    assert_eq!(total.transformed_weights, 7);
+    assert_eq!(total.source_tiles, 10);
+    assert_eq!(total.peak_in_flight_tiles, 4);
+    assert_eq!(total.source_bytes_read, 300);
+    assert_eq!(total.output_bytes, 75);
+    assert_eq!(total.peak_planned_working_set_bytes, 56);
+    assert_eq!(total.largest_source_tile_bytes, 32);
+    assert_eq!(total.largest_output_tile_bytes, 12);
+}
+
+#[test]
+fn independent_prompt_cache_uses_the_canonical_rank_path() {
+    let root = std::path::Path::new("/cache");
+    let replicated = eredu_core::cache::PromptCacheTopology::default();
+    assert_eq!(
+        eredu_runtime::prompt_cache_rank_path(root, &replicated),
+        root
+    );
+    let distributed =
+        eredu_core::cache::PromptCacheTopology::new(Some((4, 2)), None, Some((8, 5)), false)
+            .unwrap();
+    assert_eq!(
+        eredu_runtime::prompt_cache_rank_path(root, &distributed),
+        root.join("rank-p2-tx-e5")
     );
 }

@@ -9,17 +9,17 @@ use std::{borrow::Borrow, marker::PhantomData};
 
 use eredu_core::{
     checkpoint::TensorDtype, BoundedCompletion, BoundedCompletionOutcome, BoundedSubmissionOutcome,
-    CompletionCancellationMode, DistributedCommitEpoch, DistributedCommitOutcome,
-    DistributedCommitPhase,
+    CollectiveGroupId, CompletionCancellationMode, DistributedCommitEpoch,
+    DistributedCommitOutcome, DistributedCommitPhase,
 };
 use eredu_nn::{NeuralBackend, Tensor};
 
 use crate::{
     ActivationObserver, ArchitectureGroupKind, BarrierBackend, BroadcastBackend,
-    CommunicationBackend, CommunicationGroupDescriptor, CommunicationGroupId,
-    CommunicationManifest, CommunicationOperation, CommunicationOperationRequirement,
-    CommunicationPeerCounts, CommunicationRouteDescriptor, CommunicationRouteId, EvenGatherBackend,
-    ExecutionGraph, ExecutionResidency, ExpertPass, FailureAgreementBackend, LayeredArchitecture,
+    CommunicationBackend, CommunicationGroupDescriptor, CommunicationManifest,
+    CommunicationOperation, CommunicationOperationRequirement, CommunicationPeerCounts,
+    CommunicationRouteDescriptor, CommunicationRouteId, EvenGatherBackend, ExecutionGraph,
+    ExecutionResidency, ExpertPass, FailureAgreementBackend, LayeredArchitecture,
     LayeredPartitionDriver, LayeredPipelineSchedule, LayeredPipelineScheduleError,
     LayeredTraversalHook, LayerwisePolicy, LayerwiseRuntime, LayerwiseRuntimeError,
     ParallelLayeredArchitecture, PipelineActivationDtype, PipelineWireContract,
@@ -39,13 +39,13 @@ pub trait CommunicationTensorMetadata<B: NeuralBackend> {
 
 /// One backend-native group paired with the opaque identity selected by the manifest.
 pub struct RealizedCommunicationGroup<G> {
-    id: CommunicationGroupId,
+    id: CollectiveGroupId,
     resource: G,
 }
 
 impl<G> RealizedCommunicationGroup<G> {
     /// Binds one native resource to its selected opaque group identity.
-    pub const fn new(id: CommunicationGroupId, resource: G) -> Self {
+    pub const fn new(id: CollectiveGroupId, resource: G) -> Self {
         Self { id, resource }
     }
 }
@@ -448,7 +448,7 @@ where
 
     fn group(
         &self,
-        id: CommunicationGroupId,
+        id: CollectiveGroupId,
         operation: CommunicationOperation,
     ) -> Result<(&CommunicationGroupDescriptor, &B::CommunicationGroup), PartitionExecutionError>
     {
@@ -590,7 +590,7 @@ where
     pub fn all_reduce_sum(
         &self,
         value: B::Tensor,
-        group: CommunicationGroupId,
+        group: CollectiveGroupId,
         executor: &B::Executor,
     ) -> Result<B::Tensor, PartitionExecutionError>
     where
@@ -635,7 +635,7 @@ where
     pub fn all_reduce_sum_wave(
         &self,
         values: impl IntoIterator<Item = B::Tensor>,
-        group: CommunicationGroupId,
+        group: CollectiveGroupId,
         executor: &B::Executor,
     ) -> Result<Vec<B::Tensor>, PartitionExecutionError>
     where
@@ -683,7 +683,7 @@ where
         &self,
         value: B::Tensor,
         axis: usize,
-        group: CommunicationGroupId,
+        group: CollectiveGroupId,
         executor: &B::Executor,
     ) -> Result<B::Tensor, PartitionExecutionError>
     where
@@ -738,7 +738,7 @@ where
         value: B::Tensor,
         counts: &[usize],
         axis: usize,
-        group: CommunicationGroupId,
+        group: CollectiveGroupId,
         executor: &B::Executor,
     ) -> Result<B::Tensor, PartitionExecutionError>
     where
@@ -794,7 +794,7 @@ where
         value: B::Tensor,
         counts: &CommunicationPeerCounts,
         axis: usize,
-        group: CommunicationGroupId,
+        group: CollectiveGroupId,
         executor: &B::Executor,
     ) -> Result<B::Tensor, PartitionExecutionError>
     where
@@ -1040,7 +1040,7 @@ where
 
     fn barrier(
         &self,
-        group: CommunicationGroupId,
+        group: CollectiveGroupId,
         executor: &B::Executor,
     ) -> Result<(), PartitionExecutionError>
     where
@@ -1099,7 +1099,7 @@ where
     fn agree_success(
         &self,
         local_success: bool,
-        group: CommunicationGroupId,
+        group: CollectiveGroupId,
         phase: DistributedExecutionPhase,
         executor: &B::Executor,
     ) -> Result<bool, PartitionExecutionError>
@@ -1138,7 +1138,7 @@ where
     fn agree_success_after_prior_failure(
         &self,
         local_success: bool,
-        group: CommunicationGroupId,
+        group: CollectiveGroupId,
         phase: DistributedExecutionPhase,
         executor: &B::Executor,
     ) -> Result<bool, PartitionExecutionError>
@@ -1371,7 +1371,7 @@ pub struct PartitionBoundaryRoute {
 #[derive(Debug, Clone, Copy)]
 pub struct PartitionOutputPublication {
     /// Opaque group containing the output owner and every session participant.
-    pub group: CommunicationGroupId,
+    pub group: CollectiveGroupId,
     /// World rank that owns architecture projection and supplies source data.
     pub owner_rank: usize,
 }
@@ -1409,7 +1409,7 @@ pub struct PartitionedExecutionPlan {
     drivers: Vec<Option<LayeredPartitionDriver>>,
     routes: Vec<PartitionBoundaryRoute>,
     publication: Option<PartitionOutputPublication>,
-    commit_barrier: Option<CommunicationGroupId>,
+    commit_barrier: Option<CollectiveGroupId>,
     wire: PipelineWireContract,
 }
 
@@ -1422,7 +1422,7 @@ impl PartitionedExecutionPlan {
         drivers: Vec<Option<LayeredPartitionDriver>>,
         routes: Vec<PartitionBoundaryRoute>,
         publication: Option<PartitionOutputPublication>,
-        commit_barrier: Option<CommunicationGroupId>,
+        commit_barrier: Option<CollectiveGroupId>,
         wire: PipelineWireContract,
     ) -> Result<Self, PartitionExecutionError> {
         if group_contracts.len() != graph.groups().len() || drivers.len() != graph.groups().len() {
@@ -1616,7 +1616,7 @@ impl PartitionedExecutionPlan {
     }
 
     /// Exact opaque session group used for post-publication commit synchronization.
-    pub const fn commit_barrier(&self) -> Option<CommunicationGroupId> {
+    pub const fn commit_barrier(&self) -> Option<CollectiveGroupId> {
         self.commit_barrier
     }
 
@@ -1968,7 +1968,7 @@ where
     fn agree_phase(
         &mut self,
         _communication: &PartitionCommunication<B, G, R, I>,
-        _group: CommunicationGroupId,
+        _group: CollectiveGroupId,
         _phase: DistributedExecutionPhase,
         local_success: bool,
         _executor: &B::Executor,
@@ -1984,7 +1984,7 @@ where
     fn agree_phase_after_prior_failure(
         &mut self,
         communication: &PartitionCommunication<B, G, R, I>,
-        group: CommunicationGroupId,
+        group: CollectiveGroupId,
         phase: DistributedExecutionPhase,
         local_success: bool,
         executor: &B::Executor,
@@ -1996,7 +1996,7 @@ where
     fn commit(
         &mut self,
         communication: &PartitionCommunication<B, G, R, I>,
-        group: CommunicationGroupId,
+        group: CollectiveGroupId,
         epoch: DistributedCommitEpoch,
         executor: &B::Executor,
     ) -> DistributedCommitOutcome;
@@ -2018,7 +2018,7 @@ where
     fn commit(
         &mut self,
         communication: &PartitionCommunication<B, G, R, I>,
-        group: CommunicationGroupId,
+        group: CollectiveGroupId,
         epoch: DistributedCommitEpoch,
         executor: &B::Executor,
     ) -> DistributedCommitOutcome {
@@ -2049,7 +2049,7 @@ where
     fn agree_phase(
         &mut self,
         communication: &PartitionCommunication<B, G, R, I>,
-        group: CommunicationGroupId,
+        group: CollectiveGroupId,
         phase: DistributedExecutionPhase,
         local_success: bool,
         executor: &B::Executor,
@@ -2060,7 +2060,7 @@ where
     fn agree_phase_after_prior_failure(
         &mut self,
         communication: &PartitionCommunication<B, G, R, I>,
-        group: CommunicationGroupId,
+        group: CollectiveGroupId,
         phase: DistributedExecutionPhase,
         local_success: bool,
         executor: &B::Executor,
@@ -2071,7 +2071,7 @@ where
     fn commit(
         &mut self,
         communication: &PartitionCommunication<B, G, R, I>,
-        group: CommunicationGroupId,
+        group: CollectiveGroupId,
         epoch: DistributedCommitEpoch,
         executor: &B::Executor,
     ) -> DistributedCommitOutcome {
@@ -2100,7 +2100,7 @@ where
     fn commit(
         &mut self,
         _communication: &PartitionCommunication<B, G, R, I>,
-        _group: CommunicationGroupId,
+        _group: CollectiveGroupId,
         epoch: DistributedCommitEpoch,
         _executor: &B::Executor,
     ) -> DistributedCommitOutcome {
@@ -3633,9 +3633,9 @@ pub enum PartitionExecutionError {
     #[error("communication resource identity mismatch (actual {actual}, expected {expected})")]
     ResourceIdentity { expected: u64, actual: u64 },
     #[error("unknown opaque communication group {0:?}")]
-    UnknownGroup(CommunicationGroupId),
+    UnknownGroup(CollectiveGroupId),
     #[error("local rank is not a member of opaque communication group {0:?}")]
-    NotGroupMember(CommunicationGroupId),
+    NotGroupMember(CollectiveGroupId),
     #[error("unknown opaque communication route {0:?}")]
     UnknownRoute(CommunicationRouteId),
     #[error(
@@ -3700,7 +3700,7 @@ pub enum PartitionExecutionError {
     #[error("opaque output group {group:?} does not contain output owner rank {rank}")]
     OutputOwnerNotMember {
         rank: usize,
-        group: CommunicationGroupId,
+        group: CollectiveGroupId,
     },
     #[error("rank {rank} output ownership disagrees with selected owner {owner}")]
     OutputOwnership { rank: usize, owner: usize },
@@ -3748,7 +3748,7 @@ pub enum PartitionExecutionError {
     OperationPolicyUnavailable(CommunicationOperation),
     #[error("opaque communication group {group:?} selected an inexact {operation:?} requirement")]
     InexactOperationRequirement {
-        group: CommunicationGroupId,
+        group: CollectiveGroupId,
         operation: CommunicationOperation,
     },
     #[error("partition communication plan and additive operation policies disagree")]
@@ -3765,7 +3765,7 @@ mod plan_tests {
         let graph =
             ExecutionGraph::new(vec![crate::ExecutionGroupSpec::root("decoder")], "decoder")
                 .unwrap();
-        let group = CommunicationGroupId::new(17);
+        let group = CollectiveGroupId::new(17);
         let plan = PartitionedExecutionPlan::new(
             graph,
             vec![(ArchitectureGroupKind::Decoder, false)],
@@ -3790,7 +3790,7 @@ mod plan_tests {
         let graph =
             ExecutionGraph::new(vec![crate::ExecutionGroupSpec::root("decoder")], "decoder")
                 .unwrap();
-        let group = CommunicationGroupId::new(17);
+        let group = CollectiveGroupId::new(17);
         let plan = PartitionedExecutionPlan::new(
             graph,
             vec![(ArchitectureGroupKind::Decoder, false)],
@@ -3899,7 +3899,7 @@ mod plan_tests {
         ));
     }
 
-    fn publication_plan(group: CommunicationGroupId) -> PartitionedExecutionPlan {
+    fn publication_plan(group: CollectiveGroupId) -> PartitionedExecutionPlan {
         PartitionedExecutionPlan::new(
             ExecutionGraph::new(vec![crate::ExecutionGroupSpec::root("decoder")], "decoder")
                 .unwrap(),
@@ -3917,7 +3917,7 @@ mod plan_tests {
     }
 
     fn single_group_manifest(
-        group: CommunicationGroupId,
+        group: CollectiveGroupId,
         requirements: CommunicationGroupRequirements,
     ) -> CommunicationManifest {
         CommunicationManifest::new(
@@ -3934,7 +3934,7 @@ mod plan_tests {
 
     #[test]
     fn plan_rejects_publication_group_without_exact_broadcast_before_execution() {
-        let group = CommunicationGroupId::new(29);
+        let group = CollectiveGroupId::new(29);
         let plan = publication_plan(group);
         let missing = single_group_manifest(
             group,
@@ -3976,7 +3976,7 @@ mod plan_tests {
 
     #[test]
     fn plan_rejects_inexact_failure_agreement_before_execution() {
-        let group = CommunicationGroupId::new(31);
+        let group = CollectiveGroupId::new(31);
         let plan = publication_plan(group);
         let manifest = single_group_manifest(
             group,

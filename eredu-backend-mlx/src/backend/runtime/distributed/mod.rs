@@ -1,11 +1,11 @@
-//! Architecture-independent distributed execution infrastructure.
+//! MLX realization of neutral distributed execution plans.
 
-/// Backend-independent ownership for submitted distributed work.
+/// MLX ownership for submitted distributed work.
 pub mod completion;
 mod group;
-/// Architecture-neutral tensor-parallel planning and execution contexts.
+/// Native tensor-parallel execution contexts.
 pub mod parallel;
-/// Runtime topology, placement planning, and selective checkpoint loading.
+/// Native topology realization and selective checkpoint loading.
 pub mod topology;
 
 #[cfg(all(test, unix))]

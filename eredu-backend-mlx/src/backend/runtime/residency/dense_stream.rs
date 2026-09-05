@@ -344,15 +344,20 @@ mod tests {
 
     #[test]
     fn worker_errors_and_panics_reach_demand_and_release_reservations() {
-        let unsupported = vec![("unsupported".to_string(), Dtype::F8_E5M2, vec![0x3c, 0x40])];
-        let (_directory, manager, ids) = test_manager(unsupported, 2);
-        let prefetch = BackgroundLayerPrefetch::new(manager.clone(), 1).unwrap();
+        let (_directory, manager, ids) = i32_manager(1, 8);
+        let operation: HostPrefetchOperation =
+            Arc::new(|_| Err("controlled worker error".to_owned()));
+        let prefetch =
+            BackgroundLayerPrefetch::new_with_operation(manager.clone(), 1, operation).unwrap();
         prefetch.submit(&ids[0]).unwrap();
         let error = match prefetch.acquire(&ids[0]) {
-            Ok(_) => panic!("unsupported stored dtype unexpectedly prefetched"),
+            Ok(_) => panic!("failing operation unexpectedly prefetched"),
             Err(error) => error,
         };
-        assert!(matches!(error, DenseStreamError::PrefetchFailed { .. }));
+        assert!(
+            matches!(error, DenseStreamError::PrefetchFailed { ref message, .. }
+            if message.contains("controlled worker error"))
+        );
         let report = manager.report().unwrap();
         assert_eq!(report.offload().resident_bytes().get(MemoryTier::Host), 0);
         assert!(!report.units()[0].host_resident());

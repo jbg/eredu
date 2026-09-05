@@ -832,6 +832,18 @@ impl PreparedMoshiRealtime {
         self.preparation.checkpoint_plan()
     }
 
+    /// Returns the exact checkpoint resolution admitted during inspection.
+    pub fn resolved_checkpoint_plan(
+        &self,
+    ) -> &eredu_checkpoint::validation::ResolvedCheckpointPlan {
+        self.preparation.resolved_checkpoint_plan()
+    }
+
+    /// Returns the exact canonical shard set admitted during path inspection.
+    pub fn admitted_shards(&self) -> Option<&eredu_checkpoint::safetensors::SafetensorsShards> {
+        self.preparation.admitted_shards()
+    }
+
     /// Returns the admitted source configuration.
     pub fn source_config(&self) -> &MoshiConfig {
         self.preparation.config()

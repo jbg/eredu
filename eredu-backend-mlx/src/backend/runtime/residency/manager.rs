@@ -24,6 +24,7 @@ use safemlx::{
 };
 
 use crate::{
+    backend::nn::shared::MlxNeuralBackend,
     backend::residency::sample_allocator_memory,
     backend::runtime::checkpoint::recipe::{MlxWeightRecipeExt, WeightRecipeError},
     backend::runtime::checkpoint::store::{
@@ -122,6 +123,9 @@ pub type ResidentTransfer =
 /// Structured failures from residency validation and state transitions.
 #[derive(Debug, thiserror::Error)]
 pub enum ResidencyError {
+    /// A complete owner binding set is unsupported by the MLX parameter backend.
+    #[error("MLX residency binding preflight failed: {0}")]
+    BindingPreflight(String),
     /// A backend-neutral binding or offload-unit declaration was invalid.
     #[error(transparent)]
     Declaration(#[from] eredu_runtime::residency::ResidencyDeclarationError),
@@ -247,6 +251,17 @@ pub struct ResidencyManager {
     inner: Arc<ManagerInner>,
 }
 
+fn preflight_residency_owner_bindings(
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
+    control: &ResidencyController,
+) -> Result<(), ResidencyError> {
+    for unit in control.units() {
+        eredu_runtime::preflight_bindings::<MlxNeuralBackend>(store, unit.bindings())
+            .map_err(|error| ResidencyError::BindingPreflight(error.to_string()))?;
+    }
+    Ok(())
+}
+
 impl ResidencyManager {
     /// Returns the MLX stream index used for device residency transfers.
     pub fn device_stream_index(&self) -> Result<i32, ResidencyError> {
@@ -286,6 +301,10 @@ impl ResidencyManager {
         source_stream: Stream,
         device_stream: Stream,
     ) -> Result<Self, ResidencyError> {
+        let units = units.into_iter().collect::<Vec<_>>();
+        let control = ResidencyController::new(store.as_ref(), plan, units)?;
+        preflight_residency_owner_bindings(store.as_ref(), &control)?;
+
         let source_device = source_stream
             .get_device()
             .map_err(|source| ResidencyError::Mlx {
@@ -305,22 +324,6 @@ impl ResidencyManager {
             return Err(ResidencyError::InvalidSourceStream);
         }
 
-        let units = units.into_iter().collect::<Vec<_>>();
-        let control = ResidencyController::new(store.as_ref(), plan, units)?;
-        for unit in control.units() {
-            for binding in unit.bindings() {
-                if binding.is_alias() {
-                    continue;
-                }
-                binding
-                    .source_recipe()
-                    .preflight_bounded(store.as_ref())
-                    .map_err(|source| ResidencyError::Recipe {
-                        binding: binding.name().to_owned(),
-                        source: source.into(),
-                    })?;
-            }
-        }
         let storage = control
             .units()
             .map(|unit| (unit.id().clone(), UnitStorage::default()))
@@ -2357,7 +2360,7 @@ mod tests {
     }
 
     #[test]
-    fn partial_initialization_failure_remains_consistent_and_inspectable() {
+    fn unsupported_owner_binding_fails_preflight_before_any_payload_read() {
         let dir = tempfile::tempdir().unwrap();
         let good = [7u8, 8];
         let bad = [9u8, 10];
@@ -2374,13 +2377,17 @@ mod tests {
         )
         .unwrap();
         let store = Arc::new(SafetensorsWeightStore::open(dir.path()).unwrap());
-        let manager = manager(
-            store,
-            OffloadConfig::new(None, Some(fixture_host_capacity(3)), 1).unwrap(),
+        let plan = OffloadPlan::new(
+            OffloadConfig::new(None, Some(6), 1).unwrap(),
             [
                 spec("a-good", 2, ResidencyPolicy::Cacheable, MemoryTier::Host),
                 spec("z-bad", 4, ResidencyPolicy::Cacheable, MemoryTier::Host),
             ],
+        )
+        .unwrap();
+        let control = ResidencyController::new(
+            store.as_ref(),
+            plan,
             [
                 unit(
                     "a-good",
@@ -2394,20 +2401,14 @@ mod tests {
                     ],
                 ),
             ],
-        );
-        assert!(matches!(
-            manager.initialize(),
-            Err(ResidencyError::CheckpointMaterialization(
-                CheckpointMaterializationError::UnsupportedStoredDtype { .. }
-            ))
-        ));
-        let report = manager.report().unwrap();
-        assert!(!report.initialized());
-        assert!(state(&report, "a-good").host_resident());
-        assert!(!state(&report, "z-bad").host_resident());
+        )
+        .unwrap();
+        let result = preflight_residency_owner_bindings(store.as_ref(), &control);
+        assert!(matches!(result, Err(ResidencyError::BindingPreflight(_))));
         assert_eq!(
-            report.offload().resident_bytes().get(MemoryTier::Host),
-            fixture_binding_capacity()
+            store.source_diagnostics().unwrap().physical_reads,
+            0,
+            "backend capability rejection must precede every payload lease"
         );
     }
 

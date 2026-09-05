@@ -17,11 +17,11 @@ use eredu_nn::{NeuralBackend, Tensor};
 
 use crate::{
     observe_model_logits, partitioned_replicated_text_materialization_tasks,
-    replicated_text_materialization_tasks, ActivationObserver, ArchitecturePartition,
-    CommunicationManifest, ExecutionResidency, ExpertPass, LayerWeightResidency,
-    LayeredArchitecture, LayerwisePolicy, LayerwiseRuntime, LayerwiseRuntimeError,
-    ParameterGroupOwner, PartitionState, PreparedInputCacheIdentity, ReplicatedTextArchitecture,
-    ReplicatedTextMaterializationTask, ReplicatedTextOutputCompanion,
+    plan_local_replicated_text_materialization_tasks, replicated_text_materialization_tasks,
+    ActivationObserver, ArchitecturePartition, CommunicationManifest, ExecutionResidency,
+    ExpertPass, LayerWeightResidency, LayeredArchitecture, LayerwisePolicy, LayerwiseRuntime,
+    LayerwiseRuntimeError, ParameterGroupOwner, PartitionState, PreparedInputCacheIdentity,
+    ReplicatedTextArchitecture, ReplicatedTextMaterializationTask, ReplicatedTextOutputCompanion,
     ReplicatedTextOutputSelection, ReplicatedTextParameterOwner, ReplicatedTextParameterPresence,
     RoutedExpertProvider, RoutedLayeredArchitecture, RuntimeState,
     SelectedReplicatedTextRealization, SelectedStateRealization, StateError, SubmissionBackend,
@@ -59,6 +59,64 @@ where
     type ExecutionReport;
     /// Mechanism failure.
     type Error;
+
+    /// Takes the aggregate report produced while realizing the selected
+    /// materialization tasks.
+    ///
+    /// The neutral constructor calls this exactly once after successful
+    /// preparation and retains the value with the completed session. This
+    /// keeps report handoff in the same typed sequencing path as preparation
+    /// instead of requiring an adapter-owned synchronization side channel.
+    fn take_materialization_report(
+        &mut self,
+    ) -> Result<Option<crate::WeightMaterializationReport>, Self::Error> {
+        Ok(None)
+    }
+
+    /// Configures rank-local neutral placement facts before partition payload
+    /// preparation and state realization.
+    fn configure_partition(
+        &mut self,
+        _target_layout: crate::LocalModelLayout,
+        _source_layout: Option<crate::LocalModelLayout>,
+        _rank: eredu_core::cache::CacheRankIdentity,
+        _global_layer_start: usize,
+    ) {
+    }
+
+    /// Prepares exact payload work for an explicitly selected rank-local unit
+    /// sequence.
+    ///
+    /// The default is suitable for mechanisms whose ordinary preparation
+    /// already accepts the global layout. Backends with distinct local-unit
+    /// binding storage override this method while retaining the neutral
+    /// construction sequencing.
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_partition_materialization(
+        &mut self,
+        architecture: &mut A,
+        global_layout: &crate::ExecutionUnitLayout,
+        addresses: &[crate::ExecutionUnitAddress],
+        task_partition: &crate::ReplicatedTextMaterializationPartitionPlan,
+        units: &mut [A::Unit],
+        source_architecture: Option<&mut A>,
+        source_units: Option<&mut [A::Unit]>,
+        tasks: &[ReplicatedTextMaterializationTask],
+        addressable_parameters: &[String],
+        context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
+    ) -> Result<(), Self::Error> {
+        let _ = (addresses, task_partition);
+        self.prepare_materialization(
+            architecture,
+            global_layout,
+            units,
+            source_architecture,
+            source_units,
+            tasks,
+            addressable_parameters,
+            context,
+        )
+    }
 
     /// Consumes the exact selected parameter tasks before runtime construction.
     #[allow(clippy::too_many_arguments)]
@@ -752,6 +810,7 @@ where
     driver: D,
     state: M::State,
     mechanisms: M,
+    materialization_report: Option<crate::WeightMaterializationReport>,
     prompt_cache_identity: Option<PromptCacheModelIdentity>,
     committed_prompt_input_identity: Option<PreparedInputCacheIdentity>,
     next_commit_epoch: DistributedCommitEpoch,
@@ -828,6 +887,215 @@ impl<A, G, W> PartitionedSessionFactoryInput<A, G, W> {
             self.tasks,
         )
     }
+}
+
+/// Unit set constructed by the neutral partition lifecycle.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum PartitionedUnitScope {
+    /// Construct every unit in the selected global execution layout.
+    All,
+    /// Construct only units owned by the admitted rank-local partition.
+    Owned,
+}
+
+/// Architecture, policy, state, and communication authority completed by the
+/// neutral partition construction lifecycle.
+pub struct PreparedPartitionedRuntimeComponents<A, G, W, S, P> {
+    architecture: A,
+    partition: ArchitecturePartition<G, W>,
+    communication: CommunicationManifest,
+    execution_policy: P,
+    bounded_policy: Option<P>,
+    state: S,
+}
+
+impl<A, G, W, S, P> PreparedPartitionedRuntimeComponents<A, G, W, S, P> {
+    /// Consumes the completed neutral lifecycle into a backend-native runtime
+    /// factory. The factory cannot repeat task partitioning, materialization,
+    /// state selection, or residency selection.
+    pub fn into_parts(
+        self,
+    ) -> (
+        A,
+        ArchitecturePartition<G, W>,
+        CommunicationManifest,
+        P,
+        Option<P>,
+        S,
+    ) {
+        (
+            self.architecture,
+            self.partition,
+            self.communication,
+            self.execution_policy,
+            self.bounded_policy,
+            self.state,
+        )
+    }
+}
+
+/// Failure from the reusable rank-local preparation lifecycle.
+#[derive(Debug, thiserror::Error)]
+pub enum PartitionedRuntimeConstructionError {
+    /// Architecture, selection, task, or partition authority disagreed.
+    #[error("partitioned runtime contract mismatch: {0}")]
+    Contract(String),
+    /// Architecture unit construction failed.
+    #[error("partitioned runtime architecture construction failed: {0}")]
+    Architecture(String),
+    /// The concrete mechanism rejected materialization, state, or policy work.
+    #[error("partitioned runtime mechanism failed: {0}")]
+    Mechanism(String),
+}
+
+/// Runs the reusable cold-path lifecycle for one exact partition.
+///
+/// Architecture authority and tasks arrive together from
+/// [`prepare_partitioned_session_runtime`]. This driver chooses the exact unit
+/// set, constructs target and optional transform-source units, prepares and
+/// partitions materialization, realizes local state, and selects the resident
+/// or bounded policy. The caller receives only the completed typed components
+/// needed to create native communication and executor mechanisms.
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_default_partitioned_runtime<A, B, M, G, W, P>(
+    input: PartitionedSessionFactoryInput<A, G, W>,
+    mut source_architecture: Option<A>,
+    target_parallel_layout: crate::LocalModelLayout,
+    source_parallel_layout: Option<crate::LocalModelLayout>,
+    selected: &SelectedReplicatedTextRealization,
+    topology: &PromptCacheTopology,
+    scope: PartitionedUnitScope,
+    addressable_parameters: &[String],
+    mechanisms: &mut M,
+    context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
+) -> Result<
+    PreparedPartitionedRuntimeComponents<A, G, W, M::State, P>,
+    PartitionedRuntimeConstructionError,
+>
+where
+    B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
+    M: ReplicatedTextSessionMechanisms<A, B, ResidentPolicy = P, BoundedPolicy = P>,
+    A: LayeredArchitecture<B, M::State>,
+    A::Error: std::fmt::Display,
+    M::Error: std::fmt::Display,
+    P: LayerwisePolicy<B, A::Unit, Error = M::PolicyError> + Clone,
+{
+    let (mut architecture, partition, communication, tasks) = input.into_parts();
+    let global_layout = partition.unit_layout().clone();
+    let addresses = match scope {
+        PartitionedUnitScope::All => (0..global_layout.len())
+            .map(|ordinal| {
+                global_layout.address(ordinal).ok_or_else(|| {
+                    PartitionedRuntimeConstructionError::Contract(format!(
+                        "global unit ordinal {ordinal} has no canonical address"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        PartitionedUnitScope::Owned => partition.units().collect::<Vec<_>>(),
+    };
+    if addresses.is_empty() {
+        return Err(PartitionedRuntimeConstructionError::Contract(
+            "partition owns no execution units".into(),
+        ));
+    }
+    let task_partition =
+        plan_local_replicated_text_materialization_tasks(&tasks, &global_layout, &addresses)
+            .map_err(|error| PartitionedRuntimeConstructionError::Contract(error.to_string()))?;
+    let mut units = addresses
+        .iter()
+        .map(|address| {
+            architecture
+                .build_unit(address.group(), address.index(), context)
+                .map_err(|error| {
+                    PartitionedRuntimeConstructionError::Architecture(error.to_string())
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut source_units = source_architecture
+        .as_ref()
+        .map(|source| {
+            addresses
+                .iter()
+                .map(|address| {
+                    source
+                        .build_unit(address.group(), address.index(), context)
+                        .map_err(|error| {
+                            PartitionedRuntimeConstructionError::Architecture(error.to_string())
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()?;
+    let local_state = partition.state().ok_or_else(|| {
+        PartitionedRuntimeConstructionError::Contract(
+            "partition owns no local mutable state".into(),
+        )
+    })?;
+    let selected_state = selected
+        .state()
+        .for_partitioned_geometry(local_state)
+        .map_err(|error| PartitionedRuntimeConstructionError::Contract(error.to_string()))?;
+    let rank = eredu_core::cache::CacheRankIdentity::new(
+        topology.stage().map(|(_, rank)| rank),
+        topology.shard().map(|(_, rank)| rank),
+        topology.addressable().map(|(_, rank)| rank),
+    );
+    mechanisms.configure_partition(
+        target_parallel_layout,
+        source_parallel_layout,
+        rank,
+        local_state.global_layer_offset(),
+    );
+    mechanisms
+        .prepare_partition_materialization(
+            &mut architecture,
+            &global_layout,
+            &addresses,
+            &task_partition,
+            &mut units,
+            source_architecture.as_mut(),
+            source_units.as_deref_mut(),
+            &tasks,
+            addressable_parameters,
+            context,
+        )
+        .map_err(|error| PartitionedRuntimeConstructionError::Mechanism(error.to_string()))?;
+    let state = mechanisms
+        .realize_state(&selected_state, context)
+        .map_err(|error| PartitionedRuntimeConstructionError::Mechanism(error.to_string()))?;
+    if state.optional_layout() != Some(selected_state.layout()) {
+        return Err(PartitionedRuntimeConstructionError::Contract(
+            "realized partition state differs from selected local geometry".into(),
+        ));
+    }
+    let (execution_policy, bounded_policy) = match selected.residency() {
+        LayerWeightResidency::FullyResident => (
+            mechanisms
+                .resident_policy(&mut architecture, units, selected, context)
+                .map_err(|error| {
+                    PartitionedRuntimeConstructionError::Mechanism(error.to_string())
+                })?,
+            None,
+        ),
+        LayerWeightResidency::LayerwiseHost(_) | LayerWeightResidency::DenseDiskStream(_) => {
+            drop(units);
+            let policy = mechanisms
+                .bounded_policy(&mut architecture, selected, context)
+                .map_err(|error| {
+                    PartitionedRuntimeConstructionError::Mechanism(error.to_string())
+                })?;
+            (policy.clone(), Some(policy))
+        }
+    };
+    Ok(PreparedPartitionedRuntimeComponents {
+        architecture,
+        partition,
+        communication,
+        execution_policy,
+        bounded_policy,
+        state,
+    })
 }
 
 /// Failure while consuming architecture authority into a rank-local runtime.
@@ -1483,6 +1751,9 @@ where
             context,
         )
         .map_err(ReplicatedTextSessionError::Mechanism)?;
+    let materialization_report = mechanisms
+        .take_materialization_report()
+        .map_err(ReplicatedTextSessionError::Mechanism)?;
     let state = mechanisms
         .realize_state(selected.state(), context)
         .map_err(ReplicatedTextSessionError::Mechanism)?;
@@ -1519,6 +1790,7 @@ where
         driver,
         state,
         mechanisms,
+        materialization_report,
         prompt_cache_identity: Some(prompt_cache_identity),
         committed_prompt_input_identity: None,
         next_commit_epoch: DistributedCommitEpoch::FIRST,
@@ -1538,7 +1810,7 @@ where
 /// [`ReplicatedTextRuntime`].
 pub fn construct_replicated_text_session_with_runtime<A, B, M, D>(
     binding: PreparedPartitionedSessionRuntime<D::Runtime, M::State>,
-    mechanisms: M,
+    mut mechanisms: M,
     driver: D,
 ) -> Result<
     ReplicatedTextSession<A, B, M, D>,
@@ -1601,6 +1873,9 @@ where
             }
         }
     }
+    let materialization_report = mechanisms
+        .take_materialization_report()
+        .map_err(ReplicatedTextSessionError::Mechanism)?;
     Ok(ReplicatedTextSession {
         selected,
         selected_state,
@@ -1608,6 +1883,7 @@ where
         driver,
         state,
         mechanisms,
+        materialization_report,
         prompt_cache_identity,
         committed_prompt_input_identity: None,
         next_commit_epoch: DistributedCommitEpoch::FIRST,
@@ -1649,6 +1925,12 @@ where
     M::PolicyError: std::fmt::Display,
     M::Error: std::fmt::Display,
 {
+    /// Returns the aggregate report captured by the neutral construction
+    /// driver after exact materialization preparation completed.
+    pub const fn materialization_report(&self) -> Option<&crate::WeightMaterializationReport> {
+        self.materialization_report.as_ref()
+    }
+
     /// Borrows the statically paired unit-execution strategy for generic telemetry.
     pub const fn execution_strategy(&self) -> &D {
         &self.driver

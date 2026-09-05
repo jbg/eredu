@@ -19877,7 +19877,6 @@ impl eredu_runtime::PreparedInputInspector<NumericTensor> for NumericInputInspec
 
 #[derive(Default)]
 struct NumericProcessorMechanisms {
-    normalizations: usize,
     tensors: usize,
 }
 
@@ -19905,33 +19904,6 @@ impl eredu_architectures::processor_execution::ProcessorMechanisms for NumericPr
     type Tensor = NumericTensor;
     type Error = String;
 
-    fn normalize_rgb(
-        &mut self,
-        image: &eredu_core::RgbImage,
-        plan: eredu_architectures::processor_plan::RgbTransformPlan,
-    ) -> Result<eredu_architectures::processor_execution::NormalizedRgb, Self::Error> {
-        self.normalizations += 1;
-        let mut values = vec![0.0; plan.width * plan.height * 3];
-        for y in 0..plan.height {
-            for x in 0..plan.width {
-                let source_y = y * image.height() as usize / plan.height;
-                let source_x = x * image.width() as usize / plan.width;
-                for channel in 0..3 {
-                    let raw = image.pixels()
-                        [(source_y * image.width() as usize + source_x) * 3 + channel]
-                        as f32;
-                    values[(channel * plan.height + y) * plan.width + x] =
-                        (raw * plan.rescale_factor - plan.mean[channel]) / plan.std[channel];
-                }
-            }
-        }
-        eredu_architectures::processor_execution::NormalizedRgb::new(
-            values,
-            plan.width,
-            plan.height,
-        )
-    }
-
     fn tensor_u32(&mut self, values: &[u32], shape: &[usize]) -> Result<Self::Tensor, Self::Error> {
         self.tensors += 1;
         Ok(NumericTensor::new(
@@ -19956,6 +19928,25 @@ impl eredu_architectures::processor_execution::ProcessorMechanisms for NumericPr
             values.iter().map(|value| *value as f32).collect(),
         )
         .with_dtype(eredu_core::checkpoint::TensorDtype::I32))
+    }
+
+    fn tensor_bool(
+        &mut self,
+        values: &[bool],
+        shape: &[usize],
+    ) -> Result<
+        Self::Tensor,
+        eredu_architectures::processor_execution::OptionalProcessorMechanism<Self::Error>,
+    > {
+        self.tensors += 1;
+        Ok(NumericTensor::new(
+            shape.iter().map(|value| *value as i32).collect::<Vec<_>>(),
+            values
+                .iter()
+                .map(|value| if *value { 1.0 } else { 0.0 })
+                .collect(),
+        )
+        .with_dtype(eredu_core::checkpoint::TensorDtype::Bool))
     }
 }
 
@@ -21440,6 +21431,176 @@ fn prepare_numeric_qwen_image_request(
     (prepared, mechanisms)
 }
 
+fn numeric_processor_for_config(
+    config: &serde_json::Value,
+) -> eredu_architectures::processor_execution::PreparedProcessor {
+    let root = tempfile::tempdir().unwrap();
+    let (configuration, resolved) = eredu_architectures::configuration::MODEL_CONFIGURATIONS
+        .resolve_safetensors(config)
+        .unwrap()
+        .into_parts();
+    let checkpoint = resolved.safetensors_architecture().unwrap().checkpoint();
+    let constraints = checkpoint
+        .common_tensors
+        .iter()
+        .chain(
+            checkpoint
+                .layout_groups
+                .iter()
+                .filter(|group| group.required)
+                .filter_map(|group| group.variants.first())
+                .flat_map(|variant| variant.tensors.iter()),
+        )
+        .filter(|tensor| {
+            tensor.requirement == eredu_checkpoint::schema::TensorRequirement::Required
+        })
+        .map(|tensor| eredu_core::checkpoint::TensorDescriptor {
+            name: tensor.key.clone(),
+            shape: tensor.shape.clone(),
+            dtype: eredu_core::checkpoint::TensorDtype::F32,
+            storage: None,
+        })
+        .collect::<Vec<_>>();
+    let catalog = eredu_core::checkpoint::TensorCatalog::new(constraints).unwrap();
+    let architecture_plan = eredu_architectures::configuration::MODEL_CONFIGURATIONS
+        .artifact_plan(
+            root.path(),
+            eredu_core::ArtifactFormat::SafeTensors,
+            &configuration,
+            &catalog,
+            None,
+            resolved,
+        )
+        .unwrap();
+    eredu_architectures::processor_execution::PreparedProcessor::from_artifact(&architecture_plan)
+        .unwrap()
+}
+
+pub fn non_mlx_processor_uses_exact_neutral_media_before_native_lowering() {
+    use std::convert::Infallible;
+
+    let qwen = serde_json::json!({
+        "model_type": "qwen3_vl", "image_token_id": 5, "video_token_id": 6,
+        "vision_start_token_id": 3, "vision_end_token_id": 4,
+        "tie_word_embeddings": false,
+        "text_config": {
+            "model_type": "qwen3_vl_text", "hidden_size": 16,
+            "num_hidden_layers": 1, "intermediate_size": 10,
+            "num_attention_heads": 2, "num_key_value_heads": 2, "head_dim": 8,
+            "rms_norm_eps": 0.000001, "vocab_size": 7,
+            "max_position_embeddings": 64, "rope_theta": 1000000.0,
+            "rope_scaling": {"mrope_section": [1, 1, 2], "mrope_interleaved": true}
+        },
+        "vision_config": {
+            "depth": 1, "hidden_size": 8, "intermediate_size": 10,
+            "num_heads": 2, "num_position_embeddings": 16,
+            "in_channels": 3, "patch_size": 2, "spatial_merge_size": 2,
+            "temporal_patch_size": 2, "out_hidden_size": 16,
+            "deepstack_visual_indexes": []
+        }
+    });
+    let (image_input, image_mechanisms) = prepare_numeric_qwen_image_request(&qwen);
+    let image = image_input.parts()[2].payload().value();
+    let source = (0..48)
+        .map(|value| value as f32 * (1.0_f32 / 255.0))
+        .collect::<Vec<_>>();
+    let mut expected = Vec::new();
+    for patch_y in [0, 2] {
+        for patch_x in [0, 2] {
+            for channel in 0..3 {
+                for _ in 0..2 {
+                    for y in 0..2 {
+                        for x in 0..2 {
+                            expected.push(source[((patch_y + y) * 4 + patch_x + x) * 3 + channel]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(image.shape(), &[4, 24]);
+    assert_eq!(image.data, expected);
+    assert_eq!(image_mechanisms.tensors, 5);
+
+    let gemma = serde_json::json!({
+        "model_type":"gemma4_unified", "tie_word_embeddings":false,
+        "image_token_id":5, "audio_token_id":6,
+        "boa_token_id":43, "eoa_token_id":44,
+        "text_config":{
+            "model_type":"gemma4_text", "hidden_size":8,
+            "num_hidden_layers":2, "intermediate_size":10,
+            "num_attention_heads":2, "num_key_value_heads":2, "head_dim":4,
+            "rms_norm_eps":0.00001, "vocab_size":7,
+            "max_position_embeddings":64, "attention_k_eq_v":false,
+            "num_kv_shared_layers":0,
+            "layer_types":["sliding_attention","full_attention"],
+            "sliding_window":4, "enable_moe_block":false,
+            "final_logit_softcapping":7.0
+        },
+        "vision_config":{
+            "hidden_size":8, "intermediate_size":10,
+            "num_hidden_layers":1, "num_attention_heads":2,
+            "num_key_value_heads":2, "head_dim":4, "patch_size":2,
+            "pooling_kernel_size":2, "position_embedding_size":2,
+            "rms_norm_eps":0.00001
+        },
+        "audio_config":{
+            "hidden_size":8, "num_hidden_layers":1,
+            "num_attention_heads":2, "output_proj_dims":8,
+            "conv_kernel_size":3, "attention_chunk_size":4,
+            "attention_context_left":5, "attention_context_right":0,
+            "attention_invalid_logits_value":-1000000000.0,
+            "attention_logit_cap":50.0, "residual_weight":0.5,
+            "rms_norm_eps":0.00001, "subsampling_conv_channels":[4,8]
+        }
+    });
+    let processor = numeric_processor_for_config(&gemma);
+    let request = eredu_core::MultimodalRequest::new(vec![
+        eredu_core::MultimodalSegment::TokenIds(vec![1]),
+        eredu_core::MultimodalSegment::Media(eredu_core::Media::Audio(
+            eredu_core::Audio::new(vec![0.0; 320], 16_000).unwrap(),
+        )),
+    ])
+    .unwrap()
+    .tokenize::<Infallible>(|_| unreachable!())
+    .unwrap();
+    let mut audio_mechanisms = NumericProcessorMechanisms::default();
+    let audio_input = processor
+        .prepare(&request, &mut audio_mechanisms, &mut |_| {
+            Ok::<_, Infallible>(Vec::new())
+        })
+        .unwrap();
+    let audio = audio_input.parts()[2].payload().value();
+    let mut expected_audio = vec![1e-3_f32.ln(); 128];
+    expected_audio.extend([0.0; 128]);
+    assert_eq!(audio.shape(), &[1, 2, 128]);
+    assert_eq!(audio.data, expected_audio);
+    assert_eq!(
+        audio_input.parts()[2]
+            .metadata_value(eredu_core::InputMetadataKey::AudioMask)
+            .unwrap()
+            .data,
+        [1.0, 0.0]
+    );
+
+    let invalid = eredu_core::MultimodalRequest::new(vec![
+        eredu_core::MultimodalSegment::TokenIds(vec![1]),
+        eredu_core::MultimodalSegment::Media(eredu_core::Media::Audio(
+            eredu_core::Audio::new(vec![0.0; 320], 8_000).unwrap(),
+        )),
+    ])
+    .unwrap()
+    .tokenize::<Infallible>(|_| unreachable!())
+    .unwrap();
+    let mut failed_mechanisms = NumericProcessorMechanisms::default();
+    assert!(processor
+        .prepare(&invalid, &mut failed_mechanisms, &mut |_| {
+            Ok::<_, Infallible>(Vec::new())
+        })
+        .is_err());
+    assert_eq!(failed_mechanisms.tensors, 0);
+}
+
 pub(crate) fn non_mlx_composite_session_runs_image_prefill_and_repeated_text_decode() {
     let config = serde_json::json!({
         "model_type": "qwen3_vl", "image_token_id": 5, "video_token_id": 6,
@@ -21462,7 +21623,6 @@ pub(crate) fn non_mlx_composite_session_runs_image_prefill_and_repeated_text_dec
         }
     });
     let (input, processor_counts) = prepare_numeric_qwen_image_request(&config);
-    assert_eq!(processor_counts.normalizations, 1);
     assert_eq!(processor_counts.tensors, 5);
     let text = NumericTensor::token_ids(&[1, 2]);
     let vision_start = NumericTensor::token_ids(&[3]);

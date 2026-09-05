@@ -16,9 +16,13 @@ use eredu_checkpoint::{
     LinearFormat, WeightQuantization,
 };
 use eredu_core::{
-    artifact::ArtifactError, checkpoint::TensorCatalog, ArtifactFormat, LoadingProtocol,
-    ModelConfiguration, ModelConfigurationResolver, ParallelRankTopology,
-    ResolvedModelConfiguration, TokenizerCompatibilityProof,
+    artifact::{
+        fingerprint_gguf_artifact, fingerprint_safetensors_artifact, ArtifactError,
+        ArtifactIdentity,
+    },
+    checkpoint::TensorCatalog,
+    ArtifactFormat, LoadingProtocol, ModelConfiguration, ModelConfigurationResolver,
+    ParallelRankTopology, ResolvedModelConfiguration, TokenizerCompatibilityProof,
 };
 use eredu_gguf::{Checkpoint, MetadataValue};
 use serde_json::Value;
@@ -291,6 +295,8 @@ pub enum ExternalAssistantCheckpoint {
     SafeTensors {
         /// Submitted artifact directory containing the admitted payload members.
         source: PathBuf,
+        /// Exact canonical shard set admitted during header inspection.
+        shards: eredu_checkpoint::safetensors::SafetensorsShards,
         /// Exact header catalog admitted during neutral preparation.
         catalog: TensorCatalog,
         /// Strict architecture schema used to revalidate the reopened source.
@@ -316,24 +322,19 @@ impl ExternalAssistantCheckpoint {
     ) -> Result<(SpeculativeIdentity, SpeculativeIdentity), ArtifactError> {
         match self {
             Self::SafeTensors {
-                source,
-                catalog,
+                source: _,
+                shards,
+                catalog: _,
                 plan,
                 resolution,
             } => {
-                let keys = resolution
-                    .source_keys()
-                    .iter()
-                    .map(String::as_str)
-                    .collect::<Vec<_>>()
-                    .join(",");
-                let artifact = external_contract_identity(format!(
-                    "external-assistant/profile={};source={};keys={keys};catalog={catalog:?}",
-                    assistant_profile.as_str(),
-                    source.display()
-                ))?;
+                let artifact = artifact_speculative_identity(fingerprint_safetensors_artifact(
+                    "eredu.external-assistant.safetensors.v1",
+                    shards,
+                )?)?;
                 let format = external_contract_identity(format!(
-                    "safetensors/plan={plan:?};resolution={resolution:?}"
+                    "safetensors/profile={};plan={plan:?};resolution={resolution:?}",
+                    assistant_profile.as_str(),
                 ))?;
                 Ok((artifact, format))
             }
@@ -356,12 +357,13 @@ impl ExternalAssistantCheckpoint {
                     })
                     .collect::<Vec<_>>()
                     .join(";");
-                let artifact = external_contract_identity(format!(
-                    "external-assistant/profile={};checkpoint={checkpoint:?}",
-                    assistant_profile.as_str()
-                ))?;
+                let artifact = artifact_speculative_identity(fingerprint_gguf_artifact(
+                    "eredu.external-assistant.gguf.v1",
+                    checkpoint,
+                )?)?;
                 let format = external_contract_identity(format!(
-                    "gguf/resolution={resolution:?};mapping={mapping}"
+                    "gguf/profile={};resolution={resolution:?};mapping={mapping}",
+                    assistant_profile.as_str(),
                 ))?;
                 Ok((artifact, format))
             }
@@ -1582,6 +1584,12 @@ fn external_contract_identity(
     SpeculativeIdentity::new(value).map_err(invalid_assistant)
 }
 
+fn artifact_speculative_identity(
+    identity: ArtifactIdentity,
+) -> Result<SpeculativeIdentity, ArtifactError> {
+    external_contract_identity(format!("artifact/{identity}"))
+}
+
 fn external_topology_identity(
     topology: ParallelRankTopology,
 ) -> Result<SpeculativeIdentity, ArtifactError> {
@@ -1990,6 +1998,10 @@ fn prepared_checkpoint(
             })?;
             Ok(ExternalAssistantCheckpoint::SafeTensors {
                 source: inspection.path().to_owned(),
+                shards: inspection
+                    .safetensors_shards()
+                    .expect("SafeTensors inspection retains admitted shards")
+                    .clone(),
                 catalog: inspection.tensors().clone(),
                 plan,
                 resolution,
@@ -2508,6 +2520,42 @@ mod tests {
                 if source == artifact.path()
                     && catalog.len() == resolution.source_keys().len()
         ));
+    }
+
+    #[test]
+    fn external_assistant_artifact_identity_is_relocation_independent_and_content_exact() {
+        let first = safetensors_artifact(GEMMA_ASSISTANT, gemma_tensors());
+        let relocated = safetensors_artifact(GEMMA_ASSISTANT, gemma_tensors());
+        let checkpoint = |path: &std::path::Path| {
+            let preparation = prepare_external_assistant(path).unwrap();
+            let mut materialized = select_direct_for_test(preparation)
+                .visit(InspectPreparation)
+                .unwrap();
+            materialized.visit(TakeInspection).checkpoint
+        };
+        let first_checkpoint = checkpoint(first.path());
+        let relocated_checkpoint = checkpoint(relocated.path());
+        let profile = identity("gemma4-assistant-profile");
+        let first_identity = first_checkpoint.speculative_identities(&profile).unwrap().0;
+        assert_eq!(
+            first_identity,
+            relocated_checkpoint
+                .speculative_identities(&profile)
+                .unwrap()
+                .0
+        );
+
+        let path = relocated.path().join("model.safetensors");
+        let mut bytes = std::fs::read(&path).unwrap();
+        *bytes.last_mut().unwrap() ^= 0x01;
+        std::fs::write(path, bytes).unwrap();
+        assert_ne!(
+            first_identity,
+            relocated_checkpoint
+                .speculative_identities(&profile)
+                .unwrap()
+                .0
+        );
     }
 
     #[test]

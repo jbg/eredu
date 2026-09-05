@@ -3,7 +3,7 @@
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeSet, HashMap},
     path::{Path, PathBuf},
 };
 
@@ -34,6 +34,8 @@ use safemlx::{Device, DeviceType};
 
 #[cfg(test)]
 static MANIFEST_GROUP_REALIZATIONS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static PARTITION_NATIVE_MATERIALIZATION_ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg(test)]
 pub(super) fn reset_manifest_group_realizations() {
@@ -43,126 +45,6 @@ pub(super) fn reset_manifest_group_realizations() {
 #[cfg(test)]
 pub(super) fn manifest_group_realizations() -> usize {
     MANIFEST_GROUP_REALIZATIONS.load(Ordering::Relaxed)
-}
-
-type LogicalRoutePlan = Vec<(usize, Vec<Option<usize>>)>;
-
-/// Backend-only realization of one opaque collective group.
-#[derive(Debug, Clone)]
-pub(crate) struct CollectiveGroupRealization {
-    id: CollectiveGroupId,
-    members: Vec<usize>,
-    local_rank: usize,
-    split_color: usize,
-    logical_routes: Option<LogicalRoutePlan>,
-    manifest_descriptor: Option<CommunicationGroupDescriptor>,
-}
-
-impl CollectiveGroupRealization {
-    pub(crate) fn new(
-        id: CollectiveGroupId,
-        members: Vec<usize>,
-        local_rank: usize,
-        split_color: usize,
-        logical_routes: Option<LogicalRoutePlan>,
-    ) -> Result<Self, Error> {
-        CollectiveGroupDescriptor::new(id, members.clone(), local_rank)
-            .map_err(|error| Error::Parallel(error.to_string()))?;
-        Ok(Self {
-            id,
-            members,
-            local_rank,
-            split_color,
-            logical_routes,
-            manifest_descriptor: None,
-        })
-    }
-
-    pub(crate) fn descriptor(&self) -> CollectiveGroupDescriptor {
-        CollectiveGroupDescriptor::new(self.id, self.members.clone(), self.local_rank)
-            .expect("collective realization is validated at construction")
-    }
-
-    fn from_manifest_descriptor(descriptor: &CommunicationGroupDescriptor) -> Result<Self, Error> {
-        let local_rank = descriptor.local_index().ok_or_else(|| {
-            Error::Parallel(format!(
-                "MLX communication group {} does not contain manifest rank",
-                descriptor.id().value()
-            ))
-        })?;
-        let split_color = usize::try_from(descriptor.id().value())
-            .map_err(|_| Error::Parallel("opaque communication group ID exceeds usize".into()))?;
-        if split_color == 0 {
-            return Err(Error::Parallel(
-                "opaque communication group ID zero is reserved".into(),
-            ));
-        }
-        i32::try_from(split_color)
-            .map_err(|_| Error::Parallel("opaque communication group ID exceeds i32".into()))?;
-        i32::try_from(local_rank).map_err(|_| {
-            Error::Parallel("opaque communication group local index exceeds i32".into())
-        })?;
-        let mut realization = Self::new(
-            descriptor.id(),
-            descriptor.members().to_vec(),
-            local_rank,
-            split_color,
-            None,
-        )?;
-        realization.manifest_descriptor = Some(descriptor.clone());
-        Ok(realization)
-    }
-}
-
-/// Backend-only communication realization selected by architecture composition.
-#[derive(Debug, Clone)]
-pub(crate) struct CollectiveRealization {
-    world_size: usize,
-    global_rank: usize,
-    groups: Vec<CollectiveGroupRealization>,
-}
-
-impl CollectiveRealization {
-    pub(crate) fn new(
-        world_size: usize,
-        global_rank: usize,
-        groups: Vec<CollectiveGroupRealization>,
-    ) -> Result<Self, Error> {
-        if world_size == 0 || global_rank >= world_size {
-            return Err(Error::Parallel(
-                "collective realization has an invalid world rank".into(),
-            ));
-        }
-        let mut ids = BTreeSet::new();
-        if groups.iter().any(|group| {
-            !ids.insert(group.id)
-                || group.members.iter().any(|member| *member >= world_size)
-                || group.members[group.local_rank] != global_rank
-        }) {
-            return Err(Error::Parallel(
-                "collective realization has invalid or duplicate opaque groups".into(),
-            ));
-        }
-        Ok(Self {
-            world_size,
-            global_rank,
-            groups,
-        })
-    }
-
-    pub(crate) const fn world_size(&self) -> usize {
-        self.world_size
-    }
-
-    pub(crate) const fn global_rank(&self) -> usize {
-        self.global_rank
-    }
-
-    fn from_manifest(manifest: &CommunicationManifest) -> Result<Self, Error> {
-        let groups =
-            manifest.try_create_groups(CollectiveGroupRealization::from_manifest_descriptor)?;
-        Self::new(manifest.world_size(), manifest.rank(), groups)
-    }
 }
 
 /// Backend-owned handle for one opaque directed communication route.
@@ -250,121 +132,6 @@ impl CommunicationRouteRealization {
     }
 }
 
-#[derive(Debug)]
-struct PreparedCommunicationManifest {
-    groups: CollectiveRealization,
-    routes: Vec<CommunicationRouteDescriptor>,
-}
-
-fn world_collective_wave_proofs(manifests: &[CommunicationManifest]) -> Result<Vec<bool>, Error> {
-    let Some(reference) = manifests.first() else {
-        return Err(Error::Parallel(
-            "communication consensus returned no rank manifests".into(),
-        ));
-    };
-    let world_size = reference.world_size();
-    let mut by_rank = vec![None; world_size];
-    for manifest in manifests {
-        if manifest.world_size() != world_size
-            || manifest.groups().len() != reference.groups().len()
-            || manifest.rank() >= world_size
-            || by_rank[manifest.rank()].replace(manifest).is_some()
-        {
-            return Err(Error::Parallel(
-                "communication consensus returned invalid or duplicate rank manifests".into(),
-            ));
-        }
-    }
-    if by_rank.iter().any(Option::is_none) {
-        return Err(Error::Parallel(
-            "communication consensus omitted one or more rank manifests".into(),
-        ));
-    }
-    Ok((0..reference.groups().len())
-        .map(|order| {
-            let requirements = reference.groups()[order].requirements();
-            manifests.iter().all(|manifest| {
-                let rank = manifest.rank();
-                let Some(group) = manifest.groups().get(order) else {
-                    return false;
-                };
-                if group.requirements() != requirements
-                    || group.creation_order() != order
-                    || group
-                        .members()
-                        .get(group.local_index().unwrap_or(usize::MAX))
-                        != Some(&rank)
-                {
-                    return false;
-                }
-                group.members().iter().all(|member| {
-                    by_rank
-                        .get(*member)
-                        .and_then(|peer| *peer)
-                        .and_then(|peer| peer.groups().get(order))
-                        .is_some_and(|peer| {
-                            peer.id() == group.id()
-                                && peer.members() == group.members()
-                                && peer.requirements() == group.requirements()
-                                && peer.creation_order() == group.creation_order()
-                        })
-                })
-            })
-        })
-        .collect())
-}
-
-fn validate_logical_variable_all_to_all_waves(
-    manifest: &CommunicationManifest,
-    proofs: &[bool],
-) -> Result<(), Error> {
-    for (order, group) in manifest.groups().iter().enumerate() {
-        let requires_wave = group.members().len() < manifest.world_size()
-            && group.requirements().operations().iter().any(|requirement| {
-                requirement.operation() == CommunicationOperation::VariableAllToAll
-            });
-        if requires_wave && proofs.get(order) != Some(&true) {
-            return Err(Error::Parallel(format!(
-                "opaque logical group {} selects VariableAllToAll without a consensus-proven world participation wave",
-                group.id().value()
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn route_world_collective_wave_proofs(
-    world_size: usize,
-    routes: &[CommunicationRouteDescriptor],
-) -> Vec<bool> {
-    let mut proofs = vec![false; routes.len()];
-    let mut batch_start = 0;
-    while batch_start < routes.len() {
-        let reference = &routes[batch_start];
-        let mut members = vec![false; world_size];
-        let mut batch_end = batch_start;
-        while batch_end < routes.len() {
-            let route = &routes[batch_end];
-            if route.requirement() != reference.requirement()
-                || route.boundary_contract() != reference.boundary_contract()
-                || members[route.source()]
-                || members[route.destination()]
-            {
-                break;
-            }
-            members[route.source()] = true;
-            members[route.destination()] = true;
-            batch_end += 1;
-            if members.iter().all(|member| *member) {
-                proofs[batch_start..batch_end].fill(true);
-                break;
-            }
-        }
-        batch_start = batch_end.max(batch_start + 1);
-    }
-    proofs
-}
-
 struct NativeWorldManifestTransport<'a> {
     world: &'a NativeGroup,
     stream: &'a Stream,
@@ -427,14 +194,6 @@ impl eredu_core::consensus::ConsensusTransport for NativeWorldManifestTransport<
                 )))
             }
         }
-    }
-}
-
-impl PreparedCommunicationManifest {
-    fn new(manifest: &CommunicationManifest) -> Result<Self, Error> {
-        let groups = CollectiveRealization::from_manifest(manifest)?;
-        let routes = manifest.routes().to_vec();
-        Ok(Self { groups, routes })
     }
 }
 
@@ -537,16 +296,6 @@ pub(crate) fn mlx_communication_capabilities() -> CommunicationCapabilities {
     )
 }
 
-fn validate_mlx_communication_manifest(manifest: &CommunicationManifest) -> Result<(), Error> {
-    mlx_communication_capabilities()
-        .validate_manifest(manifest)
-        .map_err(|error| {
-            Error::Parallel(format!(
-                "communication manifest exceeds MLX mechanism capabilities: {error}"
-            ))
-        })
-}
-
 /// Backend communication contexts materialized from opaque group realizations.
 ///
 /// Uncontracted construction may enter native subgroup splits. Opaque manifest
@@ -555,7 +304,9 @@ fn validate_mlx_communication_manifest(manifest: &CommunicationManifest) -> Resu
 /// same-requirement subgroup wave at that creation order.
 #[derive(Clone)]
 pub struct ParallelCommunicators {
-    realization: CollectiveRealization,
+    world_size: usize,
+    global_rank: usize,
+    descriptors: Vec<CommunicationGroupDescriptor>,
     control_world: Group,
     groups: HashMap<CollectiveGroupId, GroupCommunicator>,
     routes: HashMap<CommunicationRouteId, CommunicationRouteRealization>,
@@ -563,7 +314,7 @@ pub struct ParallelCommunicators {
 
 #[derive(Clone)]
 struct GroupCommunicator {
-    realization: CollectiveGroupRealization,
+    descriptor: CommunicationGroupDescriptor,
     native: Option<Group>,
 }
 
@@ -571,7 +322,9 @@ impl std::fmt::Debug for ParallelCommunicators {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("ParallelCommunicators")
-            .field("realization", &self.realization)
+            .field("world_size", &self.world_size)
+            .field("global_rank", &self.global_rank)
+            .field("descriptors", &self.descriptors)
             .finish()
     }
 }
@@ -601,7 +354,17 @@ impl ParallelCommunicators {
         // any rank-local backend capability, quarantine, or world-identity
         // check can diverge. A corrupt projection therefore has one shared
         // fail-closed result and cannot strand peers in setup or payload work.
-        validate_mlx_communication_manifest(manifest)?;
+        let prepared = eredu_runtime::prepare_communication_realization(
+            manifest,
+            &agreed_manifests,
+            &mlx_communication_capabilities(),
+            eredu_runtime::CommunicationTopologyCapabilities::RingWithWorldWaves,
+        )
+        .map_err(|error| {
+            Error::Parallel(format!(
+                "communication manifest cannot be realized by MLX mechanisms: {error}"
+            ))
+        })?;
         let completion = manifest.completion_policy().ok_or_else(|| {
             Error::Parallel(
                 "communication manifest requires an explicit bounded completion policy".into(),
@@ -609,42 +372,25 @@ impl ParallelCommunicators {
         })?;
         let control = Group::uncontracted(world);
         crate::backend::runtime::distributed::completion::ensure_group_available(&control)?;
-        let world_collective_waves = world_collective_wave_proofs(&agreed_manifests)?;
-        validate_logical_variable_all_to_all_waves(manifest, &world_collective_waves)?;
-        let prepared = PreparedCommunicationManifest::new(manifest)?;
-        let route_world_collective_waves =
-            route_world_collective_wave_proofs(manifest.world_size(), &prepared.routes);
-        Self::new_with_routes(
-            prepared.groups,
-            prepared.routes,
-            world,
-            Some(completion),
-            Some(world_collective_waves),
-            Some(route_world_collective_waves),
-        )
+        Self::new_with_routes(prepared, world, completion)
     }
 
     fn new_with_routes(
-        realization: CollectiveRealization,
-        routes: Vec<CommunicationRouteDescriptor>,
+        prepared: eredu_runtime::PreparedCommunicationRealization,
         world: &NativeGroup,
-        completion: Option<eredu_runtime::CommunicationCompletionPolicy>,
-        world_collective_waves: Option<Vec<bool>>,
-        route_world_collective_waves: Option<Vec<bool>>,
+        completion: eredu_runtime::CommunicationCompletionPolicy,
     ) -> Result<Self, Error> {
         // Fence both manifest and uncontracted construction while any timed-out
         // work on this exact native communicator remains quarantined.
-        let owned_world = completion.map_or_else(
-            || Group::uncontracted(world),
-            |policy| Group::uncontracted(world).with_completion_policy(policy),
-        );
+        let owned_world = Group::uncontracted(world).with_completion_policy(completion);
         crate::backend::runtime::distributed::completion::ensure_group_available(&owned_world)?;
         let _setup = owned_world.begin_bounded_setup()?;
-        if world.rank() != realization.global_rank || world.size() != realization.world_size {
+        let manifest = prepared.manifest();
+        if world.rank() != manifest.rank() || world.size() != manifest.world_size() {
             return Err(Error::Parallel(format!(
                 "collective realization expects world rank {}/{} but received {}/{}",
-                realization.global_rank,
-                realization.world_size,
+                manifest.rank(),
+                manifest.world_size(),
                 world.rank(),
                 world.size()
             )));
@@ -652,41 +398,26 @@ impl ParallelCommunicators {
         // This unsplit handle is intentionally uncontracted: it is the control
         // plane from which exact manifest handles are realized.
         let world = owned_world;
-        let mut groups = HashMap::new();
-        for (order, group) in realization.groups.iter().cloned().enumerate() {
-            let id = group.id;
-            groups.insert(
-                id,
-                Self::materialize(
-                    group,
-                    realization.world_size,
-                    &world,
-                    world_collective_waves
-                        .as_ref()
-                        .and_then(|proofs| proofs.get(order))
-                        .copied()
-                        .unwrap_or(false),
-                )?,
-            );
-        }
-        let routes = routes
+        let groups = prepared
+            .try_create_groups(|descriptor, world_wave| {
+                let group =
+                    Self::materialize(descriptor, manifest.world_size(), &world, world_wave)?;
+                Ok::<_, Error>((descriptor.id(), group))
+            })?
             .into_iter()
-            .enumerate()
-            .map(|(order, descriptor)| {
-                let route = CommunicationRouteRealization::from_descriptor(
-                    &descriptor,
-                    &world,
-                    route_world_collective_waves
-                        .as_ref()
-                        .and_then(|proofs| proofs.get(order))
-                        .copied()
-                        .unwrap_or(false),
-                )?;
-                Ok((descriptor.id(), route))
-            })
-            .collect::<Result<HashMap<_, _>, Error>>()?;
+            .collect::<HashMap<_, _>>();
+        let routes = prepared
+            .try_create_routes(|descriptor, world_wave| {
+                let route =
+                    CommunicationRouteRealization::from_descriptor(descriptor, &world, world_wave)?;
+                Ok::<_, Error>((descriptor.id(), route))
+            })?
+            .into_iter()
+            .collect::<HashMap<_, _>>();
         Ok(Self {
-            realization,
+            world_size: manifest.world_size(),
+            global_rank: manifest.rank(),
+            descriptors: manifest.groups().to_vec(),
             control_world: world,
             groups,
             routes,
@@ -694,88 +425,38 @@ impl ParallelCommunicators {
     }
 
     fn materialize(
-        realization: CollectiveGroupRealization,
+        descriptor: &CommunicationGroupDescriptor,
         world_size: usize,
         world: &Group,
         world_collective_wave: bool,
     ) -> Result<GroupCommunicator, Error> {
         #[cfg(test)]
         MANIFEST_GROUP_REALIZATIONS.fetch_add(1, Ordering::Relaxed);
-        let size = realization.members.len();
+        let size = descriptor.members().len();
         let native = if size == world_size {
             world.clone()
-        } else if realization.manifest_descriptor.is_some() {
-            match realization.logical_routes.clone() {
-                Some(routes) => world
-                    .logical_subgroup_with_routes(&realization.members, routes)
-                    .map(|group| group.with_world_collective_wave(world_collective_wave))
-                    .map_err(|error| {
-                        Error::Parallel(format!(
-                            "failed to materialize routed logical group {} with members {:?}: {error}",
-                            realization.id.value(), realization.members
-                        ))
-                    })?,
-                None => world
-                    .logical_subgroup(&realization.members)
-                    .map(|group| group.with_world_collective_wave(world_collective_wave))
-                    .map_err(|error| {
-                        Error::Parallel(format!(
-                            "failed to materialize logical group {} with members {:?}: {error}",
-                            realization.id.value(), realization.members
-                        ))
-                    })?,
-            }
         } else {
-            let color = i32::try_from(realization.split_color)
-                .map_err(|_| Error::Parallel("collective group split color exceeds i32".into()))?;
-            let key = i32::try_from(realization.local_rank)
-                .map_err(|_| Error::Parallel("collective group local rank exceeds i32".into()))?;
-            let group = match world.split(color, Some(key)) {
-                Ok(group) => group,
-                Err(_) => match realization.logical_routes.clone() {
-                    Some(routes) => world
-                        .logical_subgroup_with_routes(&realization.members, routes)
-                        .map_err(|error| {
-                            Error::Parallel(format!(
-                                "failed to materialize routed logical group {} with members {:?}: {error}",
-                                realization.id.value(), realization.members
-                            ))
-                        })?,
-                    None => world
-                        .logical_subgroup(&realization.members)
-                        .map_err(|error| {
-                            Error::Parallel(format!(
-                                "failed to materialize native or logical group {} with members {:?}: {error}",
-                                realization.id.value(), realization.members
-                            ))
-                        })?,
-                },
-            };
-            if group.rank() != realization.local_rank || group.size() != size {
-                return Err(Error::Parallel(format!(
-                    "collective group {} expected rank {}/{} but backend produced {}/{}",
-                    realization.id.value(),
-                    realization.local_rank,
-                    size,
-                    group.rank(),
-                    group.size()
-                )));
-            }
-            group
+            world
+                .logical_subgroup(descriptor.members())
+                .map(|group| group.with_world_collective_wave(world_collective_wave))
+                .map_err(|error| {
+                    Error::Parallel(format!(
+                        "failed to materialize logical group {} with members {:?}: {error}",
+                        descriptor.id().value(),
+                        descriptor.members()
+                    ))
+                })?
         };
-        let native = match &realization.manifest_descriptor {
-            Some(descriptor) => native
-                .with_manifest_contract(
-                    descriptor,
-                    world.completion_policy().ok_or_else(|| {
-                        Error::Parallel("manifest group has no selected completion policy".into())
-                    })?,
-                )
-                .map_err(|error| Error::Parallel(error.to_string()))?,
-            None => native,
-        };
+        let native = native
+            .with_manifest_contract(
+                descriptor,
+                world.completion_policy().ok_or_else(|| {
+                    Error::Parallel("manifest group has no selected completion policy".into())
+                })?,
+            )
+            .map_err(|error| Error::Parallel(error.to_string()))?;
         Ok(GroupCommunicator {
-            realization,
+            descriptor: descriptor.clone(),
             native: Some(native),
         })
     }
@@ -788,7 +469,7 @@ impl ParallelCommunicators {
     /// Returns the group for an active opaque collective identity.
     pub fn group(&self, id: CollectiveGroupId) -> Option<&Group> {
         let communicator = self.groups.get(&id)?;
-        if communicator.realization.members.len() == 1 {
+        if communicator.descriptor.members().len() == 1 {
             return None;
         }
         communicator.native.as_ref()
@@ -812,7 +493,9 @@ impl ParallelCommunicators {
         Error,
     > {
         let Self {
-            realization: _,
+            world_size: _,
+            global_rank: _,
+            descriptors: _,
             control_world: _,
             mut groups,
             mut routes,
@@ -870,138 +553,48 @@ impl ParallelCommunicators {
     }
 
     pub(crate) fn descriptors(&self) -> Vec<CollectiveGroupDescriptor> {
-        self.realization
-            .groups
+        self.descriptors
             .iter()
-            .filter(|group| group.members.len() > 1)
-            .map(CollectiveGroupRealization::descriptor)
+            .filter(|group| group.members().len() > 1)
+            .filter_map(CommunicationGroupDescriptor::collective_descriptor)
             .collect()
     }
 
     pub(crate) fn group_ids(&self) -> Vec<CollectiveGroupId> {
-        self.realization
-            .groups
+        self.descriptors
             .iter()
-            .filter(|group| group.members.len() > 1)
-            .map(|group| group.id)
+            .filter(|group| group.members().len() > 1)
+            .map(CommunicationGroupDescriptor::id)
             .collect()
     }
 
-    pub(crate) const fn realization(&self) -> &CollectiveRealization {
-        &self.realization
+    pub(crate) const fn world_size(&self) -> usize {
+        self.world_size
+    }
+
+    pub(crate) const fn global_rank(&self) -> usize {
+        self.global_rank
     }
 }
 
-/// A validated contiguous slice of a source tensor.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct TensorSlice {
-    /// Source tensor axis being divided.
-    axis: usize,
-    /// Inclusive element offset on `axis`.
-    start: usize,
-    /// Exclusive element offset on `axis`.
-    end: usize,
-    /// Shard index.
-    index: usize,
-    /// Total number of equal shards.
-    parts: usize,
-}
+#[cfg(test)]
+use eredu_runtime::TensorSlice;
 
-impl TensorSlice {
-    /// Returns the source tensor axis being divided.
-    pub const fn axis(&self) -> usize {
-        self.axis
-    }
-
-    /// Returns the inclusive element offset on the divided axis.
-    pub const fn start(&self) -> usize {
-        self.start
-    }
-
-    /// Returns the exclusive element offset on the divided axis.
-    pub const fn end(&self) -> usize {
-        self.end
-    }
-
-    /// Returns the zero-based shard index.
-    pub const fn index(&self) -> usize {
-        self.index
-    }
-
-    /// Returns the total number of equal shards.
-    pub const fn parts(&self) -> usize {
-        self.parts
-    }
-
-    /// Validates and calculates an equal contiguous tensor slice.
-    pub fn for_shape(
-        shape: &[usize],
-        axis: usize,
-        index: usize,
-        parts: usize,
-    ) -> Result<Self, Error> {
-        if axis >= shape.len() {
-            return Err(Error::Parallel(format!(
-                "tensor axis {axis} is outside rank {} shape {shape:?}",
-                shape.len()
-            )));
-        }
-        if parts == 0 {
-            return Err(Error::Parallel("tensor shard count must be nonzero".into()));
-        }
-        if index >= parts {
-            return Err(Error::Parallel(format!(
-                "tensor shard index {index} is outside {parts} parts"
-            )));
-        }
-        let dimension = shape[axis];
-        if dimension == 0 || !dimension.is_multiple_of(parts) {
-            return Err(Error::Parallel(format!(
-                "tensor dimension {dimension} on axis {axis} is not nonzero and divisible by {parts}"
-            )));
-        }
-        let width = dimension / parts;
-        let start = index
-            .checked_mul(width)
-            .ok_or_else(|| Error::Parallel("tensor slice offset overflowed usize".into()))?;
-        Ok(Self {
-            axis,
-            start,
-            end: start + width,
-            index,
-            parts,
-        })
-    }
-
-    /// Returns the local tensor shape produced by this slice.
-    pub fn local_shape(&self, source_shape: &[usize]) -> Vec<usize> {
-        let mut shape = source_shape.to_vec();
-        shape[self.axis] = self.end - self.start;
-        shape
-    }
-}
-
-#[derive(Debug, Clone)]
-struct TensorPlan {
-    placement: TensorPlacement,
-    expected_source_shape: Option<Vec<usize>>,
-}
-
-/// Inspectable mapping from exact checkpoint names to typed placement decisions.
+/// MLX device binding around the authoritative neutral placement plan.
 #[derive(Debug, Clone)]
 pub struct PlacementPlan {
     topology: MlxRankContext,
-    tensors: HashMap<String, TensorPlan>,
-    default: Option<TensorPlacement>,
+    logical: eredu_runtime::PlacementPlan,
 }
 
 impl PlacementPlan {
     /// Creates a strict plan in which every checkpoint tensor must be named.
     pub fn new(topology: MlxRankContext) -> Self {
+        let rank = eredu_runtime::PlacementRank::new(topology.world_size(), topology.global_rank())
+            .expect("MLX rank context is already validated");
         Self {
             topology,
-            tensors: HashMap::new(),
-            default: None,
+            logical: eredu_runtime::PlacementPlan::new(rank),
         }
     }
 
@@ -1012,250 +605,54 @@ impl PlacementPlan {
 
     /// Sets the placement used for checkpoint keys without an explicit entry.
     pub fn with_default(mut self, placement: TensorPlacement) -> Self {
-        self.default = Some(placement);
+        self.logical = self.logical.with_default(placement);
         self
     }
 
-    /// Returns the topology captured by this plan.
+    /// Returns the mechanism-bound topology.
     pub const fn topology(&self) -> MlxRankContext {
         self.topology
     }
 
-    /// Adds or replaces a checkpoint-tensor placement.
+    /// Adds or replaces one exact source placement.
     pub fn insert(&mut self, source: impl Into<String>, placement: TensorPlacement) {
-        self.tensors.insert(
-            source.into(),
-            TensorPlan {
-                placement,
-                expected_source_shape: None,
-            },
-        );
+        self.logical.insert(source, placement);
     }
 
-    /// Adds a placement with a required pre-slice checkpoint shape.
+    /// Adds one placement with an exact admitted source shape.
     pub fn insert_expected(
         &mut self,
         source: impl Into<String>,
         expected_source_shape: impl Into<Vec<usize>>,
         placement: TensorPlacement,
     ) -> Result<(), Error> {
-        let expected_source_shape = expected_source_shape.into();
-        validate_placement(&placement, &expected_source_shape, self.topology)?;
-        self.tensors.insert(
-            source.into(),
-            TensorPlan {
-                placement,
-                expected_source_shape: Some(expected_source_shape),
-            },
-        );
-        Ok(())
+        self.logical
+            .insert_expected(source, expected_source_shape, placement)
+            .map_err(|error| Error::Parallel(error.to_string()))
     }
 
-    /// Adds weight, scales, and optional biases using one logical placement.
-    ///
-    /// Keeping companions in one call prevents a quantized module's metadata
-    /// from being accidentally placed differently from its packed weight.
+    /// Adds a packed weight and its companions with one logical placement.
     pub fn insert_quantized_companions(
         &mut self,
         prefix: &str,
         placement: TensorPlacement,
         has_biases: bool,
     ) {
-        self.insert(format!("{prefix}.weight"), placement.clone());
-        self.insert(format!("{prefix}.scales"), placement.clone());
-        if has_biases {
-            self.insert(format!("{prefix}.biases"), placement);
-        }
+        self.logical
+            .insert_quantized_companions(prefix, placement, has_biases);
     }
 
-    /// Returns an explicit tensor placement by exact checkpoint name.
+    /// Returns an explicit placement by exact checkpoint name.
     pub fn placement(&self, source: &str) -> Option<&TensorPlacement> {
-        self.tensors.get(source).map(|plan| &plan.placement)
+        self.logical.placement(source)
     }
 
-    /// Validates every placement whose constraints are known before loading.
-    ///
-    /// Axis bounds and divisibility require `insert_expected`; ownership and
-    /// shard-coordinate bounds are validated for all entries.
+    /// Validates all cold logical geometry.
     pub fn validate(&self) -> Result<(), Error> {
-        for (source, tensor) in &self.tensors {
-            validate_plan_entry(tensor, self.topology).map_err(|error| {
-                Error::Parallel(format!("placement for tensor {source}: {error}"))
-            })?;
-        }
-        if let Some(default) = &self.default {
-            validate_plan_entry(
-                &TensorPlan {
-                    placement: default.clone(),
-                    expected_source_shape: None,
-                },
-                self.topology,
-            )?;
-        }
-        Ok(())
+        self.logical
+            .validate()
+            .map_err(|error| Error::Parallel(error.to_string()))
     }
-
-    fn source_plan(&self, source: &str) -> SourcePlan {
-        if let Some(plan) = self.tensors.get(source) {
-            return SourcePlan::Known(plan.clone());
-        }
-        if let Some(placement) = &self.default {
-            SourcePlan::Known(TensorPlan {
-                placement: placement.clone(),
-                expected_source_shape: None,
-            })
-        } else {
-            SourcePlan::Unexpected
-        }
-    }
-}
-
-fn validate_plan_entry(plan: &TensorPlan, topology: MlxRankContext) -> Result<(), Error> {
-    match &plan.placement {
-        TensorPlacement::Rank { rank } if *rank >= topology.world_size() => {
-            Err(Error::Parallel(format!(
-                "owner rank {rank} is outside world size {}",
-                topology.world_size()
-            )))
-        }
-        TensorPlacement::Shard { index, parts, .. } if *parts == 0 || *index >= *parts => {
-            Err(Error::Parallel(format!(
-                "tensor shard index {index} is invalid for {parts} parts"
-            )))
-        }
-        TensorPlacement::Range { start, end, .. } if start >= end => Err(Error::Parallel(format!(
-            "tensor range {start}..{end} must be non-empty"
-        ))),
-        TensorPlacement::Indices { indices, .. } if indices.is_empty() => Err(Error::Parallel(
-            "tensor index selection must be non-empty".into(),
-        )),
-        TensorPlacement::Indices { indices, .. }
-            if indices.iter().collect::<HashSet<_>>().len() != indices.len() =>
-        {
-            Err(Error::Parallel(
-                "tensor index selection must not contain duplicates".into(),
-            ))
-        }
-        placement => {
-            if let Some(shape) = &plan.expected_source_shape {
-                validate_placement(placement, shape, topology)?;
-            }
-            Ok(())
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-enum SourcePlan {
-    Known(TensorPlan),
-    Unexpected,
-}
-
-#[derive(Debug)]
-enum ResolvedPlacement {
-    Materialize,
-    Omit,
-    Shard(TensorSlice),
-    Indices { axis: usize, indices: Vec<usize> },
-}
-
-fn validate_placement(
-    placement: &TensorPlacement,
-    shape: &[usize],
-    topology: MlxRankContext,
-) -> Result<(), Error> {
-    match placement {
-        TensorPlacement::Rank { rank } if *rank >= topology.world_size() => {
-            Err(Error::Parallel(format!(
-                "owner rank {rank} is outside world size {}",
-                topology.world_size()
-            )))
-        }
-        TensorPlacement::Shard { axis, index, parts } => {
-            TensorSlice::for_shape(shape, *axis, *index, *parts).map(|_| ())
-        }
-        TensorPlacement::Range { axis, start, end } => {
-            if *axis >= shape.len() {
-                return Err(Error::Parallel(format!(
-                    "tensor range axis {axis} is outside rank {} shape {shape:?}",
-                    shape.len()
-                )));
-            }
-            if start >= end || *end > shape[*axis] {
-                return Err(Error::Parallel(format!(
-                    "tensor range {start}..{end} is invalid for dimension {} on axis {axis}",
-                    shape[*axis]
-                )));
-            }
-            Ok(())
-        }
-        TensorPlacement::Indices { axis, indices } => {
-            if *axis >= shape.len() {
-                return Err(Error::Parallel(format!(
-                    "tensor index axis {axis} is outside rank {} shape {shape:?}",
-                    shape.len()
-                )));
-            }
-            if indices.is_empty() {
-                return Err(Error::Parallel(
-                    "tensor index selection must be non-empty".into(),
-                ));
-            }
-            if indices.iter().collect::<HashSet<_>>().len() != indices.len() {
-                return Err(Error::Parallel(
-                    "tensor index selection must not contain duplicates".into(),
-                ));
-            }
-            if let Some(index) = indices.iter().copied().find(|index| *index >= shape[*axis]) {
-                return Err(Error::Parallel(format!(
-                    "tensor index {index} is outside dimension {} on axis {axis}",
-                    shape[*axis]
-                )));
-            }
-            Ok(())
-        }
-        _ => Ok(()),
-    }
-}
-
-fn resolve_placement(
-    plan: &TensorPlan,
-    shape: &[usize],
-    topology: MlxRankContext,
-) -> Result<ResolvedPlacement, Error> {
-    if let Some(expected) = &plan.expected_source_shape {
-        if expected != shape {
-            return Err(Error::Parallel(format!(
-                "expected checkpoint shape {expected:?}, got {shape:?}"
-            )));
-        }
-    }
-    validate_placement(&plan.placement, shape, topology)?;
-    Ok(match &plan.placement {
-        TensorPlacement::Replicated | TensorPlacement::Local => ResolvedPlacement::Materialize,
-        TensorPlacement::Omit => ResolvedPlacement::Omit,
-        TensorPlacement::Rank { rank } => {
-            if *rank == topology.global_rank() {
-                ResolvedPlacement::Materialize
-            } else {
-                ResolvedPlacement::Omit
-            }
-        }
-        TensorPlacement::Shard { axis, index, parts } => {
-            ResolvedPlacement::Shard(TensorSlice::for_shape(shape, *axis, *index, *parts)?)
-        }
-        TensorPlacement::Range { axis, start, end } => ResolvedPlacement::Shard(TensorSlice {
-            axis: *axis,
-            start: *start,
-            end: *end,
-            index: 0,
-            parts: 1,
-        }),
-        TensorPlacement::Indices { axis, indices } => ResolvedPlacement::Indices {
-            axis: *axis,
-            indices: indices.clone(),
-        },
-    })
 }
 
 /// Locally materialized checkpoint partition.
@@ -1306,38 +703,25 @@ impl RankPartition {
 
 #[derive(Default)]
 struct PartitionReport {
-    loaded: HashSet<String>,
+    loaded: BTreeSet<String>,
     unexpected: Vec<String>,
 }
 
 impl PartitionReport {
     fn finish(self, plan: &PlacementPlan) -> Result<(), Error> {
-        let mut missing = Vec::new();
-        for (source, tensor) in &plan.tensors {
-            let locally_required = match tensor.placement {
-                TensorPlacement::Replicated
-                | TensorPlacement::Local
-                | TensorPlacement::Shard { .. }
-                | TensorPlacement::Range { .. }
-                | TensorPlacement::Indices { .. } => true,
-                TensorPlacement::Omit => false,
-                TensorPlacement::Rank { rank } => rank == plan.topology.global_rank(),
-            };
-            if locally_required && !self.loaded.contains(source) {
-                missing.push(source.clone());
-            }
-        }
-        missing.sort();
-        let mut unexpected = self.unexpected;
-        unexpected.sort();
-        unexpected.dedup();
-        if missing.is_empty() && unexpected.is_empty() {
-            Ok(())
-        } else {
-            Err(Error::StrictLoadValidation {
+        match plan
+            .logical
+            .validate_loaded_sources(&self.loaded, self.unexpected)
+        {
+            Ok(()) => Ok(()),
+            Err(eredu_runtime::PlacementPlanError::Coverage {
+                missing,
+                unexpected,
+            }) => Err(Error::StrictLoadValidation {
                 missing,
                 unused: unexpected,
-            })
+            }),
+            Err(error) => Err(Error::Parallel(error.to_string())),
         }
     }
 }
@@ -1383,70 +767,106 @@ pub fn load_safetensors_partition_on_streams(
 /// Placement is resolved from catalog metadata before a lease materializes an
 /// array. Remote-only indexed shards are therefore never acquired or buffered.
 pub fn load_partition_from_store_on_streams(
-    store: &(impl CheckpointSource + ?Sized),
+    store: &dyn CheckpointSource,
     plan: &PlacementPlan,
     source_stream: &Stream,
     execution_stream: &Stream,
 ) -> Result<RankPartition, Error> {
-    plan.validate()?;
+    let prepared = prepare_partition_bindings(store, plan)?;
     plan.topology.validate_execution_stream(execution_stream)?;
-    let mut report = PartitionReport::default();
     let mut tensors = HashMap::new();
     let mut opened_shards = BTreeSet::new();
     let context = MlxParameterMaterializationContext::new(source_stream, execution_stream);
 
-    for source in store.source_keys() {
-        let SourcePlan::Known(tensor) = plan.source_plan(&source) else {
-            report.unexpected.push(source);
-            continue;
-        };
-        let potentially_local = !matches!(tensor.placement, TensorPlacement::Omit)
-            && !matches!(tensor.placement, TensorPlacement::Rank { rank } if rank != plan.topology.global_rank());
-        if !potentially_local {
-            continue;
-        }
-
-        let metadata = store.source_metadata(&source)?;
-        let resolved = resolve_placement(&tensor, &metadata.logical_shape, plan.topology)
-            .map_err(|error| Error::Parallel(format!("checkpoint tensor {source}: {error}")))?;
-        let selection = match resolved {
-            ResolvedPlacement::Omit => continue,
-            ResolvedPlacement::Materialize => TensorSelection::Full,
-            ResolvedPlacement::Shard(slice) => TensorSelection::Range {
-                axis: slice.axis,
-                start: slice.start,
-                end: slice.end,
-            },
-            ResolvedPlacement::Indices { axis, indices } => {
-                TensorSelection::Indices { axis, indices }
-            }
-        };
+    for prepared in prepared {
         let lease = store.acquire_lease(TensorReadRequest {
-            key: source.clone(),
-            selection,
+            key: prepared.source.clone(),
+            selection: prepared.selection,
             policy: ReadPolicy::RequireBounded,
         })?;
         if let Some(path) = eredu_checkpoint::store::EncodedTensorLease::backing_path(&lease) {
             opened_shards.insert(path.to_path_buf());
         }
+        #[cfg(test)]
+        PARTITION_NATIVE_MATERIALIZATION_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
         let value = context
             .weight_lease(lease)?
             .materialize(source_stream, execution_stream)?
             .synchronize()?;
-        report.loaded.insert(source.clone());
-        if tensors.insert(source.clone(), value).is_some() {
+        if tensors.insert(prepared.source.clone(), value).is_some() {
             return Err(Error::Parallel(format!(
-                "checkpoint tensor {source} was materialized more than once"
+                "checkpoint tensor {:?} was materialized more than once",
+                prepared.source
             )));
         }
     }
 
-    report.finish(plan)?;
     Ok(RankPartition {
         topology: plan.topology,
         tensors,
         opened_shards: opened_shards.into_iter().collect(),
     })
+}
+
+struct PreparedPartitionBinding {
+    source: String,
+    selection: TensorSelection,
+}
+
+fn prepare_partition_bindings(
+    store: &dyn CheckpointSource,
+    plan: &PlacementPlan,
+) -> Result<Vec<PreparedPartitionBinding>, Error> {
+    plan.validate()?;
+    let mut report = PartitionReport::default();
+    let mut prepared = Vec::new();
+    let mut bindings = Vec::new();
+
+    for source in store.source_keys() {
+        match plan.logical.potentially_local(&source) {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(eredu_runtime::PlacementPlanError::UnexpectedSource { .. }) => {
+                report.unexpected.push(source);
+                continue;
+            }
+            Err(error) => return Err(Error::Parallel(error.to_string())),
+        }
+
+        let metadata = store.source_metadata(&source)?;
+        let resolved = plan
+            .logical
+            .resolve(&source, &metadata.logical_shape)
+            .map_err(|error| Error::Parallel(format!("checkpoint tensor {source}: {error}")))?;
+        let selection = match resolved {
+            eredu_runtime::ResolvedTensorPlacement::Omit => continue,
+            eredu_runtime::ResolvedTensorPlacement::Materialize => TensorSelection::Full,
+            eredu_runtime::ResolvedTensorPlacement::Selection(selection) => selection,
+        };
+        if !report.loaded.insert(source.clone()) {
+            return Err(Error::Parallel(format!(
+                "checkpoint tensor {source} was selected more than once"
+            )));
+        }
+        let recipe = eredu_checkpoint::recipe::DerivedWeightRecipe::source(
+            source.clone(),
+            selection.clone(),
+        );
+        let expected = recipe.infer(store)?.byte_len();
+        bindings.push(eredu_runtime::WeightBinding::from_recipe(
+            source.clone(),
+            recipe,
+            expected,
+        )?);
+        prepared.push(PreparedPartitionBinding { source, selection });
+    }
+
+    report.finish(plan)?;
+    eredu_runtime::preflight_bindings::<crate::backend::nn::shared::MlxNeuralBackend>(
+        store, &bindings,
+    )
+    .map_err(|error| Error::Parallel(error.to_string()))?;
+    Ok(prepared)
 }
 
 #[cfg(test)]
@@ -1531,171 +951,6 @@ mod tests {
     }
 
     #[test]
-    fn complete_subgroup_batches_are_the_only_world_collective_waves() {
-        let topology = ParallelTopology::new(4, 2, 2, 1).unwrap();
-        let plan = TopologyCommunicationPlan::new()
-            .with_tensor_groups(communication_group_requirements(
-                CommunicationOperation::AllReduceSum,
-            ))
-            .with_pipeline_groups(communication_group_requirements(
-                CommunicationOperation::AllGatherEven,
-            ));
-        let manifests = project_all_communication_manifests(topology, &plan).unwrap();
-        assert_eq!(
-            world_collective_wave_proofs(&manifests).unwrap(),
-            [true, true]
-        );
-
-        let asymmetric = [
-            CommunicationManifest::new(
-                2,
-                0,
-                vec![CommunicationGroupDescriptor::new(
-                    CollectiveGroupId::new(1),
-                    0,
-                    vec![0, 1],
-                    Some(0),
-                    communication_group_requirements(CommunicationOperation::AllReduceSum),
-                )
-                .unwrap()],
-                vec![],
-            )
-            .unwrap(),
-            CommunicationManifest::new(
-                2,
-                1,
-                vec![CommunicationGroupDescriptor::new(
-                    CollectiveGroupId::new(1),
-                    0,
-                    vec![0, 1],
-                    Some(1),
-                    communication_group_requirements(CommunicationOperation::AllGatherEven),
-                )
-                .unwrap()],
-                vec![],
-            )
-            .unwrap(),
-        ];
-        assert_eq!(world_collective_wave_proofs(&asymmetric).unwrap(), [false]);
-
-        let inconsistent_overlap = (0..4)
-            .map(|rank| {
-                let (id, members) = match rank {
-                    0 | 1 => (CollectiveGroupId::new(1), vec![0, 1]),
-                    2 => (CollectiveGroupId::new(2), vec![1, 2]),
-                    3 => (CollectiveGroupId::new(3), vec![2, 3]),
-                    _ => unreachable!(),
-                };
-                let local = members.iter().position(|member| *member == rank).unwrap();
-                CommunicationManifest::new(
-                    4,
-                    rank,
-                    vec![CommunicationGroupDescriptor::new(
-                        id,
-                        0,
-                        members,
-                        Some(local),
-                        communication_group_requirements(CommunicationOperation::VariableAllToAll),
-                    )
-                    .unwrap()],
-                    vec![],
-                )
-                .unwrap()
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            world_collective_wave_proofs(&inconsistent_overlap).unwrap(),
-            [false],
-            "same-contract descriptors that do not form consistent disjoint classes cannot share a native world wave"
-        );
-        super::super::group::reset_native_collective_submissions();
-        let error = validate_logical_variable_all_to_all_waves(
-            &inconsistent_overlap[0],
-            &world_collective_wave_proofs(&inconsistent_overlap).unwrap(),
-        )
-        .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("without a consensus-proven world participation wave"));
-        assert_eq!(
-            super::super::group::native_collective_submissions(),
-            0,
-            "an unproven logical exchange must fail before native payload submission"
-        );
-
-        let topology = ParallelTopology::new(2, 1, 2, 1).unwrap();
-        let plan = TopologyCommunicationPlan::new()
-            .with_tensor_groups(communication_group_requirements(
-                CommunicationOperation::AllReduceSum,
-            ))
-            .with_expert_groups(communication_group_requirements(
-                CommunicationOperation::VariableAllToAll,
-            ));
-        let compound = project_all_communication_manifests(topology, &plan).unwrap();
-        let proofs = world_collective_wave_proofs(&compound).unwrap();
-        assert_eq!(proofs, [true, true]);
-        for manifest in &compound {
-            validate_logical_variable_all_to_all_waves(manifest, &proofs).unwrap();
-        }
-    }
-
-    #[test]
-    fn route_wave_requires_identical_disjoint_pairs_covering_the_world() {
-        let route = |id, source, destination, operation| {
-            CommunicationRouteDescriptor::new(
-                CommunicationRouteId::new(id),
-                id as usize,
-                source,
-                destination,
-                communication_requirement(operation),
-            )
-            .unwrap()
-        };
-        let complete = [
-            route(1, 0, 2, CommunicationOperation::SendReceive),
-            route(2, 1, 3, CommunicationOperation::SendReceive),
-        ];
-        assert_eq!(
-            route_world_collective_wave_proofs(4, &complete),
-            [true, true]
-        );
-
-        let partial = [route(1, 0, 2, CommunicationOperation::SendReceive)];
-        assert_eq!(route_world_collective_wave_proofs(4, &partial), [false]);
-
-        let overlapping = [
-            route(1, 0, 2, CommunicationOperation::SendReceive),
-            route(2, 0, 3, CommunicationOperation::SendReceive),
-        ];
-        assert_eq!(
-            route_world_collective_wave_proofs(4, &overlapping),
-            [false, false]
-        );
-
-        let incompatible = [
-            route(1, 0, 2, CommunicationOperation::SendReceive),
-            CommunicationRouteDescriptor::new(
-                CommunicationRouteId::new(2),
-                2,
-                1,
-                3,
-                CommunicationOperationRequirement::tensors(
-                    CommunicationOperation::SendReceive,
-                    [TensorDtype::I32],
-                    CommunicationTensorLimits::new(1, 1, 8, None).unwrap(),
-                    true,
-                )
-                .unwrap(),
-            )
-            .unwrap(),
-        ];
-        assert_eq!(
-            route_world_collective_wave_proofs(4, &incompatible),
-            [false, false]
-        );
-    }
-
-    #[test]
     fn manifest_preparation_preserves_opaque_groups_and_routes() {
         let manifest = CommunicationManifest::new(
             6,
@@ -1729,21 +984,17 @@ mod tests {
         )
         .unwrap();
 
-        let prepared = PreparedCommunicationManifest::new(&manifest).unwrap();
-        assert_eq!(prepared.groups.world_size, 6);
-        assert_eq!(prepared.groups.global_rank, 2);
-        assert_eq!(prepared.groups.groups.len(), 2);
-        assert_eq!(prepared.groups.groups[0].id, CollectiveGroupId::new(7));
-        assert_eq!(prepared.groups.groups[0].members, [0, 2, 4]);
-        assert_eq!(prepared.groups.groups[0].local_rank, 1);
-        assert_eq!(prepared.groups.groups[0].split_color, 7);
-        assert!(prepared.groups.groups[0].logical_routes.is_none());
-        assert_eq!(prepared.groups.groups[1].id, CollectiveGroupId::new(11));
-        assert_eq!(prepared.groups.groups[1].split_color, 11);
-        assert_eq!(prepared.routes.len(), 1);
-        assert_eq!(prepared.routes[0].id(), CommunicationRouteId::new(19));
-        assert_eq!(prepared.routes[0].source(), 2);
-        assert_eq!(prepared.routes[0].destination(), 5);
+        assert_eq!(manifest.world_size(), 6);
+        assert_eq!(manifest.rank(), 2);
+        assert_eq!(manifest.groups().len(), 2);
+        assert_eq!(manifest.groups()[0].id(), CollectiveGroupId::new(7));
+        assert_eq!(manifest.groups()[0].members(), [0, 2, 4]);
+        assert_eq!(manifest.groups()[0].local_index(), Some(1));
+        assert_eq!(manifest.groups()[1].id(), CollectiveGroupId::new(11));
+        assert_eq!(manifest.routes().len(), 1);
+        assert_eq!(manifest.routes()[0].id(), CommunicationRouteId::new(19));
+        assert_eq!(manifest.routes()[0].source(), 2);
+        assert_eq!(manifest.routes()[0].destination(), 5);
     }
 
     #[test]
@@ -1913,19 +1164,21 @@ mod tests {
                 CommunicationOperation::VariableAllToAll,
             ));
         let manifests = project_all_communication_manifests(topology, &plan).unwrap();
+        eredu_runtime::validate_compatible_communication_manifests(&manifests).unwrap();
 
         for manifest in &manifests {
-            let prepared = PreparedCommunicationManifest::new(manifest).unwrap();
-            assert_eq!(prepared.groups.groups.len(), 3);
-            for (creation_order, group) in prepared.groups.groups.iter().enumerate() {
+            assert_eq!(manifest.groups().len(), 3);
+            for (creation_order, group) in manifest.groups().iter().enumerate() {
                 assert_eq!(
                     manifest.groups()[creation_order].creation_order(),
                     creation_order
                 );
-                assert_eq!(group.id, manifest.groups()[creation_order].id());
-                assert_eq!(group.split_color, group.id.value() as usize);
-                assert_eq!(group.members[group.local_rank], manifest.rank());
-                assert_eq!(group.members.len(), 2);
+                assert_eq!(group.id(), manifest.groups()[creation_order].id());
+                assert_eq!(
+                    group.members()[group.local_index().unwrap()],
+                    manifest.rank()
+                );
+                assert_eq!(group.members().len(), 2);
             }
         }
     }
@@ -1952,7 +1205,9 @@ mod tests {
         )
         .unwrap()
         .with_completion_policy(completion_policy());
-        validate_mlx_communication_manifest(&publication).unwrap();
+        mlx_communication_capabilities()
+            .validate_manifest(&publication)
+            .unwrap();
 
         let unsupported = CommunicationManifest::new(
             1,
@@ -1976,27 +1231,10 @@ mod tests {
         )
         .unwrap()
         .with_completion_policy(completion_policy());
-        let error = validate_mlx_communication_manifest(&unsupported)
+        let error = mlx_communication_capabilities()
+            .validate_manifest(&unsupported)
             .expect_err("integer broadcast must be rejected");
         assert!(error.to_string().contains("I32"));
-
-        let zero_id = CommunicationManifest::new(
-            2,
-            0,
-            vec![CommunicationGroupDescriptor::new(
-                CollectiveGroupId::new(0),
-                0,
-                vec![0, 1],
-                Some(0),
-                communication_group_requirements(CommunicationOperation::AllReduceSum),
-            )
-            .unwrap()],
-            vec![],
-        )
-        .unwrap();
-        let error = PreparedCommunicationManifest::new(&zero_id)
-            .expect_err("zero group ID must be rejected");
-        assert!(error.to_string().contains("ID zero is reserved"));
     }
 
     #[test]
@@ -2019,7 +1257,9 @@ mod tests {
         )
         .unwrap()
         .with_completion_policy(completion_policy());
-        validate_mlx_communication_manifest(&failure_agreement).unwrap();
+        mlx_communication_capabilities()
+            .validate_manifest(&failure_agreement)
+            .unwrap();
 
         let capabilities_without_agreement =
             CommunicationCapabilities::new([CommunicationOperationRequirement::barrier(true)])
@@ -2192,7 +1432,9 @@ mod tests {
         )
         .unwrap()
         .with_completion_policy(completion_policy());
-        validate_mlx_communication_manifest(&route_manifest).unwrap();
+        mlx_communication_capabilities()
+            .validate_manifest(&route_manifest)
+            .unwrap();
 
         let exact_manifest = CommunicationManifest::new(
             1,
@@ -2209,7 +1451,9 @@ mod tests {
         )
         .unwrap()
         .with_completion_policy(completion_policy());
-        validate_mlx_communication_manifest(&exact_manifest).unwrap();
+        mlx_communication_capabilities()
+            .validate_manifest(&exact_manifest)
+            .unwrap();
 
         let barrier = CommunicationManifest::new(
             1,
@@ -2229,7 +1473,9 @@ mod tests {
         )
         .unwrap()
         .with_completion_policy(completion_policy());
-        validate_mlx_communication_manifest(&barrier).unwrap();
+        mlx_communication_capabilities()
+            .validate_manifest(&barrier)
+            .unwrap();
     }
 
     #[test]
@@ -2319,19 +1565,17 @@ mod tests {
 
     #[test]
     fn typed_rank_ownership_resolves_locally() {
-        let rank_zero = topology(0, 2, 2, 1);
-        let rank_three = topology(3, 2, 2, 1);
-        let rank_owned = TensorPlan {
-            placement: TensorPlacement::Rank { rank: 3 },
-            expected_source_shape: None,
-        };
+        let mut rank_zero = PlacementPlan::new(topology(0, 2, 2, 1));
+        rank_zero.insert("owned", TensorPlacement::Rank { rank: 3 });
+        let mut rank_three = PlacementPlan::new(topology(3, 2, 2, 1));
+        rank_three.insert("owned", TensorPlacement::Rank { rank: 3 });
         assert!(matches!(
-            resolve_placement(&rank_owned, &[2], rank_zero).unwrap(),
-            ResolvedPlacement::Omit
+            rank_zero.logical.resolve("owned", &[2]).unwrap(),
+            eredu_runtime::ResolvedTensorPlacement::Omit
         ));
         assert!(matches!(
-            resolve_placement(&rank_owned, &[2], rank_three).unwrap(),
-            ResolvedPlacement::Materialize
+            rank_three.logical.resolve("owned", &[2]).unwrap(),
+            eredu_runtime::ResolvedTensorPlacement::Materialize
         ));
     }
 
@@ -2559,5 +1803,46 @@ mod tests {
             }
             other => panic!("unexpected error: {other}"),
         }
+    }
+
+    #[test]
+    fn late_partition_preflight_failure_performs_zero_payload_reads_or_native_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let early_bytes = [1_i32, 2]
+            .into_iter()
+            .flat_map(i32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let late_bytes = [3_i32, 4]
+            .into_iter()
+            .flat_map(i32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let early = TensorView::new(Dtype::I32, vec![2], &early_bytes).unwrap();
+        let late = TensorView::new(Dtype::I32, vec![2], &late_bytes).unwrap();
+        serialize_to_file(
+            [("a.valid", early), ("z.invalid", late)],
+            None,
+            &dir.path().join("model.safetensors"),
+        )
+        .unwrap();
+
+        let store = SafetensorsWeightStore::open(dir.path()).unwrap();
+        let mut plan = PlacementPlan::new(topology(0, 1, 1, 1));
+        plan.insert_expected("a.valid", vec![2], TensorPlacement::Local)
+            .unwrap();
+        plan.insert_expected("z.invalid", vec![3], TensorPlacement::Local)
+            .unwrap();
+        PARTITION_NATIVE_MATERIALIZATION_ATTEMPTS.store(0, Ordering::Relaxed);
+        let source_stream = stream();
+        let execution_stream = stream();
+
+        assert!(matches!(
+            load_partition_from_store_on_streams(&store, &plan, &source_stream, &execution_stream,),
+            Err(Error::Parallel(_))
+        ));
+        assert_eq!(store.source_diagnostics().unwrap().physical_reads, 0);
+        assert_eq!(
+            PARTITION_NATIVE_MATERIALIZATION_ATTEMPTS.load(Ordering::Relaxed),
+            0
+        );
     }
 }

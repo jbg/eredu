@@ -60,9 +60,11 @@ use crate::backend::{
         PagedKeyValueCache,
     },
 };
+#[cfg(test)]
+use crate::module::ModuleParamMut;
 use crate::MlxTensor;
 use crate::{
-    module::{Module, ModuleParamMut, ModuleParamRef, PhysicalParameters},
+    module::{Module, ModuleParamRef, PhysicalParameters},
     nested::NestedValue,
     nn,
 };
@@ -292,10 +294,12 @@ impl<'a> ParameterVisitor<'a, MlxTensor> for ParameterRefCollector<'a> {
     }
 }
 
+#[cfg(test)]
 struct ParameterMutCollector<'a> {
     parameters: ModuleParamMut<'a>,
 }
 
+#[cfg(test)]
 impl<'a> ParameterVisitorMut<'a, MlxTensor> for ParameterMutCollector<'a> {
     fn visit_mut(&mut self, metadata: ParameterMetadata, value: &'a mut MlxTensor) {
         self.parameters.insert(
@@ -320,6 +324,7 @@ pub(crate) fn neutral_parameter_refs<M: Parameterized<MlxTensor>>(
 }
 
 /// Collects mutable MLX parameter references from a neutral module.
+#[cfg(test)]
 pub(crate) fn neutral_parameter_refs_mut<M: Parameterized<MlxTensor>>(
     module: &mut M,
 ) -> ModuleParamMut<'_> {
@@ -422,9 +427,9 @@ impl<M: PhysicalParameters> MlxNamedModule<M> {
                 actual.difference(&expected).collect::<Vec<_>>()
             )));
         }
-        for (local, parameter) in self.inner.parameters_mut().flatten() {
+        for (local, parameter) in self.inner.parameters().flatten() {
             let value = bindings
-                .remove(local.as_ref())
+                .get(local.as_ref())
                 .expect("equal compact binding sets contain every native parameter");
             if parameter.shape() != value.shape() {
                 return Err(ComputeError::backend(format!(
@@ -433,6 +438,11 @@ impl<M: PhysicalParameters> MlxNamedModule<M> {
                     parameter.shape()
                 )));
             }
+        }
+        for (local, parameter) in self.inner.parameters_mut().flatten() {
+            let value = bindings
+                .remove(local.as_ref())
+                .expect("equal compact binding sets contain every native parameter");
             *parameter = value;
         }
         Ok(())

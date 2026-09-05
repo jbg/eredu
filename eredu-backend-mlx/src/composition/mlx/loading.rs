@@ -142,7 +142,7 @@ impl MlxModelConfig {
 #[derive(Debug, Clone)]
 pub struct MlxSelectedPreparation {
     execution: MlxSelectedExecution,
-    session: eredu_core::SessionCapabilities,
+    admission: eredu_core::PreparationAdmission,
     rank_context: Option<crate::backend::MlxRankContext>,
     prediction_extension: Option<eredu_architectures::configuration::PredictionExtensionPlan>,
     prediction_realization: Option<eredu_runtime::SelectedSpeculativeRealization>,
@@ -181,14 +181,14 @@ enum MlxSelectedExecution {
 impl MlxSelectedPreparation {
     const fn new(
         execution: MlxSelectedExecution,
-        session: eredu_core::SessionCapabilities,
+        admission: eredu_core::PreparationAdmission,
         rank_context: Option<crate::backend::MlxRankContext>,
         prediction_extension: Option<eredu_architectures::configuration::PredictionExtensionPlan>,
         prediction_realization: Option<eredu_runtime::SelectedSpeculativeRealization>,
     ) -> Self {
         Self {
             execution,
-            session,
+            admission,
             rank_context,
             prediction_extension,
             prediction_realization,
@@ -196,7 +196,11 @@ impl MlxSelectedPreparation {
     }
 
     pub(crate) const fn session_capabilities(&self) -> eredu_core::SessionCapabilities {
-        self.session
+        self.admission.session_capabilities()
+    }
+
+    pub(crate) const fn admission(&self) -> eredu_core::PreparationAdmission {
+        self.admission
     }
 
     #[cfg(test)]
@@ -709,7 +713,36 @@ fn select_embedded_prediction_realization(
         extension,
         eredu_architectures::prediction_extension::EmbeddedSpeculativeContractRequest::new(
             identity(format!("target/{:?}", extension.kind()))?,
-            identity(format!("artifact/{}", inspection.path().display()))?,
+            identity(format!(
+                "artifact/{}",
+                match inspection.format() {
+                    eredu_core::ArtifactFormat::SafeTensors => {
+                        eredu_core::artifact::fingerprint_safetensors_artifact(
+                            "eredu.embedded-speculative.safetensors.v1",
+                            inspection.safetensors_shards().ok_or_else(|| {
+                                Error::ArchitectureModel(
+                                    "SafeTensors inspection lost its admitted shard set".into(),
+                                )
+                            })?,
+                        )?
+                    }
+                    eredu_core::ArtifactFormat::Gguf => {
+                        eredu_core::artifact::fingerprint_gguf_artifact(
+                            "eredu.embedded-speculative.gguf.v1",
+                            inspection.gguf_checkpoint().ok_or_else(|| {
+                                Error::ArchitectureModel(
+                                    "GGUF inspection lost its admitted checkpoint".into(),
+                                )
+                            })?,
+                        )?
+                    }
+                    _ => {
+                        return Err(Error::ArchitectureModel(
+                            "embedded speculative artifact format is unsupported".into(),
+                        ));
+                    }
+                }
+            ))?,
             identity(format!("format/{:?}", inspection.format()))?,
             topology,
             identity("prepared-input/text-token-ids/v1".into())?,
@@ -754,8 +787,8 @@ fn select_preparation_with_capabilities(
             "MLX preparation policy does not match the caller request".into(),
         ));
     }
-    structural::validate_inspected_preparation(inspection, policy)?;
-    let admitted_session = structural::inspected_session_capabilities(inspection, policy)?;
+    let admission = structural::admit_inspected_preparation(inspection, policy)?;
+    let admitted_session = admission.session_capabilities();
     let grouped_requirements = inspection
         .architecture_plan()
         .grouped_operation_requirements(policy.topology());
@@ -915,7 +948,7 @@ fn select_preparation_with_capabilities(
     };
     Ok(MlxSelectedPreparation::new(
         execution,
-        admitted_session,
+        admission,
         rank_context,
         prediction_extension,
         prediction_realization,
@@ -931,7 +964,7 @@ pub fn materialize_model_plan(
 ) -> Result<MlxModel, Error> {
     let MlxSelectedPreparation {
         execution,
-        session: _,
+        admission: _,
         rank_context: _,
         prediction_extension,
         prediction_realization,
@@ -1012,7 +1045,7 @@ fn materialize_partitioned_composite(
     let store: Arc<dyn eredu_checkpoint::store::CheckpointSource> = match plan.into_artifact() {
         ModelArtifact::SafeTensors {
             path: _,
-            configuration,
+            configuration: _,
             tensors,
             shards,
         } => {
@@ -1020,14 +1053,21 @@ fn materialize_partitioned_composite(
                 || prepared_safetensors_architecture(&architecture_plan).cloned(),
                 |extension| Ok(extension.complete_architecture().clone()),
             )?;
-            let prepared = super::artifact::PreparedSafetensorsArtifact::open(
-                configuration,
-                store_architecture,
-                tensors,
+            let resolution = store_architecture
+                .checkpoint_resolution()
+                .ok_or_else(|| {
+                    Error::ArchitectureModel(
+                        "prepared SafeTensors artifact omitted its admitted checkpoint layout"
+                            .into(),
+                    )
+                })?
+                .clone();
+            eredu_core::artifact::open_prepared_safetensors_artifact(
+                &tensors,
                 shards,
+                resolution,
                 max_cached_shards,
-            )?;
-            prepared.store()
+            )?
         }
         ModelArtifact::Gguf { validated, .. } => {
             let architecture = prepared_gguf_plan(&architecture_plan)?.clone();
@@ -1194,7 +1234,7 @@ fn materialize_partitioned_routed_decoder(
     let store: Arc<dyn eredu_checkpoint::store::CheckpointSource> = match plan.into_artifact() {
         ModelArtifact::SafeTensors {
             path: _,
-            configuration,
+            configuration: _,
             tensors,
             shards,
         } => {
@@ -1202,14 +1242,21 @@ fn materialize_partitioned_routed_decoder(
                 || prepared_safetensors_architecture(&architecture_plan).cloned(),
                 |extension| Ok(extension.complete_architecture().clone()),
             )?;
-            super::artifact::PreparedSafetensorsArtifact::open(
-                configuration,
-                store_architecture,
-                tensors,
+            let resolution = store_architecture
+                .checkpoint_resolution()
+                .ok_or_else(|| {
+                    Error::ArchitectureModel(
+                        "prepared SafeTensors artifact omitted its admitted checkpoint layout"
+                            .into(),
+                    )
+                })?
+                .clone();
+            eredu_core::artifact::open_prepared_safetensors_artifact(
+                &tensors,
                 shards,
+                resolution,
                 max_cached_shards,
             )?
-            .store()
         }
         ModelArtifact::Gguf { validated, .. } => {
             let architecture = prepared_gguf_plan(&architecture_plan)?.clone();
@@ -1356,7 +1403,7 @@ fn materialize_partitioned_dense_decoder(
     let store: Arc<dyn eredu_checkpoint::store::CheckpointSource> = match artifact {
         ModelArtifact::SafeTensors {
             path: _,
-            configuration,
+            configuration: _,
             tensors,
             shards,
         } => {
@@ -1364,14 +1411,21 @@ fn materialize_partitioned_dense_decoder(
                 || prepared_safetensors_architecture(&architecture_plan).cloned(),
                 |extension| Ok(extension.complete_architecture().clone()),
             )?;
-            let prepared = super::artifact::PreparedSafetensorsArtifact::open(
-                configuration,
-                store_architecture,
-                tensors,
+            let resolution = store_architecture
+                .checkpoint_resolution()
+                .ok_or_else(|| {
+                    Error::ArchitectureModel(
+                        "prepared SafeTensors artifact omitted its admitted checkpoint layout"
+                            .into(),
+                    )
+                })?
+                .clone();
+            eredu_core::artifact::open_prepared_safetensors_artifact(
+                &tensors,
                 shards,
+                resolution,
                 max_cached_shards,
-            )?;
-            prepared.store()
+            )?
         }
         ModelArtifact::Gguf { validated, .. } => {
             let architecture = prepared_gguf_plan(&architecture_plan)?.clone();
@@ -1659,7 +1713,7 @@ fn materialize_replicated_text_plan(
     let executable = match artifact {
         ModelArtifact::SafeTensors {
             path: _,
-            configuration,
+            configuration: _,
             tensors,
             shards,
         } => {
@@ -1667,14 +1721,21 @@ fn materialize_replicated_text_plan(
                 || prepared_safetensors_architecture(&architecture_plan).cloned(),
                 |extension| Ok(extension.complete_architecture().clone()),
             )?;
-            let prepared = super::artifact::PreparedSafetensorsArtifact::open(
-                configuration,
-                store_architecture,
-                tensors,
+            let resolution = store_architecture
+                .checkpoint_resolution()
+                .ok_or_else(|| {
+                    Error::ArchitectureModel(
+                        "prepared SafeTensors artifact omitted its admitted checkpoint layout"
+                            .into(),
+                    )
+                })?
+                .clone();
+            let store = eredu_core::artifact::open_prepared_safetensors_artifact(
+                &tensors,
                 shards,
+                resolution,
                 max_cached_shards,
             )?;
-            let store = prepared.store();
             let materialized = prediction_extension
                 .as_ref()
                 .map(|extension| {
@@ -1797,7 +1858,7 @@ fn materialize_routed_text_plan(
     let executable = match artifact {
         ModelArtifact::SafeTensors {
             path: _,
-            configuration,
+            configuration: _,
             tensors,
             shards,
         } => {
@@ -1805,14 +1866,21 @@ fn materialize_routed_text_plan(
                 || prepared_safetensors_architecture(&architecture_plan).cloned(),
                 |extension| Ok(extension.complete_architecture().clone()),
             )?;
-            let prepared = super::artifact::PreparedSafetensorsArtifact::open(
-                configuration,
-                store_architecture,
-                tensors,
+            let resolution = store_architecture
+                .checkpoint_resolution()
+                .ok_or_else(|| {
+                    Error::ArchitectureModel(
+                        "prepared SafeTensors artifact omitted its admitted checkpoint layout"
+                            .into(),
+                    )
+                })?
+                .clone();
+            let store = eredu_core::artifact::open_prepared_safetensors_artifact(
+                &tensors,
                 shards,
+                resolution,
                 max_cached_shards,
             )?;
-            let store = prepared.store();
             let materialized = prediction_extension
                 .as_ref()
                 .map(|extension| {
@@ -1939,7 +2007,7 @@ fn materialize_composite_text_plan(
     let store: Arc<dyn eredu_checkpoint::store::CheckpointSource> = match artifact {
         ModelArtifact::SafeTensors {
             path: _,
-            configuration,
+            configuration: _,
             tensors,
             shards,
         } => {
@@ -1947,14 +2015,22 @@ fn materialize_composite_text_plan(
                 || prepared_safetensors_architecture(&architecture_plan).cloned(),
                 |extension| Ok(extension.complete_architecture().clone()),
             )?;
-            let prepared = super::artifact::PreparedSafetensorsArtifact::open(
-                configuration,
-                store_architecture,
-                tensors,
+            let resolution = store_architecture
+                .checkpoint_resolution()
+                .ok_or_else(|| {
+                    Error::ArchitectureModel(
+                        "prepared SafeTensors artifact omitted its admitted checkpoint layout"
+                            .into(),
+                    )
+                })?
+                .clone();
+            let store = eredu_core::artifact::open_prepared_safetensors_artifact(
+                &tensors,
                 shards,
+                resolution,
                 max_cached_shards,
             )?;
-            Arc::clone(&prepared.store())
+            Arc::clone(&store)
         }
         ModelArtifact::Gguf { validated, .. } => {
             let architecture = prepared_gguf_plan(&architecture_plan)?.clone();

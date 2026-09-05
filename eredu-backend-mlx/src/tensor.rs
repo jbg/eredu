@@ -41,6 +41,7 @@ impl MlxTensor {
 
     /// Mutably borrows the native array for parameter binding without
     /// materialization or copying.
+    #[cfg(test)]
     pub(crate) fn as_array_mut(&mut self) -> &mut Array {
         &mut self.0
     }

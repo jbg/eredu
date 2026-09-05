@@ -10,14 +10,15 @@ planning and scheduling components.
 
 ## What the crate provides
 
-- Artifact inspection, resolved model configuration, tensor catalogs, and preparation plans
-  for SafeTensors and GGUF checkpoints.
+- The canonical in-memory content-exact artifact identity and logical-member
+  combining algorithm, plus artifact inspection, resolved model configuration,
+  tensor catalogs, and preparation plans for SafeTensors and GGUF checkpoints.
 - Whole-model backend, session, prefill, decode, completion, capability, and
   optional distributed contracts.
 - Generation, cancellation, speculative decoding, realtime scheduling, and
   transactional request state machines.
-- Attention schedules, parallel topology, execution plans, admission reports,
-  and telemetry schemas.
+- Attention schedules, parallel topology, execution plans, mechanism-capability
+  admission, reusable inspection reports, and telemetry schemas.
 - Weight and cache residency policy, budgets, accounting schemas, eviction
   rules, and transfer contracts.
 - Portable decoded media descriptions and ordered multimodal requests.

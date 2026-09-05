@@ -6,6 +6,12 @@ portable contracts for parameter binding, mutable state, cache and weight
 residency, transfers, collectives, generation, speculative decoding, and
 realtime execution.
 
+It owns the canonical declarative parameter-binding and logical placement
+plans, communication-manifest validation, and reusable replicated-session
+construction flow. Backends supply statically dispatched native
+materialization, completion, storage, group, and tensor mechanisms to those
+plans.
+
 The crate does not depend on a model-family implementation or a concrete
 backend. Architectures declare their execution and state semantics in
 `eredu-architectures`; backends implement the capabilities required to realize

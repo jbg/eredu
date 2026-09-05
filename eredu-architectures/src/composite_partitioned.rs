@@ -582,7 +582,7 @@ pub struct PreparedCompositeRoutedExecution {
     tensor_reductions: std::collections::BTreeMap<usize, (usize, usize)>,
     hidden_width: usize,
     tensor_output_width: Option<usize>,
-    expert_group: Option<eredu_runtime::CommunicationGroupId>,
+    expert_group: Option<eredu_core::CollectiveGroupId>,
 }
 
 /// Opaque architecture-selected construction for one composite partition executor.
@@ -592,7 +592,7 @@ pub struct PreparedCompositeRoutedExecution {
 /// backend supplies only its unit policy, parallel context, tensor allocator,
 /// and route-movement mechanism.
 pub struct PreparedCompositeExecutorPlan {
-    tensor_group: Option<eredu_runtime::CommunicationGroupId>,
+    tensor_group: Option<eredu_core::CollectiveGroupId>,
     structure: crate::partitioned_execution::PreparedCompositeExecutorStructure,
     strategy: PreparedCompositeUnitStrategy,
 }
@@ -602,13 +602,13 @@ enum PreparedCompositeUnitStrategy {
     Routed {
         provider: crate::PlannedResidentGatedProduct,
         plan: crate::routed_text::RoutedGroupedPlan,
-        expert_group: Option<eredu_runtime::CommunicationGroupId>,
+        expert_group: Option<eredu_core::CollectiveGroupId>,
     },
     RoutedCollective {
         provider: crate::PlannedResidentGatedProduct,
         plan: crate::routed_text::RoutedGroupedPlan,
-        expert_group: eredu_runtime::CommunicationGroupId,
-        tensor_group: Option<eredu_runtime::CommunicationGroupId>,
+        expert_group: eredu_core::CollectiveGroupId,
+        tensor_group: Option<eredu_core::CollectiveGroupId>,
         waves: crate::partitioned_execution::RoutedExpertCollectiveWaveSchedule,
     },
 }
@@ -726,7 +726,7 @@ impl PreparedCompositeExecutorPlan {
     }
 
     /// Opaque tensor group needed by the backend communication realizer.
-    pub const fn communication_tensor_group(&self) -> Option<eredu_runtime::CommunicationGroupId> {
+    pub const fn communication_tensor_group(&self) -> Option<eredu_core::CollectiveGroupId> {
         self.tensor_group
     }
 
@@ -882,7 +882,7 @@ impl PreparedCompositeRoutedExecution {
     }
 
     /// Opaque expert exchange group selected during admission, when EP is active.
-    pub const fn expert_group(&self) -> Option<eredu_runtime::CommunicationGroupId> {
+    pub const fn expert_group(&self) -> Option<eredu_core::CollectiveGroupId> {
         self.expert_group
     }
 }

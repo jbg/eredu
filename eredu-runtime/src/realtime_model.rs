@@ -1,15 +1,15 @@
 //! Family-blind construction of a selected layered realtime model.
 
-use std::marker::PhantomData;
+use std::{collections::BTreeMap, marker::PhantomData};
 
 use eredu_checkpoint::recipe::{DerivedWeightRecipe, RecipeMetadata};
 use eredu_nn::{NeuralBackend, Tensor};
 
 use crate::{
-    LayerWeightResidency, LayeredArchitecture, LayerwisePolicy, LayerwiseRuntime,
+    LayerWeightResidency, LayeredArchitecture, LayerwisePolicy, LayerwiseRuntime, ParameterBackend,
     ParameterGroupOwner, RealtimeWeightComponentRequirement, RealtimeWeightComponentRole,
     RealtimeWeightLoweringRequirement, RuntimeState, SelectedRealtimeRealization,
-    SubmissionBackend,
+    SubmissionBackend, WeightBinding, WeightBindingPlan,
 };
 
 /// Architecture-issued identities that bind concrete modules to one selection.
@@ -202,6 +202,182 @@ impl RealtimeMaterializationTask {
     pub fn components(&self) -> &[RealtimeMaterializationComponent] {
         &self.components
     }
+}
+
+/// Canonical owner-partitioned bindings derived from exact realtime tasks.
+#[derive(Debug, Clone)]
+pub struct RealtimeTaskBindingPlan {
+    pinned: Vec<WeightBinding>,
+    units: BTreeMap<ParameterGroupOwner, Vec<WeightBinding>>,
+}
+
+impl RealtimeTaskBindingPlan {
+    /// Consumes the pinned and execution-unit binding partitions.
+    pub fn into_parts(
+        self,
+    ) -> (
+        Vec<WeightBinding>,
+        BTreeMap<ParameterGroupOwner, Vec<WeightBinding>>,
+    ) {
+        (self.pinned, self.units)
+    }
+}
+
+/// Validates every exact realtime task and backend recipe capability without payload access.
+///
+/// This gate is valid against the original checkpoint even when later transform
+/// work publishes authoritative packed outputs.
+pub fn preflight_realtime_materialization_tasks<B: ParameterBackend>(
+    tasks: &[RealtimeMaterializationTask],
+    source: &dyn eredu_checkpoint::store::CheckpointSource,
+) -> Result<(), RealtimeModelContractError> {
+    for task in tasks {
+        let transformed = matches!(
+            task.lowering().kind(),
+            crate::WeightLoweringKind::Transform | crate::WeightLoweringKind::DerivedTransform
+        );
+        let targets = task
+            .components()
+            .iter()
+            .map(|component| component.requirement().target().as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        for component in task.components() {
+            for admitted in component.source_provenance() {
+                let actual = source
+                    .source_provenance(&admitted.catalog_key)
+                    .map_err(|error| RealtimeModelContractError::BindingPlan {
+                        detail: error.to_string(),
+                    })?;
+                if &actual != admitted {
+                    return Err(RealtimeModelContractError::BindingPlan {
+                        detail: format!(
+                            "realtime component {:?} differs from admitted source provenance",
+                            component.requirement().target().as_str()
+                        ),
+                    });
+                }
+            }
+            if let Some(owner) = component.requirement().recipe_owner() {
+                if owner != component.requirement().target() && !targets.contains(owner.as_str()) {
+                    return Err(RealtimeModelContractError::BindingPlan {
+                        detail: format!("realtime alias owner {:?} is absent", owner.as_str()),
+                    });
+                }
+            }
+            if let Some(recipe) = component.recipe() {
+                let actual = recipe.infer(source).map_err(|error| {
+                    RealtimeModelContractError::BindingPlan {
+                        detail: error.to_string(),
+                    }
+                })?;
+                if component.recipe_output() != Some(&actual) {
+                    return Err(RealtimeModelContractError::BindingPlan {
+                        detail: format!(
+                            "realtime component {:?} recipe output drifted",
+                            component.requirement().target().as_str()
+                        ),
+                    });
+                }
+                B::preflight_recipe(recipe, source).map_err(|error| {
+                    RealtimeModelContractError::BindingPlan {
+                        detail: error.to_string(),
+                    }
+                })?;
+            } else if component.requirement().recipe_owner().is_none() && !transformed {
+                return Err(RealtimeModelContractError::BindingPlan {
+                    detail: format!(
+                        "realtime component {:?} has neither recipe nor alias owner",
+                        component.requirement().target().as_str()
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Derives the singular canonical binding partitions from exact realtime tasks.
+pub fn realtime_task_binding_plan(
+    tasks: &[RealtimeMaterializationTask],
+    source: &dyn eredu_checkpoint::store::CheckpointSource,
+) -> Result<RealtimeTaskBindingPlan, RealtimeModelContractError> {
+    let mut pinned = Vec::new();
+    let mut units = BTreeMap::<ParameterGroupOwner, Vec<WeightBinding>>::new();
+    for task in tasks {
+        let destination = match task.owner() {
+            ParameterGroupOwner::StaticRole(_) | ParameterGroupOwner::StaticAnyOf(_) => &mut pinned,
+            ParameterGroupOwner::ExecutionUnit { .. } => {
+                units.entry(task.owner().clone()).or_default()
+            }
+        };
+        let transformed = matches!(
+            task.lowering().kind(),
+            crate::WeightLoweringKind::Transform | crate::WeightLoweringKind::DerivedTransform
+        );
+        for component in task.components() {
+            let requirement = component.requirement();
+            let target = requirement.target().as_str();
+            let binding = if transformed {
+                if !source.is_authoritative_materialized_key(target) {
+                    return Err(RealtimeModelContractError::BindingPlan {
+                        detail: format!(
+                            "transformed realtime output {target:?} is not authoritative"
+                        ),
+                    });
+                }
+                let metadata = source.source_metadata(target).map_err(|error| {
+                    RealtimeModelContractError::BindingPlan {
+                        detail: error.to_string(),
+                    }
+                })?;
+                WeightBinding::new(
+                    target,
+                    target,
+                    eredu_checkpoint::store::TensorSelection::Full,
+                    metadata.encoded_byte_len,
+                )
+            } else {
+                let output = component.recipe_output().ok_or_else(|| {
+                    RealtimeModelContractError::BindingPlan {
+                        detail: format!("realtime recipe component {target:?} has no output"),
+                    }
+                })?;
+                match requirement.recipe_owner() {
+                    Some(owner) if owner != requirement.target() => {
+                        WeightBinding::alias(target, owner.as_str(), output.byte_len())
+                    }
+                    _ => WeightBinding::from_recipe(
+                        target,
+                        component.recipe().cloned().ok_or_else(|| {
+                            RealtimeModelContractError::BindingPlan {
+                                detail: format!("realtime component {target:?} has no recipe"),
+                            }
+                        })?,
+                        output.byte_len(),
+                    ),
+                }
+            }
+            .map_err(|error| RealtimeModelContractError::BindingPlan {
+                detail: error.to_string(),
+            })?
+            .with_logical_target(task.lowering().target().as_str())
+            .map_err(|error| RealtimeModelContractError::BindingPlan {
+                detail: error.to_string(),
+            })?;
+            destination.push(binding);
+        }
+    }
+    WeightBindingPlan::new(&pinned).map_err(|error| RealtimeModelContractError::BindingPlan {
+        detail: error.to_string(),
+    })?;
+    for bindings in units.values() {
+        WeightBindingPlan::new(bindings).map_err(|error| {
+            RealtimeModelContractError::BindingPlan {
+                detail: error.to_string(),
+            }
+        })?;
+    }
+    Ok(RealtimeTaskBindingPlan { pinned, units })
 }
 
 /// Selected realization paired with complete architecture recipe payloads.
@@ -775,6 +951,12 @@ pub enum RealtimeModelContractError {
     TaskOwnerMismatch {
         /// Affected selected lowering target.
         target: String,
+    },
+    /// Canonical task-to-binding derivation or metadata preflight failed.
+    #[error("realtime binding plan is invalid: {detail}")]
+    BindingPlan {
+        /// Exact metadata-only causal failure.
+        detail: String,
     },
 }
 

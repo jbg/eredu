@@ -1,15 +1,11 @@
-//! Media preprocessing before typed model prefill.
+//! MLX conversion of validated portable media buffers before typed prefill.
 
 /// Typed runtime inputs for model prefill.
 pub mod input;
 
-#[cfg(all(test, not(any(feature = "image", feature = "audio"))))]
+#[cfg(any(test, feature = "image", feature = "audio"))]
 use eredu_core::InputModality;
-#[cfg(feature = "image")]
-use eredu_core::VideoSampling;
 use eredu_core::{checkpoint::TensorDtype, InputTensorIdentity, PreparedInputIdentity};
-#[cfg(any(feature = "image", feature = "audio"))]
-use eredu_core::{InputExtent, InputMetadataKey, InputModality};
 use eredu_runtime::{PreparedInputCacheIdentity, PreparedModelInput as RuntimePreparedModelInput};
 use safemlx::{Array, Dtype};
 
@@ -19,106 +15,6 @@ use crate::{backend::error::Error, backend::runtime::media::input::ModelInput};
 
 /// Backend-neutral runtime input part specialized to MLX arrays.
 pub(crate) use crate::backend::runtime::media::input::InputPart;
-
-/// Shared PCM waveform validation and spectral operations.
-#[cfg(feature = "audio")]
-pub mod audio;
-/// Shared decoded-image operations.
-#[cfg(feature = "image")]
-pub mod image;
-/// Shared decoded-video validation, sampling, and timing operations.
-#[cfg(feature = "image")]
-pub mod video;
-
-#[cfg(feature = "audio")]
-pub(crate) use audio::AudioWaveform;
-#[cfg(feature = "image")]
-pub(crate) use image::RgbImageView;
-
-/// One decoded media item supplied to a model processor.
-#[derive(Debug, Clone, Copy)]
-#[cfg(any(feature = "image", feature = "audio"))]
-pub struct MediaInput<'a> {
-    /// Declared modality of the item.
-    pub modality: InputModality,
-    /// Decoded media payload.
-    pub payload: MediaPayload<'a>,
-}
-
-#[cfg(any(feature = "image", feature = "audio"))]
-impl<'a> MediaInput<'a> {
-    /// Creates an RGB8 image input.
-    #[cfg(feature = "image")]
-    pub fn image_rgb8(image: RgbImageView<'a>) -> Self {
-        Self {
-            modality: InputModality::Image,
-            payload: MediaPayload::Rgb8(image),
-        }
-    }
-
-    /// Creates a decoded RGB8 video input with an explicit sampling policy.
-    #[cfg(feature = "image")]
-    pub fn video_rgb8_with_sampling(
-        frames: &'a [RgbImageView<'a>],
-        source_fps: Option<f64>,
-        sampling: VideoSampling,
-    ) -> Self {
-        Self {
-            modality: InputModality::Video,
-            payload: MediaPayload::VideoFrames(VideoFrames {
-                frames,
-                source_fps,
-                sampling,
-            }),
-        }
-    }
-
-    /// Creates a mono floating-point PCM audio input.
-    #[cfg(feature = "audio")]
-    pub fn audio_f32(samples: &'a [f32], sample_rate: u32) -> Result<Self, Error> {
-        Ok(Self {
-            modality: InputModality::Audio,
-            payload: MediaPayload::AudioF32(AudioWaveform::new(samples, sample_rate)?),
-        })
-    }
-}
-
-/// One ordered input segment supplied to a model processor.
-#[derive(Debug, Clone, Copy)]
-#[cfg(any(feature = "image", feature = "audio"))]
-pub enum ProcessorInput<'a> {
-    /// Already-tokenized text IDs.
-    TokenIds(&'a [u32]),
-    /// Decoded media to preprocess and insert at this exact position.
-    Media(MediaInput<'a>),
-}
-
-/// Borrowed sequence of decoded RGB8 video frames.
-#[cfg(feature = "image")]
-#[derive(Debug, Clone, Copy)]
-pub struct VideoFrames<'a> {
-    /// Frames in source order.
-    pub frames: &'a [RgbImageView<'a>],
-    /// Source frame rate used for sampling and timestamp generation.
-    pub source_fps: Option<f64>,
-    /// Frame-selection policy.
-    pub sampling: VideoSampling,
-}
-
-/// Decoded data accepted by media processors.
-#[derive(Debug, Clone, Copy)]
-#[cfg(any(feature = "image", feature = "audio"))]
-pub enum MediaPayload<'a> {
-    /// Decoded RGB8 image pixels.
-    #[cfg(feature = "image")]
-    Rgb8(RgbImageView<'a>),
-    /// Decoded RGB8 video frames and timing metadata.
-    #[cfg(feature = "image")]
-    VideoFrames(VideoFrames<'a>),
-    /// Mono floating-point PCM samples and their sampling rate.
-    #[cfg(feature = "audio")]
-    AudioF32(AudioWaveform<'a>),
-}
 
 #[cfg(any(test, feature = "image", feature = "audio"))]
 fn text_input_part(ids: &[u32]) -> Result<InputPart, Error> {
@@ -131,17 +27,6 @@ fn text_input_part(ids: &[u32]) -> Result<InputPart, Error> {
         [],
     )
     .map_err(Into::into)
-}
-
-#[cfg(any(feature = "image", feature = "audio"))]
-/// Builds one tensor-backed input part for a media modality.
-pub fn media_input_part(
-    modality: InputModality,
-    tensor: Array,
-    metadata: impl IntoIterator<Item = (InputMetadataKey, Array)>,
-    extents: impl IntoIterator<Item = InputExtent>,
-) -> Result<InputPart, Error> {
-    input::input_part(modality, InputPayload::Tensor(tensor), metadata, extents).map_err(Into::into)
 }
 
 /// Owned runtime input produced by a media processor.

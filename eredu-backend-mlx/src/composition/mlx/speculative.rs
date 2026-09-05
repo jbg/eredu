@@ -102,7 +102,7 @@ fn materialize_external_assistant<A: eredu_architectures::ExternalAssistantArchi
 ) -> Result<MlxExternalAssistant<A>, Error> {
     use crate::backend::runtime::{
         checkpoint::binding::{
-            build_exact_replicated_text_bindings, materialize_module_bindings,
+            build_mlx_exact_replicated_text_bindings, materialize_module_bindings,
             populate_module_from_arrays_excluding,
         },
         execution::layerwise::quantize_exact_replicated_text_tasks,
@@ -112,15 +112,15 @@ fn materialize_external_assistant<A: eredu_architectures::ExternalAssistantArchi
     let (checkpoint, source_config, config, tasks) = prepared.into_parts();
     let store = match checkpoint {
         eredu_architectures::ExternalAssistantCheckpoint::SafeTensors {
-            source,
+            source: _,
+            shards,
             catalog,
-            plan,
+            plan: _,
             resolution,
-        } => crate::composition::mlx::artifact::open_prepared_safetensors_checkpoint(
-            &source,
-            catalog,
-            &plan,
-            &resolution,
+        } => eredu_core::artifact::open_prepared_safetensors_artifact(
+            &catalog,
+            shards,
+            resolution,
             max_cached_shards,
         )?,
         eredu_architectures::ExternalAssistantCheckpoint::Gguf {
@@ -188,7 +188,7 @@ fn materialize_external_assistant<A: eredu_architectures::ExternalAssistantArchi
             .map_err(|error| Error::ArchitectureModel(error.to_string()))?,
     );
     let task_refs = tasks.iter().collect::<Vec<_>>();
-    let bindings = build_exact_replicated_text_bindings(
+    let bindings = build_mlx_exact_replicated_text_bindings(
         &module,
         store.as_ref(),
         &task_refs,
@@ -1051,7 +1051,7 @@ mod external_materialization_tests {
             ("gemma4_assistant".into(), None)
         );
         let counts = crate::composition::mlx::path_instrumentation::snapshot();
-        assert_eq!(counts.payload_opens, 1);
+        assert_eq!(counts.payload_opens, 0);
         assert_eq!(counts.constructors, 0);
     }
 
@@ -1076,7 +1076,7 @@ mod external_materialization_tests {
             )
         );
         let counts = crate::composition::mlx::path_instrumentation::snapshot();
-        assert_eq!(counts.payload_opens, 1);
+        assert_eq!(counts.payload_opens, 0);
         assert_eq!(counts.constructors, 0);
     }
 

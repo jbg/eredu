@@ -10,6 +10,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex, MutexGuard,
     },
+    time::SystemTime,
 };
 
 use crate::{
@@ -109,6 +110,10 @@ pub struct BoundedReadProof {
     pub offset_bytes: u64,
     /// Physical payload bytes read for this lease.
     pub length_bytes: u64,
+    /// Actual filesystem read operations, including exactness verification.
+    pub physical_reads: u64,
+    /// Actual filesystem bytes read, including exactness verification.
+    pub physical_read_bytes: u64,
 }
 
 /// Format-native encoded payload retained by a checkpoint lease.
@@ -188,7 +193,7 @@ impl EncodedTensorLease for CheckpointLease {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Eq, PartialEq)]
 struct MemoryTensor {
     metadata: TensorMetadata,
     dtype: Dtype,
@@ -319,6 +324,8 @@ impl WeightStore for MemoryWeightStore {
                 length_bytes: u64::try_from(length).map_err(|_| StoreError::Overflow {
                     context: "in-memory selection byte length".into(),
                 })?,
+                physical_reads: 0,
+                physical_read_bytes: 0,
             },
             span,
             selected_bytes: selected_bytes.map(Arc::from),
@@ -437,6 +444,45 @@ pub struct PreparedCheckpointSource {
 }
 
 impl PreparedCheckpointSource {
+    /// Opens an exact admitted SafeTensors shard set and pins it to metadata
+    /// retained by header-only preparation.
+    ///
+    /// This performs no directory or index rediscovery and materializes no
+    /// tensor payload. Deferred exact-range acquisition admits immutable bytes
+    /// only after metadata, provenance, selection, and encoded-length checks.
+    pub fn open_admitted_safetensors(
+        shards: SafetensorsShards,
+        catalog: BTreeMap<String, TensorMetadata>,
+        max_cached_shards: usize,
+    ) -> Result<Self, StoreError> {
+        let source: SharedCheckpointSource = Arc::new(SafetensorsWeightStore::open_admitted(
+            shards,
+            max_cached_shards,
+        )?);
+        let catalog = catalog
+            .into_iter()
+            .map(|(key, metadata)| {
+                let provenance = TensorSourceProvenance {
+                    catalog_key: key.clone(),
+                    physical_tensor: key.clone(),
+                    output: key.clone(),
+                    backing_shard: metadata.backing_shard.clone(),
+                    source_encoding: crate::SourceTensorEncoding::Safetensors(
+                        metadata.stored_dtype.clone(),
+                    ),
+                };
+                (
+                    key,
+                    PreparedTensorSource {
+                        metadata,
+                        provenance,
+                    },
+                )
+            })
+            .collect();
+        Self::new(source, catalog)
+    }
+
     /// Pins a source to the supplied exact catalog.
     pub fn new(
         source: SharedCheckpointSource,
@@ -943,6 +989,12 @@ pub enum StoreError {
         /// Logical tensor whose physical metadata changed.
         key: String,
     },
+    /// An admitted filesystem object changed after its metadata snapshot.
+    #[error("admitted checkpoint file changed after preparation: {path}", path = .path.display())]
+    AdmittedFileChanged {
+        /// Exact admitted path whose pinned object changed.
+        path: PathBuf,
+    },
     /// Filesystem or container access failed.
     #[error("checkpoint I/O failed for {path}: {message}", path = .path.display())]
     Io {
@@ -970,6 +1022,7 @@ pub const DEFAULT_MAX_CACHED_SHARDS: usize = 4;
 #[derive(Debug)]
 struct CachedShard {
     path: PathBuf,
+    admitted_file: Arc<AdmittedFile>,
     metadata: Metadata,
     payload_offset: usize,
     full_tensors: Mutex<BTreeMap<String, Arc<[u8]>>>,
@@ -1001,6 +1054,105 @@ struct SafetensorsReadTelemetry {
 #[derive(Debug, Clone)]
 struct CatalogEntry {
     shard: PathBuf,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct AdmittedFileIdentity {
+    canonical_path: PathBuf,
+    len: u64,
+    modified: SystemTime,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    // Unix ctime is the strongest change-version metadata exposed by the
+    // standard library: unlike mtime, normal timestamp APIs cannot restore it.
+    #[cfg(unix)]
+    change_time_seconds: i64,
+    #[cfg(unix)]
+    change_time_nanoseconds: i64,
+    // Other targets do not expose an equivalent change counter through the
+    // portable Metadata API. Retain creation time when the filesystem reports
+    // it, in addition to length and modification time.
+    #[cfg(not(unix))]
+    created: Option<SystemTime>,
+    #[cfg(windows)]
+    file_attributes: u32,
+    #[cfg(windows)]
+    creation_time: u64,
+}
+
+impl AdmittedFileIdentity {
+    fn from_metadata(path: &Path, metadata: &std::fs::Metadata) -> Result<Self, StoreError> {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt as _;
+
+        Ok(Self {
+            canonical_path: path.to_path_buf(),
+            len: metadata.len(),
+            modified: metadata.modified().map_err(|error| fs_error(path, error))?,
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+            #[cfg(unix)]
+            change_time_seconds: metadata.ctime(),
+            #[cfg(unix)]
+            change_time_nanoseconds: metadata.ctime_nsec(),
+            #[cfg(not(unix))]
+            created: metadata.created().ok(),
+            #[cfg(windows)]
+            file_attributes: {
+                use std::os::windows::fs::MetadataExt as _;
+                metadata.file_attributes()
+            },
+            #[cfg(windows)]
+            creation_time: {
+                use std::os::windows::fs::MetadataExt as _;
+                metadata.creation_time()
+            },
+        })
+    }
+}
+
+#[derive(Debug)]
+struct AdmittedFile {
+    identity: AdmittedFileIdentity,
+}
+
+impl AdmittedFile {
+    fn open(path: &Path) -> Result<Self, StoreError> {
+        let file = File::open(path).map_err(|error| fs_error(path, error))?;
+        let identity = AdmittedFileIdentity::from_metadata(
+            path,
+            &file.metadata().map_err(|error| fs_error(path, error))?,
+        )?;
+        Ok(Self { identity })
+    }
+
+    fn open_validated(&self, path: &Path) -> Result<File, StoreError> {
+        if path != self.identity.canonical_path {
+            return Err(StoreError::AdmittedFileChanged {
+                path: path.to_path_buf(),
+            });
+        }
+        let file = File::open(path).map_err(|error| fs_error(path, error))?;
+        self.validate_file(path, &file)?;
+        Ok(file)
+    }
+
+    fn validate_file(&self, path: &Path, file: &File) -> Result<(), StoreError> {
+        let current = AdmittedFileIdentity::from_metadata(
+            path,
+            &file.metadata().map_err(|error| fs_error(path, error))?,
+        )?;
+        if current != self.identity {
+            return Err(StoreError::AdmittedFileChanged {
+                path: path.to_path_buf(),
+            });
+        }
+        Ok(())
+    }
 }
 
 /// Encoded SafeTensors selection retaining its cached shard metadata.
@@ -1045,6 +1197,7 @@ impl EncodedTensorLease for SafetensorsLease {
 pub struct SafetensorsWeightStore {
     catalog: BTreeMap<String, CatalogEntry>,
     indexed_shards: BTreeMap<PathBuf, BTreeSet<String>>,
+    admitted_files: BTreeMap<PathBuf, Arc<AdmittedFile>>,
     metadata: Mutex<BTreeMap<String, TensorMetadata>>,
     cache: Mutex<CacheState>,
     read_telemetry: Arc<SafetensorsReadTelemetry>,
@@ -1077,6 +1230,14 @@ impl SafetensorsWeightStore {
         if max_cached_shards == 0 {
             return Err(StoreError::InvalidShardCacheLimit);
         }
+        // Snapshot every admitted object without retaining one descriptor per
+        // shard. A selected shard is reopened and validated against this exact
+        // identity only after preflight.
+        let admitted_files = shards
+            .payload_paths()
+            .iter()
+            .map(|path| AdmittedFile::open(path).map(|file| (path.clone(), Arc::new(file))))
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
         if let Some(locations) = shards.tensor_locations() {
             let mut indexed_shards = BTreeMap::<PathBuf, BTreeSet<String>>::new();
             for (key, shard) in locations {
@@ -1099,6 +1260,7 @@ impl SafetensorsWeightStore {
             return Ok(Self {
                 catalog,
                 indexed_shards,
+                admitted_files,
                 metadata: Mutex::new(BTreeMap::new()),
                 cache: Mutex::new(CacheState::default()),
                 read_telemetry: Arc::new(SafetensorsReadTelemetry::default()),
@@ -1110,11 +1272,21 @@ impl SafetensorsWeightStore {
             .first()
             .expect("unindexed discovery returns one payload")
             .clone();
-        Self::from_single_file(file, max_cached_shards)
+        let admitted_file = Arc::clone(
+            admitted_files
+                .get(&file)
+                .expect("admitted payload has an identity snapshot"),
+        );
+        Self::from_single_file(file, admitted_file, admitted_files, max_cached_shards)
     }
 
-    fn from_single_file(file: PathBuf, max_cached_shards: usize) -> Result<Self, StoreError> {
-        let discovered = inspect_file(&file)?;
+    fn from_single_file(
+        file: PathBuf,
+        admitted_file: Arc<AdmittedFile>,
+        admitted_files: BTreeMap<PathBuf, Arc<AdmittedFile>>,
+        max_cached_shards: usize,
+    ) -> Result<Self, StoreError> {
+        let discovered = inspect_file(&file, &admitted_file)?;
         let catalog = discovered
             .keys()
             .map(|key| {
@@ -1129,6 +1301,7 @@ impl SafetensorsWeightStore {
         Ok(Self {
             catalog,
             indexed_shards: BTreeMap::new(),
+            admitted_files,
             metadata: Mutex::new(discovered),
             cache: Mutex::new(CacheState::default()),
             read_telemetry: Arc::new(SafetensorsReadTelemetry::default()),
@@ -1152,6 +1325,7 @@ impl SafetensorsWeightStore {
             .get(&canonical_path)
             .map(|entry| Arc::clone(&entry.shard))
         {
+            drop(shard.admitted_file.open_validated(&canonical_path)?);
             cache.hits = cache.hits.saturating_add(1);
             cache.entries.get_mut(&canonical_path).unwrap().last_used = tick;
             return Ok(shard);
@@ -1180,9 +1354,18 @@ impl SafetensorsWeightStore {
                 });
             }
         }
-        let (payload_offset, metadata) = read_safetensors_metadata(&canonical_path)?;
+        let admitted_file =
+            Arc::clone(self.admitted_files.get(&canonical_path).ok_or_else(|| {
+                StoreError::Internal(format!(
+                    "admitted SafeTensors file is missing for {}",
+                    canonical_path.display()
+                ))
+            })?);
+        let (payload_offset, metadata) =
+            read_safetensors_metadata(&canonical_path, &admitted_file)?;
         let shard = Arc::new(CachedShard {
             path: entry.shard.clone(),
+            admitted_file,
             metadata,
             payload_offset,
             full_tensors: Mutex::new(BTreeMap::new()),
@@ -1244,6 +1427,17 @@ impl SafetensorsWeightStore {
                 ))
             })
     }
+
+    fn validate_admitted_path(&self, path: &Path) -> Result<(), StoreError> {
+        let admitted = self.admitted_files.get(path).ok_or_else(|| {
+            StoreError::Internal(format!(
+                "admitted SafeTensors file is missing for {}",
+                path.display()
+            ))
+        })?;
+        drop(admitted.open_validated(path)?);
+        Ok(())
+    }
 }
 
 impl WeightStore for SafetensorsWeightStore {
@@ -1261,6 +1455,11 @@ impl WeightStore for SafetensorsWeightStore {
             .get(key)
             .cloned()
         {
+            let entry = self
+                .catalog
+                .get(key)
+                .ok_or_else(|| StoreError::UnknownTensor { key: key.into() })?;
+            self.validate_admitted_path(&entry.shard)?;
             return Ok(metadata);
         }
         let entry = self
@@ -1317,6 +1516,7 @@ impl WeightStore for SafetensorsWeightStore {
             .cloned();
         let complete_tensor =
             read.ranges.len() == 1 && read.ranges[0].start == 0 && read.ranges[0].end == tensor_len;
+        let cache_hit = cached.is_some();
         let bytes = match cached {
             Some(bytes) if complete_tensor => bytes,
             Some(bytes) => Arc::from(copy_safetensors_ranges(
@@ -1327,6 +1527,7 @@ impl WeightStore for SafetensorsWeightStore {
             None => {
                 let bytes: Arc<[u8]> = Arc::from(read_safetensors_ranges(
                     &shard.path,
+                    &shard.admitted_file,
                     payload_start,
                     &read.ranges,
                     self.read_telemetry.as_ref(),
@@ -1359,6 +1560,18 @@ impl WeightStore for SafetensorsWeightStore {
                     }
                 })?,
                 length_bytes: length,
+                physical_reads: if cache_hit {
+                    0
+                } else {
+                    u64::try_from(read.ranges.len())
+                        .unwrap_or(u64::MAX)
+                        .saturating_mul(2)
+                },
+                physical_read_bytes: if cache_hit {
+                    0
+                } else {
+                    length.saturating_mul(2)
+                },
             },
             shard,
             bytes,
@@ -1418,8 +1631,11 @@ impl crate::validation::SafetensorsCatalog for SafetensorsWeightStore {
     }
 }
 
-fn inspect_file(path: &Path) -> Result<BTreeMap<String, TensorMetadata>, StoreError> {
-    let (_, metadata) = read_safetensors_metadata(path)?;
+fn inspect_file(
+    path: &Path,
+    admitted_file: &AdmittedFile,
+) -> Result<BTreeMap<String, TensorMetadata>, StoreError> {
+    let (_, metadata) = read_safetensors_metadata(path, admitted_file)?;
     metadata
         .tensors()
         .into_iter()
@@ -1427,13 +1643,20 @@ fn inspect_file(path: &Path) -> Result<BTreeMap<String, TensorMetadata>, StoreEr
         .collect()
 }
 
-fn read_safetensors_metadata(path: &Path) -> Result<(usize, Metadata), StoreError> {
-    let mut file = File::open(path).map_err(|error| fs_error(path, error))?;
+fn read_safetensors_metadata(
+    path: &Path,
+    admitted_file: &AdmittedFile,
+) -> Result<(usize, Metadata), StoreError> {
+    let mut file = admitted_file.open_validated(path)?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| io_error(path, error))?;
     let file_len = file
         .metadata()
         .map_err(|error| fs_error(path, error))?
         .len();
-    read_safetensors_metadata_from(path, &mut file, file_len)
+    let metadata = read_safetensors_metadata_from(path, &mut file, file_len)?;
+    admitted_file.validate_file(path, &file)?;
+    Ok(metadata)
 }
 
 fn read_safetensors_metadata_from(
@@ -1681,9 +1904,28 @@ fn plan_safetensors_reads(
 
 fn read_safetensors_ranges(
     path: &Path,
+    admitted_file: &AdmittedFile,
     tensor_payload_start: usize,
     ranges: &[Range<usize>],
     telemetry: &SafetensorsReadTelemetry,
+) -> Result<Vec<u8>, StoreError> {
+    read_safetensors_ranges_with_hook(
+        path,
+        admitted_file,
+        tensor_payload_start,
+        ranges,
+        telemetry,
+        || {},
+    )
+}
+
+fn read_safetensors_ranges_with_hook(
+    path: &Path,
+    admitted_file: &AdmittedFile,
+    tensor_payload_start: usize,
+    ranges: &[Range<usize>],
+    telemetry: &SafetensorsReadTelemetry,
+    between_passes: impl FnOnce(),
 ) -> Result<Vec<u8>, StoreError> {
     let capacity = ranges.iter().try_fold(0usize, |total, range| {
         total
@@ -1692,7 +1934,43 @@ fn read_safetensors_ranges(
                 context: format!("selected payload length for {}", path.display()),
             })
     })?;
-    let mut file = File::open(path).map_err(|error| fs_error(path, error))?;
+    let mut file = admitted_file.open_validated(path)?;
+    let first = read_safetensors_range_pass(
+        path,
+        &mut file,
+        tensor_payload_start,
+        ranges,
+        capacity,
+        telemetry,
+    )?;
+    admitted_file.validate_file(path, &file)?;
+    between_passes();
+    admitted_file.validate_file(path, &file)?;
+    let second = read_safetensors_range_pass(
+        path,
+        &mut file,
+        tensor_payload_start,
+        ranges,
+        capacity,
+        telemetry,
+    )?;
+    admitted_file.validate_file(path, &file)?;
+    if first != second {
+        return Err(StoreError::AdmittedFileChanged {
+            path: path.to_path_buf(),
+        });
+    }
+    Ok(first)
+}
+
+fn read_safetensors_range_pass(
+    path: &Path,
+    file: &mut File,
+    tensor_payload_start: usize,
+    ranges: &[Range<usize>],
+    capacity: usize,
+    telemetry: &SafetensorsReadTelemetry,
+) -> Result<Vec<u8>, StoreError> {
     let mut output = Vec::with_capacity(capacity);
     for range in ranges {
         let absolute = tensor_payload_start
@@ -2081,6 +2359,8 @@ mod tests {
                 physically_bounded: true,
                 offset_bytes: 4,
                 length_bytes: 4,
+                physical_reads: 1,
+                physical_read_bytes: 4,
             },
             bytes: vec![0; 4],
         };
@@ -2132,6 +2412,297 @@ mod tests {
     }
 
     #[test]
+    fn prepared_safetensors_open_uses_admitted_shards_without_payload_reads() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("model.safetensors");
+        let payload = f32_bytes(&[1.0, 2.0]);
+        serialize_to_file(
+            [(
+                "weight",
+                TensorView::new(Dtype::F32, vec![2], &payload).unwrap(),
+            )],
+            None,
+            &path,
+        )
+        .unwrap();
+        let admitted =
+            crate::safetensors::SafetensorsMetadataCatalog::discover(directory.path()).unwrap();
+        let prepared = PreparedCheckpointSource::open_admitted_safetensors(
+            admitted.admitted_shards(),
+            admitted.tensors().clone(),
+            1,
+        )
+        .unwrap();
+
+        assert_eq!(prepared.source_keys(), vec!["weight"]);
+        let diagnostics = prepared.source_diagnostics().unwrap();
+        assert_eq!(diagnostics.physical_reads, 0);
+        assert_eq!(diagnostics.physical_read_bytes, 0);
+        assert!(diagnostics.payload_shard_paths.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepared_many_shard_catalog_retains_no_descriptor_per_shard() {
+        fn open_descriptor_count() -> usize {
+            let directory = if Path::new("/proc/self/fd").is_dir() {
+                Path::new("/proc/self/fd")
+            } else {
+                Path::new("/dev/fd")
+            };
+            std::fs::read_dir(directory).unwrap().count()
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut weight_map = BTreeMap::new();
+        for index in 0..96 {
+            let key = format!("weight.{index}");
+            let file_name = format!("model-{index:05}-of-00096.safetensors");
+            let path = directory.path().join(&file_name);
+            let payload = [u8::try_from(index).unwrap()];
+            serialize_to_file(
+                [(
+                    key.as_str(),
+                    TensorView::new(Dtype::U8, vec![1], &payload).unwrap(),
+                )],
+                None,
+                &path,
+            )
+            .unwrap();
+            weight_map.insert(key, file_name);
+        }
+        std::fs::write(
+            directory.path().join("model.safetensors.index.json"),
+            serde_json::to_vec(&serde_json::json!({ "weight_map": weight_map })).unwrap(),
+        )
+        .unwrap();
+        let admitted =
+            crate::safetensors::SafetensorsMetadataCatalog::discover(directory.path()).unwrap();
+        let before = open_descriptor_count();
+        let prepared = PreparedCheckpointSource::open_admitted_safetensors(
+            admitted.admitted_shards(),
+            admitted.tensors().clone(),
+            1,
+        )
+        .unwrap();
+        let after = open_descriptor_count();
+
+        // The descriptor-directory iterator itself and unrelated parallel
+        // tests may account for a small fluctuation. A shard-scaled leak would
+        // retain all 96 descriptors and exceed this fixed allowance.
+        assert!(
+            after <= before + 8,
+            "descriptor count grew from {before} to {after}"
+        );
+        let diagnostics = prepared.source_diagnostics().unwrap();
+        assert_eq!(diagnostics.physical_reads, 0);
+        assert!(diagnostics.payload_shard_paths.is_empty());
+    }
+
+    #[test]
+    fn prepared_safetensors_open_rejects_catalog_substitution_before_payload_reads() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("model.safetensors");
+        let original = f32_bytes(&[1.0, 2.0]);
+        serialize_to_file(
+            [(
+                "weight",
+                TensorView::new(Dtype::F32, vec![2], &original).unwrap(),
+            )],
+            None,
+            &path,
+        )
+        .unwrap();
+        let admitted =
+            crate::safetensors::SafetensorsMetadataCatalog::discover(directory.path()).unwrap();
+        let changed = f32_bytes(&[1.0, 2.0, 3.0]);
+        serialize_to_file(
+            [(
+                "weight",
+                TensorView::new(Dtype::F32, vec![3], &changed).unwrap(),
+            )],
+            None,
+            &path,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            PreparedCheckpointSource::open_admitted_safetensors(
+                admitted.admitted_shards(),
+                admitted.tensors().clone(),
+                1,
+            ),
+            Err(StoreError::PreparedCatalogMismatch { key }) if key == "weight"
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepared_safetensors_rejects_path_replacement_before_first_acquisition() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("model.safetensors");
+        let original = f32_bytes(&[1.0, 2.0]);
+        serialize_to_file(
+            [(
+                "weight",
+                TensorView::new(Dtype::F32, vec![2], &original).unwrap(),
+            )],
+            None,
+            &path,
+        )
+        .unwrap();
+        let admitted =
+            crate::safetensors::SafetensorsMetadataCatalog::discover(directory.path()).unwrap();
+        let prepared = PreparedCheckpointSource::open_admitted_safetensors(
+            admitted.admitted_shards(),
+            admitted.tensors().clone(),
+            1,
+        )
+        .unwrap();
+        assert_eq!(prepared.source_diagnostics().unwrap().physical_reads, 0);
+
+        let replacement = directory.path().join("replacement.safetensors");
+        let substituted = f32_bytes(&[9.0, 10.0]);
+        serialize_to_file(
+            [(
+                "weight",
+                TensorView::new(Dtype::F32, vec![2], &substituted).unwrap(),
+            )],
+            None,
+            &replacement,
+        )
+        .unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+
+        assert!(matches!(
+            prepared.acquire_lease(TensorReadRequest {
+                key: "weight".into(),
+                selection: TensorSelection::Full,
+                policy: ReadPolicy::RequireBounded,
+            }),
+            Err(StoreError::AdmittedFileChanged { .. })
+        ));
+        let diagnostics = prepared.source_diagnostics().unwrap();
+        assert_eq!(diagnostics.physical_reads, 0);
+        assert_eq!(diagnostics.physical_read_bytes, 0);
+        assert!(diagnostics.payload_shard_paths.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepared_safetensors_rejects_restored_mtime_overwrite_before_first_acquisition() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("model.safetensors");
+        let original = f32_bytes(&[1.0, 2.0]);
+        serialize_to_file(
+            [(
+                "weight",
+                TensorView::new(Dtype::F32, vec![2], &original).unwrap(),
+            )],
+            None,
+            &path,
+        )
+        .unwrap();
+        let admitted =
+            crate::safetensors::SafetensorsMetadataCatalog::discover(directory.path()).unwrap();
+        let prepared = PreparedCheckpointSource::open_admitted_safetensors(
+            admitted.admitted_shards(),
+            admitted.tensors().clone(),
+            1,
+        )
+        .unwrap();
+        let admitted_metadata = std::fs::metadata(&path).unwrap();
+        let admitted_modified = admitted_metadata.modified().unwrap();
+
+        // Ensure even filesystems with a coarser change-time clock observe a
+        // distinct overwrite before the attacker restores mtime.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let mut encoded = std::fs::read(&path).unwrap();
+        let substituted = f32_bytes(&[9.0, 10.0]);
+        let payload_start = encoded.len() - substituted.len();
+        encoded[payload_start..].copy_from_slice(&substituted);
+        std::fs::write(&path, encoded).unwrap();
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(admitted_modified))
+            .unwrap();
+        let attacked_metadata = std::fs::metadata(&path).unwrap();
+        assert_eq!(attacked_metadata.len(), admitted_metadata.len());
+        assert_eq!(attacked_metadata.modified().unwrap(), admitted_modified);
+
+        assert!(matches!(
+            prepared.acquire_lease(TensorReadRequest {
+                key: "weight".into(),
+                selection: TensorSelection::Full,
+                policy: ReadPolicy::RequireBounded,
+            }),
+            Err(StoreError::AdmittedFileChanged { .. })
+        ));
+        let diagnostics = prepared.source_diagnostics().unwrap();
+        assert_eq!(diagnostics.physical_reads, 0);
+        assert_eq!(diagnostics.physical_read_bytes, 0);
+        assert!(diagnostics.payload_shard_paths.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn acquired_bytes_survive_and_cached_source_rejects_later_in_place_substitution() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("model.safetensors");
+        let original = f32_bytes(&[1.0, 2.0]);
+        serialize_to_file(
+            [(
+                "weight",
+                TensorView::new(Dtype::F32, vec![2], &original).unwrap(),
+            )],
+            None,
+            &path,
+        )
+        .unwrap();
+        let admitted =
+            crate::safetensors::SafetensorsMetadataCatalog::discover(directory.path()).unwrap();
+        let prepared = PreparedCheckpointSource::open_admitted_safetensors(
+            admitted.admitted_shards(),
+            admitted.tensors().clone(),
+            1,
+        )
+        .unwrap();
+        let request = TensorReadRequest {
+            key: "weight".into(),
+            selection: TensorSelection::Full,
+            policy: ReadPolicy::RequireBounded,
+        };
+        let lease = prepared.acquire_lease(request.clone()).unwrap();
+        assert_eq!(lease.encoded_bytes().unwrap(), original);
+        let admitted_modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+        let mut encoded = std::fs::read(&path).unwrap();
+        let substituted = f32_bytes(&[9.0, 10.0]);
+        let payload_start = encoded.len() - substituted.len();
+        encoded[payload_start..].copy_from_slice(&substituted);
+        std::fs::write(&path, encoded).unwrap();
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(admitted_modified))
+            .unwrap();
+
+        assert_eq!(lease.encoded_bytes().unwrap(), original);
+        assert!(matches!(
+            prepared.acquire_lease(request),
+            Err(StoreError::AdmittedFileChanged { .. })
+        ));
+        assert_eq!(prepared.source_diagnostics().unwrap().physical_reads, 2);
+        assert_eq!(
+            prepared.source_diagnostics().unwrap().physical_read_bytes,
+            16
+        );
+    }
+
+    #[test]
     fn safetensors_store_physically_reads_only_selected_noncontiguous_ranges() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("model.safetensors");
@@ -2171,15 +2742,129 @@ mod tests {
             .unwrap();
 
         let diagnostics = store.diagnostics().unwrap();
-        assert_eq!(diagnostics.physical_reads, 2);
-        assert_eq!(diagnostics.physical_read_bytes, 16);
+        assert_eq!(diagnostics.physical_reads, 4);
+        assert_eq!(diagnostics.physical_read_bytes, 32);
         assert_eq!(lease.bounded_read_proof().offset_bytes, 8);
         assert_eq!(lease.bounded_read_proof().length_bytes, 16);
+        assert_eq!(lease.bounded_read_proof().physical_reads, 4);
+        assert_eq!(lease.bounded_read_proof().physical_read_bytes, 32);
         assert!(lease.bounded_read_proof().physically_bounded);
         let mut expected = selected[8..16].to_vec();
         expected.extend_from_slice(&selected[32..40]);
         assert_eq!(lease.encoded_bytes().unwrap(), expected);
         assert!(std::fs::metadata(&path).unwrap().len() > diagnostics.physical_read_bytes);
+    }
+
+    #[test]
+    fn one_byte_selection_reads_exactly_that_byte_twice_for_admission() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("model.safetensors");
+        let payload = (0..=255).collect::<Vec<u8>>();
+        serialize_to_file(
+            [(
+                "bytes",
+                TensorView::new(Dtype::U8, vec![payload.len()], &payload).unwrap(),
+            )],
+            None,
+            &path,
+        )
+        .unwrap();
+        let store = SafetensorsWeightStore::open(&path).unwrap();
+        let lease = store
+            .acquire(TensorReadRequest {
+                key: "bytes".into(),
+                selection: TensorSelection::Contiguous {
+                    offset_elements: 137,
+                    shape: vec![1],
+                },
+                policy: ReadPolicy::RequireBounded,
+            })
+            .unwrap();
+        assert_eq!(lease.encoded_bytes().unwrap(), &[137]);
+        assert_eq!(lease.bounded_read_proof().length_bytes, 1);
+        assert_eq!(lease.bounded_read_proof().physical_reads, 2);
+        assert_eq!(lease.bounded_read_proof().physical_read_bytes, 2);
+        let diagnostics = store.diagnostics().unwrap();
+        assert_eq!(diagnostics.physical_reads, 2);
+        assert_eq!(diagnostics.physical_read_bytes, 2);
+    }
+
+    #[test]
+    fn invalid_selection_reads_no_payload_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("model.safetensors");
+        let payload = [1_u8, 2, 3, 4];
+        serialize_to_file(
+            [(
+                "bytes",
+                TensorView::new(Dtype::U8, vec![payload.len()], &payload).unwrap(),
+            )],
+            None,
+            &path,
+        )
+        .unwrap();
+        let store = SafetensorsWeightStore::open(&path).unwrap();
+        assert!(store
+            .acquire(TensorReadRequest {
+                key: "bytes".into(),
+                selection: TensorSelection::Range {
+                    axis: 0,
+                    start: 3,
+                    end: 5,
+                },
+                policy: ReadPolicy::RequireBounded,
+            })
+            .is_err());
+        let diagnostics = store.diagnostics().unwrap();
+        assert_eq!(diagnostics.physical_reads, 0);
+        assert_eq!(diagnostics.physical_read_bytes, 0);
+        assert!(diagnostics.payload_shard_paths.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::single_range_in_vec_init)]
+    fn exact_range_admission_rejects_restored_mtime_mutation_between_reads() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("model.safetensors");
+        let payload = [1_u8, 2, 3, 4];
+        serialize_to_file(
+            [(
+                "bytes",
+                TensorView::new(Dtype::U8, vec![payload.len()], &payload).unwrap(),
+            )],
+            None,
+            &path,
+        )
+        .unwrap();
+        let admitted = AdmittedFile::open(&path).unwrap();
+        let (payload_offset, _) = read_safetensors_metadata(&path, &admitted).unwrap();
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let telemetry = SafetensorsReadTelemetry::default();
+        let result = read_safetensors_ranges_with_hook(
+            &path,
+            &admitted,
+            payload_offset,
+            &[1..2],
+            &telemetry,
+            || {
+                let mut bytes = std::fs::read(&path).unwrap();
+                bytes[payload_offset + 1] = 9;
+                std::fs::write(&path, bytes).unwrap();
+                File::options()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_times(std::fs::FileTimes::new().set_modified(modified))
+                    .unwrap();
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(StoreError::AdmittedFileChanged { .. })
+        ));
+        assert_eq!(telemetry.physical_reads.load(Ordering::Relaxed), 1);
+        assert_eq!(telemetry.physical_read_bytes.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -2211,11 +2896,13 @@ mod tests {
             .unwrap();
 
         let diagnostics = store.diagnostics().unwrap();
-        assert_eq!(diagnostics.physical_reads, 1);
-        assert_eq!(diagnostics.physical_read_bytes, 48);
+        assert_eq!(diagnostics.physical_reads, 2);
+        assert_eq!(diagnostics.physical_read_bytes, 96);
         assert!(!lease.bounded_read_proof().physically_bounded);
         assert_eq!(lease.bounded_read_proof().offset_bytes, 0);
         assert_eq!(lease.bounded_read_proof().length_bytes, 48);
+        assert_eq!(lease.bounded_read_proof().physical_reads, 2);
+        assert_eq!(lease.bounded_read_proof().physical_read_bytes, 96);
         assert_eq!(lease.encoded_bytes().unwrap(), selected);
 
         let bounded = store
@@ -2230,13 +2917,15 @@ mod tests {
             })
             .unwrap();
         let cached_diagnostics = store.diagnostics().unwrap();
-        assert_eq!(cached_diagnostics.physical_reads, 1);
-        assert_eq!(cached_diagnostics.physical_read_bytes, 48);
+        assert_eq!(cached_diagnostics.physical_reads, 2);
+        assert_eq!(cached_diagnostics.physical_read_bytes, 96);
         let mut expected = selected[8..16].to_vec();
         expected.extend_from_slice(&selected[32..40]);
         assert_eq!(bounded.encoded_bytes().unwrap(), expected);
         assert!(bounded.bounded_read_proof().physically_bounded);
         assert_eq!(bounded.bounded_read_proof().length_bytes, 16);
+        assert_eq!(bounded.bounded_read_proof().physical_reads, 0);
+        assert_eq!(bounded.bounded_read_proof().physical_read_bytes, 0);
     }
 
     #[test]
@@ -2304,8 +2993,8 @@ mod tests {
         assert_eq!(lease.bounded_read_proof().length_bytes, 8);
         let diagnostics = store.diagnostics().unwrap();
         assert_eq!(diagnostics.payload_shard_paths, [first]);
-        assert_eq!(diagnostics.physical_reads, 1);
-        assert_eq!(diagnostics.physical_read_bytes, 8);
+        assert_eq!(diagnostics.physical_reads, 2);
+        assert_eq!(diagnostics.physical_read_bytes, 16);
         assert!(matches!(
             store.acquire(TensorReadRequest {
                 key: "right".into(),

@@ -3,7 +3,7 @@
 `eredu-backend-mlx` is the concrete MLX implementation of Eredu's
 backend-neutral contracts. It owns MLX tensor and neural operations,
 checkpoint materialization, execution runtime, typed architecture-to-mechanism
-binding, media processing, and distributed execution. Neural codec semantics
+binding, processed-media tensor conversion, and distributed execution. Neural codec semantics
 and artifact plans remain in `eredu-codec`; MLX supplies the same generic
 parameter materialization mechanisms used by other neutral modules. This crate
 does not depend on the `eredu` facade crate.
@@ -37,9 +37,11 @@ let model = load_model(&backend, "/path/to/model", MlxLoadRequest::default())?;
 ```
 
 Reusable low-level mechanics are rooted directly under
-`eredu_backend_mlx::backend`, including neutral neural operators, quantization,
-checkpoint materialization, mutable execution state, logical distributed
-subgroups, axis-aware collectives, and runtime facilities.
+`eredu_backend_mlx::backend`, including native neural operators, quantization,
+checkpoint materialization, mutable execution state, native distributed
+groups, axis-aware collectives, and runtime facilities. Portable artifact
+identity, host media processing, parameter-binding plans, admission, session
+construction flow, and logical placement use their canonical neutral crates.
 `safemlx` beneath this boundary contains only safe wrappers over native MLX.
 Backend-generic sampling policies come from `eredu-runtime`, while
 `backend::runtime::generation::MlxSamplingBackend` implements the native
@@ -68,8 +70,8 @@ execution, distributed, and model-composition support.
 | --- | --- |
 | `accelerate` | Accelerate-backed operations on Apple platforms |
 | `metal` | Metal execution on Apple platforms |
-| `image` | Image/video decoding and shared multimodal request preparation |
-| `audio` | Audio preprocessing and shared multimodal request preparation |
+| `image` | Portable image/video processing plus MLX tensor conversion |
+| `audio` | Portable audio processing plus MLX tensor conversion |
 | `cuda` | CUDA execution for native MLX operations |
 | `nccl` | NCCL collectives; implies `cuda` |
 

@@ -4,16 +4,16 @@ use std::{collections::BTreeMap, ops::Range};
 
 use crate::decoder::{self, Config as _};
 use eredu_checkpoint::LinearFormat;
-use eredu_core::{checkpoint::TensorDtype, ParallelRankTopology};
+use eredu_core::{checkpoint::TensorDtype, CollectiveGroupId, ParallelRankTopology};
 use eredu_nn::NeuralBackend;
 use eredu_runtime::{
     aligned_partition_units, module_parameter_group, ArchitectureGroupKind,
     ArchitectureParameterDescription, ArchitecturePartition, CommunicationCompletionPolicy,
-    CommunicationGroupId, CommunicationGroupRequirements, CommunicationManifest,
-    CommunicationOperation, CommunicationOperationRequirement, CommunicationTensorLimits,
-    ExecutionGraph, ExecutionUnitLayout, LayerRuntimeState, LayeredPartitionDriver,
-    LocalModelLayout, MemberSharding, NoAuxiliaryBoundarySchema, OwnedParameterGroupSpec,
-    ParallelPlanError, ParameterGroupOwner, ParameterGroupSpec, ParameterMemberSpec, ParameterRole,
+    CommunicationGroupRequirements, CommunicationManifest, CommunicationOperation,
+    CommunicationOperationRequirement, CommunicationTensorLimits, ExecutionGraph,
+    ExecutionUnitLayout, LayerRuntimeState, LayeredPartitionDriver, LocalModelLayout,
+    MemberSharding, NoAuxiliaryBoundarySchema, OwnedParameterGroupSpec, ParallelPlanError,
+    ParameterGroupOwner, ParameterGroupSpec, ParameterMemberSpec, ParameterRole,
     PartitionOwnership, PartitionedExecutionPlan, PipelineActivationDtype, PipelineWireContract,
     StateLayout, StateSegmentLifetime, StateSegmentSpec, TensorPlacement,
     TopologyCommunicationPlan,
@@ -121,7 +121,7 @@ pub struct MoshiParallelSelection {
     layout: LocalModelLayout,
     geometry: LocalGeometry,
     communication: CommunicationManifest,
-    tensor_group: CommunicationGroupId,
+    tensor_group: CollectiveGroupId,
     execution_plan: PartitionedExecutionPlan,
     execution_identity: String,
 }
@@ -148,7 +148,7 @@ impl MoshiParallelSelection {
     }
 
     /// Opaque group used by rank-local tensor-parallel operators.
-    pub const fn tensor_group(&self) -> CommunicationGroupId {
+    pub const fn tensor_group(&self) -> CollectiveGroupId {
         self.tensor_group
     }
 
@@ -169,7 +169,7 @@ impl MoshiParallelSelection {
         LocalModelLayout,
         LocalGeometry,
         CommunicationManifest,
-        CommunicationGroupId,
+        CollectiveGroupId,
         PartitionedExecutionPlan,
     ) {
         (

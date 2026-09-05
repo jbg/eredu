@@ -64,11 +64,12 @@ Implementation crates remain specialized dependencies.
 | [`eredu`](eredu/) | Main model loading, generation, chat, multimodal, realtime, and planning API |
 | [`eredu-cli`](eredu-cli/) | Command-line model runner built on Eredu |
 | [`eredu-core`](eredu-core/) | Backend-neutral contracts, artifact inspection, planning, validation, and portable schemas |
+| [`eredu-media`](eredu-media/) | Optional backend-neutral host audio, image, and video processing |
 | [`eredu-runtime`](eredu-runtime/) | Backend-neutral execution, scheduling, cache I/O, and weight and cache residency orchestration |
 | [`eredu-architectures`](eredu-architectures/) | Model-family configuration, checkpoint schemas, parameter topology, and backend-neutral execution |
 | [`eredu-text`](eredu-text/) | Backend-neutral tokenization and chat-template utilities |
 | [`eredu-gguf`](eredu-gguf/) | Bounded, framework-independent GGUF reading, writing, and tensor conversion |
-| [`eredu-backend-mlx`](eredu-backend-mlx/) | Concrete MLX tensor, execution, checkpoint, composition, and media mechanisms |
+| [`eredu-backend-mlx`](eredu-backend-mlx/) | Concrete MLX tensor, execution, checkpoint, composition, and processed-buffer lowering mechanisms |
 | [`safemlx`](safemlx/) | Low-level MLX implementation used by Eredu's default backend |
 | [`safemlx-sys`](safemlx-sys/) | MLX C bindings and native build integration |
 | [`eredu-nn`](eredu-nn/) | Backend-neutral tensor and neural-operation contracts for shared architectures |

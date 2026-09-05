@@ -163,13 +163,15 @@ fn generic_cpu_mimi_construction_materializes_identity_and_transpose_recipes() {
     assert_eq!(mimi.mimi_config().num_codebooks, 1);
     assert!(active_parameters > 0);
     let materialized_diagnostics = store.diagnostics().unwrap();
+    // Exact admitted-range reads use two matching physical passes so a
+    // concurrent payload change cannot publish a mixed lease.
     assert_eq!(
         materialized_diagnostics.physical_reads,
-        u64::try_from(active_parameters).unwrap()
+        u64::try_from(active_parameters).unwrap() * 2
     );
     assert_eq!(
         materialized_diagnostics.physical_read_bytes,
-        active_source_bytes
+        active_source_bytes * 2
     );
     assert_eq!(materialized_diagnostics.payload_shard_paths.len(), 1);
 

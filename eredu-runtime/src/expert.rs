@@ -390,6 +390,227 @@ impl AddressableBankMember {
     }
 }
 
+/// Backend-neutral transform retained for one addressable binding.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct AddressableBindingTransform {
+    quantization: eredu_checkpoint::WeightQuantization,
+    companion_dtype: eredu_checkpoint::recipe::RecipeDtype,
+}
+
+impl AddressableBindingTransform {
+    /// Selected packed executable format.
+    pub const fn quantization(&self) -> eredu_checkpoint::WeightQuantization {
+        self.quantization
+    }
+    /// Selected scale and affine-bias scalar representation.
+    pub const fn companion_dtype(&self) -> &eredu_checkpoint::recipe::RecipeDtype {
+        &self.companion_dtype
+    }
+}
+
+/// Canonical binding and transformation plan for one addressable member.
+#[derive(Debug, Clone)]
+pub struct AddressableBankBindingPlan {
+    key: ParameterBankKey,
+    bindings: Vec<crate::WeightBinding>,
+    transformations: std::collections::BTreeMap<String, AddressableBindingTransform>,
+    selected_bytes: u64,
+    placement: AddressableBankMemberPlacement,
+}
+
+impl AddressableBankBindingPlan {
+    /// Generic member identity.
+    pub const fn key(&self) -> ParameterBankKey {
+        self.key
+    }
+    /// Source-side canonical bindings.
+    pub fn bindings(&self) -> &[crate::WeightBinding] {
+        &self.bindings
+    }
+    /// Per-binding transforms selected by architecture admission.
+    pub const fn transformations(
+        &self,
+    ) -> &std::collections::BTreeMap<String, AddressableBindingTransform> {
+        &self.transformations
+    }
+    /// Exact executable bytes after all transforms.
+    pub const fn selected_bytes(&self) -> u64 {
+        self.selected_bytes
+    }
+    /// Exact rank-local architecture placement.
+    pub const fn placement(&self) -> &AddressableBankMemberPlacement {
+        &self.placement
+    }
+    /// Consumes the complete canonical member plan.
+    #[allow(clippy::type_complexity)]
+    pub fn into_parts(
+        self,
+    ) -> (
+        ParameterBankKey,
+        Vec<crate::WeightBinding>,
+        std::collections::BTreeMap<String, AddressableBindingTransform>,
+        u64,
+        AddressableBankMemberPlacement,
+    ) {
+        (
+            self.key,
+            self.bindings,
+            self.transformations,
+            self.selected_bytes,
+            self.placement,
+        )
+    }
+}
+
+/// Validates exact addressable tasks and derives their singular canonical binding plans.
+pub fn plan_addressable_bank_bindings<L, E>(
+    members: &[AddressableBankMember],
+    source: &dyn eredu_checkpoint::store::CheckpointSource,
+    mut lower_mxfp4: L,
+) -> Result<Vec<AddressableBankBindingPlan>, AddressableBankMemberError>
+where
+    L: FnMut(
+        &ReplicatedTextMaterializationTask,
+        eredu_checkpoint::recipe::DerivedWeightRecipe,
+        &dyn eredu_checkpoint::store::CheckpointSource,
+    ) -> Result<eredu_checkpoint::recipe::DerivedWeightRecipe, E>,
+    E: std::fmt::Display,
+{
+    let mut plans = Vec::with_capacity(members.len());
+    for member in members {
+        let mut bindings = Vec::with_capacity(member.parameters().len());
+        let mut transformations = std::collections::BTreeMap::new();
+        for parameter in member.parameters() {
+            let task = parameter.task();
+            let declared = task
+                .sources()
+                .iter()
+                .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>();
+            let physical = task
+                .physical_sources()
+                .iter()
+                .map(|item| item.catalog_key())
+                .collect::<std::collections::BTreeSet<_>>();
+            if declared != physical || physical.len() != task.physical_sources().len() {
+                return Err(AddressableBankMemberError::InvalidParameter {
+                    parameter: task.name().to_owned(),
+                    detail: "selected physical provenance does not exactly cover task sources"
+                        .into(),
+                });
+            }
+            for admitted in task.physical_sources() {
+                let actual = source
+                    .source_provenance(admitted.catalog_key())
+                    .map_err(|error| AddressableBankMemberError::InvalidParameter {
+                        parameter: task.name().to_owned(),
+                        detail: error.to_string(),
+                    })?;
+                let metadata = source
+                    .source_metadata(admitted.catalog_key())
+                    .map_err(|error| AddressableBankMemberError::InvalidParameter {
+                        parameter: task.name().to_owned(),
+                        detail: error.to_string(),
+                    })?;
+                if actual.catalog_key != admitted.catalog_key()
+                    || actual.physical_tensor != admitted.tensor()
+                    || actual.output != admitted.output()
+                    || actual.backing_shard.as_deref() != Some(admitted.shard())
+                    || actual.source_encoding != *admitted.source_encoding()
+                    || metadata.encoded_byte_len != admitted.encoded_byte_len()
+                {
+                    return Err(AddressableBankMemberError::InvalidParameter {
+                        parameter: task.name().to_owned(),
+                        detail: format!(
+                            "source {:?} differs from admitted provenance",
+                            admitted.catalog_key()
+                        ),
+                    });
+                }
+            }
+            let mut recipe = parameter.recipe().clone();
+            let inferred = recipe.infer(source).map_err(|error| {
+                AddressableBankMemberError::InvalidParameter {
+                    parameter: task.name().to_owned(),
+                    detail: error.to_string(),
+                }
+            })?;
+            if &inferred != parameter.source_output() {
+                return Err(AddressableBankMemberError::InvalidParameter {
+                    parameter: task.name().to_owned(),
+                    detail: "member-local recipe output drifted".into(),
+                });
+            }
+            if task.executable() == eredu_checkpoint::LinearFormat::MxFp4
+                && inferred.dtype() == &eredu_checkpoint::recipe::RecipeDtype::F4
+                && parameter.quantization_companions().is_none()
+            {
+                recipe = lower_mxfp4(task, recipe, source).map_err(|error| {
+                    AddressableBankMemberError::InvalidParameter {
+                        parameter: task.name().to_owned(),
+                        detail: error.to_string(),
+                    }
+                })?;
+            }
+            let metadata = recipe.infer(source).map_err(|error| {
+                AddressableBankMemberError::InvalidParameter {
+                    parameter: task.name().to_owned(),
+                    detail: error.to_string(),
+                }
+            })?;
+            let mut binding = crate::WeightBinding::from_recipe(
+                parameter.binding_name(),
+                recipe,
+                metadata.byte_len(),
+            )
+            .and_then(|binding| binding.with_logical_target(task.name()))
+            .map_err(|error| AddressableBankMemberError::InvalidParameter {
+                parameter: task.name().to_owned(),
+                detail: error.to_string(),
+            })?;
+            if let Some(companions) = parameter.quantization_companions() {
+                let quantization = task.executable().weight_quantization().ok_or_else(|| {
+                    AddressableBankMemberError::InvalidParameter {
+                        parameter: task.name().to_owned(),
+                        detail: "transformed task has no packed format".into(),
+                    }
+                })?;
+                transformations.insert(
+                    parameter.binding_name().to_owned(),
+                    AddressableBindingTransform {
+                        quantization,
+                        companion_dtype: parameter.source_output().dtype().clone(),
+                    },
+                );
+                binding = binding
+                    .with_quantization_companions(
+                        companions.scale(),
+                        companions.affine_bias().map(str::to_owned),
+                    )
+                    .map_err(|error| AddressableBankMemberError::InvalidParameter {
+                        parameter: task.name().to_owned(),
+                        detail: error.to_string(),
+                    })?;
+            }
+            bindings.push(binding);
+        }
+        crate::WeightBindingPlan::new(&bindings).map_err(|error| {
+            AddressableBankMemberError::InvalidParameter {
+                parameter: format!("{:?}", member.key()),
+                detail: error.to_string(),
+            }
+        })?;
+        plans.push(AddressableBankBindingPlan {
+            key: member.key(),
+            bindings,
+            transformations,
+            selected_bytes: member.selected_bytes(),
+            placement: member.placement().clone(),
+        });
+    }
+    Ok(plans)
+}
+
 /// Computes executable storage bytes for one admitted member-local task output.
 ///
 /// A task's own derived output describes whole-parameter derivation before a

@@ -14,12 +14,6 @@ use eredu_core::{
 };
 use serde::{Deserialize, Serialize};
 
-/// Stable opaque identity of one communication group in a selected session.
-///
-/// This alias preserves the established core identity consumed by backend
-/// communicator maps while the runtime manifest adds ordering and requirements.
-pub type CommunicationGroupId = CollectiveGroupId;
-
 /// Exact rank-local send and receive element counts for a variable exchange.
 ///
 /// Counts are ordered by opaque communication-group membership. Zero is a
@@ -420,7 +414,7 @@ impl CommunicationGroupRequirements {
 /// Ordered membership and exact requirements for one opaque group.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
 pub struct CommunicationGroupDescriptor {
-    id: CommunicationGroupId,
+    id: CollectiveGroupId,
     creation_order: usize,
     members: Vec<usize>,
     local_index: Option<usize>,
@@ -430,7 +424,7 @@ pub struct CommunicationGroupDescriptor {
 impl CommunicationGroupDescriptor {
     /// Validates local ordered membership independent of world geometry.
     pub fn new(
-        id: CommunicationGroupId,
+        id: CollectiveGroupId,
         creation_order: usize,
         members: Vec<usize>,
         local_index: Option<usize>,
@@ -456,7 +450,7 @@ impl CommunicationGroupDescriptor {
     }
 
     /// Opaque stable group identity.
-    pub const fn id(&self) -> CommunicationGroupId {
+    pub const fn id(&self) -> CollectiveGroupId {
         self.id
     }
 
@@ -499,7 +493,7 @@ impl<'de> Deserialize<'de> for CommunicationGroupDescriptor {
     {
         #[derive(Deserialize)]
         struct Raw {
-            id: CommunicationGroupId,
+            id: CollectiveGroupId,
             creation_order: usize,
             members: Vec<usize>,
             local_index: Option<usize>,
@@ -1210,22 +1204,6 @@ impl CommunicationManifest {
     pub const fn completion_policy(&self) -> Option<CommunicationCompletionPolicy> {
         self.completion
     }
-
-    /// Invokes a mechanism-only callback for every descriptor in creation order.
-    pub fn try_create_groups<T, E>(
-        &self,
-        mut create: impl FnMut(&CommunicationGroupDescriptor) -> Result<T, E>,
-    ) -> Result<Vec<T>, E> {
-        self.groups.iter().map(&mut create).collect()
-    }
-
-    /// Invokes a mechanism-only callback for every route in submission order.
-    pub fn try_create_routes<T, E>(
-        &self,
-        mut create: impl FnMut(&CommunicationRouteDescriptor) -> Result<T, E>,
-    ) -> Result<Vec<T>, E> {
-        self.routes.iter().map(&mut create).collect()
-    }
 }
 
 impl<'de> Deserialize<'de> for CommunicationManifest {
@@ -1295,9 +1273,9 @@ impl TopologyCommunicationPlan {
     }
 
     /// Exact opaque ID assigned to the requested session group.
-    pub const fn session_group_id(&self) -> Option<CommunicationGroupId> {
+    pub const fn session_group_id(&self) -> Option<CollectiveGroupId> {
         if self.session_group.is_some() {
-            Some(CommunicationGroupId::new(1))
+            Some(CollectiveGroupId::new(1))
         } else {
             None
         }
@@ -1314,7 +1292,7 @@ impl TopologyCommunicationPlan {
         &self,
         topology: ParallelTopology,
         rank: ParallelRankTopology,
-    ) -> Result<Option<CommunicationGroupId>, CommunicationManifestError> {
+    ) -> Result<Option<CollectiveGroupId>, CommunicationManifestError> {
         if self.tensor_groups.is_none() {
             return Ok(None);
         }
@@ -1330,7 +1308,7 @@ impl TopologyCommunicationPlan {
         let numeric = first
             .checked_add(subgroup)
             .ok_or(CommunicationManifestError::DescriptorCountOverflow)?;
-        Ok(Some(CommunicationGroupId::new(
+        Ok(Some(CollectiveGroupId::new(
             u32::try_from(numeric)
                 .map_err(|_| CommunicationManifestError::DescriptorCountOverflow)?,
         )))
@@ -1386,7 +1364,7 @@ pub fn project_communication_manifest(
     let mut groups = Vec::new();
     let mut next_group_id = 1usize;
     if let Some(requirements) = &plan.session_group {
-        let id = CommunicationGroupId::new(1);
+        let id = CollectiveGroupId::new(1);
         groups.push(CommunicationGroupDescriptor::new(
             id,
             0,
@@ -1414,7 +1392,7 @@ pub fn project_communication_manifest(
         let numeric_id = next_group_id
             .checked_add(subgroup_index)
             .ok_or(CommunicationManifestError::DescriptorCountOverflow)?;
-        let id = CommunicationGroupId::new(
+        let id = CollectiveGroupId::new(
             u32::try_from(numeric_id)
                 .map_err(|_| CommunicationManifestError::DescriptorCountOverflow)?,
         );
@@ -1704,6 +1682,204 @@ pub struct CommunicationCapabilities {
     boundary_framing: Vec<BoundaryFramingProtocol>,
 }
 
+/// Backend support for realizing logical groups and directed routes over one
+/// already-created world communicator.
+///
+/// This describes reachability only. Operation, dtype, size, framing, and
+/// completion support remain in [`CommunicationCapabilities`].
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum CommunicationTopologyCapabilities {
+    /// The backend can create every validated logical subgroup and route
+    /// directly, without requiring unrelated world ranks to participate.
+    FullyConnected,
+    /// Direct logical communication is limited to neighboring world ranks.
+    /// Other groups and routes are available only when compatible manifests
+    /// prove a disjoint, same-operation wave covering the complete world.
+    RingWithWorldWaves,
+}
+
+/// Communication descriptors and world-wave proofs validated before native
+/// subgroup or route resources are created.
+#[derive(Debug, Clone)]
+pub struct PreparedCommunicationRealization {
+    manifest: CommunicationManifest,
+    group_world_waves: Vec<bool>,
+    route_world_waves: Vec<bool>,
+}
+
+impl PreparedCommunicationRealization {
+    /// Exact rank-local manifest retained by this realization.
+    pub const fn manifest(&self) -> &CommunicationManifest {
+        &self.manifest
+    }
+
+    /// Whether one group may use a complete-world collective wave.
+    pub fn group_world_wave(&self, creation_order: usize) -> Option<bool> {
+        self.group_world_waves.get(creation_order).copied()
+    }
+
+    /// Whether one directed route may use a complete-world collective wave.
+    pub fn route_world_wave(&self, submission_order: usize) -> Option<bool> {
+        self.route_world_waves.get(submission_order).copied()
+    }
+
+    /// Invokes a mechanism-only callback for every checked group in order.
+    pub fn try_create_groups<T, E>(
+        &self,
+        mut create: impl FnMut(&CommunicationGroupDescriptor, bool) -> Result<T, E>,
+    ) -> Result<Vec<T>, E> {
+        self.manifest
+            .groups()
+            .iter()
+            .zip(self.group_world_waves.iter().copied())
+            .map(|(descriptor, world_wave)| create(descriptor, world_wave))
+            .collect()
+    }
+
+    /// Invokes a mechanism-only callback for every checked route in order.
+    pub fn try_create_routes<T, E>(
+        &self,
+        mut create: impl FnMut(&CommunicationRouteDescriptor, bool) -> Result<T, E>,
+    ) -> Result<Vec<T>, E> {
+        self.manifest
+            .routes()
+            .iter()
+            .zip(self.route_world_waves.iter().copied())
+            .map(|(descriptor, world_wave)| create(descriptor, world_wave))
+            .collect()
+    }
+}
+
+/// Failure while converting compatible manifests into a native-resource-free
+/// communication realization.
+#[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
+#[non_exhaustive]
+pub enum CommunicationRealizationError {
+    /// Rank-local manifests are not one compatible complete-world projection.
+    #[error(transparent)]
+    Manifest(#[from] CommunicationManifestError),
+    /// Required operation, completion, or reachability support is unavailable.
+    #[error(transparent)]
+    Capability(#[from] CommunicationCapabilityError),
+    /// The separately supplied local manifest differs from its agreed rank entry.
+    #[error("local communication manifest differs from the agreed rank projection")]
+    LocalManifestMismatch,
+}
+
+/// Validates capability and reachability once, before any native subgroup or
+/// directed-route resource is created.
+pub fn prepare_communication_realization(
+    manifest: &CommunicationManifest,
+    compatible_manifests: &[CommunicationManifest],
+    capabilities: &CommunicationCapabilities,
+    topology: CommunicationTopologyCapabilities,
+) -> Result<PreparedCommunicationRealization, CommunicationRealizationError> {
+    validate_compatible_communication_manifests(compatible_manifests)?;
+    let agreed = compatible_manifests
+        .iter()
+        .find(|candidate| candidate.rank() == manifest.rank())
+        .ok_or(CommunicationRealizationError::LocalManifestMismatch)?;
+    if agreed != manifest {
+        return Err(CommunicationRealizationError::LocalManifestMismatch);
+    }
+    capabilities.validate_manifest(manifest)?;
+
+    let group_wave_proofs = compatible_group_world_wave_proofs(compatible_manifests);
+    let route_wave_proofs = route_world_wave_proofs(manifest);
+    let mut selected_group_waves = vec![false; manifest.groups().len()];
+    let mut selected_route_waves = vec![false; manifest.routes().len()];
+
+    if topology == CommunicationTopologyCapabilities::RingWithWorldWaves {
+        for (order, group) in manifest.groups().iter().enumerate() {
+            let directly_reachable = group.members().len() <= 1
+                || group.members().len() == manifest.world_size()
+                || (group.members().len() == 2
+                    && ring_neighbors(
+                        group.members()[0],
+                        group.members()[1],
+                        manifest.world_size(),
+                    ));
+            if !directly_reachable {
+                if !group_wave_proofs.get(order).copied().unwrap_or(false) {
+                    return Err(
+                        CommunicationCapabilityError::UnreachableGroup { id: group.id() }.into(),
+                    );
+                }
+                selected_group_waves[order] = true;
+            }
+        }
+        for (order, route) in manifest.routes().iter().enumerate() {
+            if !ring_neighbors(route.source(), route.destination(), manifest.world_size()) {
+                if !route_wave_proofs.get(order).copied().unwrap_or(false) {
+                    return Err(CommunicationCapabilityError::UnreachableRoute {
+                        id: route.id(),
+                        source_rank: route.source(),
+                        destination_rank: route.destination(),
+                    }
+                    .into());
+                }
+                selected_route_waves[order] = true;
+            }
+        }
+    }
+
+    Ok(PreparedCommunicationRealization {
+        manifest: manifest.clone(),
+        group_world_waves: selected_group_waves,
+        route_world_waves: selected_route_waves,
+    })
+}
+
+/// Returns complete-world collective-wave proofs for each compatible group order.
+///
+/// Callers must validate the complete manifest set first. The prepared
+/// realization constructor performs both steps atomically for production use.
+pub fn compatible_group_world_wave_proofs(manifests: &[CommunicationManifest]) -> Vec<bool> {
+    let group_count = manifests
+        .first()
+        .map_or(0, |manifest| manifest.groups().len());
+    (0..group_count)
+        .map(|order| {
+            let Some(requirements) = manifests
+                .first()
+                .and_then(|manifest| manifest.groups().get(order))
+                .map(CommunicationGroupDescriptor::requirements)
+            else {
+                return false;
+            };
+            manifests.iter().all(|manifest| {
+                manifest
+                    .groups()
+                    .get(order)
+                    .is_some_and(|group| group.requirements() == requirements)
+            })
+        })
+        .collect()
+}
+
+/// Returns complete-world collective-wave proofs for each route submission order.
+///
+/// Production backends should normally consume these through
+/// [`prepare_communication_realization`].
+pub fn route_world_wave_proofs(manifest: &CommunicationManifest) -> Vec<bool> {
+    let mut proofs = vec![false; manifest.routes().len()];
+    for wave in manifest.route_submission_waves() {
+        let mut members = vec![false; manifest.world_size()];
+        for route in &manifest.routes()[wave.clone()] {
+            members[route.source()] = true;
+            members[route.destination()] = true;
+        }
+        if members.iter().all(|member| *member) {
+            proofs[wave].fill(true);
+        }
+    }
+    proofs
+}
+
+fn ring_neighbors(left: usize, right: usize, world_size: usize) -> bool {
+    world_size > 1 && ((left + 1) % world_size == right || (right + 1) % world_size == left)
+}
+
 impl CommunicationCapabilities {
     /// Validates one capability entry per operation.
     pub fn new(
@@ -1888,19 +2064,19 @@ pub enum CommunicationManifestError {
     #[error("communication group {id:?} has no members")]
     EmptyGroup {
         /// Invalid group.
-        id: CommunicationGroupId,
+        id: CollectiveGroupId,
     },
     /// A group repeats a world rank.
     #[error("communication group {id:?} repeats a world rank")]
     DuplicateGroupMember {
         /// Invalid group.
-        id: CommunicationGroupId,
+        id: CollectiveGroupId,
     },
     /// A group member is outside the manifest world.
     #[error("communication group {id:?} contains a rank outside world size {world_size}")]
     GroupMemberOutOfRange {
         /// Invalid group.
-        id: CommunicationGroupId,
+        id: CollectiveGroupId,
         /// Declared world size.
         world_size: usize,
     },
@@ -1908,19 +2084,19 @@ pub enum CommunicationManifestError {
     #[error("communication group {id:?} has the wrong local member index")]
     WrongLocalIndex {
         /// Invalid group.
-        id: CommunicationGroupId,
+        id: CollectiveGroupId,
     },
     /// Group IDs are not unique.
     #[error("communication group ID {id:?} is repeated")]
     DuplicateGroupId {
         /// Repeated group identity.
-        id: CommunicationGroupId,
+        id: CollectiveGroupId,
     },
     /// Group descriptors are not in their declared canonical order.
     #[error("communication group {id:?} has creation order {actual}, expected {expected}")]
     WrongGroupOrder {
         /// Invalid group.
-        id: CommunicationGroupId,
+        id: CollectiveGroupId,
         /// Required position.
         expected: usize,
         /// Declared position.
@@ -2072,6 +2248,24 @@ pub enum CommunicationManifestConsensusError {
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
 #[non_exhaustive]
 pub enum CommunicationCapabilityError {
+    /// A logical group cannot be realized directly or as a proven world wave.
+    #[error("communication group {id:?} is unreachable with the selected topology mechanisms")]
+    UnreachableGroup {
+        /// Unreachable group.
+        id: CollectiveGroupId,
+    },
+    /// A directed route cannot be realized directly or as a proven world wave.
+    #[error(
+        "communication route {id:?} ({source_rank} -> {destination_rank}) is unreachable with the selected topology mechanisms"
+    )]
+    UnreachableRoute {
+        /// Unreachable route.
+        id: CommunicationRouteId,
+        /// Source world rank.
+        source_rank: usize,
+        /// Destination world rank.
+        destination_rank: usize,
+    },
     /// A route selected an in-band framing protocol unavailable in the backend.
     #[error("boundary framing protocol {protocol:?} is unavailable")]
     MissingBoundaryFraming {
@@ -2254,7 +2448,7 @@ mod tests {
         let selected_id = plan.session_group_id().unwrap();
         let manifests = project_all_communication_manifests(topology, &plan).unwrap();
 
-        assert_eq!(selected_id, CommunicationGroupId::new(1));
+        assert_eq!(selected_id, CollectiveGroupId::new(1));
         for (rank, manifest) in manifests.iter().enumerate() {
             let session = &manifest.groups()[0];
             assert_eq!(session.id(), selected_id);
@@ -2305,19 +2499,19 @@ mod tests {
         let requirements = group_requirements(CommunicationOperation::AllReduceSum);
         assert_eq!(
             CommunicationGroupDescriptor::new(
-                CommunicationGroupId::new(4),
+                CollectiveGroupId::new(4),
                 0,
                 vec![0, 0],
                 Some(0),
                 requirements.clone(),
             ),
             Err(CommunicationManifestError::DuplicateGroupMember {
-                id: CommunicationGroupId::new(4)
+                id: CollectiveGroupId::new(4)
             })
         );
 
         let out_of_range = CommunicationGroupDescriptor::new(
-            CommunicationGroupId::new(4),
+            CollectiveGroupId::new(4),
             0,
             vec![0, 3],
             Some(0),
@@ -2327,13 +2521,13 @@ mod tests {
         assert_eq!(
             CommunicationManifest::new(2, 0, vec![out_of_range], vec![]),
             Err(CommunicationManifestError::GroupMemberOutOfRange {
-                id: CommunicationGroupId::new(4),
+                id: CollectiveGroupId::new(4),
                 world_size: 2,
             })
         );
 
         let wrong_local = CommunicationGroupDescriptor::new(
-            CommunicationGroupId::new(4),
+            CollectiveGroupId::new(4),
             0,
             vec![0, 1],
             Some(1),
@@ -2343,7 +2537,7 @@ mod tests {
         assert_eq!(
             CommunicationManifest::new(2, 0, vec![wrong_local], vec![]),
             Err(CommunicationManifestError::WrongLocalIndex {
-                id: CommunicationGroupId::new(4)
+                id: CollectiveGroupId::new(4)
             })
         );
     }
@@ -2367,7 +2561,7 @@ mod tests {
         );
 
         let group = CommunicationGroupDescriptor::new(
-            CommunicationGroupId::new(2),
+            CollectiveGroupId::new(2),
             1,
             vec![0, 1],
             Some(0),
@@ -2377,7 +2571,7 @@ mod tests {
         assert_eq!(
             CommunicationManifest::new(2, 0, vec![group], vec![]),
             Err(CommunicationManifestError::WrongGroupOrder {
-                id: CommunicationGroupId::new(2),
+                id: CollectiveGroupId::new(2),
                 expected: 0,
                 actual: 1,
             })
@@ -2588,43 +2782,6 @@ mod tests {
     }
 
     #[test]
-    fn backend_callbacks_receive_only_opaque_descriptors_in_declared_order() {
-        let topology = ParallelTopology::new(2, 2, 1, 1).unwrap();
-        let manifest = project_all_communication_manifests(topology, &projection_plan())
-            .unwrap()
-            .remove(3);
-
-        let groups = manifest
-            .try_create_groups(|descriptor| {
-                Ok::<_, std::convert::Infallible>((
-                    descriptor.id(),
-                    descriptor.creation_order(),
-                    descriptor.members().to_vec(),
-                    descriptor.local_index(),
-                ))
-            })
-            .unwrap();
-        assert!(groups
-            .iter()
-            .enumerate()
-            .all(|(index, (_, order, _, _))| index == *order));
-
-        let routes = manifest
-            .try_create_routes(|descriptor| {
-                Ok::<_, std::convert::Infallible>((
-                    descriptor.id(),
-                    descriptor.source(),
-                    descriptor.destination(),
-                    descriptor.requirement().operation(),
-                ))
-            })
-            .unwrap();
-        assert!(routes.iter().all(|(_, source, destination, operation)| {
-            source != destination && *operation == CommunicationOperation::SendReceive
-        }));
-    }
-
-    #[test]
     fn variable_peer_counts_preserve_zeroes_and_exact_member_order() {
         let counts = CommunicationPeerCounts::new(vec![0, 3, 1], vec![2, 0, 2], 3).unwrap();
         assert_eq!(counts.send(), [0, 3, 1]);
@@ -2675,7 +2832,7 @@ mod tests {
     #[test]
     fn communication_resources_require_selected_supported_completion() {
         let group = CommunicationGroupDescriptor::new(
-            CommunicationGroupId::new(1),
+            CollectiveGroupId::new(1),
             0,
             vec![0],
             Some(0),
@@ -2956,5 +3113,84 @@ mod tests {
             overlapping.route_submission_waves(),
             [0..1, 1..2, 2..3, 3..4]
         );
+    }
+
+    fn route_only_capabilities(
+        requirement: CommunicationOperationRequirement,
+    ) -> CommunicationCapabilities {
+        CommunicationCapabilities::new([requirement])
+            .unwrap()
+            .with_completion_capabilities(test_completion_capabilities())
+    }
+
+    #[test]
+    fn prepared_realization_rejects_unreachable_ring_routes_before_callbacks() {
+        let requirement = CommunicationOperationRequirement::tensors(
+            CommunicationOperation::SendReceive,
+            [TensorDtype::F32],
+            CommunicationTensorLimits::new(1, 3, 64, None).unwrap(),
+            true,
+        )
+        .unwrap();
+        let plan = TopologyCommunicationPlan::new()
+            .with_completion_policy(test_completion_policy())
+            .with_pipeline_routes(requirement.clone())
+            .unwrap();
+        let topology = ParallelTopology::new(2, 3, 1, 1).unwrap();
+        let manifests = project_all_communication_manifests(topology, &plan).unwrap();
+        let error = prepare_communication_realization(
+            &manifests[0],
+            &manifests,
+            &route_only_capabilities(requirement),
+            CommunicationTopologyCapabilities::RingWithWorldWaves,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            CommunicationRealizationError::Capability(
+                CommunicationCapabilityError::UnreachableRoute { .. }
+            )
+        ));
+    }
+
+    #[test]
+    fn prepared_realization_proves_world_waves_before_mechanism_callbacks() {
+        let requirement = CommunicationOperationRequirement::tensors(
+            CommunicationOperation::SendReceive,
+            [TensorDtype::F32],
+            CommunicationTensorLimits::new(1, 3, 64, None).unwrap(),
+            true,
+        )
+        .unwrap();
+        let plan = TopologyCommunicationPlan::new()
+            .with_completion_policy(test_completion_policy())
+            .with_pipeline_routes(requirement.clone())
+            .unwrap();
+        let topology = ParallelTopology::new(2, 2, 1, 1).unwrap();
+        let manifests = project_all_communication_manifests(topology, &plan).unwrap();
+        let prepared = prepare_communication_realization(
+            &manifests[0],
+            &manifests,
+            &route_only_capabilities(requirement),
+            CommunicationTopologyCapabilities::RingWithWorldWaves,
+        )
+        .unwrap();
+        assert!(prepared
+            .manifest()
+            .routes()
+            .iter()
+            .enumerate()
+            .all(|(order, _)| prepared.route_world_wave(order) == Some(true)));
+
+        let calls = std::cell::Cell::new(0usize);
+        let routes = prepared
+            .try_create_routes(|descriptor, world_wave| {
+                calls.set(calls.get() + 1);
+                assert!(world_wave);
+                Ok::<_, std::convert::Infallible>(descriptor.id())
+            })
+            .unwrap();
+        assert_eq!(calls.get(), prepared.manifest().routes().len());
+        assert_eq!(routes.len(), calls.get());
     }
 }

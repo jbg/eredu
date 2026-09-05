@@ -4,14 +4,11 @@
 //! These helpers keep checkpoint-name expansion, shape validation, byte
 //! accounting, and resident-lease assignment independent of model families.
 
-use eredu_checkpoint::{
-    store::{ReadPolicy, TensorReadRequest},
-    SourceTensorEncoding,
-};
-use eredu_nn::Parameterized;
+use eredu_checkpoint::store::{ReadPolicy, TensorReadRequest};
+use eredu_nn::{ParameterId, Parameterized};
 use eredu_runtime::{
-    ParameterGroupSpec, ParameterRole, ReplicatedTextMaterializationTask, WeightBinding,
-    WeightBindingPlan, WeightLoweringKind,
+    ModuleBindingPlan, ParameterBindingTarget, ReplicatedTextMaterializationTask, WeightBinding,
+    WeightBindingPlan,
 };
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -19,8 +16,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use safemlx::{Array, Stream};
 
 use crate::{
-    backend::nn::shared::{neutral_parameter_refs, neutral_parameter_refs_mut},
-    backend::runtime::checkpoint::binding_plan::{BindingPlan, BindingPlanError, PlannedBinding},
+    backend::nn::shared::{neutral_parameter_refs, MlxNeuralBackend},
     backend::runtime::checkpoint::recipe::{
         recipe_dtype_from_mlx, MlxWeightRecipeExt, WeightRecipeError,
     },
@@ -28,36 +24,10 @@ use crate::{
         MlxParameterMaterializationContext, WeightMaterialization,
     },
     backend::runtime::residency::manager::ResidentUnitLease,
-    module::FlattenedModuleParamRef,
 };
-use eredu_checkpoint::{
-    recipe::{DerivedWeightRecipe, RecipeDtype},
-    store::TensorSelection,
-};
+use eredu_checkpoint::recipe::DerivedWeightRecipe;
 
 const MODEL_LOAD_MATERIALIZATION_BUFFERS: usize = 2;
-
-/// Exact local parameter targets owned by one neutral semantic role.
-///
-/// Targets come from the architecture parameter contract, so packed
-/// companions and alias destinations participate atomically with their base
-/// weight rather than being rediscovered from family-specific path syntax.
-pub fn parameter_role_targets(
-    groups: &[ParameterGroupSpec],
-    role: ParameterRole,
-) -> BTreeSet<String> {
-    groups
-        .iter()
-        .filter(|group| group.role() == role)
-        .flat_map(ParameterGroupSpec::members)
-        .map(|member| member.target().to_owned())
-        .collect()
-}
-
-/// Returns whether a parameter name is one of the declared targets.
-pub fn parameter_name_in_targets(name: &str, targets: &BTreeSet<String>) -> bool {
-    targets.contains(name)
-}
 
 /// Builds exact full-tensor residency bindings for an unloaded module.
 ///
@@ -108,66 +78,9 @@ pub fn build_module_bindings_with_recipes<M>(
 where
     M: Parameterized<crate::MlxTensor>,
 {
-    build_module_binding_plan_with_recipes(module, prefix, store, recipes)?.build_bindings(store)
-}
-
-/// Replaces global binding sources with architecture-produced rank-local recipes.
-///
-/// Recipe keys are exact architecture-logical parameter targets. This lowering
-/// knows nothing about architecture-specific axes or physical checkpoint layouts; those
-/// have already been expressed by the recipes.
-pub fn apply_rank_local_parameter_recipes(
-    bindings: Vec<WeightBinding>,
-    store: &dyn eredu_checkpoint::store::CheckpointSource,
-    mut recipes: BTreeMap<String, DerivedWeightRecipe>,
-) -> Result<Vec<WeightBinding>, ModuleBindingError> {
-    let bindings = bindings
-        .into_iter()
-        .map(|binding| {
-            let Some(target) = binding.logical_target() else {
-                return Ok(binding);
-            };
-            let Some(recipe) = recipes.remove(target) else {
-                return Ok(binding);
-            };
-            let bytes = recipe.infer(store)?.byte_len();
-            binding
-                .with_source_recipe(recipe, bytes)
-                .map_err(ModuleBindingError::from)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    if !recipes.is_empty() {
-        return Err(ModuleBindingError::UnknownRecipeParameters {
-            parameters: recipes.into_keys().collect(),
-        });
-    }
-    Ok(bindings)
-}
-
-/// A declarative module binding plan plus fully qualified logical targets.
-pub struct ModuleBindingPlan {
-    plan: BindingPlan,
-    logical_targets: BTreeMap<String, String>,
-}
-
-impl ModuleBindingPlan {
-    /// Resolves the plan into runtime bindings against a checkpoint source.
-    pub fn build_bindings(
-        &self,
-        store: &dyn eredu_checkpoint::store::CheckpointSource,
-    ) -> Result<Vec<WeightBinding>, ModuleBindingError> {
-        self.plan
-            .build_bindings(store)?
-            .into_iter()
-            .map(|binding| {
-                let logical_target = self
-                    .logical_targets
-                    .get(binding.name())
-                    .expect("module binding plan contains every local target");
-                Ok(binding.with_logical_target(logical_target)?)
-            })
-            .collect()
-    }
+    build_module_binding_plan_with_recipes(module, prefix, store, recipes)?
+        .build_bindings(store)
+        .map_err(|error| ModuleBindingError::BindingPlan(error.to_string()))
 }
 
 /// Builds a complete module binding plan including derived-weight recipes.
@@ -224,10 +137,9 @@ where
             (name, recipe)
         })
         .collect();
-    build_flattened_module_binding_plan_with_recipes_excluding(
-        parameters, "", store, selected, exclude,
-    )?
-    .build_bindings(store)
+    build_module_binding_plan_with_recipes_excluding(module, "", store, selected, exclude)?
+        .build_bindings(store)
+        .map_err(|error| ModuleBindingError::BindingPlan(error.to_string()))
 }
 
 /// Resolves one exact replicated-text task partition to native module handles.
@@ -236,102 +148,9 @@ where
 /// and transformed companion identities. Module traversal only verifies that
 /// every selected destination has one native handle, while the checkpoint
 /// source supplies byte metadata without opening payloads.
-fn binding_from_exact_replicated_text_task(
-    task: &ReplicatedTextMaterializationTask,
-    store: &dyn eredu_checkpoint::store::CheckpointSource,
-) -> Result<WeightBinding, ModuleBindingError> {
-    if !matches!(
-        task.lowering(),
-        WeightLoweringKind::Transform | WeightLoweringKind::DerivedTransform
-    ) {
-        for physical in task.physical_sources() {
-            let provenance = store.source_provenance(physical.catalog_key())?;
-            let metadata = store.source_metadata(physical.catalog_key())?;
-            if provenance.catalog_key != physical.catalog_key()
-                || provenance.physical_tensor != physical.tensor()
-                || provenance.output != physical.output()
-                || provenance.backing_shard.as_deref() != Some(physical.shard())
-                || provenance.source_encoding != *physical.source_encoding()
-                || metadata.encoded_byte_len != physical.encoded_byte_len()
-            {
-                return Err(ModuleBindingError::BindingPlan(format!(
-                    "exact task {:?} differs from admitted physical provenance for {:?}",
-                    task.name(),
-                    physical.catalog_key()
-                )));
-            }
-        }
-    }
-    let binding = match task.lowering() {
-        WeightLoweringKind::Transform | WeightLoweringKind::DerivedTransform => {
-            if !store.is_authoritative_materialized_key(task.name()) {
-                return Err(ModuleBindingError::BindingPlan(format!(
-                    "exact transformed task {:?} has no authoritative materialized output",
-                    task.name()
-                )));
-            }
-            let metadata = store.source_metadata(task.name())?;
-            WeightBinding::new(
-                task.name(),
-                task.name(),
-                TensorSelection::Full,
-                metadata.encoded_byte_len,
-            )?
-        }
-        WeightLoweringKind::Direct => {
-            let [source] = task.sources() else {
-                return Err(ModuleBindingError::BindingPlan(format!(
-                    "exact direct task {:?} must name exactly one source",
-                    task.name()
-                )));
-            };
-            let metadata = store.source_metadata(source)?;
-            WeightBinding::new(
-                task.name(),
-                source,
-                TensorSelection::Full,
-                metadata.encoded_byte_len,
-            )?
-        }
-        WeightLoweringKind::Derived => {
-            let recipe = task
-                .source_recipe()
-                .map_err(|error| ModuleBindingError::BindingPlan(error.to_string()))?;
-            let metadata = recipe.infer(store)?;
-            if task
-                .derived_output()
-                .is_some_and(|expected| expected != &metadata)
-            {
-                return Err(ModuleBindingError::BindingPlan(format!(
-                    "exact derived task {:?} differs from its admitted output",
-                    task.name()
-                )));
-            }
-            let recipe = if task.executable() == eredu_checkpoint::LinearFormat::MxFp4
-                && metadata.dtype() == &eredu_checkpoint::recipe::RecipeDtype::F4
-            {
-                crate::backend::runtime::checkpoint::recipe::lower_mxfp4_recipe(recipe, store)?
-            } else {
-                recipe
-            };
-            let metadata = recipe.infer(store)?;
-            WeightBinding::from_recipe(task.name(), recipe, metadata.byte_len())?
-        }
-        _ => {
-            return Err(ModuleBindingError::BindingPlan(format!(
-                "exact task {:?} selected an unsupported lowering",
-                task.name()
-            )))
-        }
-    };
-    binding.with_logical_target(task.name()).map_err(Into::into)
-}
-
-/// Resolves one exact replicated-text task partition to native module handles.
-///
-/// Each primary and companion binding consumes its complete selected task;
-/// checkpoint target-name probing is not a source-selection mechanism.
-pub fn build_exact_replicated_text_bindings<M>(
+/// Adapts MLX parameter geometry and the intrinsic MXFP4 recipe conversion to
+/// the canonical backend-neutral exact-task binder.
+pub fn build_mlx_exact_replicated_text_bindings<M>(
     module: &M,
     store: &dyn eredu_checkpoint::store::CheckpointSource,
     tasks: &[&ReplicatedTextMaterializationTask],
@@ -340,164 +159,33 @@ pub fn build_exact_replicated_text_bindings<M>(
 where
     M: Parameterized<crate::MlxTensor>,
 {
-    let parameter_names = neutral_parameter_refs(module, false)
-        .flatten()
-        .into_keys()
-        .map(|name| name.as_ref().to_owned())
-        .collect::<BTreeSet<_>>();
-    let mut covered = BTreeSet::new();
-    let mut bindings = Vec::new();
-    for task in tasks {
-        if !parameter_names.contains(task.name()) {
-            return Err(ModuleBindingError::BindingPlan(format!(
-                "exact materialization task {:?} has no native module destination",
-                task.name()
-            )));
-        }
-        if !covered.insert(task.name().to_owned()) {
-            return Err(ModuleBindingError::BindingPlan(format!(
-                "exact materialization task {:?} was consumed more than once",
-                task.name()
-            )));
-        }
-        bindings.push(binding_from_exact_replicated_text_task(task, store)?);
-
-        for companion in task.output_companions() {
-            if !parameter_names.contains(companion.name()) {
-                return Err(ModuleBindingError::BindingPlan(format!(
-                    "exact task {:?} companion {:?} has no native module destination",
-                    task.name(),
-                    companion.name()
-                )));
-            }
-            if !covered.insert(companion.name().to_owned()) {
-                return Err(ModuleBindingError::BindingPlan(format!(
-                    "exact companion {:?} was consumed more than once",
-                    companion.name()
-                )));
-            }
-            let binding = if let Some(exact) = companion.materialization_task() {
-                binding_from_exact_replicated_text_task(exact, store)?
-            } else if let (Some(recipe), Some(expected)) =
-                (companion.derived_recipe(), companion.derived_output())
-            {
-                let metadata = recipe.infer(store)?;
-                if &metadata != expected {
-                    return Err(ModuleBindingError::BindingPlan(format!(
-                        "exact companion {:?} differs from its admitted derived output",
-                        companion.name()
-                    )));
-                }
-                WeightBinding::from_recipe(companion.name(), recipe.clone(), metadata.byte_len())?
-                    .with_logical_target(companion.name())?
-            } else if let Some(source) = companion.catalog_source() {
-                let provenance = store.source_provenance(source.catalog_key())?;
-                let metadata = store.source_metadata(source.catalog_key())?;
-                if provenance.catalog_key != source.catalog_key()
-                    || provenance.physical_tensor != source.tensor()
-                    || provenance.output != source.output()
-                    || provenance.backing_shard.as_deref() != Some(source.shard())
-                    || provenance.source_encoding != *source.source_encoding()
-                    || metadata.encoded_byte_len != source.encoded_byte_len()
-                {
-                    return Err(ModuleBindingError::BindingPlan(format!(
-                        "translated catalog companion {:?} differs from its admitted provenance",
-                        companion.name()
-                    )));
-                }
-                WeightBinding::new(
-                    companion.name(),
-                    source.catalog_key(),
-                    TensorSelection::Full,
-                    metadata.encoded_byte_len,
-                )?
-                .with_logical_target(companion.name())?
-            } else if matches!(
-                task.lowering(),
-                WeightLoweringKind::Transform | WeightLoweringKind::DerivedTransform
-            ) || matches!(task.source_encoding(), SourceTensorEncoding::Gguf { .. })
-            {
-                if !store.is_authoritative_materialized_key(companion.name()) {
-                    return Err(ModuleBindingError::BindingPlan(format!(
-                        "generated companion {:?} has no authoritative materialized output",
-                        companion.name()
-                    )));
-                }
-                let metadata = store.source_metadata(companion.name())?;
-                WeightBinding::new(
-                    companion.name(),
-                    companion.name(),
-                    TensorSelection::Full,
-                    metadata.encoded_byte_len,
-                )?
-                .with_logical_target(companion.name())?
-            } else {
-                return Err(ModuleBindingError::BindingPlan(format!(
-                    "exact companion {:?} has neither a selected task nor a causal primary output",
-                    companion.name()
-                )));
-            };
-            bindings.push(binding);
-        }
-    }
-    let missing = parameter_names
-        .difference(&covered)
-        .filter(|name| !addressable_parameters.contains(*name))
-        .cloned()
-        .collect::<Vec<_>>();
-    if !missing.is_empty() {
-        let selected = tasks
-            .iter()
-            .map(|task| {
-                (
-                    task.name(),
-                    task.output_companions()
-                        .iter()
-                        .map(|companion| companion.name())
-                        .collect::<Vec<_>>(),
-                )
-            })
-            .collect::<Vec<_>>();
-        return Err(ModuleBindingError::BindingPlan(format!(
-            "native module parameters have no exact materialization tasks: {missing:?}; selected tasks: {selected:?}"
-        )));
-    }
-    WeightBindingPlan::new(&bindings)
-        .map_err(|error| ModuleBindingError::BindingPlan(error.to_string()))?;
-    Ok(bindings)
+    eredu_runtime::build_exact_replicated_text_bindings(
+        module,
+        store,
+        tasks,
+        addressable_parameters,
+        mlx_parameter_binding_target,
+        |_task, recipe, source| {
+            crate::backend::runtime::checkpoint::recipe::lower_mxfp4_recipe(recipe, source)
+        },
+    )
+    .map_err(|error| ModuleBindingError::BindingPlan(error.to_string()))
 }
 
-/// Materializes a set of direct or derived bindings without constructing a
-/// residency manager.
+/// Materializes a complete binding unit with a fixed two-completion window.
 ///
-/// This is useful for loaders that keep one parameter class resident while a
-/// separate cache owns another class from the same type-erased checkpoint
-/// store. Direct and recipe outputs share a fixed two-completion window;
-/// source leases remain retained through their exact event, and outputs are
-/// copied to the execution stream when the streams differ. Shard-cache-capacity
-/// pressure drains the oldest completion before retrying.
+/// The canonical neutral preflight completes before any payload lease or MLX
+/// operation; publication remains atomic in the caller's module binder.
 pub fn materialize_module_bindings(
     store: &dyn eredu_checkpoint::store::CheckpointSource,
     bindings: &[WeightBinding],
     source_stream: &Stream,
     execution_stream: &Stream,
 ) -> Result<BTreeMap<String, Array>, ModuleBindingError> {
+    eredu_runtime::preflight_bindings::<MlxNeuralBackend>(store, bindings)
+        .map_err(|error| ModuleBindingError::BindingPlan(error.to_string()))?;
     let plan = WeightBindingPlan::new(bindings)
         .map_err(|error| ModuleBindingError::BindingPlan(error.to_string()))?;
-    for binding in plan.owners() {
-        let actual = binding
-            .source_recipe()
-            .infer(store)
-            .map_err(|error| ModuleBindingError::BindingPlan(error.to_string()))?
-            .byte_len();
-        if actual != binding.expected_bytes() {
-            return Err(ModuleBindingError::BindingPlan(format!(
-                "binding {:?} declares {} bytes but materializes {actual}",
-                binding.name(),
-                binding.expected_bytes()
-            )));
-        }
-    }
     let mut arrays = BTreeMap::new();
     let mut pending = VecDeque::with_capacity(MODEL_LOAD_MATERIALIZATION_BUFFERS);
     let context = MlxParameterMaterializationContext::new(source_stream, execution_stream);
@@ -605,54 +293,20 @@ where
     M: Parameterized<crate::MlxTensor>,
     F: Fn(&str) -> bool,
 {
-    let expected = {
-        let params = neutral_parameter_refs(module, false).flatten();
-        params
-            .iter()
-            .filter(|(name, _)| !excluded(name))
-            .map(|(name, _)| name.to_string())
-            .collect::<BTreeSet<_>>()
-    };
-    let mut resolved = BTreeMap::<String, &Array>::new();
-    let mut unexpected = Vec::new();
-    for (name, value) in arrays {
-        if expected.contains(name) {
-            resolved.insert(name.clone(), value);
-        } else {
-            unexpected.push(name.clone());
-        }
-    }
-    let missing = expected
+    let weights = arrays
         .iter()
-        .filter(|name| !resolved.contains_key(*name))
-        .cloned()
-        .collect::<Vec<_>>();
-    if !missing.is_empty() || !unexpected.is_empty() {
-        return Err(ModuleBindingError::LeaseContents {
-            unit: "materialized checkpoint bindings".into(),
-            missing,
-            unexpected,
-        });
-    }
-    let mut params = neutral_parameter_refs_mut(module).flatten();
-    for (name, parameter) in &mut params {
-        if !expected.contains(name.as_ref()) {
-            continue;
-        }
-        let value = *resolved
-            .get(name.as_ref())
-            .expect("validated materialized binding must exist");
-        if parameter.shape() != value.shape() {
-            return Err(ModuleBindingError::ResidentShapeMismatch {
-                unit: "materialized checkpoint bindings".into(),
-                parameter: name.to_string(),
-                expected: parameter.shape().to_vec(),
-                actual: value.shape().to_vec(),
-            });
-        }
-        **parameter = value.clone();
-    }
-    Ok(())
+        .map(|(name, value)| {
+            let id = ParameterId::new(name.clone())
+                .map_err(|error| ModuleBindingError::BindingPlan(error.to_string()))?;
+            Ok((id, crate::MlxTensor::from_array(value.clone())))
+        })
+        .collect::<Result<Vec<_>, ModuleBindingError>>()?;
+    let unit = eredu_runtime::MaterializedUnit::<MlxNeuralBackend>::try_from_weights(weights)
+        .map_err(|error| ModuleBindingError::BindingPlan(error.to_string()))?;
+    eredu_runtime::bind_materialized_unit_excluding::<MlxNeuralBackend, M, _>(module, unit, |id| {
+        excluded(id.as_str())
+    })
+    .map_err(|error| ModuleBindingError::BindingPlan(error.to_string()))
 }
 
 /// Builds bindings while excluding parameters managed by another loader.
@@ -669,6 +323,7 @@ where
 {
     build_module_binding_plan_with_recipes_excluding(module, prefix, store, recipes, exclude)?
         .build_bindings(store)
+        .map_err(|error| ModuleBindingError::BindingPlan(error.to_string()))
 }
 
 /// Builds a derived binding plan while excluding independently managed parameters.
@@ -683,154 +338,30 @@ where
     M: Parameterized<crate::MlxTensor>,
     F: Fn(&str) -> bool,
 {
-    build_flattened_module_binding_plan_with_recipes_excluding(
-        neutral_parameter_refs(module, false).flatten(),
+    eredu_runtime::build_module_binding_plan(
+        module,
         prefix,
         store,
         recipes,
+        BTreeSet::new(),
         exclude,
+        mlx_parameter_binding_target,
     )
+    .map_err(|error| ModuleBindingError::BindingPlan(error.to_string()))
 }
 
-fn build_flattened_module_binding_plan_with_recipes_excluding<F>(
-    params: FlattenedModuleParamRef<'_>,
-    prefix: &str,
-    store: &dyn eredu_checkpoint::store::CheckpointSource,
-    mut recipes: BTreeMap<String, DerivedWeightRecipe>,
-    exclude: F,
-) -> Result<ModuleBindingPlan, ModuleBindingError>
-where
-    F: Fn(&str) -> bool,
-{
-    let keys = store.source_keys().into_iter().collect::<BTreeSet<_>>();
-    let mut local_names = params
+fn mlx_parameter_binding_target(parameter: &crate::MlxTensor) -> Option<ParameterBindingTarget> {
+    let shape = parameter
+        .as_array()
+        .shape()
         .iter()
-        .filter(|(name, _)| !exclude(name))
-        .map(|(name, _)| name.to_string())
-        .collect::<Vec<_>>();
-    local_names.sort();
-    recipes.retain(|name, _| !exclude(name));
-    let mut claimed = BTreeMap::<String, String>::new();
-    let mut planned = Vec::with_capacity(local_names.len());
-    let mut logical_targets = BTreeMap::new();
-    let mut source_claim_counts = BTreeMap::<String, usize>::new();
-
-    for local_name in local_names {
-        let parameter = params
-            .get(local_name.as_str())
-            .expect("parameter name came from the same flattened tree");
-        let destination = qualify(prefix, &local_name);
-        logical_targets.insert(local_name.clone(), destination.clone());
-        let authoritative_key = if store.is_authoritative_materialized_key(&destination) {
-            Some(destination.clone())
-        } else {
-            None
-        };
-        if authoritative_key.is_none() {
-            if let Some(recipe) = recipes.remove(&local_name) {
-                let metadata = recipe.infer(store)?;
-                let expected_shape = parameter
-                    .shape()
-                    .iter()
-                    .map(|&dimension| usize::try_from(dimension))
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|_| ModuleBindingError::InvalidModuleShape {
-                        parameter: qualify(prefix, &local_name),
-                        shape: parameter.shape().to_vec(),
-                    })?;
-                if metadata.shape() != expected_shape {
-                    return Err(ModuleBindingError::RecipeShapeMismatch {
-                        parameter: qualify(prefix, &local_name),
-                        expected: expected_shape,
-                        actual: metadata.shape().to_vec(),
-                    });
-                }
-                let expected_dtype = recipe_dtype_from_mlx(parameter.dtype());
-                if !recipe_dtype_matches(&expected_dtype, metadata.dtype()) {
-                    return Err(ModuleBindingError::RecipeDtypeMismatch {
-                        parameter: qualify(prefix, &local_name),
-                        expected: expected_dtype,
-                        actual: metadata.dtype().clone(),
-                    });
-                }
-                for source in recipe.source_keys() {
-                    *source_claim_counts.entry(source.into()).or_default() += 1;
-                }
-                planned.push(PlannedBinding {
-                    target_name: local_name,
-                    expected_shape,
-                    expected_dtype,
-                    recipe,
-                });
-                continue;
-            }
-        } else {
-            recipes.remove(&local_name);
-        }
-        let checkpoint_key = if let Some(authoritative_key) = authoritative_key {
-            authoritative_key
-        } else if keys.contains(&destination) {
-            destination.clone()
-        } else {
-            return Err(ModuleBindingError::MissingParameter { destination });
-        };
-
-        if let Some(previous) = claimed.insert(checkpoint_key.clone(), destination.clone()) {
-            return Err(ModuleBindingError::DuplicateCheckpointBinding {
-                checkpoint_key,
-                first: previous,
-                second: destination,
-            });
-        }
-
-        let metadata = store.source_metadata(&checkpoint_key)?;
-        let expected_shape = parameter
-            .shape()
-            .iter()
-            .map(|&dimension| usize::try_from(dimension))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|_| ModuleBindingError::InvalidModuleShape {
-                parameter: destination.clone(),
-                shape: parameter.shape().to_vec(),
-            })?;
-        if metadata.logical_shape != expected_shape {
-            return Err(ModuleBindingError::ShapeMismatch {
-                checkpoint_key,
-                parameter: destination,
-                expected: expected_shape,
-                actual: metadata.logical_shape,
-            });
-        }
-        // Direct checkpoint tensors retain their stored dtype. Some modules
-        // intentionally use an unloaded placeholder with a different dtype
-        // and adopt the checkpoint representation when the binding is loaded.
-        let expected_dtype = RecipeDtype::from(metadata.stored_dtype.clone());
-        let recipe = DerivedWeightRecipe::source(metadata.name, TensorSelection::Full);
-        for source in recipe.source_keys() {
-            *source_claim_counts.entry(source.into()).or_default() += 1;
-        }
-        planned.push(PlannedBinding {
-            target_name: local_name,
-            expected_shape,
-            expected_dtype,
-            recipe,
-        });
-    }
-
-    if !recipes.is_empty() {
-        return Err(ModuleBindingError::UnknownRecipeParameters {
-            parameters: recipes.into_keys().collect(),
-        });
-    }
-
-    let shared_source_keys = source_claim_counts
-        .into_iter()
-        .filter_map(|(source, claims)| (claims > 1).then_some(source))
-        .collect();
-    let plan = BindingPlan::allowing_shared_sources(planned, shared_source_keys)?;
-    Ok(ModuleBindingPlan {
-        plan,
-        logical_targets,
+        .map(|&dimension| usize::try_from(dimension))
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    Some(ParameterBindingTarget {
+        shape,
+        dtype: recipe_dtype_from_mlx(parameter.as_array().dtype()),
+        permitted_source_dtypes: Vec::new(),
     })
 }
 
@@ -859,51 +390,21 @@ where
     M: Parameterized<crate::MlxTensor>,
     F: Fn(&str) -> bool,
 {
-    let resident_names = lease.binding_names().collect::<BTreeSet<_>>();
-    let expected_names = {
-        let params = neutral_parameter_refs(module, false).flatten();
-        params
-            .iter()
-            .filter(|(name, _)| !excluded(name))
-            .map(|(name, _)| name.to_string())
-            .collect::<BTreeSet<_>>()
-    };
-
-    let missing = expected_names
-        .iter()
-        .filter(|name| !resident_names.contains(name.as_str()))
-        .cloned()
-        .collect::<Vec<_>>();
-    let unexpected = resident_names
-        .iter()
-        .filter(|name| !expected_names.contains(**name))
-        .map(|name| (*name).to_string())
-        .collect::<Vec<_>>();
-    if !missing.is_empty() || !unexpected.is_empty() {
-        return Err(ModuleBindingError::LeaseContents {
-            unit: lease.id().to_string(),
-            missing,
-            unexpected,
-        });
-    }
-
-    let mut params = neutral_parameter_refs_mut(module).flatten();
-    for (name, parameter) in &mut params {
-        if !expected_names.contains(name.as_ref()) {
-            continue;
-        }
-        let value = lease.device_value(name)?;
-        if parameter.shape() != value.shape() {
-            return Err(ModuleBindingError::ResidentShapeMismatch {
-                unit: lease.id().to_string(),
-                parameter: name.to_string(),
-                expected: parameter.shape().to_vec(),
-                actual: value.shape().to_vec(),
-            });
-        }
-        **parameter = value.clone();
-    }
-    Ok(())
+    let weights = lease
+        .binding_names()
+        .map(|name| {
+            let id = ParameterId::new(name)
+                .map_err(|error| ModuleBindingError::BindingPlan(error.to_string()))?;
+            let value = lease.device_value(name)?.clone();
+            Ok((id, crate::MlxTensor::from_array(value)))
+        })
+        .collect::<Result<Vec<_>, ModuleBindingError>>()?;
+    let unit = eredu_runtime::MaterializedUnit::<MlxNeuralBackend>::try_from_weights(weights)
+        .map_err(|error| ModuleBindingError::BindingPlan(error.to_string()))?;
+    eredu_runtime::bind_materialized_unit_excluding::<MlxNeuralBackend, M, _>(module, unit, |id| {
+        excluded(id.as_str())
+    })
+    .map_err(|error| ModuleBindingError::BindingPlan(error.to_string()))
 }
 
 /// Returns the checked total byte count of a binding collection.
@@ -920,32 +421,6 @@ pub fn binding_bytes(bindings: &[WeightBinding]) -> Result<u64, ModuleBindingErr
     })
 }
 
-fn qualify(prefix: &str, name: &str) -> String {
-    if prefix.is_empty() {
-        name.to_string()
-    } else {
-        format!("{prefix}.{name}")
-    }
-}
-
-fn recipe_dtype_matches(expected: &RecipeDtype, actual: &RecipeDtype) -> bool {
-    expected == actual
-        || matches!((expected, actual), (RecipeDtype::U8, RecipeDtype::F8E4M3))
-        // Dense module placeholders default to F32, while direct checkpoint
-        // bindings replace them with the checkpoint's native floating dtype.
-        // Derived bindings (including key rewrites and leading-axis stacking) must
-        // follow the same rule or valid BF16 checkpoints are rejected solely
-        // because their public tensor names require a recipe.
-        || (is_floating_recipe_dtype(expected) && is_floating_recipe_dtype(actual))
-}
-
-fn is_floating_recipe_dtype(dtype: &RecipeDtype) -> bool {
-    matches!(
-        dtype,
-        RecipeDtype::F16 | RecipeDtype::BF16 | RecipeDtype::F32 | RecipeDtype::F64
-    )
-}
-
 /// Structured module-to-checkpoint binding failures.
 #[derive(Debug, thiserror::Error)]
 pub enum ModuleBindingError {
@@ -958,32 +433,6 @@ pub enum ModuleBindingError {
         /// Unknown local parameter names.
         parameters: Vec<String>,
     },
-    /// A recipe output shape differed from its runtime placeholder.
-    #[error("derived weight for {parameter:?} has shape {actual:?}, expected {expected:?}")]
-    RecipeShapeMismatch {
-        /// Fully qualified runtime parameter.
-        parameter: String,
-        /// Runtime placeholder shape.
-        expected: Vec<usize>,
-        /// Recipe output shape.
-        actual: Vec<usize>,
-    },
-    /// A recipe output dtype differed from its runtime placeholder.
-    #[error("derived weight for {parameter:?} has dtype {actual:?}, expected {expected:?}")]
-    RecipeDtypeMismatch {
-        /// Fully qualified runtime parameter.
-        parameter: String,
-        /// Runtime placeholder dtype.
-        expected: RecipeDtype,
-        /// Recipe output dtype.
-        actual: RecipeDtype,
-    },
-    /// A module parameter had no matching checkpoint tensor.
-    #[error("checkpoint is missing module parameter {destination:?}")]
-    MissingParameter {
-        /// Full module parameter name.
-        destination: String,
-    },
     /// Two parameters resolved to one checkpoint tensor.
     #[error("checkpoint tensor {checkpoint_key:?} resolves to both {first:?} and {second:?}")]
     DuplicateCheckpointBinding {
@@ -993,50 +442,6 @@ pub enum ModuleBindingError {
         first: String,
         /// Second module parameter.
         second: String,
-    },
-    /// A module placeholder exposed an invalid dimension.
-    #[error("module parameter {parameter:?} has invalid shape {shape:?}")]
-    InvalidModuleShape {
-        /// Full parameter name.
-        parameter: String,
-        /// Invalid MLX shape.
-        shape: Vec<i32>,
-    },
-    /// Checkpoint and unloaded-module shapes differed.
-    #[error("checkpoint tensor {checkpoint_key:?} for {parameter:?} has shape {actual:?}, expected {expected:?}")]
-    ShapeMismatch {
-        /// Source checkpoint key.
-        checkpoint_key: String,
-        /// Destination module parameter.
-        parameter: String,
-        /// Unloaded module shape.
-        expected: Vec<usize>,
-        /// Checkpoint shape.
-        actual: Vec<usize>,
-    },
-    /// A resident unit did not exactly match the module parameter tree.
-    #[error("resident unit {unit} cannot populate module: missing {missing:?}, unexpected {unexpected:?}")]
-    LeaseContents {
-        /// Resident unit identifier.
-        unit: String,
-        /// Expected module parameters absent from the lease.
-        missing: Vec<String>,
-        /// Lease bindings absent from the module.
-        unexpected: Vec<String>,
-    },
-    /// A resident array shape differs from its unloaded placeholder.
-    #[error(
-        "resident unit {unit} parameter {parameter:?} has shape {actual:?}, expected {expected:?}"
-    )]
-    ResidentShapeMismatch {
-        /// Resident unit identifier.
-        unit: String,
-        /// Local module parameter.
-        parameter: String,
-        /// Unloaded module shape.
-        expected: Vec<i32>,
-        /// Resident array shape.
-        actual: Vec<i32>,
     },
     /// Checked accounting overflowed.
     #[error("module binding arithmetic overflow: {context}")]
@@ -1066,7 +471,10 @@ pub enum ModuleBindingError {
     Residency(#[from] crate::backend::runtime::residency::manager::ResidencyError),
 }
 
-#[cfg(test)]
+#[cfg(all(
+    test,
+    any(feature = "cuda", all(feature = "metal", target_os = "macos"))
+))]
 #[allow(
     clippy::items_after_test_module,
     reason = "binding tests stay adjacent to the binding planners they exercise"
@@ -1074,10 +482,8 @@ pub enum ModuleBindingError {
 mod tests {
     use super::*;
     use eredu_checkpoint::store::MemoryWeightStore;
-    #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
     use eredu_nn::{ParameterMetadata, ParameterSpec, ParameterVisitor, ParameterVisitorMut};
 
-    #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
     #[test]
     fn architecture_scale_matching_native_sentinel_shape_is_bound() {
         struct Module {
@@ -1148,58 +554,5 @@ mod tests {
             .collect::<BTreeSet<_>>();
 
         assert_eq!(names, BTreeSet::from(["scales".into(), "weight".into()]));
-    }
-
-    #[test]
-    fn architecture_inner_path_is_an_exact_parameter_identity() {
-        let targets =
-            BTreeSet::from(["projection.weight".to_owned(), "projection.bias".to_owned()]);
-        assert!(!parameter_name_in_targets(
-            "projection.inner.weight",
-            &targets
-        ));
-        assert!(!parameter_name_in_targets(
-            "projection.inner.bias",
-            &targets
-        ));
-    }
-
-    #[test]
-    fn rank_local_recipes_replace_sources_by_exact_logical_target() {
-        let store = MemoryWeightStore::from_safetensors([(
-            "physical.experts".to_owned(),
-            safetensors::Dtype::F32,
-            vec![4, 2],
-            vec![0; 4 * 2 * size_of::<f32>()],
-        )])
-        .unwrap();
-        let global = DerivedWeightRecipe::source("physical.experts", TensorSelection::Full);
-        let binding = WeightBinding::from_recipe("local.experts", global, 32)
-            .unwrap()
-            .with_logical_target("model.experts")
-            .unwrap();
-        let local = DerivedWeightRecipe::source(
-            "physical.experts",
-            TensorSelection::Indices {
-                axis: 0,
-                indices: vec![3, 1],
-            },
-        );
-
-        let bindings = apply_rank_local_parameter_recipes(
-            vec![binding],
-            &store,
-            BTreeMap::from([("model.experts".into(), local.clone())]),
-        )
-        .unwrap();
-
-        assert_eq!(bindings[0].source_recipe(), local);
-        assert_eq!(bindings[0].expected_bytes(), 16);
-    }
-}
-
-impl From<BindingPlanError> for ModuleBindingError {
-    fn from(error: BindingPlanError) -> Self {
-        Self::BindingPlan(error.to_string())
     }
 }

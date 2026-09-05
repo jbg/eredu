@@ -713,7 +713,9 @@ where
                 .iter()
                 .chain(std::iter::once(tensor.placement()))
             {
-                let selection = stored_placement_selection(tensor, placement, metadata.shape())?;
+                let selection =
+                    eredu_runtime::placement_selection(tensor, placement, metadata.shape())
+                        .map_err(|error| Error::Parallel(error.to_string()))?;
                 if selection != TensorSelection::Full {
                     recipe = recipe.select_bounded(store, selection)?;
                     metadata = recipe.infer(store)?;
@@ -1441,178 +1443,14 @@ fn bounded_quantization_working_set(
     Ok(output_bytes.max(minimum_tile_bytes))
 }
 
-fn stored_placement_selection(
-    tensor: &eredu_runtime::LocalTensorLayout,
-    placement: &eredu_runtime::TensorPlacement,
-    stored_shape: &[usize],
-) -> Result<TensorSelection, Error> {
-    use eredu_runtime::TensorPlacement;
-
-    let scale_boundary = |axis: usize, boundary: usize| -> Result<usize, Error> {
-        let semantic = tensor.global_shape()[axis];
-        let stored = stored_shape[axis];
-        boundary
-            .checked_mul(stored)
-            .and_then(|value| value.checked_div(semantic))
-            .filter(|scaled| scaled * semantic == boundary * stored)
-            .ok_or_else(|| {
-                Error::Parallel(format!(
-                    "semantic shard boundary {boundary} on axis {axis} is not aligned to packed storage shape {stored_shape:?} derived from {:?}",
-                    tensor.global_shape()
-                ))
-            })
-    };
-
-    Ok(match placement {
-        TensorPlacement::Replicated | TensorPlacement::Local => TensorSelection::Full,
-        TensorPlacement::Shard { axis, index, parts } => {
-            let stored = stored_shape[*axis];
-            if !stored.is_multiple_of(*parts) {
-                return Err(Error::Parallel(format!(
-                    "packed storage axis {axis} width {stored} cannot be divided among {parts} TP ranks"
-                )));
-            }
-            let width = stored / *parts;
-            TensorSelection::Range {
-                axis: *axis,
-                start: index * width,
-                end: (index + 1) * width,
-            }
-        }
-        TensorPlacement::Range { axis, start, end } => TensorSelection::Range {
-            axis: *axis,
-            start: scale_boundary(*axis, *start)?,
-            end: scale_boundary(*axis, *end)?,
-        },
-        TensorPlacement::Indices { axis, indices } => {
-            if stored_shape[*axis] != tensor.global_shape()[*axis] {
-                return Err(Error::Parallel(format!(
-                    "indexed TP placement on semantic axis {axis} cannot address packed storage shape {stored_shape:?} derived from {:?}",
-                    tensor.global_shape()
-                )));
-            }
-            TensorSelection::Indices {
-                axis: *axis,
-                indices: indices.clone(),
-            }
-        }
-        TensorPlacement::Omit | TensorPlacement::Rank { .. } => {
-            return Err(Error::Parallel(format!(
-                "execution-group binding has non-TP placement {:?}",
-                placement
-            )))
-        }
-    })
-}
-
 /// Applies the local parallel layout to architecture-declared layer bindings.
 pub fn shard_layer_bindings(
     bindings: Vec<WeightBinding>,
     store: &dyn eredu_checkpoint::store::CheckpointSource,
     layout: &eredu_runtime::LocalModelLayout,
 ) -> Result<Vec<WeightBinding>, Error> {
-    let store_keys = store.source_keys().into_iter().collect::<BTreeSet<_>>();
-    let mut output = Vec::with_capacity(bindings.len());
-    for binding in bindings {
-        if binding.is_alias() {
-            output.push(binding);
-            continue;
-        }
-        let logical_target = binding
-            .logical_target()
-            .ok_or_else(|| LayerwiseModelError::MissingParallelBindingTarget {
-                binding: binding.name().to_owned(),
-            })?
-            .to_owned();
-        let quantization_companions = binding.quantization_companions().cloned();
-        let tensor = layout.tensor(&logical_target).ok_or_else(|| {
-            LayerwiseModelError::UnknownParallelBindingTarget {
-                binding: binding.name().to_owned(),
-                target: logical_target.clone(),
-            }
-        })?;
-        // Direct bindings created by callers can describe a logical checkpoint
-        // target that is deliberately absent from this physical store. Preserve
-        // that contract by deriving its selection and byte count from semantic
-        // layout alone. Physical and derived bindings use store metadata below,
-        // which is required when packed storage geometry differs from the
-        // semantic weight geometry.
-        if binding.recipe().is_none() && !store_keys.contains(binding.checkpoint_key()) {
-            if !tensor.additional_placements().is_empty() {
-                return Err(Error::Parallel(format!(
-                    "compound placement for {:?} requires an admitted checkpoint recipe",
-                    binding.name()
-                )));
-            }
-            let selection =
-                stored_placement_selection(tensor, tensor.placement(), tensor.global_shape())?;
-            if selection == TensorSelection::Full {
-                output.push(binding);
-                continue;
-            }
-            let global_elements = tensor.global_shape().iter().product::<usize>();
-            let local_elements = tensor.local_shape().iter().product::<usize>();
-            let expected_bytes = binding
-                .expected_bytes()
-                .checked_mul(local_elements as u64)
-                .and_then(|bytes| bytes.checked_div(global_elements as u64))
-                .ok_or_else(|| {
-                    Error::Parallel(format!(
-                        "cannot size rank-local binding {:?}",
-                        binding.name()
-                    ))
-                })?;
-            let mut sharded = WeightBinding::new(
-                binding.name(),
-                binding.checkpoint_key(),
-                selection,
-                expected_bytes,
-            )?;
-            sharded = sharded.with_logical_target(logical_target)?;
-            if let Some(companions) = quantization_companions {
-                sharded = sharded.with_quantization_companions(
-                    companions.scale(),
-                    companions.affine_bias().map(str::to_owned),
-                )?;
-            }
-            output.push(sharded);
-            continue;
-        }
-        let mut recipe = binding.source_recipe();
-        let mut selected = false;
-        for placement in tensor
-            .additional_placements()
-            .iter()
-            .chain(std::iter::once(tensor.placement()))
-        {
-            let metadata = recipe.infer(store)?;
-            let selection = stored_placement_selection(tensor, placement, metadata.shape())
-                .map_err(|error| {
-                    Error::Parallel(format!(
-                        "cannot place logical parameter {logical_target:?}: {error}"
-                    ))
-                })?;
-            if selection != TensorSelection::Full {
-                recipe = recipe.select_bounded(store, selection)?;
-                selected = true;
-            }
-        }
-        if !selected {
-            output.push(binding);
-            continue;
-        }
-        let expected_bytes = recipe.infer(store)?.byte_len();
-        let mut sharded = WeightBinding::from_recipe(binding.name(), recipe, expected_bytes)?;
-        sharded = sharded.with_logical_target(logical_target)?;
-        if let Some(companions) = quantization_companions {
-            sharded = sharded.with_quantization_companions(
-                companions.scale(),
-                companions.affine_bias().map(str::to_owned),
-            )?;
-        }
-        output.push(sharded);
-    }
-    Ok(output)
+    eredu_runtime::place_weight_bindings(bindings, store, layout)
+        .map_err(|error| Error::Parallel(error.to_string()))
 }
 
 /// Applies only the primary physical placement to already member-selected bindings.
@@ -1625,60 +1463,8 @@ pub fn shard_addressable_member_bindings(
     store: &dyn eredu_checkpoint::store::CheckpointSource,
     layout: &eredu_runtime::LocalModelLayout,
 ) -> Result<Vec<WeightBinding>, Error> {
-    let mut output = Vec::with_capacity(bindings.len());
-    for binding in bindings {
-        let logical_target = binding
-            .logical_target()
-            .ok_or_else(|| LayerwiseModelError::MissingParallelBindingTarget {
-                binding: binding.name().to_owned(),
-            })?
-            .to_owned();
-        let tensor = layout.tensor(&logical_target).ok_or_else(|| {
-            LayerwiseModelError::UnknownParallelBindingTarget {
-                binding: binding.name().to_owned(),
-                target: logical_target.clone(),
-            }
-        })?;
-        let mut recipe = binding.source_recipe();
-        let mut selected = false;
-        for placement in tensor
-            .additional_placements()
-            .iter()
-            .chain(std::iter::once(tensor.placement()))
-        {
-            let member_axis = match placement {
-                eredu_runtime::TensorPlacement::Shard { axis, .. }
-                | eredu_runtime::TensorPlacement::Range { axis, .. }
-                | eredu_runtime::TensorPlacement::Indices { axis, .. } => *axis == 0,
-                _ => false,
-            };
-            if member_axis {
-                continue;
-            }
-            let metadata = recipe.infer(store)?;
-            let selection = stored_placement_selection(tensor, placement, metadata.shape())?;
-            if selection != TensorSelection::Full {
-                recipe = recipe.select_bounded(store, selection)?;
-                selected = true;
-            }
-        }
-        if !selected {
-            output.push(binding);
-            continue;
-        }
-        let expected_bytes = recipe.infer(store)?.byte_len();
-        let quantization_companions = binding.quantization_companions().cloned();
-        let mut sharded = WeightBinding::from_recipe(binding.name(), recipe, expected_bytes)?
-            .with_logical_target(logical_target)?;
-        if let Some(companions) = quantization_companions {
-            sharded = sharded.with_quantization_companions(
-                companions.scale(),
-                companions.affine_bias().map(str::to_owned),
-            )?;
-        }
-        output.push(sharded);
-    }
-    Ok(output)
+    eredu_runtime::place_addressable_member_bindings(bindings, store, layout)
+        .map_err(|error| Error::Parallel(error.to_string()))
 }
 
 #[cfg(test)]
@@ -1798,12 +1584,8 @@ mod shard_layer_bindings_tests {
     fn sharding_rejects_a_missing_architecture_logical_target() {
         let error = shard_layer_bindings(vec![binding()], &store(), &layout()).unwrap_err();
 
-        assert!(matches!(
-            error,
-            Error::LayerwiseModel(LayerwiseModelError::MissingParallelBindingTarget {
-                binding,
-            }) if binding == "weight"
-        ));
+        assert!(matches!(error, Error::Parallel(ref message)
+            if message.contains("binding \"weight\" has no logical placement target")));
     }
 
     #[test]
@@ -1812,13 +1594,8 @@ mod shard_layer_bindings_tests {
 
         let error = shard_layer_bindings(vec![binding], &store(), &layout()).unwrap_err();
 
-        assert!(matches!(
-            error,
-            Error::LayerwiseModel(LayerwiseModelError::UnknownParallelBindingTarget {
-                binding,
-                target,
-            }) if binding == "weight" && target == "model.weigth"
-        ));
+        assert!(matches!(error, Error::Parallel(ref message)
+            if message.contains("binding \"weight\" targets unknown layout entry \"model.weigth\"")));
     }
 }
 

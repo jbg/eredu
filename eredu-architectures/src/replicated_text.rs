@@ -2269,6 +2269,28 @@ impl EligibleConfig<'_> {
         Ok(recipes)
     }
 
+    /// Declares the fused physical inputs which this architecture deliberately
+    /// projects into multiple logical parameters. Other architectures retain
+    /// exclusive source ownership even when malformed recipes happen to repeat.
+    fn shared_derived_source_keys(
+        &self,
+        recipes: &BTreeMap<String, eredu_checkpoint::recipe::DerivedWeightRecipe>,
+    ) -> BTreeSet<String> {
+        if !matches!(self, Self::QwenHybrid(_) | Self::Inkling(_)) {
+            return BTreeSet::new();
+        }
+        let mut claims = BTreeMap::<String, usize>::new();
+        for recipe in recipes.values() {
+            for source in recipe.source_keys().into_iter().collect::<BTreeSet<_>>() {
+                *claims.entry(source.to_owned()).or_default() += 1;
+            }
+        }
+        claims
+            .into_iter()
+            .filter_map(|(source, count)| (count > 1).then_some(source))
+            .collect()
+    }
+
     fn architecture_identity(&self) -> String {
         match self {
             Self::Llama(args) => crate::llama::prompt_cache_architecture_fingerprint(args),
@@ -3596,6 +3618,7 @@ fn replicated_text_requirements_for_structure(
     };
     let (parameters, derived_recipes, derived_recipe_outputs) =
         finalize_materialization_parameters(&config, parameters, recipe_source.as_ref())?;
+    let shared_source_keys = config.shared_derived_source_keys(&derived_recipes);
     let auxiliary = plan
         .prediction_extension()
         .map(|extension| prediction_extension_materialization_parameters(inspection, extension))
@@ -3611,7 +3634,11 @@ fn replicated_text_requirements_for_structure(
         parameters,
     )
     .and_then(|requirements| {
-        requirements.with_derived_recipes(derived_recipes, derived_recipe_outputs)
+        requirements.with_derived_recipes_and_shared_sources(
+            derived_recipes,
+            derived_recipe_outputs,
+            shared_source_keys,
+        )
     })
     .map_err(|error| ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string()))?;
     if let Some((parameters, recipes, outputs)) = auxiliary {
@@ -4792,6 +4819,29 @@ fn gguf_parameters(
             parameter_owner(config, &mapping.layout.name),
             presence,
         )?);
+    }
+    // GGUF encoded-linear companions are dynamically typed native slots. The
+    // architecture explicitly admits only the exact catalog dtype selected for
+    // each companion; ordinary weights retain exact destination dtype matching.
+    for parameter in &mut parameters {
+        if parameter.role() != ReplicatedTextParameterRole::FormatCompanion {
+            continue;
+        }
+        let dtypes = parameter
+            .sources()
+            .iter()
+            .map(|source| {
+                source_catalog
+                    .source_metadata(source)
+                    .map(|metadata| metadata.stored_dtype.into())
+                    .map_err(|error| {
+                        ReplicatedTextRequirementsError::InvalidArtifact(error.to_string())
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        *parameter = parameter
+            .clone()
+            .with_permitted_native_source_dtypes(dtypes);
     }
     finish_parameters_with_tied_output(parameters, config)
 }

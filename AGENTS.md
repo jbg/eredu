@@ -8,7 +8,7 @@ and dependency direction; directory names alone are not an architectural API.
 Keep production dependencies flowing in this direction:
 
 ```text
-eredu-core / eredu-checkpoint / eredu-nn
+eredu-core / eredu-checkpoint / eredu-nn / eredu-media
                     |
               eredu-runtime
                     |
@@ -19,15 +19,15 @@ eredu-core / eredu-checkpoint / eredu-nn
               eredu API
 ```
 
-- `eredu-core`, `eredu-checkpoint`, `eredu-nn`, `eredu-runtime`, and
-  `eredu-codec` are backend-neutral and must not depend on `eredu`,
+- `eredu-core`, `eredu-checkpoint`, `eredu-nn`, `eredu-media`,
+  `eredu-runtime`, and `eredu-codec` are backend-neutral and must not depend on `eredu`,
   `eredu-backend-mlx`, `safemlx`, or another native accelerator runtime.
   Target-specific operating system support for portable facilities is allowed.
 - `eredu-architectures` owns model-family configuration, checkpoint schemas,
   parameter topology, module construction, state geometry, parallel semantic
-  plans, and embedding/layer/output execution. It may use neutral backend
-  traits, but must not import `safemlx`, `eredu::backend`, or another concrete
-  backend.
+  plans, processor request policy, and embedding/layer/output execution. It may
+  use neutral backend traits, but must not import `safemlx`, `eredu::backend`,
+  or another concrete backend.
 - `eredu-backend-mlx` owns reusable MLX tensors, operators,
   streams, completion objects, materialization, cache storage, transfers, and
   collectives. It also owns MLX family composition, which may bind
@@ -41,6 +41,9 @@ eredu-core / eredu-checkpoint / eredu-nn
   types needed to implement the neutral backend traits; that exception does
   not transfer tokenizer, generation, scheduling, or application policy into
   the backend.
+- `eredu-media` owns portable host audio, image, and video validation and
+  processing. It may depend on optional host libraries, but never allocates a
+  backend tensor, selects a device or stream, or depends on a concrete backend.
 
 ## Feature boundary
 
@@ -53,6 +56,8 @@ eredu-core / eredu-checkpoint / eredu-nn
   corresponding features.
 - `eredu-nn` and `eredu-codec` expose no concrete-backend features, including
   under `--all-features`. MLX implementations belong in `eredu-backend-mlx`.
+- `eredu-media` keeps image and audio dependencies optional. Consumers forward
+  only the host-media features they need.
 - Feature-gate concrete backend adapters and backend-specific composition, not
   the family they adapt. If a family integration currently mixes neutral and
   native code, separate those surfaces instead of hiding the family behind the
@@ -92,6 +97,8 @@ cargo check -p eredu-checkpoint
 cargo check -p eredu-runtime
 cargo check -p eredu-nn --all-features
 cargo check -p eredu-codec --all-features
+cargo check -p eredu-media --no-default-features
+cargo check -p eredu-media --all-features
 cargo check -p eredu-architectures
 cargo test -p eredu --no-default-features --test portable_facade
 cargo test -p eredu --no-default-features --test backend_conformance

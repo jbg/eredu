@@ -1,8 +1,16 @@
 //! Shared PCM validation and log-mel feature extraction.
 
+#[cfg(feature = "audio")]
 use rustfft::{num_complex::Complex32, FftPlanner};
 
-use crate::backend::error::Error;
+use crate::{MediaError, ProcessedMediaDtype};
+
+/// Memory order of a log-mel feature buffer.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum LogMelLayout {
+    /// Contiguous row-major `[frames, mel_bins]` order.
+    FramesMelBins,
+}
 
 /// Borrowed mono floating-point PCM waveform.
 #[derive(Debug, Clone, Copy)]
@@ -13,18 +21,16 @@ pub struct AudioWaveform<'a> {
 
 impl<'a> AudioWaveform<'a> {
     /// Validates and creates a mono PCM waveform.
-    pub fn new(samples: &'a [f32], sample_rate: u32) -> Result<Self, Error> {
+    pub fn new(samples: &'a [f32], sample_rate: u32) -> Result<Self, MediaError> {
         if samples.is_empty() {
-            return Err(Error::Processor("audio waveform must not be empty".into()));
+            return Err(MediaError::invalid("audio waveform must not be empty"));
         }
         if sample_rate == 0 {
-            return Err(Error::Processor(
-                "audio sample rate must be positive".into(),
-            ));
+            return Err(MediaError::invalid("audio sample rate must be positive"));
         }
         if samples.iter().any(|sample| !sample.is_finite()) {
-            return Err(Error::Processor(
-                "audio waveform samples must all be finite".into(),
+            return Err(MediaError::invalid(
+                "audio waveform samples must all be finite",
             ));
         }
         Ok(Self {
@@ -70,7 +76,7 @@ pub struct LogMelConfig {
 }
 
 /// Owned model-ready features and their valid-frame mask.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct LogMelFeatures {
     /// Row-major `[frames, mel_bins]` feature values.
     pub values: Vec<f32>,
@@ -80,6 +86,28 @@ pub struct LogMelFeatures {
     pub frames: usize,
     /// Number of mel bins.
     pub mel_bins: usize,
+}
+
+impl LogMelFeatures {
+    /// Scalar dtype of every feature value.
+    pub const fn dtype(&self) -> ProcessedMediaDtype {
+        ProcessedMediaDtype::F32
+    }
+
+    /// Explicit feature memory layout.
+    pub const fn layout(&self) -> LogMelLayout {
+        LogMelLayout::FramesMelBins
+    }
+
+    /// Logical `[frames, mel_bins]` shape.
+    pub const fn shape(&self) -> [usize; 2] {
+        [self.frames, self.mel_bins]
+    }
+
+    /// Valid-frame mask paired one-for-one with the first shape dimension.
+    pub fn frame_mask(&self) -> &[bool] {
+        &self.mask
+    }
 }
 
 /// Model-independent leading-zero Slaney log-mel extraction parameters.
@@ -107,9 +135,27 @@ pub struct LeadingSlaneyLogMelConfig {
 pub fn extract_log_mel(
     waveform: AudioWaveform<'_>,
     config: &LogMelConfig,
-) -> Result<LogMelFeatures, Error> {
+) -> Result<LogMelFeatures, MediaError> {
+    #[cfg(feature = "audio")]
+    {
+        extract_log_mel_enabled(waveform, config)
+    }
+    #[cfg(not(feature = "audio"))]
+    {
+        let _ = (waveform, config);
+        Err(MediaError::invalid(
+            "HTK log-mel extraction requires the `audio` feature",
+        ))
+    }
+}
+
+#[cfg(feature = "audio")]
+fn extract_log_mel_enabled(
+    waveform: AudioWaveform<'_>,
+    config: &LogMelConfig,
+) -> Result<LogMelFeatures, MediaError> {
     if waveform.sample_rate != config.sample_rate {
-        return Err(Error::Processor(format!(
+        return Err(MediaError::invalid(format!(
             "audio processor requires {} Hz PCM, got {} Hz",
             config.sample_rate, waveform.sample_rate
         )));
@@ -117,19 +163,33 @@ pub fn extract_log_mel(
     if config.frame_length == 0
         || config.hop_length == 0
         || config.fft_length < config.frame_length
+        || config.fft_length < 2
         || config.mel_bins == 0
         || config.pad_to_multiple == 0
+        || config.max_samples == 0
+        || !config.min_frequency.is_finite()
+        || !config.max_frequency.is_finite()
+        || config.min_frequency < 0.0
+        || config.max_frequency <= config.min_frequency
+        || config.max_frequency > config.sample_rate as f32 / 2.0
+        || !config.mel_floor.is_finite()
+        || config.mel_floor <= 0.0
     {
-        return Err(Error::Processor(
-            "invalid log-mel processor configuration".into(),
+        return Err(MediaError::invalid(
+            "invalid log-mel processor configuration",
         ));
     }
 
     let real_samples = waveform.samples.len().min(config.max_samples);
-    let padded_samples = real_samples.div_ceil(config.pad_to_multiple) * config.pad_to_multiple;
+    let padded_samples = real_samples
+        .div_ceil(config.pad_to_multiple)
+        .checked_mul(config.pad_to_multiple)
+        .ok_or_else(|| MediaError::invalid("audio padding geometry overflowed"))?;
     let left_padding = config.frame_length / 2;
     let frame_span = config.frame_length + 1;
-    let total = left_padding + padded_samples;
+    let total = left_padding
+        .checked_add(padded_samples)
+        .ok_or_else(|| MediaError::invalid("audio framing geometry overflowed"))?;
     let frames = total.saturating_sub(frame_span) / config.hop_length + 1;
     let mut padded = vec![0.0f32; total];
     padded[left_padding..left_padding + real_samples]
@@ -183,9 +243,27 @@ pub fn extract_log_mel(
 pub fn extract_leading_slaney_log_mel(
     waveform: AudioWaveform<'_>,
     config: &LeadingSlaneyLogMelConfig,
-) -> Result<LogMelFeatures, Error> {
+) -> Result<LogMelFeatures, MediaError> {
+    #[cfg(feature = "audio")]
+    {
+        extract_leading_slaney_log_mel_enabled(waveform, config)
+    }
+    #[cfg(not(feature = "audio"))]
+    {
+        let _ = (waveform, config);
+        Err(MediaError::invalid(
+            "Slaney log-mel extraction requires the `audio` feature",
+        ))
+    }
+}
+
+#[cfg(feature = "audio")]
+fn extract_leading_slaney_log_mel_enabled(
+    waveform: AudioWaveform<'_>,
+    config: &LeadingSlaneyLogMelConfig,
+) -> Result<LogMelFeatures, MediaError> {
     if waveform.sample_rate != config.sample_rate {
-        return Err(Error::Processor(format!(
+        return Err(MediaError::invalid(format!(
             "audio processor requires {} Hz PCM, got {} Hz",
             config.sample_rate, waveform.sample_rate
         )));
@@ -201,8 +279,8 @@ pub fn extract_leading_slaney_log_mel(
         || !config.energy_floor.is_finite()
         || config.energy_floor <= 0.0
     {
-        return Err(Error::Processor(
-            "invalid leading Slaney log-mel configuration".into(),
+        return Err(MediaError::invalid(
+            "invalid leading Slaney log-mel configuration",
         ));
     }
 
@@ -220,10 +298,10 @@ pub fn extract_leading_slaney_log_mel(
     let waveform_end = config
         .leading_zeros
         .checked_add(waveform.samples.len())
-        .ok_or_else(|| Error::Processor("audio framing geometry overflowed".into()))?;
+        .ok_or_else(|| MediaError::invalid("audio framing geometry overflowed"))?;
     if waveform_end > padded.len() {
-        return Err(Error::Processor(
-            "audio framing does not contain the waveform".into(),
+        return Err(MediaError::invalid(
+            "audio framing does not contain the waveform",
         ));
     }
     padded[config.leading_zeros..waveform_end].copy_from_slice(waveform.samples);
@@ -260,6 +338,7 @@ pub fn extract_leading_slaney_log_mel(
     })
 }
 
+#[cfg(feature = "audio")]
 fn htk_mel_filters(config: &LogMelConfig) -> Vec<f32> {
     let frequency_bins = config.fft_length / 2 + 1;
     let hertz_to_mel = |frequency: f32| 2595.0 * (1.0 + frequency / 700.0).log10();
@@ -285,6 +364,7 @@ fn htk_mel_filters(config: &LogMelConfig) -> Vec<f32> {
     filters
 }
 
+#[cfg(feature = "audio")]
 fn slaney_mel_filters(config: &LeadingSlaneyLogMelConfig) -> Vec<f32> {
     let hz_to_mel = |hz: f64| {
         if hz < 1_000.0 {
@@ -322,7 +402,7 @@ fn slaney_mel_filters(config: &LeadingSlaneyLogMelConfig) -> Vec<f32> {
     filters
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "audio"))]
 mod tests {
     use super::{
         extract_leading_slaney_log_mel, extract_log_mel, AudioWaveform, LeadingSlaneyLogMelConfig,
@@ -353,6 +433,36 @@ mod tests {
         assert_eq!(features.values.len(), 99 * 128);
         assert!(features.mask.iter().all(|valid| *valid));
         assert!(features.values.iter().all(|value| value.is_finite()));
+        assert!(features
+            .values
+            .iter()
+            .all(|value| (*value - 1e-3_f32.ln()).abs() < 1e-6));
+    }
+
+    #[test]
+    fn nonzero_impulse_has_stable_htk_log_mel_values() {
+        let samples = [1.0f32, 0.0, 0.0, 0.0];
+        let features = extract_log_mel(
+            AudioWaveform::new(&samples, 8).unwrap(),
+            &LogMelConfig {
+                sample_rate: 8,
+                frame_length: 4,
+                hop_length: 1,
+                fft_length: 4,
+                mel_bins: 1,
+                min_frequency: 0.0,
+                max_frequency: 4.0,
+                mel_floor: 1e-6,
+                max_samples: 4,
+                pad_to_multiple: 4,
+            },
+        )
+        .unwrap();
+        assert_eq!(features.frames, 2);
+        assert_eq!(features.mask, [true, true]);
+        assert_eq!(features.values.len(), 2);
+        assert!((features.values[0] - -0.001_431_296_9).abs() < 1e-6);
+        assert!((features.values[1] - -0.694_577_46).abs() < 1e-6);
     }
 
     #[test]
@@ -379,5 +489,46 @@ mod tests {
             .iter()
             .all(|value| (*value + 10.0).abs() < 1e-6));
         assert!(features.mask.iter().all(|valid| *valid));
+    }
+
+    #[test]
+    fn rejects_invalid_waveforms_and_configs() {
+        assert!(AudioWaveform::new(&[], 16_000).is_err());
+        assert!(AudioWaveform::new(&[0.0], 0).is_err());
+        assert!(AudioWaveform::new(&[f32::NAN], 16_000).is_err());
+
+        let waveform = AudioWaveform::new(&[0.0; 320], 8_000).unwrap();
+        assert!(extract_log_mel(
+            waveform,
+            &LogMelConfig {
+                sample_rate: 16_000,
+                frame_length: 320,
+                hop_length: 160,
+                fft_length: 512,
+                mel_bins: 128,
+                min_frequency: 0.0,
+                max_frequency: 8_000.0,
+                mel_floor: 1e-3,
+                max_samples: 480_000,
+                pad_to_multiple: 128,
+            }
+        )
+        .is_err());
+
+        let waveform = AudioWaveform::new(&[0.0; 320], 16_000).unwrap();
+        assert!(extract_leading_slaney_log_mel(
+            waveform,
+            &LeadingSlaneyLogMelConfig {
+                sample_rate: 16_000,
+                fft_length: 1_600,
+                hop_length: 0,
+                leading_zeros: 800,
+                mel_bins: 80,
+                min_frequency: 0.0,
+                max_frequency: 8_000.0,
+                energy_floor: 1e-10,
+            }
+        )
+        .is_err());
     }
 }

@@ -1,8 +1,7 @@
-//! Typed, architecture-neutral tensor-parallel planning.
+//! MLX-native sampling and synchronization for selected tensor-parallel plans.
 //!
-//! Architecture adapters describe logical parameter roles and exact checkpoint
-//! members. This module converts those descriptions into rank-local placement
-//! and shape information without inspecting checkpoint-name substrings.
+//! Logical rank placement and planning remain in neutral crates; this module
+//! only realizes their native operations.
 
 use eredu_runtime::{
     BroadcastBackend, DistributedExecutionPhase, PartitionCommunicationAuthority, Sampler,

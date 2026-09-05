@@ -1,0 +1,24 @@
+[package]
+name = "eredu-media"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Backend-neutral host media transformations for Eredu"
+readme = "README.md"
+
+[features]
+default = []
+image = ["dep:image"]
+audio = ["dep:rustfft"]
+
+[lints]
+workspace = true
+
+[dependencies]
+eredu-core.workspace = true
+thiserror.workspace = true
+image = { version = "0.25", default-features = false, optional = true }
+rustfft = { version = "6", optional = true }

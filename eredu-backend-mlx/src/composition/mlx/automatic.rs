@@ -484,8 +484,7 @@ impl ExecutionPlanBackendFactory for MlxBackendFactory {
             .map_err(|error| planning_backend_error("select_preparation_policy", error))?;
         let selected = super::loading::select_preparation(inspection, options, policy)
             .map_err(|error| planning_backend_error("select_model_preparation", error))?;
-        let capabilities = super::structural::inspected_session_capabilities(inspection, policy)
-            .map_err(|error| planning_backend_error("select_session_capabilities", error))?;
+        let capabilities = selected.session_capabilities();
         Ok(ExecutionPlanTargetSelection::new(
             policy,
             selected,
@@ -947,13 +946,16 @@ mod tests {
             .bounded_residency_requirement(&inspection, &plan)
             .expect_err("realtime architecture must not enter ordinary bounded probing");
 
-        assert!(matches!(
-            error,
-            AutomaticPlanningError::Backend {
-                operation: "select_model_preparation",
-                ref message,
-            } if message.contains("Realtime loading protocol")
-        ));
+        assert!(
+            matches!(
+                &error,
+                AutomaticPlanningError::Backend {
+                    operation: "select_model_preparation",
+                    message,
+                } if message.contains("loading protocol Realtime")
+            ),
+            "{error:?}"
+        );
         assert_eq!(
             super::super::path_instrumentation::target_native_resource_realization_attempts(),
             0

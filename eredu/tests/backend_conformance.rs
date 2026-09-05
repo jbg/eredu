@@ -512,14 +512,8 @@ impl ModelLoadingBackend for MockBackend {
         Ok(())
     }
 
-    fn session_capabilities(
-        &self,
-        _: &eredu_core::ArtifactInspection<
-            eredu_architectures::processor_plan::ArtifactArchitecturePlan,
-        >,
-        _: eredu_core::PreparationPolicy,
-    ) -> Result<SessionCapabilities, Self::Error> {
-        Ok(SessionCapabilities::new(true, true, false))
+    fn selected_session_capabilities(&self, _: &Self::SelectedPreparation) -> SessionCapabilities {
+        SessionCapabilities::new(true, true, false)
     }
 
     fn model_config(

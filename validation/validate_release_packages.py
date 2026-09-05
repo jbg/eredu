@@ -30,6 +30,7 @@ RELEASE_ORDER = (
     "safemlx",
     "eredu-nn",
     "eredu-runtime",
+    "eredu-media",
     "eredu-architectures",
     "eredu-codec",
     "eredu-evaluation",

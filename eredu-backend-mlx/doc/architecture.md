@@ -33,11 +33,14 @@ signatures.
 ## Materialization and execution
 
 Runtime modules implement checkpoint materialization, sampling, cache storage,
-residency workers, media processing, and collectives. They consume exact
+residency workers, processed-buffer tensor conversion, and collectives. They consume exact
 architecture-owned parameter identities, bindings, recipes, execution-unit
 layouts, and parallel plans; they do not reconstruct family policy from names,
 shapes, or configuration fields.
 
+Canonical artifact identity, prepared-source exactness, declarative parameter
+binding, host media processing, admission/report assembly, replicated-session
+construction, and logical distributed placement come from neutral crates.
 Public checkpoint runtime types are the MLX-owned materializers, materialized
 tensors, errors, and explicit conversion options and reports used by backend
 tooling. Raw SafeTensors visitation, shard discovery, GGUF metadata copying and
@@ -88,7 +91,9 @@ and `LocalInspectionOptions` values through `eredu::api`. Backend tooling may
 instead pass a checked neutral `ParallelRankTopology` and a process-local
 `native::DeviceAssignment` through the root `MlxLoadRequest` adapter. Selection
 projects the architecture's exact groups and routes into an opaque manifest
-before payload access. MLX binds that manifest to the local rank/device context;
+before payload access. The neutral runtime validates complete-world groups,
+routes, capabilities, and realization waves before MLX binds the prepared
+descriptors to the local rank/device context;
 materialization receives only the selected preparation and resolved
 composition-owned construction values. No public MLX parallel-plan or
 family-pipeline construction surface remains.

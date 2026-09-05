@@ -425,6 +425,8 @@ impl WeightStore for GgufWeightStore {
                 physically_bounded,
                 offset_bytes: read.physical_offset,
                 length_bytes: read.physical_byte_len,
+                physical_reads: 1,
+                physical_read_bytes: read.physical_byte_len,
             },
             selection_is_materialized: read.selection_is_materialized,
         })

@@ -4,6 +4,7 @@ use crate::backend::runtime::checkpoint::gguf::GgufCheckpoint;
 #[cfg(test)]
 use serde_json::Value;
 
+#[cfg(test)]
 use eredu_architectures::ModelKind;
 
 #[cfg(test)]
@@ -80,74 +81,46 @@ impl AdmittedGguf {
     }
 }
 
-fn validate_quantization_capability(
-    kind: ModelKind,
-    format: eredu_core::ArtifactFormat,
-    policy: eredu_core::PreparationPolicy,
+fn architecture_admission_capabilities(
     capabilities: eredu_architectures::preparation::ArchitectureCapabilities,
-) -> Result<(), Error> {
-    if policy.quantization().is_none() {
-        return Ok(());
-    }
-    if policy
-        .topology()
-        .is_some_and(|topology| !topology.is_replicated())
-    {
-        // Exact distributed quantization support is selected by the neutral
-        // partitioned realization before payload materialization.
-        return Ok(());
-    }
-    if format == eredu_core::ArtifactFormat::Gguf {
-        // The neutral execution selection validates whether the chosen MLX
-        // linear mechanisms can realize the requested transform. Payload
-        // inspection separately rejects implicit transcoding of packed GGUF.
-        return Ok(());
-    }
-    let supported = policy.residency() == eredu_core::ResidencyRequest::FullyResident
-        || capabilities.nonresident_safetensors_quantization();
-    if supported {
-        return Ok(());
-    }
-    Err(Error::Artifact(
-        eredu_core::artifact::ArtifactError::UnsupportedQuantizationPolicy(format!(
-            "load-time quantization is unavailable for the normalized {} architecture from SafeTensors with {:?} weights on MLX",
-            kind.canonical_name(),
-            policy.residency(),
-        )),
-    ))
+) -> eredu_core::ArchitecturePreparationCapabilities {
+    let parallel = capabilities.parallel_plan();
+    eredu_core::ArchitecturePreparationCapabilities::new(
+        capabilities.independently_addressable_experts(),
+        capabilities.nonresident_safetensors_quantization(),
+        parallel.tensor_parallel(),
+        parallel.pipeline_parallel(),
+        parallel.expert_parallel(),
+        capabilities.input_modalities(),
+    )
 }
 
-fn validate_parameter_bank_capability(
-    kind: ModelKind,
-    capabilities: eredu_architectures::preparation::ArchitectureCapabilities,
-) -> Result<(), Error> {
-    if capabilities.independently_addressable_experts() {
-        return Ok(());
-    }
-    Err(Error::Artifact(
-        eredu_core::artifact::ArtifactError::UnsupportedResidencyPolicy(format!(
-            "independent expert caching is unavailable for the normalized {} architecture on MLX",
-            kind.canonical_name()
-        )),
-    ))
-}
-
-fn validate_preparation_capability_intersection(
-    kind: ModelKind,
-    format: eredu_core::ArtifactFormat,
-    policy: eredu_core::PreparationPolicy,
-    capabilities: eredu_architectures::preparation::ArchitectureCapabilities,
-) -> Result<(), Error> {
-    validate_quantization_capability(kind, format, policy, capabilities)?;
-    if policy.residency() == eredu_core::ResidencyRequest::AddressableParameterBanks {
-        validate_parameter_bank_capability(kind, capabilities)?;
-    }
-    Ok(())
-}
-
-fn requires_architecture_capabilities(policy: eredu_core::PreparationPolicy) -> bool {
-    policy.residency() == eredu_core::ResidencyRequest::AddressableParameterBanks
-        || policy.quantization().is_some()
+/// Cold MLX facts supplied to the portable admission selector.
+pub(crate) const fn preparation_mechanism_capabilities(
+) -> eredu_core::PreparationMechanismCapabilities {
+    let modalities = eredu_core::InputModalities {
+        text: true,
+        image: cfg!(feature = "image"),
+        audio: cfg!(feature = "audio"),
+        video: cfg!(feature = "image"),
+    };
+    eredu_core::PreparationMechanismCapabilities::new(true, true)
+        .with_safetensors_quantization(true, true)
+        .with_gguf_quantized_loading(true)
+        .with_residency(eredu_core::ResidencyRequest::FullyResident, true)
+        .with_residency(eredu_core::ResidencyRequest::LayerwiseHost, true)
+        .with_residency(eredu_core::ResidencyRequest::DenseDiskStream, true)
+        .with_residency(
+            eredu_core::ResidencyRequest::AddressableParameterBanks,
+            true,
+        )
+        .with_parallel_axis(eredu_core::ParallelAxis::Tensor, true)
+        .with_parallel_axis(eredu_core::ParallelAxis::Pipeline, true)
+        .with_parallel_axis(eredu_core::ParallelAxis::Expert, true)
+        .with_parallel_axis(eredu_core::ParallelAxis::Data, true)
+        .with_input_modalities(modalities)
+        .with_exact_completion(true)
+        .with_session(eredu_core::SessionCapabilities::new(true, true, true))
 }
 
 #[cfg(test)]
@@ -157,10 +130,6 @@ fn validate_safetensors_preparation_for_test(
     options: MlxLoadRequest,
 ) -> Result<(), Error> {
     let policy = options.preparation_policy()?;
-    eredu_core::validate_preparation_policy(kind.loading_protocol(), policy)?;
-    if !requires_architecture_capabilities(policy) {
-        return Ok(());
-    }
     let resolved = eredu_architectures::configuration::resolve_model_config(config)?;
     if resolved.kind != kind {
         return Err(Error::ArchitectureModel(format!(
@@ -171,26 +140,26 @@ fn validate_safetensors_preparation_for_test(
     let capabilities =
         eredu_architectures::preparation::prepared_safetensors_capabilities(&resolved.architecture)
             .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    validate_preparation_capability_intersection(
-        kind,
+    let request = eredu_core::PreparationAdmissionRequest::new(
+        kind.loading_protocol(),
         eredu_core::ArtifactFormat::SafeTensors,
         policy,
-        capabilities,
+        architecture_admission_capabilities(capabilities),
     )
+    .with_exact_completion(true);
+    eredu_core::admit_preparation(request, preparation_mechanism_capabilities())
+        .map(drop)
+        .map_err(Into::into)
 }
 
-pub(crate) fn validate_inspected_preparation(
+/// Selects and retains the portable preparation admission before native work.
+pub(crate) fn admit_inspected_preparation(
     inspection: &eredu_core::ArtifactInspection<
         eredu_architectures::processor_plan::ArtifactArchitecturePlan,
     >,
     policy: eredu_core::PreparationPolicy,
-) -> Result<(), Error> {
-    eredu_core::validate_preparation_policy(inspection.configuration().loading_protocol(), policy)?;
-    if !requires_architecture_capabilities(policy) {
-        return Ok(());
-    }
+) -> Result<eredu_core::PreparationAdmission, Error> {
     let architecture_plan = inspection.architecture_plan();
-    let kind = architecture_plan.model_kind();
     let capabilities = match inspection.format() {
         eredu_core::ArtifactFormat::SafeTensors => {
             eredu_architectures::preparation::prepared_safetensors_capabilities(
@@ -220,18 +189,14 @@ pub(crate) fn validate_inspected_preparation(
         }
     }
     .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    validate_preparation_capability_intersection(kind, inspection.format(), policy, capabilities)
-}
-
-/// Derives exact MLX session capabilities without opening checkpoint payloads.
-pub(crate) fn inspected_session_capabilities(
-    inspection: &eredu_core::ArtifactInspection<
-        eredu_architectures::processor_plan::ArtifactArchitecturePlan,
-    >,
-    policy: eredu_core::PreparationPolicy,
-) -> Result<eredu_core::SessionCapabilities, Error> {
-    validate_inspected_preparation(inspection, policy)?;
-    Ok(eredu_core::SessionCapabilities::new(true, true, true))
+    let request = eredu_core::PreparationAdmissionRequest::new(
+        inspection.configuration().loading_protocol(),
+        inspection.format(),
+        policy,
+        architecture_admission_capabilities(capabilities),
+    )
+    .with_exact_completion(true);
+    eredu_core::admit_preparation(request, preparation_mechanism_capabilities()).map_err(Into::into)
 }
 
 #[cfg(test)]
@@ -435,22 +400,18 @@ mod admission_policy_tests {
             Some(eredu_core::QuantizationRequest::MxFp4),
             eredu_core::ResidencyRequest::FullyResident,
         );
-        let capabilities = eredu_architectures::preparation::ArchitectureCapabilities::default();
-
-        validate_quantization_capability(
-            ModelKind::Qwen3,
-            eredu_core::ArtifactFormat::Gguf,
-            policy,
-            capabilities,
-        )
-        .unwrap();
-        validate_quantization_capability(
-            ModelKind::DeepSeekV3,
-            eredu_core::ArtifactFormat::Gguf,
-            policy,
-            capabilities,
-        )
-        .unwrap();
+        let capabilities = architecture_admission_capabilities(
+            eredu_architectures::preparation::ArchitectureCapabilities::default(),
+        );
+        for kind in [ModelKind::Qwen3, ModelKind::DeepSeekV3] {
+            let request = eredu_core::PreparationAdmissionRequest::new(
+                kind.loading_protocol(),
+                eredu_core::ArtifactFormat::Gguf,
+                policy,
+                capabilities,
+            );
+            eredu_core::admit_preparation(request, preparation_mechanism_capabilities()).unwrap();
+        }
     }
 
     #[test]
@@ -464,8 +425,8 @@ mod admission_policy_tests {
         ] {
             assert!(matches!(
                 validate_safetensors_preparation_for_test(kind, &config, options.clone()),
-                Err(Error::Artifact(
-                    eredu_core::artifact::ArtifactError::UnsupportedResidencyPolicy(_)
+                Err(Error::PreparationAdmission(
+                    eredu_core::PreparationAdmissionError::ArchitectureParameterBanks
                 ))
             ));
         }

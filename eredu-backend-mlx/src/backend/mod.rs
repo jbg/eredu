@@ -639,14 +639,11 @@ impl ModelLoadingBackend for MlxBackend<'_> {
         crate::composition::mlx::loading::select_preparation(inspection, options.clone(), policy)
     }
 
-    fn session_capabilities(
+    fn selected_session_capabilities(
         &self,
-        inspection: &eredu_core::ArtifactInspection<
-            eredu_architectures::processor_plan::ArtifactArchitecturePlan,
-        >,
-        policy: eredu_core::PreparationPolicy,
-    ) -> Result<SessionCapabilities, Self::Error> {
-        crate::composition::mlx::structural::inspected_session_capabilities(inspection, policy)
+        selected: &Self::SelectedPreparation,
+    ) -> SessionCapabilities {
+        selected.session_capabilities()
     }
 
     fn model_config(

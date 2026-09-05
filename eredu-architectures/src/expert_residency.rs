@@ -11,8 +11,8 @@ use eredu_core::{
 use eredu_nn::Tensor;
 use eredu_runtime::{
     AddressableExpertRouteProvider, AddressableExpertRouteRequest, AddressableGatedProductBank,
-    CollectiveBackend, CommunicationGroupId, CommunicationPeerCounts, CommunicationTensorMetadata,
-    EvenGatherBackend, ExecutionGroupId, ExpertPass, ExpertRouteCombination, ExpertRouteExchange,
+    CollectiveBackend, CommunicationPeerCounts, CommunicationTensorMetadata, EvenGatherBackend,
+    ExecutionGroupId, ExpertPass, ExpertRouteCombination, ExpertRouteExchange,
     ExpertRouteTensorMovement, ParameterBankKey, PartitionCommunication,
     RoutedExpertTensorParallelOutput, VariableAllToAllBackend,
 };
@@ -180,7 +180,7 @@ pub enum RoutedMechanismExecutionError {
 /// variable-count exchange.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ExpertRouteCountPlan {
-    group: CommunicationGroupId,
+    group: CollectiveGroupId,
     group_size: usize,
     local_rank: usize,
     count_matrix: Vec<usize>,
@@ -191,7 +191,7 @@ pub struct ExpertRouteCountPlan {
 impl ExpertRouteCountPlan {
     /// Validates count consensus and derives exact forward and reverse exchanges.
     pub fn from_consensus(
-        group: CommunicationGroupId,
+        group: CollectiveGroupId,
         local_rank: usize,
         local_send_counts: Vec<usize>,
         count_matrix: Vec<usize>,
@@ -251,7 +251,7 @@ impl ExpertRouteCountPlan {
     }
 
     /// Opaque communication group selected before model construction.
-    pub const fn group(&self) -> CommunicationGroupId {
+    pub const fn group(&self) -> CollectiveGroupId {
         self.group
     }
 
@@ -425,7 +425,7 @@ impl ExpertRoutePackingPlan {
 /// Performs one neutral count-consensus gather before any variable exchange.
 #[allow(clippy::too_many_arguments)]
 pub fn agree_expert_route_counts<B, G, R, I>(
-    group: CommunicationGroupId,
+    group: CollectiveGroupId,
     local_rank: usize,
     local_send_counts: Vec<usize>,
     communication: &PartitionCommunication<B, G, R, I>,
@@ -2068,7 +2068,7 @@ mod tests {
         .unwrap();
         let packing = ExpertRoutePackingPlan::new(&realization, 2, 2, &[2, 3, 2, 3]).unwrap();
         let counts = ExpertRouteCountPlan::from_consensus(
-            CommunicationGroupId::new(71),
+            CollectiveGroupId::new(71),
             1,
             vec![0, 4],
             vec![0, 0, 0, 4],
@@ -2160,7 +2160,7 @@ mod tests {
     #[test]
     fn expert_route_counts_preserve_uneven_and_zero_peer_rows() {
         let plan = ExpertRouteCountPlan::from_consensus(
-            CommunicationGroupId::new(17),
+            CollectiveGroupId::new(17),
             1,
             vec![0, 2, 1],
             vec![2, 0, 1, 0, 2, 1, 4, 0, 0],
@@ -2177,7 +2177,7 @@ mod tests {
     #[test]
     fn expert_route_count_consensus_rejects_changed_local_row() {
         let error = ExpertRouteCountPlan::from_consensus(
-            CommunicationGroupId::new(18),
+            CollectiveGroupId::new(18),
             1,
             vec![0, 2],
             vec![1, 0, 1, 1],
