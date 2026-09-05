@@ -29,13 +29,14 @@ use eredu_nn::{
 use eredu_runtime::{
     bind_materialized_unit, construct_replicated_text_session,
     construct_replicated_text_session_with_runtime, materialize_bindings,
-    prepare_layered_text_contract, prepare_partitioned_session_runtime,
-    prepare_replicated_text_contract, realize_architecture_state,
-    select_replicated_text_realization, ArchitectureBoundary, ArchitectureGroupKind,
-    ArchitectureGroupPlacement, ArchitectureGroupTransport, ArchitectureMergeDestination,
-    ArchitectureParameterDescription, ArchitectureParameters, ArchitecturePartition,
-    ArchitectureStateFactory, BackendMechanismCapabilities, BarrierBackend, CacheResidencyPolicy,
-    CollectiveBackend, CommunicationBackend, CommunicationGroupDescriptor, CommunicationGroupId,
+    materialize_selected_bindings, prepare_layered_text_contract,
+    prepare_partitioned_session_runtime, prepare_replicated_text_contract,
+    realize_architecture_state, select_bindings, select_replicated_text_realization,
+    ArchitectureBoundary, ArchitectureGroupKind, ArchitectureGroupPlacement,
+    ArchitectureGroupTransport, ArchitectureMergeDestination, ArchitectureParameterDescription,
+    ArchitectureParameters, ArchitecturePartition, ArchitectureStateFactory,
+    BackendMechanismCapabilities, BarrierBackend, CacheResidencyPolicy, CollectiveBackend,
+    CommunicationBackend, CommunicationGroupDescriptor, CommunicationGroupId,
     CommunicationGroupRequirements, CommunicationManifest, CommunicationOperation,
     CommunicationOperationRequirement, CommunicationRouteDescriptor, CommunicationRouteId,
     CommunicationTensorLimits, CommunicationTensorMetadata, CompositeLayeredTraversalHook,
@@ -206,8 +207,32 @@ impl Tensor for FakeTensor {
 #[derive(Debug, Clone)]
 struct FakeOperator;
 
+#[derive(Debug, thiserror::Error)]
+enum FakeParameterError {
+    #[error("the fake backend does not support transposed parameter recipes")]
+    UnsupportedTranspose,
+    #[error("the fake backend was asked to select one binding more than once")]
+    RepeatedPreflight,
+    #[error("parameter shape {parameter:?} does not match materialized shape {weight:?}")]
+    ShapeMismatch {
+        parameter: Vec<i32>,
+        weight: Vec<i32>,
+    },
+}
+
 struct FakeModule {
     weight: FakeTensor,
+}
+
+fn fake_parameter_metadata(id: &str) -> eredu_nn::ParameterMetadata {
+    eredu_nn::ParameterMetadata {
+        id: eredu_nn::ParameterId::new(id).unwrap(),
+        trainable: true,
+        alias_of: None,
+        group: None,
+        linear_companion: None,
+        linear_companion_of: None,
+    }
 }
 
 impl Parameterized<FakeTensor> for FakeModule {
@@ -215,16 +240,40 @@ impl Parameterized<FakeTensor> for FakeModule {
     where
         V: ParameterVisitor<'a, FakeTensor>,
     {
+        visitor.visit(fake_parameter_metadata("weight"), &self.weight);
+    }
+
+    fn visit_parameters_mut<'a, V>(&'a mut self, visitor: &mut V)
+    where
+        V: ParameterVisitorMut<'a, FakeTensor>,
+    {
+        visitor.visit_mut(fake_parameter_metadata("weight"), &mut self.weight);
+    }
+
+    fn set_trainable(&mut self, _trainable: bool) {}
+}
+
+struct AtomicFakeModule {
+    first: FakeTensor,
+    second: FakeTensor,
+    duplicate_identity: bool,
+    mutable_mismatch: bool,
+    mutable_visits: usize,
+}
+
+impl Parameterized<FakeTensor> for AtomicFakeModule {
+    fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
+    where
+        V: ParameterVisitor<'a, FakeTensor>,
+    {
+        visitor.visit(fake_parameter_metadata("first"), &self.first);
         visitor.visit(
-            eredu_nn::ParameterMetadata {
-                id: eredu_nn::ParameterId::new("weight").unwrap(),
-                trainable: true,
-                alias_of: None,
-                group: None,
-                linear_companion: None,
-                linear_companion_of: None,
-            },
-            &self.weight,
+            fake_parameter_metadata(if self.duplicate_identity {
+                "first"
+            } else {
+                "second"
+            }),
+            &self.second,
         );
     }
 
@@ -232,16 +281,17 @@ impl Parameterized<FakeTensor> for FakeModule {
     where
         V: ParameterVisitorMut<'a, FakeTensor>,
     {
+        self.mutable_visits += 2;
+        visitor.visit_mut(fake_parameter_metadata("first"), &mut self.first);
         visitor.visit_mut(
-            eredu_nn::ParameterMetadata {
-                id: eredu_nn::ParameterId::new("weight").unwrap(),
-                trainable: true,
-                alias_of: None,
-                group: None,
-                linear_companion: None,
-                linear_companion_of: None,
-            },
-            &mut self.weight,
+            fake_parameter_metadata(if self.mutable_mismatch {
+                "third"
+            } else if self.duplicate_identity {
+                "first"
+            } else {
+                "second"
+            }),
+            &mut self.second,
         );
     }
 
@@ -1410,11 +1460,30 @@ impl ParameterBackend for FakeBackend {
     type MaterializedWeight = FakeTensor;
     type MaterializationContext = ();
     type Materialization = FakeTensor;
-    type ParameterError = Infallible;
+    type ParameterError = FakeParameterError;
+    fn preflight_recipe(
+        recipe: &eredu_checkpoint::recipe::DerivedWeightRecipe,
+        _source: &dyn eredu_checkpoint::store::CheckpointSource,
+    ) -> Result<(), Self::ParameterError> {
+        static SINGLE_PREFLIGHT_CALLS: AtomicUsize = AtomicUsize::new(0);
+        if recipe.source_keys().contains(&"single-preflight")
+            && SINGLE_PREFLIGHT_CALLS.fetch_add(1, Ordering::SeqCst) != 0
+        {
+            return Err(FakeParameterError::RepeatedPreflight);
+        }
+        if matches!(
+            recipe,
+            eredu_checkpoint::recipe::DerivedWeightRecipe::Transpose { .. }
+        ) {
+            Err(FakeParameterError::UnsupportedTranspose)
+        } else {
+            Ok(())
+        }
+    }
     fn materialize(
         lease: eredu_checkpoint::store::CheckpointLease,
         _: &(),
-    ) -> Result<Self::Materialization, Infallible> {
+    ) -> Result<Self::Materialization, Self::ParameterError> {
         use eredu_checkpoint::store::EncodedTensorLease;
         Ok(FakeTensor(
             lease
@@ -1428,7 +1497,7 @@ impl ParameterBackend for FakeBackend {
         recipe: &eredu_checkpoint::recipe::DerivedWeightRecipe,
         source: &dyn eredu_checkpoint::store::CheckpointSource,
         _: &(),
-    ) -> Result<Self::Materialization, Infallible> {
+    ) -> Result<Self::Materialization, Self::ParameterError> {
         let metadata = recipe
             .infer(source)
             .expect("fake-backend recipes are validated by the neutral catalog");
@@ -1445,26 +1514,28 @@ impl ParameterBackend for FakeBackend {
     }
     fn finish_materialization(
         materialization: Self::Materialization,
-    ) -> Result<Self::MaterializedWeight, Infallible> {
+    ) -> Result<Self::MaterializedWeight, Self::ParameterError> {
         Ok(materialization)
     }
     fn share_materialized_weight(
         weight: &Self::MaterializedWeight,
-    ) -> Result<Self::MaterializedWeight, Infallible> {
+    ) -> Result<Self::MaterializedWeight, Self::ParameterError> {
         Ok(weight.clone())
     }
     fn validate_bind(
-        _parameter: &Self::Parameter,
-        _weight: &Self::MaterializedWeight,
-    ) -> Result<(), Infallible> {
+        parameter: &Self::Parameter,
+        weight: &Self::MaterializedWeight,
+    ) -> Result<(), Self::ParameterError> {
+        if parameter.0 != weight.0 {
+            return Err(FakeParameterError::ShapeMismatch {
+                parameter: parameter.0.clone(),
+                weight: weight.0.clone(),
+            });
+        }
         Ok(())
     }
-    fn bind(
-        parameter: &mut Self::Parameter,
-        weight: Self::MaterializedWeight,
-    ) -> Result<(), Infallible> {
+    fn bind(parameter: &mut Self::Parameter, weight: Self::MaterializedWeight) {
         *parameter = weight;
-        Ok(())
     }
 }
 
@@ -1537,7 +1608,7 @@ fn neutral_loader_materializes_and_binds_the_fake_backend() {
     assert!(unit.contains(&id));
 
     let mut module = FakeModule {
-        weight: FakeTensor(vec![0]),
+        weight: FakeTensor(vec![2, 2]),
     };
     bind_materialized_unit::<FakeBackend, _>(&mut module, unit).unwrap();
     assert_eq!(module.weight, FakeTensor(vec![2, 2]));
@@ -1620,6 +1691,145 @@ fn invalid_alias_graph_fails_before_any_physical_read() {
     ];
     assert!(materialize_bindings::<FakeBackend>(&source, &bindings, &()).is_err());
     assert_eq!(leases.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn later_unsupported_recipe_fails_before_any_physical_read() {
+    use eredu_checkpoint::{
+        recipe::DerivedWeightRecipe,
+        store::{MemoryWeightStore, TensorSelection},
+    };
+
+    let leases = Arc::new(AtomicUsize::new(0));
+    let inner = MemoryWeightStore::from_safetensors([
+        (
+            "first".to_owned(),
+            safetensors::Dtype::F32,
+            vec![2, 2],
+            vec![0; 16],
+        ),
+        (
+            "second".to_owned(),
+            safetensors::Dtype::F32,
+            vec![2, 2],
+            vec![0; 16],
+        ),
+    ])
+    .unwrap();
+    let source: eredu_checkpoint::store::SharedCheckpointSource = Arc::new(CountingSource {
+        inner,
+        leases: Arc::clone(&leases),
+    });
+    let bindings = vec![
+        WeightBinding::new("first", "first", TensorSelection::Full, 16).unwrap(),
+        WeightBinding::from_recipe(
+            "second",
+            DerivedWeightRecipe::Transpose {
+                input: Box::new(DerivedWeightRecipe::source("second", TensorSelection::Full)),
+                axes: vec![1, 0],
+            },
+            16,
+        )
+        .unwrap(),
+    ];
+
+    assert!(select_bindings::<FakeBackend>(Arc::clone(&source), bindings.clone()).is_err());
+    assert!(materialize_bindings::<FakeBackend>(source.as_ref(), &bindings, &()).is_err());
+    assert_eq!(leases.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn selected_binding_plan_does_not_repeat_backend_preflight() {
+    use eredu_checkpoint::store::{MemoryWeightStore, TensorSelection};
+
+    let source: eredu_checkpoint::store::SharedCheckpointSource = Arc::new(
+        MemoryWeightStore::from_safetensors([(
+            "single-preflight".to_owned(),
+            safetensors::Dtype::F32,
+            vec![2, 2],
+            vec![0; 16],
+        )])
+        .unwrap(),
+    );
+    let binding =
+        WeightBinding::new("weight", "single-preflight", TensorSelection::Full, 16).unwrap();
+    let selected = select_bindings::<FakeBackend>(source, vec![binding]).unwrap();
+    let unit = materialize_selected_bindings::<FakeBackend>(selected, &()).unwrap();
+    assert_eq!(unit.len(), 1);
+}
+
+fn atomic_binding_fixture(
+    bindings: &[(&str, &str)],
+) -> eredu_runtime::MaterializedUnit<FakeBackend> {
+    use eredu_checkpoint::store::{MemoryWeightStore, TensorSelection};
+
+    let source = MemoryWeightStore::from_safetensors(bindings.iter().map(|(_, checkpoint)| {
+        (
+            (*checkpoint).to_owned(),
+            safetensors::Dtype::F32,
+            vec![2, 2],
+            vec![0; 16],
+        )
+    }))
+    .unwrap();
+    let bindings = bindings
+        .iter()
+        .map(|(parameter, checkpoint)| {
+            WeightBinding::new(*parameter, *checkpoint, TensorSelection::Full, 16).unwrap()
+        })
+        .collect::<Vec<_>>();
+    materialize_bindings::<FakeBackend>(&source, &bindings, &()).unwrap()
+}
+
+#[test]
+fn duplicate_module_parameter_identity_fails_before_mutable_traversal() {
+    let unit = atomic_binding_fixture(&[("first", "first")]);
+    let mut module = AtomicFakeModule {
+        first: FakeTensor(vec![2, 2]),
+        second: FakeTensor(vec![2, 2]),
+        duplicate_identity: true,
+        mutable_mismatch: false,
+        mutable_visits: 0,
+    };
+
+    assert!(bind_materialized_unit::<FakeBackend, _>(&mut module, unit).is_err());
+    assert_eq!(module.mutable_visits, 0);
+}
+
+#[test]
+fn bind_validation_failure_is_atomic() {
+    let unit = atomic_binding_fixture(&[("first", "first"), ("second", "second")]);
+    let mut module = AtomicFakeModule {
+        first: FakeTensor(vec![2, 2]),
+        second: FakeTensor(vec![1]),
+        duplicate_identity: false,
+        mutable_mismatch: false,
+        mutable_visits: 0,
+    };
+    let before = (module.first.clone(), module.second.clone());
+
+    assert!(bind_materialized_unit::<FakeBackend, _>(&mut module, unit).is_err());
+    assert_eq!(module.mutable_visits, 0);
+    assert_eq!((module.first, module.second), before);
+}
+
+#[test]
+fn immutable_and_mutable_traversal_disagreement_fails_before_binding() {
+    let unit = atomic_binding_fixture(&[("first", "first"), ("second", "second")]);
+    let mut module = AtomicFakeModule {
+        first: FakeTensor(vec![2, 2]),
+        second: FakeTensor(vec![2, 2]),
+        duplicate_identity: false,
+        mutable_mismatch: true,
+        mutable_visits: 0,
+    };
+    let before = (module.first.clone(), module.second.clone());
+
+    assert!(matches!(
+        bind_materialized_unit::<FakeBackend, _>(&mut module, unit),
+        Err(eredu_runtime::ParameterOrchestrationError::ParameterTraversalMismatch { .. })
+    ));
+    assert_eq!((module.first, module.second), before);
 }
 
 #[derive(Debug, Clone)]

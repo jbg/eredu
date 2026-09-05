@@ -748,6 +748,11 @@ pub trait ParameterVisitorMut<'a, T: 'a> {
 }
 
 /// Backend-neutral parameter topology for a module or operator.
+///
+/// Immutable and mutable traversal must expose the same complete set of stable
+/// identities. Repeated mutable traversals must preserve that set until a
+/// visitor replaces a parameter value; runtime binding relies on this law to
+/// validate the whole topology before publishing any replacement.
 pub trait Parameterized<T: 'static> {
     /// Visits every parameter exactly once using stable identities.
     fn visit_parameters<'a, V>(&'a self, visitor: &mut V)

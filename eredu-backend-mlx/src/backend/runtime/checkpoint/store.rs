@@ -40,7 +40,7 @@ use eredu_checkpoint::store::{
 #[cfg(test)]
 use eredu_gguf::TensorSelection as GgufTensorSelection;
 
-fn safetensors_dtype(
+pub(super) fn safetensors_dtype(
     key: &str,
     value: &StoredDtype,
 ) -> Result<Dtype, CheckpointMaterializationError> {

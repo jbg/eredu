@@ -178,8 +178,9 @@ pub use parallel::{
     ProjectionSharding, ShardingPolicy, TensorPlacement,
 };
 pub use parameter::{
-    bind_materialized_unit, bindings_from_recipe_set, materialize_bindings, MaterializedUnit,
-    ParameterOrchestrationError, RecipeBindingError,
+    bind_materialized_unit, bindings_from_recipe_set, materialize_bindings,
+    materialize_selected_bindings, select_bindings, MaterializedUnit, ParameterOrchestrationError,
+    RecipeBindingError, SelectedBindingPlan,
 };
 pub use partition::{
     validate_boundary_tensor_count, ArchitectureBoundary, ArchitectureBoundaryError,

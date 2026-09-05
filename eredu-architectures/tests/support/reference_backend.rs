@@ -1054,6 +1054,16 @@ impl ParameterBackend for ReferenceBackend {
     type Materialization = ReferenceTensor;
     type ParameterError = std::convert::Infallible;
 
+    fn preflight_recipe(
+        recipe: &eredu_checkpoint::recipe::DerivedWeightRecipe,
+        source: &dyn eredu_checkpoint::store::CheckpointSource,
+    ) -> Result<(), Self::ParameterError> {
+        recipe
+            .infer(source)
+            .expect("validated reference parameter recipe");
+        Ok(())
+    }
+
     fn materialize(
         lease: eredu_checkpoint::store::CheckpointLease,
         _: &(),
@@ -1107,12 +1117,8 @@ impl ParameterBackend for ReferenceBackend {
         Ok(())
     }
 
-    fn bind(
-        parameter: &mut Self::Parameter,
-        weight: Self::MaterializedWeight,
-    ) -> Result<(), Self::ParameterError> {
+    fn bind(parameter: &mut Self::Parameter, weight: Self::MaterializedWeight) {
         *parameter = weight;
-        Ok(())
     }
 }
 

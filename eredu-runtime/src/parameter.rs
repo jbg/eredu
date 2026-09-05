@@ -1,10 +1,10 @@
 //! Backend-neutral checkpoint materialization and parameter binding.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, marker::PhantomData};
 
 use eredu_checkpoint::{
     recipe::{AtomicRecipeSet, RecipeCatalog, RecipeError},
-    store::{CheckpointSource, ReadPolicy, StoreError, TensorReadRequest},
+    store::{CheckpointSource, ReadPolicy, SharedCheckpointSource, StoreError, TensorReadRequest},
 };
 use eredu_nn::{
     ParameterId, ParameterMetadata, ParameterVisitor, ParameterVisitorMut, Parameterized,
@@ -53,6 +53,66 @@ pub struct MaterializedUnit<B: ParameterBackend> {
     weights: BTreeMap<ParameterId, B::MaterializedWeight>,
 }
 
+/// An immutable binding unit admitted by one backend against one exact source.
+///
+/// Construction is intentionally restricted to [`select_bindings`]. Consuming
+/// this token materializes the already selected operations without asking the
+/// backend to select them again.
+pub struct SelectedBindingPlan<B: ParameterBackend> {
+    source: SharedCheckpointSource,
+    bindings: Vec<WeightBinding>,
+    backend: PhantomData<fn() -> B>,
+}
+
+impl<B: ParameterBackend> std::fmt::Debug for SelectedBindingPlan<B> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SelectedBindingPlan")
+            .field("bindings", &self.bindings)
+            .finish_non_exhaustive()
+    }
+}
+
+fn validated_binding_plan<'a, B: ParameterBackend>(
+    source: &dyn CheckpointSource,
+    bindings: &'a [WeightBinding],
+) -> Result<WeightBindingPlan<'a>, ParameterOrchestrationError<B::ParameterError>> {
+    let plan = WeightBindingPlan::new(bindings)?;
+    for binding in plan.owners() {
+        let inferred = binding.source_recipe().infer(source)?;
+        if inferred.byte_len() != binding.expected_bytes() {
+            return Err(ParameterOrchestrationError::ByteMismatch {
+                parameter: binding.name().to_owned(),
+                expected: binding.expected_bytes(),
+                actual: inferred.byte_len(),
+            });
+        }
+    }
+    for binding in plan.owners() {
+        B::preflight_recipe(&binding.source_recipe(), source)
+            .map_err(ParameterOrchestrationError::Backend)?;
+    }
+    Ok(plan)
+}
+
+/// Selects a complete immutable binding unit against one exact source.
+///
+/// Selection validates every declaration, recipe, byte count, and backend
+/// capability without reading payloads, allocating native tensors, or
+/// publishing parameters. The returned token owns both the source and tasks so
+/// later materialization cannot substitute either or repeat backend selection.
+pub fn select_bindings<B: ParameterBackend>(
+    source: SharedCheckpointSource,
+    bindings: Vec<WeightBinding>,
+) -> Result<SelectedBindingPlan<B>, ParameterOrchestrationError<B::ParameterError>> {
+    validated_binding_plan::<B>(source.as_ref(), &bindings)?;
+    Ok(SelectedBindingPlan {
+        source,
+        bindings,
+        backend: PhantomData,
+    })
+}
+
 impl<B: ParameterBackend> MaterializedUnit<B> {
     /// Returns the number of realized parameter values.
     pub fn len(&self) -> usize {
@@ -80,17 +140,31 @@ pub fn materialize_bindings<B: ParameterBackend>(
     bindings: &[WeightBinding],
     context: &B::MaterializationContext,
 ) -> Result<MaterializedUnit<B>, ParameterOrchestrationError<B::ParameterError>> {
-    let plan = WeightBindingPlan::new(bindings)?;
-    for binding in plan.owners() {
-        let inferred = binding.source_recipe().infer(source)?;
-        if inferred.byte_len() != binding.expected_bytes() {
-            return Err(ParameterOrchestrationError::ByteMismatch {
-                parameter: binding.name().to_owned(),
-                expected: binding.expected_bytes(),
-                actual: inferred.byte_len(),
-            });
-        }
-    }
+    let plan = validated_binding_plan::<B>(source, bindings)?;
+    materialize_validated_plan::<B>(source, plan, context)
+}
+
+/// Materializes a previously selected binding unit without repeating backend
+/// capability selection.
+pub fn materialize_selected_bindings<B: ParameterBackend>(
+    selected: SelectedBindingPlan<B>,
+    context: &B::MaterializationContext,
+) -> Result<MaterializedUnit<B>, ParameterOrchestrationError<B::ParameterError>> {
+    let SelectedBindingPlan {
+        source,
+        bindings,
+        backend: _,
+    } = selected;
+    let plan = WeightBindingPlan::new(&bindings)
+        .expect("selected binding declarations remain immutable after admission");
+    materialize_validated_plan::<B>(source.as_ref(), plan, context)
+}
+
+fn materialize_validated_plan<B: ParameterBackend>(
+    source: &dyn CheckpointSource,
+    plan: WeightBindingPlan<'_>,
+    context: &B::MaterializationContext,
+) -> Result<MaterializedUnit<B>, ParameterOrchestrationError<B::ParameterError>> {
     let mut weights = BTreeMap::new();
     for binding in plan.owners() {
         let materialization = match binding.recipe() {
@@ -155,6 +229,12 @@ where
             if self.error.is_some() {
                 return;
             }
+            if self.visited.insert(metadata.id.clone(), ()).is_some() {
+                self.error = Some(ParameterOrchestrationError::DuplicateParameter {
+                    parameter: metadata.id,
+                });
+                return;
+            }
             let Some(weight) = self.weights.get(&metadata.id) else {
                 self.error = Some(ParameterOrchestrationError::MissingBinding {
                     parameter: metadata.id,
@@ -163,9 +243,7 @@ where
             };
             if let Err(error) = B::validate_bind(parameter, weight) {
                 self.error = Some(ParameterOrchestrationError::Backend(error));
-                return;
             }
-            self.visited.insert(metadata.id, ());
         }
     }
 
@@ -190,41 +268,74 @@ where
         });
     }
 
+    struct MutableTopologyValidator<'a> {
+        expected: &'a BTreeMap<ParameterId, ()>,
+        visited: BTreeMap<ParameterId, ()>,
+        unexpected: Vec<ParameterId>,
+        duplicate: Option<ParameterId>,
+    }
+
+    impl<'a, 'value, P: 'value> ParameterVisitorMut<'value, P> for MutableTopologyValidator<'a> {
+        fn visit_mut(&mut self, metadata: ParameterMetadata, _: &'value mut P) {
+            if self.duplicate.is_some() {
+                return;
+            }
+            if self.visited.insert(metadata.id.clone(), ()).is_some() {
+                self.duplicate = Some(metadata.id);
+            } else if !self.expected.contains_key(&metadata.id) {
+                self.unexpected.push(metadata.id);
+            }
+        }
+    }
+
+    let mut mutable_topology = MutableTopologyValidator {
+        expected: &validator.visited,
+        visited: BTreeMap::new(),
+        unexpected: Vec::new(),
+        duplicate: None,
+    };
+    module.visit_parameters_mut(&mut mutable_topology);
+    if let Some(parameter) = mutable_topology.duplicate {
+        return Err(ParameterOrchestrationError::DuplicateParameter { parameter });
+    }
+    let mut mismatch = mutable_topology.unexpected;
+    mismatch.extend(
+        validator
+            .visited
+            .keys()
+            .filter(|id| !mutable_topology.visited.contains_key(*id))
+            .cloned(),
+    );
+    if !mismatch.is_empty() {
+        mismatch.sort();
+        mismatch.dedup();
+        return Err(ParameterOrchestrationError::ParameterTraversalMismatch {
+            parameters: mismatch,
+        });
+    }
+
     struct Binder<'a, B: ParameterBackend> {
         weights: &'a mut BTreeMap<ParameterId, B::MaterializedWeight>,
-        error: Option<ParameterOrchestrationError<B::ParameterError>>,
     }
 
     impl<'a, 'value, B: ParameterBackend> ParameterVisitorMut<'value, B::Parameter> for Binder<'a, B> {
         fn visit_mut(&mut self, metadata: ParameterMetadata, parameter: &'value mut B::Parameter) {
-            if self.error.is_some() {
-                return;
-            }
-            let Some(weight) = self.weights.remove(&metadata.id) else {
-                self.error = Some(ParameterOrchestrationError::MissingBinding {
-                    parameter: metadata.id,
-                });
-                return;
-            };
-            if let Err(error) = B::bind(parameter, weight) {
-                self.error = Some(ParameterOrchestrationError::Backend(error));
-            }
+            let weight = self
+                .weights
+                .remove(&metadata.id)
+                .expect("prepublication mutable traversal validated every binding identity");
+            B::bind(parameter, weight);
         }
     }
 
     let mut binder = Binder::<B> {
         weights: &mut unit.weights,
-        error: None,
     };
     module.visit_parameters_mut(&mut binder);
-    if let Some(error) = binder.error {
-        return Err(error);
-    }
-    if !unit.weights.is_empty() {
-        return Err(ParameterOrchestrationError::UnexpectedBindings {
-            parameters: unit.weights.into_keys().collect(),
-        });
-    }
+    assert!(
+        unit.weights.is_empty(),
+        "prepublication mutable traversal validated complete binding consumption"
+    );
     Ok(())
 }
 
@@ -251,6 +362,18 @@ where
     DuplicateBinding {
         /// Duplicated identity.
         parameter: ParameterId,
+    },
+    /// A module traversal repeated one stable destination identity.
+    #[error("module parameter traversal repeats identity {parameter}")]
+    DuplicateParameter {
+        /// Repeated module parameter identity.
+        parameter: ParameterId,
+    },
+    /// Immutable and mutable module traversals declared different identities.
+    #[error("immutable and mutable module parameter traversals disagree: {parameters:?}")]
+    ParameterTraversalMismatch {
+        /// Identities present in only one traversal.
+        parameters: Vec<ParameterId>,
     },
     /// Inferred and declared materialized byte sizes disagreed.
     #[error("parameter {parameter:?} declares {expected} bytes but its recipe produces {actual}")]

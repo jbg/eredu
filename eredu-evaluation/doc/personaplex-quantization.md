@@ -25,7 +25,7 @@ produce codec noise rather than meaningful speech.
 ## Run one comparison
 
 ```sh
-cargo run --release -p eredu-backend-mlx --features codec \
+cargo run --release -p eredu-backend-mlx \
   --example personaplex_quantization_eval -- \
   /path/to/personaplex-dense \
   /path/to/personaplex-quantized \

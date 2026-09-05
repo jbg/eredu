@@ -315,6 +315,41 @@ impl<'de> Deserialize<'de> for UniqueWeightMap {
     }
 }
 
+#[derive(Debug)]
+struct UniqueHeader(BTreeMap<String, serde_json::Value>);
+
+impl<'de> Deserialize<'de> for UniqueHeader {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = UniqueHeader;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a SafeTensors header with unique tensor names")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut values = BTreeMap::new();
+                while let Some((key, value)) = map.next_entry::<String, serde_json::Value>()? {
+                    if values.insert(key.clone(), value).is_some() {
+                        return Err(serde::de::Error::custom(format!(
+                            "duplicate SafeTensors header entry for {key:?}"
+                        )));
+                    }
+                }
+                Ok(UniqueHeader(values))
+            }
+        }
+        deserializer.deserialize_map(Visitor)
+    }
+}
+
 fn validate_indexed_shards(
     index_path: &Path,
     indexed_names: &BTreeMap<PathBuf, BTreeSet<String>>,
@@ -370,9 +405,10 @@ fn read_tensor_names(path: &Path) -> Result<BTreeSet<String>, SafetensorsShardEr
     let mut header = vec![0_u8; header_len];
     file.read_exact(&mut header)
         .map_err(|error| malformed_shard(path, error.to_string()))?;
-    let raw = serde_json::from_slice::<BTreeMap<String, serde_json::Value>>(&header)
+    let raw = serde_json::from_slice::<UniqueHeader>(&header)
         .map_err(|error| malformed_shard(path, error.to_string()))?;
     Ok(raw
+        .0
         .into_keys()
         .filter(|name| name != "__metadata__")
         .collect())
@@ -406,6 +442,8 @@ fn read_tensor_metadata(
         .map_err(|_| malformed_shard(path, "header length overflows usize"))?;
     let mut header = vec![0_u8; header_len_usize];
     file.read_exact(&mut header)
+        .map_err(|error| malformed_shard(path, error.to_string()))?;
+    serde_json::from_slice::<UniqueHeader>(&header)
         .map_err(|error| malformed_shard(path, error.to_string()))?;
     let metadata: Metadata = serde_json::from_slice(&header)
         .map_err(|error| malformed_shard(path, error.to_string()))?;
@@ -685,6 +723,27 @@ mod tests {
             SafetensorsShardError::MalformedShard { .. }
         ));
         assert!(error.to_string().contains("provides 3"));
+    }
+
+    #[test]
+    fn metadata_catalog_rejects_duplicate_tensor_names_within_one_header() {
+        let root = tempfile::tempdir().unwrap();
+        let shard = root.path().join("duplicate.safetensors");
+        let header = br#"{"weight":{"dtype":"U8","shape":[1],"data_offsets":[0,1]},"weight":{"dtype":"U8","shape":[1],"data_offsets":[0,1]}}"#;
+        let mut padded = header.to_vec();
+        padded.resize(padded.len().next_multiple_of(8), b' ');
+        let mut file = File::create(&shard).unwrap();
+        file.write_all(&(padded.len() as u64).to_le_bytes())
+            .unwrap();
+        file.write_all(&padded).unwrap();
+        file.write_all(&[0]).unwrap();
+
+        let error = SafetensorsMetadataCatalog::discover(&shard).unwrap_err();
+        assert!(matches!(
+            error,
+            SafetensorsShardError::MalformedShard { .. }
+        ));
+        assert!(error.to_string().contains("duplicate SafeTensors header"));
     }
 
     #[test]

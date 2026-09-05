@@ -1,6 +1,6 @@
 [package]
 name = "eredu-backend-mlx"
-version = "0.8.0"
+version = "0.9.0"
 edition.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -14,6 +14,7 @@ include = [
     "src/**",
     "tests/**",
     "examples/*.rs",
+    "examples/support/**",
     "validation/*.py",
     "doc/**",
     "README.md",
@@ -28,22 +29,19 @@ targets = [
     "x86_64-pc-windows-msvc",
 ]
 no-default-features = true
-features = ["image", "codec"]
+features = ["image"]
 
 [[example]]
 name = "mimi_realtime_bench"
 path = "examples/mimi_realtime_bench.rs"
-required-features = ["codec"]
 
 [[example]]
 name = "personaplex_full_path_bench"
 path = "examples/personaplex_full_path_bench.rs"
-required-features = ["codec"]
 
 [[example]]
 name = "personaplex_quantization_eval"
 path = "examples/personaplex_quantization_eval.rs"
-required-features = ["codec"]
 
 [features]
 default = []
@@ -53,7 +51,6 @@ cuda = ["safemlx/cuda"]
 nccl = ["cuda", "safemlx/nccl"]
 image = ["dep:image"]
 audio = ["dep:rustfft"]
-codec = ["audio", "dep:eredu-codec"]
 
 [lints]
 workspace = true
@@ -65,7 +62,6 @@ eredu-nn.workspace = true
 eredu-runtime.workspace = true
 eredu-architectures.workspace = true
 eredu-gguf.workspace = true
-eredu-codec = { workspace = true, optional = true }
 safemlx = { workspace = true, default-features = false, features = ["safetensors"] }
 eredu-backend-mlx-macros.workspace = true
 serde = { version = "1", features = ["derive"] }
@@ -83,6 +79,7 @@ ref-cast = "1"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 eredu-evaluation.workspace = true
+eredu-codec.workspace = true
 eredu-text = { workspace = true, default-features = false }
 tempfile.workspace = true
 float_eq = "1"

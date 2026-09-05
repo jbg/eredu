@@ -1,16 +1,17 @@
 # eredu-codec
 
 `eredu-codec` contains backend-neutral neural-audio architectures used with
-Eredu's realtime speech models. Backends construct `Mimi<T>`, use
-`checkpoint_tensor_plan` to map released checkpoint tensors, and populate the
-model through `Mimi::load_parameters`.
+Eredu's realtime speech models. Mimi checkpoint preparation validates the
+released SafeTensors catalog and produces exact neutral parameter recipes.
+`construct` materializes and atomically binds those recipes through any
+general `ParameterBackend`, returning the ordinary `Mimi<B::Tensor>` type.
 
 ## Mimi
 
 The `mimi` module implements the Mimi encoder, residual vector quantizer, and
 decoder used by Moshi-family speech models. It supports:
 
-- backend-neutral checkpoint name and tensor-layout planning;
+- exact backend-neutral checkpoint admission and tensor-layout recipes;
 - selecting an active subset of a checkpoint's codebooks;
 - PCM-to-token and token-to-PCM conversion;
 - latent-to-token and token-to-latent conversion; and
@@ -35,9 +36,10 @@ playback, resampling, and device selection remain application concerns.
 
 ## Evaluation tools
 
-Concrete backend integrations own executable Mimi benchmarks and PersonaPlex
-evaluation entry points; this crate has no concrete-backend feature or
-accelerator dependency. See the [PersonaPlex quantization evaluation
+Executable Mimi benchmarks and PersonaPlex evaluation entry points select a
+backend's general parameter mechanisms and use this crate's neutral
+constructor. This crate has no concrete-backend feature or accelerator
+dependency. See the [PersonaPlex quantization evaluation
 guide](https://github.com/jbg/eredu/blob/main/eredu-evaluation/doc/personaplex-quantization.md).
 
 ## License

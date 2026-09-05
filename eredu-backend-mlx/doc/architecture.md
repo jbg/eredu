@@ -80,7 +80,8 @@ it. Direct CUDA facade builds therefore use `--no-default-features` with
 
 This crate has no default features and disables `safemlx` defaults, so direct
 users explicitly select native execution support. Enable `image` or `audio`
-for the corresponding processor support and `codec` for the MLX Mimi binding.
+for the corresponding processor support. Neutral codec constructors use the
+base generic checkpoint and parameter-materialization mechanisms.
 
 Application clients should use portable `ExecutionPlan`, `LocalLoadOptions`,
 and `LocalInspectionOptions` values through `eredu::api`. Backend tooling may

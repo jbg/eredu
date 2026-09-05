@@ -1,6 +1,14 @@
 use std::{path::PathBuf, time::Instant};
 
-use eredu_backend_mlx::{codec::mimi::load, native::ExecutionContext, MlxTensor};
+use eredu_backend_mlx::{
+    backend::{
+        nn::shared::MlxNeuralBackend,
+        runtime::checkpoint::store::MlxParameterMaterializationContext,
+    },
+    native::ExecutionContext,
+    MlxTensor,
+};
+use eredu_codec::mimi::{construct, prepare_checkpoint, Config};
 use eredu_nn::Tensor;
 use safemlx::{ops::indexing::TryIndexOp, transforms::eval, Array, Device, DeviceType};
 
@@ -35,7 +43,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let stream = ctx.stream();
 
     let load_start = Instant::now();
-    let mut mimi = load(&checkpoint, Some(codebooks), stream)?;
+    let prepared = prepare_checkpoint(&checkpoint, Config::v0_1(Some(codebooks)))?;
+    let materialization = MlxParameterMaterializationContext::new(stream, stream);
+    let mut mimi = construct::<MlxNeuralBackend>(prepared, stream, &materialization)?;
     stream.synchronize()?;
     println!("load_s={:.3}", load_start.elapsed().as_secs_f64());
 

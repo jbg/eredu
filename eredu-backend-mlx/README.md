@@ -3,8 +3,10 @@
 `eredu-backend-mlx` is the concrete MLX implementation of Eredu's
 backend-neutral contracts. It owns MLX tensor and neural operations,
 checkpoint materialization, execution runtime, typed architecture-to-mechanism
-binding, media processing, distributed execution, and optional codec
-integration. It does not depend on the `eredu` facade crate.
+binding, media processing, and distributed execution. Neural codec semantics
+and artifact plans remain in `eredu-codec`; MLX supplies the same generic
+parameter materialization mechanisms used by other neutral modules. This crate
+does not depend on the `eredu` facade crate.
 
 The crate's `MlxTensor` is a transparent, zero-copy wrapper around the native
 MLX array handle. The wrapper lets this crate implement `eredu_nn::Tensor`
@@ -68,7 +70,6 @@ execution, distributed, and model-composition support.
 | `metal` | Metal execution on Apple platforms |
 | `image` | Image/video decoding and shared multimodal request preparation |
 | `audio` | Audio preprocessing and shared multimodal request preparation |
-| `codec` | MLX Mimi integration and codec examples; implies `audio` |
 | `cuda` | CUDA execution for native MLX operations |
 | `nccl` | NCCL collectives; implies `cuda` |
 
@@ -78,7 +79,8 @@ Enabling either `image` or `audio` compiles the shared multimodal processor;
 there is no standalone `media` feature.
 
 The packaged `mimi_realtime_bench`, `personaplex_full_path_bench`, and
-`personaplex_quantization_eval` examples require `codec`.
+`personaplex_quantization_eval` examples prepare Mimi artifacts through
+`eredu-codec` and construct them with the generic MLX parameter backend.
 The quantization example is a thin MLX composition entry point over the
 backend-neutral driver in `eredu-evaluation`.
 

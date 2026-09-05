@@ -67,6 +67,120 @@ fn mlx_dtype(value: &RecipeDtype) -> Result<Dtype, WeightRecipeError> {
     }
 }
 
+/// Validates that MLX can represent every source and intermediate value in a
+/// neutral recipe without acquiring payloads or constructing native arrays.
+pub(crate) fn preflight_mlx_recipe(
+    recipe: &DerivedWeightRecipe,
+    source: &dyn CheckpointSource,
+) -> Result<(), WeightRecipeError> {
+    fn validate_selection(selection: &TensorSelection) -> Result<(), WeightRecipeError> {
+        match selection {
+            TensorSelection::Full => {}
+            TensorSelection::Range { axis, start, end } => {
+                usize_to_i32(*axis, "selection axis")?;
+                usize_to_i32(*start, "selection start")?;
+                usize_to_i32(end.saturating_sub(1), "selection end")?;
+            }
+            TensorSelection::Indices { axis, indices } => {
+                usize_to_i32(*axis, "selection axis")?;
+                for index in indices {
+                    usize_to_i32(*index, "selection index")?;
+                }
+            }
+            TensorSelection::Contiguous {
+                offset_elements,
+                shape,
+            } => {
+                let elements = shape.iter().try_fold(1usize, |count, dimension| {
+                    count
+                        .checked_mul(*dimension)
+                        .ok_or(WeightRecipeError::ArithmeticOverflow(
+                            "contiguous recipe selection size",
+                        ))
+                })?;
+                let last = offset_elements
+                    .checked_add(elements.saturating_sub(1))
+                    .ok_or(WeightRecipeError::ArithmeticOverflow(
+                        "contiguous recipe selection end",
+                    ))?;
+                usize_to_i32(last, "contiguous selection index")?;
+            }
+        }
+        Ok(())
+    }
+
+    fn visit(
+        recipe: &DerivedWeightRecipe,
+        source: &dyn CheckpointSource,
+    ) -> Result<(), WeightRecipeError> {
+        let metadata = recipe.infer(source)?;
+        for dimension in metadata.shape() {
+            usize_to_i32(*dimension, "recipe dimension")?;
+        }
+        mlx_dtype(metadata.dtype())?;
+
+        match recipe {
+            DerivedWeightRecipe::Source { key, selection } => {
+                validate_selection(selection)?;
+                let source_metadata = source.source_metadata(key)?;
+                for dimension in source_metadata
+                    .logical_shape
+                    .iter()
+                    .chain(&source_metadata.physical_shape)
+                {
+                    usize_to_i32(*dimension, "checkpoint source dimension")?;
+                }
+                usize::try_from(source_metadata.encoded_byte_len).map_err(|_| {
+                    WeightRecipeError::ArithmeticOverflow("checkpoint source byte length")
+                })?;
+                let provenance = source.source_provenance(key)?;
+                match provenance.source_encoding {
+                    eredu_checkpoint::SourceTensorEncoding::Safetensors(dtype) => {
+                        super::store::safetensors_dtype(key, &dtype)?;
+                    }
+                    eredu_checkpoint::SourceTensorEncoding::RecipeOutput(dtype) => {
+                        mlx_dtype(&dtype.into())?;
+                    }
+                    eredu_checkpoint::SourceTensorEncoding::Gguf { .. } => {}
+                    encoding => {
+                        return Err(WeightRecipeError::UnsupportedDtype {
+                            dtype: format!("{encoding:?}"),
+                        });
+                    }
+                }
+            }
+            DerivedWeightRecipe::Concatenate { axis, inputs }
+            | DerivedWeightRecipe::Stack { axis, inputs } => {
+                usize_to_i32(*axis, "recipe join axis")?;
+                for input in inputs {
+                    visit(input, source)?;
+                }
+            }
+            DerivedWeightRecipe::Select { input, selection } => {
+                validate_selection(selection)?;
+                visit(input, source)?;
+            }
+            DerivedWeightRecipe::Transpose { input, axes } => {
+                for axis in axes {
+                    usize_to_i32(*axis, "transpose axis")?;
+                }
+                visit(input, source)?;
+            }
+            DerivedWeightRecipe::Cast { input, dtype }
+            | DerivedWeightRecipe::View { input, dtype, .. } => {
+                mlx_dtype(dtype)?;
+                visit(input, source)?;
+            }
+            DerivedWeightRecipe::Reshape { input, .. }
+            | DerivedWeightRecipe::NegLog { input }
+            | DerivedWeightRecipe::SubtractOne { input } => visit(input, source)?,
+        }
+        Ok(())
+    }
+
+    visit(recipe, source)
+}
+
 /// Lowers a terminal logical MXFP4 value recipe to MLX's packed U32 storage.
 ///
 /// Neutral checkpoint recipes describe the represented F4 values. MLX affine
@@ -645,6 +759,23 @@ mod tests {
             output.evaluated().unwrap().as_slice::<u8>(),
             &[1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 4, 0, 0, 0]
         );
+    }
+
+    #[test]
+    fn recipe_preflight_reads_only_checkpoint_metadata() {
+        let (_dir, store) = fixture();
+        let recipe = DerivedWeightRecipe::Transpose {
+            input: Box::new(DerivedWeightRecipe::source("cube", TensorSelection::Full)),
+            axes: vec![0, 2, 1],
+        };
+
+        preflight_mlx_recipe(&recipe, store.as_ref()).unwrap();
+
+        let diagnostics =
+            eredu_checkpoint::store::CheckpointSource::source_diagnostics(store.as_ref()).unwrap();
+        assert_eq!(diagnostics.physical_reads, 0);
+        assert_eq!(diagnostics.physical_read_bytes, 0);
+        assert!(diagnostics.payload_shard_paths.is_empty());
     }
 
     #[test]

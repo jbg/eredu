@@ -52,7 +52,7 @@ jobs:
           cargo check --locked -p safemlx --all-targets --no-default-features --features "accelerate,metal,safetensors"
           cargo check --locked -p safemlx-tests --all-targets --no-default-features --features metal
           cargo check --locked -p eredu-text --all-targets --all-features
-          cargo check --locked -p eredu-backend-mlx --all-targets --no-default-features --features "accelerate,metal,image,codec"
+          cargo check --locked -p eredu-backend-mlx --all-targets --no-default-features --features "accelerate,metal,image"
           cargo check --locked -p eredu --all-targets --no-default-features --features "mlx,metal,image,audio,onig,esaxx_fast"
           cargo check --locked -p eredu-cli --all-targets
 
@@ -76,10 +76,9 @@ jobs:
         run: cargo check --workspace
       - name: Lint the workspace with warnings denied
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
-      - name: Check isolated audio and codec features
+      - name: Check the isolated audio feature
         run: |
           cargo check -p eredu-backend-mlx --no-default-features --features audio
-          cargo check -p eredu-backend-mlx --no-default-features --features codec
           cargo check -p eredu --no-default-features --features mlx,audio
       - name: Test the portable facade without default features
         run: |
@@ -141,8 +140,8 @@ jobs:
           cargo test -j 1 --locked -p eredu --no-default-features --features "nccl,image,audio" --lib --no-run
           cargo test -j 1 --locked -p eredu-backend-mlx --features "nccl,image" --lib --no-run
           cargo test -j 1 --locked -p eredu-backend-mlx --features nccl --example llama_residency --no-run
-      - name: Compile the CUDA codec backend
-        run: cargo test -j 1 --locked -p eredu-backend-mlx --features "nccl,image,codec" --test mimi_codec --no-run
+      - name: Compile the CUDA Mimi integration test
+        run: cargo test -j 1 --locked -p eredu-backend-mlx --features "nccl,image" --test mimi_codec --no-run
       - name: Build and final-link the CUDA language-model CLI tests
         run: cargo test -j 1 --locked -p eredu-cli --no-default-features --features nccl --no-run
 

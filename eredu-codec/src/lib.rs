@@ -49,7 +49,7 @@ pub struct AudioTokenizerConfig {
     pub cardinality: i32,
 }
 
-/// Errors returned by codec loaders and tokenization operations.
+/// Errors returned by codec construction and tokenization operations.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// Invalid input or checkpoint shape.
@@ -59,12 +59,4 @@ pub enum Error {
     /// Underlying neural-compute backend error.
     #[error(transparent)]
     Compute(#[from] eredu_nn::Error),
-
-    /// Filesystem I/O error.
-    #[error(transparent)]
-    Io(#[from] std::io::Error),
-
-    /// Boxed third-party codec loader error.
-    #[error(transparent)]
-    Other(#[from] Box<dyn std::error::Error + Send + Sync>),
 }

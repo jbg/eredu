@@ -15,9 +15,6 @@ compile_error!("the `metal` and `cuda` backend features are mutually exclusive")
 mod adapter;
 /// Reusable MLX tensors, operators, runtime facilities, and distributed primitives.
 pub mod backend;
-/// Optional MLX bindings for backend-neutral audio codecs.
-#[cfg(feature = "codec")]
-pub mod codec;
 mod composition;
 
 pub use adapter::*;

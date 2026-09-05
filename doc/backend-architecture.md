@@ -9,13 +9,13 @@ and an execution backend. It is intended for backend authors and maintainers of
 ```text
 eredu-core        eredu-checkpoint        eredu-nn
         \                |                /    \
-                     eredu-runtime          eredu-codec
-                           |                     :
-                   eredu-architectures           : optional
-                           |                     :
-                           +-- eredu-backend-mlx -+
-                                      |
-                                    eredu
+                     eredu-runtime ---- eredu-codec
+                           |
+                   eredu-architectures
+                           |
+                   eredu-backend-mlx
+                           |
+                         eredu
 ```
 
 The neutral crates contain no native accelerator dependency under any feature.
@@ -31,10 +31,13 @@ axis-aware gathers composed over MLX's native collective primitives;
 Model-family construction and equations remain in
 `eredu-architectures`; MLX-specific realization remains in
 `eredu-backend-mlx`.
-`eredu-codec` owns backend-neutral neural audio codec architectures and depends
-on the neutral tensor contracts in `eredu-nn`. A concrete backend may depend on
-`eredu-codec` for an optional codec binding; the codec crate does not acquire a
-backend feature or dependency in the other direction.
+`eredu-codec` owns backend-neutral neural audio codec architectures, exact
+released checkpoint schemas, parameter topology, layout recipes, and typed
+artifact construction. It uses neutral tensor and runtime parameter contracts.
+Concrete backends implement general checkpoint materialization, recipe,
+completion, and binding mechanisms without depending on a codec family.
+Application composition combines a prepared codec artifact with those generic
+mechanisms and receives the ordinary neutral codec type.
 The workspace forbids unsafe Rust in every package except the native `safemlx`
 wrapper, its raw `safemlx-sys` bindings, and the `eredu-ios` C-ABI example.
 Unsafe MLX and operating-system calls remain encapsulated by safe `safemlx`
@@ -188,8 +191,9 @@ names. Inspection never performs an implicit cross-rank host gather.
 
 Backend-neutral parity, distribution metrics, timing summaries, evidence, and
 evaluation drivers live in `eredu-evaluation`. Concrete backend examples only
-select execution contexts and materialize model and codec artifacts; they do
-not own comparison thresholds or reference policy. Backend-specific validation
+select execution contexts and supply generic mechanisms for neutral model and
+codec artifact construction; they do not own checkpoint interpretation,
+comparison thresholds, or reference policy. Backend-specific validation
 inputs and reference-fixture generators live with the backend that consumes
 them, so every published backend package contains the tooling required by its
 examples; they do not live under the facade.

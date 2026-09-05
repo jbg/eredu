@@ -1,10 +1,16 @@
-use std::{error::Error, path::Path, path::PathBuf};
+use std::{error::Error, path::PathBuf};
 
 #[path = "support/realtime.rs"]
 mod realtime_support;
 
-use eredu_backend_mlx::native::ExecutionContext;
-use eredu_backend_mlx::{codec::mimi::load, native::MlxRealtimeExecutionContext};
+use eredu_backend_mlx::{
+    backend::{
+        nn::shared::MlxNeuralBackend,
+        runtime::checkpoint::store::MlxParameterMaterializationContext,
+    },
+    native::{ExecutionContext, MlxRealtimeExecutionContext},
+};
+use eredu_codec::mimi::{construct, prepare_checkpoint, Config};
 use eredu_evaluation::{
     run_personaplex_quantization, PersonaPlexEvaluationOptions, PersonaPlexEvaluationPaths,
 };
@@ -44,11 +50,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = gpu.stream();
     let weights_stream = cpu.stream();
-    let mut mimi = load(
-        Path::new(&args[2]),
-        Some(eredu_architectures::moshi::personaplex_prompt::AUDIO_TOKENS_PER_STREAM as i32),
-        stream,
+    let prepared = prepare_checkpoint(
+        &args[2],
+        Config::v0_1(Some(
+            eredu_architectures::moshi::personaplex_prompt::AUDIO_TOKENS_PER_STREAM as i32,
+        )),
     )?;
+    let materialization = MlxParameterMaterializationContext::new(stream, stream);
+    let mut mimi = construct::<MlxNeuralBackend>(prepared, stream, &materialization)?;
     run_personaplex_quantization(&paths, &options, &mut mimi, stream, |artifact| {
         let preparation = eredu_architectures::moshi::prepare_realtime_model(artifact)?;
         let backend = MlxRealtimeExecutionContext::new(stream, weights_stream);

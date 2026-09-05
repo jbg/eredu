@@ -294,7 +294,7 @@ def validate_packaged_tests(
             "cargo",
             "test",
             "--no-run",
-            "--lib",
+            "--all-targets",
             "--no-default-features",
             "--config",
             str(config),

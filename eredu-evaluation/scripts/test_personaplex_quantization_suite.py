@@ -26,7 +26,7 @@ def quality(distributions, value):
 
 
 class QuantizationSuiteTests(unittest.TestCase):
-    def test_builds_backend_owned_codec_example(self):
+    def test_builds_neutral_codec_example(self):
         self.assertEqual(
             suite.build_command(),
             [
@@ -35,8 +35,6 @@ class QuantizationSuiteTests(unittest.TestCase):
                 "--release",
                 "-p",
                 "eredu-backend-mlx",
-                "--features",
-                "codec",
                 "--example",
                 "personaplex_quantization_eval",
             ],

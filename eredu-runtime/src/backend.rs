@@ -60,6 +60,15 @@ pub trait ParameterBackend: NeuralBackend {
     /// Backend-specific loading failure.
     type ParameterError: std::error::Error + Send + Sync + 'static;
 
+    /// Validates that one neutral recipe can be represented by this backend.
+    ///
+    /// This is a metadata-only selection gate. Implementations must not acquire
+    /// payload leases, allocate native tensors, or submit backend work.
+    fn preflight_recipe(
+        recipe: &DerivedWeightRecipe,
+        source: &dyn CheckpointSource,
+    ) -> Result<(), Self::ParameterError>;
+
     /// Lowers one format-preserving encoded lease into a native weight.
     fn materialize(
         lease: CheckpointLease,
@@ -95,13 +104,9 @@ pub trait ParameterBackend: NeuralBackend {
 
     /// Binds one materialized weight to its destination parameter.
     ///
-    /// After successful [`Self::validate_bind`] on unchanged arguments this
-    /// operation must not fail, allowing orchestration to validate an entire
+    /// This operation is infallible so orchestration can validate an entire
     /// atomic unit before publishing any destination.
-    fn bind(
-        parameter: &mut Self::Parameter,
-        weight: Self::MaterializedWeight,
-    ) -> Result<(), Self::ParameterError>;
+    fn bind(parameter: &mut Self::Parameter, weight: Self::MaterializedWeight);
 }
 
 /// Promotes and demotes backend-native storage without changing its semantics.

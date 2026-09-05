@@ -5,12 +5,35 @@
 //! vector quantizer, and the non-streaming SEANet/transformer encoder and
 //! decoder used to map between PCM and Mimi codebook tokens.
 
-use eredu_nn::{
-    AttentionMask, Index, LayerNorm, Linear, LinearSpec, PadMode, Parameter, ParameterId,
-    ParameterMetadata, ParameterSpec, ParameterVisitor, ParameterVisitorMut, Parameterized, Rope,
-    Tensor,
+use eredu_checkpoint::{
+    recipe::{DerivedWeightRecipe, RecipeCatalog, RecipeDtype, RecipeError, RecipeMetadata},
+    safetensors::{SafetensorsMetadataCatalog, SafetensorsShardError},
+    schema::{
+        CatalogPolicy, CheckpointPlanError, SafetensorsCheckpointPlan, SafetensorsTensorConstraint,
+        StoredDtypeConstraint,
+    },
+    store::{
+        PreparedCheckpointSource, PreparedTensorSource, ResolvedCheckpointSource,
+        SafetensorsWeightStore, SharedCheckpointSource, StoreError, TensorMetadata,
+        TensorSelection, TensorSourceProvenance,
+    },
+    validation::{resolve_safetensors_plan, CheckpointValidation, ResolvedCheckpointPlan},
+    SourceTensorEncoding, StoredDtype,
 };
-use std::collections::HashMap;
+use eredu_nn::{
+    AttentionMask, Index, LayerNorm, Linear, LinearSpec, NeuralBackend, PadMode, Parameter,
+    ParameterId, ParameterMetadata, ParameterSpec, ParameterVisitor, ParameterVisitorMut,
+    Parameterized, Rope, Tensor,
+};
+use eredu_runtime::{
+    bind_materialized_unit, materialize_selected_bindings, select_bindings, ParameterBackend,
+    ParameterOrchestrationError, ResidencyDeclarationError, SelectedBindingPlan, WeightBinding,
+};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+    sync::Arc,
+};
 
 use crate::{AudioTokenizer, AudioTokenizerConfig, Error};
 
@@ -119,7 +142,9 @@ impl Config {
 
     fn validate(&self) -> Result<(), Error> {
         if self.channels <= 0
+            || !self.sample_rate.is_finite()
             || self.sample_rate <= 0.0
+            || !self.frame_rate.is_finite()
             || self.frame_rate <= 0.0
             || self.num_codebooks <= 0
             || self.num_codebooks > self.total_codebooks
@@ -138,6 +163,20 @@ impl Config {
                 self.quantizer_dim,
                 self.latent_dim
             )));
+        }
+        if self.channels != 1
+            || self.sample_rate != 24_000.0
+            || self.frame_rate != 12.5
+            || !self.renormalize
+            || self.resample_method != ResampleMethod::Conv
+            || self.total_codebooks != 32
+            || self.bins != 2_048
+            || self.quantizer_dim != 256
+            || self.latent_dim != 512
+        {
+            return Err(Error::InvalidShape(
+                "unsupported Mimi configuration; only the released v0.1 profile is admitted".into(),
+            ));
         }
         Ok(())
     }
@@ -192,53 +231,6 @@ impl<T: Tensor> Mimi<T> {
     /// Returns the Mimi configuration.
     pub fn mimi_config(&self) -> &Config {
         &self.config
-    }
-
-    /// Strictly replaces every model parameter with backend-native checkpoint
-    /// tensors using Eredu's stable parameter names.
-    ///
-    /// Backend integrations remain responsible for reading their preferred
-    /// checkpoint format and converting weight layouts. Mimi owns parameter
-    /// completeness and shape validation, so those integrations do not need
-    /// to reproduce the architecture or its parameter tree.
-    pub fn load_parameters(
-        &mut self,
-        parameters: impl IntoIterator<Item = (String, T)>,
-    ) -> Result<(), Error> {
-        let mut parameters = parameters.into_iter().collect::<HashMap<_, _>>();
-        let mut missing = Vec::new();
-        let mut mismatch = None;
-        self.visit_mimi_parameters("", &mut |metadata, parameter| {
-            let key = metadata.id.as_str();
-            match parameters.get(key) {
-                None => missing.push(key.to_owned()),
-                Some(value) if value.shape() != parameter.shape() => {
-                    mismatch = Some(format!(
-                        "Mimi checkpoint tensor {key} has shape {:?}, expected {:?}",
-                        value.shape(),
-                        parameter.shape()
-                    ));
-                }
-                Some(_) => {}
-            }
-        });
-        if let Some(mismatch) = mismatch {
-            return Err(Error::InvalidShape(mismatch));
-        }
-        if !missing.is_empty() {
-            missing.sort();
-            return Err(Error::InvalidShape(format!(
-                "Mimi checkpoint is missing {} model tensors: {}",
-                missing.len(),
-                missing.join(", ")
-            )));
-        }
-        self.visit_mimi_parameters_mut("", &mut |metadata, parameter| {
-            *parameter = parameters
-                .remove(metadata.id.as_str())
-                .expect("checkpoint presence was validated before parameter update");
-        });
-        Ok(())
     }
 
     /// Encodes latent frames shaped `[batch, 512, frames]` into Mimi tokens.
@@ -323,51 +315,851 @@ impl<T: Tensor> Mimi<T> {
     }
 }
 
-/// Backend-independent layout conversion required by a Mimi checkpoint tensor.
-///
-/// Backends use this metadata to convert framework-native checkpoint layouts
-/// into the layouts expected by [`Mimi::load_parameters`].
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum CheckpointTensorLayout {
-    /// The checkpoint and model use the same tensor layout.
-    Identity,
-    /// A rank-three checkpoint tensor must be transposed along these axes.
-    Transpose3d([i32; 3]),
-}
-
-/// Backend-independent loading plan for one tensor in a released Mimi
-/// checkpoint.
+/// Exact released-checkpoint requirement for one Mimi parameter.
 #[derive(Debug, Clone, Eq, PartialEq)]
-pub struct CheckpointTensorPlan {
-    /// Stable [`Mimi`] parameter identity.
-    pub parameter: String,
-    /// Checkpoint-to-model layout conversion required before loading.
-    pub layout: CheckpointTensorLayout,
+pub struct MimiParameterRequirement {
+    logical_name: String,
+    checkpoint_key: String,
+    physical_shape: Vec<usize>,
+    logical_shape: Vec<usize>,
+    source_dtype: StoredDtype,
+    output_dtype: RecipeDtype,
+    source_encoding: SourceTensorEncoding,
+    source_bytes: u64,
+    output_bytes: u64,
+    recipe: DerivedWeightRecipe,
+    active: bool,
 }
 
-/// Maps a released Mimi checkpoint tensor name to its stable model parameter
-/// and required layout conversion.
-///
-/// Returns `None` for checkpoint entries that are not model parameters owned
-/// by [`Mimi`]. Reading a checkpoint and performing the planned conversion are
-/// backend responsibilities.
-pub fn checkpoint_tensor_plan(key: &str) -> Option<CheckpointTensorPlan> {
-    let parameter = transform_decoder_key(key)?;
-    let layout = if parameter.ends_with(".weight") && is_conv_weight_key(&parameter) {
-        // PyTorch ConvTranspose1d stores non-depthwise weights as
-        // [input, output/groups, kernel]. All other Mimi convolutions,
-        // including its depthwise top-level upsampler, retain their leading
-        // channel dimension.
-        let axes = if parameter.contains(".upsample.") {
+impl MimiParameterRequirement {
+    /// Stable parameter identity in [`Mimi`]'s authoritative traversal.
+    pub fn logical_name(&self) -> &str {
+        &self.logical_name
+    }
+
+    /// Exact physical tensor name in the released SafeTensors artifact.
+    pub fn checkpoint_key(&self) -> &str {
+        &self.checkpoint_key
+    }
+
+    /// Exact physical checkpoint geometry.
+    pub fn physical_shape(&self) -> &[usize] {
+        &self.physical_shape
+    }
+
+    /// Exact logical destination geometry after the neutral recipe.
+    pub fn logical_shape(&self) -> &[usize] {
+        &self.logical_shape
+    }
+
+    /// Exact scalar representation in the released SafeTensors payload.
+    pub const fn source_dtype(&self) -> &StoredDtype {
+        &self.source_dtype
+    }
+
+    /// Exact scalar representation produced by the neutral recipe.
+    pub const fn output_dtype(&self) -> &RecipeDtype {
+        &self.output_dtype
+    }
+
+    /// Exact physical container encoding required from the admitted source.
+    pub const fn source_encoding(&self) -> &SourceTensorEncoding {
+        &self.source_encoding
+    }
+
+    /// Exact selected source byte count.
+    pub const fn source_bytes(&self) -> u64 {
+        self.source_bytes
+    }
+
+    /// Exact logical output byte count.
+    pub const fn output_bytes(&self) -> u64 {
+        self.output_bytes
+    }
+
+    /// Neutral source-to-logical layout recipe.
+    pub const fn recipe(&self) -> &DerivedWeightRecipe {
+        &self.recipe
+    }
+
+    /// Whether this parameter is materialized for the selected active codebooks.
+    pub const fn is_active(&self) -> bool {
+        self.active
+    }
+}
+
+/// Header-admitted Mimi artifact with an immutable exact parameter plan.
+pub struct PreparedMimiArtifact {
+    config: Config,
+    source: SharedCheckpointSource,
+    requirements: Vec<MimiParameterRequirement>,
+    bindings: Vec<WeightBinding>,
+}
+
+impl std::fmt::Debug for PreparedMimiArtifact {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreparedMimiArtifact")
+            .field("config", &self.config)
+            .field("requirements", &self.requirements)
+            .field("bindings", &self.bindings)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PreparedMimiArtifact {
+    /// Released configuration fixed by neutral preparation.
+    pub const fn config(&self) -> &Config {
+        &self.config
+    }
+
+    /// Exact full-checkpoint requirements, including inactive codebooks.
+    pub fn requirements(&self) -> &[MimiParameterRequirement] {
+        &self.requirements
+    }
+
+    /// Active generic runtime bindings selected by preparation.
+    pub fn bindings(&self) -> &[WeightBinding] {
+        &self.bindings
+    }
+
+    /// Performs backend mechanism admission without reading payloads or
+    /// constructing backend-native Mimi tensors.
+    pub fn select<B>(
+        self,
+    ) -> Result<SelectedMimiArtifact<B>, MimiConstructionError<B::ParameterError>>
+    where
+        B: ParameterBackend<Parameter = <B as NeuralBackend>::Tensor>,
+    {
+        let Self {
+            config,
+            source,
+            requirements,
+            bindings,
+        } = self;
+        let selected = select_bindings::<B>(source, bindings)?;
+        Ok(SelectedMimiArtifact {
+            config,
+            requirements,
+            selected,
+        })
+    }
+}
+
+/// Backend-admitted Mimi plan ready for native materialization.
+pub struct SelectedMimiArtifact<B>
+where
+    B: ParameterBackend<Parameter = <B as NeuralBackend>::Tensor>,
+{
+    config: Config,
+    requirements: Vec<MimiParameterRequirement>,
+    selected: SelectedBindingPlan<B>,
+}
+
+impl<B> std::fmt::Debug for SelectedMimiArtifact<B>
+where
+    B: ParameterBackend<Parameter = <B as NeuralBackend>::Tensor>,
+{
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SelectedMimiArtifact")
+            .field("config", &self.config)
+            .field("requirements", &self.requirements)
+            .field("selected", &self.selected)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<B> SelectedMimiArtifact<B>
+where
+    B: ParameterBackend<Parameter = <B as NeuralBackend>::Tensor>,
+{
+    /// Constructs, materializes, validates, and atomically binds the ordinary
+    /// backend-neutral Mimi type.
+    pub fn construct(
+        self,
+        tensor_context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
+        materialization_context: &B::MaterializationContext,
+    ) -> Result<Mimi<<B as NeuralBackend>::Tensor>, MimiConstructionError<B::ParameterError>> {
+        let SelectedMimiArtifact {
+            config,
+            requirements: _,
+            selected,
+        } = self;
+        let mut mimi = Mimi::new(config, tensor_context)?;
+        let materialized = materialize_selected_bindings::<B>(selected, materialization_context)?;
+        bind_materialized_unit::<B, _>(&mut mimi, materialized)?;
+        Ok(mimi)
+    }
+}
+
+/// Failure while preparing a released Mimi artifact from neutral metadata.
+#[derive(Debug, thiserror::Error)]
+pub enum MimiArtifactError {
+    /// Mimi configuration or pure topology was invalid.
+    #[error(transparent)]
+    Codec(#[from] Error),
+    /// Canonical SafeTensors discovery or header admission failed.
+    #[error(transparent)]
+    Safetensors(#[from] SafetensorsShardError),
+    /// A declarative checkpoint plan was internally invalid.
+    #[error(transparent)]
+    Plan(#[from] CheckpointPlanError),
+    /// The exact released catalog contract was not satisfied.
+    #[error("Mimi SafeTensors catalog is not exact: {0:?}")]
+    Catalog(CheckpointValidation),
+    /// Neutral checkpoint storage could not be opened or inspected.
+    #[error(transparent)]
+    Store(#[from] StoreError),
+    /// A neutral layout recipe was invalid.
+    #[error(transparent)]
+    Recipe(#[from] RecipeError),
+    /// A generic runtime binding declaration was invalid.
+    #[error(transparent)]
+    Binding(#[from] ResidencyDeclarationError),
+    /// Codec-owned parameter topology contradicted its released schema.
+    #[error("invalid Mimi parameter topology: {0}")]
+    Topology(String),
+}
+
+/// Failure while selecting, materializing, or constructing Mimi on a backend.
+#[derive(Debug, thiserror::Error)]
+pub enum MimiConstructionError<E>
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    /// Backend-neutral Mimi construction failed.
+    #[error(transparent)]
+    Codec(#[from] Error),
+    /// Generic parameter selection, materialization, validation, or binding failed.
+    #[error(transparent)]
+    Parameters(#[from] ParameterOrchestrationError<E>),
+}
+
+/// Inspects and admits an exact released Mimi SafeTensors artifact without
+/// reading tensor payloads.
+pub fn prepare_checkpoint(
+    path: impl AsRef<Path>,
+    config: Config,
+) -> Result<PreparedMimiArtifact, MimiArtifactError> {
+    let (plan, requirements, bindings) = prepare_catalog(&config)?;
+    let catalog = SafetensorsMetadataCatalog::discover(path)?;
+    let resolution =
+        resolve_safetensors_plan(&catalog, &plan).map_err(MimiArtifactError::Catalog)?;
+    let store = Arc::new(SafetensorsWeightStore::open_admitted(
+        catalog.into_admitted_shards(),
+        1,
+    )?);
+    prepared_from_resolution(config, store, resolution, requirements, bindings)
+}
+
+/// Returns the complete released-checkpoint schema derived from Mimi's
+/// authoritative parameter topology without inspecting an artifact.
+pub fn released_checkpoint_requirements(
+    config: &Config,
+) -> Result<Vec<MimiParameterRequirement>, MimiArtifactError> {
+    prepare_catalog(config).map(|(_, requirements, _)| requirements)
+}
+
+/// Admits an already opened backend-neutral SafeTensors-compatible source.
+/// No tensor payload is acquired during preparation.
+pub fn prepare_source(
+    source: SharedCheckpointSource,
+    config: Config,
+) -> Result<PreparedMimiArtifact, MimiArtifactError> {
+    let (plan, requirements, bindings) = prepare_catalog(&config)?;
+    let resolution =
+        resolve_safetensors_plan(source.as_ref(), &plan).map_err(MimiArtifactError::Catalog)?;
+    prepared_from_resolution(config, source, resolution, requirements, bindings)
+}
+
+/// Selects generic backend mechanisms, then constructs Mimi through the exact
+/// neutral artifact plan.
+pub fn construct<B>(
+    prepared: PreparedMimiArtifact,
+    tensor_context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
+    materialization_context: &B::MaterializationContext,
+) -> Result<Mimi<<B as NeuralBackend>::Tensor>, MimiConstructionError<B::ParameterError>>
+where
+    B: ParameterBackend<Parameter = <B as NeuralBackend>::Tensor>,
+{
+    prepared
+        .select::<B>()?
+        .construct(tensor_context, materialization_context)
+}
+
+fn checkpoint_parameter_for_key(key: &str) -> Option<String> {
+    transform_decoder_key(key)
+}
+
+fn prepare_catalog(
+    config: &Config,
+) -> Result<
+    (
+        SafetensorsCheckpointPlan,
+        Vec<MimiParameterRequirement>,
+        Vec<WeightBinding>,
+    ),
+    MimiArtifactError,
+> {
+    config.validate()?;
+    let active_topology = parameter_topology(config.clone())?;
+    let mut full_config = config.clone();
+    full_config.num_codebooks = full_config.total_codebooks;
+    let full_topology = parameter_topology(full_config)?;
+    if active_topology
+        .keys()
+        .any(|name| !full_topology.contains_key(name))
+    {
+        return Err(MimiArtifactError::Topology(
+            "active codebook topology is not contained by the released topology".into(),
+        ));
+    }
+
+    let mut physical_names = BTreeSet::new();
+    let mut requirements = Vec::with_capacity(full_topology.len());
+    let mut bindings = Vec::with_capacity(active_topology.len());
+    for (logical_name, logical_shape) in full_topology {
+        let checkpoint_key = checkpoint_key_for_parameter(&logical_name).ok_or_else(|| {
+            MimiArtifactError::Topology(format!(
+                "parameter {logical_name:?} has no released checkpoint identity"
+            ))
+        })?;
+        if !physical_names.insert(checkpoint_key.clone()) {
+            return Err(MimiArtifactError::Topology(format!(
+                "released checkpoint identity {checkpoint_key:?} is duplicated"
+            )));
+        }
+        if checkpoint_parameter_for_key(&checkpoint_key).as_deref() != Some(&logical_name) {
+            return Err(MimiArtifactError::Topology(format!(
+                "checkpoint identity {checkpoint_key:?} does not round-trip to {logical_name:?}"
+            )));
+        }
+        let axes = checkpoint_layout_axes(&logical_name);
+        let physical_shape = match axes {
+            Some(axes) => inverse_permuted_shape(&logical_shape, axes)?,
+            None => logical_shape.clone(),
+        };
+        let source_bytes = f32_bytes(&physical_shape, &checkpoint_key)?;
+        let output_bytes = f32_bytes(&logical_shape, &logical_name)?;
+        let source = DerivedWeightRecipe::source(&checkpoint_key, TensorSelection::Full);
+        let recipe = match axes {
+            Some(axes) => DerivedWeightRecipe::Transpose {
+                input: Box::new(source),
+                axes: axes.to_vec(),
+            },
+            None => source,
+        };
+        let active = active_topology.contains_key(&logical_name);
+        if active {
+            bindings.push(WeightBinding::from_recipe(
+                &logical_name,
+                recipe.clone(),
+                output_bytes,
+            )?);
+        }
+        requirements.push(MimiParameterRequirement {
+            logical_name,
+            checkpoint_key,
+            physical_shape,
+            logical_shape,
+            source_dtype: StoredDtype::F32,
+            output_dtype: RecipeDtype::F32,
+            source_encoding: SourceTensorEncoding::Safetensors(StoredDtype::F32),
+            source_bytes,
+            output_bytes,
+            recipe,
+            active,
+        });
+    }
+    requirements.sort_by(|left, right| left.checkpoint_key.cmp(&right.checkpoint_key));
+    bindings.sort_by(|left, right| left.name().cmp(right.name()));
+    let constraints = requirements
+        .iter()
+        .map(|requirement| {
+            SafetensorsTensorConstraint::required(
+                &requirement.checkpoint_key,
+                requirement.physical_shape.clone(),
+                StoredDtypeConstraint::Exact(requirement.source_dtype.clone()),
+            )
+        })
+        .collect();
+    let plan = SafetensorsCheckpointPlan::new(
+        "mimi-v0.1",
+        constraints,
+        Vec::new(),
+        CatalogPolicy::strict(),
+    )?;
+    Ok((plan, requirements, bindings))
+}
+
+fn prepared_from_resolution(
+    config: Config,
+    source: SharedCheckpointSource,
+    resolution: ResolvedCheckpointPlan,
+    requirements: Vec<MimiParameterRequirement>,
+    bindings: Vec<WeightBinding>,
+) -> Result<PreparedMimiArtifact, MimiArtifactError> {
+    let mut exact_catalog = BTreeMap::new();
+    for requirement in &requirements {
+        let key = requirement.checkpoint_key();
+        let actual_metadata = source.source_metadata(key)?;
+        let expected_metadata = TensorMetadata {
+            name: key.to_owned(),
+            logical_shape: requirement.physical_shape.clone(),
+            physical_shape: requirement.physical_shape.clone(),
+            stored_dtype: requirement.source_dtype.clone(),
+            encoded_byte_len: requirement.source_bytes,
+            backing_shard: actual_metadata.backing_shard.clone(),
+        };
+        let actual_provenance = source.source_provenance(key)?;
+        let expected_provenance = TensorSourceProvenance {
+            catalog_key: key.to_owned(),
+            physical_tensor: key.to_owned(),
+            output: key.to_owned(),
+            backing_shard: expected_metadata.backing_shard.clone(),
+            source_encoding: requirement.source_encoding.clone(),
+        };
+        if actual_metadata != expected_metadata || actual_provenance != expected_provenance {
+            return Err(MimiArtifactError::Topology(format!(
+                "checkpoint tensor {key:?} does not have the exact released SafeTensors provenance"
+            )));
+        }
+        exact_catalog.insert(
+            key.to_owned(),
+            PreparedTensorSource {
+                metadata: expected_metadata,
+                provenance: expected_provenance,
+            },
+        );
+    }
+    let source: SharedCheckpointSource =
+        Arc::new(PreparedCheckpointSource::new(source, exact_catalog)?);
+    let source: SharedCheckpointSource =
+        Arc::new(ResolvedCheckpointSource::new(source, resolution));
+    validate_requirement_recipes(source.as_ref(), &requirements)?;
+    Ok(PreparedMimiArtifact {
+        config,
+        source,
+        requirements,
+        bindings,
+    })
+}
+
+fn validate_requirement_recipes(
+    catalog: &(impl RecipeCatalog + ?Sized),
+    requirements: &[MimiParameterRequirement],
+) -> Result<(), MimiArtifactError> {
+    for requirement in requirements {
+        let actual = requirement.recipe.infer(catalog)?;
+        let expected = RecipeMetadata {
+            shape: requirement.logical_shape.clone(),
+            dtype: requirement.output_dtype.clone(),
+            byte_len: requirement.output_bytes,
+        };
+        if actual != expected {
+            return Err(MimiArtifactError::Topology(format!(
+                "recipe for {:?} produced {actual:?}, expected {expected:?}",
+                requirement.logical_name
+            )));
+        }
+        let metadata = catalog.tensor_metadata(&requirement.checkpoint_key)?;
+        if metadata.encoded_byte_len != requirement.source_bytes {
+            return Err(MimiArtifactError::Topology(format!(
+                "checkpoint tensor {:?} declares {} source bytes, expected {}",
+                requirement.checkpoint_key, metadata.encoded_byte_len, requirement.source_bytes
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct PlanningTensor(Vec<i32>);
+
+impl PlanningTensor {
+    fn unavailable() -> Result<Self, eredu_nn::Error> {
+        Err(eredu_nn::Error::backend(
+            "Mimi planning tensors cannot execute neural operations",
+        ))
+    }
+}
+
+impl Tensor for PlanningTensor {
+    type Context = ();
+
+    fn shape(&self) -> &[i32] {
+        &self.0
+    }
+
+    fn unloaded_f32(shape: &[i32], _: &Self::Context) -> Result<Self, eredu_nn::Error> {
+        Ok(Self(shape.to_vec()))
+    }
+
+    fn from_f32_slice(_: &[f32], _: &[i32], _: &Self::Context) -> Result<Self, eredu_nn::Error> {
+        Self::unavailable()
+    }
+
+    fn add(&self, _: &Self, _: &Self::Context) -> Result<Self, eredu_nn::Error> {
+        Self::unavailable()
+    }
+
+    fn subtract(&self, _: &Self, _: &Self::Context) -> Result<Self, eredu_nn::Error> {
+        Self::unavailable()
+    }
+
+    fn multiply(&self, _: &Self, _: &Self::Context) -> Result<Self, eredu_nn::Error> {
+        Self::unavailable()
+    }
+
+    fn multiply_scalar(&self, _: f32, _: &Self::Context) -> Result<Self, eredu_nn::Error> {
+        Self::unavailable()
+    }
+
+    fn divide(&self, _: &Self, _: &Self::Context) -> Result<Self, eredu_nn::Error> {
+        Self::unavailable()
+    }
+
+    fn square(&self, _: &Self::Context) -> Result<Self, eredu_nn::Error> {
+        Self::unavailable()
+    }
+
+    fn maximum_scalar(&self, _: f32, _: &Self::Context) -> Result<Self, eredu_nn::Error> {
+        Self::unavailable()
+    }
+
+    fn reshape(&self, _: &[i32], _: &Self::Context) -> Result<Self, eredu_nn::Error> {
+        Self::unavailable()
+    }
+
+    fn transpose_axes(&self, _: &[i32], _: &Self::Context) -> Result<Self, eredu_nn::Error> {
+        Self::unavailable()
+    }
+
+    fn swap_axes(&self, _: i32, _: i32, _: &Self::Context) -> Result<Self, eredu_nn::Error> {
+        Self::unavailable()
+    }
+
+    fn transpose(&self, _: &Self::Context) -> Result<Self, eredu_nn::Error> {
+        Self::unavailable()
+    }
+
+    fn expand_dims(&self, _: i32, _: &Self::Context) -> Result<Self, eredu_nn::Error> {
+        Self::unavailable()
+    }
+
+    fn squeeze_axes(&self, _: &[i32], _: &Self::Context) -> Result<Self, eredu_nn::Error> {
+        Self::unavailable()
+    }
+
+    fn index(&self, _: &[Index], _: &Self::Context) -> Result<Self, eredu_nn::Error> {
+        Self::unavailable()
+    }
+
+    fn take_axis(&self, _: &Self, _: i32, _: &Self::Context) -> Result<Self, eredu_nn::Error> {
+        Self::unavailable()
+    }
+
+    fn concatenate(_: &[Self], _: i32, _: &Self::Context) -> Result<Self, eredu_nn::Error> {
+        Self::unavailable()
+    }
+
+    fn stack(_: &[Self], _: i32, _: &Self::Context) -> Result<Self, eredu_nn::Error> {
+        Self::unavailable()
+    }
+
+    fn matmul(_: &Self, _: &Self, _: &Self::Context) -> Result<Self, eredu_nn::Error> {
+        Self::unavailable()
+    }
+
+    fn sum_axis(_: &Self, _: i32, _: bool, _: &Self::Context) -> Result<Self, eredu_nn::Error> {
+        Self::unavailable()
+    }
+
+    fn argmin_axis(_: &Self, _: i32, _: bool, _: &Self::Context) -> Result<Self, eredu_nn::Error> {
+        Self::unavailable()
+    }
+
+    fn pad(
+        _: &Self,
+        _: &[(i32, i32)],
+        _: PadMode,
+        _: &Self::Context,
+    ) -> Result<Self, eredu_nn::Error> {
+        Self::unavailable()
+    }
+
+    fn conv1d(
+        _: &Self,
+        _: &Self,
+        _: i32,
+        _: i32,
+        _: i32,
+        _: i32,
+        _: &Self::Context,
+    ) -> Result<Self, eredu_nn::Error> {
+        Self::unavailable()
+    }
+
+    fn conv_transpose1d(
+        _: &Self,
+        _: &Self,
+        _: i32,
+        _: i32,
+        _: i32,
+        _: i32,
+        _: i32,
+        _: &Self::Context,
+    ) -> Result<Self, eredu_nn::Error> {
+        Self::unavailable()
+    }
+
+    fn linear(
+        _: &Self,
+        _: &Self,
+        _: Option<&Self>,
+        _: &Self::Context,
+    ) -> Result<Self, eredu_nn::Error> {
+        Self::unavailable()
+    }
+
+    fn layer_norm(
+        _: &Self,
+        _: Option<&Self>,
+        _: Option<&Self>,
+        _: f32,
+        _: &Self::Context,
+    ) -> Result<Self, eredu_nn::Error> {
+        Self::unavailable()
+    }
+
+    fn gelu(_: &Self, _: &Self::Context) -> Result<Self, eredu_nn::Error> {
+        Self::unavailable()
+    }
+
+    fn elu(_: &Self, _: f32, _: &Self::Context) -> Result<Self, eredu_nn::Error> {
+        Self::unavailable()
+    }
+
+    fn rope(
+        _: &Self,
+        _: i32,
+        _: bool,
+        _: f32,
+        _: f32,
+        _: i32,
+        _: &Self::Context,
+    ) -> Result<Self, eredu_nn::Error> {
+        Self::unavailable()
+    }
+
+    fn scaled_dot_product_attention(
+        _: &Self,
+        _: &Self,
+        _: &Self,
+        _: f32,
+        _: AttentionMask<'_, Self>,
+        _: &Self::Context,
+    ) -> Result<Self, eredu_nn::Error> {
+        Self::unavailable()
+    }
+}
+
+fn parameter_topology(config: Config) -> Result<BTreeMap<String, Vec<usize>>, MimiArtifactError> {
+    let mimi = Mimi::<PlanningTensor>::new(config, &())?;
+    let mut topology = BTreeMap::new();
+    let mut duplicate = None;
+    mimi.visit_mimi_parameters("", &mut |metadata, parameter| {
+        let shape = parameter
+            .shape()
+            .iter()
+            .map(|dimension| {
+                usize::try_from(*dimension).map_err(|_| {
+                    MimiArtifactError::Topology(format!(
+                        "parameter {:?} has invalid shape {:?}",
+                        metadata.id,
+                        parameter.shape()
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>();
+        match shape {
+            Ok(shape) => {
+                if topology.insert(metadata.id.to_string(), shape).is_some() {
+                    duplicate = Some(metadata.id.to_string());
+                }
+            }
+            Err(error) => duplicate = Some(error.to_string()),
+        }
+    });
+    if let Some(duplicate) = duplicate {
+        return Err(MimiArtifactError::Topology(format!(
+            "duplicate or invalid parameter identity {duplicate:?}"
+        )));
+    }
+    Ok(topology)
+}
+
+fn checkpoint_layout_axes(parameter: &str) -> Option<[usize; 3]> {
+    (parameter.ends_with(".weight") && is_conv_weight_key(parameter)).then(|| {
+        if parameter.contains(".upsample.") {
             [1, 2, 0]
         } else {
             [0, 2, 1]
-        };
-        CheckpointTensorLayout::Transpose3d(axes)
-    } else {
-        CheckpointTensorLayout::Identity
-    };
-    Some(CheckpointTensorPlan { parameter, layout })
+        }
+    })
+}
+
+fn inverse_permuted_shape(
+    logical_shape: &[usize],
+    axes: [usize; 3],
+) -> Result<Vec<usize>, MimiArtifactError> {
+    if logical_shape.len() != axes.len() {
+        return Err(MimiArtifactError::Topology(format!(
+            "rank-{} parameter cannot use transpose axes {axes:?}",
+            logical_shape.len()
+        )));
+    }
+    let mut physical = vec![0; axes.len()];
+    for (logical_axis, physical_axis) in axes.into_iter().enumerate() {
+        physical[physical_axis] = logical_shape[logical_axis];
+    }
+    Ok(physical)
+}
+
+fn f32_bytes(shape: &[usize], name: &str) -> Result<u64, MimiArtifactError> {
+    shape.iter().try_fold(4u64, |bytes, dimension| {
+        bytes.checked_mul(*dimension as u64).ok_or_else(|| {
+            MimiArtifactError::Topology(format!("byte count overflows for {name:?}"))
+        })
+    })
+}
+
+fn checkpoint_key_for_parameter(parameter: &str) -> Option<String> {
+    if parameter.starts_with("quantizer.") {
+        return Some(parameter.to_owned());
+    }
+    if parameter == "downsample.weight" {
+        return Some("downsample.conv.conv.conv.weight".into());
+    }
+    if let Some(key) = parameter.strip_prefix("encoder_transformer.") {
+        let key = key
+            .replace(".self_attn.in_proj.weight", ".self_attn.in_proj_weight")
+            .replace(".mlp.linear1.", ".linear1.")
+            .replace(".mlp.linear2.", ".linear2.");
+        return Some(format!("encoder_transformer.transformer.{key}"));
+    }
+    if let Some(key) = reverse_seanet_encoder_key(parameter) {
+        return Some(format!("encoder.model.{key}"));
+    }
+    if parameter == "upsample.weight" {
+        return Some("upsample.convtr.convtr.convtr.weight".into());
+    }
+    if let Some(key) = parameter.strip_prefix("decoder_transformer.") {
+        let key = key
+            .replace(".self_attn.in_proj.weight", ".self_attn.in_proj_weight")
+            .replace(".mlp.linear1.", ".linear1.")
+            .replace(".mlp.linear2.", ".linear2.");
+        return Some(format!("decoder_transformer.transformer.{key}"));
+    }
+    reverse_seanet_decoder_key(parameter).map(|key| format!("decoder.model.{key}"))
+}
+
+const SEANET_ENCODER_KEY_MAPPINGS: &[(&str, &str)] = &[
+    ("0.conv.conv.", "encoder.init_conv1d."),
+    (
+        "1.block.1.conv.conv.",
+        "encoder.layers.0.residuals.0.block.0.",
+    ),
+    (
+        "1.block.3.conv.conv.",
+        "encoder.layers.0.residuals.0.block.1.",
+    ),
+    ("3.conv.conv.", "encoder.layers.0.downsample."),
+    (
+        "4.block.1.conv.conv.",
+        "encoder.layers.1.residuals.0.block.0.",
+    ),
+    (
+        "4.block.3.conv.conv.",
+        "encoder.layers.1.residuals.0.block.1.",
+    ),
+    ("6.conv.conv.", "encoder.layers.1.downsample."),
+    (
+        "7.block.1.conv.conv.",
+        "encoder.layers.2.residuals.0.block.0.",
+    ),
+    (
+        "7.block.3.conv.conv.",
+        "encoder.layers.2.residuals.0.block.1.",
+    ),
+    ("9.conv.conv.", "encoder.layers.2.downsample."),
+    (
+        "10.block.1.conv.conv.",
+        "encoder.layers.3.residuals.0.block.0.",
+    ),
+    (
+        "10.block.3.conv.conv.",
+        "encoder.layers.3.residuals.0.block.1.",
+    ),
+    ("12.conv.conv.", "encoder.layers.3.downsample."),
+    ("14.conv.conv.", "encoder.final_conv1d."),
+];
+
+const SEANET_DECODER_KEY_MAPPINGS: &[(&str, &str)] = &[
+    ("0.conv.conv.", "decoder.init_conv1d."),
+    ("2.convtr.convtr.", "decoder.layers.0.upsample."),
+    (
+        "3.block.1.conv.conv.",
+        "decoder.layers.0.residuals.0.block.0.",
+    ),
+    (
+        "3.block.3.conv.conv.",
+        "decoder.layers.0.residuals.0.block.1.",
+    ),
+    ("5.convtr.convtr.", "decoder.layers.1.upsample."),
+    (
+        "6.block.1.conv.conv.",
+        "decoder.layers.1.residuals.0.block.0.",
+    ),
+    (
+        "6.block.3.conv.conv.",
+        "decoder.layers.1.residuals.0.block.1.",
+    ),
+    ("8.convtr.convtr.", "decoder.layers.2.upsample."),
+    (
+        "9.block.1.conv.conv.",
+        "decoder.layers.2.residuals.0.block.0.",
+    ),
+    (
+        "9.block.3.conv.conv.",
+        "decoder.layers.2.residuals.0.block.1.",
+    ),
+    ("11.convtr.convtr.", "decoder.layers.3.upsample."),
+    (
+        "12.block.1.conv.conv.",
+        "decoder.layers.3.residuals.0.block.0.",
+    ),
+    (
+        "12.block.3.conv.conv.",
+        "decoder.layers.3.residuals.0.block.1.",
+    ),
+    ("14.conv.conv.", "decoder.final_conv1d."),
+];
+
+fn reverse_seanet_key(parameter: &str, mappings: &[(&str, &str)]) -> Option<String> {
+    let &(source, target) = mappings
+        .iter()
+        .find(|(_, target)| parameter.starts_with(target))?;
+    Some(format!("{source}{}", &parameter[target.len()..]))
+}
+
+fn reverse_seanet_encoder_key(parameter: &str) -> Option<String> {
+    reverse_seanet_key(parameter, SEANET_ENCODER_KEY_MAPPINGS)
+}
+
+fn reverse_seanet_decoder_key(parameter: &str) -> Option<String> {
+    reverse_seanet_key(parameter, SEANET_DECODER_KEY_MAPPINGS)
 }
 
 fn transform_decoder_key(key: &str) -> Option<String> {
@@ -404,94 +1196,17 @@ fn transform_decoder_key(key: &str) -> Option<String> {
 }
 
 fn transform_seanet_encoder_key(key: &str) -> Option<String> {
-    let (source, target) = [
-        ("0.conv.conv.", "encoder.init_conv1d."),
-        (
-            "1.block.1.conv.conv.",
-            "encoder.layers.0.residuals.0.block.0.",
-        ),
-        (
-            "1.block.3.conv.conv.",
-            "encoder.layers.0.residuals.0.block.1.",
-        ),
-        ("3.conv.conv.", "encoder.layers.0.downsample."),
-        (
-            "4.block.1.conv.conv.",
-            "encoder.layers.1.residuals.0.block.0.",
-        ),
-        (
-            "4.block.3.conv.conv.",
-            "encoder.layers.1.residuals.0.block.1.",
-        ),
-        ("6.conv.conv.", "encoder.layers.1.downsample."),
-        (
-            "7.block.1.conv.conv.",
-            "encoder.layers.2.residuals.0.block.0.",
-        ),
-        (
-            "7.block.3.conv.conv.",
-            "encoder.layers.2.residuals.0.block.1.",
-        ),
-        ("9.conv.conv.", "encoder.layers.2.downsample."),
-        (
-            "10.block.1.conv.conv.",
-            "encoder.layers.3.residuals.0.block.0.",
-        ),
-        (
-            "10.block.3.conv.conv.",
-            "encoder.layers.3.residuals.0.block.1.",
-        ),
-        ("12.conv.conv.", "encoder.layers.3.downsample."),
-        ("14.conv.conv.", "encoder.final_conv1d."),
-    ]
-    .into_iter()
-    .find(|(source, _)| key.starts_with(source))?;
-    Some(format!("{target}{}", &key[source.len()..]))
+    transform_seanet_key(key, SEANET_ENCODER_KEY_MAPPINGS)
 }
 
 fn transform_seanet_decoder_key(key: &str) -> Option<String> {
-    let (source, target) = [
-        ("0.conv.conv.", "decoder.init_conv1d."),
-        ("2.convtr.convtr.", "decoder.layers.0.upsample."),
-        (
-            "3.block.1.conv.conv.",
-            "decoder.layers.0.residuals.0.block.0.",
-        ),
-        (
-            "3.block.3.conv.conv.",
-            "decoder.layers.0.residuals.0.block.1.",
-        ),
-        ("5.convtr.convtr.", "decoder.layers.1.upsample."),
-        (
-            "6.block.1.conv.conv.",
-            "decoder.layers.1.residuals.0.block.0.",
-        ),
-        (
-            "6.block.3.conv.conv.",
-            "decoder.layers.1.residuals.0.block.1.",
-        ),
-        ("8.convtr.convtr.", "decoder.layers.2.upsample."),
-        (
-            "9.block.1.conv.conv.",
-            "decoder.layers.2.residuals.0.block.0.",
-        ),
-        (
-            "9.block.3.conv.conv.",
-            "decoder.layers.2.residuals.0.block.1.",
-        ),
-        ("11.convtr.convtr.", "decoder.layers.3.upsample."),
-        (
-            "12.block.1.conv.conv.",
-            "decoder.layers.3.residuals.0.block.0.",
-        ),
-        (
-            "12.block.3.conv.conv.",
-            "decoder.layers.3.residuals.0.block.1.",
-        ),
-        ("14.conv.conv.", "decoder.final_conv1d."),
-    ]
-    .into_iter()
-    .find(|(source, _)| key.starts_with(source))?;
+    transform_seanet_key(key, SEANET_DECODER_KEY_MAPPINGS)
+}
+
+fn transform_seanet_key(key: &str, mappings: &[(&str, &str)]) -> Option<String> {
+    let &(source, target) = mappings
+        .iter()
+        .find(|(source, _)| key.starts_with(source))?;
     Some(format!("{target}{}", &key[source.len()..]))
 }
 
@@ -2021,261 +2736,285 @@ fn validate_codes<T: Tensor>(codes: &T, max_codebooks: i32) -> Result<(), Error>
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        checkpoint_tensor_plan, CheckpointTensorLayout, Config, Mimi, MimiModuleParameters,
+    use std::{
+        collections::BTreeMap,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
     };
-    use eredu_nn::{AttentionMask, Error as ComputeError, Index, PadMode, Tensor};
 
-    #[derive(Debug, Clone)]
-    struct ShapeTensor(Vec<i32>);
+    use super::{
+        checkpoint_key_for_parameter, checkpoint_layout_axes, checkpoint_parameter_for_key,
+        parameter_topology, prepare_catalog, prepare_source, released_checkpoint_requirements,
+        Config, Mimi, MimiArtifactError, MimiParameterRequirement, RecipeDtype,
+    };
+    use eredu_checkpoint::store::{
+        CheckpointLease, CheckpointSource, TensorMetadata, TensorReadRequest,
+        TensorSourceProvenance, WeightStoreBackend, WeightStoreDiagnostics,
+    };
+    use eredu_checkpoint::{SourceTensorEncoding, StoredDtype};
 
-    impl ShapeTensor {
-        fn unavailable() -> Result<Self, ComputeError> {
-            unreachable!("shape-only test backend cannot execute tensor operations")
+    struct MetadataSource {
+        tensors: BTreeMap<String, TensorMetadata>,
+        payload_reads: AtomicUsize,
+        encoding: SourceTensorEncoding,
+    }
+
+    impl MetadataSource {
+        fn exact(requirements: &[MimiParameterRequirement]) -> Self {
+            Self {
+                tensors: requirements
+                    .iter()
+                    .map(|requirement| {
+                        (
+                            requirement.checkpoint_key().to_owned(),
+                            TensorMetadata {
+                                name: requirement.checkpoint_key().to_owned(),
+                                logical_shape: requirement.physical_shape().to_vec(),
+                                physical_shape: requirement.physical_shape().to_vec(),
+                                stored_dtype: requirement.source_dtype().clone(),
+                                encoded_byte_len: requirement.source_bytes(),
+                                backing_shard: None,
+                            },
+                        )
+                    })
+                    .collect(),
+                payload_reads: AtomicUsize::new(0),
+                encoding: SourceTensorEncoding::Safetensors(StoredDtype::F32),
+            }
         }
     }
 
-    impl Tensor for ShapeTensor {
-        type Context = ();
-
-        fn shape(&self) -> &[i32] {
-            &self.0
+    impl CheckpointSource for MetadataSource {
+        fn source_keys(&self) -> Vec<String> {
+            self.tensors.keys().cloned().collect()
         }
 
-        fn unloaded_f32(shape: &[i32], _: &Self::Context) -> Result<Self, ComputeError> {
-            Ok(Self(shape.to_vec()))
+        fn source_metadata(
+            &self,
+            key: &str,
+        ) -> Result<TensorMetadata, eredu_checkpoint::store::StoreError> {
+            self.tensors.get(key).cloned().ok_or_else(|| {
+                eredu_checkpoint::store::StoreError::UnknownTensor { key: key.into() }
+            })
         }
 
-        fn from_f32_slice(_: &[f32], _: &[i32], _: &Self::Context) -> Result<Self, ComputeError> {
-            Self::unavailable()
+        fn acquire_lease(
+            &self,
+            _: TensorReadRequest,
+        ) -> Result<CheckpointLease, eredu_checkpoint::store::StoreError> {
+            self.payload_reads.fetch_add(1, Ordering::Relaxed);
+            Err(eredu_checkpoint::store::StoreError::Internal(
+                "metadata-only test source cannot read payloads".into(),
+            ))
         }
 
-        fn add(&self, _: &Self, _: &Self::Context) -> Result<Self, ComputeError> {
-            Self::unavailable()
+        fn source_diagnostics(
+            &self,
+        ) -> Result<WeightStoreDiagnostics, eredu_checkpoint::store::StoreError> {
+            Ok(WeightStoreDiagnostics {
+                backend: WeightStoreBackend::Memory,
+                cache_hits: 0,
+                cache_misses: 0,
+                evictions: 0,
+                currently_cached_shards: 0,
+                touched_shard_paths: Vec::new(),
+                payload_shard_paths: Vec::new(),
+                physical_reads: self.payload_reads.load(Ordering::Relaxed) as u64,
+                physical_read_bytes: 0,
+                coalesced_group_hits: 0,
+            })
         }
 
-        fn subtract(&self, _: &Self, _: &Self::Context) -> Result<Self, ComputeError> {
-            Self::unavailable()
+        fn source_provenance(
+            &self,
+            key: &str,
+        ) -> Result<TensorSourceProvenance, eredu_checkpoint::store::StoreError> {
+            let metadata = self.source_metadata(key)?;
+            Ok(TensorSourceProvenance {
+                catalog_key: key.to_owned(),
+                physical_tensor: key.to_owned(),
+                output: key.to_owned(),
+                backing_shard: metadata.backing_shard,
+                source_encoding: self.encoding.clone(),
+            })
         }
+    }
 
-        fn multiply(&self, _: &Self, _: &Self::Context) -> Result<Self, ComputeError> {
-            Self::unavailable()
-        }
-
-        fn multiply_scalar(&self, _: f32, _: &Self::Context) -> Result<Self, ComputeError> {
-            Self::unavailable()
-        }
-
-        fn divide(&self, _: &Self, _: &Self::Context) -> Result<Self, ComputeError> {
-            Self::unavailable()
-        }
-
-        fn square(&self, _: &Self::Context) -> Result<Self, ComputeError> {
-            Self::unavailable()
-        }
-
-        fn maximum_scalar(&self, _: f32, _: &Self::Context) -> Result<Self, ComputeError> {
-            Self::unavailable()
-        }
-
-        fn reshape(&self, _: &[i32], _: &Self::Context) -> Result<Self, ComputeError> {
-            Self::unavailable()
-        }
-
-        fn transpose_axes(&self, _: &[i32], _: &Self::Context) -> Result<Self, ComputeError> {
-            Self::unavailable()
-        }
-
-        fn swap_axes(&self, _: i32, _: i32, _: &Self::Context) -> Result<Self, ComputeError> {
-            Self::unavailable()
-        }
-
-        fn transpose(&self, _: &Self::Context) -> Result<Self, ComputeError> {
-            Self::unavailable()
-        }
-
-        fn expand_dims(&self, _: i32, _: &Self::Context) -> Result<Self, ComputeError> {
-            Self::unavailable()
-        }
-
-        fn squeeze_axes(&self, _: &[i32], _: &Self::Context) -> Result<Self, ComputeError> {
-            Self::unavailable()
-        }
-
-        fn index(&self, _: &[Index], _: &Self::Context) -> Result<Self, ComputeError> {
-            Self::unavailable()
-        }
-
-        fn take_axis(&self, _: &Self, _: i32, _: &Self::Context) -> Result<Self, ComputeError> {
-            Self::unavailable()
-        }
-
-        fn concatenate(_: &[Self], _: i32, _: &Self::Context) -> Result<Self, ComputeError> {
-            Self::unavailable()
-        }
-
-        fn stack(_: &[Self], _: i32, _: &Self::Context) -> Result<Self, ComputeError> {
-            Self::unavailable()
-        }
-
-        fn matmul(_: &Self, _: &Self, _: &Self::Context) -> Result<Self, ComputeError> {
-            Self::unavailable()
-        }
-
-        fn sum_axis(_: &Self, _: i32, _: bool, _: &Self::Context) -> Result<Self, ComputeError> {
-            Self::unavailable()
-        }
-
-        fn argmin_axis(_: &Self, _: i32, _: bool, _: &Self::Context) -> Result<Self, ComputeError> {
-            Self::unavailable()
-        }
-
-        fn pad(
-            _: &Self,
-            _: &[(i32, i32)],
-            _: PadMode,
-            _: &Self::Context,
-        ) -> Result<Self, ComputeError> {
-            Self::unavailable()
-        }
-
-        fn conv1d(
-            _: &Self,
-            _: &Self,
-            _: i32,
-            _: i32,
-            _: i32,
-            _: i32,
-            _: &Self::Context,
-        ) -> Result<Self, ComputeError> {
-            Self::unavailable()
-        }
-
-        fn conv_transpose1d(
-            _: &Self,
-            _: &Self,
-            _: i32,
-            _: i32,
-            _: i32,
-            _: i32,
-            _: i32,
-            _: &Self::Context,
-        ) -> Result<Self, ComputeError> {
-            Self::unavailable()
-        }
-
-        fn linear(
-            _: &Self,
-            _: &Self,
-            _: Option<&Self>,
-            _: &Self::Context,
-        ) -> Result<Self, ComputeError> {
-            Self::unavailable()
-        }
-
-        fn layer_norm(
-            _: &Self,
-            _: Option<&Self>,
-            _: Option<&Self>,
-            _: f32,
-            _: &Self::Context,
-        ) -> Result<Self, ComputeError> {
-            Self::unavailable()
-        }
-
-        fn gelu(_: &Self, _: &Self::Context) -> Result<Self, ComputeError> {
-            Self::unavailable()
-        }
-
-        fn elu(_: &Self, _: f32, _: &Self::Context) -> Result<Self, ComputeError> {
-            Self::unavailable()
-        }
-
-        fn rope(
-            _: &Self,
-            _: i32,
-            _: bool,
-            _: f32,
-            _: f32,
-            _: i32,
-            _: &Self::Context,
-        ) -> Result<Self, ComputeError> {
-            Self::unavailable()
-        }
-
-        fn scaled_dot_product_attention(
-            _: &Self,
-            _: &Self,
-            _: &Self,
-            _: f32,
-            _: AttentionMask<'_, Self>,
-            _: &Self::Context,
-        ) -> Result<Self, ComputeError> {
-            Self::unavailable()
-        }
+    fn exact_source() -> (Arc<MetadataSource>, Vec<MimiParameterRequirement>) {
+        let (_, requirements, _) = prepare_catalog(&Config::v0_1(Some(8))).unwrap();
+        (Arc::new(MetadataSource::exact(&requirements)), requirements)
     }
 
     #[test]
     fn checkpoint_quantizer_keys_keep_the_model_root() {
         let key = "quantizer.rvq_first.vq.layers.0._codebook.embedding_sum";
-        let plan = checkpoint_tensor_plan(key).unwrap();
-        assert_eq!(plan.parameter, key);
-        assert_eq!(plan.layout, CheckpointTensorLayout::Identity);
+        assert_eq!(checkpoint_parameter_for_key(key).as_deref(), Some(key));
+        assert_eq!(checkpoint_key_for_parameter(key).as_deref(), Some(key));
+        assert_eq!(checkpoint_layout_axes(key), None);
     }
 
     #[test]
     fn checkpoint_plan_declares_canonical_convolution_layouts() {
         assert_eq!(
-            checkpoint_tensor_plan("encoder.model.0.conv.conv.weight")
-                .unwrap()
-                .layout,
-            CheckpointTensorLayout::Transpose3d([0, 2, 1])
+            checkpoint_layout_axes("encoder.init_conv1d.weight"),
+            Some([0, 2, 1])
         );
         assert_eq!(
-            checkpoint_tensor_plan("decoder.model.2.convtr.convtr.weight")
-                .unwrap()
-                .layout,
-            CheckpointTensorLayout::Transpose3d([1, 2, 0])
+            checkpoint_layout_axes("decoder.layers.0.upsample.weight"),
+            Some([1, 2, 0])
         );
-        assert_eq!(
-            checkpoint_tensor_plan("upsample.convtr.convtr.convtr.weight")
-                .unwrap()
-                .layout,
-            CheckpointTensorLayout::Transpose3d([0, 2, 1])
-        );
-        assert!(checkpoint_tensor_plan("optimizer.state").is_none());
+        assert_eq!(checkpoint_layout_axes("upsample.weight"), Some([0, 2, 1]));
+        assert!(checkpoint_parameter_for_key("optimizer.state").is_none());
     }
 
     #[test]
     fn parameter_names_are_unique_and_cover_checkpoint_mapping() {
-        let model = Mimi::<ShapeTensor>::new(Config::v0_1(Some(8)), &()).unwrap();
-        let mut names = Vec::new();
-        model.visit_mimi_parameters("", &mut |metadata, _| {
-            names.push(metadata.id.as_str().to_owned());
-        });
-
-        let mut unique = names.clone();
-        unique.sort();
-        unique.dedup();
-        assert_eq!(names.len(), unique.len(), "duplicate Mimi parameter name");
-
-        for checkpoint_name in [
-            "quantizer.rvq_first.vq.layers.0._codebook.embedding_sum",
-            "downsample.conv.conv.conv.weight",
-            "encoder_transformer.transformer.layers.0.self_attn.in_proj_weight",
-            "encoder.model.0.conv.conv.weight",
-            "upsample.convtr.convtr.convtr.weight",
-            "decoder_transformer.transformer.layers.0.linear1.weight",
-            "decoder.model.0.conv.conv.weight",
-        ] {
-            let model_name = checkpoint_tensor_plan(checkpoint_name)
-                .unwrap_or_else(|| panic!("checkpoint key was not mapped: {checkpoint_name}"))
-                .parameter;
-            assert!(
-                unique.binary_search(&model_name).is_ok(),
-                "mapped parameter is absent from Mimi: {checkpoint_name} -> {model_name}"
+        let active = parameter_topology(Config::v0_1(Some(8))).unwrap();
+        let full = parameter_topology(Config::v0_1(Some(32))).unwrap();
+        assert_eq!(active.len(), 246);
+        assert_eq!(full.len(), 318);
+        for model_name in full.keys() {
+            let checkpoint_name = checkpoint_key_for_parameter(model_name)
+                .unwrap_or_else(|| panic!("model parameter was not mapped: {model_name}"));
+            assert_eq!(
+                checkpoint_parameter_for_key(&checkpoint_name).as_deref(),
+                Some(model_name.as_str()),
+                "checkpoint mapping did not round-trip"
             );
         }
+    }
+
+    #[test]
+    fn exact_catalog_preparation_validates_total_topology_without_payload_reads() {
+        for active in 1..=32 {
+            let (_, requirements) = exact_source();
+            let source = Arc::new(MetadataSource::exact(&requirements));
+            let prepared = prepare_source(source.clone(), Config::v0_1(Some(active))).unwrap();
+            assert_eq!(prepared.requirements().len(), 318);
+            assert_eq!(prepared.bindings().len(), 3 * active as usize + 222);
+            assert_eq!(
+                prepared
+                    .requirements()
+                    .iter()
+                    .filter(|requirement| requirement.is_active())
+                    .count(),
+                3 * active as usize + 222
+            );
+            assert!(prepared.requirements().iter().all(|requirement| {
+                requirement.source_dtype() == &StoredDtype::F32
+                    && requirement.output_dtype() == &RecipeDtype::F32
+                    && requirement.source_encoding()
+                        == &SourceTensorEncoding::Safetensors(StoredDtype::F32)
+            }));
+            assert_eq!(
+                prepared
+                    .requirements()
+                    .iter()
+                    .filter(|requirement| matches!(
+                        requirement.recipe(),
+                        eredu_checkpoint::recipe::DerivedWeightRecipe::Transpose { .. }
+                    ))
+                    .count(),
+                30
+            );
+            assert_eq!(
+                prepared
+                    .requirements()
+                    .iter()
+                    .filter(|requirement| requirement.recipe().source_keys().len() == 1)
+                    .count(),
+                318
+            );
+            assert_eq!(source.payload_reads.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    #[test]
+    fn corrupt_catalogs_fail_before_payload_reads() {
+        let (source, requirements) = exact_source();
+        let missing_key = requirements[0].checkpoint_key().to_owned();
+        let mut missing = MetadataSource::exact(&requirements);
+        missing.tensors.remove(&missing_key);
+        let missing = Arc::new(missing);
+        assert!(matches!(
+            prepare_source(missing.clone(), Config::v0_1(Some(8))),
+            Err(MimiArtifactError::Catalog(_))
+        ));
+        assert_eq!(missing.payload_reads.load(Ordering::Relaxed), 0);
+
+        let mut extra = MetadataSource::exact(&requirements);
+        extra.tensors.insert(
+            "optimizer.state".into(),
+            TensorMetadata {
+                name: "optimizer.state".into(),
+                logical_shape: vec![1],
+                physical_shape: vec![1],
+                stored_dtype: StoredDtype::F32,
+                encoded_byte_len: 4,
+                backing_shard: None,
+            },
+        );
+        let extra = Arc::new(extra);
+        assert!(matches!(
+            prepare_source(extra.clone(), Config::v0_1(Some(8))),
+            Err(MimiArtifactError::Catalog(_))
+        ));
+        assert_eq!(extra.payload_reads.load(Ordering::Relaxed), 0);
+
+        let corrupt = requirements
+            .iter()
+            .find(|requirement| requirement.physical_shape().len() == 3)
+            .unwrap();
+        let mut wrong_shape = MetadataSource::exact(&requirements);
+        wrong_shape
+            .tensors
+            .get_mut(corrupt.checkpoint_key())
+            .unwrap()
+            .logical_shape[0] += 1;
+        let wrong_shape = Arc::new(wrong_shape);
+        assert!(matches!(
+            prepare_source(wrong_shape.clone(), Config::v0_1(Some(8))),
+            Err(MimiArtifactError::Catalog(_))
+        ));
+        assert_eq!(wrong_shape.payload_reads.load(Ordering::Relaxed), 0);
+
+        let mut wrong_dtype = MetadataSource::exact(&requirements);
+        wrong_dtype
+            .tensors
+            .get_mut(corrupt.checkpoint_key())
+            .unwrap()
+            .stored_dtype = StoredDtype::F16;
+        let wrong_dtype = Arc::new(wrong_dtype);
+        assert!(matches!(
+            prepare_source(wrong_dtype.clone(), Config::v0_1(Some(8))),
+            Err(MimiArtifactError::Catalog(_))
+        ));
+        assert_eq!(wrong_dtype.payload_reads.load(Ordering::Relaxed), 0);
+
+        let mut wrong_bytes = MetadataSource::exact(&requirements);
+        wrong_bytes
+            .tensors
+            .get_mut(corrupt.checkpoint_key())
+            .unwrap()
+            .encoded_byte_len -= 4;
+        let wrong_bytes = Arc::new(wrong_bytes);
+        assert!(matches!(
+            prepare_source(wrong_bytes.clone(), Config::v0_1(Some(8))),
+            Err(MimiArtifactError::Topology(_))
+        ));
+        assert_eq!(wrong_bytes.payload_reads.load(Ordering::Relaxed), 0);
+
+        let mut wrong_encoding = MetadataSource::exact(&requirements);
+        wrong_encoding.encoding = SourceTensorEncoding::RecipeOutput(StoredDtype::F32);
+        let wrong_encoding = Arc::new(wrong_encoding);
+        assert!(matches!(
+            prepare_source(wrong_encoding.clone(), Config::v0_1(Some(8))),
+            Err(MimiArtifactError::Topology(_))
+        ));
+        assert_eq!(wrong_encoding.payload_reads.load(Ordering::Relaxed), 0);
+        assert_eq!(source.payload_reads.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -2286,5 +3025,20 @@ mod tests {
         assert_eq!(cfg.num_codebooks, 16);
         assert_eq!(cfg.total_codebooks, 32);
         assert_eq!(cfg.bins, 2_048);
+    }
+
+    #[test]
+    fn unsupported_or_non_finite_profiles_fail_before_tensor_construction() {
+        let mut invalid = Config::v0_1(Some(8));
+        invalid.sample_rate = f64::NAN;
+        assert!(Mimi::<super::PlanningTensor>::new(invalid, &()).is_err());
+
+        let mut unsupported = Config::v0_1(Some(8));
+        unsupported.total_codebooks = 16;
+        assert!(Mimi::<super::PlanningTensor>::new(unsupported, &()).is_err());
+
+        for active in [-1, 0, 33] {
+            assert!(released_checkpoint_requirements(&Config::v0_1(Some(active))).is_err());
+        }
     }
 }

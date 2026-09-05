@@ -3,9 +3,15 @@ use std::{path::PathBuf, time::Instant};
 #[path = "support/realtime.rs"]
 mod realtime_support;
 
-use eredu_backend_mlx::native::ExecutionContext;
-use eredu_backend_mlx::{codec::mimi::load, native::MlxRealtimeExecutionContext, MlxTensor};
-use eredu_codec::mimi::Mimi;
+use eredu_backend_mlx::{
+    backend::{
+        nn::shared::MlxNeuralBackend,
+        runtime::checkpoint::store::MlxParameterMaterializationContext,
+    },
+    native::{ExecutionContext, MlxRealtimeExecutionContext},
+    MlxTensor,
+};
+use eredu_codec::mimi::{construct, prepare_checkpoint, Config, Mimi};
 use eredu_core::{scheduler::RequestId, RealtimeSampling};
 use safemlx::{transforms::eval, Array, Device, DeviceType, Stream};
 
@@ -54,11 +60,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let input_audio_codebooks = config.input_audio_codebooks() as i32;
     let generated_audio_codebooks = config.generated_audio_codebooks() as i32;
     let depth_audio_codebooks = config.depth_audio_codebooks() as i32;
-    let mut mimi = load(
+    let prepared = prepare_checkpoint(
         &mimi_path,
-        Some(input_audio_codebooks.max(generated_audio_codebooks)),
-        stream,
+        Config::v0_1(Some(input_audio_codebooks.max(generated_audio_codebooks))),
     )?;
+    let materialization = MlxParameterMaterializationContext::new(stream, stream);
+    let mut mimi = construct::<MlxNeuralBackend>(prepared, stream, &materialization)?;
     stream.synchronize()?;
     println!("load_s={:.3}", load_start.elapsed().as_secs_f64());
     println!(

@@ -186,8 +186,6 @@ def build_command() -> list[str]:
         "--release",
         "-p",
         "eredu-backend-mlx",
-        "--features",
-        "codec",
         "--example",
         "personaplex_quantization_eval",
     ]

@@ -416,6 +416,141 @@ pub trait CheckpointSource: Send + Sync {
 /// Shared ownership of one backend-neutral checkpoint source.
 pub type SharedCheckpointSource = Arc<dyn CheckpointSource>;
 
+/// Immutable catalog entry retained across deferred payload acquisition.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct PreparedTensorSource {
+    /// Exact metadata admitted before payload access.
+    pub metadata: TensorMetadata,
+    /// Exact container identity and encoding admitted before payload access.
+    pub provenance: TensorSourceProvenance,
+}
+
+/// Checkpoint source pinned to an exact metadata and provenance snapshot.
+///
+/// The wrapper revalidates the source before each acquisition and validates
+/// the resulting lease before returning it. This closes the interval between
+/// header-only preparation and deferred materialization without converting or
+/// buffering payloads.
+pub struct PreparedCheckpointSource {
+    source: SharedCheckpointSource,
+    catalog: BTreeMap<String, PreparedTensorSource>,
+}
+
+impl PreparedCheckpointSource {
+    /// Pins a source to the supplied exact catalog.
+    pub fn new(
+        source: SharedCheckpointSource,
+        catalog: BTreeMap<String, PreparedTensorSource>,
+    ) -> Result<Self, StoreError> {
+        let prepared = Self { source, catalog };
+        let mut source_keys = prepared.source.source_keys();
+        source_keys.sort();
+        if source_keys != prepared.catalog.keys().cloned().collect::<Vec<_>>() {
+            return Err(StoreError::PreparedCatalogMismatch {
+                key: "<catalog>".into(),
+            });
+        }
+        for key in prepared.catalog.keys() {
+            prepared.validate_current(key)?;
+        }
+        Ok(prepared)
+    }
+
+    fn expected(&self, key: &str) -> Result<&PreparedTensorSource, StoreError> {
+        self.catalog
+            .get(key)
+            .ok_or_else(|| StoreError::UnknownTensor { key: key.into() })
+    }
+
+    fn validate_current(&self, key: &str) -> Result<(), StoreError> {
+        let expected = self.expected(key)?;
+        if self.source.source_metadata(key)? != expected.metadata
+            || self.source.source_provenance(key)? != expected.provenance
+        {
+            return Err(StoreError::PreparedCatalogMismatch { key: key.into() });
+        }
+        Ok(())
+    }
+
+    fn validate_lease(
+        &self,
+        request: &TensorReadRequest,
+        lease: &CheckpointLease,
+    ) -> Result<(), StoreError> {
+        let expected = self.expected(&request.key)?;
+        let proof = lease.bounded_read_proof();
+        let full_selection = matches!(request.selection, TensorSelection::Full);
+        let encoded_len = lease
+            .encoded_bytes()
+            .and_then(|bytes| u64::try_from(bytes.len()).ok());
+        if lease.metadata() != &expected.metadata
+            || lease.selection() != &request.selection
+            || !proof.physically_bounded
+            || (full_selection
+                && (lease.output_shape() != expected.metadata.logical_shape
+                    || proof.offset_bytes != 0
+                    || proof.length_bytes != expected.metadata.encoded_byte_len))
+            || lease.backing_path() != expected.metadata.backing_shard.as_deref()
+            || encoded_len.is_some_and(|length| {
+                length != proof.length_bytes
+                    || (full_selection && length != expected.metadata.encoded_byte_len)
+            })
+        {
+            return Err(StoreError::PreparedCatalogMismatch {
+                key: request.key.clone(),
+            });
+        }
+        self.validate_current(&request.key)
+    }
+}
+
+impl CheckpointSource for PreparedCheckpointSource {
+    fn source_keys(&self) -> Vec<String> {
+        self.catalog.keys().cloned().collect()
+    }
+
+    fn source_metadata(&self, key: &str) -> Result<TensorMetadata, StoreError> {
+        self.validate_current(key)?;
+        Ok(self.expected(key)?.metadata.clone())
+    }
+
+    fn acquire_lease(&self, request: TensorReadRequest) -> Result<CheckpointLease, StoreError> {
+        self.validate_current(&request.key)?;
+        let lease = self.source.acquire_lease(request.clone())?;
+        self.validate_lease(&request, &lease)?;
+        Ok(lease)
+    }
+
+    fn source_diagnostics(&self) -> Result<WeightStoreDiagnostics, StoreError> {
+        self.source.source_diagnostics()
+    }
+
+    fn source_provenance(&self, key: &str) -> Result<TensorSourceProvenance, StoreError> {
+        self.validate_current(key)?;
+        Ok(self.expected(key)?.provenance.clone())
+    }
+
+    fn materialized_source_keys(&self) -> Vec<String> {
+        self.source.materialized_source_keys()
+    }
+
+    fn materialized_source_shards(&self) -> Vec<PathBuf> {
+        self.source.materialized_source_shards()
+    }
+
+    fn unclaimed_checkpoint_keys(&self) -> Vec<String> {
+        self.source.unclaimed_checkpoint_keys()
+    }
+
+    fn is_authoritative_materialized_key(&self, key: &str) -> bool {
+        self.source.is_authoritative_materialized_key(key)
+    }
+
+    fn is_checkpoint_contract_resolved(&self) -> bool {
+        self.source.is_checkpoint_contract_resolved()
+    }
+}
+
 /// Disjoint logical union of independently opened checkpoint artifacts.
 ///
 /// This is used by split model/projector artifacts while preserving each
@@ -2434,5 +2569,74 @@ mod tests {
             .unwrap(),
         );
         assert!(CompositeCheckpointSource::new([first, second]).is_err());
+    }
+
+    #[test]
+    fn prepared_source_rejects_a_lease_that_differs_from_the_admitted_catalog() {
+        struct LeaseSwapSource {
+            prepared: TensorMetadata,
+            payload: MemoryWeightStore,
+        }
+
+        impl CheckpointSource for LeaseSwapSource {
+            fn source_keys(&self) -> Vec<String> {
+                vec!["weight".into()]
+            }
+
+            fn source_metadata(&self, _: &str) -> Result<TensorMetadata, StoreError> {
+                Ok(self.prepared.clone())
+            }
+
+            fn acquire_lease(
+                &self,
+                request: TensorReadRequest,
+            ) -> Result<CheckpointLease, StoreError> {
+                self.payload.acquire_lease(request)
+            }
+
+            fn source_diagnostics(&self) -> Result<WeightStoreDiagnostics, StoreError> {
+                self.payload.source_diagnostics()
+            }
+        }
+
+        let prepared = TensorMetadata {
+            name: "weight".into(),
+            logical_shape: vec![1],
+            physical_shape: vec![1],
+            stored_dtype: StoredDtype::F32,
+            encoded_byte_len: 4,
+            backing_shard: None,
+        };
+        let source: SharedCheckpointSource = Arc::new(LeaseSwapSource {
+            prepared: prepared.clone(),
+            payload: MemoryWeightStore::from_safetensors([(
+                "weight".into(),
+                Dtype::I32,
+                vec![1],
+                7_i32.to_le_bytes().to_vec(),
+            )])
+            .unwrap(),
+        });
+        let provenance = source.source_provenance("weight").unwrap();
+        let source = PreparedCheckpointSource::new(
+            source,
+            BTreeMap::from([(
+                "weight".into(),
+                PreparedTensorSource {
+                    metadata: prepared,
+                    provenance,
+                },
+            )]),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            source.acquire_lease(TensorReadRequest {
+                key: "weight".into(),
+                selection: TensorSelection::Full,
+                policy: ReadPolicy::RequireBounded,
+            }),
+            Err(StoreError::PreparedCatalogMismatch { key }) if key == "weight"
+        ));
     }
 }

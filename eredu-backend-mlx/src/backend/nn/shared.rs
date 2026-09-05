@@ -1833,6 +1833,14 @@ impl ParameterBackend for MlxNeuralBackend {
     type Materialization = crate::backend::runtime::checkpoint::store::WeightMaterialization;
     type ParameterError = MlxParameterError;
 
+    fn preflight_recipe(
+        recipe: &eredu_checkpoint::recipe::DerivedWeightRecipe,
+        source: &dyn eredu_checkpoint::store::CheckpointSource,
+    ) -> Result<(), Self::ParameterError> {
+        crate::backend::runtime::checkpoint::recipe::preflight_mlx_recipe(recipe, source)?;
+        Ok(())
+    }
+
     fn materialize(
         lease: eredu_checkpoint::store::CheckpointLease,
         context: &Self::MaterializationContext,
@@ -1895,12 +1903,8 @@ impl ParameterBackend for MlxNeuralBackend {
         Ok(())
     }
 
-    fn bind(
-        parameter: &mut Self::Parameter,
-        weight: Self::MaterializedWeight,
-    ) -> Result<(), Self::ParameterError> {
+    fn bind(parameter: &mut Self::Parameter, weight: Self::MaterializedWeight) {
         *parameter = weight;
-        Ok(())
     }
 }
 
