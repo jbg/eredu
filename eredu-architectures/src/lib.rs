@@ -34,8 +34,8 @@ pub use external_assistant::{
     ExternalAssistantPreparation, ExternalAssistantPreparationVisitor,
     ExternalAssistantTargetProfile, ExternalAssistantTensorPlacement, ExternalAssistantTransfer,
     ExternalSpeculativeContract, ExternalSpeculativeContractRequest, MaterializedExternalAssistant,
-    MaterializedExternalAssistantVisitor, SelectedExternalAssistant,
-    SelectedExternalAssistantPreparation,
+    MaterializedExternalAssistantVisitor, PreparedCompatibleExternalAssistant,
+    PreparedExternalAssistantSource, SelectedExternalAssistantPreparation,
 };
 /// Backend-neutral schedules and recipes for independent expert residency.
 pub mod expert_residency;
@@ -47,6 +47,12 @@ pub mod gguf_companion;
 mod linear_format;
 /// Backend-neutral prepared-media admission and workspace plans.
 pub mod media_plan;
+/// Architecture-aware total artifact inspection and preparation retention.
+pub mod model_inspection;
+pub use model_inspection::{
+    inspect_model, inspect_selected_model, prepare_inspected_model_sources, ModelInspectionOutcome,
+    SelectedModelInspection,
+};
 /// Optional backend operators required by each architecture family.
 pub mod operator_requirements;
 /// Architecture-owned admission and typed handoff for partitioned execution.
@@ -55,6 +61,19 @@ pub mod partitioned_execution;
 pub mod prediction_extension;
 /// Architecture-derived capabilities used before backend materialization.
 pub mod preparation;
+/// Architecture-owned total cold-preparation selection.
+pub mod preparation_selection;
+pub use preparation_selection::{
+    select_preparation, PreparationMechanismProvider, PreparationSelectionError,
+};
+/// Exact backend-neutral checkpoint source graphs prepared after selection.
+pub mod prepared_sources;
+/// Total backend-neutral execution and preparation selections.
+pub mod selected_execution;
+pub use selected_execution::{
+    SelectedCompositePartitionedExecution, SelectedDensePartitionedExecution, SelectedExecution,
+    SelectedExecutionDispatcher, SelectedPreparation, SelectedRoutedPartitionedExecution,
+};
 /// Architecture-owned execution of retained media processor plans.
 pub mod processor_execution;
 /// Backend-neutral family preprocessing and framing plans.

@@ -365,7 +365,8 @@ fn moshi_ring_model_parity_worker() {
         1,
         4096,
         MlxLoadRequest::test_communication_completion_policy(),
-    );
+    )
+    .unwrap();
     let parallel_selected = MlxRealtimeExecutionContext::select_realtime_execution(
         eredu_architectures::moshi::prepare_realtime_model(Path::new(&fixture)).unwrap(),
         &parallel_options,

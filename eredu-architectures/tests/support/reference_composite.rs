@@ -1213,33 +1213,18 @@ impl eredu_architectures::ExternalAssistantPreparationVisitor for ReferenceAssis
 
     fn visit<A: eredu_architectures::ExternalAssistantArchitecture>(
         self,
-        prepared: eredu_architectures::SelectedExternalAssistant<A>,
+        prepared: eredu_architectures::PreparedExternalAssistantSource<A>,
     ) -> Result<Self::Output<A>, Self::Error> {
-        let (checkpoint, _source_config, config, _tasks) = prepared.into_parts();
-        let store: eredu_checkpoint::store::SharedCheckpointSource = match checkpoint {
-            eredu_architectures::ExternalAssistantCheckpoint::SafeTensors {
-                source,
-                catalog,
-                resolution,
-                ..
-            } => {
-                let store = eredu_checkpoint::store::SafetensorsWeightStore::open(&source)
-                    .map_err(|error| Error::backend(error.to_string()))?;
-                if resolution.source_keys().is_empty()
-                    || catalog.len() < resolution.source_keys().len()
-                {
-                    return Err(Error::backend(
-                        "reference assistant payload did not preserve its admitted resolution",
-                    ));
-                }
-                std::sync::Arc::new(store)
-            }
-            eredu_architectures::ExternalAssistantCheckpoint::Gguf { .. } => {
+        let (store, checkpoint, _identity, _source_config, config, _tasks) =
+            prepared.into_parts();
+        if matches!(
+            checkpoint,
+            eredu_architectures::ExternalAssistantCheckpoint::Gguf { .. }
+        ) {
                 return Err(Error::backend(
                     "reference production proof requires its SafeTensors fixture",
                 ));
-            }
-        };
+        }
         let mut module = A::module::<ReferenceBackend>(config.clone(), &())?;
         struct Bindings(Vec<eredu_runtime::WeightBinding>);
         impl<'a> ParameterVisitor<'a, ReferenceTensor> for Bindings {
@@ -2376,7 +2361,11 @@ fn run_reference_external_production(
     let (mut target, _target_artifact) = construct_reference_composite_target(target_config);
     let compatible = eredu_architectures::prepare_external_assistant(assistant_artifact)
         .map_err(|error| error.to_string())?
-        .select_materialization(None, |_, _| Some(eredu_runtime::WeightLoweringKind::Direct))?
+        .select_materialization(
+            None,
+            eredu_checkpoint::store::DEFAULT_MAX_CACHED_SHARDS,
+            |_, _| Some(eredu_runtime::WeightLoweringKind::Direct),
+        )?
         .prove_target_compatibility(&target.profile())?;
     let capture = compatible.capture().clone();
     let fingerprint = [33_u8; 32];
@@ -2407,6 +2396,9 @@ fn run_reference_external_production(
             .iter()
             .copied(),
     );
+    let compatible = compatible
+        .prepare_source(eredu_checkpoint::store::DEFAULT_MAX_CACHED_SHARDS)
+        .map_err(|error| error.to_string())?;
     let payload = RefCell::new(Some(compatible));
     let construction_stages = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let observed_stages = construction_stages.clone();

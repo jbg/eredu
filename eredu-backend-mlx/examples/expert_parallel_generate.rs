@@ -36,7 +36,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::time::Duration::from_secs(30),
             eredu_core::CompletionCancellationMode::QuarantineUntilComplete,
         )?,
-    )
+    )?
     .with_weight_residency(WeightResidency::with_independent_parameter_banks(
         OrdinaryWeightResidency::LayerwiseHost(Default::default()),
         ParameterBankLoadOptions::default(),

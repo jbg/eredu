@@ -423,6 +423,58 @@ pub trait CheckpointSource: Send + Sync {
 /// Shared ownership of one backend-neutral checkpoint source.
 pub type SharedCheckpointSource = Arc<dyn CheckpointSource>;
 
+/// Opens one exact admitted SafeTensors source and applies its retained resolution.
+///
+/// This is the singular backend-neutral source constructor shared by ordinary
+/// and realtime architecture preparation. It never rediscovers an artifact and
+/// does not acquire tensor payloads.
+pub fn open_prepared_safetensors_source(
+    shards: SafetensorsShards,
+    catalog: BTreeMap<String, TensorMetadata>,
+    resolution: crate::validation::ResolvedCheckpointPlan,
+    max_cached_shards: usize,
+) -> Result<SharedCheckpointSource, StoreError> {
+    let prepared =
+        PreparedCheckpointSource::open_admitted_safetensors(shards, catalog, max_cached_shards)?;
+    Ok(Arc::new(ResolvedCheckpointSource::new(
+        Arc::new(prepared),
+        resolution,
+    )))
+}
+
+/// Opens one admitted SafeTensors source and proves its retained schema resolution still holds.
+///
+/// Header and provenance validation happen before the resolved view is published. Payload bytes
+/// remain lazy behind later leases.
+pub fn open_validated_safetensors_source(
+    shards: SafetensorsShards,
+    catalog: BTreeMap<String, TensorMetadata>,
+    checkpoint_plan: &crate::schema::SafetensorsCheckpointPlan,
+    admitted_resolution: crate::validation::ResolvedCheckpointPlan,
+    max_cached_shards: usize,
+) -> Result<SharedCheckpointSource, StoreError> {
+    let prepared =
+        PreparedCheckpointSource::open_admitted_safetensors(shards, catalog, max_cached_shards)?;
+    let current = crate::validation::resolve_safetensors_plan(
+        &prepared as &dyn CheckpointSource,
+        checkpoint_plan,
+    )
+    .map_err(|validation| {
+        StoreError::Internal(format!(
+            "admitted SafeTensors checkpoint contract no longer resolves: {validation:?}"
+        ))
+    })?;
+    if current != admitted_resolution {
+        return Err(StoreError::Internal(
+            "admitted SafeTensors checkpoint resolution changed during source preparation".into(),
+        ));
+    }
+    Ok(Arc::new(ResolvedCheckpointSource::new(
+        Arc::new(prepared),
+        current,
+    )))
+}
+
 /// Immutable catalog entry retained across deferred payload acquisition.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct PreparedTensorSource {
@@ -741,6 +793,167 @@ impl CheckpointSource for CompositeCheckpointSource {
         self.sources
             .iter()
             .all(|source| source.is_checkpoint_contract_resolved())
+    }
+}
+
+/// A named logical view that restricts the visible checkpoint catalog.
+///
+/// The view shares the underlying source, caches, leases, and diagnostics. It
+/// changes only catalog authorization, so creating the view performs no
+/// payload reads and acquiring an authorized lease preserves the source's
+/// exact provenance and bounded-read guarantees.
+pub struct RestrictedCheckpointSource {
+    source: SharedCheckpointSource,
+    contract: String,
+    denied: BTreeSet<String>,
+    allowed: Option<BTreeSet<String>>,
+}
+
+impl RestrictedCheckpointSource {
+    /// Creates a source view excluding exactly the supplied catalog keys.
+    ///
+    /// Every denied key must exist in the source at construction time. This
+    /// prevents a misspelled projection from silently widening the view.
+    pub fn excluding(
+        source: SharedCheckpointSource,
+        contract: impl Into<String>,
+        denied: BTreeSet<String>,
+    ) -> Result<Self, StoreError> {
+        let contract = contract.into();
+        if contract.is_empty() {
+            return Err(StoreError::Internal(
+                "restricted checkpoint source requires a nonempty contract identity".into(),
+            ));
+        }
+        let source_keys = source.source_keys().into_iter().collect::<BTreeSet<_>>();
+        if let Some(key) = denied.iter().find(|key| !source_keys.contains(*key)) {
+            return Err(StoreError::UnknownTensor { key: key.clone() });
+        }
+        Ok(Self {
+            source,
+            contract,
+            denied,
+            allowed: None,
+        })
+    }
+
+    /// Creates a source view containing exactly the supplied catalog keys.
+    ///
+    /// Every allowed key must exist in the source. The explicit allow set is
+    /// retained so callers can audit the projection without reconstructing it
+    /// from the source catalog and an exclusion set.
+    pub fn including(
+        source: SharedCheckpointSource,
+        contract: impl Into<String>,
+        allowed: BTreeSet<String>,
+    ) -> Result<Self, StoreError> {
+        let contract = contract.into();
+        if contract.is_empty() {
+            return Err(StoreError::Internal(
+                "restricted checkpoint source requires a nonempty contract identity".into(),
+            ));
+        }
+        let source_keys = source.source_keys().into_iter().collect::<BTreeSet<_>>();
+        if let Some(key) = allowed.iter().find(|key| !source_keys.contains(*key)) {
+            return Err(StoreError::UnknownTensor { key: key.clone() });
+        }
+        let denied = source_keys.difference(&allowed).cloned().collect();
+        Ok(Self {
+            source,
+            contract,
+            denied,
+            allowed: Some(allowed),
+        })
+    }
+
+    /// Returns the stable identity used by authorization failures.
+    pub fn contract_identity(&self) -> &str {
+        &self.contract
+    }
+
+    /// Returns the exact keys denied by this view.
+    pub fn denied_keys(&self) -> &BTreeSet<String> {
+        &self.denied
+    }
+
+    /// Returns the exact allow set when this is an inclusion projection.
+    pub fn allowed_keys(&self) -> Option<&BTreeSet<String>> {
+        self.allowed.as_ref()
+    }
+
+    fn is_authorized(&self, key: &str) -> bool {
+        self.allowed.as_ref().map_or_else(
+            || !self.denied.contains(key),
+            |allowed| allowed.contains(key),
+        )
+    }
+
+    fn authorize(&self, key: &str) -> Result<(), StoreError> {
+        if !self.is_authorized(key) {
+            Err(StoreError::UnauthorizedTensor {
+                contract: self.contract.clone(),
+                key: key.to_owned(),
+            })
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl CheckpointSource for RestrictedCheckpointSource {
+    fn source_keys(&self) -> Vec<String> {
+        self.source
+            .source_keys()
+            .into_iter()
+            .filter(|key| self.is_authorized(key))
+            .collect()
+    }
+
+    fn source_metadata(&self, key: &str) -> Result<TensorMetadata, StoreError> {
+        self.authorize(key)?;
+        self.source.source_metadata(key)
+    }
+
+    fn acquire_lease(&self, request: TensorReadRequest) -> Result<CheckpointLease, StoreError> {
+        self.authorize(&request.key)?;
+        self.source.acquire_lease(request)
+    }
+
+    fn source_diagnostics(&self) -> Result<WeightStoreDiagnostics, StoreError> {
+        self.source.source_diagnostics()
+    }
+
+    fn source_provenance(&self, key: &str) -> Result<TensorSourceProvenance, StoreError> {
+        self.authorize(key)?;
+        self.source.source_provenance(key)
+    }
+
+    fn materialized_source_keys(&self) -> Vec<String> {
+        self.source
+            .materialized_source_keys()
+            .into_iter()
+            .filter(|key| self.is_authorized(key))
+            .collect()
+    }
+
+    fn materialized_source_shards(&self) -> Vec<PathBuf> {
+        self.source.materialized_source_shards()
+    }
+
+    fn unclaimed_checkpoint_keys(&self) -> Vec<String> {
+        self.source
+            .unclaimed_checkpoint_keys()
+            .into_iter()
+            .filter(|key| self.is_authorized(key))
+            .collect()
+    }
+
+    fn is_authoritative_materialized_key(&self, key: &str) -> bool {
+        self.is_authorized(key) && self.source.is_authoritative_materialized_key(key)
+    }
+
+    fn is_checkpoint_contract_resolved(&self) -> bool {
+        self.source.is_checkpoint_contract_resolved()
     }
 }
 
@@ -3258,6 +3471,135 @@ mod tests {
             .unwrap(),
         );
         assert!(CompositeCheckpointSource::new([first, second]).is_err());
+    }
+
+    #[test]
+    fn restricted_source_denies_exact_keys_without_rebuilding_storage() {
+        let source: SharedCheckpointSource = Arc::new(
+            MemoryWeightStore::from_safetensors([
+                (
+                    "target.weight".into(),
+                    Dtype::F32,
+                    vec![1],
+                    f32_bytes(&[1.0]),
+                ),
+                (
+                    "extension.weight".into(),
+                    Dtype::F32,
+                    vec![1],
+                    f32_bytes(&[2.0]),
+                ),
+            ])
+            .unwrap(),
+        );
+        let restricted = RestrictedCheckpointSource::excluding(
+            Arc::clone(&source),
+            "prediction-target",
+            BTreeSet::from(["extension.weight".into()]),
+        )
+        .unwrap();
+
+        assert_eq!(restricted.source_keys(), ["target.weight"]);
+        assert_eq!(
+            restricted.source_provenance("target.weight").unwrap(),
+            source.source_provenance("target.weight").unwrap()
+        );
+        assert!(matches!(
+            restricted.source_metadata("extension.weight"),
+            Err(StoreError::UnauthorizedTensor { contract, key })
+                if contract == "prediction-target" && key == "extension.weight"
+        ));
+        assert!(matches!(
+            restricted.acquire_lease(TensorReadRequest {
+                key: "extension.weight".into(),
+                selection: TensorSelection::Full,
+                policy: ReadPolicy::RequireBounded,
+            }),
+            Err(StoreError::UnauthorizedTensor { contract, key })
+                if contract == "prediction-target" && key == "extension.weight"
+        ));
+        assert_eq!(
+            restricted
+                .acquire_lease(TensorReadRequest {
+                    key: "target.weight".into(),
+                    selection: TensorSelection::Full,
+                    policy: ReadPolicy::RequireBounded,
+                })
+                .unwrap()
+                .encoded_bytes()
+                .unwrap(),
+            f32_bytes(&[1.0])
+        );
+    }
+
+    #[test]
+    fn restricted_source_rejects_unknown_denied_keys() {
+        let source: SharedCheckpointSource = Arc::new(
+            MemoryWeightStore::from_safetensors([(
+                "target.weight".into(),
+                Dtype::F32,
+                vec![1],
+                f32_bytes(&[1.0]),
+            )])
+            .unwrap(),
+        );
+
+        assert!(matches!(
+            RestrictedCheckpointSource::excluding(
+                source,
+                "prediction-target",
+                BTreeSet::from(["missing.weight".into()]),
+            ),
+            Err(StoreError::UnknownTensor { key }) if key == "missing.weight"
+        ));
+    }
+
+    #[test]
+    fn restricted_source_includes_only_the_explicit_projection() {
+        let source: SharedCheckpointSource = Arc::new(
+            MemoryWeightStore::from_safetensors([
+                (
+                    "target.weight".into(),
+                    Dtype::F32,
+                    vec![1],
+                    f32_bytes(&[1.0]),
+                ),
+                (
+                    "extension.weight".into(),
+                    Dtype::F32,
+                    vec![1],
+                    f32_bytes(&[2.0]),
+                ),
+            ])
+            .unwrap(),
+        );
+        let allowed = BTreeSet::from(["extension.weight".into()]);
+        let restricted = RestrictedCheckpointSource::including(
+            Arc::clone(&source),
+            "prediction-extension",
+            allowed.clone(),
+        )
+        .unwrap();
+
+        assert_eq!(restricted.allowed_keys(), Some(&allowed));
+        assert_eq!(restricted.source_keys(), ["extension.weight"]);
+        assert!(matches!(
+            restricted.source_metadata("target.weight"),
+            Err(StoreError::UnauthorizedTensor { contract, key })
+                if contract == "prediction-extension" && key == "target.weight"
+        ));
+        assert_eq!(
+            restricted
+                .acquire_lease(TensorReadRequest {
+                    key: "extension.weight".into(),
+                    selection: TensorSelection::Full,
+                    policy: ReadPolicy::RequireBounded,
+                })
+                .unwrap()
+                .encoded_bytes()
+                .unwrap(),
+            f32_bytes(&[2.0])
+        );
     }
 
     #[test]

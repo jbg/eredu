@@ -155,8 +155,10 @@ preparation marker and must equal the realized session report.
 Portable execution-plan factories use the same ordering for native resources.
 The factory first translates the plan and selects the exact backend preparation
 against the inspected artifact without creating a device, stream, queue, or
-communication resource. Core validates that selection and builds the neutral
-preparation plan; only the retained selected target may then be passed back to
+communication resource. The neutral selector validates the normalized request
+once and returns its unforgeable admission; core builds the preparation plan
+directly from that retained admission without asking the backend to derive the
+policy again. Only the retained selected target may then be passed back to
 the factory for native realization. Materialization consumes that retained
 selection instead of repeating route selection after native resources exist.
 Core carries the neutral preparation plan and backend selection in one opaque
@@ -343,7 +345,48 @@ selection and exact tasks. That contract is the proof-bearing handoff to
 construction; later code does not repeat those checks from family
 configuration or caller options.
 
-The MLX adapter consumes its load request before neutral selection completes.
+The runtime-owned `NormalizedLoadRequest` is the single portable cold-load
+policy. Its checked parallel subrequest atomically binds rank topology, wire,
+positive invocation limits, and bounded completion; drafting capacity is also
+positive by construction. A concrete adapter may pair that request with a
+native resource token, but cannot add a second policy representation. The MLX
+adapter validates its `DeviceAssignment` pairing and consumes the paired
+request before neutral selection completes. Total cold branch selection lives
+in `eredu-architectures::preparation_selection`; MLX supplies only a
+side-effect-free `PreparationMechanismProvider` and consumes the resulting
+opaque `SelectedExecution` through its typed materialization dispatcher.
+
+`eredu-architectures::select_preparation` is the singular total cold selector.
+It accepts that normalized request and a side-effect-free mechanism provider,
+then performs admission, grouped-operation checks, processor and prediction
+selection, ordinary or partitioned execution dispatch, communication
+admission, and architecture production-route validation as one operation. Its
+opaque `SelectedPreparation` covers replicated, routed, composite,
+partitioned-dense, partitioned-routed, and partitioned-composite execution.
+Concrete backends consume the selected branch through a typed static
+dispatcher; they do not mirror the sum or rebuild any request.
+
+After selection, `PreparedModelSources` is the sole architecture-aware
+SafeTensors/GGUF source factory for model loading. It opens every admitted
+physical source once, retains exact resolutions and metadata, composes typed
+companions in semantic-role order, and publishes explicit primary, complete,
+target, and prediction-extension views. Restricted views share the same source
+cache and fail closed for unauthorized keys. MLX begins only with these source
+roles and performs native lease conversion, transforms, binding, and tensor
+materialization.
+
+Architecture-aware model inspection uses the same normalized request,
+mechanism provider, and total selector. The neutral outcome owns report state
+transitions and can retain the exact selection used to establish readiness.
+Backend adapters add only their name, static hardware context, and native
+diagnostics; inspection itself opens no payload and creates no native resource.
+
+Moshi realtime selection likewise derives shared policy from
+`NormalizedLoadRequest`. Its neutral prepared-source handoff contains the exact
+source, content identity under the architecture-selected domain, retained
+resolution and metadata validation, selected topology and architecture, and a
+consistent lowering summary. MLX receives that completed handoff and adds only
+groups, streams, caches, arrays, random state, completion, and final erasure.
 Replicated routed text has its own architecture-owned requirements
 and selected realization layered over the shared replicated-text contract.
 Replicated composite text adds selected processor and ingress requirements to
@@ -1194,10 +1237,11 @@ intersection: the architecture declares whether its normalized parameter
 topology can be transformed before bounded materialization, and the backend
 declares whether its family composition implements that route. Core preserves
 the neutral quantization and residency request without maintaining a family
-allowlist. The composition-owned MLX load request carries `QuantizationRequest`, whose
-variants describe load-time transforms only; checkpoint storage encodings such
-as native GGUF blocks remain internal to artifact inspection and
-materialization.
+allowlist. The runtime-owned normalized load request carries
+`QuantizationRequest`, whose variants describe load-time transforms only; the
+MLX request is a thin native-device adapter over that request. Checkpoint
+storage encodings such as native GGUF blocks remain internal to artifact
+inspection and materialization.
 
 Routed execution classifies prefill and decode in the neutral request or
 layered-architecture driver. Provider-backed backend wrappers invoke pass-free
@@ -1624,9 +1668,11 @@ wrappers. Backend inspection classifies unsupported encodings from the nested
 GGUF error variant and its numeric type code, never from rendered diagnostic
 text.
 
-`ModelPreparationPlan` is the one-shot authority for stage 4. Materializers,
-including partitioned materializers, consume its inspected configuration,
-primary and companion checkpoint handles, and selected route directly. They
+`ModelPreparationPlan` is the one-shot authority for stage 4. The architecture
+source factory consumes it with the exact retained selection and publishes one
+bundle containing the originating inspection plus primary, companion, target,
+and extension views. Materializers, including partitioned materializers,
+consume that inseparable bundle and selected route directly. They
 must not reopen an artifact to rediscover configuration, checkpoint metadata,
 or sibling filename policy after planning; payload stores may still map weight
 members during materialization, but those reads do not replace the plan's

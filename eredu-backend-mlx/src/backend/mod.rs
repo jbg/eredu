@@ -401,18 +401,12 @@ impl<'a> BackendProvider for MlxBackend<'a> {
         &self,
         config: Self::ModelConfig,
     ) -> Result<PreparedModel<Self::Model>, Self::Error> {
-        let capabilities = config.selected.session_capabilities();
-        if config.plan.admitted_session_capabilities() != capabilities {
-            return Err(Error::ArchitectureModel(
-                "selected session facilities differ from the admitted preparation plan".into(),
-            ));
-        }
-        let rank = config.selected.rank_context();
-        let manifest = config.selected.realized_communication_manifest().cloned();
+        let capabilities = config.sources.selected().session_capabilities();
+        let rank = config.rank_context;
+        let manifest = config.sources.selected().communication_manifest().cloned();
         self.materialize_after_communication(capabilities, manifest.as_ref(), rank, |distributed| {
             crate::composition::mlx::loading::materialize_model_plan(
-                config.plan,
-                config.selected,
+                config.sources,
                 distributed,
                 &self.stream,
                 &self.weights_stream,
@@ -621,38 +615,28 @@ impl ModelLoadingBackend for MlxBackend<'_> {
         &eredu_architectures::configuration::MODEL_CONFIGURATIONS
     }
 
-    fn preparation_policy(
-        &self,
-        options: &Self::LoadOptions,
-    ) -> Result<eredu_core::PreparationPolicy, Self::Error> {
-        options.preparation_policy()
-    }
-
     fn select_preparation(
         &self,
         inspection: &eredu_core::ArtifactInspection<
             eredu_architectures::processor_plan::ArtifactArchitecturePlan,
         >,
         options: &Self::LoadOptions,
-        policy: eredu_core::PreparationPolicy,
     ) -> Result<Self::SelectedPreparation, Self::Error> {
-        crate::composition::mlx::loading::select_preparation(inspection, options.clone(), policy)
+        crate::composition::mlx::loading::select_preparation(inspection, options.clone())
     }
 
-    fn selected_session_capabilities(
+    fn selected_preparation_admission(
         &self,
         selected: &Self::SelectedPreparation,
-    ) -> SessionCapabilities {
-        selected.session_capabilities()
+    ) -> eredu_core::PreparationAdmission {
+        selected.neutral().admission()
     }
 
     fn model_config(
         &self,
         selected: eredu_core::SelectedModelPreparation<Self>,
     ) -> Result<Self::ModelConfig, Self::Error> {
-        Ok(crate::composition::mlx::loading::MlxModelConfig::new(
-            selected,
-        ))
+        crate::composition::mlx::loading::MlxModelConfig::new(selected)
     }
 }
 

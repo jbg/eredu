@@ -10,8 +10,9 @@ use eredu_backend_mlx::backend::{
     MlxBackend, MlxCompletion, MlxModel,
 };
 use eredu_backend_mlx::native::{
-    DeviceAssignment, MlxDrafter, MlxInspectionOptions, MlxModelInput, MlxModelOutput,
-    MlxModelSession, MlxRealtimeExecution, MlxRealtimeExecutionContext, MlxSessionCompletion,
+    inspect_model_preparation, DeviceAssignment, MlxDrafter, MlxInspectionOptions, MlxModelInput,
+    MlxModelOutput, MlxModelSession, MlxRealtimeExecution, MlxRealtimeExecutionContext,
+    MlxSessionCompletion,
 };
 use eredu_backend_mlx::{MlxLoadRequest, MlxModelConfig, MlxTensor};
 use eredu_core::InspectableBackendSession;
@@ -40,6 +41,20 @@ fn backend_and_composition_types_are_rooted_under_their_ownership_modules() {
     assert_public_type::<MlxModel>();
     assert_public_type::<MlxModelConfig>();
     assert_public_type::<MlxLoadRequest>();
+    assert_public_type::<eredu_runtime::NormalizedLoadRequest>();
+    assert_public_type::<eredu_architectures::SelectedPreparation>();
+}
+
+#[test]
+fn parallel_load_options_exposes_checked_backend_author_construction() {
+    let _: fn(
+        eredu_core::ParallelRankTopology,
+        DeviceAssignment,
+        eredu_runtime::PipelineWireContract,
+        i32,
+        i32,
+        eredu_runtime::CommunicationCompletionPolicy,
+    ) -> Result<MlxLoadRequest, Error> = eredu_backend_mlx::native::parallel_load_options;
 }
 
 #[test]
@@ -58,6 +73,15 @@ fn model_session_exposes_the_neutral_inspection_contract() {
     fn assert_inspectable<T: InspectableBackendSession<MlxBackend<'static>>>() {}
 
     assert_inspectable::<MlxModelSession>();
+}
+
+#[test]
+fn inspection_exposes_the_retained_neutral_preparation() {
+    let public_call = || {
+        let _: Result<eredu_architectures::ModelInspectionOutcome, Error> =
+            inspect_model_preparation(std::path::PathBuf::new(), MlxInspectionOptions::default());
+    };
+    let _ = public_call;
 }
 
 #[test]

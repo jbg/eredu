@@ -7848,9 +7848,15 @@ pub(crate) mod tests {
         stream: &Stream,
         weights_stream: &Stream,
     ) -> Result<crate::backend::MlxModel, crate::backend::error::Error> {
-        let selected =
-            super::super::loading::select_preparation(plan.inspection(), options, plan.policy())?;
-        super::super::loading::materialize_model_plan(plan, selected, None, stream, weights_stream)
+        let selected = super::super::loading::select_preparation(plan.inspection(), options)?;
+        let plan = eredu_core::plan_model_preparation(
+            plan.inspection().clone(),
+            plan.policy(),
+            selected.session_capabilities(),
+        )?;
+        let (sources, _rank_context) =
+            super::super::loading::prepare_selected_sources(plan, selected)?;
+        super::super::loading::materialize_model_plan(sources, None, stream, weights_stream)
     }
 
     #[test]
@@ -11115,14 +11121,14 @@ pub(crate) mod tests {
             1,
             2,
             crate::MlxLoadRequest::test_communication_completion_policy(),
-        );
-        let policy = options.preparation_policy().unwrap();
+        )
+        .unwrap();
         super::super::path_instrumentation::reset();
 
-        let selected = super::super::loading::select_preparation(&inspection, options, policy)
+        let selected = super::super::loading::select_preparation(&inspection, options)
             .expect("prediction target projection must enter neutral routed admission");
 
-        assert!(selected.communication_manifest().is_some());
+        assert!(selected.neutral().communication_manifest().is_some());
         assert!(selected.rank_context().is_some());
         assert_eq!(
             super::super::path_instrumentation::snapshot(),
@@ -11196,12 +11202,11 @@ pub(crate) mod tests {
             1,
             128,
             crate::MlxLoadRequest::test_communication_completion_policy(),
-        );
-        let routed_policy = routed_options.preparation_policy().unwrap();
+        )
+        .unwrap();
         let error = super::super::loading::select_preparation_with_grouped_capabilities(
             &routed,
             routed_options,
-            routed_policy,
             &[GroupedOperationRequirement::GatedProduct],
         )
         .unwrap_err();
@@ -11356,11 +11361,9 @@ pub(crate) mod tests {
                 eredu_runtime::ParameterBankLoadOptions::default(),
             ),
         );
-        let policy = options.preparation_policy().unwrap();
         let error = super::super::loading::select_preparation_with_grouped_capabilities(
             &inspection,
             options,
-            policy,
             &GROUPED_OPERATION_CAPABILITIES,
         )
         .expect_err("dense replicated text silently discarded addressable residency");

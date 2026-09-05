@@ -223,7 +223,7 @@ fn mlx_load_options(
             ))
         }
     };
-    load.required_session_capabilities = *plan.required_session_capabilities();
+    load = load.with_required_session_capabilities(*plan.required_session_capabilities());
     let residency = match plan.residency() {
         ResidencyPlan::FullyResident => OrdinaryWeightResidency::FullyResident,
         ResidencyPlan::LayerwiseHost {
@@ -351,10 +351,7 @@ impl AutomaticPlanningBackend for MlxBackendFactory {
     ) -> Result<CandidateAdmission, AutomaticPlanningError> {
         let load = mlx_load_options(self, plan)
             .map_err(|error| planning_backend_error("realize_plan", error))?;
-        let policy = load
-            .preparation_policy()
-            .map_err(|error| planning_backend_error("admit_candidate_policy", error))?;
-        match super::loading::select_preparation(inspection, load, policy) {
+        match super::loading::select_preparation(inspection, load) {
             Ok(_) => Ok(CandidateAdmission {
                 supported: true,
                 rejection: None,
@@ -379,14 +376,9 @@ impl AutomaticPlanningBackend for MlxBackendFactory {
         let options = self
             .load_request_for_plan(plan)
             .map_err(|error| planning_backend_error("bounded_residency_options", error))?;
-        let policy = options
-            .preparation_policy()
-            .map_err(|error| planning_backend_error("bounded_residency_policy", error))?;
-        let selected = super::loading::select_preparation(inspection, options, policy)
+        let selected = super::loading::select_preparation(inspection, options)
             .map_err(|error| planning_backend_error("select_model_preparation", error))?;
-        let (text, excluded) = selected
-            .selected_bounded_residency()
-            .map_err(|error| planning_backend_error("selected_text_residency", error))?;
+        let (text, excluded) = selected.neutral().selected_bounded_residency();
         selected_text_bounded_requirement(&text, &excluded)
             .map_err(|error| planning_backend_error("selected_text_residency", error))
     }
@@ -460,9 +452,8 @@ fn selected_text_bounded_requirement(
 
 /// Cold-selected external assistant plus MLX reader-cache mechanism policy.
 pub struct SelectedMlxExternalAssistantPreparation {
-    preparation: eredu_architectures::CompatibleExternalAssistantPreparation,
+    preparation: eredu_architectures::PreparedCompatibleExternalAssistant,
     speculative: eredu_runtime::SelectedSpeculativeRealization,
-    max_cached_shards: usize,
 }
 
 impl ExecutionPlanBackendFactory for MlxBackendFactory {
@@ -479,11 +470,9 @@ impl ExecutionPlanBackendFactory for MlxBackendFactory {
         plan: &ExecutionPlan,
     ) -> Result<ExecutionPlanTargetSelection<Self::Backend>, AutomaticPlanningError> {
         let options = self.load_request_for_plan(plan)?;
-        let policy = options
-            .preparation_policy()
-            .map_err(|error| planning_backend_error("select_preparation_policy", error))?;
-        let selected = super::loading::select_preparation(inspection, options, policy)
+        let selected = super::loading::select_preparation(inspection, options)
             .map_err(|error| planning_backend_error("select_model_preparation", error))?;
+        let policy = selected.neutral().admission().request().policy();
         let capabilities = selected.session_capabilities();
         Ok(ExecutionPlanTargetSelection::new(
             policy,
@@ -523,7 +512,7 @@ impl ExecutionPlanBackendFactory for MlxBackendFactory {
         };
         let options = mlx_drafter_load_options(plan)
             .map_err(|error| planning_backend_error("select_external_drafter", error))?;
-        if !options.weight_residency.is_fully_resident() {
+        if !options.weight_residency().is_fully_resident() {
             return Err(AutomaticPlanningError::Invalid(
                 "external assistants require fully resident weights".into(),
             ));
@@ -536,18 +525,22 @@ impl ExecutionPlanBackendFactory for MlxBackendFactory {
                 "external assistants require replicated placement".into(),
             ));
         }
-        let max_cached_shards = options.weight_residency.max_cached_shards();
+        let max_cached_shards = options.weight_residency().max_cached_shards();
         let preparation = artifact
             .preparation
-            .select_materialization(options.quantization, |descriptor, transforms| {
-                if transforms && super::replicated_text::supports_transform(descriptor) {
-                    Some(eredu_runtime::WeightLoweringKind::Transform)
-                } else if !transforms && super::replicated_text::supports_direct(descriptor) {
-                    Some(eredu_runtime::WeightLoweringKind::Direct)
-                } else {
-                    None
-                }
-            })
+            .select_materialization(
+                options.quantization(),
+                max_cached_shards,
+                |descriptor, transforms| {
+                    if transforms && super::replicated_text::supports_transform(descriptor) {
+                        Some(eredu_runtime::WeightLoweringKind::Transform)
+                    } else if !transforms && super::replicated_text::supports_direct(descriptor) {
+                        Some(eredu_runtime::WeightLoweringKind::Direct)
+                    } else {
+                        None
+                    }
+                },
+            )
             .map_err(|message| AutomaticPlanningError::Backend {
                 operation: "select_external_drafter",
                 message,
@@ -621,11 +614,13 @@ impl ExecutionPlanBackendFactory for MlxBackendFactory {
         .map_err(|error| AutomaticPlanningError::Invalid(error.to_string()))?
         .into_parts()
         .0;
+        let preparation = preparation
+            .prepare_source(max_cached_shards)
+            .map_err(|error| planning_backend_error("prepare_external_drafter_source", error))?;
         Ok(Some(ExternalDraftArtifact {
             preparation: SelectedMlxExternalAssistantPreparation {
                 preparation,
                 speculative,
-                max_cached_shards,
             },
             tokenizer_compatibility: artifact.tokenizer_compatibility,
         }))
@@ -658,7 +653,6 @@ impl ExecutionPlanBackendFactory for MlxBackendFactory {
                         "external drafting is missing proven tokenizer compatibility".into(),
                     )
                 })?;
-                let max_cached_shards = artifact.preparation.max_cached_shards;
                 let preparation = artifact.preparation.preparation;
                 let selected = artifact.preparation.speculative;
                 let draft_stream = match placement {
@@ -678,7 +672,6 @@ impl ExecutionPlanBackendFactory for MlxBackendFactory {
                 let drafter = MlxDrafter::materialize_with_compatibility(
                     preparation,
                     artifact.tokenizer_compatibility,
-                    max_cached_shards,
                     &draft_stream,
                     target.backend().weights_stream(),
                     selected,

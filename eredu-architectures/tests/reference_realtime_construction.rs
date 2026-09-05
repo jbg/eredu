@@ -1313,39 +1313,50 @@ fn request(
     quantization: Option<QuantizationRequest>,
     residency: LayerWeightResidency,
 ) -> MoshiRealtimeRequest {
-    MoshiRealtimeRequest::new(
-        quantization,
-        residency,
-        CacheResidencyPolicy::Device,
-        ParallelRankTopology::new(ParallelTopology::new(1, 1, 1, 1).unwrap(), 0).unwrap(),
-        NonZeroUsize::new(1).unwrap(),
-        NonZeroUsize::new(1).unwrap(),
-        PipelineActivationDtype::Float32,
-        CommunicationCompletionPolicy::new(
-            Duration::from_secs(1),
-            CompletionCancellationMode::QuarantineUntilComplete,
-        )
-        .unwrap(),
+    let completion = CommunicationCompletionPolicy::new(
+        Duration::from_secs(1),
+        CompletionCancellationMode::QuarantineUntilComplete,
+    )
+    .unwrap();
+    let mut normalized = quantization.map_or_else(
+        eredu_runtime::NormalizedLoadRequest::default,
+        eredu_runtime::NormalizedLoadRequest::with_quantization,
+    );
+    normalized = normalized
+        .with_weight_residency(eredu_runtime::WeightResidency::with_layers(residency))
+        .with_state_residency(CacheResidencyPolicy::Device)
+        .with_communication_completion_policy(completion);
+    moshi::moshi_realtime_request_from_normalized(
+        &normalized,
         RealtimeObservationRequirements::new(true, []),
     )
+    .unwrap()
 }
 
 fn tensor_parallel_request(residency: LayerWeightResidency) -> MoshiRealtimeRequest {
-    MoshiRealtimeRequest::new(
-        None,
-        residency,
-        CacheResidencyPolicy::Device,
+    let completion = CommunicationCompletionPolicy::new(
+        Duration::from_secs(1),
+        CompletionCancellationMode::QuarantineUntilComplete,
+    )
+    .unwrap();
+    let parallel = eredu_runtime::ParallelLoadRequest::new(
         ParallelRankTopology::new(ParallelTopology::new(2, 1, 1, 1).unwrap(), 0).unwrap(),
-        NonZeroUsize::new(1).unwrap(),
-        NonZeroUsize::new(1).unwrap(),
-        PipelineActivationDtype::Float32,
-        CommunicationCompletionPolicy::new(
-            Duration::from_secs(1),
-            CompletionCancellationMode::QuarantineUntilComplete,
-        )
-        .unwrap(),
+        eredu_runtime::PipelineWireContract::new(PipelineActivationDtype::Float32),
+        1,
+        1,
+        completion,
+    )
+    .unwrap();
+    let normalized = eredu_runtime::NormalizedLoadRequest::default()
+        .with_weight_residency(eredu_runtime::WeightResidency::with_layers(residency))
+        .with_state_residency(CacheResidencyPolicy::Device)
+        .with_parallel_execution(parallel)
+        .unwrap();
+    moshi::moshi_realtime_request_from_normalized(
+        &normalized,
         RealtimeObservationRequirements::new(true, []),
     )
+    .unwrap()
 }
 
 fn capabilities(
@@ -1433,6 +1444,13 @@ fn selected(
     moshi::select_inspected_moshi_realtime(inspected, &capabilities).unwrap()
 }
 
+fn reference_source(
+    selected: moshi::PreparedMoshiRealtime,
+    source: SharedCheckpointSource,
+) -> Result<moshi::PreparedMoshiRealtimeSource, moshi::MoshiRealtimeSourceError> {
+    moshi::PreparedMoshiRealtimeSource::from_reference_source(selected, source)
+}
+
 fn run_reference_scenario(
     config: MoshiConfig,
     residency: LayerWeightResidency,
@@ -1468,10 +1486,10 @@ fn try_run_reference_scenario_with_authority(
     let prepared = selected(&config, &store, request(quantization, residency));
     selection_complete.set(true);
     let shared_store: SharedCheckpointSource = store;
+    let prepared = reference_source(prepared, shared_store).unwrap();
     let summary =
         moshi::visit_selected_moshi_realtime_architecture::<ReferenceBackend, ReferenceState, _>(
             prepared,
-            shared_store,
             &(),
             ConstructionVisitor {
                 started: started.clone(),
@@ -1506,26 +1524,24 @@ fn run_observation_scenario(
         .into_iter()
         .map(|point| RealtimeIdentity::new(point.path()).unwrap())
         .collect::<Vec<_>>();
-    let request = MoshiRealtimeRequest::new(
-        None,
-        LayerWeightResidency::FullyResident,
-        CacheResidencyPolicy::Device,
-        ParallelRankTopology::new(ParallelTopology::new(1, 1, 1, 1).unwrap(), 0).unwrap(),
-        NonZeroUsize::new(1).unwrap(),
-        NonZeroUsize::new(1).unwrap(),
-        PipelineActivationDtype::Float32,
-        CommunicationCompletionPolicy::new(
-            Duration::from_secs(1),
-            CompletionCancellationMode::QuarantineUntilComplete,
-        )
-        .unwrap(),
+    let completion = CommunicationCompletionPolicy::new(
+        Duration::from_secs(1),
+        CompletionCancellationMode::QuarantineUntilComplete,
+    )
+    .unwrap();
+    let normalized = eredu_runtime::NormalizedLoadRequest::default()
+        .with_state_residency(CacheResidencyPolicy::Device)
+        .with_communication_completion_policy(completion);
+    let request = moshi::moshi_realtime_request_from_normalized(
+        &normalized,
         RealtimeObservationRequirements::new(true, activations),
-    );
+    )
+    .unwrap();
     let prepared = selected(&config, &store, request);
     let shared_store: SharedCheckpointSource = store;
+    let prepared = reference_source(prepared, shared_store).unwrap();
     moshi::visit_selected_moshi_realtime_architecture::<ReferenceBackend, ReferenceState, _>(
         prepared,
-        shared_store,
         &(),
         ObservationVisitor {
             ingress,
@@ -1625,24 +1641,15 @@ fn selection_and_store_validation_precede_reference_construction() {
         request(None, LayerWeightResidency::FullyResident),
     );
     let started = Rc::new(Cell::new(false));
-    let error =
-        moshi::visit_selected_moshi_realtime_architecture::<ReferenceBackend, ReferenceState, _>(
-            prepared,
-            Arc::new(MetadataCheckpointSource {
-                tensors: BTreeMap::new(),
-            }),
-            &(),
-            ConstructionVisitor {
-                started: started.clone(),
-                selection_complete: Rc::new(Cell::new(true)),
-                ingress: moshi::realtime_ingress_contract(&config).unwrap(),
-                residency: LayerWeightResidency::FullyResident,
-                expects_transform: false,
-                text_cardinality: config.text_vocabulary_size(),
-                inspection_authority: None,
-            },
-        )
-        .unwrap_err();
+    let error = match reference_source(
+        prepared,
+        Arc::new(MetadataCheckpointSource {
+            tensors: BTreeMap::new(),
+        }),
+    ) {
+        Ok(_) => panic!("mismatched source unexpectedly passed validation"),
+        Err(error) => error,
+    };
     assert!(error.to_string().contains("source catalog differs"));
     assert!(!started.get());
 }
@@ -1701,9 +1708,9 @@ fn replicated_architecture_cannot_satisfy_tensor_parallel_selection() {
         &store,
         tensor_parallel_request(LayerWeightResidency::FullyResident),
     );
+    let prepared = reference_source(prepared, store).unwrap();
     moshi::visit_selected_moshi_realtime_architecture::<ReferenceBackend, ReferenceState, _>(
         prepared,
-        store,
         &(),
         ReplicatedAgainstTensorParallelVisitor { config },
     )

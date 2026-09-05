@@ -1,13 +1,14 @@
 //! Architecture-owned Moshi realtime realization selection.
 
-use std::{borrow::Borrow, collections::BTreeMap, num::NonZeroUsize};
+use std::{borrow::Borrow, collections::BTreeMap};
 
 use eredu_checkpoint::{
     recipe::{AtomicRecipeSet, DerivedWeightRecipe, RecipeDtype, RecipeMetadata},
-    store::{TensorMetadata, TensorSourceProvenance},
+    store::{SharedCheckpointSource, TensorMetadata, TensorSourceProvenance},
     LinearFormat, SourceTensorEncoding, StoredDtype, WeightQuantization,
 };
 use eredu_core::{
+    artifact::{fingerprint_safetensors_artifact, ArtifactIdentity},
     ParallelRankTopology, QuantizationRequest, RealtimeSampling, RealtimeSpeechConfig,
 };
 use eredu_nn::{DistributedNeuralBackend, NeuralBackend, Tensor};
@@ -15,7 +16,7 @@ use eredu_runtime::{
     observe_and_intervene, observe_model_logits, select_realtime_realization, ActivationObserver,
     CacheResidencyPolicy, CommunicationCompletionPolicy, CompositeLayeredTraversalHook,
     ExecutionResidency, GenerationSampler, LayerWeightResidency, LayeredTraversalHook,
-    PipelineActivationDtype, PreparedRealtimeModelContract, RealtimeArchitectureProof,
+    NormalizedLoadRequest, PreparedRealtimeModelContract, RealtimeArchitectureProof,
     RealtimeArchitectureRequirements, RealtimeDecisionExecution, RealtimeExecutionRequirements,
     RealtimeIdentity, RealtimeMaterializationComponent, RealtimeMaterializationTask,
     RealtimeMechanism, RealtimeMechanismCapabilities, RealtimeMechanismRequirements,
@@ -583,81 +584,71 @@ pub enum MoshiRealtimeExecutionError<P: std::fmt::Display> {
 /// Complete architecture-owned request made before realtime construction.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct MoshiRealtimeRequest {
-    quantization: Option<QuantizationRequest>,
-    residency: LayerWeightResidency,
-    state: CacheResidencyPolicy,
-    rank: ParallelRankTopology,
-    maximum_batch_size: NonZeroUsize,
-    maximum_sequence_length: NonZeroUsize,
-    activation_dtype: PipelineActivationDtype,
-    completion: CommunicationCompletionPolicy,
+    normalized: NormalizedLoadRequest,
     observations: RealtimeObservationRequirements,
-    independently_addressable_parameters: bool,
 }
 
 impl MoshiRealtimeRequest {
-    /// Creates one request from already validated topology, rank, and finite bounds.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        quantization: Option<QuantizationRequest>,
-        residency: LayerWeightResidency,
-        state: CacheResidencyPolicy,
-        rank: ParallelRankTopology,
-        maximum_batch_size: NonZeroUsize,
-        maximum_sequence_length: NonZeroUsize,
-        activation_dtype: PipelineActivationDtype,
-        completion: CommunicationCompletionPolicy,
-        observations: RealtimeObservationRequirements,
-    ) -> Self {
-        Self {
-            quantization,
-            residency,
-            state,
-            rank,
-            maximum_batch_size,
-            maximum_sequence_length,
-            activation_dtype,
-            completion,
-            observations,
-            independently_addressable_parameters: false,
-        }
-    }
-
-    /// Records a request for independently addressable parameter banks.
-    pub const fn with_independently_addressable_parameters(mut self, requested: bool) -> Self {
-        self.independently_addressable_parameters = requested;
-        self
+    /// Returns the singular portable policy consumed by realtime selection.
+    pub const fn normalized(&self) -> &NormalizedLoadRequest {
+        &self.normalized
     }
 
     /// Returns the optional load-time transformation request.
     pub const fn quantization(&self) -> Option<QuantizationRequest> {
-        self.quantization
+        self.normalized.quantization()
     }
 
     /// Returns the exact immutable-weight residency policy.
     pub const fn residency(&self) -> LayerWeightResidency {
-        self.residency
+        self.normalized.weight_residency().layers()
     }
 
     /// Returns the exact mutable-state residency policy.
     pub const fn state(&self) -> &CacheResidencyPolicy {
-        &self.state
+        self.normalized.state_residency()
     }
 
     /// Returns the validated topology and global rank.
-    pub const fn rank(&self) -> ParallelRankTopology {
-        self.rank
+    pub fn rank(&self) -> ParallelRankTopology {
+        self.normalized.parallel_topology().unwrap_or_else(|| {
+            ParallelRankTopology::new(
+                eredu_core::ParallelTopology::new(1, 1, 1, 1)
+                    .expect("replicated topology is valid"),
+                0,
+            )
+            .expect("rank zero belongs to replicated topology")
+        })
     }
 
     /// Returns the one requested bounded-wait and timeout disposition policy.
-    pub const fn completion(&self) -> CommunicationCompletionPolicy {
-        self.completion
+    pub fn completion(&self) -> CommunicationCompletionPolicy {
+        self.normalized
+            .realtime_completion_policy()
+            .expect("realtime request completion was validated at construction")
     }
 
     /// Returns exact requested observations.
     pub const fn observations(&self) -> &RealtimeObservationRequirements {
         &self.observations
     }
+}
+
+/// Derives Moshi-specific cold semantics from the singular normalized load request.
+pub fn moshi_realtime_request_from_normalized(
+    request: &NormalizedLoadRequest,
+    observations: RealtimeObservationRequirements,
+) -> Result<MoshiRealtimeRequest, MoshiRealtimeSelectionError> {
+    request
+        .weight_quantization()
+        .map_err(|error| MoshiRealtimeSelectionError::InvalidRequest(error.to_string()))?;
+    request
+        .realtime_completion_policy()
+        .map_err(|error| MoshiRealtimeSelectionError::InvalidRequest(error.to_string()))?;
+    Ok(MoshiRealtimeRequest {
+        normalized: request.clone(),
+        observations,
+    })
 }
 
 /// Architecture-owned result selected before backend construction.
@@ -669,6 +660,146 @@ pub struct PreparedMoshiRealtime {
     execution_parameters: MoshiParameterContract,
     parallel: Option<MoshiParallelSelection>,
     contract: PreparedRealtimeModelContract,
+}
+
+/// Exact executable and transforming quantization selected for Moshi weights.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct MoshiWeightLoweringSummary {
+    transform: Option<WeightQuantization>,
+    target: Option<WeightQuantization>,
+}
+
+impl MoshiWeightLoweringSummary {
+    /// Quantization applied while transforming source weights, when selected.
+    pub const fn transform(self) -> Option<WeightQuantization> {
+        self.transform
+    }
+
+    /// Quantization format consumed by the executable target, when selected.
+    pub const fn target(self) -> Option<WeightQuantization> {
+        self.target
+    }
+}
+
+/// Selected Moshi execution inseparably paired with its exact neutral source handoff.
+pub struct PreparedMoshiRealtimeSource {
+    selected: PreparedMoshiRealtime,
+    source: SharedCheckpointSource,
+    artifact_identity: ArtifactIdentity,
+    lowering: MoshiWeightLoweringSummary,
+}
+
+impl PreparedMoshiRealtimeSource {
+    /// Authoritative selected Moshi execution.
+    pub const fn selected(&self) -> &PreparedMoshiRealtime {
+        &self.selected
+    }
+
+    /// Exact prepared checkpoint source; payloads remain lazy until lease acquisition.
+    pub fn source(&self) -> &SharedCheckpointSource {
+        &self.source
+    }
+
+    /// Content-exact identity under the architecture-selected Moshi domain.
+    pub const fn artifact_identity(&self) -> ArtifactIdentity {
+        self.artifact_identity
+    }
+
+    /// Neutral reduction of all admitted weight lowerings.
+    pub const fn lowering(&self) -> MoshiWeightLoweringSummary {
+        self.lowering
+    }
+
+    /// Consumes the handoff inside the architecture-owned typed dispatch.
+    fn into_parts(
+        self,
+    ) -> (
+        PreparedMoshiRealtime,
+        SharedCheckpointSource,
+        ArtifactIdentity,
+        MoshiWeightLoweringSummary,
+    ) {
+        (
+            self.selected,
+            self.source,
+            self.artifact_identity,
+            self.lowering,
+        )
+    }
+
+    /// Builds a synthetic handoff for the backend-neutral reference harness.
+    ///
+    /// This API is absent from optimized production builds. It still validates
+    /// the complete selected metadata contract before allowing typed dispatch.
+    #[cfg(debug_assertions)]
+    pub fn from_reference_source(
+        selected: PreparedMoshiRealtime,
+        source: SharedCheckpointSource,
+    ) -> Result<Self, MoshiRealtimeSourceError> {
+        validate_store_metadata(&selected, source.as_ref())
+            .map_err(MoshiRealtimeSourceError::Source)?;
+        let artifact_identity = reference_source_contract_identity(source.as_ref())?;
+        let lowering = selected_moshi_lowering_summary(selected.selected())?;
+        Ok(Self {
+            selected,
+            source,
+            artifact_identity,
+            lowering,
+        })
+    }
+}
+
+/// Produces an unswappable identity for a metadata-only reference source.
+///
+/// Reference sources deliberately have no readable payload. Their complete
+/// observable content is the validated catalog and provenance contract, which
+/// is therefore the exact identity domain for this debug-only harness path.
+#[cfg(debug_assertions)]
+fn reference_source_contract_identity(
+    source: &dyn eredu_checkpoint::store::CheckpointSource,
+) -> Result<ArtifactIdentity, MoshiRealtimeSourceError> {
+    use sha2::Digest as _;
+
+    let mut keys = source.source_keys();
+    keys.sort();
+    let mut hasher = sha2::Sha256::new();
+    for key in &keys {
+        let metadata = source.source_metadata(key)?;
+        let provenance = source.source_provenance(key)?;
+        let fact = format!("{key:?}\0{metadata:?}\0{provenance:?}\0");
+        hasher.update((fact.len() as u64).to_le_bytes());
+        hasher.update(fact.as_bytes());
+    }
+    let digest = hasher.finalize().into();
+    eredu_core::artifact::fingerprint_artifact(
+        "eredu.reference-moshi-source-contract.v1",
+        [eredu_core::artifact::ArtifactMemberIdentity::new(
+            "validated-catalog-and-provenance",
+            u64::try_from(keys.len()).unwrap_or(u64::MAX),
+            digest,
+        )],
+    )
+    .map_err(MoshiRealtimeSourceError::Artifact)
+}
+
+/// Failure while preparing the final neutral Moshi source handoff.
+#[derive(Debug, thiserror::Error)]
+pub enum MoshiRealtimeSourceError {
+    /// Source-generic inspection has no filesystem shard set to open.
+    #[error("selected Moshi artifact has no admitted SafeTensors shard set")]
+    MissingAdmittedShards,
+    /// Exact content identity could not be produced.
+    #[error(transparent)]
+    Artifact(#[from] eredu_core::artifact::ArtifactError),
+    /// The retained source catalog or resolution changed before handoff.
+    #[error(transparent)]
+    Store(#[from] eredu_checkpoint::store::StoreError),
+    /// Selected lowerings disagree or omit required executable formats.
+    #[error("invalid selected Moshi lowering summary: {0}")]
+    Lowering(String),
+    /// The opened source does not match the selected catalog, provenance, or tasks.
+    #[error("invalid selected Moshi source: {0}")]
+    Source(String),
 }
 
 /// Architecture-owned selected Moshi execution paired with backend mechanisms.
@@ -988,13 +1119,94 @@ pub fn select_moshi_realtime(
     select_inspected_moshi_realtime(inspected, capabilities)
 }
 
+/// Opens and validates the exact source selected for one Moshi realization.
+///
+/// Selection remains header-only. This handoff performs content fingerprinting and source-cache
+/// construction once, after selection and before a concrete backend can allocate native state.
+pub fn prepare_selected_moshi_realtime_source(
+    selected: PreparedMoshiRealtime,
+) -> Result<PreparedMoshiRealtimeSource, MoshiRealtimeSourceError> {
+    let shards = selected
+        .admitted_shards()
+        .cloned()
+        .ok_or(MoshiRealtimeSourceError::MissingAdmittedShards)?;
+    let artifact_identity = fingerprint_safetensors_artifact(
+        selected.source_config().effective_model_type().as_str(),
+        &shards,
+    )?;
+    let source = eredu_checkpoint::store::open_validated_safetensors_source(
+        shards,
+        selected.source_metadata().clone(),
+        selected.checkpoint_plan(),
+        selected.resolved_checkpoint_plan().clone(),
+        selected.selected().residency().max_cached_shards(),
+    )?;
+    validate_store_metadata(&selected, source.as_ref())
+        .map_err(MoshiRealtimeSourceError::Source)?;
+    let lowering = selected_moshi_lowering_summary(selected.selected())?;
+    Ok(PreparedMoshiRealtimeSource {
+        selected,
+        source,
+        artifact_identity,
+        lowering,
+    })
+}
+
+/// Reduces exact selected Moshi lowering work into backend materialization inputs.
+pub fn selected_moshi_lowering_summary(
+    selected: &SelectedRealtimeRealization,
+) -> Result<MoshiWeightLoweringSummary, MoshiRealtimeSourceError> {
+    if selected.weight_lowerings().is_empty() {
+        return Err(MoshiRealtimeSourceError::Lowering(
+            "selected realtime execution has no weight lowerings".into(),
+        ));
+    }
+    let mut target = None;
+    for quantization in selected
+        .weight_lowerings()
+        .iter()
+        .filter_map(|lowering| lowering.descriptor().executable().weight_quantization())
+    {
+        if target.is_some_and(|current| current != quantization) {
+            return Err(MoshiRealtimeSourceError::Lowering(
+                "executable lowerings mix incompatible quantization formats".into(),
+            ));
+        }
+        target = Some(quantization);
+    }
+
+    let mut transform = None;
+    for lowering in selected.weight_lowerings().iter().filter(|lowering| {
+        matches!(
+            lowering.kind(),
+            WeightLoweringKind::Transform | WeightLoweringKind::DerivedTransform
+        )
+    }) {
+        let quantization = lowering
+            .descriptor()
+            .executable()
+            .weight_quantization()
+            .ok_or_else(|| {
+                MoshiRealtimeSourceError::Lowering(
+                    "a transforming lowering has no executable quantization".into(),
+                )
+            })?;
+        if transform.is_some_and(|current| current != quantization) {
+            return Err(MoshiRealtimeSourceError::Lowering(
+                "transform lowerings disagree on quantization".into(),
+            ));
+        }
+        transform = Some(quantization);
+    }
+    Ok(MoshiWeightLoweringSummary { transform, target })
+}
+
 /// Constructs and visits one selected Moshi-family architecture.
 ///
 /// Store validation and task assembly inspect metadata only. The visitor is
 /// the first code allowed to materialize checkpoint payloads.
 pub fn visit_selected_moshi_realtime_architecture<B, S, V>(
-    prepared: PreparedMoshiRealtime,
-    store: eredu_checkpoint::store::SharedCheckpointSource,
+    prepared_source: PreparedMoshiRealtimeSource,
     context: &<B::Tensor as Tensor>::Context,
     mut visitor: V,
 ) -> Result<V::Output, MoshiRealtimeDispatchError<V::Error>>
@@ -1004,6 +1216,7 @@ where
     S::LayerState: eredu_nn::AttentionCache<B::Tensor>,
     V: MoshiRealtimeArchitectureVisitor<B, S>,
 {
+    let (prepared, store, _artifact_identity, _lowering) = prepared_source.into_parts();
     validate_store_metadata(&prepared, store.as_ref())
         .map_err(MoshiRealtimeDispatchError::Architecture)?;
     let (
@@ -1192,13 +1405,18 @@ fn build_candidate(
     preparation: RealtimePreparationPlan,
     request: MoshiRealtimeRequest,
 ) -> Result<Candidate, MoshiRealtimeSelectionError> {
-    if request.independently_addressable_parameters {
+    if request
+        .normalized()
+        .weight_residency()
+        .parameter_bank_cache()
+        .is_some()
+    {
         return Err(MoshiRealtimeSelectionError::InvalidRequest(
             "independently addressable parameter banks require routed execution units".into(),
         ));
     }
     let source_config = preparation.config().clone();
-    let execution_config = execution_config(&source_config, request.quantization)?;
+    let execution_config = execution_config(&source_config, request.quantization())?;
     let source_parameters = parameter_contract(&source_config)
         .map_err(|error| MoshiRealtimeSelectionError::InvalidArchitecture(error.to_string()))?;
     let execution_parameters = parameter_contract(&execution_config)
@@ -1206,7 +1424,8 @@ fn build_candidate(
 
     validate_observations(&execution_config, request.observations())?;
 
-    let topology = request.rank.topology();
+    let rank = request.rank();
+    let topology = rank.topology();
     let parallel = if topology.is_replicated() {
         None
     } else {
@@ -1219,26 +1438,24 @@ fn build_candidate(
                 topology.data()
             )));
         }
-        let maximum_batch_size = i32::try_from(request.maximum_batch_size.get()).map_err(|_| {
-            MoshiRealtimeSelectionError::InvalidRequest(
-                "maximum tensor-parallel batch size exceeds i32".into(),
-            )
-        })?;
-        let maximum_sequence_length = i32::try_from(request.maximum_sequence_length.get())
-            .map_err(|_| {
-                MoshiRealtimeSelectionError::InvalidRequest(
-                    "maximum tensor-parallel sequence length exceeds i32".into(),
-                )
-            })?;
+        let (maximum_batch_size, maximum_sequence_length) = request
+            .normalized()
+            .partitioned_invocation_limits()
+            .expect("non-replicated normalized request retains invocation limits");
+        let activation_dtype = request
+            .normalized()
+            .pipeline_wire_contract()
+            .expect("non-replicated normalized request retains a wire contract")
+            .activation_dtype();
         Some(
             select_parallel_execution(
                 &execution_config,
                 execution_parameters.description(),
-                request.rank,
+                rank,
                 maximum_batch_size,
                 maximum_sequence_length,
-                request.activation_dtype,
-                request.completion,
+                activation_dtype,
+                request.completion(),
                 preparation.recipes().aliases(),
             )
             .map_err(|error| MoshiRealtimeSelectionError::InvalidArchitecture(error.to_string()))?,
@@ -1290,7 +1507,7 @@ fn build_candidate(
         RealtimeMechanism::ResourceRetention,
         RealtimeMechanism::Transfer,
     ];
-    if request.observations.requires_activations() {
+    if request.observations().requires_activations() {
         mechanisms.push(RealtimeMechanism::Observation);
     }
     if !topology.is_replicated() {
@@ -1338,15 +1555,15 @@ fn build_candidate(
         state_identity,
         topology_identity,
         topology,
-        request.rank.global_rank(),
+        rank.global_rank(),
     );
     let selection_request = RealtimeSelectionRequest::new(
         source_identity,
         execution_identity,
-        request.residency,
-        request.state,
+        request.residency(),
+        request.state().clone(),
         Some(proof),
-        request.completion,
+        request.completion(),
         request.observations,
     );
     Ok(Candidate {
@@ -1869,7 +2086,9 @@ mod tests {
         ));
     }
 
-    use crate::moshi::{prepare_realtime_model_from_catalog, safetensors_plan};
+    use crate::moshi::{
+        prepare_realtime_model, prepare_realtime_model_from_catalog, safetensors_plan,
+    };
 
     use super::*;
 
@@ -1999,21 +2218,37 @@ mod tests {
         tensor_parallel: usize,
     ) -> MoshiRealtimeRequest {
         let topology = ParallelTopology::new(tensor_parallel, 1, 1, 1).unwrap();
-        MoshiRealtimeRequest::new(
-            quantization,
-            LayerWeightResidency::FullyResident,
-            CacheResidencyPolicy::Device,
-            ParallelRankTopology::new(topology, 0).unwrap(),
-            NonZeroUsize::new(1).unwrap(),
-            NonZeroUsize::new(1).unwrap(),
-            PipelineActivationDtype::Float32,
-            CommunicationCompletionPolicy::new(
-                Duration::from_secs(1),
-                CompletionCancellationMode::QuarantineUntilComplete,
-            )
-            .unwrap(),
+        let completion = CommunicationCompletionPolicy::new(
+            Duration::from_secs(1),
+            CompletionCancellationMode::QuarantineUntilComplete,
+        )
+        .unwrap();
+        let mut normalized = quantization.map_or_else(NormalizedLoadRequest::default, |value| {
+            NormalizedLoadRequest::with_quantization(value)
+        });
+        if tensor_parallel == 1 {
+            normalized = normalized.with_communication_completion_policy(completion);
+        } else {
+            normalized = normalized
+                .with_parallel_execution(
+                    eredu_runtime::ParallelLoadRequest::new(
+                        ParallelRankTopology::new(topology, 0).unwrap(),
+                        eredu_runtime::PipelineWireContract::new(
+                            eredu_runtime::PipelineActivationDtype::Float32,
+                        ),
+                        1,
+                        1,
+                        completion,
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+        moshi_realtime_request_from_normalized(
+            &normalized,
             RealtimeObservationRequirements::new(true, activations),
         )
+        .unwrap()
     }
 
     fn capabilities(candidate: &Candidate) -> RealtimeMechanismCapabilities {
@@ -2064,6 +2299,72 @@ mod tests {
                 .into_iter()
                 .map(|point| RealtimeIdentity::new(point.path()).unwrap()),
         )
+    }
+
+    #[test]
+    fn neutral_moshi_inspection_selection_and_source_handoff_remain_payload_lazy() {
+        use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
+
+        let dimensions = 4;
+        let root = tempfile::tempdir().unwrap();
+        let config_json = format!(
+            r#"{{
+                "model_type":"moshi", "dim":{dimensions}, "text_card":17,
+                "n_q":2, "dep_q":1, "generated_audio_codebooks":1, "card":16,
+                "num_heads":1, "num_layers":1, "dim_feedforward":6,
+                "causal":true, "context":3, "max_period":10000.0,
+                "positional_embedding":"rope", "depformer_dim":{dimensions},
+                "depformer_dim_feedforward":6, "depformer_num_heads":1,
+                "depformer_num_layers":1, "depformer_context":2,
+                "depformer_max_period":10000.0, "depformer_pos_emb":"none",
+                "delays":[0,0,1]
+            }}"#
+        );
+        std::fs::write(root.path().join("config.json"), &config_json).unwrap();
+        let config = MoshiConfig::from_json(&config_json).unwrap();
+        let plan = safetensors_plan(&config).unwrap();
+        let tensors = plan
+            .common_tensors
+            .iter()
+            .map(|constraint| {
+                let elements = constraint.shape.iter().product::<usize>();
+                (
+                    constraint.key.as_str(),
+                    constraint.shape.clone(),
+                    vec![0; elements * 4],
+                )
+            })
+            .collect::<Vec<_>>();
+        serialize_to_file(
+            tensors.iter().map(|(name, shape, bytes)| {
+                (
+                    *name,
+                    TensorView::new(Dtype::F32, shape.clone(), bytes.as_slice()).unwrap(),
+                )
+            }),
+            None,
+            &root.path().join("model.safetensors"),
+        )
+        .unwrap();
+
+        let request = request(None, std::iter::empty());
+        let capability_candidate = build_candidate(preparation(config), request.clone()).unwrap();
+        let mechanisms = capabilities(&capability_candidate);
+        let preparation = prepare_realtime_model(root.path()).unwrap();
+        let inspected = inspect_moshi_realtime(preparation, request).unwrap();
+        assert!(!inspected.requirements().executions()[0]
+            .weight_lowerings()
+            .is_empty());
+        let selected = select_inspected_moshi_realtime(inspected, &mechanisms).unwrap();
+        let prepared = prepare_selected_moshi_realtime_source(selected).unwrap();
+
+        assert_eq!(prepared.lowering().transform(), None);
+        assert_eq!(prepared.lowering().target(), None);
+        assert!(!prepared.source().source_keys().is_empty());
+        let diagnostics = prepared.source().source_diagnostics().unwrap();
+        assert_eq!(diagnostics.physical_reads, 0);
+        assert_eq!(diagnostics.physical_read_bytes, 0);
+        assert!(diagnostics.payload_shard_paths.is_empty());
     }
 
     #[test]

@@ -259,16 +259,15 @@ fn pipeline_activation_dtype_comes_from_wire_contract_not_weights() {
         4,
         4096,
         ring_completion_policy(),
-    );
+    )
+    .unwrap();
     let inspection = eredu_architectures::configuration::inspect_artifact(checkpoint.path())
         .expect("fixture inspection");
-    let policy = request.preparation_policy().unwrap();
-    let selected =
-        crate::composition::mlx::loading::select_preparation(&inspection, request, policy)
-            .expect("public neutral selection");
+    let selected = crate::composition::mlx::loading::select_preparation(&inspection, request)
+        .expect("public neutral selection");
 
     assert_eq!(
-        selected.partitioned_activation_dtype(),
+        selected.neutral().partitioned_activation_dtype(),
         Some(wire_contract.activation_dtype())
     );
 }
@@ -786,16 +785,18 @@ fn pipeline_ring_worker() {
                     bits: 4,
                 }
             };
-            MlxLoadRequest::with_quantization(request).with_parallel_topology(
-                topology,
-                device,
-                eredu_runtime::PipelineWireContract::new(
-                    eredu_runtime::PipelineActivationDtype::Float32,
-                ),
-                4,
-                4096,
-                ring_completion_policy(),
-            )
+            MlxLoadRequest::with_quantization(request)
+                .with_parallel_topology(
+                    topology,
+                    device,
+                    eredu_runtime::PipelineWireContract::new(
+                        eredu_runtime::PipelineActivationDtype::Float32,
+                    ),
+                    4,
+                    4096,
+                    ring_completion_policy(),
+                )
+                .unwrap()
         } else {
             MlxLoadRequest::with_parallel(
                 topology,
@@ -807,6 +808,7 @@ fn pipeline_ring_worker() {
                 4096,
                 ring_completion_policy(),
             )
+            .unwrap()
         };
         let load_options = if std::env::var_os(EXPERT_CACHE).is_some() {
             let ordinary = if dense_stream {
@@ -850,20 +852,21 @@ fn pipeline_ring_worker() {
         {
             let inspection = eredu_architectures::configuration::inspect_artifact(&checkpoint)
                 .expect("V4 prediction artifact inspection");
-            let policy = load_options.preparation_policy().unwrap();
             let selected = crate::composition::mlx::loading::select_preparation(
                 &inspection,
                 load_options.clone(),
-                policy,
             )
             .expect("V4 prediction target selection");
             assert_eq!(
-                selected.prediction_extension_kind(),
+                selected
+                    .neutral()
+                    .prediction_extension()
+                    .map(|extension| extension.kind()),
                 Some(
                     eredu_architectures::configuration::PredictionExtensionKind::DeepSeekV4Embedded
                 )
             );
-            assert!(selected.realized_communication_manifest().is_some());
+            assert!(selected.neutral().communication_manifest().is_some());
             assert!(selected.rank_context().is_some());
         }
         let model = match load_model(&backend, &checkpoint, load_options) {

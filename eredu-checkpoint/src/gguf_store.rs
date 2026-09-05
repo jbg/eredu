@@ -260,6 +260,23 @@ impl GgufWeightStoreBuilder {
     }
 }
 
+/// Opens a backend-neutral GGUF source from an admitted checkpoint, exact
+/// architecture contract, and canonical output mapping.
+///
+/// Construction validates only headers and mappings. Tensor payloads remain
+/// lazy and are read through bounded leases after selection.
+pub fn open_prepared_gguf_source(
+    checkpoint: Checkpoint,
+    plan: &crate::schema::GgufCheckpointPlan,
+    tensor_mapping: &[eredu_gguf::TranslatedTensorLayout],
+    max_cached_readers: usize,
+) -> Result<GgufWeightStore, StoreError> {
+    GgufWeightStoreBuilder::default()
+        .max_cached_readers(max_cached_readers)?
+        .add_checkpoint(checkpoint, plan, tensor_mapping)?
+        .build()
+}
+
 /// Persistent backend-neutral logical tensor store for GGUF checkpoints.
 #[derive(Debug, Clone)]
 pub struct GgufWeightStore {

@@ -41,7 +41,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 std::time::Duration::from_secs(30),
                 eredu_core::CompletionCancellationMode::QuarantineUntilComplete,
             )?,
-        ),
+        )?,
     )?;
     let mut session = backend.create_session(model)?;
     let prompt = Array::from_slice(&[1u32, 2, 3], &[1, 3]);

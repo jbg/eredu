@@ -5,8 +5,8 @@ use std::{fmt::Debug, path::Path};
 
 use crate::{
     artifact::{
-        inspect_artifact, plan_model_preparation, ArtifactError, ArtifactInspection,
-        ModelConfigurationResolver, ModelPreparationPlan, PreparationPolicy,
+        inspect_artifact, ArtifactError, ArtifactInspection, ModelConfigurationResolver,
+        ModelPreparationPlan,
     },
     capability::{
         CapabilityError, InputTokenCount, ModelCapabilities, RuntimeStateEstimate,
@@ -16,6 +16,7 @@ use crate::{
     generation::{GenerationError, ResolvedGenerationConfig},
     media::TokenizedMultimodalRequest,
     observation::{InspectedOutput, ObservationRequest, ObservationSet},
+    PreparationAdmission,
 };
 
 /// Stable, extensible description of an execution backend.
@@ -880,12 +881,6 @@ pub trait ModelLoadingBackend: BackendProvider {
     /// Returns the architecture-owned model configuration registry.
     fn configuration_resolver(&self) -> &Self::ConfigurationResolver;
 
-    /// Resolves backend options into the policy used during neutral planning.
-    fn preparation_policy(
-        &self,
-        options: &Self::LoadOptions,
-    ) -> Result<PreparationPolicy, Self::Error>;
-
     /// Intersects normalized architecture requirements and the caller request
     /// with backend support, returning the sole construction-policy handoff.
     ///
@@ -899,14 +894,13 @@ pub trait ModelLoadingBackend: BackendProvider {
             <Self::ConfigurationResolver as ModelConfigurationResolver>::ArtifactPlan,
         >,
         options: &Self::LoadOptions,
-        policy: PreparationPolicy,
     ) -> Result<Self::SelectedPreparation, Self::Error>;
 
-    /// Returns the exact session report retained by the authoritative selection.
-    fn selected_session_capabilities(
+    /// Returns the exact portable admission retained by the authoritative selection.
+    fn selected_preparation_admission(
         &self,
         selected: &Self::SelectedPreparation,
-    ) -> SessionCapabilities;
+    ) -> PreparationAdmission;
 
     /// Binds a neutral preparation plan and its authoritative selected
     /// realization to backend-owned materialization input.
@@ -1000,17 +994,11 @@ pub fn prepare_inspected_model<B: ModelLoadingBackend>(
     >,
     options: B::LoadOptions,
 ) -> Result<PreparedModel<B::Model>, ModelLoadError<B::Error>> {
-    let policy = backend
-        .preparation_policy(&options)
-        .map_err(ModelLoadError::Backend)?;
     let selected = backend
-        .select_preparation(&inspection, &options, policy)
+        .select_preparation(&inspection, &options)
         .map_err(ModelLoadError::Backend)?;
-    let capabilities = backend.selected_session_capabilities(&selected);
-    policy
-        .validate_session_capabilities(&capabilities)
-        .map_err(ModelLoadError::SessionCapability)?;
-    let plan = plan_model_preparation(inspection, policy, capabilities)?;
+    let admission = backend.selected_preparation_admission(&selected);
+    let plan = ModelPreparationPlan::from_retained_admission(inspection, admission)?;
     prepare_selected_model(backend, SelectedModelPreparation::new(plan, selected))
 }
 
@@ -2137,47 +2125,61 @@ mod tests {
 
     impl ModelLoadingBackend for LoadingMock {
         type LoadOptions = u32;
-        type SelectedPreparation = u32;
+        type SelectedPreparation = (u32, crate::PreparationAdmission);
         type ConfigurationResolver = LoadingConfigurationResolver;
 
         fn configuration_resolver(&self) -> &Self::ConfigurationResolver {
             &LOADING_CONFIGURATION_RESOLVER
         }
 
-        fn preparation_policy(
-            &self,
-            options: &Self::LoadOptions,
-        ) -> Result<PreparationPolicy, Self::Error> {
-            Ok(
-                PreparationPolicy::default().with_required_session_capabilities(
-                    SessionCapabilities::default().with_activation_inspection(*options == 99),
-                ),
-            )
-        }
-
         fn select_preparation(
             &self,
             _: &ArtifactInspection,
             options: &Self::LoadOptions,
-            _: PreparationPolicy,
         ) -> Result<Self::SelectedPreparation, Self::Error> {
             self.selections
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Ok(*options)
+            let policy = crate::PreparationPolicy::default().with_required_session_capabilities(
+                SessionCapabilities::default().with_activation_inspection(*options == 99),
+            );
+            let request = crate::PreparationAdmissionRequest::new(
+                crate::LoadingProtocol::Model,
+                crate::ArtifactFormat::SafeTensors,
+                policy,
+                crate::ArchitecturePreparationCapabilities::new(
+                    false,
+                    true,
+                    false,
+                    false,
+                    false,
+                    crate::InputModalities::TEXT,
+                ),
+            );
+            let admission = crate::admit_preparation(
+                request,
+                crate::PreparationMechanismCapabilities::new(true, true)
+                    .with_residency(crate::ResidencyRequest::FullyResident, true)
+                    .with_input_modalities(crate::InputModalities::TEXT)
+                    .with_session(
+                        SessionCapabilities::default().with_activation_inspection(*options == 99),
+                    ),
+            )
+            .expect("mock admission facts are coherent");
+            Ok((*options, admission))
         }
 
-        fn selected_session_capabilities(
+        fn selected_preparation_admission(
             &self,
-            _: &Self::SelectedPreparation,
-        ) -> SessionCapabilities {
-            SessionCapabilities::default()
+            selected: &Self::SelectedPreparation,
+        ) -> crate::PreparationAdmission {
+            selected.1
         }
 
         fn model_config(
             &self,
             selected: SelectedModelPreparation<Self>,
         ) -> Result<Self::ModelConfig, Self::Error> {
-            let (plan, selected) = selected.into_parts();
+            let (plan, (selected, _admission)) = selected.into_parts();
             Ok((plan, selected))
         }
     }
@@ -2421,18 +2423,14 @@ mod tests {
     }
 
     #[test]
-    fn session_requirement_is_rejected_before_materialization() {
+    fn session_requirement_is_retained_by_the_single_admission() {
         let root = tempfile::tempdir().unwrap();
         write_loading_fixture(root.path());
         let backend = LoadingMock::default();
 
-        let error = load_model(&backend, root.path(), 99).unwrap_err();
+        let prepared = load_model(&backend, root.path(), 99).unwrap();
 
-        assert!(matches!(
-            error,
-            ModelLoadError::SessionCapability(error)
-                if error.capability() == "activation_inspection"
-        ));
+        assert_eq!(*prepared, 99);
         assert_eq!(
             backend
                 .selections
@@ -2443,7 +2441,7 @@ mod tests {
             backend
                 .materializations
                 .load(std::sync::atomic::Ordering::Relaxed),
-            0
+            1
         );
     }
 

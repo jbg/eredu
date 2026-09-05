@@ -70,8 +70,8 @@ pub mod native {
     };
     pub use crate::composition::mlx::speculative::MlxDrafter;
     pub use crate::composition::mlx::{
-        inspect_model, MlxInspectionOptions, MlxModelInput, MlxModelOutput, MlxModelSession,
-        MlxSessionCompletion,
+        inspect_model, inspect_model_preparation, MlxInspectionOptions, MlxModelInput,
+        MlxModelOutput, MlxModelSession, MlxSessionCompletion,
     };
     /// Converts a checkpoint with an explicitly selected native execution stream.
     pub fn quantize_checkpoint(
@@ -116,7 +116,7 @@ pub mod native {
         maximum_batch_size: i32,
         maximum_sequence_length: i32,
         completion_policy: eredu_runtime::CommunicationCompletionPolicy,
-    ) -> crate::MlxLoadRequest {
+    ) -> Result<crate::MlxLoadRequest, crate::backend::error::Error> {
         crate::MlxLoadRequest::with_parallel(
             topology,
             device,

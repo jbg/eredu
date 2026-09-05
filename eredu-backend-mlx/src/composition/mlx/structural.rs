@@ -1,6 +1,5 @@
 //! MLX architecture binding against portable checkpoint catalogs.
 
-use crate::backend::runtime::checkpoint::gguf::GgufCheckpoint;
 #[cfg(test)]
 use serde_json::Value;
 
@@ -9,78 +8,10 @@ use eredu_architectures::ModelKind;
 
 #[cfg(test)]
 use super::MlxLoadRequest;
+#[cfg(test)]
 use crate::backend::error::Error;
 
-/// Native view of the GGUF source admitted by portable inspection.
-///
-/// Family composition consumes this type instead of repeating architecture
-/// admission or reaching upward from reusable backend runtime code.
-pub(crate) struct AdmittedGguf {
-    plan: eredu_architectures::configuration::GgufArchitecturePlan,
-    checkpoint: GgufCheckpoint,
-}
-
-/// Native projector payload paired with its architecture-owned admission proof.
-///
-/// Family composition may lower this plan into MLX checkpoint sources, but it
-/// must not reconstruct family geometry or checkpoint schemas from the payload.
-pub(crate) struct AdmittedGgufProjector {
-    plan: eredu_architectures::gguf_companion::GgufMediaProjectorPlan,
-    checkpoint: GgufCheckpoint,
-}
-
-impl AdmittedGgufProjector {
-    pub(crate) const fn plan(
-        &self,
-    ) -> &eredu_architectures::gguf_companion::GgufMediaProjectorPlan {
-        &self.plan
-    }
-
-    pub(crate) fn checkpoint(&self) -> &GgufCheckpoint {
-        &self.checkpoint
-    }
-}
-
-impl AdmittedGguf {
-    pub(crate) fn from_admission(
-        plan: eredu_architectures::configuration::GgufArchitecturePlan,
-        projector_plan: Option<eredu_architectures::gguf_companion::GgufMediaProjectorPlan>,
-        validated: eredu_core::ValidatedGguf,
-    ) -> Result<(Self, Option<AdmittedGgufProjector>), Error> {
-        let (checkpoint, mut companions) = validated.into_parts();
-        let checkpoint = GgufCheckpoint::from_portable(checkpoint);
-        let projector = companions.remove(&eredu_core::GgufCompanionRole::MediaProjector);
-        let projector = match (projector_plan, projector) {
-            (Some(plan), Some(projector)) => Some(AdmittedGgufProjector {
-                plan,
-                checkpoint: GgufCheckpoint::from_portable(projector.checkpoint().clone()),
-            }),
-            (None, None) => None,
-            (Some(_), None) => {
-                return Err(Error::ArchitectureModel(
-                    "GGUF preparation retained a media-projector plan without its admitted checkpoint"
-                        .into(),
-                ));
-            }
-            (None, Some(_)) => {
-                return Err(Error::ArchitectureModel(
-                    "GGUF preparation retained a media-projector checkpoint without its typed architecture plan"
-                        .into(),
-                ));
-            }
-        };
-        Ok((Self { plan, checkpoint }, projector))
-    }
-
-    pub(crate) const fn plan(&self) -> &eredu_architectures::configuration::GgufArchitecturePlan {
-        &self.plan
-    }
-
-    pub(crate) fn checkpoint(&self) -> &GgufCheckpoint {
-        &self.checkpoint
-    }
-}
-
+#[cfg(test)]
 fn architecture_admission_capabilities(
     capabilities: eredu_architectures::preparation::ArchitectureCapabilities,
 ) -> eredu_core::ArchitecturePreparationCapabilities {
@@ -150,53 +81,6 @@ fn validate_safetensors_preparation_for_test(
     eredu_core::admit_preparation(request, preparation_mechanism_capabilities())
         .map(drop)
         .map_err(Into::into)
-}
-
-/// Selects and retains the portable preparation admission before native work.
-pub(crate) fn admit_inspected_preparation(
-    inspection: &eredu_core::ArtifactInspection<
-        eredu_architectures::processor_plan::ArtifactArchitecturePlan,
-    >,
-    policy: eredu_core::PreparationPolicy,
-) -> Result<eredu_core::PreparationAdmission, Error> {
-    let architecture_plan = inspection.architecture_plan();
-    let capabilities = match inspection.format() {
-        eredu_core::ArtifactFormat::SafeTensors => {
-            eredu_architectures::preparation::prepared_safetensors_capabilities(
-                architecture_plan
-                    .safetensors_architecture()
-                    .ok_or_else(|| {
-                        Error::ArchitectureModel(
-                            "SafeTensors preparation omitted its validated architecture plan"
-                                .into(),
-                        )
-                    })?,
-            )
-        }
-        eredu_core::ArtifactFormat::Gguf => Ok(
-            eredu_architectures::preparation::prepared_gguf_capabilities(
-                architecture_plan.gguf_plan().ok_or_else(|| {
-                    Error::ArchitectureModel(
-                        "GGUF preparation omitted its validated architecture plan".into(),
-                    )
-                })?,
-            ),
-        ),
-        _ => {
-            return Err(Error::ArchitectureModel(
-                "unsupported artifact format selected during structural validation".into(),
-            ));
-        }
-    }
-    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    let request = eredu_core::PreparationAdmissionRequest::new(
-        inspection.configuration().loading_protocol(),
-        inspection.format(),
-        policy,
-        architecture_admission_capabilities(capabilities),
-    )
-    .with_exact_completion(true);
-    eredu_core::admit_preparation(request, preparation_mechanism_capabilities()).map_err(Into::into)
 }
 
 #[cfg(test)]
@@ -369,7 +253,8 @@ mod admission_policy_tests {
                 1,
                 128,
                 MlxLoadRequest::test_communication_completion_policy(),
-            );
+            )
+            .unwrap();
 
         validate_safetensors_preparation_for_test(ModelKind::Qwen3, &dense_qwen3_config(), options)
             .unwrap();
@@ -388,7 +273,8 @@ mod admission_policy_tests {
                 1,
                 128,
                 MlxLoadRequest::test_communication_completion_policy(),
-            );
+            )
+            .unwrap();
 
         validate_safetensors_preparation_for_test(ModelKind::Qwen3, &dense_qwen3_config(), options)
             .unwrap();

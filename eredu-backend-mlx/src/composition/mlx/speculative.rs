@@ -74,7 +74,6 @@ pub(crate) struct MlxExternalAssistant<A: eredu_architectures::ExternalAssistant
 pub(crate) struct MlxAssistantPreparationVisitor {
     stream: Stream,
     weights_stream: Stream,
-    max_cached_shards: usize,
 }
 
 impl eredu_architectures::ExternalAssistantPreparationVisitor for MlxAssistantPreparationVisitor {
@@ -83,22 +82,16 @@ impl eredu_architectures::ExternalAssistantPreparationVisitor for MlxAssistantPr
 
     fn visit<A: eredu_architectures::ExternalAssistantArchitecture>(
         self,
-        prepared: eredu_architectures::SelectedExternalAssistant<A>,
+        prepared: eredu_architectures::PreparedExternalAssistantSource<A>,
     ) -> Result<Self::Output<A>, Self::Error> {
-        materialize_external_assistant::<A>(
-            prepared,
-            &self.stream,
-            &self.weights_stream,
-            self.max_cached_shards,
-        )
+        materialize_external_assistant::<A>(prepared, &self.stream, &self.weights_stream)
     }
 }
 
 fn materialize_external_assistant<A: eredu_architectures::ExternalAssistantArchitecture>(
-    prepared: eredu_architectures::SelectedExternalAssistant<A>,
+    prepared: eredu_architectures::PreparedExternalAssistantSource<A>,
     stream: &Stream,
     weights_stream: &Stream,
-    max_cached_shards: usize,
 ) -> Result<MlxExternalAssistant<A>, Error> {
     use crate::backend::runtime::{
         checkpoint::binding::{
@@ -107,36 +100,8 @@ fn materialize_external_assistant<A: eredu_architectures::ExternalAssistantArchi
         },
         execution::layerwise::quantize_exact_replicated_text_tasks,
     };
-    use std::sync::Arc;
-
-    let (checkpoint, source_config, config, tasks) = prepared.into_parts();
-    let store = match checkpoint {
-        eredu_architectures::ExternalAssistantCheckpoint::SafeTensors {
-            source: _,
-            shards,
-            catalog,
-            plan: _,
-            resolution,
-        } => eredu_core::artifact::open_prepared_safetensors_artifact(
-            &catalog,
-            shards,
-            resolution,
-            max_cached_shards,
-        )?,
-        eredu_architectures::ExternalAssistantCheckpoint::Gguf {
-            checkpoint,
-            resolution,
-            tensor_mapping,
-        } => {
-            let store: eredu_checkpoint::store::SharedCheckpointSource = Arc::new(
-                eredu_checkpoint::gguf_store::GgufWeightStore::builder()
-                    .max_cached_readers(max_cached_shards)?
-                    .add_resolved_checkpoint(checkpoint, &resolution, &tensor_mapping)?
-                    .build()?,
-            );
-            store
-        }
-    };
+    let (store, _checkpoint, _artifact_identity, source_config, config, tasks) =
+        prepared.into_parts();
     let mut store = store;
     let transformed = tasks
         .iter()
@@ -233,9 +198,8 @@ impl MlxDrafter {
 
     /// Materializes an architecture-inspected drafter with proven tokenizer compatibility.
     pub(crate) fn materialize_with_compatibility(
-        preparation: eredu_architectures::CompatibleExternalAssistantPreparation,
+        preparation: eredu_architectures::PreparedCompatibleExternalAssistant,
         tokenizer_compatibility: TokenizerCompatibilityProof,
-        max_cached_shards: usize,
         stream: &Stream,
         weights_stream: &Stream,
         selected: SelectedSpeculativeRealization,
@@ -255,7 +219,6 @@ impl MlxDrafter {
         let assistant = preparation.visit(MlxAssistantPreparationVisitor {
             stream: stream.clone(),
             weights_stream: weights_stream.clone(),
-            max_cached_shards,
         })?;
         Ok(Self {
             assistant,
@@ -995,7 +958,6 @@ mod external_materialization_tests {
         MlxAssistantPreparationVisitor {
             stream: stream.clone(),
             weights_stream: stream.clone(),
-            max_cached_shards: eredu_checkpoint::store::DEFAULT_MAX_CACHED_SHARDS,
         }
     }
 
@@ -1004,16 +966,21 @@ mod external_materialization_tests {
         quantization: Option<eredu_core::QuantizationRequest>,
     ) -> eredu_architectures::SelectedExternalAssistantPreparation {
         preparation
-            .select_materialization(quantization, |descriptor, transforms| {
-                if transforms && super::super::replicated_text::supports_transform(descriptor) {
-                    Some(eredu_runtime::WeightLoweringKind::Transform)
-                } else if !transforms && super::super::replicated_text::supports_direct(descriptor)
-                {
-                    Some(eredu_runtime::WeightLoweringKind::Direct)
-                } else {
-                    None
-                }
-            })
+            .select_materialization(
+                quantization,
+                eredu_checkpoint::store::DEFAULT_MAX_CACHED_SHARDS,
+                |descriptor, transforms| {
+                    if transforms && super::super::replicated_text::supports_transform(descriptor) {
+                        Some(eredu_runtime::WeightLoweringKind::Transform)
+                    } else if !transforms
+                        && super::super::replicated_text::supports_direct(descriptor)
+                    {
+                        Some(eredu_runtime::WeightLoweringKind::Direct)
+                    } else {
+                        None
+                    }
+                },
+            )
             .unwrap()
     }
 
@@ -1045,7 +1012,10 @@ mod external_materialization_tests {
         let stream = Stream::try_new_with_device(&Device::new(DeviceType::Cpu, 0)).unwrap();
         crate::composition::mlx::path_instrumentation::reset();
 
-        let mut materialized = compatible.visit(visitor(&stream)).unwrap();
+        let prepared = compatible
+            .prepare_source(eredu_checkpoint::store::DEFAULT_MAX_CACHED_SHARDS)
+            .unwrap();
+        let mut materialized = prepared.visit(visitor(&stream)).unwrap();
         assert_eq!(
             materialized.visit(InspectMaterialized),
             ("gemma4_assistant".into(), None)
@@ -1067,7 +1037,10 @@ mod external_materialization_tests {
         let stream = Stream::try_new_with_device(&Device::new(DeviceType::Cpu, 0)).unwrap();
         crate::composition::mlx::path_instrumentation::reset();
 
-        let mut materialized = compatible.visit(visitor(&stream)).unwrap();
+        let prepared = compatible
+            .prepare_source(eredu_checkpoint::store::DEFAULT_MAX_CACHED_SHARDS)
+            .unwrap();
+        let mut materialized = prepared.visit(visitor(&stream)).unwrap();
         assert_eq!(
             materialized.visit(InspectMaterialized),
             (

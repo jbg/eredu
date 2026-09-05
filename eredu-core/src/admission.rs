@@ -228,6 +228,16 @@ impl PreparationAdmissionRequest {
         self.exact_completion = required;
         self
     }
+
+    /// Exact portable loading policy retained by admission.
+    pub const fn policy(self) -> PreparationPolicy {
+        self.policy
+    }
+
+    /// Artifact format retained by admission.
+    pub const fn format(self) -> ArtifactFormat {
+        self.format
+    }
 }
 
 /// Retained result of portable architecture/policy/mechanism admission.

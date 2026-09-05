@@ -7,8 +7,11 @@
 //! selected native mechanisms.
 
 pub use eredu_architectures::moshi::{
-    inspect_moshi_realtime, prepare_realtime_model_from_catalog, select_inspected_moshi_realtime,
-    InspectedMoshiRealtime, MoshiRealtimeRequest, PreparedMoshiRealtime, RealtimePreparationPlan,
+    inspect_moshi_realtime, moshi_realtime_request_from_normalized,
+    prepare_realtime_model_from_catalog, prepare_selected_moshi_realtime_source,
+    select_inspected_moshi_realtime, InspectedMoshiRealtime, MoshiRealtimeRequest,
+    MoshiRealtimeSourceError, MoshiWeightLoweringSummary, PreparedMoshiRealtime,
+    PreparedMoshiRealtimeSource, RealtimePreparationPlan,
 };
 pub use eredu_core::{
     scheduler::{

@@ -323,15 +323,15 @@ impl ExternalAssistantCheckpoint {
         match self {
             Self::SafeTensors {
                 source: _,
-                shards,
+                shards: _,
                 catalog: _,
                 plan,
                 resolution,
             } => {
-                let artifact = artifact_speculative_identity(fingerprint_safetensors_artifact(
-                    "eredu.external-assistant.safetensors.v1",
-                    shards,
-                )?)?;
+                let artifact = external_contract_identity(format!(
+                    "admission/safetensors/profile={};plan={plan:?};resolution={resolution:?}",
+                    assistant_profile.as_str(),
+                ))?;
                 let format = external_contract_identity(format!(
                     "safetensors/profile={};plan={plan:?};resolution={resolution:?}",
                     assistant_profile.as_str(),
@@ -339,7 +339,7 @@ impl ExternalAssistantCheckpoint {
                 Ok((artifact, format))
             }
             Self::Gguf {
-                checkpoint,
+                checkpoint: _,
                 resolution,
                 tensor_mapping,
             } => {
@@ -357,10 +357,10 @@ impl ExternalAssistantCheckpoint {
                     })
                     .collect::<Vec<_>>()
                     .join(";");
-                let artifact = artifact_speculative_identity(fingerprint_gguf_artifact(
-                    "eredu.external-assistant.gguf.v1",
-                    checkpoint,
-                )?)?;
+                let artifact = external_contract_identity(format!(
+                    "admission/gguf/profile={};resolution={resolution:?};mapping={mapping}",
+                    assistant_profile.as_str(),
+                ))?;
                 let format = external_contract_identity(format!(
                     "gguf/profile={};resolution={resolution:?};mapping={mapping}",
                     assistant_profile.as_str(),
@@ -881,40 +881,127 @@ pub(crate) struct PreparedExternalAssistant<A: ExternalAssistantArchitecture> {
 }
 
 /// Cold-selected physical materialization for one typed external assistant.
-#[derive(Debug, Clone)]
-pub struct SelectedExternalAssistant<A: ExternalAssistantArchitecture> {
+#[derive(Clone)]
+pub(crate) struct SelectedExternalAssistant<A: ExternalAssistantArchitecture> {
     checkpoint: ExternalAssistantCheckpoint,
+    prepared_source: Option<eredu_checkpoint::store::SharedCheckpointSource>,
     source_config: A::Config,
     config: A::Config,
     tasks: Vec<ReplicatedTextMaterializationTask>,
     _architecture: PhantomData<fn() -> A>,
 }
 
-impl<A: ExternalAssistantArchitecture> SelectedExternalAssistant<A> {
-    /// Consumes the selection into the exact admitted source, constructed config, and tasks.
-    pub fn into_parts(
-        self,
-    ) -> (
-        ExternalAssistantCheckpoint,
-        A::Config,
-        A::Config,
-        Vec<ReplicatedTextMaterializationTask>,
-    ) {
-        (self.checkpoint, self.source_config, self.config, self.tasks)
+/// Exact neutral source role paired with one selected external assistant.
+pub struct PreparedExternalAssistantSource<A: ExternalAssistantArchitecture> {
+    checkpoint: ExternalAssistantCheckpoint,
+    artifact_identity: ArtifactIdentity,
+    source: eredu_checkpoint::store::SharedCheckpointSource,
+    source_config: A::Config,
+    config: A::Config,
+    tasks: Vec<ReplicatedTextMaterializationTask>,
+}
+
+impl<A: ExternalAssistantArchitecture> PreparedExternalAssistantSource<A> {
+    /// Exact admitted checkpoint provenance paired with this source.
+    pub const fn checkpoint(&self) -> &ExternalAssistantCheckpoint {
+        &self.checkpoint
     }
 
-    /// Returns the exact selected materialization tasks.
-    pub fn tasks(&self) -> &[ReplicatedTextMaterializationTask] {
-        &self.tasks
+    /// Content-exact identity computed immediately before backend handoff.
+    pub const fn artifact_identity(&self) -> ArtifactIdentity {
+        self.artifact_identity
     }
 
-    /// Borrows the exact selected module configuration.
+    /// Selected executable configuration paired with this source.
     pub const fn config(&self) -> &A::Config {
         &self.config
     }
 
+    /// Consumes the handoff into the exact source, source/target configs, and tasks.
+    pub fn into_parts(
+        self,
+    ) -> (
+        eredu_checkpoint::store::SharedCheckpointSource,
+        ExternalAssistantCheckpoint,
+        ArtifactIdentity,
+        A::Config,
+        A::Config,
+        Vec<ReplicatedTextMaterializationTask>,
+    ) {
+        (
+            self.source,
+            self.checkpoint,
+            self.artifact_identity,
+            self.source_config,
+            self.config,
+            self.tasks,
+        )
+    }
+}
+
+impl<A: ExternalAssistantArchitecture> SelectedExternalAssistant<A> {
+    /// Prepares the admitted physical source once before backend materialization.
+    fn prepare_source(
+        self,
+        max_cached_sources: usize,
+    ) -> Result<PreparedExternalAssistantSource<A>, ArtifactError> {
+        let Self {
+            checkpoint,
+            prepared_source,
+            source_config,
+            config,
+            tasks,
+            _architecture: _,
+        } = self;
+        let retained_checkpoint = checkpoint.clone();
+        let artifact_identity = match &checkpoint {
+            ExternalAssistantCheckpoint::SafeTensors { shards, .. } => {
+                fingerprint_safetensors_artifact("eredu.external-assistant.safetensors.v1", shards)?
+            }
+            ExternalAssistantCheckpoint::Gguf { checkpoint, .. } => {
+                fingerprint_gguf_artifact("eredu.external-assistant.gguf.v1", checkpoint)?
+            }
+        };
+        let source = match checkpoint {
+            ExternalAssistantCheckpoint::SafeTensors {
+                source: _,
+                shards,
+                catalog,
+                plan: _,
+                resolution,
+            } => eredu_core::artifact::open_prepared_safetensors_artifact(
+                &catalog,
+                shards,
+                resolution,
+                max_cached_sources,
+            )?,
+            ExternalAssistantCheckpoint::Gguf {
+                checkpoint: _,
+                resolution: _,
+                tensor_mapping: _,
+            } => prepared_source.ok_or_else(|| {
+                ArtifactError::InvalidArtifact(
+                    "selected GGUF assistant omitted its singular prepared source".into(),
+                )
+            })?,
+        };
+        Ok(PreparedExternalAssistantSource {
+            source,
+            checkpoint: retained_checkpoint,
+            artifact_identity,
+            source_config,
+            config,
+            tasks,
+        })
+    }
+
+    /// Borrows the exact selected module configuration.
+    const fn config(&self) -> &A::Config {
+        &self.config
+    }
+
     /// Borrows the admitted checkpoint behind this selection.
-    pub const fn checkpoint(&self) -> &ExternalAssistantCheckpoint {
+    const fn checkpoint(&self) -> &ExternalAssistantCheckpoint {
         &self.checkpoint
     }
 }
@@ -936,7 +1023,7 @@ pub trait ExternalAssistantPreparationVisitor {
     /// Visits any sealed assistant architecture through one static-dispatch path.
     fn visit<A: ExternalAssistantArchitecture>(
         self,
-        prepared: SelectedExternalAssistant<A>,
+        prepared: PreparedExternalAssistantSource<A>,
     ) -> Result<Self::Output<A>, Self::Error>;
 }
 
@@ -985,7 +1072,7 @@ enum DispatchedExternalAssistantPreparation {
     MuseGlimmer(PreparedExternalAssistant<MuseGlimmerAssistantArchitecture>),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 enum DispatchedSelectedExternalAssistant {
     Gemma4(SelectedExternalAssistant<Gemma4AssistantArchitecture>),
     MuseGlimmer(SelectedExternalAssistant<MuseGlimmerAssistantArchitecture>),
@@ -998,7 +1085,7 @@ pub struct ExternalAssistantPreparation {
 }
 
 /// Opaque architecture-dispatched materialization selected before native resources exist.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SelectedExternalAssistantPreparation {
     dispatched: DispatchedSelectedExternalAssistant,
 }
@@ -1098,6 +1185,20 @@ pub struct CompatibleExternalAssistantPreparation {
     capture: crate::composite_execution::ExternalPredictionCaptureRequest,
 }
 
+enum DispatchedPreparedExternalAssistant {
+    Gemma4(PreparedExternalAssistantSource<Gemma4AssistantArchitecture>),
+    MuseGlimmer(PreparedExternalAssistantSource<MuseGlimmerAssistantArchitecture>),
+}
+
+/// Compatibility-proven assistant whose exact neutral source is already open.
+///
+/// Concrete backends receive this value only after all artifact policy and
+/// source construction has completed, so native resources cannot precede it.
+pub struct PreparedCompatibleExternalAssistant {
+    preparation: DispatchedPreparedExternalAssistant,
+    capture: crate::composite_execution::ExternalPredictionCaptureRequest,
+}
+
 impl CompatibleExternalAssistantPreparation {
     /// Returns the exact architecture-owned target capture request.
     pub const fn capture(&self) -> &crate::composite_execution::ExternalPredictionCaptureRequest {
@@ -1112,12 +1213,55 @@ impl CompatibleExternalAssistantPreparation {
         external_speculative_contract(self, request)
     }
 
-    /// Materializes the already compatible assistant through one generic visitor.
+    /// Opens the exact admitted assistant source before native materialization.
+    pub fn prepare_source(
+        self,
+        max_cached_sources: usize,
+    ) -> Result<PreparedCompatibleExternalAssistant, ArtifactError> {
+        let preparation = match self.preparation.dispatched {
+            DispatchedSelectedExternalAssistant::Gemma4(selected) => {
+                DispatchedPreparedExternalAssistant::Gemma4(
+                    selected.prepare_source(max_cached_sources)?,
+                )
+            }
+            DispatchedSelectedExternalAssistant::MuseGlimmer(selected) => {
+                DispatchedPreparedExternalAssistant::MuseGlimmer(
+                    selected.prepare_source(max_cached_sources)?,
+                )
+            }
+        };
+        Ok(PreparedCompatibleExternalAssistant {
+            preparation,
+            capture: self.capture,
+        })
+    }
+}
+
+impl PreparedCompatibleExternalAssistant {
+    /// Exact architecture-owned target capture request.
+    pub const fn capture(&self) -> &crate::composite_execution::ExternalPredictionCaptureRequest {
+        &self.capture
+    }
+
+    /// Dispatches an already prepared neutral source to native materialization.
     pub fn visit<V: ExternalAssistantPreparationVisitor>(
         self,
         visitor: V,
     ) -> Result<MaterializedExternalAssistant<V>, V::Error> {
-        self.preparation.visit(visitor)
+        match self.preparation {
+            DispatchedPreparedExternalAssistant::Gemma4(prepared) => {
+                visitor
+                    .visit(prepared)
+                    .map(|assistant| MaterializedExternalAssistant {
+                        dispatched: DispatchedMaterializedExternalAssistant::Gemma4(assistant),
+                    })
+            }
+            DispatchedPreparedExternalAssistant::MuseGlimmer(prepared) => visitor
+                .visit(prepared)
+                .map(|assistant| MaterializedExternalAssistant {
+                    dispatched: DispatchedMaterializedExternalAssistant::MuseGlimmer(assistant),
+                }),
+        }
     }
 }
 
@@ -1138,31 +1282,62 @@ impl ExternalAssistantPreparation {
     pub fn select_materialization<F>(
         self,
         quantization: Option<eredu_core::QuantizationRequest>,
+        max_cached_sources: usize,
         lowering: F,
     ) -> Result<SelectedExternalAssistantPreparation, String>
     where
         F: Fn(&WeightLoweringDescriptor, bool) -> Option<WeightLoweringKind>,
     {
-        let dispatched =
-            match self.dispatched {
-                DispatchedExternalAssistantPreparation::Gemma4(prepared) => {
-                    DispatchedSelectedExternalAssistant::Gemma4(select_external_materialization(
-                        prepared,
-                        quantization,
-                        &lowering,
-                    )?)
-                }
-                DispatchedExternalAssistantPreparation::MuseGlimmer(prepared) => {
-                    DispatchedSelectedExternalAssistant::MuseGlimmer(
-                        select_external_materialization(prepared, quantization, &lowering)?,
-                    )
-                }
-            };
+        let dispatched = match self.dispatched {
+            DispatchedExternalAssistantPreparation::Gemma4(prepared) => {
+                DispatchedSelectedExternalAssistant::Gemma4(select_external_materialization(
+                    prepared,
+                    quantization,
+                    max_cached_sources,
+                    &lowering,
+                )?)
+            }
+            DispatchedExternalAssistantPreparation::MuseGlimmer(prepared) => {
+                DispatchedSelectedExternalAssistant::MuseGlimmer(select_external_materialization(
+                    prepared,
+                    quantization,
+                    max_cached_sources,
+                    &lowering,
+                )?)
+            }
+        };
         Ok(SelectedExternalAssistantPreparation { dispatched })
     }
 }
 
 impl SelectedExternalAssistantPreparation {
+    #[cfg(test)]
+    fn visit_for_test<V: ExternalAssistantPreparationVisitor>(
+        self,
+        visitor: V,
+    ) -> Result<MaterializedExternalAssistant<V>, V::Error> {
+        fn prepared<A: ExternalAssistantArchitecture>(
+            selected: SelectedExternalAssistant<A>,
+        ) -> PreparedExternalAssistantSource<A> {
+            match selected.prepare_source(eredu_checkpoint::store::DEFAULT_MAX_CACHED_SHARDS) {
+                Ok(prepared) => prepared,
+                Err(error) => panic!("test source preparation failed: {error}"),
+            }
+        }
+        match self.dispatched {
+            DispatchedSelectedExternalAssistant::Gemma4(selected) => visitor
+                .visit(prepared(selected))
+                .map(|assistant| MaterializedExternalAssistant {
+                    dispatched: DispatchedMaterializedExternalAssistant::Gemma4(assistant),
+                }),
+            DispatchedSelectedExternalAssistant::MuseGlimmer(selected) => visitor
+                .visit(prepared(selected))
+                .map(|assistant| MaterializedExternalAssistant {
+                    dispatched: DispatchedMaterializedExternalAssistant::MuseGlimmer(assistant),
+                }),
+        }
+    }
+
     /// Proves exact target compatibility without opening assistant weight payloads.
     pub fn prove_target_compatibility(
         self,
@@ -1189,27 +1364,6 @@ impl SelectedExternalAssistantPreparation {
             target: target.clone(),
             capture,
         })
-    }
-
-    /// Dispatches a compatibility-proven plan to one architecture-typed materializer.
-    fn visit<V: ExternalAssistantPreparationVisitor>(
-        self,
-        visitor: V,
-    ) -> Result<MaterializedExternalAssistant<V>, V::Error> {
-        match self.dispatched {
-            DispatchedSelectedExternalAssistant::Gemma4(prepared) => {
-                visitor
-                    .visit(prepared)
-                    .map(|assistant| MaterializedExternalAssistant {
-                        dispatched: DispatchedMaterializedExternalAssistant::Gemma4(assistant),
-                    })
-            }
-            DispatchedSelectedExternalAssistant::MuseGlimmer(prepared) => visitor
-                .visit(prepared)
-                .map(|assistant| MaterializedExternalAssistant {
-                    dispatched: DispatchedMaterializedExternalAssistant::MuseGlimmer(assistant),
-                }),
-        }
     }
 }
 
@@ -1262,6 +1416,7 @@ impl SelectedCheckpointCatalog<'_> {
 
 fn selected_checkpoint_catalog(
     checkpoint: &ExternalAssistantCheckpoint,
+    max_cached_sources: usize,
 ) -> Result<SelectedCheckpointCatalog<'_>, String> {
     match checkpoint {
         ExternalAssistantCheckpoint::SafeTensors {
@@ -1290,6 +1445,8 @@ fn selected_checkpoint_catalog(
             tensor_mapping,
         } => Ok(SelectedCheckpointCatalog::Source(Arc::new(
             eredu_checkpoint::gguf_store::GgufWeightStore::builder()
+                .max_cached_readers(max_cached_sources)
+                .map_err(|error| error.to_string())?
                 .add_resolved_checkpoint(checkpoint.clone(), resolution, tensor_mapping)
                 .map_err(|error| error.to_string())?
                 .build()
@@ -1434,6 +1591,7 @@ fn exact_physical_source(
 fn select_external_materialization<A, F>(
     prepared: PreparedExternalAssistant<A>,
     quantization: Option<eredu_core::QuantizationRequest>,
+    max_cached_sources: usize,
     lowering: &F,
 ) -> Result<SelectedExternalAssistant<A>, String>
 where
@@ -1441,7 +1599,11 @@ where
     F: Fn(&WeightLoweringDescriptor, bool) -> Option<WeightLoweringKind>,
 {
     let (checkpoint, source_config) = prepared.into_parts();
-    let store = selected_checkpoint_catalog(&checkpoint)?;
+    let store = selected_checkpoint_catalog(&checkpoint, max_cached_sources)?;
+    let prepared_source = match &store {
+        SelectedCheckpointCatalog::Source(source) => Some(Arc::clone(source)),
+        SelectedCheckpointCatalog::SafeTensors(_) => None,
+    };
     let source_config = if matches!(checkpoint, ExternalAssistantCheckpoint::Gguf { .. }) {
         A::with_checkpoint_formats(&source_config, gguf_checkpoint_formats(&checkpoint)?)?
     } else {
@@ -1571,6 +1733,7 @@ where
     }
     Ok(SelectedExternalAssistant {
         checkpoint,
+        prepared_source,
         source_config,
         config: target_config,
         tasks,
@@ -1582,12 +1745,6 @@ fn external_contract_identity(
     value: impl Into<String>,
 ) -> Result<SpeculativeIdentity, ArtifactError> {
     SpeculativeIdentity::new(value).map_err(invalid_assistant)
-}
-
-fn artifact_speculative_identity(
-    identity: ArtifactIdentity,
-) -> Result<SpeculativeIdentity, ArtifactError> {
-    external_contract_identity(format!("artifact/{identity}"))
 }
 
 fn external_topology_identity(
@@ -2140,43 +2297,47 @@ mod tests {
         preparation: ExternalAssistantPreparation,
     ) -> SelectedExternalAssistantPreparation {
         preparation
-            .select_materialization(None, |descriptor, transforms| {
-                let direct = !transforms
-                    && match (descriptor.source(), descriptor.executable()) {
-                        (
-                            SourceTensorEncoding::Safetensors(
-                                StoredDtype::F16 | StoredDtype::BF16 | StoredDtype::F32,
-                            ),
-                            LinearFormat::Dense,
-                        ) => true,
-                        (
-                            SourceTensorEncoding::Safetensors(StoredDtype::U32),
-                            LinearFormat::Affine(_) | LinearFormat::MxFp4,
-                        ) => true,
-                        (SourceTensorEncoding::Gguf { ggml_type, .. }, LinearFormat::Dense) => {
-                            matches!(
-                                ggml_type,
-                                eredu_gguf::GgmlType::F16
-                                    | eredu_gguf::GgmlType::Bf16
-                                    | eredu_gguf::GgmlType::F32
-                            )
-                        }
-                        (SourceTensorEncoding::Gguf { ggml_type, .. }, LinearFormat::MxFp4) => {
-                            *ggml_type == eredu_gguf::GgmlType::MxFp4
-                        }
-                        (
-                            SourceTensorEncoding::Gguf {
-                                ggml_type, endian, ..
-                            },
-                            LinearFormat::GgufIQuant {
-                                ggml_type: executable,
-                                endian: executable_endian,
-                            },
-                        ) => ggml_type == &executable && endian == &executable_endian,
-                        _ => false,
-                    };
-                direct.then_some(WeightLoweringKind::Direct)
-            })
+            .select_materialization(
+                None,
+                eredu_checkpoint::store::DEFAULT_MAX_CACHED_SHARDS,
+                |descriptor, transforms| {
+                    let direct = !transforms
+                        && match (descriptor.source(), descriptor.executable()) {
+                            (
+                                SourceTensorEncoding::Safetensors(
+                                    StoredDtype::F16 | StoredDtype::BF16 | StoredDtype::F32,
+                                ),
+                                LinearFormat::Dense,
+                            ) => true,
+                            (
+                                SourceTensorEncoding::Safetensors(StoredDtype::U32),
+                                LinearFormat::Affine(_) | LinearFormat::MxFp4,
+                            ) => true,
+                            (SourceTensorEncoding::Gguf { ggml_type, .. }, LinearFormat::Dense) => {
+                                matches!(
+                                    ggml_type,
+                                    eredu_gguf::GgmlType::F16
+                                        | eredu_gguf::GgmlType::Bf16
+                                        | eredu_gguf::GgmlType::F32
+                                )
+                            }
+                            (SourceTensorEncoding::Gguf { ggml_type, .. }, LinearFormat::MxFp4) => {
+                                *ggml_type == eredu_gguf::GgmlType::MxFp4
+                            }
+                            (
+                                SourceTensorEncoding::Gguf {
+                                    ggml_type, endian, ..
+                                },
+                                LinearFormat::GgufIQuant {
+                                    ggml_type: executable,
+                                    endian: executable_endian,
+                                },
+                            ) => *ggml_type == executable && *endian == executable_endian,
+                            _ => false,
+                        };
+                    direct.then_some(WeightLoweringKind::Direct)
+                },
+            )
             .expect("test artifact has a valid direct lowering for every assistant parameter")
     }
 
@@ -2436,6 +2597,7 @@ mod tests {
 
     struct InspectedPreparation {
         checkpoint: ExternalAssistantCheckpoint,
+        artifact_identity: ArtifactIdentity,
         tokenizer_model_kind: crate::configuration::ModelKind,
         model_type: String,
     }
@@ -2448,12 +2610,14 @@ mod tests {
 
         fn visit<A: ExternalAssistantArchitecture>(
             self,
-            prepared: SelectedExternalAssistant<A>,
+            prepared: PreparedExternalAssistantSource<A>,
         ) -> Result<Self::Output<A>, Self::Error> {
             let model_type = A::configuration_model_type(prepared.config()).to_owned();
-            let (checkpoint, _, _, _) = prepared.into_parts();
+            let checkpoint = prepared.checkpoint().clone();
+            let artifact_identity = prepared.artifact_identity();
             Ok(InspectedPreparation {
                 checkpoint,
+                artifact_identity,
                 tokenizer_model_kind: A::tokenizer_model_kind(),
                 model_type,
             })
@@ -2471,24 +2635,10 @@ mod tests {
         ) -> Self::Output {
             InspectedPreparation {
                 checkpoint: assistant.checkpoint.clone(),
+                artifact_identity: assistant.artifact_identity,
                 tokenizer_model_kind: assistant.tokenizer_model_kind,
                 model_type: assistant.model_type.clone(),
             }
-        }
-    }
-
-    struct CountPayloadOpens(Arc<AtomicUsize>);
-
-    impl ExternalAssistantPreparationVisitor for CountPayloadOpens {
-        type Output<A: ExternalAssistantArchitecture> = ();
-        type Error = Infallible;
-
-        fn visit<A: ExternalAssistantArchitecture>(
-            self,
-            _prepared: SelectedExternalAssistant<A>,
-        ) -> Result<Self::Output<A>, Self::Error> {
-            self.0.fetch_add(1, Ordering::SeqCst);
-            Ok(())
         }
     }
 
@@ -2501,7 +2651,7 @@ mod tests {
             crate::configuration::ModelKind::Gemma4
         );
         let mut materialized = select_direct_for_test(preparation)
-            .visit(InspectPreparation)
+            .visit_for_test(InspectPreparation)
             .unwrap();
         let inspected = materialized.visit(TakeInspection);
         assert_eq!(
@@ -2523,23 +2673,32 @@ mod tests {
     }
 
     #[test]
-    fn external_assistant_artifact_identity_is_relocation_independent_and_content_exact() {
+    fn external_assistant_cold_identity_is_lazy_and_prepared_identity_is_content_exact() {
         let first = safetensors_artifact(GEMMA_ASSISTANT, gemma_tensors());
         let relocated = safetensors_artifact(GEMMA_ASSISTANT, gemma_tensors());
-        let checkpoint = |path: &std::path::Path| {
+        let inspected = |path: &std::path::Path| {
             let preparation = prepare_external_assistant(path).unwrap();
             let mut materialized = select_direct_for_test(preparation)
-                .visit(InspectPreparation)
+                .visit_for_test(InspectPreparation)
                 .unwrap();
-            materialized.visit(TakeInspection).checkpoint
+            materialized.visit(TakeInspection)
         };
-        let first_checkpoint = checkpoint(first.path());
-        let relocated_checkpoint = checkpoint(relocated.path());
+        let first_inspected = inspected(first.path());
+        let relocated_inspected = inspected(relocated.path());
+        assert_eq!(
+            first_inspected.artifact_identity,
+            relocated_inspected.artifact_identity
+        );
         let profile = identity("gemma4-assistant-profile");
-        let first_identity = first_checkpoint.speculative_identities(&profile).unwrap().0;
+        let first_identity = first_inspected
+            .checkpoint
+            .speculative_identities(&profile)
+            .unwrap()
+            .0;
         assert_eq!(
             first_identity,
-            relocated_checkpoint
+            relocated_inspected
+                .checkpoint
                 .speculative_identities(&profile)
                 .unwrap()
                 .0
@@ -2549,9 +2708,12 @@ mod tests {
         let mut bytes = std::fs::read(&path).unwrap();
         *bytes.last_mut().unwrap() ^= 0x01;
         std::fs::write(path, bytes).unwrap();
-        assert_ne!(
+        let mutated = inspected(relocated.path());
+        assert_ne!(first_inspected.artifact_identity, mutated.artifact_identity);
+        assert_eq!(
             first_identity,
-            relocated_checkpoint
+            mutated
+                .checkpoint
                 .speculative_identities(&profile)
                 .unwrap()
                 .0
@@ -2559,21 +2721,24 @@ mod tests {
     }
 
     #[test]
-    fn muse_assistant_visits_the_same_typed_family_blind_materializer() {
+    fn muse_assistant_uses_the_same_typed_cold_selection() {
         let (preparation, _artifact) = prepared_muse_without_payload_open();
         assert_eq!(
             preparation.tokenizer_model_kind(),
             crate::configuration::ModelKind::MuseGlimmer
         );
-        let mut materialized = select_direct_for_test(preparation)
-            .visit(InspectPreparation)
-            .unwrap();
-        let inspected = materialized.visit(TakeInspection);
+        let selected = select_direct_for_test(preparation);
+        let DispatchedSelectedExternalAssistant::MuseGlimmer(prepared) = selected.dispatched else {
+            panic!("Muse assistant selected a different typed family")
+        };
         assert_eq!(
-            inspected.tokenizer_model_kind,
+            MuseGlimmerAssistantArchitecture::tokenizer_model_kind(),
             crate::configuration::ModelKind::MuseGlimmer
         );
-        assert_eq!(inspected.model_type, "muse_glimmer_assistant");
+        assert_eq!(
+            MuseGlimmerAssistantArchitecture::configuration_model_type(prepared.config()),
+            "muse_glimmer_assistant"
+        );
     }
 
     #[test]
@@ -2744,12 +2909,7 @@ mod tests {
         let payload_opens = Arc::new(AtomicUsize::new(0));
 
         match compatible.speculative_contract(request) {
-            Ok(_) => {
-                compatible
-                    .visit(CountPayloadOpens(payload_opens.clone()))
-                    .unwrap();
-                panic!("partitioned external target unexpectedly produced a contract")
-            }
+            Ok(_) => panic!("partitioned external target unexpectedly produced a contract"),
             Err(error) => assert!(
                 error
                     .to_string()
@@ -2841,12 +3001,7 @@ mod tests {
         );
         let payload_opens = Arc::new(AtomicUsize::new(0));
         match select_direct_for_test(preparation).prove_target_compatibility(&target) {
-            Ok(compatible) => {
-                compatible
-                    .visit(CountPayloadOpens(payload_opens.clone()))
-                    .unwrap();
-                panic!("mismatched external assistant unexpectedly passed compatibility")
-            }
+            Ok(_) => panic!("mismatched external assistant unexpectedly passed compatibility"),
             Err(error) => assert!(error.contains("family does not match")),
         }
         assert_eq!(payload_opens.load(Ordering::SeqCst), 0);

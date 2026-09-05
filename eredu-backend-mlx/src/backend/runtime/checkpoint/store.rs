@@ -8,10 +8,7 @@
 
 use eredu_checkpoint::store::{StoreError, TensorMetadata, TensorSelection};
 use eredu_checkpoint::{
-    gguf_store::{
-        GgufLease as NeutralGgufLease, GgufWeightStore as NeutralGgufWeightStore,
-        GgufWeightStoreBuilder as NeutralGgufWeightStoreBuilder,
-    },
+    gguf_store::GgufLease as NeutralGgufLease,
     store::{
         CheckpointLease, EncodedTensorLease, MemoryLease as NeutralMemoryLease,
         SafetensorsLease as NeutralSafetensorsLease,
@@ -28,10 +25,14 @@ use std::{
 use safemlx::{ops::indexing::TryIndexOp, transforms::async_eval_with_event, Array, Event, Stream};
 use safetensors::tensor::{Dtype, TensorView};
 
-use super::gguf::{GgufCheckpoint, GgufTensor};
+use super::gguf::GgufTensor;
 
 #[cfg(test)]
-use eredu_checkpoint::gguf_store::GgufPhysicalSelection;
+use super::gguf::GgufCheckpoint;
+#[cfg(test)]
+use eredu_checkpoint::gguf_store::{
+    GgufPhysicalSelection, GgufWeightStore as NeutralGgufWeightStore,
+};
 #[cfg(test)]
 use eredu_checkpoint::store::{
     CheckpointSource, ReadPolicy as WeightReadPolicy, SafetensorsWeightStore, TensorReadRequest,
@@ -186,20 +187,6 @@ impl MlxParameterMaterializationContext {
     }
 }
 
-/// Opens a backend-neutral GGUF source from the MLX checkpoint handle used by
-/// high-level model composition.
-pub fn open_gguf_checkpoint_source(
-    checkpoint: GgufCheckpoint,
-    plan: &eredu_checkpoint::schema::GgufCheckpointPlan,
-    tensor_mapping: &[eredu_gguf::TranslatedTensorLayout],
-    max_cached_readers: usize,
-) -> Result<NeutralGgufWeightStore, StoreError> {
-    NeutralGgufWeightStoreBuilder::default()
-        .max_cached_readers(max_cached_readers)?
-        .add_checkpoint(checkpoint.catalog().clone(), plan, tensor_mapping)?
-        .build()
-}
-
 #[cfg(test)]
 fn gguf_test_plan(
     checkpoint: &eredu_gguf::Checkpoint,
@@ -257,11 +244,13 @@ where
             key: String::new(),
             message: error.to_string(),
         })?;
-    NeutralGgufWeightStoreBuilder::default()
-        .add_checkpoint(checkpoint.catalog().clone(), &plan, &tensor_mapping)
-        .map_err(CheckpointMaterializationError::from)?
-        .build()
-        .map_err(CheckpointMaterializationError::from)
+    eredu_checkpoint::gguf_store::open_prepared_gguf_source(
+        checkpoint.catalog().clone(),
+        &plan,
+        &tensor_mapping,
+        eredu_checkpoint::store::DEFAULT_MAX_CACHED_SHARDS,
+    )
+    .map_err(CheckpointMaterializationError::from)
 }
 
 fn selected_byte_len(

@@ -4,7 +4,9 @@
 orchestration for Eredu. It coordinates opaque backend-owned values through
 portable contracts for parameter binding, mutable state, cache and weight
 residency, transfers, collectives, generation, speculative decoding, and
-realtime execution.
+realtime execution. `NormalizedLoadRequest` is the singular portable cold-load
+policy: topology, wire, invocation bounds, completion, residency, session, and
+drafting intent are validated before any backend resource is selected.
 
 It owns the canonical declarative parameter-binding and logical placement
 plans, communication-manifest validation, and reusable replicated-session

@@ -55,17 +55,18 @@ fn selected_load_policy_is_facade_owned_and_portable() {
     let plan = ExecutionPlan::fully_resident(DevicePlan::new("mlx", "cpu:0").unwrap());
     let planned =
         LocalInspectionOptions::for_execution_plan(&LocalBackendFactory::default(), &plan).unwrap();
-    assert_eq!(planned.load(), LocalLoadOptions::default());
+    assert_eq!(
+        planned.load().drafting(),
+        eredu_runtime::DraftingLoadRequest::Disabled
+    );
 }
 
 #[test]
-fn selected_inspection_wraps_backend_errors() {
+fn selected_inspection_is_total_for_missing_artifacts() {
     let result: Result<eredu_core::ModelInspectionReport, LocalBackendError> = inspect_local_model(
         "/path/that/does/not/exist/eredu-selected-backend-api",
         LocalInspectionOptions::default(),
     );
-    let error = result.unwrap_err();
-
-    assert_eq!(error.operation(), "model inspection");
-    assert!(error.message().contains("does not exist"));
+    let report = result.unwrap();
+    assert_eq!(report.container, eredu_core::InspectionReadiness::Missing);
 }

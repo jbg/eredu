@@ -33,12 +33,15 @@ pub use parallel::{
 };
 pub use realtime::{
     execute_detached_partitioned_moshi_realtime, execute_detached_replicated_moshi_realtime,
-    execute_replicated_moshi_realtime, inspect_moshi_realtime, realtime_decision_execution,
-    realtime_generation_samplers, realtime_ingress_contract, select_inspected_moshi_realtime,
-    select_moshi_realtime, visit_selected_moshi_realtime_architecture, InspectedMoshiRealtime,
+    execute_replicated_moshi_realtime, inspect_moshi_realtime,
+    moshi_realtime_request_from_normalized, prepare_selected_moshi_realtime_source,
+    realtime_decision_execution, realtime_generation_samplers, realtime_ingress_contract,
+    select_inspected_moshi_realtime, select_moshi_realtime, selected_moshi_lowering_summary,
+    visit_selected_moshi_realtime_architecture, InspectedMoshiRealtime,
     MoshiPreparedRealtimeFrameExecutor, MoshiRealtimeArchitectureVisitor,
     MoshiRealtimeDispatchError, MoshiRealtimeExecution, MoshiRealtimeExecutionArchitecture,
     MoshiRealtimeExecutionDescriptor, MoshiRealtimeExecutionError, MoshiRealtimeRequest,
-    MoshiRealtimeSamplingError, MoshiRealtimeSelectionError, PreparedMoshiRealtime,
-    PreparedMoshiRealtimeArchitecture,
+    MoshiRealtimeSamplingError, MoshiRealtimeSelectionError, MoshiRealtimeSourceError,
+    MoshiWeightLoweringSummary, PreparedMoshiRealtime, PreparedMoshiRealtimeArchitecture,
+    PreparedMoshiRealtimeSource,
 };

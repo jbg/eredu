@@ -8,9 +8,7 @@ pub use eredu_checkpoint::artifact::ArtifactFile;
 use eredu_checkpoint::{
     artifact::{fingerprint_artifact_files, ArtifactFingerprintError, ArtifactMemberFingerprint},
     safetensors::SafetensorsShards,
-    store::{
-        PreparedCheckpointSource, ResolvedCheckpointSource, SharedCheckpointSource, TensorMetadata,
-    },
+    store::{SharedCheckpointSource, TensorMetadata},
     StoredDtype,
 };
 use eredu_gguf::{Checkpoint as GgufCheckpoint, GgmlType, MetadataValue};
@@ -36,6 +34,31 @@ impl ArtifactIdentity {
     /// Returns the raw SHA-256 digest.
     pub const fn digest(self) -> [u8; 32] {
         self.0
+    }
+}
+
+/// Opaque identity of one header-inspection admission instance.
+///
+/// Cloning or architecture-projecting an inspection preserves this token. Independently
+/// inspecting even identical bytes creates a different token, allowing later cold-selection
+/// handoffs to reject accidental cross-plan substitution without reading payload content.
+#[derive(Clone)]
+pub struct ArtifactAdmissionToken(Arc<()>);
+
+impl ArtifactAdmissionToken {
+    fn new() -> Self {
+        Self(Arc::new(()))
+    }
+
+    /// Returns whether two values originated from the same admitted inspection instance.
+    pub fn same_admission(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl std::fmt::Debug for ArtifactAdmissionToken {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ArtifactAdmissionToken(..)")
     }
 }
 
@@ -459,6 +482,7 @@ pub fn gguf_u32_metadata_values(
 /// Header-only artifact inspection result.
 #[derive(Debug, Clone)]
 pub struct ArtifactInspection<P = ()> {
+    admission_token: ArtifactAdmissionToken,
     path: PathBuf,
     format: ArtifactFormat,
     configuration: ModelConfiguration,
@@ -527,6 +551,10 @@ impl ValidatedGguf {
 }
 
 impl<P> ArtifactInspection<P> {
+    /// Opaque origin retained across clones and architecture-plan projections.
+    pub fn admission_token(&self) -> ArtifactAdmissionToken {
+        self.admission_token.clone()
+    }
     /// Submitted artifact path.
     pub fn path(&self) -> &Path {
         &self.path
@@ -570,6 +598,7 @@ impl<P> ArtifactInspection<P> {
     /// whose original checkpoint admission remains authoritative.
     pub fn map_architecture_plan<Q>(self, map: impl FnOnce(P) -> Q) -> ArtifactInspection<Q> {
         ArtifactInspection {
+            admission_token: self.admission_token,
             path: self.path,
             format: self.format,
             configuration: self.configuration,
@@ -704,6 +733,25 @@ pub struct ModelPreparationPlan<P = ()> {
 }
 
 impl<P> ModelPreparationPlan<P> {
+    /// Builds a plan directly from the exact admission retained by a neutral
+    /// inspection/selection outcome.
+    pub fn from_retained_admission(
+        inspection: ArtifactInspection<P>,
+        admission: crate::PreparationAdmission,
+    ) -> Result<Self, ArtifactError> {
+        if admission.request().format() != inspection.format() {
+            return Err(ArtifactError::InvalidArtifact(
+                "retained preparation admission has a different artifact format".into(),
+            ));
+        }
+        Ok(Self {
+            inspection,
+            policy: admission.request().policy(),
+            route: admission.route(),
+            admitted_session_capabilities: admission.session_capabilities(),
+        })
+    }
+
     /// Header-only inspection owned by the plan.
     pub fn inspection(&self) -> &ArtifactInspection<P> {
         &self.inspection
@@ -812,12 +860,13 @@ pub fn open_prepared_safetensors_artifact(
             ))
         })
         .collect::<Result<BTreeMap<_, _>, ArtifactError>>()?;
-    let prepared =
-        PreparedCheckpointSource::open_admitted_safetensors(shards, catalog, max_cached_shards)?;
-    Ok(Arc::new(ResolvedCheckpointSource::new(
-        Arc::new(prepared),
+    eredu_checkpoint::store::open_prepared_safetensors_source(
+        shards,
+        catalog,
         resolution,
-    )))
+        max_cached_shards,
+    )
+    .map_err(Into::into)
 }
 
 fn tensor_dtype_to_stored(dtype: &TensorDtype) -> StoredDtype {
@@ -952,6 +1001,7 @@ fn inspect_gguf<R: ModelConfigurationResolver>(
         resolved_plan,
     )?;
     Ok(ArtifactInspection {
+        admission_token: ArtifactAdmissionToken::new(),
         path: path.to_path_buf(),
         format: ArtifactFormat::Gguf,
         configuration,
@@ -1149,6 +1199,7 @@ fn inspect_safetensors<R: ModelConfigurationResolver>(
         resolved_plan,
     )?;
     Ok(ArtifactInspection {
+        admission_token: ArtifactAdmissionToken::new(),
         path: path.to_path_buf(),
         format: ArtifactFormat::SafeTensors,
         configuration,

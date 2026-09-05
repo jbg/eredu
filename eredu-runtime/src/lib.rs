@@ -31,6 +31,8 @@ pub mod input;
 pub mod inspection;
 /// Statically dispatched layered architecture lifecycle and resident policy.
 pub mod layered;
+/// Normalized portable policy for cold model preparation.
+pub mod load_request;
 /// Architecture-declared parallel parameter semantics and local layouts.
 pub mod parallel;
 /// Neutral checkpoint materialization and stable parameter binding.
@@ -173,6 +175,10 @@ pub use layered::{
     ParallelLayeredArchitecture, ParallelRoutedLayeredArchitecture, PartitionedLayeredArchitecture,
     ResidentRuntime, ResidentUnitWindow, ResidentUnitWindowError, RoutedLayeredArchitecture,
     StaticParameterVisitor, StaticParameterVisitorMut,
+};
+pub use load_request::{
+    DraftingLoadRequest, NormalizedLoadRequest, NormalizedLoadRequestError, ParallelLoadRequest,
+    ValidatedModelLoadRequest,
 };
 pub use parallel::{
     aligned_partition_units, expand_linear_format_parameter_groups, module_parameter_group,

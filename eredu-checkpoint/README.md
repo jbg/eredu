@@ -18,6 +18,11 @@ discovery. Architecture crates use these types to declare checkpoint intent;
 backend implementations decide how selected values are materialized and where
 they reside.
 
+Prepared SafeTensors/GGUF constructors and restricted source views preserve a
+single physical source cache while exposing exact architecture-selected roles.
+Restricted views fail closed for metadata, provenance, and lease requests to
+keys outside their explicit contract.
+
 `PreparedCheckpointSource` binds the exact admitted catalog, shard identities,
 provenance, selections, and bounded lease geometry to the source used for later
 payload reads. Preparation records each admitted file's identity and inspects

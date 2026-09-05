@@ -1,15 +1,14 @@
 #[cfg(test)]
 use eredu_checkpoint::{AffineQuantization, WeightQuantization};
 
-use std::{
-    collections::HashMap,
-    path::{Path, PathBuf},
-};
+#[cfg(test)]
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
-use eredu_gguf::MetadataValue as GgufMetadataValue;
 use safemlx::{Array, Stream};
 
 use crate::backend::error::Error;
+#[cfg(test)]
 use crate::backend::runtime::checkpoint::gguf::GgufCheckpoint;
 #[cfg(all(
     test,
@@ -39,15 +38,6 @@ use safetensors::SafeTensors;
     any(feature = "cuda", all(feature = "metal", target_os = "macos"))
 ))]
 use std::collections::HashSet;
-
-/// Copies decoded GGUF metadata into a name-addressable map.
-pub(crate) fn gguf_metadata(checkpoint: &GgufCheckpoint) -> HashMap<String, GgufMetadataValue> {
-    checkpoint
-        .metadata()
-        .iter()
-        .map(|(name, value)| (name.clone(), value.clone()))
-        .collect()
-}
 
 /// Lowers affine GGUF encodings under an admitted canonical tensor mapping.
 #[cfg(test)]

@@ -3,19 +3,20 @@
 use std::{num::NonZeroUsize, ops::Deref, sync::Arc};
 
 use eredu_architectures::moshi::{
-    inspect_moshi_realtime, select_inspected_moshi_realtime, MoshiRealtimeExecution,
-    MoshiRealtimeRequest, PreparedMoshiRealtime, RealtimePreparationPlan,
+    inspect_moshi_realtime, moshi_realtime_request_from_normalized,
+    prepare_selected_moshi_realtime_source, select_inspected_moshi_realtime,
+    MoshiRealtimeExecution, PreparedMoshiRealtimeSource, RealtimePreparationPlan,
 };
 use eredu_checkpoint::{LinearFormat, SourceTensorEncoding};
 use eredu_core::cache::{StateComponentPolicy, StateComponentRole};
 use eredu_core::{
     backend::Completion,
     realtime::{RealtimeDecisionDiagnostics, RealtimeInputFrame, RealtimeOutputFrame},
-    CompletionCancellationMode, ParallelRankTopology, ParallelTopology, SessionCapabilities,
+    CompletionCancellationMode, SessionCapabilities,
 };
 use eredu_runtime::{
     execute_realtime_frame, CommunicationCompletionCapabilities, CompletedRealtimeFrame,
-    ExecutionResidency, GenerationSampler, MaterializedRealtimeInput, PipelineActivationDtype,
+    ExecutionResidency, GenerationSampler, MaterializedRealtimeInput,
     PreparedRealtimeFrameExecutor, PrepublicationRealtimeFrame, RealtimeArchitectureRequirements,
     RealtimeCompletionCreationError, RealtimeFrameCompletionMechanism, RealtimeFrameHostObserver,
     RealtimeFrameTensorMechanisms, RealtimeHostTokenMaterializer, RealtimeMechanism,
@@ -93,14 +94,14 @@ impl MlxRealtimeExecutionContext {
         preparation: RealtimePreparationPlan,
         options: &MlxLoadRequest,
         collectives_supported: bool,
-    ) -> Result<PreparedMoshiRealtime, Error> {
+    ) -> Result<PreparedMoshiRealtimeSource, Error> {
         select_realtime_model(preparation, options, collectives_supported)
     }
 
     /// Materializes an already selected architecture through MLX mechanisms.
     pub fn materialize_realtime_execution(
         &self,
-        selected: PreparedMoshiRealtime,
+        selected: PreparedMoshiRealtimeSource,
         options: MlxLoadRequest,
     ) -> Result<MoshiRealtimeExecution<MlxRealtimeExecution>, Error> {
         validate_realtime_session_requirements(&options)?;
@@ -148,19 +149,19 @@ const fn realtime_session_capabilities() -> eredu_core::SessionCapabilities {
 
 fn validate_realtime_session_requirements(options: &MlxLoadRequest) -> Result<(), Error> {
     options
-        .required_session_capabilities
+        .required_session_capabilities()
         .validate(&realtime_session_capabilities())?;
     Ok(())
 }
 
 fn materialize_realtime_model(
-    selected: PreparedMoshiRealtime,
+    selected: PreparedMoshiRealtimeSource,
     options: MlxLoadRequest,
     world: Option<Arc<Group>>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<MoshiRealtimeExecution<MlxRealtimeExecution>, Error> {
-    if !selected.selected().topology().is_replicated() {
+    if !selected.selected().selected().topology().is_replicated() {
         options
             .parallel_rank_context()?
             .ok_or_else(|| {
@@ -175,63 +176,20 @@ fn select_realtime_model(
     preparation: RealtimePreparationPlan,
     options: &MlxLoadRequest,
     collectives_supported: bool,
-) -> Result<PreparedMoshiRealtime, Error> {
+) -> Result<PreparedMoshiRealtimeSource, Error> {
     validate_realtime_session_requirements(options)?;
-    let request = mlx_realtime_request(options)?;
+    let request = moshi_realtime_request_from_normalized(
+        options.checked_normalized()?.0,
+        RealtimeObservationRequirements::new(true, []),
+    )
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let inspected = inspect_moshi_realtime(preparation, request)
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let capabilities = mlx_realtime_capabilities(inspected.requirements(), collectives_supported);
-    select_inspected_moshi_realtime(inspected, &capabilities)
+    let selected = select_inspected_moshi_realtime(inspected, &capabilities)
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    prepare_selected_moshi_realtime_source(selected)
         .map_err(|error| Error::ArchitectureModel(error.to_string()))
-}
-
-fn mlx_realtime_request(options: &MlxLoadRequest) -> Result<MoshiRealtimeRequest, Error> {
-    let rank = options.parallel_topology().unwrap_or_else(|| {
-        ParallelRankTopology::new(
-            ParallelTopology::new(1, 1, 1, 1).expect("replicated topology is valid"),
-            0,
-        )
-        .expect("rank zero belongs to replicated topology")
-    });
-    let (maximum_batch_size, maximum_sequence_length) = options
-        .partitioned_invocation_limits()?
-        .unwrap_or((i32::MAX, i32::MAX));
-    let maximum_batch_size = NonZeroUsize::new(
-        usize::try_from(maximum_batch_size)
-            .map_err(|_| Error::Parallel("negative realtime batch limit".into()))?,
-    )
-    .ok_or_else(|| Error::Parallel("realtime batch limit must be positive".into()))?;
-    let maximum_sequence_length = NonZeroUsize::new(
-        usize::try_from(maximum_sequence_length)
-            .map_err(|_| Error::Parallel("negative realtime sequence limit".into()))?,
-    )
-    .ok_or_else(|| Error::Parallel("realtime sequence limit must be positive".into()))?;
-    let activation_dtype = match (
-        rank.topology().is_replicated(),
-        options.pipeline_wire_contract(),
-    ) {
-        (false, None) => {
-            return Err(Error::Parallel(
-                "parallel Moshi wire contract is missing".into(),
-            ))
-        }
-        (_, Some(wire)) => wire.activation_dtype(),
-        (true, None) => PipelineActivationDtype::Float32,
-    };
-    Ok(MoshiRealtimeRequest::new(
-        options.quantization(),
-        options.weight_residency().layers(),
-        options.state_residency().clone(),
-        rank,
-        maximum_batch_size,
-        maximum_sequence_length,
-        activation_dtype,
-        options.realtime_completion_policy()?,
-        RealtimeObservationRequirements::new(true, []),
-    )
-    .with_independently_addressable_parameters(
-        options.weight_residency().parameter_bank_cache().is_some(),
-    ))
 }
 
 fn mlx_realtime_capabilities(

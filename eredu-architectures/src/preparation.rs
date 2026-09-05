@@ -412,6 +412,34 @@ pub fn prepared_gguf_floating_state_dtype_source(
     resolve_gguf_floating_state_dtype_source(architecture.checkpoint(), parameter, tensors)
 }
 
+/// Resolves the floating-state dtype source from one completely inspected artifact.
+///
+/// Container dispatch remains architecture-owned so concrete backends receive only the
+/// neutral dtype source selected from the exact admitted plan and tensor catalog.
+pub fn prepared_floating_state_dtype_source(
+    inspection: &eredu_core::ArtifactInspection<crate::processor_plan::ArtifactArchitecturePlan>,
+) -> Result<FloatingStateDtypeSource, PreparationCapabilityError> {
+    match inspection.format() {
+        eredu_core::ArtifactFormat::SafeTensors => {
+            let architecture = inspection
+                .architecture_plan()
+                .safetensors_architecture()
+                .ok_or_else(|| invalid("SafeTensors inspection omitted its architecture plan"))?;
+            prepared_safetensors_floating_state_dtype_source(architecture, inspection.tensors())
+        }
+        eredu_core::ArtifactFormat::Gguf => {
+            let architecture = inspection
+                .architecture_plan()
+                .gguf_plan()
+                .ok_or_else(|| invalid("GGUF inspection omitted its architecture plan"))?;
+            prepared_gguf_floating_state_dtype_source(architecture, inspection.tensors())
+        }
+        _ => Err(invalid(
+            "unsupported artifact format for floating-state dtype inspection",
+        )),
+    }
+}
+
 /// Derives preparation capabilities from the exact SafeTensors plan retained at admission.
 pub fn prepared_safetensors_capabilities(
     architecture: &crate::configuration::SafetensorsArchitecturePlan,

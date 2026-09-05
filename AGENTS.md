@@ -25,16 +25,26 @@ eredu-core / eredu-checkpoint / eredu-nn / eredu-media
   Target-specific operating system support for portable facilities is allowed.
 - `eredu-architectures` owns model-family configuration, checkpoint schemas,
   parameter topology, module construction, state geometry, parallel semantic
-  plans, processor request policy, and embedding/layer/output execution. It may
-  use neutral backend traits, but must not import `safemlx`, `eredu::backend`,
-  or another concrete backend.
+  plans, processor request policy, cold execution-class selection, prepared
+  source roles, architecture-aware inspection, and embedding/layer/output
+  execution. It may use neutral backend traits, but must not import `safemlx`,
+  `eredu::backend`, or another concrete backend.
+- `eredu-runtime` owns normalized portable load policy and model-independent
+  mechanism selection. `eredu-checkpoint` owns exact prepared source stores,
+  restricted views, cache policy, leases, provenance, and resolution guards.
+  Cold selection and inspection consume backend capability facts but never a
+  native device, stream, tensor, group, or completion object.
 - `eredu-backend-mlx` owns reusable MLX tensors, operators,
   streams, completion objects, materialization, cache storage, transfers, and
   collectives. It also owns MLX family composition, which may bind
   architecture-declared parameters and assemble sessions or distributed
-  executables. Reusable backend modules must not own model-family
-  configuration, checkpoint naming policy, layer equations, or family-specific
-  state geometry. The crate must not depend on the `eredu` facade.
+  executables. Its cold adapters translate public options once, report exact
+  side-effect-free capability facts, bind native rank/device resources, and
+  consume the retained neutral selection and prepared sources without
+  reopening artifacts or reconstructing semantic branches. Reusable backend
+  modules must not own model-family configuration, checkpoint naming policy,
+  layer equations, family-specific state geometry, portable inspection state,
+  or source-format dispatch. The crate must not depend on the `eredu` facade.
 - `eredu/src/api` and `eredu/src/runtime` own backend-independent facade
   orchestration. Production backend code must not import them. A backend's
   public adapter may depend on narrow composition-owned executable or session

@@ -23,13 +23,13 @@ use eredu_checkpoint::{
 };
 use eredu_core::{
     scheduler::{SemanticStateTransaction, TransitionOutput},
-    Completion, CompletionCancellationMode, ParallelRankTopology, ParallelTopology,
+    Completion, CompletionCancellationMode,
 };
 use eredu_runtime::{
     CacheResidencyPolicy, CommunicationCompletionCapabilities, CommunicationCompletionPolicy,
-    ExecutionResidency, LayerWeightResidency, PipelineActivationDtype, RealtimeMechanism,
-    RealtimeMechanismCapabilities, RealtimeObservationRequirements, StateComponentMechanism,
-    StateComponentPlacement, StateMechanismCapabilities, WeightLoweringCapability,
+    ExecutionResidency, RealtimeMechanism, RealtimeMechanismCapabilities,
+    RealtimeObservationRequirements, StateComponentMechanism, StateComponentPlacement,
+    StateMechanismCapabilities, WeightLoweringCapability,
 };
 
 struct HeaderCatalog(BTreeMap<String, TensorMetadata>);
@@ -113,21 +113,19 @@ fn config() -> MoshiConfig {
 }
 
 fn request() -> MoshiRealtimeRequest {
-    MoshiRealtimeRequest::new(
-        None,
-        LayerWeightResidency::FullyResident,
-        CacheResidencyPolicy::Device,
-        ParallelRankTopology::new(ParallelTopology::new(1, 1, 1, 1).unwrap(), 0).unwrap(),
-        NonZeroUsize::new(1).unwrap(),
-        NonZeroUsize::new(4).unwrap(),
-        PipelineActivationDtype::Float32,
-        CommunicationCompletionPolicy::new(
-            Duration::from_secs(1),
-            CompletionCancellationMode::QuarantineUntilComplete,
-        )
-        .unwrap(),
+    let completion = CommunicationCompletionPolicy::new(
+        Duration::from_secs(1),
+        CompletionCancellationMode::QuarantineUntilComplete,
+    )
+    .unwrap();
+    let normalized = eredu_runtime::NormalizedLoadRequest::default()
+        .with_state_residency(CacheResidencyPolicy::Device)
+        .with_communication_completion_policy(completion);
+    moshi::moshi_realtime_request_from_normalized(
+        &normalized,
         RealtimeObservationRequirements::new(true, []),
     )
+    .unwrap()
 }
 
 fn capabilities(

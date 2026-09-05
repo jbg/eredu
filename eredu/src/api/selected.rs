@@ -738,96 +738,77 @@ fn map_multimodal_error(
 /// Distributed native device bindings are intentionally absent. Application
 /// clients select portable placement and topology through an
 /// [`crate::ExecutionPlan`].
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
 pub struct LocalLoadOptions {
-    quantization: Option<crate::QuantizationRequest>,
-    weight_residency: eredu_runtime::WeightResidency,
-    required_session_capabilities: crate::SessionCapabilities,
+    normalized: eredu_runtime::NormalizedLoadRequest,
 }
 
 impl LocalLoadOptions {
     /// Creates load options that quantize eligible dense weights on load.
     pub fn with_quantization(quantization: crate::QuantizationRequest) -> Self {
         Self {
-            quantization: Some(quantization),
-            ..Self::default()
+            normalized: eredu_runtime::NormalizedLoadRequest::with_quantization(quantization),
         }
     }
 
     /// Selects fully resident or bounded layer execution for checkpoint weights.
-    pub const fn with_weight_residency(
-        mut self,
-        residency: eredu_runtime::WeightResidency,
-    ) -> Self {
-        self.weight_residency = residency;
+    pub fn with_weight_residency(mut self, residency: eredu_runtime::WeightResidency) -> Self {
+        self.normalized = self.normalized.with_weight_residency(residency);
         self
     }
 
     /// Requires capabilities from the exact inspected and realized session.
-    pub const fn with_required_session_capabilities(
+    pub fn with_required_session_capabilities(
         mut self,
         capabilities: crate::SessionCapabilities,
     ) -> Self {
-        self.required_session_capabilities = capabilities;
+        self.normalized = self
+            .normalized
+            .with_required_session_capabilities(capabilities);
         self
     }
 
     /// Requested dense-weight transformation, if any.
     pub const fn quantization(&self) -> Option<crate::QuantizationRequest> {
-        self.quantization
+        self.normalized.quantization()
     }
 
     /// Selected immutable-weight residency policy.
     pub const fn weight_residency(&self) -> eredu_runtime::WeightResidency {
-        self.weight_residency
+        self.normalized.weight_residency()
     }
 
     /// Capabilities required from the realized session.
     pub const fn required_session_capabilities(&self) -> crate::SessionCapabilities {
-        self.required_session_capabilities
+        self.normalized.required_session_capabilities()
+    }
+
+    /// Portable drafting policy retained from explicit or planned loading.
+    pub const fn drafting(&self) -> eredu_runtime::DraftingLoadRequest {
+        self.normalized.drafting()
     }
 
     fn into_backend(self) -> eredu_backend_mlx::MlxLoadRequest {
-        let options = match self.quantization {
-            Some(quantization) => {
-                eredu_backend_mlx::MlxLoadRequest::with_quantization(quantization)
-            }
-            None => eredu_backend_mlx::MlxLoadRequest::default(),
-        };
-        options
-            .with_weight_residency(self.weight_residency)
-            .with_required_session_capabilities(self.required_session_capabilities)
+        eredu_backend_mlx::MlxLoadRequest::from_normalized(self.normalized)
     }
 
     fn from_backend(
         options: eredu_backend_mlx::MlxLoadRequest,
     ) -> Result<Self, crate::AutomaticPlanningError> {
-        if options.has_parallel_execution() {
+        if options.normalized().has_parallel_execution() {
             return Err(crate::AutomaticPlanningError::Invalid(
                 "selected-local inspection options cannot contain a native parallel context; use a portable execution plan"
                     .into(),
             ));
         }
         Ok(Self {
-            quantization: options.quantization(),
-            weight_residency: options.weight_residency(),
-            required_session_capabilities: options.required_session_capabilities(),
+            normalized: options.normalized().clone(),
         })
     }
 }
 
-impl Default for LocalLoadOptions {
-    fn default() -> Self {
-        Self {
-            quantization: None,
-            weight_residency: eredu_runtime::WeightResidency::fully_resident(),
-            required_session_capabilities: crate::SessionCapabilities::default(),
-        }
-    }
-}
-
 /// Facade-owned options for selected-local-backend model inspection.
-#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
 pub struct LocalInspectionOptions {
     /// The exact facade loading policy that admission should validate.
     load: LocalLoadOptions,
@@ -840,8 +821,8 @@ impl LocalInspectionOptions {
     }
 
     /// Returns the load request whose feasibility is being inspected.
-    pub const fn load(&self) -> LocalLoadOptions {
-        self.load
+    pub fn load(&self) -> LocalLoadOptions {
+        self.load.clone()
     }
 
     /// Derives inspection options from a portable execution plan.

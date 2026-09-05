@@ -2,11 +2,11 @@
 
 use std::{collections::BTreeMap, sync::Arc};
 
-use eredu_architectures::moshi::{self, MoshiConfig};
-use eredu_checkpoint::store::{
-    CheckpointSource, PreparedCheckpointSource, ResolvedCheckpointSource, SharedCheckpointSource,
-};
-use eredu_core::artifact::{fingerprint_filesystem_artifact, ArtifactFile, ArtifactIdentity};
+#[cfg(test)]
+use eredu_architectures::moshi::MoshiConfig;
+use eredu_architectures::moshi::{self};
+use eredu_checkpoint::store::{CheckpointSource, SharedCheckpointSource};
+use eredu_core::artifact::ArtifactIdentity;
 use eredu_nn::Parameterized;
 use eredu_runtime::{
     construct_realtime_model, ConstructedRealtimeExecution, DenseDiskStreamReport,
@@ -687,59 +687,34 @@ impl moshi::MoshiRealtimeArchitectureVisitor<MlxNeuralBackend, MlxKeyValueState>
 /// Constructs one already selected model through neutral construction and its
 /// architecture-selected replicated or pure-TP executor.
 pub fn materialize_selected(
-    prepared: moshi::PreparedMoshiRealtime,
+    prepared: moshi::PreparedMoshiRealtimeSource,
     world: Option<Arc<crate::backend::runtime::distributed::Group>>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<moshi::MoshiRealtimeExecution<MlxRealtimeExecution>, Error> {
-    let execution_descriptor = prepared.execution_descriptor();
-    let checkpoint_plan = prepared.checkpoint_plan().clone();
-    let admitted_resolution = prepared.resolved_checkpoint_plan().clone();
-    let admitted_shards = prepared.admitted_shards().cloned().ok_or_else(|| {
-        Error::ArchitectureModel(
-            "selected Moshi path artifact omitted its admitted SafeTensors shard set".into(),
-        )
-    })?;
-    let source_metadata = prepared.source_metadata().clone();
-    let source_config = prepared.source_config().clone();
-    let target_config = prepared.execution_config().clone();
-    let selected = prepared.selected().clone();
-    let (transform, target_quantization) = selected_quantization(&selected)?;
+    let execution_descriptor = prepared.selected().execution_descriptor();
+    let target_config = prepared.selected().execution_config().clone();
+    let selected = prepared.selected().selected().clone();
     let effective_model_type = target_config.effective_model_type().as_str().to_owned();
-    let artifact_identity = artifact_identity(&admitted_shards, &source_config)?;
-    let source_store = PreparedCheckpointSource::open_admitted_safetensors(
-        admitted_shards,
-        source_metadata,
-        selected.residency().max_cached_shards(),
-    )?;
-    let checkpoint_contract = eredu_checkpoint::validation::resolve_safetensors_plan(
-        &source_store as &dyn CheckpointSource,
-        &checkpoint_plan,
-    )
-    .map_err(|validation| {
-        Error::ArchitectureModel(format!(
-            "selected Moshi checkpoint contract no longer resolves: {validation:?}"
-        ))
-    })?;
-    if checkpoint_contract != admitted_resolution {
-        return Err(Error::ArchitectureModel(
-            "selected Moshi checkpoint resolution changed after preparation".into(),
-        ));
-    }
-    let store: SharedCheckpointSource = Arc::new(ResolvedCheckpointSource::new(
-        Arc::new(source_store),
-        checkpoint_contract,
-    ));
-    let distributed = prepared
+    let parallel_manifest = prepared
+        .selected()
         .parallel()
-        .map(|parallel| {
+        .map(|parallel| parallel.communication().clone());
+    let artifact_identity = prepared.artifact_identity();
+    let lowering = prepared.lowering();
+    let store = Arc::clone(prepared.source());
+    let transform = lowering.transform();
+    let target_quantization = lowering.target();
+    let distributed = parallel_manifest
+        .as_ref()
+        .map(|communication| {
             let world = world.as_deref().ok_or_else(|| {
                 Error::Parallel(
                     "selected Moshi tensor parallelism requires a native world group".into(),
                 )
             })?;
             crate::backend::MlxDistributedSession::from_manifest(
-                parallel.communication(),
+                communication,
                 world.native_group(),
                 stream,
             )
@@ -754,7 +729,6 @@ pub fn materialize_selected(
     let execution =
         moshi::visit_selected_moshi_realtime_architecture::<MlxNeuralBackend, MlxKeyValueState, _>(
             prepared,
-            store,
             stream,
             SelectedMoshiRealtimeMechanismVisitor {
                 artifact_identity,
@@ -770,76 +744,6 @@ pub fn materialize_selected(
         )
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     Ok(execution_descriptor.bind(execution))
-}
-
-fn selected_quantization(
-    selected: &SelectedRealtimeRealization,
-) -> Result<
-    (
-        Option<eredu_checkpoint::WeightQuantization>,
-        Option<eredu_checkpoint::WeightQuantization>,
-    ),
-    Error,
-> {
-    if selected.weight_lowerings().is_empty() {
-        return Err(Error::ArchitectureModel(
-            "selected realtime execution has no weight lowerings".into(),
-        ));
-    }
-    let mut target = None;
-    for quantization in selected
-        .weight_lowerings()
-        .iter()
-        .filter_map(|lowering| lowering.descriptor().executable().weight_quantization())
-    {
-        if target.is_some_and(|selected| selected != quantization) {
-            return Err(Error::ArchitectureModel(
-                "selected realtime execution mixes incompatible executable quantization formats"
-                    .into(),
-            ));
-        }
-        target = Some(quantization);
-    }
-
-    let mut transform = None;
-    for lowering in selected.weight_lowerings().iter().filter(|lowering| {
-        matches!(
-            lowering.kind(),
-            eredu_runtime::WeightLoweringKind::Transform
-                | eredu_runtime::WeightLoweringKind::DerivedTransform
-        )
-    }) {
-        let quantization = lowering
-            .descriptor()
-            .executable()
-            .weight_quantization()
-            .ok_or_else(|| {
-                Error::ArchitectureModel(
-                    "selected transforming realtime lowering has no executable quantization".into(),
-                )
-            })?;
-        if transform.is_some_and(|selected| selected != quantization) {
-            return Err(Error::ArchitectureModel(
-                "selected realtime transform lowerings disagree on quantization".into(),
-            ));
-        }
-        transform = Some(quantization);
-    }
-    Ok((transform, target))
-}
-
-fn artifact_identity(
-    shards: &eredu_checkpoint::safetensors::SafetensorsShards,
-    config: &MoshiConfig,
-) -> Result<ArtifactIdentity, Error> {
-    let files = shards
-        .logical_payload_paths()
-        .iter()
-        .map(|(logical, path)| ArtifactFile::new(logical, path));
-    Ok(fingerprint_filesystem_artifact(
-        config.effective_model_type().as_str(),
-        files,
-    )?)
 }
 
 #[cfg(test)]

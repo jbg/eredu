@@ -16,9 +16,8 @@ mod session;
 pub mod speculative;
 pub mod structural;
 
-pub use inspection::{inspect_model, MlxInspectionOptions};
+pub use inspection::{inspect_model, inspect_model_preparation, MlxInspectionOptions};
 pub use load_request::MlxLoadRequest;
-pub(crate) use loading::validate_gguf_quantization_source;
 pub use loading::{MlxModelConfig, MlxSelectedPreparation};
 pub(crate) use model::Executable;
 #[cfg(any(feature = "image", feature = "audio"))]

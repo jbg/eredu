@@ -3,7 +3,8 @@
 `eredu-architectures` provides Eredu's backend-neutral text, multimodal, and
 realtime model families. It owns model configuration, checkpoint schemas,
 parameter topology, state geometry, parallel semantic plans, and model
-execution equations.
+execution equations. It also owns the total cold selector, architecture-aware
+inspection state, and exact prepared-source roles consumed by backends.
 
 Architecture implementations are generic over the traits from `eredu-nn`.
 Concrete backends retain control of tensors, storage, graph construction,

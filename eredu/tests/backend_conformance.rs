@@ -487,40 +487,55 @@ impl ModelCapabilityBackend for MockBackend {
 
 impl ModelLoadingBackend for MockBackend {
     type LoadOptions = ();
-    type SelectedPreparation = ();
+    type SelectedPreparation = eredu_core::PreparationAdmission;
     type ConfigurationResolver = eredu_architectures::configuration::ModelConfigurations;
 
     fn configuration_resolver(&self) -> &Self::ConfigurationResolver {
         &eredu_architectures::configuration::MODEL_CONFIGURATIONS
     }
 
-    fn preparation_policy(
-        &self,
-        _: &Self::LoadOptions,
-    ) -> Result<eredu_core::PreparationPolicy, Self::Error> {
-        Ok(eredu_core::PreparationPolicy::default())
-    }
-
     fn select_preparation(
         &self,
-        _: &eredu_core::ArtifactInspection<
+        inspection: &eredu_core::ArtifactInspection<
             eredu_architectures::processor_plan::ArtifactArchitecturePlan,
         >,
         _: &Self::LoadOptions,
-        _: eredu_core::PreparationPolicy,
     ) -> Result<Self::SelectedPreparation, Self::Error> {
-        Ok(())
+        let request = eredu_core::PreparationAdmissionRequest::new(
+            eredu_core::LoadingProtocol::Model,
+            inspection.format(),
+            eredu_core::PreparationPolicy::default(),
+            eredu_core::ArchitecturePreparationCapabilities::new(
+                false,
+                true,
+                false,
+                false,
+                false,
+                eredu_core::InputModalities::TEXT,
+            ),
+        );
+        Ok(eredu_core::admit_preparation(
+            request,
+            eredu_core::PreparationMechanismCapabilities::new(true, true)
+                .with_residency(eredu_core::ResidencyRequest::FullyResident, true)
+                .with_input_modalities(eredu_core::InputModalities::TEXT)
+                .with_session(SessionCapabilities::new(true, true, false)),
+        )
+        .expect("mock preparation facts are coherent"))
     }
 
-    fn selected_session_capabilities(&self, _: &Self::SelectedPreparation) -> SessionCapabilities {
-        SessionCapabilities::new(true, true, false)
+    fn selected_preparation_admission(
+        &self,
+        selected: &Self::SelectedPreparation,
+    ) -> eredu_core::PreparationAdmission {
+        *selected
     }
 
     fn model_config(
         &self,
         selected: eredu_core::SelectedModelPreparation<Self>,
     ) -> Result<Self::ModelConfig, Self::Error> {
-        let (plan, ()) = selected.into_parts();
+        let (plan, _admission) = selected.into_parts();
         assert_eq!(plan.inspection().configuration().family(), "llama");
         Ok(())
     }
@@ -618,14 +633,15 @@ impl ExecutionPlanBackendFactory for MockBackend {
 
     fn select_target(
         &self,
-        _: &eredu_core::ArtifactInspection<
+        inspection: &eredu_core::ArtifactInspection<
             eredu_architectures::processor_plan::ArtifactArchitecturePlan,
         >,
         _: &ExecutionPlan,
     ) -> Result<ExecutionPlanTargetSelection<Self::Backend>, AutomaticPlanningError> {
         Ok(ExecutionPlanTargetSelection::new(
             eredu_core::PreparationPolicy::default(),
-            (),
+            self.select_preparation(inspection, &())
+                .expect("mock target selection is coherent"),
             SessionCapabilities::new(true, true, false),
         ))
     }

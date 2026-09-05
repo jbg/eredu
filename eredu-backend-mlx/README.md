@@ -8,6 +8,13 @@ and artifact plans remain in `eredu-codec`; MLX supplies the same generic
 parameter materialization mechanisms used by other neutral modules. This crate
 does not depend on the `eredu` facade crate.
 
+Cold preparation enters this crate as a normalized portable request, a total
+architecture-selected execution, and an exact prepared-source bundle. MLX
+reports side-effect-free capability facts and retains native rank/device,
+stream, cache, collective, lease-conversion, tensor, and erasure work; it does
+not reopen artifact formats or reconstruct portable selection and inspection
+policy.
+
 The crate's `MlxTensor` is a transparent, zero-copy wrapper around the native
 MLX array handle. The wrapper lets this crate implement `eredu_nn::Tensor`
 without placing accelerator code in `eredu-nn` and without violating Rust's
