@@ -5,6 +5,8 @@ use std::{cell::Cell, marker::PhantomData, rc::Rc, time::Duration};
 #[cfg(test)]
 use eredu_core::generation::SpeculativeRequestStatus;
 #[cfg(test)]
+use eredu_core::BoundedCompletion;
+#[cfg(test)]
 use eredu_core::{
     resolve_optimistic_branch, SpeculativeDraftBlock, SpeculativeExecutionTopology,
     SpeculativeOptimisticBranch, SpeculativeProposal,
@@ -152,14 +154,14 @@ fn plain_runtime<'a, S, F>(
 ) -> CommittedOutputRuntime<'a, S>
 where
     S: SpeculativeSampler<MlxSamplingBackend> + Clone,
-    F: FnMut(u32) -> Result<(), Exception> + 'a,
+    F: FnMut(&[u32]) -> Result<(), Exception> + 'a,
 {
     SpeculativeOutputRuntime::new(
         MlxSpeculativeSampling::new(sampler),
         GenerationSequence::new(config.max_tokens, config.eos_token_ids.iter().copied()),
         SpeculativeSemanticConstraint::plain(),
-        SpeculativeCallbackPublisher::tokens(move |token| {
-            on_token(token).map_err(|error| SpeculativeOutputError::publication(error.to_string()))
+        SpeculativeCallbackPublisher::tokens(move |tokens| {
+            on_token(tokens).map_err(|error| SpeculativeOutputError::publication(error.to_string()))
         }),
         GenerationCancellationToken::new(),
     )
@@ -242,6 +244,15 @@ where
         streams: SpeculativeExecutionStreams<'a>,
         options: SpeculativeSchedulerOptions,
     ) -> Result<Self, Exception> {
+        let wait = options
+            .completion_wait()
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        if !MlxSpeculativeCompletion::supports_cancellation(wait.cancellation()) {
+            return Err(Exception::custom(format!(
+                "MLX speculative completion does not support {:?}",
+                wait.cancellation()
+            )));
+        }
         let requests = SpeculativeRequestTable::new(options, streams.topology())
             .map_err(|error| Exception::custom(error.to_string()))?;
         let component_timing = component_timing_enabled() && backend.supports_telemetry();
@@ -266,7 +277,7 @@ where
         on_token: F,
     ) -> Result<SpeculativeRequestId, Exception>
     where
-        F: FnMut(u32) -> Result<(), Exception> + 'a,
+        F: FnMut(&[u32]) -> Result<(), Exception> + 'a,
     {
         let runtime = plain_runtime(sampler, &config, on_token);
         self.submit_runtime(cache, input, config, prng_key, runtime)
@@ -493,7 +504,7 @@ fn generate_tokens<'runtime, B, S, F>(
 where
     B: MlxSpeculativeRuntime<'runtime>,
     S: SpeculativeSampler<MlxSamplingBackend> + Clone + 'runtime,
-    F: FnMut(u32) -> Result<(), Exception> + 'runtime,
+    F: FnMut(&[u32]) -> Result<(), Exception> + 'runtime,
 {
     validate_input(input)?;
     let randomness = <MlxSpeculativeSampling<S> as SpeculativeSampling>::initialize_randomness(
@@ -1033,6 +1044,29 @@ mod tests {
             draft_storage: Vec::new(),
             draft_capacities: Vec::new(),
         }
+    }
+
+    #[test]
+    fn native_cancellation_is_rejected_before_speculative_submission() {
+        let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let mut backend = scripted_backend();
+        let options = SpeculativeSchedulerOptions::default()
+            .with_completion_wait(
+                Duration::from_millis(1),
+                eredu_core::CompletionCancellationMode::NativeCancel,
+            )
+            .unwrap();
+
+        let error = MlxSpeculativeScheduler::<_, UniformSampler>::new(
+            &mut backend,
+            SpeculativeExecutionStreams::single(context.stream()),
+            options,
+        )
+        .err()
+        .expect("MLX must reject unsupported native cancellation");
+
+        assert!(error.to_string().contains("does not support NativeCancel"));
+        assert!(backend.routes.is_empty());
     }
 
     #[test]
@@ -1673,8 +1707,8 @@ mod tests {
             &mut DefaultSampler,
             SpeculativeExecutionStreams::single(stream),
             SpeculativeSchedulerOptions::default(),
-            |token| {
-                emitted.push(token);
+            |tokens| {
+                emitted.extend_from_slice(tokens);
                 Ok(())
             },
         )
@@ -2332,8 +2366,8 @@ mod tests {
                         },
                         None,
                         CountingSampler::default(),
-                        |token| {
-                            callback_tokens.push(token);
+                        |tokens| {
+                            callback_tokens.extend_from_slice(tokens);
                             Ok(())
                         },
                     )
@@ -2793,8 +2827,8 @@ mod tests {
                     },
                     None,
                     DefaultSampler,
-                    |token| {
-                        callback_a.push(token);
+                    |tokens| {
+                        callback_a.extend_from_slice(tokens);
                         Ok(())
                     },
                 )
@@ -2811,8 +2845,8 @@ mod tests {
                     },
                     None,
                     DefaultSampler,
-                    |token| {
-                        callback_b.push(token);
+                    |tokens| {
+                        callback_b.extend_from_slice(tokens);
                         Ok(())
                     },
                 )

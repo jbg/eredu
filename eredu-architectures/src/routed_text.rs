@@ -108,7 +108,6 @@ pub struct PreparedRoutedTextArchitecture<A> {
     routes_per_token: usize,
     routes_by_unit: BTreeMap<usize, usize>,
     addressable_members: Vec<eredu_runtime::AddressableBankMember>,
-    addressable_quantization: Option<eredu_checkpoint::WeightQuantization>,
 }
 
 impl<A> PreparedRoutedTextArchitecture<A> {
@@ -154,11 +153,6 @@ impl<A> PreparedRoutedTextArchitecture<A> {
     /// Returns generic source bindings and selected byte geometry for storage.
     pub fn addressable_members(&self) -> &[eredu_runtime::AddressableBankMember] {
         &self.addressable_members
-    }
-
-    /// Returns the selected uniform load-time bank transform, when present.
-    pub const fn addressable_quantization(&self) -> Option<eredu_checkpoint::WeightQuantization> {
-        self.addressable_quantization
     }
 
     /// Consumes the checked handoff into text modules and routed composition values.
@@ -303,7 +297,6 @@ pub struct PreparedRelu2RoutedTextArchitecture<A> {
     catalog: ExpertResidencyCatalog,
     routes_per_token: usize,
     addressable_members: Vec<eredu_runtime::AddressableBankMember>,
-    addressable_quantization: Option<eredu_checkpoint::WeightQuantization>,
 }
 
 impl<A> PreparedRelu2RoutedTextArchitecture<A> {
@@ -335,11 +328,6 @@ impl<A> PreparedRelu2RoutedTextArchitecture<A> {
     /// Returns generic source bindings and selected byte geometry for storage.
     pub fn addressable_members(&self) -> &[eredu_runtime::AddressableBankMember] {
         &self.addressable_members
-    }
-
-    /// Returns the selected uniform load-time bank transform, when present.
-    pub const fn addressable_quantization(&self) -> Option<eredu_checkpoint::WeightQuantization> {
-        self.addressable_quantization
     }
 
     fn into_parts(
@@ -481,69 +469,21 @@ pub enum RoutedTextPreparationError {
     Invalid(String),
 }
 
-fn transformed_member_parameter_bytes(
-    metadata: &eredu_checkpoint::recipe::RecipeMetadata,
-    quantization: eredu_checkpoint::WeightQuantization,
-) -> Result<u64, String> {
-    let shape = metadata.shape();
-    if shape.len() < 2 {
-        return Err("addressable transform target is not a matrix".into());
-    }
-    let columns = *shape.last().expect("matrix shape is non-empty");
-    let rows = shape[..shape.len() - 1]
-        .iter()
-        .try_fold(1usize, |total, dimension| total.checked_mul(*dimension))
-        .ok_or_else(|| "addressable transform row geometry overflowed".to_owned())?;
-    let group = usize::try_from(quantization.group_size())
-        .map_err(|_| "addressable transform group size is negative".to_owned())?;
-    let bits = usize::try_from(quantization.bits())
-        .map_err(|_| "addressable transform bit width is negative".to_owned())?;
-    if group == 0 || !columns.is_multiple_of(group) || !columns.is_multiple_of(32) {
-        return Err(format!(
-            "addressable transform width {columns} is incompatible with group {group}"
-        ));
-    }
-    let packed = columns
-        .checked_mul(bits)
-        .and_then(|value| value.checked_div(8))
-        .ok_or_else(|| "addressable packed byte geometry overflowed".to_owned())?;
-    let affine_scalar_bytes = usize::try_from(
-        metadata
-            .dtype()
-            .bit_width()
-            .map_err(|error| error.to_string())?
-            / 8,
-    )
-    .map_err(|_| "addressable affine scalar width is not representable".to_owned())?;
-    let companion_width = if matches!(quantization, eredu_checkpoint::WeightQuantization::MxFp4) {
-        1
-    } else {
-        affine_scalar_bytes
-    };
-    let companions = columns
-        .checked_div(group)
-        .and_then(|count| count.checked_mul(companion_width))
-        .and_then(|scales| {
-            let biases = if quantization.has_biases() { scales } else { 0 };
-            biases.checked_add(scales)
-        })
-        .ok_or_else(|| "addressable companion byte geometry overflowed".to_owned())?;
-    u64::try_from(
-        rows.checked_mul(
-            packed
-                .checked_add(companions)
-                .ok_or_else(|| "addressable selected row byte geometry overflowed".to_owned())?,
-        )
-        .ok_or_else(|| "addressable selected byte geometry overflowed".to_owned())?,
-    )
-    .map_err(|_| "addressable selected byte geometry is not representable".to_owned())
-}
-
 fn selected_member_geometry(
     unit: &crate::ExpertResidencyUnit,
     selected: &eredu_runtime::SelectedReplicatedTextRealization,
-) -> Result<(u64, u64, Option<eredu_checkpoint::WeightQuantization>), String> {
-    let mut selected_quantization = None;
+) -> Result<(u64, u64), String> {
+    let selected_tasks = eredu_runtime::replicated_text_materialization_tasks(selected)
+        .map_err(|error| error.to_string())?;
+    let mut tasks = BTreeMap::new();
+    for task in selected_tasks {
+        for companion in task.output_companions() {
+            if let Some(exact) = companion.materialization_task() {
+                tasks.insert(companion.name().to_owned(), exact.clone());
+            }
+        }
+        tasks.insert(task.name().to_owned(), task);
+    }
     let mut source_bytes = 0u64;
     let mut selected_bytes = 0u64;
     for parameter in unit.parameters() {
@@ -556,39 +496,34 @@ fn selected_member_geometry(
         source_bytes = source_bytes
             .checked_add(metadata.byte_len())
             .ok_or_else(|| "addressable source byte geometry overflowed".to_owned())?;
-        let realization = selected
-            .parameters()
-            .iter()
-            .find(|candidate| candidate.name() == parameter.logical_target())
-            .ok_or_else(|| {
-                format!(
-                    "addressable target {:?} has no selected parameter realization",
-                    parameter.logical_target()
-                )
-            })?;
+        let task = tasks.get(parameter.logical_target()).ok_or_else(|| {
+            format!(
+                "addressable target {:?} has no selected parameter realization",
+                parameter.logical_target()
+            )
+        })?;
         let parameter_bytes = if matches!(
-            realization.lowering(),
+            task.lowering(),
             eredu_runtime::WeightLoweringKind::Transform
                 | eredu_runtime::WeightLoweringKind::DerivedTransform
         ) {
-            if !matches!(
-                parameter.role(),
-                crate::ExpertParameterRole::QuantizableProjection { .. }
-            ) {
+            if metadata.dtype() != &eredu_checkpoint::recipe::RecipeDtype::F4
+                && !matches!(
+                    parameter.role(),
+                    crate::ExpertParameterRole::QuantizableProjection { .. }
+                )
+            {
                 return Err(format!(
                     "addressable transform target {:?} is not a quantizable projection",
                     parameter.logical_target()
                 ));
             }
-            let quantization = realization
-                .executable()
-                .weight_quantization()
-                .ok_or_else(|| {
-                    format!(
-                        "addressable transform target {:?} has no packed realization",
-                        parameter.logical_target()
-                    )
-                })?;
+            let quantization = task.executable().weight_quantization().ok_or_else(|| {
+                format!(
+                    "addressable transform target {:?} has no packed realization",
+                    parameter.logical_target()
+                )
+            })?;
             if matches!(
                 quantization,
                 eredu_checkpoint::WeightQuantization::GgufIQuant { .. }
@@ -597,13 +532,8 @@ fn selected_member_geometry(
                     "load-time addressable transformation cannot select GGUF IQuant".into(),
                 );
             }
-            if selected_quantization
-                .replace(quantization)
-                .is_some_and(|prior| prior != quantization)
-            {
-                return Err("addressable bank selected heterogeneous load-time transforms".into());
-            }
-            transformed_member_parameter_bytes(metadata, quantization)?
+            eredu_runtime::selected_addressable_parameter_bytes(task, metadata)
+                .map_err(|error| error.to_string())?
         } else {
             metadata.byte_len()
         };
@@ -617,36 +547,77 @@ fn selected_member_geometry(
             unit.identity()
         ));
     }
-    Ok((source_bytes, selected_bytes, selected_quantization))
+    Ok((source_bytes, selected_bytes))
 }
 
 pub(crate) fn project_addressable_members(
     catalog: &ExpertResidencyCatalog,
     selected: &eredu_runtime::SelectedReplicatedTextRealization,
-) -> Result<
-    (
-        Vec<eredu_runtime::AddressableBankMember>,
-        Option<eredu_checkpoint::WeightQuantization>,
-    ),
-    RoutedTextPreparationError,
-> {
-    let mut selected_quantization = None;
-    let mut members = Vec::with_capacity(catalog.units().len());
-    for unit in catalog.units() {
-        let (_source_bytes, selected_bytes, member_quantization) =
-            selected_member_geometry(unit, selected)
-                .map_err(RoutedTextPreparationError::Invalid)?;
-        if let Some(quantization) = member_quantization {
-            if selected_quantization
-                .replace(quantization)
-                .is_some_and(|prior| prior != quantization)
+) -> Result<Vec<eredu_runtime::AddressableBankMember>, RoutedTextPreparationError> {
+    let tasks = eredu_runtime::replicated_text_materialization_tasks(selected)
+        .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
+    project_addressable_members_with_tasks(catalog, selected, &tasks)
+}
+
+pub(crate) fn project_addressable_members_with_tasks(
+    catalog: &ExpertResidencyCatalog,
+    selected: &eredu_runtime::SelectedReplicatedTextRealization,
+    tasks: &[eredu_runtime::ReplicatedTextMaterializationTask],
+) -> Result<Vec<eredu_runtime::AddressableBankMember>, RoutedTextPreparationError> {
+    let mut exact_tasks = BTreeMap::new();
+    for task in tasks {
+        if exact_tasks
+            .insert(task.name().to_owned(), task.clone())
+            .is_some()
+        {
+            return Err(RoutedTextPreparationError::Invalid(format!(
+                "addressable materialization repeats task {:?}",
+                task.name()
+            )));
+        }
+        // Partition projection folds encoded-linear companions into their
+        // primary task so the physical family stays atomic. A bank catalog,
+        // however, retains one binding and recipe per stored value. Re-index
+        // the exact standalone task retained by each companion under the
+        // architecture topology identity; do not reconstruct its lowering.
+        for companion in task.output_companions() {
+            let Some(exact) = companion.materialization_task() else {
+                continue;
+            };
+            if exact_tasks
+                .insert(companion.name().to_owned(), exact.clone())
+                .is_some()
             {
-                return Err(RoutedTextPreparationError::Invalid(
-                    "addressable bank selected heterogeneous load-time transforms".into(),
-                ));
+                return Err(RoutedTextPreparationError::Invalid(format!(
+                    "addressable materialization repeats output {:?}",
+                    companion.name()
+                )));
             }
         }
-        let mut bindings = Vec::with_capacity(unit.parameters().len());
+    }
+    let mut members = Vec::with_capacity(catalog.units().len());
+    for unit in catalog.units() {
+        if unit.distribution() != crate::ExpertResidencyDistribution::ExpertParallel {
+            continue;
+        }
+        let local_parameters = unit
+            .parameters()
+            .iter()
+            .filter(|parameter| exact_tasks.contains_key(parameter.logical_target()))
+            .count();
+        if local_parameters == 0 {
+            continue;
+        }
+        if local_parameters != unit.parameters().len() {
+            return Err(RoutedTextPreparationError::Invalid(format!(
+                "addressable member {:?} has only {local_parameters} of {} exact local tasks",
+                unit.identity(),
+                unit.parameters().len()
+            )));
+        }
+        let (source_bytes, _selected_bytes) = selected_member_geometry(unit, selected)
+            .map_err(RoutedTextPreparationError::Invalid)?;
+        let mut parameters = Vec::with_capacity(unit.parameters().len());
         for parameter in unit.parameters() {
             let metadata = parameter.metadata().ok_or_else(|| {
                 RoutedTextPreparationError::Invalid(format!(
@@ -654,30 +625,170 @@ pub(crate) fn project_addressable_members(
                     unit.identity()
                 ))
             })?;
-            let mut binding = eredu_runtime::WeightBinding::from_recipe(
-                parameter.binding_name(),
-                parameter.recipe().clone(),
-                metadata.byte_len(),
-            )
-            .and_then(|binding| binding.with_logical_target(parameter.logical_target()))
-            .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
-            if let crate::ExpertParameterRole::QuantizableProjection {
-                scales_binding,
-                biases_binding,
-            } = parameter.role()
-            {
-                binding = binding
-                    .with_quantization_companions(scales_binding, biases_binding)
-                    .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
+            let mut task = exact_tasks
+                .get(parameter.logical_target())
+                .cloned()
+                .ok_or_else(|| {
+                    RoutedTextPreparationError::Invalid(format!(
+                        "addressable target {:?} has no exact materialization task",
+                        parameter.logical_target()
+                    ))
+                })?;
+            let transforms = matches!(
+                task.lowering(),
+                eredu_runtime::WeightLoweringKind::Transform
+                    | eredu_runtime::WeightLoweringKind::DerivedTransform
+            );
+            let selected_bytes = if transforms {
+                eredu_runtime::selected_addressable_parameter_bytes(&task, metadata)
+                    .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?
+            } else {
+                metadata.byte_len()
+            };
+            let companions =
+                if transforms && metadata.dtype() != &eredu_checkpoint::recipe::RecipeDtype::F4 {
+                    match parameter.role() {
+                        crate::ExpertParameterRole::QuantizableProjection {
+                            scales_binding,
+                            biases_binding,
+                        } => {
+                            let quantization =
+                                task.executable().weight_quantization().ok_or_else(|| {
+                                    RoutedTextPreparationError::Invalid(format!(
+                                        "addressable transform target {:?} has no packed format",
+                                        task.name()
+                                    ))
+                                })?;
+                            Some(
+                                eredu_runtime::QuantizationCompanionBindings::new(
+                                    scales_binding,
+                                    quantization.has_biases().then(|| biases_binding.clone()),
+                                )
+                                .map_err(|error| {
+                                    RoutedTextPreparationError::Invalid(error.to_string())
+                                })?,
+                            )
+                        }
+                        crate::ExpertParameterRole::Preserved => None,
+                    }
+                } else {
+                    None
+                };
+            if task.output_companions().is_empty() {
+                if let Some(companions) = companions.as_ref() {
+                    let quantization =
+                        task.executable().weight_quantization().ok_or_else(|| {
+                            RoutedTextPreparationError::Invalid(format!(
+                                "addressable transform target {:?} has no packed format",
+                                task.name()
+                            ))
+                        })?;
+                    let prefix = parameter
+                        .logical_target()
+                        .strip_suffix(parameter.binding_name())
+                        .ok_or_else(|| {
+                            RoutedTextPreparationError::Invalid(format!(
+                                "addressable target {:?} does not end in its local binding {:?}",
+                                parameter.logical_target(),
+                                parameter.binding_name()
+                            ))
+                        })?;
+                    let mut shape = metadata.shape().to_vec();
+                    let columns = shape.last_mut().ok_or_else(|| {
+                        RoutedTextPreparationError::Invalid(
+                            "addressable transform companion has no group axis".into(),
+                        )
+                    })?;
+                    *columns = columns
+                        .checked_div(quantization.group_size() as usize)
+                        .ok_or_else(|| {
+                            RoutedTextPreparationError::Invalid(
+                                "addressable transform companion group geometry is invalid".into(),
+                            )
+                        })?;
+                    let owner = match task.owner() {
+                        eredu_runtime::ReplicatedTextParameterOwner::ExecutionUnit {
+                            group,
+                            unit,
+                        } => eredu_runtime::ParameterGroupOwner::execution_unit(
+                            eredu_runtime::ExecutionGroupId::new(group.clone()).map_err(
+                                |error| RoutedTextPreparationError::Invalid(error.to_string()),
+                            )?,
+                            *unit,
+                        ),
+                        eredu_runtime::ReplicatedTextParameterOwner::StaticRole(role) => {
+                            eredu_runtime::ParameterGroupOwner::StaticRole(role.clone())
+                        }
+                        _ => {
+                            return Err(RoutedTextPreparationError::Invalid(
+                                "addressable transform selected an unsupported owner".into(),
+                            ));
+                        }
+                    };
+                    let mut outputs = vec![eredu_runtime::ReplicatedTextOutputCompanion::new(
+                        format!("{prefix}{}", companions.scale()),
+                        eredu_nn::LinearCompanionRole::Scale,
+                        shape.clone(),
+                        owner.clone(),
+                    )
+                    .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?];
+                    if let Some(biases) = companions.affine_bias() {
+                        outputs.push(
+                            eredu_runtime::ReplicatedTextOutputCompanion::new(
+                                format!("{prefix}{biases}"),
+                                eredu_nn::LinearCompanionRole::AffineBias,
+                                shape,
+                                owner,
+                            )
+                            .map_err(|error| {
+                                RoutedTextPreparationError::Invalid(error.to_string())
+                            })?,
+                        );
+                    }
+                    task = task
+                        .with_output_companions(outputs)
+                        .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
+                }
             }
-            bindings.push(binding);
-        }
-        members.push(
-            eredu_runtime::AddressableBankMember::new(unit.identity(), bindings, selected_bytes)
+            parameters.push(
+                eredu_runtime::AddressableBankParameter::new(
+                    parameter.binding_name(),
+                    task,
+                    parameter.recipe().clone(),
+                    metadata.clone(),
+                    selected_bytes,
+                    companions,
+                )
                 .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?,
-        );
+            );
+        }
+        let distribution = match unit.distribution() {
+            crate::ExpertResidencyDistribution::Replicated => {
+                eredu_runtime::AddressableBankDistribution::Replicated
+            }
+            crate::ExpertResidencyDistribution::ExpertParallel => {
+                eredu_runtime::AddressableBankDistribution::ExpertParallel
+            }
+        };
+        let placement = eredu_runtime::AddressableBankMemberPlacement::new(
+            unit.owner_group().clone(),
+            unit.owner_unit(),
+            unit.unit_path(),
+            distribution,
+        )
+        .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
+        let member =
+            eredu_runtime::AddressableBankMember::new(unit.identity(), placement, parameters)
+                .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
+        if member.source_bytes() != source_bytes {
+            return Err(RoutedTextPreparationError::Invalid(format!(
+                "addressable member {:?} source bytes differ from its exact tasks",
+                unit.identity()
+            )));
+        }
+        members.push(member);
     }
-    Ok((members, selected_quantization))
+    Ok(members)
 }
 
 fn validate_selected_routed_handoff(
@@ -713,9 +824,13 @@ where
         eredu_runtime::ParameterBankResidency::IndependentCache(_)
     ) {
         catalog
-            .logical_targets()
-            .into_iter()
-            .map(str::to_owned)
+            .units()
+            .iter()
+            .filter(|unit| {
+                unit.distribution() == crate::ExpertResidencyDistribution::ExpertParallel
+            })
+            .flat_map(crate::ExpertResidencyUnit::parameters)
+            .map(|parameter| parameter.logical_target().to_owned())
             .collect()
     } else {
         std::collections::BTreeSet::new()
@@ -759,9 +874,8 @@ where
         },
         _ => return Err(RoutedTextPreparationError::Ineligible),
     };
-    let (text, bank_residency, owner_group, plan, catalog) = selected.into_parts();
-    let (addressable_members, addressable_quantization) =
-        project_addressable_members(&catalog, &text)?;
+    let (text, bank_residency, owner_group, plan, catalog, addressable_members) =
+        selected.into_parts();
     let RoutedGroupedPlan::Gated(plan) = plan else {
         return Err(RoutedTextPreparationError::Invalid(
             "selected grouped equation differs from the admitted architecture".into(),
@@ -803,7 +917,6 @@ where
         routes_per_token,
         routes_by_unit,
         addressable_members,
-        addressable_quantization,
     })
 }
 
@@ -844,9 +957,8 @@ where
         },
         _ => return Err(RoutedTextPreparationError::Ineligible),
     };
-    let (text, bank_residency, owner_group, plan, catalog) = selected.into_parts();
-    let (addressable_members, addressable_quantization) =
-        project_addressable_members(&catalog, &text)?;
+    let (text, bank_residency, owner_group, plan, catalog, addressable_members) =
+        selected.into_parts();
     let RoutedGroupedPlan::Gated(plan) = plan else {
         return Err(RoutedTextPreparationError::Invalid(
             "selected grouped equation differs from the admitted architecture".into(),
@@ -888,7 +1000,6 @@ where
         routes_per_token,
         routes_by_unit,
         addressable_members,
-        addressable_quantization,
     })
 }
 
@@ -932,9 +1043,8 @@ where
         },
         _ => return Err(RoutedTextPreparationError::Ineligible),
     };
-    let (text, bank_residency, owner_group, plan, catalog) = selected.into_parts();
-    let (addressable_members, addressable_quantization) =
-        project_addressable_members(&catalog, &text)?;
+    let (text, bank_residency, owner_group, plan, catalog, addressable_members) =
+        selected.into_parts();
     let RoutedGroupedPlan::Gated(plan) = plan else {
         return Err(RoutedTextPreparationError::Invalid(
             "selected grouped equation differs from the admitted architecture".into(),
@@ -976,7 +1086,6 @@ where
         routes_per_token,
         routes_by_unit,
         addressable_members,
-        addressable_quantization,
     })
 }
 
@@ -1028,9 +1137,8 @@ where
         },
         _ => return Err(RoutedTextPreparationError::Ineligible),
     };
-    let (text, bank_residency, owner_group, plan, catalog) = selected.into_parts();
-    let (addressable_members, addressable_quantization) =
-        project_addressable_members(&catalog, &text)?;
+    let (text, bank_residency, owner_group, plan, catalog, addressable_members) =
+        selected.into_parts();
     let RoutedGroupedPlan::Gated(plan) = plan else {
         return Err(RoutedTextPreparationError::Invalid(
             "selected grouped equation differs from the admitted architecture".into(),
@@ -1072,7 +1180,6 @@ where
         routes_per_token,
         routes_by_unit,
         addressable_members,
-        addressable_quantization,
     })
 }
 
@@ -1125,9 +1232,8 @@ where
         },
         _ => return Err(RoutedTextPreparationError::Ineligible),
     };
-    let (text, bank_residency, owner_group, plan, catalog) = selected.into_parts();
-    let (addressable_members, addressable_quantization) =
-        project_addressable_members(&catalog, &text)?;
+    let (text, bank_residency, owner_group, plan, catalog, addressable_members) =
+        selected.into_parts();
     let RoutedGroupedPlan::Gated(plan) = plan else {
         return Err(RoutedTextPreparationError::Invalid(
             "selected grouped equation differs from the admitted architecture".into(),
@@ -1169,7 +1275,6 @@ where
         routes_per_token,
         routes_by_unit,
         addressable_members,
-        addressable_quantization,
     })
 }
 
@@ -1217,9 +1322,8 @@ where
         },
         _ => return Err(RoutedTextPreparationError::Ineligible),
     };
-    let (text, bank_residency, owner_group, plan, catalog) = selected.into_parts();
-    let (addressable_members, addressable_quantization) =
-        project_addressable_members(&catalog, &text)?;
+    let (text, bank_residency, owner_group, plan, catalog, addressable_members) =
+        selected.into_parts();
     let RoutedGroupedPlan::Gated(plan) = plan else {
         return Err(RoutedTextPreparationError::Invalid(
             "selected grouped equation differs from the admitted architecture".into(),
@@ -1261,7 +1365,6 @@ where
         routes_per_token,
         routes_by_unit,
         addressable_members,
-        addressable_quantization,
     })
 }
 
@@ -1309,9 +1412,8 @@ where
         },
         _ => return Err(RoutedTextPreparationError::Ineligible),
     };
-    let (text, bank_residency, owner_group, plan, catalog) = selected.into_parts();
-    let (addressable_members, addressable_quantization) =
-        project_addressable_members(&catalog, &text)?;
+    let (text, bank_residency, owner_group, plan, catalog, addressable_members) =
+        selected.into_parts();
     let RoutedGroupedPlan::Gated(plan) = plan else {
         return Err(RoutedTextPreparationError::Invalid(
             "selected grouped equation differs from the admitted architecture".into(),
@@ -1353,7 +1455,6 @@ where
         routes_per_token,
         routes_by_unit,
         addressable_members,
-        addressable_quantization,
     })
 }
 
@@ -1401,9 +1502,8 @@ where
         },
         _ => return Err(RoutedTextPreparationError::Ineligible),
     };
-    let (text, bank_residency, owner_group, plan, catalog) = selected.into_parts();
-    let (addressable_members, addressable_quantization) =
-        project_addressable_members(&catalog, &text)?;
+    let (text, bank_residency, owner_group, plan, catalog, addressable_members) =
+        selected.into_parts();
     let RoutedGroupedPlan::Relu2(plan) = plan else {
         return Err(RoutedTextPreparationError::Invalid(
             "selected grouped equation differs from the admitted architecture".into(),
@@ -1443,7 +1543,6 @@ where
         catalog,
         routes_per_token,
         addressable_members,
-        addressable_quantization,
     })
 }
 
@@ -2227,9 +2326,8 @@ where
     A::StaticModules: Clone,
 {
     validate_selected_routed_handoff(&expected, &selected).map_err(|error| error.to_string())?;
-    let (text, bank_residency, owner_group, plan, catalog) = selected.into_parts();
-    let (addressable_members, addressable_quantization) =
-        project_addressable_members(&catalog, &text).map_err(|error| error.to_string())?;
+    let (text, bank_residency, owner_group, plan, catalog, addressable_members) =
+        selected.into_parts();
     let RoutedGroupedPlan::Gated(plan) = plan else {
         return Err("selected grouped equation differs from the composite architecture".into());
     };
@@ -2256,7 +2354,6 @@ where
         routes_per_token,
         routes_by_unit: expected.routes_by_unit,
         addressable_members,
-        addressable_quantization,
     })
 }
 
@@ -2309,6 +2406,7 @@ pub struct SelectedRoutedTextRealization {
     owner_group: eredu_runtime::ExecutionGroupId,
     plan: RoutedGroupedPlan,
     catalog: ExpertResidencyCatalog,
+    addressable_members: Vec<eredu_runtime::AddressableBankMember>,
     routes_per_token: usize,
     routes_by_unit: BTreeMap<usize, usize>,
 }
@@ -2339,6 +2437,11 @@ impl SelectedRoutedTextRealization {
         &self.catalog
     }
 
+    /// Exact addressable member tasks validated during neutral selection.
+    pub fn addressable_members(&self) -> &[eredu_runtime::AddressableBankMember] {
+        &self.addressable_members
+    }
+
     /// Returns the exact selected expert cardinality for every routed token row.
     pub const fn routes_per_token(&self) -> usize {
         self.routes_per_token
@@ -2358,6 +2461,7 @@ impl SelectedRoutedTextRealization {
         eredu_runtime::ExecutionGroupId,
         RoutedGroupedPlan,
         ExpertResidencyCatalog,
+        Vec<eredu_runtime::AddressableBankMember>,
     ) {
         (
             self.text,
@@ -2365,6 +2469,7 @@ impl SelectedRoutedTextRealization {
             self.owner_group,
             self.plan,
             self.catalog,
+            self.addressable_members,
         )
     }
 }
@@ -2389,7 +2494,7 @@ fn maximum_selected_compact_bytes(
 ) -> Result<u64, String> {
     let mut by_unit = BTreeMap::<(String, usize), Vec<u64>>::new();
     for unit in requirements.catalog().units() {
-        let (_, selected_bytes, _) = selected_member_geometry(unit, selected)?;
+        let (_, selected_bytes) = selected_member_geometry(unit, selected)?;
         by_unit
             .entry((
                 unit.owner_group().as_str().to_owned(),
@@ -2496,12 +2601,19 @@ pub fn select_routed_text_realization(
             issues: vec![issue],
         }
     })?;
+    let addressable_members =
+        project_addressable_members(&requirements.catalog, &text).map_err(|error| {
+            RoutedTextSelectionError {
+                issues: vec![error.to_string()],
+            }
+        })?;
     Ok(SelectedRoutedTextRealization {
         text,
         bank_residency,
         owner_group: requirements.owner_group.clone(),
         plan,
         catalog: requirements.catalog.clone(),
+        addressable_members,
         routes_per_token: requirements.routes_per_token,
         routes_by_unit: requirements.routes_by_unit.clone(),
     })
@@ -5029,12 +5141,16 @@ where
 {
     validate_plan_catalog::<O>(owner_group, plan, catalog)
         .map_err(|error| RoutedTextExecutionError::Contract(error.to_string()))?;
-    if selected_member_bytes.len() != catalog.units().len() {
+    let addressable_units = catalog
+        .units()
+        .iter()
+        .filter(|unit| unit.distribution() == crate::ExpertResidencyDistribution::ExpertParallel);
+    if selected_member_bytes.len() != addressable_units.clone().count() {
         return Err(RoutedTextExecutionError::Contract(
             "selected addressable member geometry differs from the architecture catalog".into(),
         ));
     }
-    for unit in catalog.units() {
+    for unit in addressable_units {
         let expected = selected_member_bytes
             .get(&unit.identity())
             .copied()
@@ -5349,8 +5465,11 @@ mod tests {
                 vec![source.into()],
                 vec![ReplicatedTextPhysicalSource::new(
                     source,
+                    source,
                     "/checkpoint/model.safetensors",
                     source,
+                    SourceTensorEncoding::Safetensors(StoredDtype::F16),
+                    (shape.iter().product::<usize>() * 2) as u64,
                 )
                 .unwrap()],
                 Vec::new(),
@@ -5497,8 +5616,11 @@ mod tests {
                     vec![source.into()],
                     vec![ReplicatedTextPhysicalSource::new(
                         source,
+                        source,
                         "/checkpoint/model.safetensors",
                         source,
+                        SourceTensorEncoding::Safetensors(StoredDtype::F16),
+                        (shape.iter().product::<usize>() * 2) as u64,
                     )
                     .unwrap()],
                     Vec::new(),

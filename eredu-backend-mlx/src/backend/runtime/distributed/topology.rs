@@ -553,6 +553,7 @@ fn validate_mlx_communication_manifest(manifest: &CommunicationManifest) -> Resu
 /// construction creates exact logical membership views and permits a
 /// world-collective implementation only when consensus proves a complete,
 /// same-requirement subgroup wave at that creation order.
+#[derive(Clone)]
 pub struct ParallelCommunicators {
     realization: CollectiveRealization,
     control_world: Group,
@@ -560,6 +561,7 @@ pub struct ParallelCommunicators {
     routes: HashMap<CommunicationRouteId, CommunicationRouteRealization>,
 }
 
+#[derive(Clone)]
 struct GroupCommunicator {
     realization: CollectiveGroupRealization,
     native: Option<Group>,

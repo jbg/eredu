@@ -1,15 +1,16 @@
 //! Prepared neutral construction for embedded prediction extensions.
 
-use std::{collections::BTreeMap, num::NonZeroUsize};
+use std::num::NonZeroUsize;
 
-use eredu_checkpoint::{recipe::DerivedWeightRecipe, store::CheckpointSource};
 use eredu_core::{cache::LayerCachePolicy, ParallelRankTopology, ParallelTopology};
 use eredu_nn::{
     BlockwiseAttentionBackend, DistributedNeuralBackend, GroupedNeuralBackend, HyperNeuralBackend,
     Parameterized, Tensor,
 };
-use eredu_runtime::RuntimeStateComponents;
 use eredu_runtime::{ArchitectureParameters, LocalModelLayout, StateLayout};
+use eredu_runtime::{
+    ReplicatedTextMaterializationTask, ReplicatedTextOutputCompanion, RuntimeStateComponents,
+};
 use eredu_runtime::{
     SpeculativeArchitectureCompatibilityProof, SpeculativeCaptureEntry, SpeculativeCaptureSchema,
     SpeculativeIdentity, SpeculativeMechanism, SpeculativeMechanismRequirements,
@@ -547,7 +548,7 @@ impl DsparkPredictionStrategy {
 pub struct PreparedPredictionUnit<M> {
     source: M,
     local: M,
-    recipes: BTreeMap<String, DerivedWeightRecipe>,
+    tasks: Vec<ReplicatedTextMaterializationTask>,
 }
 
 /// Architecture-constructed fused DSpark modules and immutable strategy.
@@ -586,17 +587,58 @@ where
 }
 
 impl<M> PreparedPredictionUnit<M> {
-    fn new(source: M, local: M, recipes: BTreeMap<String, DerivedWeightRecipe>) -> Self {
-        Self {
+    fn new<T: 'static>(
+        source: M,
+        local: M,
+        tasks: &[ReplicatedTextMaterializationTask],
+    ) -> Result<Self, eredu_core::artifact::ArtifactError>
+    where
+        M: Parameterized<T>,
+    {
+        let names = eredu_nn::validate_parameter_topology(&source)
+            .map_err(|error| invalid(error.to_string()))?
+            .into_iter()
+            .map(|metadata| metadata.id.as_str().to_owned())
+            .collect::<std::collections::BTreeSet<_>>();
+        let all_task_names = tasks
+            .iter()
+            .map(ReplicatedTextMaterializationTask::name)
+            .collect::<Vec<_>>();
+        let tasks = tasks
+            .iter()
+            .filter(|task| names.contains(task.name()))
+            .cloned()
+            .collect::<Vec<_>>();
+        let selected_names = tasks
+            .iter()
+            .flat_map(|task| {
+                std::iter::once(task.name()).chain(
+                    task.output_companions()
+                        .iter()
+                        .map(ReplicatedTextOutputCompanion::name),
+                )
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        let missing = names
+            .iter()
+            .filter(|name| !selected_names.contains(name.as_str()))
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            return Err(invalid(format!(
+                "prediction module parameters have no exact pre-resource materialization tasks: {missing:?}; local={:?}; all={all_task_names:?}",
+                tasks.iter().map(ReplicatedTextMaterializationTask::name).collect::<Vec<_>>()
+            )));
+        }
+        Ok(Self {
             source,
             local,
-            recipes,
-        }
+            tasks,
+        })
     }
 
-    /// Consumes the handoff into the checkpoint-global module, rank-local module, and recipes.
-    pub fn into_parts(self) -> (M, M, BTreeMap<String, DerivedWeightRecipe>) {
-        (self.source, self.local, self.recipes)
+    /// Consumes the handoff into the checkpoint-global module, rank-local module, and exact tasks.
+    pub fn into_parts(self) -> (M, M, Vec<ReplicatedTextMaterializationTask>) {
+        (self.source, self.local, self.tasks)
     }
 }
 
@@ -3028,7 +3070,7 @@ pub fn validate_partitioned_prediction_extension(
 pub fn prepare_partitioned_prediction_extension<B, R, Q>(
     extension: &PredictionExtensionPlan,
     selected: &crate::partitioned_execution::SelectedPartitionedAdmission<R, Q>,
-    store: &dyn CheckpointSource,
+    tasks: &[ReplicatedTextMaterializationTask],
     source_context: &<B::Tensor as Tensor>::Context,
     execution_context: &<B::Tensor as Tensor>::Context,
 ) -> Result<PreparedPredictionExtension<B>, eredu_core::artifact::ArtifactError>
@@ -3041,7 +3083,7 @@ where
     prepare(
         extension,
         selected.requirements().topology(),
-        store,
+        tasks,
         source_context,
         execution_context,
     )
@@ -3050,7 +3092,7 @@ where
 /// Prepares an extension for a single-rank replicated target.
 pub fn prepare_replicated_prediction_extension<B>(
     extension: &PredictionExtensionPlan,
-    store: &dyn CheckpointSource,
+    tasks: &[ReplicatedTextMaterializationTask],
     source_context: &<B::Tensor as Tensor>::Context,
     execution_context: &<B::Tensor as Tensor>::Context,
 ) -> Result<PreparedPredictionExtension<B>, eredu_core::artifact::ArtifactError>
@@ -3066,7 +3108,7 @@ where
     prepare(
         extension,
         topology,
-        store,
+        tasks,
         source_context,
         execution_context,
     )
@@ -3075,7 +3117,7 @@ where
 fn prepare<B>(
     extension: &PredictionExtensionPlan,
     topology: ParallelRankTopology,
-    store: &dyn CheckpointSource,
+    tasks: &[ReplicatedTextMaterializationTask],
     source_context: &<B::Tensor as Tensor>::Context,
     execution_context: &<B::Tensor as Tensor>::Context,
 ) -> Result<PreparedPredictionExtension<B>, eredu_core::artifact::ArtifactError>
@@ -3105,24 +3147,15 @@ where
                 execution_context,
             )
             .map_err(|error| invalid(error.to_string()))?;
-            let target = usize::try_from(args.num_hidden_layers)
-                .map_err(|_| invalid("DeepSeek-V3 target count exceeds usize"))?;
             let mut units = Vec::with_capacity(extension.depth());
             for depth in 0..extension.depth() {
-                let ordinal = target + depth;
                 let source_unit = source
                     .construct_unit(depth + 1, 0, source_context)
                     .map_err(|error| invalid(error.to_string()))?;
                 let local_unit = local
                     .construct_unit(depth + 1, 0, execution_context)
                     .map_err(|error| invalid(error.to_string()))?;
-                let recipes = crate::deepseek::v3_unit_recipes(store, args, ordinal, true)
-                    .map_err(invalid)?;
-                units.push(PreparedPredictionUnit::new(
-                    source_unit,
-                    local_unit,
-                    recipes,
-                ));
+                units.push(PreparedPredictionUnit::new(source_unit, local_unit, tasks)?);
             }
             Ok(PreparedPredictionExtension::DeepSeekV3 { layout, units })
         }
@@ -3158,22 +3191,12 @@ where
                 let local_unit = local
                     .construct_unit(depth + 1, 0, execution_context)
                     .map_err(|error| invalid(error.to_string()))?;
-                let expert =
-                    crate::deepseek::v4_expert_recipes(store, args, ordinal).map_err(invalid)?;
-                let recipes = BTreeMap::from([
-                    (expert.target_gate_up, expert.gate_up),
-                    (expert.target_down, expert.down),
-                ]);
                 let policy = state_layout.layer(ordinal).cloned().ok_or_else(|| {
                     invalid(format!(
                         "DeepSeek-V4 prediction depth {depth} has no state policy"
                     ))
                 })?;
-                units.push(PreparedPredictionUnit::new(
-                    source_unit,
-                    local_unit,
-                    recipes,
-                ));
+                units.push(PreparedPredictionUnit::new(source_unit, local_unit, tasks)?);
                 state.push((ordinal, policy));
             }
             if args.dspark.is_some() {
@@ -3194,8 +3217,8 @@ where
                         static_modules: PreparedPredictionUnit::new(
                             source_static,
                             local_static,
-                            BTreeMap::new(),
-                        ),
+                            tasks,
+                        )?,
                     },
                     units,
                     state,
@@ -3215,12 +3238,11 @@ where
             let local = crate::inkling::MtpModel::<B>::new(args, execution_context)
                 .map_err(|error| invalid(error.to_string()))?
                 .ok_or_else(|| invalid("Inkling prediction extension has no configured depth"))?;
-            let recipes = crate::inkling::mtp_safetensors_recipes(args, store).map_err(invalid)?;
             let state = crate::inkling::mtp_state_layout(args)
                 .map_err(|error| invalid(error.to_string()))?
                 .ok_or_else(|| invalid("Inkling prediction extension has no state layout"))?;
             Ok(PreparedPredictionExtension::Inkling {
-                model: PreparedPredictionUnit::new(source, local, recipes),
+                model: PreparedPredictionUnit::new(source, local, tasks)?,
                 state,
             })
         }
@@ -3266,9 +3288,7 @@ where
                     execution_context,
                 )
                 .map_err(|error| invalid(error.to_string()))?;
-                let recipes = crate::qwen::hybrid::unit_recipes(store, &args.text, target + depth)
-                    .map_err(invalid)?;
-                units.push(PreparedPredictionUnit::new(source, local, recipes));
+                units.push(PreparedPredictionUnit::new(source, local, tasks)?);
             }
             let state = geometry
                 .state_layout()
@@ -3329,15 +3349,7 @@ where
                         execution_context,
                     )
                     .map_err(|error| invalid(error.to_string()))?;
-                    let recipes = crate::nemotron_h::unit_recipes(
-                        store,
-                        args,
-                        prediction + 1,
-                        relative,
-                        true,
-                    )
-                    .map_err(invalid)?;
-                    units.push(PreparedPredictionUnit::new(source, local, recipes));
+                    units.push(PreparedPredictionUnit::new(source, local, tasks)?);
                 }
                 groups.push(units);
             }

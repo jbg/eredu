@@ -9,8 +9,9 @@ use eredu_architectures::{
     llama::{self, LayeredInput, ModelArgs},
     moshi, muse_glimmer, qwen,
     replicated_text::{
-        replicated_text_requirements, visit_replicated_text_architecture,
-        PreparedReplicatedTextArchitecture, ReplicatedTextArchitectureVisitor,
+        replicated_text_requirements, visit_replicated_compressed_only_text_architecture,
+        visit_replicated_text_architecture, PreparedReplicatedTextArchitecture,
+        ReplicatedTextArchitectureVisitor,
     },
 };
 use eredu_core::{AttentionPolicy, Completion, LayerSchedule, TokenFilter};
@@ -562,6 +563,114 @@ fn replicated_requirement_catalog_matches_authoritative_architecture_parameters(
     )
     .unwrap();
     assert_eq!(logits, ReferenceTensor(vec![1, 3, 32]));
+}
+
+#[test]
+fn dense_deepseek_v3_constructs_through_the_typed_compressed_visitor() {
+    use eredu_core::ModelConfigurationResolver;
+    use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
+
+    let config = serde_json::json!({
+        "architectures": ["DeepseekV3ForCausalLM"],
+        "model_type": "deepseek_v3",
+        "hidden_size": 16,
+        "intermediate_size": 32,
+        "moe_intermediate_size": 8,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 2,
+        "vocab_size": 128,
+        "max_position_embeddings": 4096,
+        "q_lora_rank": 4,
+        "kv_lora_rank": 4,
+        "qk_nope_head_dim": 6,
+        "qk_rope_head_dim": 2,
+        "v_head_dim": 8,
+        "first_k_dense_replace": 2,
+        "moe_layer_freq": 2,
+        "n_routed_experts": 8,
+        "n_shared_experts": 1,
+        "num_experts_per_tok": 2,
+        "n_group": 2,
+        "topk_group": 1,
+        "topk_method": "noaux_tc",
+        "scoring_func": "sigmoid",
+        "norm_topk_prob": true,
+        "routed_scaling_factor": 1.0,
+        "tie_word_embeddings": false,
+        "num_nextn_predict_layers": 0
+    });
+    let resolved = configuration::MODEL_CONFIGURATIONS
+        .resolve_safetensors(&config)
+        .unwrap();
+    let checkpoint = resolved
+        .architecture_plan()
+        .safetensors_architecture()
+        .unwrap()
+        .checkpoint();
+    let mut constraints = checkpoint.common_tensors.iter().collect::<Vec<_>>();
+    constraints.extend(
+        checkpoint
+            .layout_groups
+            .iter()
+            .filter_map(|group| group.variants.first())
+            .flat_map(|variant| variant.tensors.iter()),
+    );
+    let tensors = constraints
+        .into_iter()
+        .map(|constraint| {
+            let dtype = match constraint.dtype {
+                eredu_checkpoint::schema::StoredDtypeConstraint::Exact(
+                    eredu_checkpoint::StoredDtype::U8,
+                ) => Dtype::U8,
+                _ => Dtype::F32,
+            };
+            let bytes =
+                constraint.shape.iter().product::<usize>() * if dtype == Dtype::U8 { 1 } else { 4 };
+            (
+                constraint.key.clone(),
+                constraint.shape.clone(),
+                dtype,
+                vec![0_u8; bytes],
+            )
+        })
+        .collect::<Vec<_>>();
+    let views = tensors
+        .iter()
+        .map(|(name, shape, dtype, bytes)| {
+            (
+                name.as_str(),
+                TensorView::new(*dtype, shape.clone(), bytes.as_slice()).unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let artifact = tempfile::tempdir().unwrap();
+    std::fs::write(
+        artifact.path().join("config.json"),
+        serde_json::to_vec(&config).unwrap(),
+    )
+    .unwrap();
+    serialize_to_file(views, None, &artifact.path().join("model.safetensors")).unwrap();
+
+    let inspection = configuration::inspect_artifact(artifact.path()).unwrap();
+    let selected = resident_selection_for(&inspection);
+    let store: eredu_checkpoint::store::SharedCheckpointSource = std::sync::Arc::new(
+        eredu_checkpoint::store::SafetensorsWeightStore::open(artifact.path()).unwrap(),
+    );
+    let logits = visit_replicated_compressed_only_text_architecture::<
+        ReferenceBackend,
+        DeviceState<ReferenceBackend, ReferenceCache>,
+        _,
+    >(
+        inspection.architecture_plan(),
+        selected,
+        store,
+        &(),
+        ReferenceReplicatedVisitor {
+            construction_started: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(logits, ReferenceTensor(vec![1, 3, 128]));
 }
 
 #[test]

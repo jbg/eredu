@@ -427,9 +427,23 @@ pub fn assistant_safetensors_plan(
     };
     let base = super::checkpoint::safetensors_plan(&family)?;
     let mut common = base.common_tensors;
+    let canonical_names = common
+        .iter()
+        .filter_map(|tensor| {
+            tensor
+                .aliases
+                .first()
+                .map(|canonical| (tensor.key.clone(), canonical.clone()))
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
     for tensor in &mut common {
         if let Some(canonical) = tensor.aliases.first().cloned() {
             tensor.key = canonical;
+        }
+        if let Some(companion) = &mut tensor.linear_companion {
+            if let Some(canonical) = canonical_names.get(&companion.primary) {
+                companion.primary = canonical.clone();
+            }
         }
         tensor.aliases.clear();
     }

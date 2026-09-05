@@ -1,10 +1,10 @@
 //! Backend-neutral speculative request lifecycle and fair scheduling.
 
 use eredu_core::{
-    CompletedSpeculativeSchedule, PreparedSpeculativeLane, SpeculativeConstraint,
-    SpeculativeDriverError, SpeculativeExecutor, SpeculativeGenerationBatchOutput,
-    SpeculativeGenerationOutput, SpeculativeGenerationVisitor, SpeculativePublisher,
-    SpeculativeRequestTable, SpeculativeSampling,
+    BoundedCompletion, CompletedSpeculativeSchedule, PreparedSpeculativeLane,
+    SpeculativeConstraint, SpeculativeDriverError, SpeculativeExecutor,
+    SpeculativeGenerationBatchOutput, SpeculativeGenerationOutput, SpeculativeGenerationVisitor,
+    SpeculativePublisher, SpeculativeRequestTable, SpeculativeSampling,
 };
 
 /// Neutral owner of speculative request registration and fair scheduling.
@@ -39,6 +39,14 @@ where
         component_timings_collected: bool,
         context: E::Context<'a>,
     ) -> Result<Self, SpeculativeDriverError<E::Error>> {
+        let completion_wait = options
+            .completion_wait()
+            .map_err(SpeculativeDriverError::Generation)?;
+        if !E::Completion::supports_cancellation(completion_wait.cancellation()) {
+            return Err(SpeculativeDriverError::UnsupportedCompletionCancellation {
+                cancellation: completion_wait.cancellation(),
+            });
+        }
         executor.set_telemetry_enabled(component_timings_collected);
         Ok(Self {
             executor,

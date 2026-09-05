@@ -23,7 +23,8 @@ crate root exposes the narrow adapters used by the `eredu` facade.
   implements `eredu_nn::Tensor`.
 - `native::MlxModelSession` owns the executable model, cache, processor state,
   and optional distributed context. `backend::MlxModel` exposes its neutral
-  capabilities and telemetry while keeping family payloads private.
+  capabilities and telemetry while keeping the architecture-erased executable
+  private.
 
 The crate never depends on the `eredu` facade. MLX arrays, streams, devices,
 events, groups, and exceptions do not appear in neutral core or facade

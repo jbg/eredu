@@ -62,6 +62,13 @@ pub struct LocalBackendFactory {
     inner: eredu_backend_mlx::MlxBackendFactory,
 }
 
+/// Opaque ownership of the one model inspection retained across planning and loading.
+pub struct LocalRetainedModelInspection {
+    inner: eredu_core::ArtifactInspection<
+        eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+    >,
+}
+
 impl LocalBackendFactory {
     /// Enables allocator and process-memory sampling for bounded residency.
     pub const fn with_residency_diagnostics(
@@ -82,6 +89,20 @@ impl LocalBackendFactory {
         request: &crate::AutomaticPlanRequest,
     ) -> Result<crate::ExecutionPlanReport, crate::AutomaticPlanningError> {
         planner.plan(&self.inner, request)
+    }
+
+    /// Plans while retaining the exact artifact inspection used by every probe.
+    pub fn plan_retained(
+        &self,
+        planner: &crate::AutomaticPlanner,
+        request: &crate::AutomaticPlanRequest,
+    ) -> Result<
+        (crate::ExecutionPlanReport, LocalRetainedModelInspection),
+        crate::AutomaticPlanningError,
+    > {
+        let retained = planner.plan_retained(&self.inner, request)?;
+        let (report, inspection) = retained.into_parts();
+        Ok((report, LocalRetainedModelInspection { inner: inspection }))
     }
 }
 
@@ -406,15 +427,41 @@ impl LocalModel {
         })
     }
 
+    /// Realizes a plan against the exact inspection retained by automatic planning.
+    pub fn load_retained_execution_plan(
+        factory: &LocalBackendFactory,
+        inspection: LocalRetainedModelInspection,
+        plan: &crate::ExecutionPlan,
+    ) -> Result<LocalPlannedModel, LocalPlannedModelLoadError> {
+        let planned = super::LoadedModel::load_inspected_execution_plan(
+            &factory.inner,
+            inspection.inner,
+            plan,
+        )
+        .map_err(map_local_planned_model_load_error)?;
+        let (model, drafting) = planned.into_parts();
+        Ok(LocalPlannedModel {
+            model: Self { inner: model },
+            drafting: LocalDrafting { inner: drafting },
+        })
+    }
+
     /// Plans and loads a model without exposing backend realization types.
     pub fn plan_and_load(
         factory: &LocalBackendFactory,
         planner: &crate::AutomaticPlanner,
         request: &crate::AutomaticPlanRequest,
     ) -> Result<(LocalPlannedModel, crate::ExecutionPlanReport), LocalPlannedModelLoadError> {
-        let report = factory.plan(planner, request)?;
-        let model = Self::load_execution_plan(factory, &request.model_path, &report.plan)?;
-        Ok((model, report))
+        let (planned, report) = super::LoadedModel::plan_and_load(&factory.inner, planner, request)
+            .map_err(map_local_planned_model_load_error)?;
+        let (model, drafting) = planned.into_parts();
+        Ok((
+            LocalPlannedModel {
+                model: Self { inner: model },
+                drafting: LocalDrafting { inner: drafting },
+            },
+            report,
+        ))
     }
 
     /// Returns the canonical architecture family.
@@ -802,8 +849,7 @@ impl LocalInspectionOptions {
         factory: &LocalBackendFactory,
         plan: &crate::ExecutionPlan,
     ) -> Result<Self, crate::AutomaticPlanningError> {
-        let realization = eredu_core::realize_execution_plan_target(&factory.inner, plan)?;
-        let (_, options) = realization.into_parts();
+        let options = factory.inner.load_request_for_plan(plan)?;
         Ok(Self::new(LocalLoadOptions::from_backend(options)?))
     }
 }

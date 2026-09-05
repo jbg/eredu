@@ -1968,6 +1968,7 @@ fn main() -> Result<()> {
     let model_path = resolved_model.path;
     let draft_model_path = resolved_draft.map(|artifact| artifact.path);
     let automatic_feedback = read_automatic_feedback(&args.auto_feedback)?;
+    let mut retained_automatic_inspection = None;
     let exact_trial_report = args
         .auto_trial_plan
         .as_ref()
@@ -2052,12 +2053,17 @@ fn main() -> Result<()> {
                     return Ok(());
                 }
                 AutoMode::Quick => {
-                    let report = automatic_report_with_cache(
-                        &model_path,
-                        args.device,
-                        args.auto_cache.as_deref(),
-                        &automatic_feedback,
-                    )?;
+                    let request = AutomaticPlanRequest::new(&model_path, device_plan(args.device)?)
+                        .with_prior_telemetry(automatic_feedback.iter().cloned());
+                    let planning_factory = LocalBackendFactory::default();
+                    let (report, inspection) =
+                        planning_factory.plan_retained(&AutomaticPlanner::default(), &request)?;
+                    retained_automatic_inspection = Some(inspection);
+                    if let Some(path) = &args.auto_cache {
+                        let observations = automatic_observations(&model_path, args.device)?;
+                        let key = automatic_cache_key(&model_path, &observations)?;
+                        write_auto_plan_cache(path, key, report.clone(), None)?;
+                    }
                     let report = apply_automatic_report(
                         &mut args,
                         &original_args,
@@ -2140,8 +2146,13 @@ fn main() -> Result<()> {
     let load_started = Instant::now();
     let factory =
         LocalBackendFactory::default().with_residency_diagnostics(args.verbose, args.verbose);
-    let planned = LocalModel::load_execution_plan(&factory, &model_path, &execution_plan)
-        .with_context(|| format!("failed to load model from {}", model_path.display()))?;
+    let planned = match retained_automatic_inspection {
+        Some(inspection) => {
+            LocalModel::load_retained_execution_plan(&factory, inspection, &execution_plan)
+        }
+        None => LocalModel::load_execution_plan(&factory, &model_path, &execution_plan),
+    }
+    .with_context(|| format!("failed to load model from {}", model_path.display()))?;
     let (mut model, mut drafting) = planned.into_parts();
     let mut resolved_generation = model.resolve_generation_config(GenerationConfigOverrides {
         temperature: args.temperature,

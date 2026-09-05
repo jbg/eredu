@@ -138,10 +138,11 @@ pub use execution::{
 pub use expert::{
     combine_routed_expert_tensor_parallel, combine_tensor_parallel_expert_outputs,
     reduce_routed_expert_tensor_parallel, reduce_tensor_parallel_expert_output,
-    AddressableBankMember, AddressableBankMemberError, AddressableExpertRouteProvider,
-    AddressableExpertRouteRequest, AddressableGatedProductBank, AddressableGroupedBank,
-    ExpertRouteCombination, ExpertRouteExchange, ExpertRouteTensorMovement, IndexedMovement,
-    ObservedExpertProvider, ObservedExpertProviderError, ParameterBankAcquisition,
+    selected_addressable_parameter_bytes, AddressableBankDistribution, AddressableBankMember,
+    AddressableBankMemberError, AddressableBankMemberPlacement, AddressableBankParameter,
+    AddressableExpertRouteProvider, AddressableExpertRouteRequest, AddressableGatedProductBank,
+    AddressableGroupedBank, ExpertRouteCombination, ExpertRouteExchange, ExpertRouteTensorMovement,
+    IndexedMovement, ObservedExpertProvider, ObservedExpertProviderError, ParameterBankAcquisition,
     ResidentExpertProvider, RoutedExpertProvider, RoutedExpertRequest,
     RoutedExpertTensorParallelOutput, RoutedObservationPoint, TensorParallelRoutedExpertProvider,
 };
@@ -269,25 +270,28 @@ pub use replicated_session::{
     SessionStateRealization, TransactionalPromptCacheMechanisms,
 };
 pub use replicated_text::{
+    partition_selected_replicated_text_materialization_tasks,
     partitioned_replicated_text_materialization_tasks, replicated_text_materialization_tasks,
-    select_replicated_text_realization, AddressableStorageCapabilities, AddressableStorageTiers,
-    BackendMechanismCapabilities, GroupedOperationRequirement, ParameterTransformConstraint,
-    ParameterTransformTarget, ReplicatedTextArchitecture, ReplicatedTextContractError,
-    ReplicatedTextMaterializationTask, ReplicatedTextOutputCompanion,
-    ReplicatedTextOutputSelection, ReplicatedTextParameterOwner, ReplicatedTextParameterPresence,
-    ReplicatedTextParameterRequirement, ReplicatedTextParameterRole, ReplicatedTextPhysicalSource,
-    ReplicatedTextRequirements, ReplicatedTextSelectionError, ReplicatedTextSelectionRequest,
-    ReplicatedTextStateAccess, SelectedParameterRealization, SelectedReplicatedTextRealization,
+    select_replicated_text_realization, selected_materialization_task_bytes,
+    AddressableStorageCapabilities, AddressableStorageTiers, BackendMechanismCapabilities,
+    GroupedOperationRequirement, ParameterTransformConstraint, ParameterTransformTarget,
+    ReplicatedTextArchitecture, ReplicatedTextContractError, ReplicatedTextMaterializationTask,
+    ReplicatedTextOutputCompanion, ReplicatedTextOutputSelection, ReplicatedTextParameterOwner,
+    ReplicatedTextParameterPresence, ReplicatedTextParameterRequirement,
+    ReplicatedTextParameterRole, ReplicatedTextPhysicalSource, ReplicatedTextRequirements,
+    ReplicatedTextSelectionError, ReplicatedTextSelectionRequest, ReplicatedTextStateAccess,
+    SelectedParameterRealization, SelectedReplicatedTextRealization,
     SelectedStateComponentRealization, SelectedStateRealization, StateComponentMechanism,
     StateComponentPlacement, StateMechanismCapabilities, WeightLoweringCapability,
     WeightLoweringDescriptor, WeightLoweringKind, WeightResidencyMechanism,
 };
 pub use residency::{
-    DeviceLayerWindow, OffloadUnit, ResidencyAcquisition, ResidencyController,
-    ResidencyControllerError, ResidencyDeclarationError, ResidencyLease, ResidencyLeaseOwner,
-    ResidencyLeaseStorage, ResidencyReport, ResidencyTransfer, ResidencyTransferOwner,
-    ResidencyWindowError, ResidencyWindowManager, ResidentLayerGroup, ResidentLayerGroupReport,
-    WeightBinding, WeightBindingPlan, WeightBindingSelectionError, WeightMaterializationReport,
+    DeviceLayerWindow, OffloadUnit, QuantizationCompanionBindings, ResidencyAcquisition,
+    ResidencyController, ResidencyControllerError, ResidencyDeclarationError, ResidencyLease,
+    ResidencyLeaseOwner, ResidencyLeaseStorage, ResidencyReport, ResidencyTransfer,
+    ResidencyTransferOwner, ResidencyWindowError, ResidencyWindowManager, ResidentLayerGroup,
+    ResidentLayerGroupReport, WeightBinding, WeightBindingPlan, WeightBindingSelectionError,
+    WeightMaterializationReport,
 };
 pub use speculative::{RunSpeculativeGeneration, SpeculativeScheduler};
 pub use speculative_selection::{

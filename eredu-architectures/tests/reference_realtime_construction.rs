@@ -1341,8 +1341,11 @@ fn declared_realtime_interventions_causally_reach_decisions_and_output_once() {
     assert_eq!(summary.observed_values[2], ReferenceTensor(vec![1, 3, 17]));
 }
 
-#[test]
-fn realtime_observer_failure_discards_the_caller_owned_transaction() {
+#[allow(
+    dead_code,
+    reason = "owned by the unified reference_conformance target"
+)]
+pub(crate) fn realtime_observer_failure_discards_the_caller_owned_transaction() {
     let failed_path = MODEL_LOGITS_OBSERVATION_PATH.to_owned();
     let summary = run_observation_scenario(BTreeMap::new(), Some(failed_path.clone()), 17);
 
@@ -1454,8 +1457,11 @@ fn replicated_architecture_cannot_satisfy_tensor_parallel_selection() {
     .unwrap();
 }
 
-#[test]
-fn native_moshi_resident_and_bounded_use_the_same_reference_frame_scheduler() {
+#[allow(
+    dead_code,
+    reason = "owned by the unified reference_conformance target"
+)]
+pub(crate) fn native_moshi_resident_and_bounded_use_the_same_reference_frame_scheduler() {
     let resident = run_reference_scenario(tiny_config(), LayerWeightResidency::FullyResident, None);
     let bounded = run_reference_scenario(
         tiny_config(),
@@ -1473,8 +1479,11 @@ fn native_moshi_resident_and_bounded_use_the_same_reference_frame_scheduler() {
     assert_eq!(bounded.random_after_forced, 9);
 }
 
-#[test]
-fn personaplex_uses_released_inspection_and_the_common_reference_scheduler() {
+#[allow(
+    dead_code,
+    reason = "owned by the unified reference_conformance target"
+)]
+pub(crate) fn personaplex_uses_released_inspection_and_the_common_reference_scheduler() {
     let config =
         MoshiConfig::from_json(r#"{"model_type":"personaplex","version":"7b-v1"}"#).unwrap();
     let summary = run_reference_scenario(config, LayerWeightResidency::FullyResident, None);
@@ -1537,8 +1546,11 @@ fn personaplex_prompt_plan_materializes_portable_frames_in_architecture_order() 
     assert_eq!(frames[3].forced_text_tokens(), Some(&[22][..]));
 }
 
-#[test]
-fn load_time_affine_transform_reaches_typed_construction_and_frame_execution() {
+#[allow(
+    dead_code,
+    reason = "owned by the unified reference_conformance target"
+)]
+pub(crate) fn load_time_affine_transform_reaches_typed_construction_and_frame_execution() {
     let summary = run_reference_scenario(
         quantizable_native_config(),
         LayerWeightResidency::FullyResident,
@@ -1548,4 +1560,45 @@ fn load_time_affine_transform_reaches_typed_construction_and_frame_execution() {
         }),
     );
     assert_eq!(summary.unit_count, 2);
+}
+
+#[cfg(test)]
+mod unified_conformance_compatibility_wrappers {
+    use super::*;
+
+    fn run_on_reference_stack(case: fn()) {
+        std::thread::Builder::new()
+            .name("reference-realtime-compatibility-wrapper".into())
+            .stack_size(64 * 1024 * 1024)
+            .spawn(case)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn observer_failure_transaction() {
+        run_on_reference_stack(realtime_observer_failure_discards_the_caller_owned_transaction);
+    }
+
+    #[test]
+    fn moshi_resident_and_bounded() {
+        run_on_reference_stack(
+            native_moshi_resident_and_bounded_use_the_same_reference_frame_scheduler,
+        );
+    }
+
+    #[test]
+    fn personaplex_reference_scheduler() {
+        run_on_reference_stack(
+            personaplex_uses_released_inspection_and_the_common_reference_scheduler,
+        );
+    }
+
+    #[test]
+    fn affine_transform_construction() {
+        run_on_reference_stack(
+            load_time_affine_transform_reaches_typed_construction_and_frame_execution,
+        );
+    }
 }

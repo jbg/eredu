@@ -1,4 +1,4 @@
-//! Cold-path model-family selection and MLX session composition.
+//! Cold-path neutral execution selection and MLX mechanism composition.
 
 pub(crate) mod artifact;
 pub mod automatic;
@@ -11,7 +11,6 @@ pub mod loading;
 mod model;
 mod prepared_speculative;
 mod processor;
-mod realization;
 pub mod realtime;
 pub(crate) mod replicated_text;
 mod session;
@@ -57,6 +56,7 @@ pub(crate) mod path_instrumentation {
         static NEUTRAL_PARTITIONED_CONSTRUCTIONS: Cell<usize> = const { Cell::new(0) };
         static BOUNDED_UNIT_ACQUISITIONS: Cell<usize> = const { Cell::new(0) };
         static VARIABLE_ALL_TO_ALL_SUBMISSIONS: Cell<usize> = const { Cell::new(0) };
+        static TARGET_NATIVE_RESOURCE_REALIZATION_ATTEMPTS: Cell<usize> = const { Cell::new(0) };
     }
 
     pub(crate) fn reset() {
@@ -66,6 +66,7 @@ pub(crate) mod path_instrumentation {
         NEUTRAL_PARTITIONED_CONSTRUCTIONS.set(0);
         BOUNDED_UNIT_ACQUISITIONS.set(0);
         VARIABLE_ALL_TO_ALL_SUBMISSIONS.set(0);
+        TARGET_NATIVE_RESOURCE_REALIZATION_ATTEMPTS.set(0);
     }
 
     pub(crate) fn snapshot() -> Counts {
@@ -78,6 +79,14 @@ pub(crate) mod path_instrumentation {
 
     pub(crate) fn communication_realization_attempt() {
         COMMUNICATION_REALIZATION_ATTEMPTS.with(|count| count.set(count.get() + 1));
+    }
+
+    pub(crate) fn target_native_resource_realization_attempts() -> usize {
+        TARGET_NATIVE_RESOURCE_REALIZATION_ATTEMPTS.get()
+    }
+
+    pub(crate) fn target_native_resource_realization_attempt() {
+        TARGET_NATIVE_RESOURCE_REALIZATION_ATTEMPTS.with(|count| count.set(count.get() + 1));
     }
 
     pub(crate) fn manifest_communication_realization_attempts() -> usize {

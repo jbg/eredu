@@ -74,9 +74,29 @@ impl eredu_architectures::prediction_extension::PredictionExtensionMaterializer<
     where
         M: Parameterized<ReferenceTensor>,
     {
-        let (_, mut local, mut recipes) = prepared.into_parts();
+        let (_, mut local, tasks) = prepared.into_parts();
+        let mut recipes = tasks
+            .iter()
+            .map(|task| {
+                task.source_recipe()
+                    .map(|recipe| (task.name().to_owned(), recipe))
+            })
+            .collect::<Result<std::collections::BTreeMap<_, _>, _>>()
+            .map_err(|error| Error::backend(error.to_string()))?;
+        for companion in tasks.iter().flat_map(|task| task.output_companions()) {
+            if let Some(task) = companion.materialization_task() {
+                recipes.insert(
+                    companion.name().to_owned(),
+                    task.source_recipe()
+                        .map_err(|error| Error::backend(error.to_string()))?,
+                );
+            } else if let Some(recipe) = companion.derived_recipe() {
+                recipes.insert(companion.name().to_owned(), recipe.clone());
+            }
+        }
         struct Bindings<'a> {
             values: Vec<eredu_runtime::WeightBinding>,
+            missing: Vec<String>,
             recipes: &'a mut std::collections::BTreeMap<
                 String,
                 eredu_checkpoint::recipe::DerivedWeightRecipe,
@@ -90,30 +110,41 @@ impl eredu_architectures::prediction_extension::PredictionExtensionMaterializer<
                     .map(|dimension| u64::try_from(*dimension).unwrap())
                     .product::<u64>()
                     * 4;
-                let binding = match self.recipes.remove(metadata.id.as_str()) {
-                    Some(recipe) => eredu_runtime::WeightBinding::from_recipe(
+                let binding = self
+                    .recipes
+                    .remove(metadata.id.as_str())
+                    .map(|recipe| {
+                        eredu_runtime::WeightBinding::from_recipe(
                         metadata.id.as_str(),
                         recipe,
                         bytes,
-                    ),
-                    None => eredu_runtime::WeightBinding::new(
-                        metadata.id.as_str(),
-                        metadata.id.as_str(),
-                        eredu_checkpoint::store::TensorSelection::Full,
-                        bytes,
-                    ),
-                };
-                self.values.push(binding.unwrap());
+                    )
+                    });
+                if let Some(binding) = binding {
+                    self.values.push(binding.unwrap());
+                } else {
+                    self.missing.push(metadata.id.as_str().to_owned());
+                }
             }
         }
         let mut bindings = Bindings {
             values: Vec::new(),
+            missing: Vec::new(),
             recipes: &mut recipes,
         };
         local.visit_parameters(&mut bindings);
+        let values = std::mem::take(&mut bindings.values);
+        let missing = std::mem::take(&mut bindings.missing);
+        drop(bindings);
+        if !recipes.is_empty() || !missing.is_empty() || values.is_empty() {
+            return Err(Error::backend(format!(
+                "reference prediction exact tasks disagree with module topology: remaining={:?}, missing={missing:?}",
+                recipes.keys().collect::<Vec<_>>(),
+            )));
+        }
         let materialized = eredu_runtime::materialize_bindings::<ReferenceBackend>(
             context.store,
-            &bindings.values,
+            &values,
             &(),
         )
         .map_err(|error| Error::backend(error.to_string()))?;
@@ -627,11 +658,16 @@ impl eredu_architectures::speculative_execution::SpeculativeTensorMechanisms
     }
 
     fn submit_verification_completion<'a>(
-        _: &eredu_architectures::speculative_execution::EmbeddedPredictionOutput<Self::Tensor>,
-        _: &Self::Tensor,
+        output: &eredu_architectures::speculative_execution::EmbeddedPredictionOutput<Self::Tensor>,
+        inputs: &Self::Tensor,
         _: Self::Context<'a>,
     ) -> Result<Self::Completion, Self::Error> {
-        Ok(ReferenceExternalCompletion)
+        Ok(ReferenceExternalCompletion::submit([
+            output.logits().clone(),
+            output.capture().clone(),
+            output.tokens().clone(),
+            inputs.clone(),
+        ]))
     }
 }
 
@@ -1003,6 +1039,7 @@ fn reference_text_capabilities(
     let lowerings = execution
         .parameters()
         .iter()
+        .chain(execution.auxiliary_parameters())
         .filter(|parameter| parameter.has_lowering_source())
         .map(|parameter| {
             let kind = if matches!(
@@ -1176,9 +1213,9 @@ impl eredu_architectures::ExternalAssistantPreparationVisitor for ReferenceAssis
 
     fn visit<A: eredu_architectures::ExternalAssistantArchitecture>(
         self,
-        prepared: eredu_architectures::PreparedExternalAssistant<A>,
+        prepared: eredu_architectures::SelectedExternalAssistant<A>,
     ) -> Result<Self::Output<A>, Self::Error> {
-        let (checkpoint, config) = prepared.into_parts();
+        let (checkpoint, _source_config, config, _tasks) = prepared.into_parts();
         let store: eredu_checkpoint::store::SharedCheckpointSource = match checkpoint {
             eredu_architectures::ExternalAssistantCheckpoint::SafeTensors {
                 source,
@@ -1242,18 +1279,261 @@ impl eredu_architectures::ExternalAssistantPreparationVisitor for ReferenceAssis
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+enum ReferenceCompletionMode {
+    Immediate,
+    Delayed { incomplete_polls: usize },
+    FailWait,
+    Never,
+}
+
+#[derive(Debug, Default)]
+struct ReferenceCompletionControl {
+    submissions: Cell<usize>,
+    polls: Cell<usize>,
+    incomplete_polls: Cell<usize>,
+    waits: Cell<usize>,
+    failures: Cell<usize>,
+    quarantines: Cell<usize>,
+    drops: Cell<usize>,
+    retained_at_incomplete_poll: Cell<usize>,
+    retained_at_wait: Cell<usize>,
+    released_resources: Cell<usize>,
+    publications: Cell<usize>,
+    restores: Cell<usize>,
+    exact_restores: Cell<usize>,
+    lifecycle: RefCell<Vec<eredu_core::SpeculativeLifecycleStage>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ReferenceCompletionEvidence {
+    submissions: usize,
+    polls: usize,
+    incomplete_polls: usize,
+    waits: usize,
+    failures: usize,
+    quarantines: usize,
+    drops: usize,
+    retained_at_incomplete_poll: usize,
+    retained_at_wait: usize,
+    released_resources: usize,
+    publications: usize,
+    restores: usize,
+    exact_restores: usize,
+    lifecycle: Vec<eredu_core::SpeculativeLifecycleStage>,
+}
+
+impl ReferenceCompletionControl {
+    fn evidence(&self) -> ReferenceCompletionEvidence {
+        ReferenceCompletionEvidence {
+            submissions: self.submissions.get(),
+            polls: self.polls.get(),
+            incomplete_polls: self.incomplete_polls.get(),
+            waits: self.waits.get(),
+            failures: self.failures.get(),
+            quarantines: self.quarantines.get(),
+            drops: self.drops.get(),
+            retained_at_incomplete_poll: self.retained_at_incomplete_poll.get(),
+            retained_at_wait: self.retained_at_wait.get(),
+            released_resources: self.released_resources.get(),
+            publications: self.publications.get(),
+            restores: self.restores.get(),
+            exact_restores: self.exact_restores.get(),
+            lifecycle: self.lifecycle.borrow().clone(),
+        }
+    }
+}
+
+thread_local! {
+    static REFERENCE_COMPLETION_CONTROL: RefCell<Option<(ReferenceCompletionMode, Rc<ReferenceCompletionControl>)>> =
+        const { RefCell::new(None) };
+    static REFERENCE_COMPLETION_QUARANTINE: RefCell<ReferenceCompletionQuarantine> =
+        RefCell::new(ReferenceCompletionQuarantine::default());
+}
+
+#[derive(Debug, Default)]
+struct ReferenceCompletionQuarantine {
+    work: Vec<ReferenceExternalCompletion>,
+}
+
+impl Drop for ReferenceCompletionQuarantine {
+    fn drop(&mut self) {
+        for completion in self.work.drain(..) {
+            // A genuinely never-completing operation has no safe release point. The
+            // reference backend deliberately retains its synthetic resources forever.
+            std::mem::forget(completion);
+        }
+    }
+}
+
+fn with_reference_completion_control<R>(
+    mode: ReferenceCompletionMode,
+    operation: impl FnOnce() -> R,
+) -> (R, ReferenceCompletionEvidence) {
+    let control = Rc::new(ReferenceCompletionControl::default());
+    REFERENCE_COMPLETION_CONTROL.with(|slot| {
+        assert!(
+            slot.borrow().is_none(),
+            "reference completion control is nested"
+        );
+        *slot.borrow_mut() = Some((mode, Rc::clone(&control)));
+    });
+    let result = operation();
+    REFERENCE_COMPLETION_CONTROL.with(|slot| {
+        slot.borrow_mut().take();
+    });
+    (result, control.evidence())
+}
+
+fn record_reference_publication() {
+    REFERENCE_COMPLETION_CONTROL.with(|slot| {
+        if let Some((_, control)) = slot.borrow().as_ref() {
+            control.publications.set(control.publications.get() + 1);
+        }
+    });
+}
+
+fn record_reference_lifecycle(stage: eredu_core::SpeculativeLifecycleStage) {
+    REFERENCE_COMPLETION_CONTROL.with(|slot| {
+        if let Some((_, control)) = slot.borrow().as_ref() {
+            control.lifecycle.borrow_mut().push(stage);
+        }
+    });
+}
+
+fn record_reference_restore(exact: bool) {
+    REFERENCE_COMPLETION_CONTROL.with(|slot| {
+        if let Some((_, control)) = slot.borrow().as_ref() {
+            control.restores.set(control.restores.get() + 1);
+            if exact {
+                control.exact_restores.set(control.exact_restores.get() + 1);
+            }
+        }
+    });
+}
+
 #[derive(Debug)]
-struct ReferenceExternalCompletion;
+struct ReferenceExternalCompletion {
+    mode: ReferenceCompletionMode,
+    remaining_incomplete_polls: Cell<usize>,
+    retained: Vec<ReferenceTensor>,
+    control: Option<Rc<ReferenceCompletionControl>>,
+}
+
+impl ReferenceExternalCompletion {
+    fn submit(retained: impl IntoIterator<Item = ReferenceTensor>) -> Self {
+        let retained = retained.into_iter().collect::<Vec<_>>();
+        let configured = REFERENCE_COMPLETION_CONTROL.with(|slot| slot.borrow().clone());
+        let (mode, control) = configured
+            .map(|(mode, control)| (mode, Some(control)))
+            .unwrap_or((ReferenceCompletionMode::Immediate, None));
+        if let Some(control) = &control {
+            control.submissions.set(control.submissions.get() + 1);
+        }
+        let remaining_incomplete_polls = match mode {
+            ReferenceCompletionMode::Delayed { incomplete_polls } => incomplete_polls,
+            ReferenceCompletionMode::Never => usize::MAX,
+            ReferenceCompletionMode::Immediate | ReferenceCompletionMode::FailWait => 0,
+        };
+        Self {
+            mode,
+            remaining_incomplete_polls: Cell::new(remaining_incomplete_polls),
+            retained,
+            control,
+        }
+    }
+}
 
 impl eredu_core::Completion for ReferenceExternalCompletion {
     type Error = Error;
 
     fn is_complete(&self) -> Result<bool, Self::Error> {
+        if let Some(control) = &self.control {
+            control.polls.set(control.polls.get() + 1);
+        }
+        if matches!(self.mode, ReferenceCompletionMode::Never) {
+            if let Some(control) = &self.control {
+                control
+                    .incomplete_polls
+                    .set(control.incomplete_polls.get() + 1);
+                control
+                    .retained_at_incomplete_poll
+                    .set(control.retained_at_incomplete_poll.get() + self.retained.len());
+            }
+            return Ok(false);
+        }
+        let remaining = self.remaining_incomplete_polls.get();
+        if remaining > 0 {
+            self.remaining_incomplete_polls.set(remaining - 1);
+            if let Some(control) = &self.control {
+                control
+                    .incomplete_polls
+                    .set(control.incomplete_polls.get() + 1);
+                control
+                    .retained_at_incomplete_poll
+                    .set(control.retained_at_incomplete_poll.get() + self.retained.len());
+            }
+            return Ok(false);
+        }
         Ok(true)
     }
 
     fn wait(&self) -> Result<(), Self::Error> {
+        if let Some(control) = &self.control {
+            control.waits.set(control.waits.get() + 1);
+            control
+                .retained_at_wait
+                .set(control.retained_at_wait.get() + self.retained.len());
+        }
+        if matches!(self.mode, ReferenceCompletionMode::FailWait | ReferenceCompletionMode::Never) {
+            if let Some(control) = &self.control {
+                control.failures.set(control.failures.get() + 1);
+            }
+            return Err(Error::backend(match self.mode {
+                ReferenceCompletionMode::Never => {
+                    "never-completing reference completion was quarantined"
+                }
+                _ => "injected reference exact-completion failure",
+            }));
+        }
         Ok(())
+    }
+}
+
+impl eredu_core::BoundedCompletion for ReferenceExternalCompletion {
+    fn wait_bounded(
+        self,
+        policy: eredu_core::BoundedCompletionWait,
+    ) -> Result<eredu_core::BoundedCompletionOutcome, Self::Error> {
+        if !matches!(self.mode, ReferenceCompletionMode::Never) {
+            self.wait()?;
+            return Ok(eredu_core::BoundedCompletionOutcome::Completed);
+        }
+        let deadline = std::time::Instant::now() + policy.timeout();
+        while std::time::Instant::now() < deadline {
+            assert!(!self.is_complete()?);
+            std::thread::yield_now();
+        }
+        if let Some(control) = &self.control {
+            control.quarantines.set(control.quarantines.get() + 1);
+        }
+        REFERENCE_COMPLETION_QUARANTINE.with(|quarantine| {
+            quarantine.borrow_mut().work.push(self);
+        });
+        Ok(eredu_core::BoundedCompletionOutcome::DeadlineExceeded {
+            cancellation: eredu_core::CompletionCancellationMode::QuarantineUntilComplete,
+        })
+    }
+}
+
+impl Drop for ReferenceExternalCompletion {
+    fn drop(&mut self) {
+        if let Some(control) = &self.control {
+            control.drops.set(control.drops.get() + 1);
+            control
+                .released_resources
+                .set(control.released_resources.get() + self.retained.len());
+        }
     }
 }
 
@@ -1339,6 +1619,19 @@ where
         _: Self::Context<'a>,
     ) -> Result<(), Self::Error> {
         cache.clone_from(checkpoint);
+        let exact = cache.as_ref().len() == checkpoint.as_ref().len()
+            && cache
+                .as_ref()
+                .iter()
+                .zip(checkpoint.as_ref())
+                .all(|(actual, expected)| {
+                    actual.offset == expected.offset
+                        && actual.window == expected.window
+                        && actual.resets == expected.resets
+                        && actual.fixed.as_ref().map(ReferenceTensor::shape)
+                            == expected.fixed.as_ref().map(ReferenceTensor::shape)
+                });
+        record_reference_restore(exact);
         Ok(())
     }
 
@@ -1473,12 +1766,14 @@ where
     }
 
     fn submit_completion<'a>(
-        _: impl IntoIterator<Item = &'a Self::Tensor>,
+        values: impl IntoIterator<Item = &'a Self::Tensor>,
     ) -> Result<Self::Completion, Self::Error>
     where
         Self::Tensor: 'a,
     {
-        Ok(ReferenceExternalCompletion)
+        Ok(ReferenceExternalCompletion::submit(
+            values.into_iter().cloned(),
+        ))
     }
 }
 
@@ -1539,6 +1834,7 @@ struct ReferenceProductionOutcome {
     target_tokens: usize,
     publications: usize,
     construction_stages: Vec<eredu_core::SpeculativeLifecycleStage>,
+    execution_stages: Vec<eredu_core::SpeculativeLifecycleStage>,
 }
 
 fn run_reference_embedded_scheduler(
@@ -1550,6 +1846,8 @@ fn run_reference_embedded_scheduler(
 ) -> Result<ReferenceProductionOutcome, String> {
     let mut cache = executor.new_cache().map_err(|error| error.to_string())?;
     let publications = Rc::new(Cell::new(0));
+    let execution_stages = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed_execution = execution_stages.clone();
     let runtime = SpeculativeOutputRuntime::new(
         ReferenceProductionSampling,
         GenerationSequence::new(3, []),
@@ -1558,7 +1856,12 @@ fn run_reference_embedded_scheduler(
             publications: publications.clone(),
         },
         GenerationCancellationToken::new(),
-    );
+    )
+    .with_lifecycle_observer(std::sync::Arc::new(move |stage| {
+        observed_execution.lock().unwrap().push(stage);
+        record_reference_lifecycle(stage);
+        Ok(())
+    }));
     let lane = PreparedSpeculativeLane::new(
         &mut cache,
         ReferencePreparedInput::tokens(&[9]).map_err(|error| error.to_string())?,
@@ -1587,12 +1890,14 @@ fn run_reference_embedded_scheduler(
         .take_requests()
         .pop()
         .ok_or_else(|| "reference embedded scheduler returned no request".to_owned())?;
+    let execution_stages = execution_stages.lock().unwrap().clone();
     Ok(ReferenceProductionOutcome {
         tokens: request.token_ids().to_vec(),
         accepted: request.stats().accept_lens().to_vec(),
         target_tokens: request.stats().target_tokens(),
         publications: publications.get(),
         construction_stages: Vec::new(),
+        execution_stages,
     })
 }
 
@@ -1712,6 +2017,25 @@ fn run_reference_embedded_production(
         eredu_checkpoint::store::SafetensorsWeightStore::open(artifact.path())
             .map_err(|error| error.to_string())?,
     );
+    let requirements = eredu_architectures::routed_text::routed_text_requirements(&inspection)
+        .map_err(|error| error.to_string())?;
+    let selected_target = eredu_architectures::routed_text::select_routed_text_realization(
+        &requirements,
+        &eredu_architectures::routed_text::RoutedTextSelectionRequest::new(
+            eredu_runtime::ReplicatedTextSelectionRequest::new(
+                eredu_runtime::LayerWeightResidency::FullyResident,
+                eredu_runtime::CacheResidencyPolicy::Device,
+            ),
+            eredu_runtime::WeightResidency::fully_resident(),
+        )
+        .map_err(|error| error.to_string())?,
+        &reference_text_capabilities(requirements.text()),
+    )
+    .map_err(|error| error.to_string())?;
+    let prediction_tasks = selected_target
+        .text()
+        .auxiliary_materialization_tasks()
+        .to_vec();
     let stages = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let observed = stages.clone();
     let prepared = eredu_runtime::select_and_prepare_speculative_realization_observed(
@@ -1725,7 +2049,7 @@ fn run_reference_embedded_production(
         |_| {
             eredu_architectures::prediction_extension::prepare_replicated_prediction_extension::<
                 ReferenceBackend,
-            >(&extension_plan, store.as_ref(), &(), &())
+            >(&extension_plan, &prediction_tasks, &(), &())
             .map(|prepared| RefCell::new(Some(prepared)))
             .map_err(|error| error.to_string())
         },
@@ -1748,21 +2072,6 @@ fn run_reference_embedded_production(
     .map_err(|error| format!("{error:?}"))?;
     let (selected, resources) = prepared.into_parts();
     let (_, extension, (), (), _) = resources.into_parts();
-    let requirements = eredu_architectures::routed_text::routed_text_requirements(&inspection)
-        .map_err(|error| error.to_string())?;
-    let selected_target = eredu_architectures::routed_text::select_routed_text_realization(
-        &requirements,
-        &eredu_architectures::routed_text::RoutedTextSelectionRequest::new(
-            eredu_runtime::ReplicatedTextSelectionRequest::new(
-                eredu_runtime::LayerWeightResidency::FullyResident,
-                eredu_runtime::CacheResidencyPolicy::Device,
-            ),
-            eredu_runtime::WeightResidency::fully_resident(),
-        )
-        .map_err(|error| error.to_string())?,
-        &reference_text_capabilities(requirements.text()),
-    )
-    .map_err(|error| error.to_string())?;
     let mut output = match extension_plan.kind() {
         eredu_architectures::configuration::PredictionExtensionKind::DeepSeekV3Mtp => {
             eredu_architectures::routed_text::visit_gated_routed_prediction_target_architecture::<
@@ -1988,6 +2297,8 @@ where
             > + 'run,
     {
         let publications = Rc::new(Cell::new(0));
+        let execution_stages = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed_execution = execution_stages.clone();
         let runtime = SpeculativeOutputRuntime::new(
             ReferenceProductionSampling,
             GenerationSequence::new(3, []),
@@ -1996,7 +2307,12 @@ where
                 publications: publications.clone(),
             },
             GenerationCancellationToken::new(),
-        );
+        )
+        .with_lifecycle_observer(std::sync::Arc::new(move |stage| {
+            observed_execution.lock().unwrap().push(stage);
+            record_reference_lifecycle(stage);
+            Ok(())
+        }));
         let lane = PreparedSpeculativeLane::new(
             self.cache,
             ReferencePreparedInput::tokens(&[9]).map_err(|error| error.to_string())?,
@@ -2009,9 +2325,23 @@ where
             runtime,
             SpeculativeRandomness::new(None, None),
         );
+        let completion_never = REFERENCE_COMPLETION_CONTROL.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .is_some_and(|(mode, _)| matches!(mode, ReferenceCompletionMode::Never))
+        });
+        let mut scheduler_options = SpeculativeSchedulerOptions::default().with_lookahead(false);
+        if completion_never {
+            scheduler_options = scheduler_options
+                .with_completion_wait(
+                    std::time::Duration::from_millis(1),
+                    eredu_core::CompletionCancellationMode::QuarantineUntilComplete,
+                )
+                .map_err(|error| error.to_string())?;
+        }
         let mut scheduler = SpeculativeScheduler::new(
             executor,
-            SpeculativeSchedulerOptions::default().with_lookahead(false),
+            scheduler_options,
             SpeculativeExecutionTopology::Single,
             false,
             false,
@@ -2025,12 +2355,14 @@ where
             .take_requests()
             .pop()
             .ok_or_else(|| "reference scheduler returned no request".to_owned())?;
+        let execution_stages = execution_stages.lock().unwrap().clone();
         Ok(ReferenceProductionOutcome {
             tokens: request.token_ids().to_vec(),
             accepted: request.stats().accept_lens().to_vec(),
             target_tokens: request.stats().target_tokens(),
             publications: publications.get(),
             construction_stages: Vec::new(),
+            execution_stages,
         })
     }
 }
@@ -2044,6 +2376,7 @@ fn run_reference_external_production(
     let (mut target, _target_artifact) = construct_reference_composite_target(target_config);
     let compatible = eredu_architectures::prepare_external_assistant(assistant_artifact)
         .map_err(|error| error.to_string())?
+        .select_materialization(None, |_, _| Some(eredu_runtime::WeightLoweringKind::Direct))?
         .prove_target_compatibility(&target.profile())?;
     let capture = compatible.capture().clone();
     let fingerprint = [33_u8; 32];

@@ -1396,14 +1396,16 @@ where
                 &$parameters,
             )
             .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
-            let selected = selected
-                .with_family_local_state(partition.state().cloned())
-                .map_err(CompositePartitionPreparationError::Architecture)?;
+            if selected.requirements().state() != partition.state() {
+                return Err(CompositePartitionPreparationError::Architecture(
+                    "constructed composite partition state differs from cold admission".into(),
+                ));
+            }
             $foundation(&partition).map_err(|error| {
                 CompositePartitionPreparationError::Architecture(error.to_string())
             })?;
-            let tasks = eredu_runtime::partitioned_replicated_text_materialization_tasks(
-                selected.base().execution(),
+            let tasks = eredu_runtime::partition_selected_replicated_text_materialization_tasks(
+                selected.materialization_tasks(),
                 &$parameters,
                 &partition,
             )
@@ -2198,14 +2200,17 @@ where
                 &$parameters,
             )
             .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
-            let selected = selected
-                .with_family_local_state(partition.state().cloned())
-                .map_err(CompositePartitionPreparationError::Architecture)?;
+            if selected.requirements().state() != partition.state() {
+                return Err(CompositePartitionPreparationError::Architecture(
+                    "constructed composite prediction partition state differs from cold admission"
+                        .into(),
+                ));
+            }
             $foundation(&partition).map_err(|error| {
                 CompositePartitionPreparationError::Architecture(error.to_string())
             })?;
-            let tasks = eredu_runtime::partitioned_replicated_text_materialization_tasks(
-                selected.base().execution(),
+            let tasks = eredu_runtime::partition_selected_replicated_text_materialization_tasks(
+                selected.materialization_tasks(),
                 &$parameters,
                 &partition,
             )

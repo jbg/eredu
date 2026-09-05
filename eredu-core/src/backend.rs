@@ -697,6 +697,13 @@ pub enum BoundedCompletionOutcome {
 /// safe disposition. Implementations must never return an error by merely dropping live
 /// resources.
 pub trait BoundedCompletion: Completion + Sized {
+    /// Whether this completion implementation can honor the selected disposition.
+    /// Implementations with a restricted native mechanism set must override this
+    /// so schedulers can reject unsupported policy before submission.
+    fn supports_cancellation(_cancellation: CompletionCancellationMode) -> bool {
+        true
+    }
+
     /// Observes exact completion until the policy deadline, then performs its selected
     /// safe cancellation disposition.
     fn wait_bounded(
@@ -908,11 +915,51 @@ pub trait ModelLoadingBackend: BackendProvider {
     /// realization to backend-owned materialization input.
     fn model_config(
         &self,
-        plan: ModelPreparationPlan<
-            <Self::ConfigurationResolver as ModelConfigurationResolver>::ArtifactPlan,
-        >,
-        selected: Self::SelectedPreparation,
+        selected: SelectedModelPreparation<Self>,
     ) -> Result<Self::ModelConfig, Self::Error>;
+}
+
+/// One neutral preparation plan inseparably paired with its backend selection.
+///
+/// Core creates this value only after policy, architecture, and session-capability
+/// admission have succeeded against the same artifact inspection. Backend adapters
+/// may consume the pair, but callers cannot substitute a different plan after
+/// selection.
+pub struct SelectedModelPreparation<B: ModelLoadingBackend> {
+    plan: ModelPreparationPlan<
+        <B::ConfigurationResolver as ModelConfigurationResolver>::ArtifactPlan,
+    >,
+    selected: B::SelectedPreparation,
+}
+
+impl<B: ModelLoadingBackend> SelectedModelPreparation<B> {
+    pub(crate) fn new(
+        plan: ModelPreparationPlan<
+            <B::ConfigurationResolver as ModelConfigurationResolver>::ArtifactPlan,
+        >,
+        selected: B::SelectedPreparation,
+    ) -> Self {
+        Self { plan, selected }
+    }
+
+    pub(crate) const fn plan(
+        &self,
+    ) -> &ModelPreparationPlan<<B::ConfigurationResolver as ModelConfigurationResolver>::ArtifactPlan>
+    {
+        &self.plan
+    }
+
+    /// Consumes the binding into the exact admitted plan and backend selection.
+    pub fn into_parts(
+        self,
+    ) -> (
+        ModelPreparationPlan<
+            <B::ConfigurationResolver as ModelConfigurationResolver>::ArtifactPlan,
+        >,
+        B::SelectedPreparation,
+    ) {
+        (self.plan, self.selected)
+    }
 }
 
 /// Failure while inspecting, planning, or materializing a model artifact.
@@ -969,8 +1016,20 @@ pub fn prepare_inspected_model<B: ModelLoadingBackend>(
         .validate_session_capabilities(&capabilities)
         .map_err(ModelLoadError::SessionCapability)?;
     let plan = plan_model_preparation(inspection, policy, capabilities)?;
+    prepare_selected_model(backend, SelectedModelPreparation::new(plan, selected))
+}
+
+/// Materializes an already planned artifact with its retained backend selection.
+///
+/// Selection and capability admission must have completed before the backend
+/// instance was realized. This entry point therefore performs no policy or
+/// route selection after native resources exist.
+pub(crate) fn prepare_selected_model<B: ModelLoadingBackend>(
+    backend: &B,
+    selected: SelectedModelPreparation<B>,
+) -> Result<PreparedModel<B::Model>, ModelLoadError<B::Error>> {
     let config = backend
-        .model_config(plan, selected)
+        .model_config(selected)
         .map_err(ModelLoadError::Backend)?;
     backend
         .prepare_model(config)
@@ -1060,6 +1119,7 @@ pub type SessionSubmission<B> = Submission<
 pub struct ModelRuntime<B: BackendProvider> {
     backend: B,
     session: B::Session,
+    execution_plan_target_id: Option<u64>,
 }
 
 impl<B: BackendProvider> ModelRuntime<B> {
@@ -1071,13 +1131,41 @@ impl<B: BackendProvider> ModelRuntime<B> {
 
     /// Creates the sole execution session for an already prepared model.
     pub fn from_prepared(backend: B, model: PreparedModel<B::Model>) -> Result<Self, B::Error> {
+        Self::from_prepared_with_execution_plan_target(backend, model, None)
+    }
+
+    pub(crate) fn from_prepared_execution_plan_target(
+        backend: B,
+        model: PreparedModel<B::Model>,
+        execution_plan_target_id: u64,
+    ) -> Result<Self, B::Error> {
+        Self::from_prepared_with_execution_plan_target(
+            backend,
+            model,
+            Some(execution_plan_target_id),
+        )
+    }
+
+    fn from_prepared_with_execution_plan_target(
+        backend: B,
+        model: PreparedModel<B::Model>,
+        execution_plan_target_id: Option<u64>,
+    ) -> Result<Self, B::Error> {
         let admitted = model.capabilities();
         let session = backend.create_session(model)?;
         let realized = session.capabilities();
         if admitted != realized {
             return Err(backend.session_capability_mismatch(admitted, realized));
         }
-        Ok(Self { backend, session })
+        Ok(Self {
+            backend,
+            session,
+            execution_plan_target_id,
+        })
+    }
+
+    pub(crate) const fn execution_plan_target_id(&self) -> Option<u64> {
+        self.execution_plan_target_id
     }
 
     /// Returns the selected backend.
@@ -1600,12 +1688,39 @@ where
         Ok(())
     }
 
+    fn resolve_completions_before_decode(&mut self) -> Result<(), B::Error> {
+        let existing = std::mem::take(&mut self.completions);
+        let mut remaining = existing.into_iter();
+        while let Some(completion) = remaining.next() {
+            let result = match completion.is_complete() {
+                Ok(true) => Ok(()),
+                Ok(false) => completion.wait(),
+                Err(error) => {
+                    let _ = completion.wait();
+                    Err(error)
+                }
+            };
+            if let Err(error) = result {
+                for pending in remaining {
+                    let _ = pending.wait();
+                }
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
     fn next_output(&mut self) -> Option<ControlledGenerationResult<B, C>> {
         if self.remaining_tokens == Some(0) {
             self.step = None;
             return None;
         }
         let step = self.step.take()?;
+        if matches!(step, TextGenerationStep::Decode(_)) {
+            if let Err(error) = self.resolve_completions_before_decode() {
+                return Some(Err(ControlledTextGenerationError::Backend(error)));
+            }
+        }
         let filter = match self.controller.current_filter() {
             Ok(filter) => filter,
             Err(error) => return Some(Err(ControlledTextGenerationError::Controller(error))),
@@ -1679,9 +1794,10 @@ where
 
 /// Backend-generic asynchronous token-generation iterator.
 ///
-/// Every yielded token handle may be fed into the following decode before its
-/// id is read on the host. Exact completions are retained until finished, and
-/// dropping the iterator waits for all still-retained submissions.
+/// Every yielded token handle may be fed into the following decode without
+/// first reading its id on the host. The preceding completion resolves before
+/// that state-mutating decode is submitted, and dropping the iterator waits
+/// for every still-retained submission.
 pub struct TextGeneration<'a, B: TextGenerationBackend> {
     inner: TextGenerationMachine<'a, B, UnconstrainedTokens>,
 }
@@ -2062,9 +2178,9 @@ mod tests {
 
         fn model_config(
             &self,
-            plan: ModelPreparationPlan,
-            selected: Self::SelectedPreparation,
+            selected: SelectedModelPreparation<Self>,
         ) -> Result<Self::ModelConfig, Self::Error> {
+            let (plan, selected) = selected.into_parts();
             Ok((plan, selected))
         }
     }

@@ -178,27 +178,25 @@ fn infer_native_device_identity(device: &Device) -> Result<MlxDeviceIdentity, Er
 /// this type. Architecture-specific rank-local executables are deliberately
 /// not exposed through the public loading API.
 pub struct MlxModel {
-    inner: MlxModelKind,
+    executable: Executable,
     floating_state_dtype_bytes: NonZeroU8,
     state_residency: eredu_runtime::CacheResidencyPolicy,
+    distributed: Option<MlxDistributedSession>,
     #[cfg(any(feature = "image", feature = "audio"))]
     processor: Option<ModelProcessor>,
 }
 
-pub(crate) enum MlxModelKind {
-    Complete(Executable),
-}
-
 impl MlxModel {
-    pub(crate) fn complete(
+    pub(crate) fn new(
         model: Executable,
         floating_state_dtype_bytes: NonZeroU8,
         state_residency: eredu_runtime::CacheResidencyPolicy,
     ) -> Self {
         Self {
-            inner: MlxModelKind::Complete(model),
+            executable: model,
             floating_state_dtype_bytes,
             state_residency,
+            distributed: None,
             #[cfg(any(feature = "image", feature = "audio"))]
             processor: None,
         }
@@ -215,13 +213,20 @@ impl MlxModel {
     /// Reports speculative-weight readiness to backend integration tests.
     #[cfg(test)]
     pub fn speculative_capability_for_test(&self) -> eredu_core::SpeculativeCapability {
-        match &self.inner {
-            MlxModelKind::Complete(model) => model.speculative_capability(),
-        }
+        self.executable.speculative_capability()
     }
 
-    pub(crate) fn into_kind(self) -> MlxModelKind {
-        self.inner
+    pub(crate) fn into_executable(self) -> Executable {
+        self.executable
+    }
+
+    pub(crate) fn take_distributed(&mut self) -> Option<MlxDistributedSession> {
+        self.distributed.take()
+    }
+
+    pub(crate) fn with_distributed(mut self, distributed: MlxDistributedSession) -> Self {
+        self.distributed = Some(distributed);
+        self
     }
 
     #[cfg(any(feature = "image", feature = "audio"))]
@@ -236,49 +241,25 @@ impl MlxModel {
     }
 
     #[cfg(test)]
-    /// Extracts the complete executable.
-    pub(crate) fn into_complete(self) -> Result<Executable, Error> {
-        match self.inner {
-            MlxModelKind::Complete(model) => Ok(model),
-        }
-    }
-
-    #[cfg(test)]
-    /// Returns the selected model's canonical architecture family in crate tests.
-    pub(crate) fn model_family(&self) -> eredu_architectures::ModelKind {
-        match &self.inner {
-            MlxModelKind::Complete(model) => model.model_family(),
-        }
-    }
-
-    #[cfg(test)]
     pub(crate) fn effective_model_type(&self) -> &str {
-        match &self.inner {
-            MlxModelKind::Complete(model) => model.effective_model_type(),
-        }
+        self.executable.effective_model_type()
     }
 
     /// Returns bounded parameter-residency telemetry when available.
     pub fn residency_report(&self) -> Result<Option<eredu_runtime::ResidencyReport>, Error> {
-        match &self.inner {
-            MlxModelKind::Complete(model) => model.residency_report(),
-        }
+        self.executable.residency_report()
     }
 
     /// Returns dense checkpoint-streaming telemetry when enabled.
     pub fn dense_stream_report(
         &self,
     ) -> Result<Option<eredu_runtime::DenseDiskStreamReport>, Error> {
-        match &self.inner {
-            MlxModelKind::Complete(model) => model.dense_stream_report(),
-        }
+        self.executable.dense_stream_report()
     }
 
     /// Returns load-time weight transformation telemetry when present.
     pub fn materialization_report(&self) -> Option<&eredu_runtime::WeightMaterializationReport> {
-        match &self.inner {
-            MlxModelKind::Complete(model) => model.materialization_report(),
-        }
+        self.executable.materialization_report()
     }
 
     /// Returns addressable parameter-bank residency telemetry when enabled.
@@ -288,9 +269,7 @@ impl MlxModel {
         Option<crate::backend::runtime::residency::parameter_bank::ParameterBankResidencyReport>,
         Error,
     > {
-        match &self.inner {
-            MlxModelKind::Complete(model) => model.parameter_bank_report(),
-        }
+        self.executable.parameter_bank_report()
     }
 }
 
@@ -672,13 +651,10 @@ impl ModelLoadingBackend for MlxBackend<'_> {
 
     fn model_config(
         &self,
-        plan: eredu_core::ModelPreparationPlan<
-            eredu_architectures::processor_plan::ArtifactArchitecturePlan,
-        >,
-        selected: Self::SelectedPreparation,
+        selected: eredu_core::SelectedModelPreparation<Self>,
     ) -> Result<Self::ModelConfig, Self::Error> {
         Ok(crate::composition::mlx::loading::MlxModelConfig::new(
-            plan, selected,
+            selected,
         ))
     }
 }

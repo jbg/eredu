@@ -464,10 +464,10 @@ where
 {
     /// Realizes a complete portable execution plan through the selected factory.
     ///
-    /// The factory owns device and queue construction plus translation to the
-    /// backend's opaque load policy. Generic callers never construct backend
-    /// streams, assistants, or backend-specific load options. The returned
-    /// [`PlannedModel`] owns the target and the plan's complete drafting mode.
+    /// The factory first translates and selects the backend preparation, then
+    /// owns device and queue construction. Generic callers never construct
+    /// backend streams, assistants, or backend-specific load options. The
+    /// returned [`PlannedModel`] owns the target and complete drafting mode.
     pub fn load_execution_plan<F>(
         factory: &F,
         artifact: impl AsRef<Path>,
@@ -482,8 +482,26 @@ where
         let artifact = artifact.as_ref();
         let inspection = eredu_architectures::configuration::inspect_artifact(artifact)
             .map_err(LoadedModelLoadError::Artifact)?;
+        Self::load_inspected_execution_plan(factory, inspection, plan)
+    }
+
+    pub(crate) fn load_inspected_execution_plan<F>(
+        factory: &F,
+        mut inspection: eredu_core::ArtifactInspection<
+            eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+        >,
+        plan: &eredu_core::ExecutionPlan,
+    ) -> Result<PlannedModel<B, F::Drafter>, PlannedModelLoadError<B::Error>>
+    where
+        F: eredu_core::ExecutionPlanBackendFactory<
+            Backend = B,
+            DrafterPreparation = eredu_architectures::ExternalAssistantPreparation,
+        >,
+    {
         let (tokenizer, config) =
             loaded_text_artifact(&inspection).map_err(LoadedModelLoadError::Metadata)?;
+        bind_gguf_special_token_ids(&mut inspection, &tokenizer)
+            .map_err(LoadedModelLoadError::Metadata)?;
         let target_tokenizer_fingerprint =
             eredu_text::tokenizer::vocabulary_fingerprint(&tokenizer);
         let external_artifact = match plan.drafting() {
@@ -508,9 +526,19 @@ where
             DraftingPlan::Disabled | DraftingPlan::Embedded { .. } => None,
             _ => return Err(LoadedModelLoadError::UnsupportedDraftingPlan.into()),
         };
-        let realization = eredu_core::realize_execution_plan_target(factory, plan)?;
-        let (backend, options) = realization.into_parts();
-        let model = Self::from_inspected(backend, inspection, options, tokenizer, config)?;
+        let selected = eredu_core::select_execution_plan_target(factory, plan, inspection)?;
+        let external_artifact = eredu_core::select_execution_plan_drafting(
+            factory,
+            plan,
+            &selected,
+            external_artifact,
+        )?;
+        let realization = eredu_core::realize_execution_plan_target(factory, plan, selected)?;
+        let runtime = match realization.into_runtime() {
+            Ok(runtime) => runtime,
+            Err(error) => return Err(map_model_load_error(error).into()),
+        };
+        let model = Self::from_runtime(runtime, tokenizer, config);
         let drafting = eredu_core::realize_execution_plan_drafting(
             factory,
             plan,
@@ -535,12 +563,17 @@ where
     >
     where
         F: eredu_core::ExecutionPlanBackendFactory<
-            Backend = B,
-            DrafterPreparation = eredu_architectures::ExternalAssistantPreparation,
-        >,
+                Backend = B,
+                DrafterPreparation = eredu_architectures::ExternalAssistantPreparation,
+            > + eredu_core::AutomaticPlanningBackend<
+                Inspection = eredu_core::ArtifactInspection<
+                    eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+                >,
+            >,
     {
-        let report = planner.plan(factory, request)?;
-        let model = Self::load_execution_plan(factory, &request.model_path, &report.plan)?;
+        let retained = planner.plan_retained(factory, request)?;
+        let (report, inspection) = retained.into_parts();
+        let model = Self::load_inspected_execution_plan(factory, inspection, &report.plan)?;
         Ok((model, report))
     }
 
@@ -572,26 +605,28 @@ where
         bind_gguf_special_token_ids(&mut inspection, &tokenizer)?;
         let prepared = match eredu_core::prepare_inspected_model(&backend, inspection, options) {
             Ok(prepared) => prepared,
-            Err(eredu_core::ModelLoadError::Artifact(error)) => {
-                return Err(LoadedModelLoadError::Artifact(error));
-            }
-            Err(eredu_core::ModelLoadError::Backend(error)) => {
-                return Err(LoadedModelLoadError::Backend(error));
-            }
-            Err(eredu_core::ModelLoadError::SessionCapability(error)) => {
-                return Err(LoadedModelLoadError::SessionCapability(error));
-            }
-            Err(error) => {
-                return Err(LoadedModelLoadError::Artifact(
-                    eredu_core::artifact::ArtifactError::InvalidArtifact(format!(
-                        "unsupported model-loading failure: {error}"
-                    )),
-                ));
-            }
+            Err(error) => return Err(map_model_load_error(error)),
         };
         let runtime = eredu_core::ModelRuntime::from_prepared(backend, prepared)
             .map_err(LoadedModelLoadError::Backend)?;
         Ok(Self::from_runtime(runtime, tokenizer, config))
+    }
+}
+
+fn map_model_load_error<E: std::error::Error + Send + Sync + 'static>(
+    error: eredu_core::ModelLoadError<E>,
+) -> LoadedModelLoadError<E> {
+    match error {
+        eredu_core::ModelLoadError::Artifact(error) => LoadedModelLoadError::Artifact(error),
+        eredu_core::ModelLoadError::Backend(error) => LoadedModelLoadError::Backend(error),
+        eredu_core::ModelLoadError::SessionCapability(error) => {
+            LoadedModelLoadError::SessionCapability(error)
+        }
+        error => {
+            LoadedModelLoadError::Artifact(eredu_core::artifact::ArtifactError::InvalidArtifact(
+                format!("unsupported model-loading failure: {error}"),
+            ))
+        }
     }
 }
 

@@ -1038,6 +1038,20 @@ impl PredictionExtensionPlan {
         &self.complete_architecture
     }
 
+    /// Returns whether two opaque values came from the same admitted extension contract.
+    ///
+    /// Normalized kind/depth, architecture family, checkpoint schema, and exact
+    /// resolved source set jointly form the cold admission identity. Callers do
+    /// not compare or reconstruct family configuration.
+    pub fn same_admission(&self, other: &Self) -> bool {
+        self.kind == other.kind
+            && self.depth == other.depth
+            && self.complete_architecture.model_kind() == other.complete_architecture.model_kind()
+            && self.complete_architecture.checkpoint() == other.complete_architecture.checkpoint()
+            && self.complete_architecture.checkpoint_resolution()
+                == other.complete_architecture.checkpoint_resolution()
+    }
+
     /// Returns the exact admitted physical sources owned only by this extension.
     ///
     /// The target projection and complete artifact share one already-admitted

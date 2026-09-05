@@ -8,8 +8,9 @@ pub mod scheduler;
 pub use scheduler::SpeculativeComponentTimingGuard;
 
 use eredu_core::{
-    Completion, SamplingPlacement, SpeculativeDraftRandomPosition, SpeculativeExecutionTopology,
-    SpeculativeSampling, TokenizerCompatibilityProof,
+    BoundedCompletion, BoundedCompletionOutcome, BoundedCompletionWait, Completion,
+    CompletionCancellationMode, SamplingPlacement, SpeculativeDraftRandomPosition,
+    SpeculativeExecutionTopology, SpeculativeSampling, TokenizerCompatibilityProof,
 };
 use eredu_runtime::{
     SelectedSpeculativeRealization, SpeculativeMechanism, SpeculativeMechanismCapabilities,
@@ -22,13 +23,14 @@ use safemlx::{
     transforms::{async_eval_with_event, eval},
     Array, Event, Stream,
 };
+use std::cell::RefCell;
 
 use crate::{
     backend::error::Error,
     backend::nn::shared::{MlxModule, MlxNeuralBackend},
     backend::random::RandomState,
     backend::runtime::generation::MlxSamplingBackend,
-    MlxLoadRequest, MlxTensor,
+    MlxTensor,
 };
 
 /// Reports only generic mechanisms available to neutral speculative selection.
@@ -70,9 +72,9 @@ pub(crate) struct MlxExternalAssistant<A: eredu_architectures::ExternalAssistant
 }
 
 pub(crate) struct MlxAssistantPreparationVisitor {
-    options: MlxLoadRequest,
     stream: Stream,
     weights_stream: Stream,
+    max_cached_shards: usize,
 }
 
 impl eredu_architectures::ExternalAssistantPreparationVisitor for MlxAssistantPreparationVisitor {
@@ -81,125 +83,117 @@ impl eredu_architectures::ExternalAssistantPreparationVisitor for MlxAssistantPr
 
     fn visit<A: eredu_architectures::ExternalAssistantArchitecture>(
         self,
-        prepared: eredu_architectures::PreparedExternalAssistant<A>,
+        prepared: eredu_architectures::SelectedExternalAssistant<A>,
     ) -> Result<Self::Output<A>, Self::Error> {
         materialize_external_assistant::<A>(
             prepared,
-            self.options,
             &self.stream,
             &self.weights_stream,
+            self.max_cached_shards,
         )
     }
 }
 
 fn materialize_external_assistant<A: eredu_architectures::ExternalAssistantArchitecture>(
-    prepared: eredu_architectures::PreparedExternalAssistant<A>,
-    options: MlxLoadRequest,
+    prepared: eredu_architectures::SelectedExternalAssistant<A>,
     stream: &Stream,
     weights_stream: &Stream,
+    max_cached_shards: usize,
 ) -> Result<MlxExternalAssistant<A>, Error> {
     use crate::backend::runtime::{
-        checkpoint::{
-            binding::{
-                build_module_bindings, materialize_module_bindings,
-                populate_module_from_arrays_excluding,
-            },
-            load::{gguf_metadata, gguf_quantization_configs},
-            quantization::should_quantize_on_load,
+        checkpoint::binding::{
+            build_exact_replicated_text_bindings, materialize_module_bindings,
+            populate_module_from_arrays_excluding,
         },
-        execution::layerwise::quantize_parameterized_module_store,
+        execution::layerwise::quantize_exact_replicated_text_tasks,
     };
     use std::sync::Arc;
 
-    let quantization = options.weight_quantization()?;
-    if !options.weight_residency.is_fully_resident() {
-        return Err(Error::ArchitectureModel(
-            "external assistants require fully resident weights".into(),
-        ));
-    }
-    if options
-        .parallel_topology()
-        .is_some_and(|topology| !topology.is_replicated())
-    {
-        return Err(Error::Parallel(
-            "external assistants require replicated placement".into(),
-        ));
-    }
-    let (checkpoint, source_config) = prepared.into_parts();
-    let (store, source_config) = match checkpoint {
+    let (checkpoint, source_config, config, tasks) = prepared.into_parts();
+    let store = match checkpoint {
         eredu_architectures::ExternalAssistantCheckpoint::SafeTensors {
             source,
             catalog,
             plan,
             resolution,
-        } => {
-            let store = crate::composition::mlx::artifact::open_prepared_safetensors_checkpoint(
-                &source,
-                catalog,
-                &plan,
-                &resolution,
-                options.weight_residency.max_cached_shards(),
-            )?;
-            (store, source_config)
-        }
+        } => crate::composition::mlx::artifact::open_prepared_safetensors_checkpoint(
+            &source,
+            catalog,
+            &plan,
+            &resolution,
+            max_cached_shards,
+        )?,
         eredu_architectures::ExternalAssistantCheckpoint::Gguf {
             checkpoint,
             resolution,
             tensor_mapping,
         } => {
-            let mlx_checkpoint =
-                crate::backend::runtime::checkpoint::gguf::GgufCheckpoint::from_portable(
-                    checkpoint.clone(),
-                );
-            let metadata = gguf_metadata(&mlx_checkpoint);
-            let formats = gguf_quantization_configs(&mlx_checkpoint, &tensor_mapping)?;
-            let source_config = A::with_checkpoint_formats(&source_config, formats)
-                .map_err(Error::ArchitectureModel)?;
-            crate::composition::mlx::validate_gguf_quantization_source(
-                &mlx_checkpoint,
-                &metadata,
-                quantization,
-            )?;
             let store: eredu_checkpoint::store::SharedCheckpointSource = Arc::new(
                 eredu_checkpoint::gguf_store::GgufWeightStore::builder()
-                    .max_cached_readers(options.weight_residency.max_cached_shards())?
+                    .max_cached_readers(max_cached_shards)?
                     .add_resolved_checkpoint(checkpoint, &resolution, &tensor_mapping)?
                     .build()?,
             );
-            (store, source_config)
+            store
         }
     };
-    let requested = quantization
-        .map(|requested| {
-            should_quantize_on_load(
-                A::configuration_model_type(&source_config),
-                A::quantization(&source_config),
-                requested,
+    let mut store = store;
+    let transformed = tasks
+        .iter()
+        .filter(|task| {
+            matches!(
+                task.lowering(),
+                eredu_runtime::WeightLoweringKind::Transform
+                    | eredu_runtime::WeightLoweringKind::DerivedTransform
             )
-            .map(|required| required.then_some(requested))
         })
-        .transpose()?
-        .flatten();
-    let config = requested
-        .map(|requested| {
-            A::load_time_quantization(&source_config, requested).map_err(Error::ArchitectureModel)
-        })
-        .transpose()?
-        .unwrap_or_else(|| source_config.clone());
-    let store = if let Some(requested) = requested {
+        .collect::<Vec<_>>();
+    if !transformed.is_empty() {
         let source = A::module::<MlxNeuralBackend>(source_config, stream)
             .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         let target = A::module::<MlxNeuralBackend>(config.clone(), stream)
             .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        quantize_parameterized_module_store(store, &source, &target, requested, stream)?.0
-    } else {
-        store
-    };
+        let mut groups = Vec::<(eredu_checkpoint::WeightQuantization, Vec<_>)>::new();
+        for task in transformed {
+            let format = task.executable().weight_quantization().ok_or_else(|| {
+                Error::Quantization(format!(
+                    "selected external assistant transform {:?} has no packed format",
+                    task.name()
+                ))
+            })?;
+            if let Some((_, grouped)) = groups.iter_mut().find(|(selected, _)| *selected == format)
+            {
+                grouped.push(task);
+            } else {
+                groups.push((format, vec![task]));
+            }
+        }
+        for (format, grouped) in groups {
+            store = quantize_exact_replicated_text_tasks(
+                store,
+                &source,
+                &target,
+                &[] as &[A::Module<MlxNeuralBackend>],
+                &[],
+                None,
+                format,
+                &grouped,
+                stream,
+            )?
+            .0;
+        }
+    }
     let mut module = MlxModule::new(
         A::module::<MlxNeuralBackend>(config.clone(), stream)
             .map_err(|error| Error::ArchitectureModel(error.to_string()))?,
     );
-    let bindings = build_module_bindings(&module, "", store.as_ref())?;
+    let task_refs = tasks.iter().collect::<Vec<_>>();
+    let bindings = build_exact_replicated_text_bindings(
+        &module,
+        store.as_ref(),
+        &task_refs,
+        &std::collections::BTreeSet::new(),
+    )?;
     let arrays = materialize_module_bindings(store.as_ref(), &bindings, weights_stream, stream)?;
     populate_module_from_arrays_excluding(&mut module, &arrays, |_| false)?;
     Ok(MlxExternalAssistant {
@@ -241,7 +235,7 @@ impl MlxDrafter {
     pub(crate) fn materialize_with_compatibility(
         preparation: eredu_architectures::CompatibleExternalAssistantPreparation,
         tokenizer_compatibility: TokenizerCompatibilityProof,
-        options: MlxLoadRequest,
+        max_cached_shards: usize,
         stream: &Stream,
         weights_stream: &Stream,
         selected: SelectedSpeculativeRealization,
@@ -259,9 +253,9 @@ impl MlxDrafter {
         }
         let capture = preparation.capture().clone();
         let assistant = preparation.visit(MlxAssistantPreparationVisitor {
-            options,
             stream: stream.clone(),
             weights_stream: weights_stream.clone(),
+            max_cached_shards,
         })?;
         Ok(Self {
             assistant,
@@ -495,6 +489,90 @@ impl Completion for MlxSpeculativeCompletion {
 
     fn wait(&self) -> Result<(), Self::Error> {
         self.event.synchronize()
+    }
+}
+
+#[derive(Default)]
+struct SpeculativeCompletionQuarantine {
+    work: Vec<MlxSpeculativeCompletion>,
+}
+
+impl SpeculativeCompletionQuarantine {
+    fn reap(&mut self) {
+        self.work
+            .retain(|completion| !matches!(completion.is_complete(), Ok(true) | Err(_)));
+    }
+}
+
+impl Drop for SpeculativeCompletionQuarantine {
+    fn drop(&mut self) {
+        self.reap();
+        for completion in self.work.drain(..) {
+            let _ = completion.wait();
+        }
+    }
+}
+
+thread_local! {
+    static SPECULATIVE_COMPLETION_ORPHANS: RefCell<SpeculativeCompletionQuarantine> =
+        RefCell::new(SpeculativeCompletionQuarantine::default());
+}
+
+fn reap_speculative_completion_orphans() {
+    let empty = SPECULATIVE_COMPLETION_ORPHANS.try_with(|orphans| {
+        if let Ok(mut orphans) = orphans.try_borrow_mut() {
+            orphans.reap();
+            return orphans.work.is_empty();
+        }
+        false
+    });
+    if matches!(empty, Ok(true)) {
+        safemlx::unregister_thread_runtime_housekeeping(reap_speculative_completion_orphans);
+    }
+}
+
+fn quarantine_speculative_completion(completion: MlxSpeculativeCompletion) {
+    safemlx::register_thread_runtime_housekeeping(reap_speculative_completion_orphans);
+    SPECULATIVE_COMPLETION_ORPHANS.with(|orphans| {
+        let mut orphans = orphans.borrow_mut();
+        orphans.reap();
+        orphans.work.push(completion);
+    });
+}
+
+impl BoundedCompletion for MlxSpeculativeCompletion {
+    fn supports_cancellation(cancellation: CompletionCancellationMode) -> bool {
+        cancellation == CompletionCancellationMode::QuarantineUntilComplete
+    }
+
+    fn wait_bounded(
+        self,
+        policy: BoundedCompletionWait,
+    ) -> Result<BoundedCompletionOutcome, Self::Error> {
+        let Some(deadline) = std::time::Instant::now().checked_add(policy.timeout()) else {
+            quarantine_speculative_completion(self);
+            return Err(Exception::custom(
+                "speculative completion deadline exceeds the host monotonic clock range; live work was quarantined safely",
+            ));
+        };
+        loop {
+            if self.is_complete()? {
+                return Ok(BoundedCompletionOutcome::Completed);
+            }
+            if std::time::Instant::now() >= deadline {
+                let selected = policy.cancellation();
+                quarantine_speculative_completion(self);
+                if selected != CompletionCancellationMode::QuarantineUntilComplete {
+                    return Err(Exception::custom(
+                        "MLX speculative execution has no native cancellation; timed-out work was quarantined safely",
+                    ));
+                }
+                return Ok(BoundedCompletionOutcome::DeadlineExceeded {
+                    cancellation: CompletionCancellationMode::QuarantineUntilComplete,
+                });
+            }
+            std::thread::yield_now();
+        }
     }
 }
 
@@ -783,15 +861,18 @@ fn array_probability_at(
     token: u32,
     stream: &Stream,
 ) -> Result<f32, Exception> {
-    if token as i32 >= probabilities.dim(-1) {
+    let vocabulary = probabilities.dim(-1);
+    if vocabulary <= 0 || u64::from(token) >= vocabulary as u64 {
         return Err(Exception::custom(format!(
             "sampled token {token} exceeds vocabulary size {}",
-            probabilities.dim(-1)
+            vocabulary
         )));
     }
+    let token = i32::try_from(token)
+        .map_err(|_| Exception::custom("sampled token exceeds the index domain"))?;
     let value = match probabilities.ndim() {
-        2 => probabilities.try_index_device((0, token as i32), stream)?,
-        3 => probabilities.try_index_device((0, 0, token as i32), stream)?,
+        2 => probabilities.try_index_device((0, token), stream)?,
+        3 => probabilities.try_index_device((0, 0, token), stream)?,
         ndim => {
             return Err(Exception::custom(format!(
                 "speculative distribution must be rank 2 or 3, got rank {ndim}"
@@ -813,7 +894,16 @@ mod completion_tests {
     use eredu_core::Completion;
     use safemlx::{Array, Device, DeviceType, Stream};
 
-    use super::MlxSpeculativeCompletion;
+    use super::{array_probability_at, MlxSpeculativeCompletion};
+
+    #[test]
+    fn probability_lookup_rejects_tokens_outside_the_i32_vocabulary_before_indexing() {
+        let stream = Stream::try_new_with_device(&Device::new(DeviceType::Cpu, 0)).unwrap();
+        let probabilities = Array::from_slice(&[0.25_f32, 0.75], &[1, 2]);
+
+        let error = array_probability_at(&probabilities, u32::MAX, &stream).unwrap_err();
+        assert!(error.to_string().contains("exceeds vocabulary size 2"));
+    }
 
     #[test]
     fn native_speculative_completion_retains_every_submitted_array_handle() {
@@ -834,19 +924,15 @@ mod completion_tests {
 
 #[cfg(test)]
 mod external_materialization_tests {
-    use std::io::Write;
-
     use eredu_architectures::{
         gemma4, ExternalAssistantArchitecture, ExternalAssistantTargetProfile,
         MaterializedExternalAssistantVisitor,
     };
     use eredu_checkpoint::schema::StoredDtypeConstraint;
-    use eredu_runtime::{LayerwiseLoadOptions, WeightResidency};
     use safemlx::{Device, DeviceType, Stream};
     use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
 
     use super::{MlxAssistantPreparationVisitor, MlxExternalAssistant};
-    use crate::MlxLoadRequest;
 
     const ASSISTANT_CONFIG: &str = r#"{
       "model_type":"gemma4_assistant","backbone_hidden_size":32,
@@ -856,18 +942,6 @@ mod external_materialization_tests {
         "num_key_value_heads":2,"head_dim":8,"rms_norm_eps":0.00001,
         "vocab_size":32,"max_position_embeddings":128,"tie_word_embeddings":false,
         "attention_k_eq_v":false,"layer_types":["full_attention"]}
-    }"#;
-
-    const MUSE_ASSISTANT_CONFIG: &str = r#"{
-      "model_type":"muse_glimmer_assistant","hidden_size":6656,
-      "intermediate_size":19968,"num_hidden_layers":5,"num_attention_heads":32,
-      "num_key_value_heads":8,"head_dim":128,"rms_norm_eps":0.000001,
-      "max_position_embeddings":131072,"sliding_window":2048,"block_size":16,
-      "mask_token_id":201818,"target_layer_ids":[1,13,25,37,49],
-      "layer_types":["sliding_attention","sliding_attention","sliding_attention",
-                     "sliding_attention","sliding_attention"],
-      "hidden_act":"silu","attention_dropout":0.0,
-      "rope_parameters":{"rope_theta":500000.0}
     }"#;
 
     fn assistant_artifact() -> tempfile::TempDir {
@@ -898,49 +972,6 @@ mod external_materialization_tests {
         directory
     }
 
-    fn sparse_muse_assistant_artifact() -> tempfile::TempDir {
-        let directory = tempfile::tempdir().unwrap();
-        std::fs::write(directory.path().join("config.json"), MUSE_ASSISTANT_CONFIG).unwrap();
-        let config = eredu_architectures::muse_glimmer::DFlashConfig::from_hf_json(
-            MUSE_ASSISTANT_CONFIG.as_bytes(),
-        )
-        .unwrap();
-        let plan = eredu_architectures::muse_glimmer::dflash_safetensors_plan(&config).unwrap();
-        let mut offset = 0_u64;
-        let mut header = serde_json::Map::new();
-        for tensor in plan.common_tensors {
-            assert_eq!(tensor.dtype, StoredDtypeConstraint::Floating);
-            let bytes = tensor
-                .shape
-                .iter()
-                .try_fold(4_u64, |bytes, dimension| {
-                    bytes.checked_mul(u64::try_from(*dimension).unwrap())
-                })
-                .unwrap();
-            let end = offset.checked_add(bytes).unwrap();
-            header.insert(
-                tensor.key,
-                serde_json::json!({
-                    "dtype": "F32",
-                    "shape": tensor.shape,
-                    "data_offsets": [offset, end],
-                }),
-            );
-            offset = end;
-        }
-        let mut header = serde_json::to_vec(&header).unwrap();
-        while !header.len().is_multiple_of(8) {
-            header.push(b' ');
-        }
-        let path = directory.path().join("model.safetensors");
-        let mut file = std::fs::File::create(path).unwrap();
-        let header_len = u64::try_from(header.len()).unwrap();
-        file.write_all(&header_len.to_le_bytes()).unwrap();
-        file.write_all(&header).unwrap();
-        file.set_len(8 + header_len + offset).unwrap();
-        directory
-    }
-
     fn target_profile() -> ExternalAssistantTargetProfile {
         let assistant = gemma4::AssistantConfig::from_json(ASSISTANT_CONFIG.as_bytes()).unwrap();
         let mut text = assistant.text_config;
@@ -960,47 +991,30 @@ mod external_materialization_tests {
         })
     }
 
-    fn muse_target_profile() -> ExternalAssistantTargetProfile {
-        let target = serde_json::json!({
-            "architectures":["MuseGlimmerForConditionalGeneration"],
-            "model_type":"muse_glimmer","image_token_id":22,"video_token_id":23,
-            "out_hidden_size":32,"projector_hidden_size":16,
-            "text_config":{
-                "model_type":"muse_glimmer_text","hidden_size":16,"num_hidden_layers":2,
-                "intermediate_size":24,"num_attention_heads":4,"num_key_value_heads":2,
-                "head_dim":4,"rms_norm_eps":0.00001,"post_norm_eps":0.00001,
-                "vocab_size":24,"max_position_embeddings":64,"rope_theta":10000.0,
-                "layer_types":["sliding_attention","full_attention"],
-                "layer_rope_theta":[10000.0,0.0],"sliding_window":8,
-                "tie_word_embeddings":false,"hidden_act":"silu","attention_dropout":0.0,
-                "qk_scale_factor":1.0,"output_multiplier":1.0,
-                "final_logit_softcapping":30.0
-            },
-            "vision_config":{
-                "model_type":"muse_glimmer_vision","hidden_size":8,
-                "intermediate_size":12,"num_attention_heads":2,"num_hidden_layers":1,
-                "patch_size":2,"patch_temporal":1,"merge_size":2,
-                "pos_emb_height":2,"pos_emb_width":2,"max_position_embeddings":4,
-                "layer_norm_eps":0.00001,"hidden_act":"gelu",
-                "layer_types":["full_attention"],
-                "rope_parameters":{"rope_theta":10000.0,"rope_type":"default"}
-            }
-        });
-        let mut target =
-            eredu_architectures::muse_glimmer::DecoderConfig::from_hf_value(&target).unwrap();
-        target.hidden_size = 6656;
-        target.num_hidden_layers = 50;
-        target.vocab_size = 201819;
-        target.max_position_embeddings = 131072;
-        ExternalAssistantTargetProfile::MuseGlimmer(target)
-    }
-
-    fn visitor(options: MlxLoadRequest, stream: &Stream) -> MlxAssistantPreparationVisitor {
+    fn visitor(stream: &Stream) -> MlxAssistantPreparationVisitor {
         MlxAssistantPreparationVisitor {
-            options,
             stream: stream.clone(),
             weights_stream: stream.clone(),
+            max_cached_shards: eredu_checkpoint::store::DEFAULT_MAX_CACHED_SHARDS,
         }
+    }
+
+    fn selected(
+        preparation: eredu_architectures::ExternalAssistantPreparation,
+        quantization: Option<eredu_core::QuantizationRequest>,
+    ) -> eredu_architectures::SelectedExternalAssistantPreparation {
+        preparation
+            .select_materialization(quantization, |descriptor, transforms| {
+                if transforms && super::super::replicated_text::supports_transform(descriptor) {
+                    Some(eredu_runtime::WeightLoweringKind::Transform)
+                } else if !transforms && super::super::replicated_text::supports_direct(descriptor)
+                {
+                    Some(eredu_runtime::WeightLoweringKind::Direct)
+                } else {
+                    None
+                }
+            })
+            .unwrap()
     }
 
     struct InspectMaterialized;
@@ -1022,16 +1036,16 @@ mod external_materialization_tests {
     #[test]
     fn family_blind_mlx_materializer_revalidates_catalog_without_reloading_target() {
         let artifact = assistant_artifact();
-        let compatible = eredu_architectures::prepare_external_assistant(artifact.path())
-            .unwrap()
-            .prove_target_compatibility(&target_profile())
-            .unwrap();
+        let compatible = selected(
+            eredu_architectures::prepare_external_assistant(artifact.path()).unwrap(),
+            None,
+        )
+        .prove_target_compatibility(&target_profile())
+        .unwrap();
         let stream = Stream::try_new_with_device(&Device::new(DeviceType::Cpu, 0)).unwrap();
         crate::composition::mlx::path_instrumentation::reset();
 
-        let mut materialized = compatible
-            .visit(visitor(MlxLoadRequest::default(), &stream))
-            .unwrap();
+        let mut materialized = compatible.visit(visitor(&stream)).unwrap();
         assert_eq!(
             materialized.visit(InspectMaterialized),
             ("gemma4_assistant".into(), None)
@@ -1044,19 +1058,16 @@ mod external_materialization_tests {
     #[test]
     fn family_blind_mlx_materializer_applies_architecture_load_time_format() {
         let artifact = assistant_artifact();
-        let compatible = eredu_architectures::prepare_external_assistant(artifact.path())
-            .unwrap()
-            .prove_target_compatibility(&target_profile())
-            .unwrap();
+        let compatible = selected(
+            eredu_architectures::prepare_external_assistant(artifact.path()).unwrap(),
+            Some(eredu_core::QuantizationRequest::MxFp4),
+        )
+        .prove_target_compatibility(&target_profile())
+        .unwrap();
         let stream = Stream::try_new_with_device(&Device::new(DeviceType::Cpu, 0)).unwrap();
         crate::composition::mlx::path_instrumentation::reset();
 
-        let mut materialized = compatible
-            .visit(visitor(
-                MlxLoadRequest::with_quantization(eredu_core::QuantizationRequest::MxFp4),
-                &stream,
-            ))
-            .unwrap();
+        let mut materialized = compatible.visit(visitor(&stream)).unwrap();
         assert_eq!(
             materialized.visit(InspectMaterialized),
             (
@@ -1070,42 +1081,93 @@ mod external_materialization_tests {
     }
 
     #[test]
-    fn nonresident_gemma_and_muse_policies_fail_before_payload_or_target_work() {
-        fn assert_rejected(
-            compatible: eredu_architectures::CompatibleExternalAssistantPreparation,
-            stream: &Stream,
-        ) {
-            let options = MlxLoadRequest::default().with_weight_residency(
-                WeightResidency::layerwise_host(LayerwiseLoadOptions::default()),
-            );
-            crate::composition::mlx::path_instrumentation::reset();
+    fn unsupported_target_lowering_fails_before_native_resources() {
+        let plan = eredu_core::ExecutionPlan::fully_resident(
+            eredu_core::DevicePlan::new("mlx", "cpu:0").unwrap(),
+        )
+        .with_weight_transformation(eredu_core::WeightTransformationPlan::Affine {
+            bits: 4,
+            group_size: 32_768,
+        })
+        .with_drafting(eredu_core::DraftingPlan::External {
+            model: "unopened-assistant".into(),
+            placement: eredu_core::DraftPlacementPlan::Target,
+            max_draft_tokens: 2,
+            lookahead: false,
+            adaptive_lookahead: false,
+        });
+        let target = super::super::replicated_text::tests::tiny_artifact("llama", false);
+        let inspection = eredu_architectures::configuration::inspect_artifact(target.path())
+            .expect("tiny target inspection");
+        let factory = crate::composition::mlx::automatic::MlxBackendFactory::default();
+        crate::composition::mlx::path_instrumentation::reset();
 
-            let error = match compatible.visit(visitor(options, stream)) {
-                Ok(_) => panic!("nonresident external assistant unexpectedly materialized"),
-                Err(error) => error,
-            };
-            assert!(error
-                .to_string()
-                .contains("external assistants require fully resident weights"));
-            let counts = crate::composition::mlx::path_instrumentation::snapshot();
-            assert_eq!(counts.payload_opens, 0);
-            assert_eq!(counts.constructors, 0);
-            assert_eq!(counts.materializations, 0);
-        }
+        let error = match eredu_core::select_execution_plan_target(&factory, &plan, inspection) {
+            Ok(_) => panic!("invalid target packing geometry unexpectedly selected"),
+            Err(error) => error,
+        };
 
-        let stream = Stream::try_new_with_device(&Device::new(DeviceType::Cpu, 0)).unwrap();
-        let gemma = assistant_artifact();
-        let gemma = eredu_architectures::prepare_external_assistant(gemma.path())
-            .unwrap()
-            .prove_target_compatibility(&target_profile())
-            .unwrap();
-        assert_rejected(gemma, &stream);
+        assert!(
+            error.to_string().contains("select_model_preparation"),
+            "{error}"
+        );
+        assert_eq!(
+            crate::composition::mlx::path_instrumentation::target_native_resource_realization_attempts(),
+            0
+        );
+        let counts = crate::composition::mlx::path_instrumentation::snapshot();
+        assert_eq!(counts.payload_opens, 0);
+        assert_eq!(counts.constructors, 0);
+        assert_eq!(counts.materializations, 0);
+    }
 
-        let muse = sparse_muse_assistant_artifact();
-        let muse = eredu_architectures::prepare_external_assistant(muse.path())
-            .unwrap()
-            .prove_target_compatibility(&muse_target_profile())
-            .unwrap();
-        assert_rejected(muse, &stream);
+    #[test]
+    fn incompatible_target_assistant_pair_fails_before_native_target_resources() {
+        let assistant = assistant_artifact();
+        let target = super::super::replicated_text::tests::tiny_artifact("llama", false);
+        let plan = eredu_core::ExecutionPlan::fully_resident(
+            eredu_core::DevicePlan::new("mlx", "cpu:0").unwrap(),
+        )
+        .with_drafting(eredu_core::DraftingPlan::External {
+            model: assistant.path().display().to_string(),
+            placement: eredu_core::DraftPlacementPlan::Target,
+            max_draft_tokens: 2,
+            lookahead: false,
+            adaptive_lookahead: false,
+        });
+        let factory = crate::composition::mlx::automatic::MlxBackendFactory::default();
+        let inspection = eredu_architectures::configuration::inspect_artifact(target.path())
+            .expect("tiny target inspection");
+        let selected_target = eredu_core::select_execution_plan_target(&factory, &plan, inspection)
+            .expect("ordinary target selection");
+        let preparation = eredu_architectures::prepare_external_assistant(assistant.path())
+            .expect("assistant inspection");
+        crate::composition::mlx::path_instrumentation::reset();
+
+        let error = eredu_core::select_execution_plan_drafting(
+            &factory,
+            &plan,
+            &selected_target,
+            Some(eredu_core::ExternalDraftArtifact {
+                preparation,
+                tokenizer_compatibility: eredu_core::TokenizerCompatibilityProof::prove(
+                    [3; 32], [3; 32],
+                )
+                .unwrap(),
+            }),
+        )
+        .expect_err("Llama has no external-assistant target contract");
+
+        assert!(error
+            .to_string()
+            .contains("does not admit an external assistant"));
+        assert_eq!(
+            crate::composition::mlx::path_instrumentation::target_native_resource_realization_attempts(),
+            0
+        );
+        let counts = crate::composition::mlx::path_instrumentation::snapshot();
+        assert_eq!(counts.payload_opens, 0);
+        assert_eq!(counts.constructors, 0);
+        assert_eq!(counts.materializations, 0);
     }
 }

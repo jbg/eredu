@@ -2,20 +2,21 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs,
+    fs::File,
+    io::{Read, Seek, SeekFrom},
     ops::Range,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering},
         Arc, Mutex, MutexGuard,
     },
 };
 
-use crate::{safetensors::SafetensorsShards, StoredDtype};
-use safetensors::{
-    tensor::{Dtype, Metadata, TensorInfo},
-    SafeTensors,
+use crate::{
+    safetensors::{SafetensorsShards, MAX_HEADER_BYTES},
+    StoredDtype,
 };
+use safetensors::tensor::{Dtype, Metadata, TensorInfo};
 
 /// Catalog metadata for one logical checkpoint tensor.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -832,16 +833,16 @@ pub enum StoreError {
 pub const DEFAULT_MAX_CACHED_SHARDS: usize = 4;
 
 #[derive(Debug)]
-struct BufferedShard {
+struct CachedShard {
     path: PathBuf,
-    bytes: Vec<u8>,
     metadata: Metadata,
     payload_offset: usize,
+    full_tensors: Mutex<BTreeMap<String, Arc<[u8]>>>,
 }
 
 #[derive(Debug)]
 struct CacheEntry {
-    shard: Arc<BufferedShard>,
+    shard: Arc<CachedShard>,
     last_used: u64,
 }
 
@@ -862,28 +863,20 @@ struct SafetensorsReadTelemetry {
     physical_read_bytes: AtomicU64,
 }
 
-#[derive(Debug)]
-struct SafetensorsReadReceipt {
-    telemetry: Arc<SafetensorsReadTelemetry>,
-    counted: AtomicBool,
-}
-
 #[derive(Debug, Clone)]
 struct CatalogEntry {
     shard: PathBuf,
 }
 
-/// Encoded SafeTensors selection retaining its backing shard buffer.
+/// Encoded SafeTensors selection retaining its cached shard metadata.
 #[derive(Debug, Clone)]
 pub struct SafetensorsLease {
     metadata: TensorMetadata,
     selection: TensorSelection,
     output_shape: Vec<usize>,
     proof: BoundedReadProof,
-    shard: Arc<BufferedShard>,
-    buffered_span: Range<usize>,
-    selected_bytes: Option<Arc<[u8]>>,
-    read_receipt: Arc<SafetensorsReadReceipt>,
+    shard: Arc<CachedShard>,
+    bytes: Arc<[u8]>,
 }
 
 impl EncodedTensorLease for SafetensorsLease {
@@ -908,23 +901,7 @@ impl EncodedTensorLease for SafetensorsLease {
     }
 
     fn encoded_bytes(&self) -> Option<&[u8]> {
-        let bytes = match &self.selected_bytes {
-            Some(bytes) => Some(bytes.as_ref()),
-            None => self.shard.bytes.get(self.buffered_span.clone()),
-        };
-        if let Some(bytes) = bytes {
-            if !self.read_receipt.counted.swap(true, Ordering::AcqRel) {
-                self.read_receipt
-                    .telemetry
-                    .physical_reads
-                    .fetch_add(1, Ordering::Relaxed);
-                self.read_receipt
-                    .telemetry
-                    .physical_read_bytes
-                    .fetch_add(bytes.len() as u64, Ordering::Relaxed);
-            }
-        }
-        bytes
+        Some(&self.bytes)
     }
 }
 
@@ -1030,7 +1007,7 @@ impl SafetensorsWeightStore {
             .map_err(|_| StoreError::Internal("checkpoint shard cache is poisoned".into()))
     }
 
-    fn acquire_shard(&self, entry: &CatalogEntry) -> Result<Arc<BufferedShard>, StoreError> {
+    fn acquire_shard(&self, entry: &CatalogEntry) -> Result<Arc<CachedShard>, StoreError> {
         let canonical_path = entry.shard.clone();
         let mut cache = self.lock_cache()?;
         cache.tick = cache.tick.saturating_add(1);
@@ -1068,24 +1045,12 @@ impl SafetensorsWeightStore {
                 });
             }
         }
-        let bytes = fs::read(&canonical_path).map_err(|error| fs_error(&entry.shard, error))?;
-        let (header_len, metadata) = SafeTensors::read_metadata(&bytes).map_err(|error| {
-            StoreError::MalformedSafetensors {
-                path: entry.shard.clone(),
-                message: error.to_string(),
-            }
-        })?;
-        let payload_offset =
-            8usize
-                .checked_add(header_len)
-                .ok_or_else(|| StoreError::Overflow {
-                    context: format!("payload offset for {}", entry.shard.display()),
-                })?;
-        let shard = Arc::new(BufferedShard {
+        let (payload_offset, metadata) = read_safetensors_metadata(&canonical_path)?;
+        let shard = Arc::new(CachedShard {
             path: entry.shard.clone(),
-            bytes,
             metadata,
             payload_offset,
+            full_tensors: Mutex::new(BTreeMap::new()),
         });
         if let Some(expected) = self.indexed_shards.get(&shard.path) {
             let actual = shard
@@ -1195,54 +1160,73 @@ impl WeightStore for SafetensorsWeightStore {
             .ok_or_else(|| StoreError::Overflow {
                 context: format!("payload start for {:?}", request.key),
             })?;
-        let payload_end = shard
-            .payload_offset
-            .checked_add(info.data_offsets.1)
-            .ok_or_else(|| StoreError::Overflow {
-                context: format!("payload end for {:?}", request.key),
-            })?;
-        let payload = shard
-            .bytes
-            .get(payload_start..payload_end)
-            .ok_or_else(|| io_error(&shard.path, "tensor payload is outside buffered shard"))?;
-        let (relative_span, selected_bytes) = select_safetensors_bytes(
+        let tensor_len = info
+            .data_offsets
+            .1
+            .checked_sub(info.data_offsets.0)
+            .ok_or_else(|| io_error(&shard.path, "tensor payload offsets descend"))?;
+        let read = plan_safetensors_reads(
             &request.key,
             info.dtype,
             &info.shape,
-            payload,
+            tensor_len,
             &request.selection,
             &output_shape,
             request.policy,
         )?;
-        let length = selected_bytes
-            .as_ref()
-            .map_or(relative_span.len(), |bytes| bytes.len());
-        let buffered_span = payload_start + relative_span.start..payload_start + relative_span.end;
-        let full_selection = matches!(request.selection, TensorSelection::Full);
+        let cached = shard
+            .full_tensors
+            .lock()
+            .map_err(|_| StoreError::Internal("checkpoint tensor cache is poisoned".into()))?
+            .get(&request.key)
+            .cloned();
+        let complete_tensor =
+            read.ranges.len() == 1 && read.ranges[0].start == 0 && read.ranges[0].end == tensor_len;
+        let bytes = match cached {
+            Some(bytes) if complete_tensor => bytes,
+            Some(bytes) => Arc::from(copy_safetensors_ranges(
+                &request.key,
+                bytes.as_ref(),
+                &read.ranges,
+            )?),
+            None => {
+                let bytes: Arc<[u8]> = Arc::from(read_safetensors_ranges(
+                    &shard.path,
+                    payload_start,
+                    &read.ranges,
+                    self.read_telemetry.as_ref(),
+                )?);
+                if complete_tensor {
+                    shard
+                        .full_tensors
+                        .lock()
+                        .map_err(|_| {
+                            StoreError::Internal("checkpoint tensor cache is poisoned".into())
+                        })?
+                        .insert(request.key.clone(), Arc::clone(&bytes));
+                }
+                bytes
+            }
+        };
+        let length = u64::try_from(bytes.len()).map_err(|_| StoreError::Overflow {
+            context: format!("physical read length for {:?}", request.key),
+        })?;
         self.lock_cache()?.payloads.insert(shard.path.clone());
         Ok(SafetensorsLease {
             metadata,
             selection: request.selection,
             output_shape,
             proof: BoundedReadProof {
-                physically_bounded: matches!(request.policy, ReadPolicy::RequireBounded)
-                    || full_selection,
-                offset_bytes: u64::try_from(relative_span.start).map_err(|_| {
+                physically_bounded: read.physically_bounded,
+                offset_bytes: u64::try_from(read.ranges[0].start).map_err(|_| {
                     StoreError::Overflow {
                         context: "selection byte offset".into(),
                     }
                 })?,
-                length_bytes: u64::try_from(length).map_err(|_| StoreError::Overflow {
-                    context: "selection byte length".into(),
-                })?,
+                length_bytes: length,
             },
             shard,
-            buffered_span,
-            selected_bytes: selected_bytes.map(Arc::from),
-            read_receipt: Arc::new(SafetensorsReadReceipt {
-                telemetry: Arc::clone(&self.read_telemetry),
-                counted: AtomicBool::new(false),
-            }),
+            bytes,
         })
     }
 
@@ -1300,19 +1284,326 @@ impl crate::validation::SafetensorsCatalog for SafetensorsWeightStore {
 }
 
 fn inspect_file(path: &Path) -> Result<BTreeMap<String, TensorMetadata>, StoreError> {
-    let bytes = fs::read(path).map_err(|error| fs_error(path, error))?;
-    let checkpoint =
-        SafeTensors::deserialize(&bytes).map_err(|error| StoreError::MalformedSafetensors {
+    let (_, metadata) = read_safetensors_metadata(path)?;
+    metadata
+        .tensors()
+        .into_iter()
+        .map(|(key, info)| metadata_for_info(&key, path, info).map(|metadata| (key, metadata)))
+        .collect()
+}
+
+fn read_safetensors_metadata(path: &Path) -> Result<(usize, Metadata), StoreError> {
+    let mut file = File::open(path).map_err(|error| fs_error(path, error))?;
+    let file_len = file
+        .metadata()
+        .map_err(|error| fs_error(path, error))?
+        .len();
+    read_safetensors_metadata_from(path, &mut file, file_len)
+}
+
+fn read_safetensors_metadata_from(
+    path: &Path,
+    reader: &mut impl Read,
+    file_len: u64,
+) -> Result<(usize, Metadata), StoreError> {
+    let mut encoded_header_len = [0u8; 8];
+    reader
+        .read_exact(&mut encoded_header_len)
+        .map_err(|error| io_error(path, error))?;
+    let header_len = u64::from_le_bytes(encoded_header_len);
+    if header_len > MAX_HEADER_BYTES {
+        return Err(StoreError::MalformedSafetensors {
+            path: path.to_path_buf(),
+            message: format!("header exceeds {MAX_HEADER_BYTES} bytes"),
+        });
+    }
+    let payload_offset = 8u64
+        .checked_add(header_len)
+        .ok_or_else(|| StoreError::Overflow {
+            context: format!("payload offset for {}", path.display()),
+        })?;
+    if payload_offset > file_len {
+        return Err(StoreError::MalformedSafetensors {
+            path: path.to_path_buf(),
+            message: "header exceeds shard length".into(),
+        });
+    }
+    let header_len = usize::try_from(header_len).map_err(|_| StoreError::Overflow {
+        context: format!("header length for {}", path.display()),
+    })?;
+    let mut encoded_header = Vec::with_capacity(8 + header_len);
+    encoded_header.extend_from_slice(&encoded_header_len);
+    encoded_header.resize(8 + header_len, 0);
+    reader
+        .read_exact(&mut encoded_header[8..])
+        .map_err(|error| io_error(path, error))?;
+    let metadata = serde_json::from_slice::<Metadata>(&encoded_header[8..]).map_err(|error| {
+        StoreError::MalformedSafetensors {
             path: path.to_path_buf(),
             message: error.to_string(),
+        }
+    })?;
+    let described_payload =
+        u64::try_from(metadata.data_len()).map_err(|_| StoreError::Overflow {
+            context: format!("described payload length for {}", path.display()),
         })?;
-    checkpoint
-        .iter()
-        .map(|(key, view)| {
-            metadata_for_parts(key, path, view.dtype(), view.shape(), view.data().len())
-                .map(|metadata| (key.to_string(), metadata))
-        })
-        .collect()
+    let described_file_len = payload_offset
+        .checked_add(described_payload)
+        .ok_or_else(|| StoreError::Overflow {
+            context: format!("described shard length for {}", path.display()),
+        })?;
+    if described_file_len != file_len {
+        return Err(StoreError::MalformedSafetensors {
+            path: path.to_path_buf(),
+            message: format!(
+                "header describes {described_payload} payload bytes, but shard length provides {}",
+                file_len - payload_offset
+            ),
+        });
+    }
+    let payload_offset = usize::try_from(payload_offset).map_err(|_| StoreError::Overflow {
+        context: format!("payload offset for {}", path.display()),
+    })?;
+    Ok((payload_offset, metadata))
+}
+
+struct SafetensorsReadPlan {
+    ranges: Vec<Range<usize>>,
+    physically_bounded: bool,
+}
+
+impl SafetensorsReadPlan {
+    fn single(range: Range<usize>, physically_bounded: bool) -> Self {
+        Self {
+            ranges: std::iter::once(range).collect(),
+            physically_bounded,
+        }
+    }
+}
+
+fn push_coalesced_range(ranges: &mut Vec<Range<usize>>, range: Range<usize>) {
+    if let Some(previous) = ranges.last_mut() {
+        if previous.end == range.start {
+            previous.end = range.end;
+            return;
+        }
+    }
+    ranges.push(range);
+}
+
+fn plan_safetensors_reads(
+    key: &str,
+    dtype: Dtype,
+    shape: &[usize],
+    payload_len: usize,
+    selection: &TensorSelection,
+    output_shape: &[usize],
+    policy: ReadPolicy,
+) -> Result<SafetensorsReadPlan, StoreError> {
+    let bounded = matches!(policy, ReadPolicy::RequireBounded);
+    if matches!(selection, TensorSelection::Full) {
+        return Ok(SafetensorsReadPlan::single(0..payload_len, true));
+    }
+    let bits = dtype.bitsize();
+    let scalar_bytes = bits.checked_div(8).filter(|_| bits.is_multiple_of(8));
+    if let (
+        Some(scalar_bytes),
+        TensorSelection::Contiguous {
+            offset_elements,
+            shape,
+        },
+    ) = (scalar_bytes, selection)
+    {
+        let start =
+            offset_elements
+                .checked_mul(scalar_bytes)
+                .ok_or_else(|| StoreError::Overflow {
+                    context: format!("contiguous byte start for {key:?}"),
+                })?;
+        let end = checked_elements(key, shape)?
+            .checked_mul(scalar_bytes)
+            .and_then(|length| start.checked_add(length))
+            .ok_or_else(|| StoreError::Overflow {
+                context: format!("contiguous byte end for {key:?}"),
+            })?;
+        if end > payload_len {
+            return Err(invalid_selection(
+                key,
+                "contiguous byte span outside payload",
+            ));
+        }
+        return Ok(SafetensorsReadPlan::single(start..end, true));
+    }
+    if let (
+        Some(_),
+        TensorSelection::Range {
+            axis: 0,
+            start,
+            end,
+        },
+    ) = (scalar_bytes, selection)
+    {
+        let row_bytes = payload_len
+            .checked_div(shape[0])
+            .filter(|_| payload_len.is_multiple_of(shape[0]))
+            .ok_or_else(|| invalid_selection(key, "payload is not row divisible"))?;
+        let byte_start = start
+            .checked_mul(row_bytes)
+            .ok_or_else(|| StoreError::Overflow {
+                context: format!("row selection byte start for {key:?}"),
+            })?;
+        let byte_end = end
+            .checked_mul(row_bytes)
+            .ok_or_else(|| StoreError::Overflow {
+                context: format!("row selection byte end for {key:?}"),
+            })?;
+        return Ok(SafetensorsReadPlan::single(byte_start..byte_end, true));
+    }
+    if !bounded {
+        return Ok(SafetensorsReadPlan::single(0..payload_len, false));
+    }
+    let (axis, indices): (usize, Vec<usize>) = match selection {
+        TensorSelection::Range { axis, start, end } => (*axis, (*start..*end).collect()),
+        TensorSelection::Indices { axis, indices } => (*axis, indices.clone()),
+        TensorSelection::Contiguous { .. } => {
+            return Err(StoreError::BoundedSelectionUnavailable {
+                key: key.into(),
+                message: "packed contiguous selection is not byte aligned".into(),
+            });
+        }
+        TensorSelection::Full => unreachable!(),
+    };
+    let axis_len = shape[axis];
+    let outer = shape[..axis].iter().product::<usize>();
+    let inner = shape[axis + 1..].iter().product::<usize>();
+    let output_bits = checked_elements(key, output_shape)?
+        .checked_mul(bits)
+        .ok_or_else(|| StoreError::Overflow {
+            context: format!("selected bit length for {key:?}"),
+        })?;
+    if !output_bits.is_multiple_of(8) {
+        return Err(StoreError::BoundedSelectionUnavailable {
+            key: key.into(),
+            message: "selected packed payload is not byte aligned".into(),
+        });
+    }
+    let block_bytes = if bits == 4 {
+        if !inner.is_multiple_of(2)
+            || indices
+                .iter()
+                .any(|index| !(index * inner).is_multiple_of(2))
+        {
+            return Err(StoreError::BoundedSelectionUnavailable {
+                key: key.into(),
+                message: "FP4 selection crosses a nibble boundary".into(),
+            });
+        }
+        inner / 2
+    } else {
+        inner
+            .checked_mul(
+                scalar_bytes.ok_or_else(|| StoreError::BoundedSelectionUnavailable {
+                    key: key.into(),
+                    message: "stored scalar width is not byte aligned".into(),
+                })?,
+            )
+            .ok_or_else(|| StoreError::Overflow {
+                context: format!("selection block bytes for {key:?}"),
+            })?
+    };
+    let mut ranges = Vec::new();
+    for outer_index in 0..outer {
+        for index in &indices {
+            let start = outer_index
+                .checked_mul(axis_len)
+                .and_then(|value| value.checked_add(*index))
+                .and_then(|value| value.checked_mul(block_bytes))
+                .ok_or_else(|| StoreError::Overflow {
+                    context: format!("selection byte start for {key:?}"),
+                })?;
+            let end = start
+                .checked_add(block_bytes)
+                .ok_or_else(|| StoreError::Overflow {
+                    context: format!("selection byte end for {key:?}"),
+                })?;
+            if end > payload_len {
+                return Err(invalid_selection(key, "selection exceeds payload"));
+            }
+            push_coalesced_range(&mut ranges, start..end);
+        }
+    }
+    if ranges.is_empty() {
+        return Err(invalid_selection(
+            key,
+            "selection produced no physical ranges",
+        ));
+    }
+    Ok(SafetensorsReadPlan {
+        ranges,
+        physically_bounded: true,
+    })
+}
+
+fn read_safetensors_ranges(
+    path: &Path,
+    tensor_payload_start: usize,
+    ranges: &[Range<usize>],
+    telemetry: &SafetensorsReadTelemetry,
+) -> Result<Vec<u8>, StoreError> {
+    let capacity = ranges.iter().try_fold(0usize, |total, range| {
+        total
+            .checked_add(range.len())
+            .ok_or_else(|| StoreError::Overflow {
+                context: format!("selected payload length for {}", path.display()),
+            })
+    })?;
+    let mut file = File::open(path).map_err(|error| fs_error(path, error))?;
+    let mut output = Vec::with_capacity(capacity);
+    for range in ranges {
+        let absolute = tensor_payload_start
+            .checked_add(range.start)
+            .ok_or_else(|| StoreError::Overflow {
+                context: format!("selected payload offset for {}", path.display()),
+            })?;
+        file.seek(SeekFrom::Start(u64::try_from(absolute).map_err(|_| {
+            StoreError::Overflow {
+                context: format!("selected payload offset for {}", path.display()),
+            }
+        })?))
+        .map_err(|error| io_error(path, error))?;
+        let start = output.len();
+        output.resize(start + range.len(), 0);
+        file.read_exact(&mut output[start..])
+            .map_err(|error| io_error(path, error))?;
+        telemetry.physical_reads.fetch_add(1, Ordering::Relaxed);
+        telemetry
+            .physical_read_bytes
+            .fetch_add(range.len() as u64, Ordering::Relaxed);
+    }
+    Ok(output)
+}
+
+fn copy_safetensors_ranges(
+    key: &str,
+    payload: &[u8],
+    ranges: &[Range<usize>],
+) -> Result<Vec<u8>, StoreError> {
+    let capacity = ranges.iter().try_fold(0usize, |total, range| {
+        total
+            .checked_add(range.len())
+            .ok_or_else(|| StoreError::Overflow {
+                context: format!("cached selected payload length for {key:?}"),
+            })
+    })?;
+    let mut output = Vec::with_capacity(capacity);
+    for range in ranges {
+        output.extend_from_slice(
+            payload
+                .get(range.clone())
+                .ok_or_else(|| invalid_selection(key, "cached selection exceeds payload"))?,
+        );
+    }
+    Ok(output)
 }
 
 fn metadata_for_info(
@@ -1668,6 +1959,149 @@ mod tests {
             .iter()
             .flat_map(|value| value.to_le_bytes())
             .collect()
+    }
+
+    #[test]
+    fn safetensors_metadata_parser_never_requests_payload_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("model.safetensors");
+        let payload = f32_bytes(&[1.0, 2.0, 3.0, 4.0]);
+        serialize_to_file(
+            [(
+                "weight",
+                TensorView::new(Dtype::F32, vec![2, 2], &payload).unwrap(),
+            )],
+            None,
+            &path,
+        )
+        .unwrap();
+        let encoded = std::fs::read(&path).unwrap();
+        let header_len =
+            usize::try_from(u64::from_le_bytes(encoded[..8].try_into().unwrap())).unwrap();
+        let payload_offset = 8 + header_len;
+        let mut header_only = std::io::Cursor::new(&encoded[..payload_offset]);
+
+        let (actual_offset, metadata) = read_safetensors_metadata_from(
+            &path,
+            &mut header_only,
+            u64::try_from(encoded.len()).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(actual_offset, payload_offset);
+        assert_eq!(metadata.info("weight").unwrap().shape, [2, 2]);
+        assert_eq!(
+            header_only.position(),
+            u64::try_from(payload_offset).unwrap()
+        );
+    }
+
+    #[test]
+    fn safetensors_store_physically_reads_only_selected_noncontiguous_ranges() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("model.safetensors");
+        let selected = f32_bytes(&(0..12).map(|value| value as f32).collect::<Vec<_>>());
+        let unrelated = vec![0x5a; 8 * 1024];
+        serialize_to_file(
+            [
+                (
+                    "selected",
+                    TensorView::new(Dtype::F32, vec![2, 3, 2], &selected).unwrap(),
+                ),
+                (
+                    "unrelated",
+                    TensorView::new(Dtype::U8, vec![unrelated.len()], &unrelated).unwrap(),
+                ),
+            ],
+            None,
+            &path,
+        )
+        .unwrap();
+        let store = SafetensorsWeightStore::open(&path).unwrap();
+        let before = store.diagnostics().unwrap();
+        assert_eq!(before.physical_reads, 0);
+        assert_eq!(before.physical_read_bytes, 0);
+        assert!(before.payload_shard_paths.is_empty());
+
+        let lease = store
+            .acquire(TensorReadRequest {
+                key: "selected".into(),
+                selection: TensorSelection::Range {
+                    axis: 1,
+                    start: 1,
+                    end: 2,
+                },
+                policy: ReadPolicy::RequireBounded,
+            })
+            .unwrap();
+
+        let diagnostics = store.diagnostics().unwrap();
+        assert_eq!(diagnostics.physical_reads, 2);
+        assert_eq!(diagnostics.physical_read_bytes, 16);
+        assert_eq!(lease.bounded_read_proof().offset_bytes, 8);
+        assert_eq!(lease.bounded_read_proof().length_bytes, 16);
+        assert!(lease.bounded_read_proof().physically_bounded);
+        let mut expected = selected[8..16].to_vec();
+        expected.extend_from_slice(&selected[32..40]);
+        assert_eq!(lease.encoded_bytes().unwrap(), expected);
+        assert!(std::fs::metadata(&path).unwrap().len() > diagnostics.physical_read_bytes);
+    }
+
+    #[test]
+    fn safetensors_unbounded_selection_reports_complete_tensor_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("model.safetensors");
+        let selected = f32_bytes(&(0..12).map(|value| value as f32).collect::<Vec<_>>());
+        serialize_to_file(
+            [(
+                "selected",
+                TensorView::new(Dtype::F32, vec![2, 3, 2], &selected).unwrap(),
+            )],
+            None,
+            &path,
+        )
+        .unwrap();
+        let store = SafetensorsWeightStore::open(&path).unwrap();
+
+        let lease = store
+            .acquire(TensorReadRequest {
+                key: "selected".into(),
+                selection: TensorSelection::Range {
+                    axis: 1,
+                    start: 1,
+                    end: 2,
+                },
+                policy: ReadPolicy::AllowFullTensorRead,
+            })
+            .unwrap();
+
+        let diagnostics = store.diagnostics().unwrap();
+        assert_eq!(diagnostics.physical_reads, 1);
+        assert_eq!(diagnostics.physical_read_bytes, 48);
+        assert!(!lease.bounded_read_proof().physically_bounded);
+        assert_eq!(lease.bounded_read_proof().offset_bytes, 0);
+        assert_eq!(lease.bounded_read_proof().length_bytes, 48);
+        assert_eq!(lease.encoded_bytes().unwrap(), selected);
+
+        let bounded = store
+            .acquire(TensorReadRequest {
+                key: "selected".into(),
+                selection: TensorSelection::Range {
+                    axis: 1,
+                    start: 1,
+                    end: 2,
+                },
+                policy: ReadPolicy::RequireBounded,
+            })
+            .unwrap();
+        let cached_diagnostics = store.diagnostics().unwrap();
+        assert_eq!(cached_diagnostics.physical_reads, 1);
+        assert_eq!(cached_diagnostics.physical_read_bytes, 48);
+        let mut expected = selected[8..16].to_vec();
+        expected.extend_from_slice(&selected[32..40]);
+        assert_eq!(bounded.encoded_bytes().unwrap(), expected);
+        assert!(bounded.bounded_read_proof().physically_bounded);
+        assert_eq!(bounded.bounded_read_proof().length_bytes, 16);
     }
 
     #[test]

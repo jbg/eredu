@@ -1905,8 +1905,7 @@ use crate::{
     preparation::ArchitectureCapabilities,
     processor_plan::ArtifactArchitecturePlan,
     replicated_text::{
-        CompositeTextRequirements, ReplicatedTextExecutionClass, ReplicatedTextIneligibility,
-        SelectedCompositeTextRealization,
+        CompositeTextRequirements, ReplicatedTextExecutionClass, SelectedCompositeTextRealization,
     },
     RoutedTextRequirements, SelectedRoutedTextRealization,
 };
@@ -5434,6 +5433,32 @@ where
         architecture_capabilities(inspection).map_err(PartitionedAdmissionError::Unsupported)?;
     let class = crate::replicated_text::replicated_text_execution_class(inspection)
         .map_err(|error| PartitionedAdmissionError::Unsupported(error.to_string()))?;
+    if matches!(&class, ReplicatedTextExecutionClass::Replicated(_))
+        && matches!(
+            (
+                inspection
+                    .architecture_plan()
+                    .safetensors_architecture()
+                    .map(|plan| plan.model()),
+                inspection
+                    .architecture_plan()
+                    .gguf_plan()
+                    .map(|plan| plan.model()),
+            ),
+            (
+                Some(crate::configuration::SafetensorsModelConfig::DeepSeekV3(_)),
+                None
+            ) | (
+                None,
+                Some(crate::configuration::GgufModelConfig::DeepSeekV3(_))
+            )
+        )
+    {
+        return Err(PartitionedAdmissionError::Unsupported(
+            "dense DeepSeek-V3 has no exact neutral partition constructor; use replicated topology"
+                .into(),
+        ));
+    }
     let routed = matches!(&class, ReplicatedTextExecutionClass::Routed(_))
         || matches!(
             &class,
@@ -5534,6 +5559,8 @@ where
                 .map_err(PartitionedAdmissionError::Dispatch)
         }
         ReplicatedTextExecutionClass::Composite(execution) => {
+            let state_layout = composite_partitioned_state_layout(inspection, rank)
+                .map_err(PartitionedAdmissionError::Unsupported)?;
             let (communication, boundary_routes, session_group, tensor_group, expert_group) =
                 communication_manifest(
                     execution.execution(),
@@ -5559,7 +5586,7 @@ where
                 session_group,
                 tensor_group,
                 expert_group,
-                None,
+                Some(&state_layout),
                 |value| value.execution(),
             )
             .map_err(PartitionedAdmissionError::Unsupported)?;
@@ -5567,14 +5594,118 @@ where
                 .composite(requirements)
                 .map_err(PartitionedAdmissionError::Dispatch)
         }
-        ReplicatedTextExecutionClass::Other(other) => Err(PartitionedAdmissionError::Unsupported(
-            match other.reason() {
-                ReplicatedTextIneligibility::EmbeddedPrediction => {
-                    "embedded prediction is active".into()
-                }
-                reason => reason.to_string(),
-            },
-        )),
+    }
+}
+
+fn local_partition_head_count(global: i32, rank: ParallelRankTopology) -> Result<i32, String> {
+    let global = usize::try_from(global)
+        .map_err(|_| "partitioned state head count is not positive".to_owned())?;
+    let local = eredu_core::balanced_contiguous_range(
+        global,
+        rank.tensor_parallel_size(),
+        rank.tensor_parallel_rank(),
+        false,
+    )
+    .map_err(|error| error.to_string())?
+    .len();
+    i32::try_from(local).map_err(|_| "partitioned state head count exceeds i32".to_owned())
+}
+
+/// Derives the complete TP-local composite state before PP ownership slices it.
+///
+/// This is deliberately configuration-only: admission fixes state geometry
+/// before a backend module, state allocation, or architecture partition exists.
+fn composite_partitioned_state_layout(
+    inspection: &ArtifactInspection<ArtifactArchitecturePlan>,
+    rank: ParallelRankTopology,
+) -> Result<eredu_runtime::StateLayout, String> {
+    let config = crate::replicated_text::composite_config(inspection.architecture_plan())
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "composite artifact has no normalized family configuration".to_owned())?;
+    match config {
+        crate::replicated_text::CompositeConfig::Gemma4(args) => {
+            let mut text = args.text.clone();
+            let layers = text
+                .layer_schedule
+                .iter()
+                .copied()
+                .map(|mut policy| {
+                    let global = i32::try_from(policy.num_key_value_heads.get())
+                        .map_err(|_| "Gemma 4 state head count exceeds i32".to_owned())?;
+                    let local = local_partition_head_count(global, rank)?;
+                    policy.num_key_value_heads = std::num::NonZeroU32::new(
+                        u32::try_from(local)
+                            .map_err(|_| "Gemma 4 local state heads exceed u32".to_owned())?,
+                    )
+                    .ok_or_else(|| "Gemma 4 local state head count is zero".to_owned())?;
+                    Ok(policy)
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            text.layer_schedule = eredu_core::LayerSchedule::new(layers.len(), layers)
+                .map_err(|error| error.to_string())?;
+            crate::gemma4::state_layout(&text).map_err(|error| error.to_string())
+        }
+        crate::replicated_text::CompositeConfig::Muse(args) => {
+            let mut local = args.clone();
+            local.num_key_value_heads = local_partition_head_count(args.num_key_value_heads, rank)?;
+            crate::muse_glimmer::state_layout(&local).map_err(|error| error.to_string())
+        }
+        crate::replicated_text::CompositeConfig::QwenVl(args) => {
+            let heads = local_partition_head_count(args.text.num_key_value_heads, rank)?;
+            let layers = usize::try_from(args.text.num_hidden_layers)
+                .map_err(|_| "Qwen3-VL layer count exceeds usize".to_owned())?;
+            crate::qwen::vl::state_layout_with_key_value_heads(args, &vec![heads; layers])
+                .map_err(|error| error.to_string())
+        }
+        crate::replicated_text::CompositeConfig::QwenHybrid(args) => {
+            use crate::qwen::hybrid::{HybridLayerPolicy, HybridStateGeometry};
+
+            let text = &args.text;
+            let attention_heads = local_partition_head_count(text.num_key_value_heads, rank)?;
+            let key_heads = local_partition_head_count(text.linear_num_key_heads, rank)?;
+            let value_heads = text
+                .linear_num_value_heads
+                .checked_mul(key_heads)
+                .and_then(|value| value.checked_div(text.linear_num_key_heads))
+                .ok_or_else(|| {
+                    "Qwen hybrid recurrent state heads do not partition proportionally".to_owned()
+                })?;
+            if value_heads.checked_mul(text.linear_num_key_heads)
+                != text.linear_num_value_heads.checked_mul(key_heads)
+            {
+                return Err(
+                    "Qwen hybrid recurrent value heads split the selected key-head partition"
+                        .into(),
+                );
+            }
+            let geometry = text
+                .layer_schedule
+                .iter()
+                .map(|policy| match policy {
+                    HybridLayerPolicy::SelfAttention(_) => HybridStateGeometry::FullAttention {
+                        key_value_heads: attention_heads,
+                    },
+                    HybridLayerPolicy::LinearAttention => HybridStateGeometry::LinearAttention {
+                        key_heads,
+                        value_heads,
+                    },
+                })
+                .collect::<Vec<_>>();
+            crate::qwen::hybrid::state_layout_with_geometry(text, &geometry)
+                .map_err(|error| error.to_string())
+        }
+        crate::replicated_text::CompositeConfig::Inkling(args) => {
+            let mut local = args.clone();
+            local.text_config.num_key_value_heads =
+                local_partition_head_count(args.text_config.num_key_value_heads, rank)?;
+            local.text_config.swa_num_key_value_heads = args
+                .text_config
+                .swa_num_key_value_heads
+                .map(|heads| local_partition_head_count(heads, rank))
+                .transpose()?;
+            let target = crate::inkling::state_layout(&local).map_err(|error| error.to_string())?;
+            crate::inkling::composite_state_layout(&target, None).map_err(|error| error.to_string())
+        }
     }
 }
 
@@ -6565,6 +6696,7 @@ fn balanced_ranges(unit_count: usize, ranks: Range<usize>) -> Vec<(usize, Range<
 pub struct SelectedPartitionedAdmission<R, Q> {
     requirements: PartitionedAdmission<Q>,
     base: R,
+    materialization_tasks: Vec<eredu_runtime::ReplicatedTextMaterializationTask>,
 }
 
 impl<R, Q> SelectedPartitionedAdmission<R, Q> {
@@ -6578,25 +6710,23 @@ impl<R, Q> SelectedPartitionedAdmission<R, Q> {
         &self.base
     }
 
-    /// Installs the exact family-derived local state before final partition binding.
+    /// Exact physical tasks selected before backend resources exist.
     ///
-    /// Composite admission deliberately defers this value because flattened text
-    /// requirements cannot describe shared, compressed, or heterogeneous family
-    /// state. A populated projection is rejected rather than silently overwritten.
-    pub(crate) fn with_family_local_state(
-        mut self,
-        state: Option<PartitionState>,
-    ) -> Result<Self, String> {
-        if self.requirements.state.is_some() {
-            return Err("partitioned admission state was already projected".into());
-        }
-        self.requirements.state = state;
-        Ok(self)
+    /// Family topology later attaches atomic output companions and projects this
+    /// immutable selection onto the already admitted rank ownership.
+    pub fn materialization_tasks(&self) -> &[eredu_runtime::ReplicatedTextMaterializationTask] {
+        &self.materialization_tasks
     }
 
-    /// Consumes the immutable proof without cloning or re-selecting its base.
-    pub fn into_parts(self) -> (R, PartitionedAdmission<Q>) {
-        (self.base, self.requirements)
+    /// Consumes the immutable proof without dropping or re-selecting physical work.
+    pub fn into_parts(
+        self,
+    ) -> (
+        R,
+        PartitionedAdmission<Q>,
+        Vec<eredu_runtime::ReplicatedTextMaterializationTask>,
+    ) {
+        (self.base, self.requirements, self.materialization_tasks)
     }
 }
 
@@ -6626,9 +6756,11 @@ pub fn select_direct_partitioned_admission(
     >,
     PartitionedAdmissionSelectionError,
 > {
+    let materialization_tasks = preselect_materialization_tasks(&requirements, &selected)?;
     select_partitioned(
         requirements,
         selected,
+        materialization_tasks,
         communication,
         |requirements, selected| selected.requirements() == requirements,
     )
@@ -6643,9 +6775,11 @@ pub fn select_routed_partitioned_admission(
     SelectedPartitionedAdmission<SelectedRoutedTextRealization, RoutedTextRequirements>,
     PartitionedAdmissionSelectionError,
 > {
+    let materialization_tasks = preselect_materialization_tasks(&requirements, selected.text())?;
     select_partitioned(
         requirements,
         selected,
+        materialization_tasks,
         communication,
         |requirements, selected| {
             selected.text().requirements() == requirements.text()
@@ -6666,9 +6800,12 @@ pub fn select_composite_partitioned_admission(
     SelectedPartitionedAdmission<SelectedCompositeTextRealization, CompositeTextRequirements>,
     PartitionedAdmissionSelectionError,
 > {
+    let materialization_tasks =
+        preselect_materialization_tasks(&requirements, selected.execution())?;
     select_partitioned(
         requirements,
         selected,
+        materialization_tasks,
         communication,
         |requirements, selected| {
             let decoder_matches = match (requirements.routed_execution(), selected) {
@@ -6692,6 +6829,7 @@ pub fn select_composite_partitioned_admission(
 fn select_partitioned<R, Q>(
     requirements: PartitionedAdmission<Q>,
     selected: R,
+    materialization_tasks: Vec<eredu_runtime::ReplicatedTextMaterializationTask>,
     communication: &CommunicationCapabilities,
     agrees: impl FnOnce(&Q, &R) -> bool,
 ) -> Result<SelectedPartitionedAdmission<R, Q>, PartitionedAdmissionSelectionError>
@@ -6714,7 +6852,96 @@ where
     Ok(SelectedPartitionedAdmission {
         requirements,
         base: selected,
+        materialization_tasks,
     })
+}
+
+fn preselect_materialization_tasks<Q>(
+    requirements: &PartitionedAdmission<Q>,
+    selected: &eredu_runtime::SelectedReplicatedTextRealization,
+) -> Result<Vec<eredu_runtime::ReplicatedTextMaterializationTask>, PartitionedAdmissionSelectionError>
+where
+    Q: TextRequirements,
+{
+    let tasks =
+        eredu_runtime::replicated_text_materialization_tasks(selected).map_err(|error| {
+            PartitionedAdmissionSelectionError {
+                issues: vec![error.to_string()],
+            }
+        })?;
+    let targets = requirements
+        .logical_parameter_targets()
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut claimed = BTreeSet::new();
+    for task in &tasks {
+        let primary_matches = std::iter::once(task.name())
+            .chain(task.aliases().iter().map(String::as_str))
+            .filter(|name| targets.contains(*name))
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>();
+        if primary_matches.len() > 1 {
+            return Err(PartitionedAdmissionSelectionError {
+                issues: vec![format!(
+                    "rank-local task {:?} ambiguously matches targets {primary_matches:?}",
+                    task.name()
+                )],
+            });
+        }
+        let companion_matches = task
+            .output_companions()
+            .iter()
+            .filter(|companion| targets.contains(companion.name()))
+            .map(|companion| companion.name().to_owned())
+            .collect::<BTreeSet<_>>();
+        if primary_matches.is_empty() && !companion_matches.is_empty() {
+            return Err(PartitionedAdmissionSelectionError {
+                issues: vec![format!(
+                    "rank-local task {:?} would select companions {companion_matches:?} without their atomic primary",
+                    task.name(),
+                )],
+            });
+        }
+        for target in primary_matches.into_iter().chain(companion_matches) {
+            if !claimed.insert(target.clone()) {
+                return Err(PartitionedAdmissionSelectionError {
+                    issues: vec![format!(
+                        "rank-local parameter target {target:?} is claimed more than once"
+                    )],
+                });
+            }
+        }
+    }
+    let missing_required = targets
+        .difference(&claimed)
+        .filter(|target| {
+            selected
+                .requirements()
+                .parameters()
+                .iter()
+                .find(|parameter| {
+                    parameter.name() == target.as_str()
+                        || parameter.aliases().iter().any(|alias| alias == *target)
+                })
+                .is_none_or(|parameter| {
+                    parameter.presence().has_physical_source()
+                        || matches!(
+                            parameter.presence(),
+                            eredu_runtime::ReplicatedTextParameterPresence::Derived { .. }
+                        )
+                })
+        })
+        .collect::<Vec<_>>();
+    if !missing_required.is_empty() {
+        return Err(PartitionedAdmissionSelectionError {
+            issues: vec![format!(
+                "rank-local exact task coverage differs from parameter ownership: missing={:?}",
+                missing_required
+            )],
+        });
+    }
+    Ok(tasks)
 }
 
 pub(crate) fn validate_selected_boundary_routes<R>(
@@ -8329,8 +8556,8 @@ where
     .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
     validate_partitioned_binding(selected.requirements(), &partition)
         .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
-    let tasks = eredu_runtime::partitioned_replicated_text_materialization_tasks(
-        selected.base(),
+    let tasks = eredu_runtime::partition_selected_replicated_text_materialization_tasks(
+        selected.materialization_tasks(),
         &parameters,
         &partition,
     )
@@ -8492,8 +8719,8 @@ where
     .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
     validate_partitioned_binding(selected.requirements(), &partition)
         .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
-    let tasks = eredu_runtime::partitioned_replicated_text_materialization_tasks(
-        selected.base(),
+    let tasks = eredu_runtime::partition_selected_replicated_text_materialization_tasks(
+        selected.materialization_tasks(),
         &parameters,
         &partition,
     )
@@ -8636,8 +8863,8 @@ where
     .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
     validate_partitioned_binding(selected.requirements(), &partition)
         .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
-    let tasks = eredu_runtime::partitioned_replicated_text_materialization_tasks(
-        selected.base(),
+    let tasks = eredu_runtime::partition_selected_replicated_text_materialization_tasks(
+        selected.materialization_tasks(),
         &parameters,
         &partition,
     )
@@ -8771,8 +8998,8 @@ where
     .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
     validate_partitioned_binding(selected.requirements(), &partition)
         .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
-    let tasks = eredu_runtime::partitioned_replicated_text_materialization_tasks(
-        selected.base(),
+    let tasks = eredu_runtime::partition_selected_replicated_text_materialization_tasks(
+        selected.materialization_tasks(),
         &parameters,
         &partition,
     )
@@ -9223,7 +9450,7 @@ where
 }
 
 /// Constructs and visits one DeepSeek-V4 ordinary target partition.
-pub fn visit_deepseek_v4_routed_partitioned_production<B, S, V>(
+pub fn visit_pooling_routed_partitioned_production<B, S, V>(
     inspection: &ArtifactInspection<ArtifactArchitecturePlan>,
     selected: SelectedPartitionedAdmission<SelectedRoutedTextRealization, RoutedTextRequirements>,
     store: eredu_checkpoint::store::SharedCheckpointSource,
@@ -9278,7 +9505,7 @@ where
 }
 
 /// Constructs a DeepSeek-V4 routed prediction target and pairs it before backend erasure.
-pub fn visit_deepseek_v4_routed_partitioned_prediction_target_production<B, S, M, V>(
+pub fn visit_pooling_routed_partitioned_prediction_target_production<B, S, M, V>(
     inspection: &ArtifactInspection<ArtifactArchitecturePlan>,
     selected: SelectedPartitionedAdmission<SelectedRoutedTextRealization, RoutedTextRequirements>,
     extension: crate::prediction_extension::MaterializedPredictionExtension<B, M>,
@@ -9465,13 +9692,91 @@ where
             .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
     let capability_estimate = crate::capability::nemotron_h(&selected_args)
         .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
-    prepare_nemotron_h_routed_partition::<B, S, V>(
+    prepare_nemotron_h_routed_partition::<B, S, _>(
         selected_args.model_type.clone(),
         selected_args,
         selected,
         store,
         context,
-        visitor,
+        OrdinaryFamilyRoutedPartitionVisitor(visitor),
+        capability_estimate,
+    )
+}
+
+/// Constructs a routed ReLU-squared prediction target and pairs it before backend erasure.
+pub fn visit_relu2_routed_partitioned_prediction_target_production<B, S, M, V>(
+    inspection: &ArtifactInspection<ArtifactArchitecturePlan>,
+    selected: SelectedPartitionedAdmission<SelectedRoutedTextRealization, RoutedTextRequirements>,
+    extension: crate::prediction_extension::MaterializedPredictionExtension<B, M>,
+    store: eredu_checkpoint::store::SharedCheckpointSource,
+    context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    visitor: V,
+) -> Result<V::Output, DenseDecoderPartitionedDispatchError<V::Error>>
+where
+    B: eredu_nn::TensorParallelGroupedNeuralBackend
+        + eredu_nn::DistributedNeuralBackend
+        + eredu_nn::BlockwiseAttentionBackend
+        + eredu_nn::HyperNeuralBackend,
+    S: eredu_runtime::LayerRuntimeState<B>,
+    S::LayerState: eredu_nn::AttentionCache<B::Tensor> + eredu_runtime::RuntimeStateComponents<B>,
+    M: crate::prediction_extension::PredictionExtensionMaterializer<B>,
+    V: RoutedPartitionedPredictionTargetProductionVisitor<B, S, M, eredu_nn::GroupedRelu2Spec>,
+{
+    let extension = <crate::nemotron_h::PartitionedLayeredModel<B> as crate::prediction_extension::MaterializedPredictionTarget<B>>::pair_prediction_extension(extension)
+        .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
+    let expected = crate::routed_text::routed_text_requirements(inspection)
+        .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
+    if &expected != selected.requirements().execution() {
+        return Err(DenseDecoderPartitionedDispatchError::Architecture(
+            "ReLU-squared routed prediction admission belongs to a different artifact".into(),
+        ));
+    }
+    crate::replicated_text::validate_store_handoff(expected.text(), store.as_ref())
+        .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
+    let args = match (
+        inspection
+            .architecture_plan()
+            .safetensors_architecture()
+            .map(|plan| plan.model()),
+        inspection
+            .architecture_plan()
+            .gguf_plan()
+            .map(|plan| plan.model()),
+    ) {
+        (Some(crate::configuration::SafetensorsModelConfig::NemotronH(args)), None)
+        | (None, Some(crate::configuration::GgufModelConfig::NemotronH(args))) => args,
+        _ => {
+            return Err(DenseDecoderPartitionedDispatchError::Architecture(
+                "ReLU-squared routed prediction requires Nemotron-H".into(),
+            ));
+        }
+    };
+    if args.num_nextn_predict_layers == 0 || !args.has_sparse_moe_layers() {
+        return Err(DenseDecoderPartitionedDispatchError::Architecture(
+            "ReLU-squared routed prediction requires sparse prediction-bearing Nemotron-H".into(),
+        ));
+    }
+    let selected_args =
+        crate::replicated_text::selected_nemotron_h_args(args, selected.base().text())
+            .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
+    let capability_estimate = crate::capability::nemotron_h(&selected_args)
+        .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
+    prepare_nemotron_h_routed_partition::<B, S, _>(
+        selected_args.model_type.clone(),
+        selected_args,
+        selected,
+        store,
+        context,
+        PredictionFamilyRoutedPartitionVisitor::<
+            B,
+            crate::nemotron_h::PartitionedLayeredModel<B>,
+            M,
+            _,
+        > {
+            extension,
+            visitor,
+            marker: PhantomData,
+        },
         capability_estimate,
     )
 }
@@ -9542,18 +9847,18 @@ where
     .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
     validate_partitioned_binding(selected.requirements(), &partition)
         .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
-    let mut tasks = eredu_runtime::partitioned_replicated_text_materialization_tasks(
-        selected.base().text(),
+    let mut tasks = eredu_runtime::partition_selected_replicated_text_materialization_tasks(
+        selected.materialization_tasks(),
         &parameters,
         &partition,
     )
     .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
-    let (mut addressable_members, addressable_quantization) =
-        crate::routed_text::project_addressable_members(
-            selected.base().catalog(),
-            selected.base().text(),
-        )
-        .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
+    let mut addressable_members = crate::routed_text::project_addressable_members_with_tasks(
+        selected.base().catalog(),
+        selected.base().text(),
+        &tasks,
+    )
+    .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
     let owner_group = selected.base().owner_group().clone();
     let local_experts = plan
         .local_global_group_indices()
@@ -9564,12 +9869,26 @@ where
     addressable_members.retain(|member| {
         local_units.contains(&member.key().unit()) && local_experts.contains(&member.key().member())
     });
+    addressable_members = addressable_members
+        .into_iter()
+        .map(|member| member.with_owner_rank(rank.global_rank()))
+        .collect();
     let bank_residency = selected.base().bank_residency();
     if matches!(
         bank_residency,
         eredu_runtime::ParameterBankResidency::IndependentCache(_)
     ) {
-        let targets = selected.base().catalog().logical_targets();
+        let targets = selected
+            .base()
+            .catalog()
+            .units()
+            .iter()
+            .filter(|unit| {
+                unit.distribution() == crate::ExpertResidencyDistribution::ExpertParallel
+            })
+            .flat_map(crate::ExpertResidencyUnit::parameters)
+            .map(crate::ExpertParameterRecipe::logical_target)
+            .collect::<BTreeSet<_>>();
         tasks.retain(|task| !targets.contains(task.name()));
     }
     let architecture = crate::decoder::PartitionedLayeredModel::<B, C, P>::from_partition(
@@ -9605,7 +9924,6 @@ where
                 routes_per_token,
                 execution,
                 addressable_members,
-                addressable_quantization,
                 backend: PhantomData,
             },
             store,
@@ -9814,7 +10132,12 @@ where
     B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     S: eredu_runtime::LayerRuntimeState<B>,
     S::LayerState: eredu_nn::AttentionCache<B::Tensor> + eredu_runtime::RuntimeStateComponents<B>,
-    V: RoutedPartitionedProductionVisitor<B, S, eredu_nn::GroupedRelu2Spec>,
+    V: FamilyRoutedPartitionVisitor<
+        B,
+        S,
+        crate::nemotron_h::PartitionedLayeredModel<B>,
+        eredu_nn::GroupedRelu2Spec,
+    >,
 {
     let description_model =
         crate::nemotron_h::LayeredModel::<B>::new(selected_args.clone(), context).map_err(
@@ -9887,7 +10210,7 @@ where
         layout,
         plan,
         store,
-        OrdinaryFamilyRoutedPartitionVisitor(visitor),
+        visitor,
         capability_estimate,
         effective_model_type,
     )
@@ -10113,18 +10436,18 @@ where
 {
     validate_partitioned_binding(selected.requirements(), &partition)
         .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
-    let mut tasks = eredu_runtime::partitioned_replicated_text_materialization_tasks(
-        selected.base().text(),
+    let mut tasks = eredu_runtime::partition_selected_replicated_text_materialization_tasks(
+        selected.materialization_tasks(),
         &parameters,
         &partition,
     )
     .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
-    let (mut addressable_members, addressable_quantization) =
-        crate::routed_text::project_addressable_members(
-            selected.base().catalog(),
-            selected.base().text(),
-        )
-        .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
+    let mut addressable_members = crate::routed_text::project_addressable_members_with_tasks(
+        selected.base().catalog(),
+        selected.base().text(),
+        &tasks,
+    )
+    .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
     let owner_group = selected.base().owner_group().clone();
     let local_units = partition
         .units()
@@ -10138,12 +10461,27 @@ where
     addressable_members.retain(|member| {
         local_units.contains(&member.key().unit()) && local_experts.contains(&member.key().member())
     });
+    let global_rank = selected.requirements().topology().global_rank();
+    addressable_members = addressable_members
+        .into_iter()
+        .map(|member| member.with_owner_rank(global_rank))
+        .collect();
     let bank_residency = selected.base().bank_residency();
     if matches!(
         bank_residency,
         eredu_runtime::ParameterBankResidency::IndependentCache(_)
     ) {
-        let targets = selected.base().catalog().logical_targets();
+        let targets = selected
+            .base()
+            .catalog()
+            .units()
+            .iter()
+            .filter(|unit| {
+                unit.distribution() == crate::ExpertResidencyDistribution::ExpertParallel
+            })
+            .flat_map(crate::ExpertResidencyUnit::parameters)
+            .map(crate::ExpertParameterRecipe::logical_target)
+            .collect::<BTreeSet<_>>();
         tasks.retain(|task| !targets.contains(task.name()));
     }
     let catalog = selected.base().catalog().clone();
@@ -10172,7 +10510,6 @@ where
                 routes_per_token,
                 execution,
                 addressable_members,
-                addressable_quantization,
                 backend: PhantomData,
             },
             store,
@@ -10600,7 +10937,6 @@ where
     routes_per_token: usize,
     execution: PreparedRoutedExecutionHandoff,
     addressable_members: Vec<eredu_runtime::AddressableBankMember>,
-    addressable_quantization: Option<eredu_checkpoint::WeightQuantization>,
     backend: PhantomData<fn() -> B>,
 }
 
@@ -10940,7 +11276,6 @@ where
             routes_per_token: _,
             execution,
             addressable_members: _,
-            addressable_quantization: _,
             backend: _,
         } = self;
         let (architecture, selected) = prepared.into_parts();
@@ -10963,7 +11298,15 @@ where
             bank_residency,
             eredu_runtime::ParameterBankResidency::IndependentCache(_)
         ) {
-            catalog.logical_targets()
+            catalog
+                .units()
+                .iter()
+                .filter(|unit| {
+                    unit.distribution() == crate::ExpertResidencyDistribution::ExpertParallel
+                })
+                .flat_map(crate::ExpertResidencyUnit::parameters)
+                .map(crate::ExpertParameterRecipe::logical_target)
+                .collect()
         } else {
             BTreeSet::new()
         };
@@ -11046,11 +11389,6 @@ where
     /// Returns selected addressable member bindings and byte geometry.
     pub fn addressable_members(&self) -> &[eredu_runtime::AddressableBankMember] {
         &self.addressable_members
-    }
-
-    /// Returns uniform addressable-bank transform, when selected.
-    pub const fn addressable_quantization(&self) -> Option<eredu_checkpoint::WeightQuantization> {
-        self.addressable_quantization
     }
 
     /// Consumes the handoff without re-selection.

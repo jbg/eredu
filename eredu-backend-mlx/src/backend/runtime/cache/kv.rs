@@ -476,6 +476,12 @@ impl CompressedLatentCache {
         self.paged.as_deref().map(|paged| &paged.manager)
     }
 
+    pub(crate) fn rebind_paging_manager(&mut self, manager: CacheResidencyManager) {
+        if let Some(paged) = self.paged.as_deref_mut() {
+            paged.manager = manager;
+        }
+    }
+
     #[cfg(test)]
     fn paged_block_ids(&self) -> Result<Option<Vec<CacheBlockId>>, Exception> {
         self.paged
@@ -1354,6 +1360,12 @@ impl LiveKeyValueCache {
         }
     }
 
+    pub(crate) fn rebind_paging_manager(&mut self, manager: CacheResidencyManager) {
+        if let Self::Paged(cache) = self {
+            cache.rebind_paging_manager(manager);
+        }
+    }
+
     /// Creates a block-addressable cache with exact global-layer and rank
     /// identity.
     pub fn paged(
@@ -1733,6 +1745,10 @@ impl PagedKeyValueCache {
     /// Returns the shared model-wide residency manager.
     pub const fn manager(&self) -> &CacheResidencyManager {
         &self.manager
+    }
+
+    pub(crate) fn rebind_paging_manager(&mut self, manager: CacheResidencyManager) {
+        self.manager = manager;
     }
 
     /// Returns whether another cache has the same immutable transaction

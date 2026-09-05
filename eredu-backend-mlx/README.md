@@ -2,9 +2,9 @@
 
 `eredu-backend-mlx` is the concrete MLX implementation of Eredu's
 backend-neutral contracts. It owns MLX tensor and neural operations,
-checkpoint materialization, execution runtime, model-family binding, media
-processing, distributed execution, and optional codec integration. It does not
-depend on the `eredu` facade crate.
+checkpoint materialization, execution runtime, typed architecture-to-mechanism
+binding, media processing, distributed execution, and optional codec
+integration. It does not depend on the `eredu` facade crate.
 
 The crate's `MlxTensor` is a transparent, zero-copy wrapper around the native
 MLX array handle. The wrapper lets this crate implement `eredu_nn::Tensor`

@@ -17,7 +17,7 @@ use crate::{
 };
 use safetensors::tensor::{Dtype, Metadata};
 
-const MAX_HEADER_BYTES: u64 = 100_000_000;
+pub(crate) const MAX_HEADER_BYTES: u64 = 100_000_000;
 
 /// One canonically resolved SafeTensors checkpoint shard set.
 ///

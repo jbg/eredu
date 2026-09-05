@@ -4,7 +4,7 @@ use std::{borrow::Borrow, collections::BTreeMap, num::NonZeroUsize};
 
 use eredu_checkpoint::{
     recipe::{AtomicRecipeSet, DerivedWeightRecipe, RecipeDtype, RecipeMetadata},
-    store::TensorMetadata,
+    store::{TensorMetadata, TensorSourceProvenance},
     LinearFormat, SourceTensorEncoding, StoredDtype, WeightQuantization,
 };
 use eredu_core::{
@@ -668,7 +668,7 @@ pub struct PreparedMoshiRealtime {
     source_parameters: MoshiParameterContract,
     execution_parameters: MoshiParameterContract,
     parallel: Option<MoshiParallelSelection>,
-    selected: SelectedRealtimeRealization,
+    contract: PreparedRealtimeModelContract,
 }
 
 /// Architecture-owned selected Moshi execution paired with backend mechanisms.
@@ -874,7 +874,12 @@ impl PreparedMoshiRealtime {
 
     /// Returns the authoritative family-blind realtime realization.
     pub const fn selected(&self) -> &SelectedRealtimeRealization {
-        &self.selected
+        self.contract.selected()
+    }
+
+    /// Returns exact selected materialization work, including physical source provenance.
+    pub fn materialization_tasks(&self) -> &[RealtimeMaterializationTask] {
+        self.contract.tasks()
     }
 
     /// Consumes the selection into all architecture-owned construction inputs.
@@ -886,7 +891,7 @@ impl PreparedMoshiRealtime {
         MoshiParameterContract,
         MoshiParameterContract,
         Option<MoshiParallelSelection>,
-        SelectedRealtimeRealization,
+        PreparedRealtimeModelContract,
     ) {
         (
             self.preparation,
@@ -894,7 +899,7 @@ impl PreparedMoshiRealtime {
             self.source_parameters,
             self.execution_parameters,
             self.parallel,
-            self.selected,
+            self.contract,
         )
     }
 }
@@ -944,13 +949,20 @@ pub fn select_inspected_moshi_realtime(
         &candidate.selection_request,
         capabilities,
     )?;
+    let tasks = materialization_tasks(
+        &candidate.execution_parameters,
+        &selected,
+        candidate.preparation.source_metadata(),
+    )?;
+    let contract = PreparedRealtimeModelContract::new(selected, tasks)
+        .map_err(|error| MoshiRealtimeSelectionError::InvalidArchitecture(error.to_string()))?;
     Ok(PreparedMoshiRealtime {
         preparation: candidate.preparation,
         execution_config: candidate.execution_config,
         source_parameters: candidate.source_parameters,
         execution_parameters: candidate.execution_parameters,
         parallel: candidate.parallel,
-        selected,
+        contract,
     })
 }
 
@@ -986,17 +998,16 @@ where
         preparation,
         execution_config,
         _source_parameters,
-        execution_parameters,
+        _execution_parameters,
         parallel,
-        selected,
+        contract,
     ) = prepared.into_parts();
+    let selected = contract.selected();
     if selected.topology().is_replicated() != parallel.is_none() {
         return Err(MoshiRealtimeDispatchError::Architecture(
             "Moshi realtime topology and rank-local parallel plan differ".into(),
         ));
     }
-    let tasks = materialization_tasks(&execution_parameters, &selected)
-        .map_err(|error| MoshiRealtimeDispatchError::Architecture(error.to_string()))?;
     let transforms = selected.weight_lowerings().iter().any(|lowering| {
         matches!(
             lowering.kind(),
@@ -1004,8 +1015,6 @@ where
         )
     });
     let source_config = transforms.then(|| preparation.config().clone());
-    let contract = PreparedRealtimeModelContract::new(selected, tasks)
-        .map_err(|error| MoshiRealtimeDispatchError::Architecture(error.to_string()))?;
 
     visitor.construction_started();
     let source_architecture = source_config
@@ -1066,12 +1075,34 @@ fn validate_store_metadata(
             ));
         }
     }
+    for provenance in prepared
+        .materialization_tasks()
+        .iter()
+        .flat_map(|task| task.components())
+        .flat_map(RealtimeMaterializationComponent::source_provenance)
+    {
+        let actual = store
+            .source_provenance(&provenance.catalog_key)
+            .map_err(|error| {
+                format!(
+                    "selected realtime source provenance {:?} is unavailable: {error}",
+                    provenance.catalog_key
+                )
+            })?;
+        if &actual != provenance {
+            return Err(format!(
+                "selected realtime source provenance differs for {:?}",
+                provenance.catalog_key
+            ));
+        }
+    }
     Ok(())
 }
 
 fn materialization_tasks(
     execution: &MoshiParameterContract,
     selected: &SelectedRealtimeRealization,
+    source_metadata: &BTreeMap<String, TensorMetadata>,
 ) -> Result<Vec<RealtimeMaterializationTask>, MoshiRealtimeSelectionError> {
     let mut owners = BTreeMap::new();
     for group in execution.description().groups() {
@@ -1101,8 +1132,33 @@ fn materialization_tasks(
                 .components()
                 .iter()
                 .cloned()
-                .map(RealtimeMaterializationComponent::new)
-                .collect::<Vec<_>>();
+                .map(|requirement| {
+                    let provenance = requirement
+                        .source_occurrences()
+                        .iter()
+                        .map(|source| {
+                            let metadata =
+                                source_metadata.get(source.as_str()).ok_or_else(|| {
+                                    invalid_architecture(format!(
+                                        "selected realtime source {:?} has no admitted metadata",
+                                        source.as_str()
+                                    ))
+                                })?;
+                            Ok(TensorSourceProvenance {
+                                catalog_key: source.as_str().to_owned(),
+                                physical_tensor: metadata.name.clone(),
+                                output: source.as_str().to_owned(),
+                                backing_shard: metadata.backing_shard.clone(),
+                                source_encoding: SourceTensorEncoding::Safetensors(
+                                    metadata.stored_dtype.clone(),
+                                ),
+                            })
+                        })
+                        .collect::<Result<Vec<_>, MoshiRealtimeSelectionError>>()?;
+                    RealtimeMaterializationComponent::new(requirement, provenance)
+                        .map_err(|error| invalid_architecture(error.to_string()))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
             RealtimeMaterializationTask::new(lowering.clone(), owner.clone(), components)
                 .map_err(|error| invalid_architecture(error.to_string()))
         })
@@ -2034,6 +2090,58 @@ mod tests {
             .observations()
             .activations()
             .contains(&observation));
+    }
+
+    #[test]
+    fn selected_moshi_and_personaplex_retain_exact_task_source_provenance() {
+        let configs = [
+            native_config(4),
+            MoshiConfig::from_json(r#"{"model_type":"personaplex","version":"7b-v1"}"#).unwrap(),
+        ];
+        for config in configs {
+            let request = request(None, std::iter::empty());
+            let candidate = build_candidate(preparation(config.clone()), request.clone()).unwrap();
+            let prepared =
+                select_moshi_realtime(preparation(config), request, &capabilities(&candidate))
+                    .unwrap();
+
+            assert_eq!(
+                prepared.materialization_tasks().len(),
+                prepared.selected().weight_lowerings().len()
+            );
+            for (task, lowering) in prepared
+                .materialization_tasks()
+                .iter()
+                .zip(prepared.selected().weight_lowerings())
+            {
+                assert_eq!(task.lowering(), lowering);
+                for component in task.components() {
+                    assert_eq!(
+                        component
+                            .source_provenance()
+                            .iter()
+                            .map(|source| source.catalog_key.as_str())
+                            .collect::<Vec<_>>(),
+                        component
+                            .requirement()
+                            .source_occurrences()
+                            .iter()
+                            .map(RealtimeIdentity::as_str)
+                            .collect::<Vec<_>>()
+                    );
+                    for source in component.source_provenance() {
+                        let metadata = &prepared.source_metadata()[&source.catalog_key];
+                        assert_eq!(source.physical_tensor, metadata.name);
+                        assert_eq!(source.output, source.catalog_key);
+                        assert_eq!(source.backing_shard, metadata.backing_shard);
+                        assert_eq!(
+                            source.source_encoding,
+                            SourceTensorEncoding::Safetensors(metadata.stored_dtype.clone())
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

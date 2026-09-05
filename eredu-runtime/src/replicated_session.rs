@@ -121,6 +121,24 @@ where
         context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
     ) -> Result<(), Self::Error>;
 
+    /// Forks canonical state for one independently advanceable prediction lane.
+    ///
+    /// The default composes ordinary realization and checkpoint restoration. Backends whose
+    /// state carries immutable transaction identity, such as a paged-cache residency session,
+    /// override this operation so copied content receives one coherent independent identity
+    /// without weakening unrelated cross-session restore validation.
+    fn fork_prediction_target_state(
+        &mut self,
+        state: &Self::State,
+        selected: &SelectedStateRealization,
+        context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
+    ) -> Result<Self::State, Self::Error> {
+        let checkpoint = self.checkpoint_state(state, context)?;
+        let mut fork = self.realize_state(selected, context)?;
+        self.restore_state(&mut fork, checkpoint, context)?;
+        Ok(fork)
+    }
+
     /// Restores native state bytes from a validated prompt-cache artifact.
     fn load_prompt_cache(
         &mut self,
@@ -1254,13 +1272,19 @@ where
     if let Some(source) = source_architecture {
         validate_architecture_parameters::<A, B, S>(source, &selected, false, context)?;
     }
-    let mut output_companions =
+    let mut constructed_companions =
         validate_architecture_parameters::<A, B, S>(architecture, &selected, true, context)?;
     let mut tasks =
         replicated_text_materialization_tasks(&selected).map_err(|error| error.to_string())?;
     let selected_parameter_names = tasks
         .iter()
-        .map(|task| task.name().to_owned())
+        .flat_map(|task| {
+            std::iter::once(task.name().to_owned()).chain(
+                task.output_companions()
+                    .iter()
+                    .map(|companion| companion.name().to_owned()),
+            )
+        })
         .collect::<BTreeSet<_>>();
     if !addressable_parameters.is_subset(&selected_parameter_names) {
         return Err(format!(
@@ -1272,48 +1296,61 @@ where
     }
     let addressable_companions = addressable_parameters
         .iter()
-        .filter_map(|name| output_companions.get(name))
-        .flatten()
+        .filter_map(|name| tasks.iter().find(|task| task.name() == name))
+        .flat_map(|task| task.output_companions())
         .map(|companion| companion.name().to_owned())
         .collect::<Vec<_>>();
     addressable_parameters.extend(addressable_companions);
-    let companion_names = output_companions
-        .values()
-        .flatten()
-        .map(|companion| companion.name().to_owned())
-        .collect::<BTreeSet<_>>();
-    let companion_tasks = tasks
-        .iter()
-        .filter(|task| companion_names.contains(task.name()))
-        .map(|task| (task.name().to_owned(), task.clone()))
-        .collect::<BTreeMap<_, _>>();
-    for task in &mut tasks {
-        let companions = output_companions
+    for task in &tasks {
+        let mut actual = constructed_companions
             .remove(task.name())
-            .unwrap_or_default()
-            .into_iter()
-            .map(
-                |companion| match companion_tasks.get(companion.name()).cloned() {
-                    Some(exact) => companion
-                        .with_materialization_task(exact)
-                        .map_err(|error| error.to_string()),
-                    None => Ok(companion),
-                },
-            )
-            .collect::<Result<Vec<_>, String>>()?;
-        task.set_output_companions(companions)
-            .map_err(|error| error.to_string())?;
+            .unwrap_or_default();
+        actual.sort_by(|left, right| {
+            left.role()
+                .cmp(&right.role())
+                .then_with(|| left.name().cmp(right.name()))
+        });
+        let expected = task.output_companions();
+        let agrees = actual.len() == expected.len()
+            && actual.iter().zip(expected).all(|(actual, expected)| {
+                actual.name() == expected.name()
+                    && actual.role() == expected.role()
+                    && actual.logical_shape() == expected.logical_shape()
+                    && (actual.owner() == expected.owner()
+                        || matches!(
+                            (actual.owner(), expected.owner()),
+                            (
+                                ParameterGroupOwner::StaticAnyOf(actual_roles),
+                                ParameterGroupOwner::StaticRole(expected_role)
+                            ) if actual_roles.iter().any(|role| role == expected_role)
+                        ))
+            });
+        if !agrees {
+            return Err(format!(
+                "constructed output companions for {:?} differ from authoritative selection: lowering={:?}, executable={:?}, constructed={:?}, selected={:?}, retained={:?}",
+                task.name(),
+                task.lowering(),
+                task.executable(),
+                actual
+                    .iter()
+                    .map(|companion| (companion.name(), companion.role(), companion.logical_shape(), companion.owner()))
+                    .collect::<Vec<_>>(),
+                expected
+                    .iter()
+                    .map(|companion| (companion.name(), companion.role(), companion.logical_shape(), companion.owner()))
+                    .collect::<Vec<_>>(),
+                selected.requirements().parameters().iter().filter_map(|parameter| {
+                    parameter.linear_companion().filter(|(_, primary)| *primary == task.name()).map(|(role, primary)| (parameter.name(), role, primary))
+                }).collect::<Vec<_>>(),
+            ));
+        }
     }
-    if !output_companions.is_empty() {
+    if !constructed_companions.is_empty() {
         return Err(format!(
             "output companion catalog contains unknown materialization tasks: {:?}",
-            output_companions.keys().collect::<Vec<_>>()
+            constructed_companions.keys().collect::<Vec<_>>()
         ));
     }
-    // Checkpoint-native companions participate in selected-parameter
-    // validation, but their primary packed output owns their one causal
-    // materialization task. Do not consume them again as standalone tasks.
-    tasks.retain(|task| !companion_names.contains(task.name()));
     tasks.retain(|task| !addressable_parameters.contains(task.name()));
     let state = PartitionState::new(selected.state().layout().clone(), 0)
         .map_err(|error| error.to_string())?;
@@ -2209,17 +2246,9 @@ where
             },
             |selected| {
                 self.mechanisms
-                    .realize_state(selected, context)
+                    .fork_prediction_target_state(&self.state, selected, context)
                     .map_err(ReplicatedTextSessionError::Mechanism)
-                    .and_then(|mut state| {
-                        validate_realized_state(&state, selected)?;
-                        let checkpoint = self
-                            .mechanisms
-                            .checkpoint_state(&self.state, context)
-                            .map_err(ReplicatedTextSessionError::Mechanism)?;
-                        self.mechanisms
-                            .restore_state(&mut state, checkpoint, context)
-                            .map_err(ReplicatedTextSessionError::Mechanism)?;
+                    .and_then(|state| {
                         validate_realized_state(&state, selected)?;
                         Ok(state)
                     })
@@ -3534,7 +3563,7 @@ where
                 parameter.presence(),
                 ReplicatedTextParameterPresence::OptionalAbsent
                     | ReplicatedTextParameterPresence::Tied { .. }
-            )
+            ) && parameter.role() != crate::ReplicatedTextParameterRole::FormatCompanion
         })
         .map(|parameter| parameter.name())
         .collect::<BTreeSet<_>>();
@@ -3562,7 +3591,7 @@ where
             parameter.presence(),
             ReplicatedTextParameterPresence::OptionalAbsent
                 | ReplicatedTextParameterPresence::Tied { .. }
-        )
+        ) && parameter.role() != crate::ReplicatedTextParameterRole::FormatCompanion
     }) {
         let (shape, owner) = actual
             .get(parameter.name())
@@ -3601,7 +3630,10 @@ where
         });
         if (!selected_formats
             || realization.is_some_and(|realization| {
-                realization.lowering() == crate::WeightLoweringKind::Direct
+                matches!(
+                    realization.lowering(),
+                    crate::WeightLoweringKind::Direct | crate::WeightLoweringKind::Derived
+                )
             }))
             && executable == eredu_checkpoint::LinearFormat::MxFp4
             && matches!(
@@ -3615,30 +3647,91 @@ where
                 .physical_shape()
                 .expect("direct native realization has admitted physical geometry")
                 .to_vec();
-        } else if let Some(last) = expected_shape.last_mut() {
-            match executable {
-                eredu_checkpoint::LinearFormat::Affine(config) => {
-                    *last = last.saturating_mul(config.bits as usize) / 32;
-                }
-                eredu_checkpoint::LinearFormat::MxFp4 => {
-                    *last = last.saturating_mul(4) / 32;
-                }
-                eredu_checkpoint::LinearFormat::GgufIQuant { ggml_type, .. } => {
-                    if let Ok((block, bytes)) = ggml_type.block_and_bytes() {
-                        if let (Ok(block), Ok(bytes)) =
-                            (usize::try_from(block), usize::try_from(bytes))
-                        {
-                            *last = last.saturating_mul(bytes) / block;
-                        }
-                    }
-                }
-                eredu_checkpoint::LinearFormat::Dense
-                | eredu_checkpoint::LinearFormat::E4M3BlockFp8(_) => {}
-            }
         }
-        if shape != &expected_shape || !owner_matches {
+        // Architecture descriptions remain semantic and may therefore expose
+        // the logical module geometry. Backends whose constructed module owns
+        // an already-packed transform expose the exact selected executable
+        // geometry instead. Keep both identities distinct and accept only the
+        // two shapes derived from this selected task.
+        let selected_lowering = realization.map_or(crate::WeightLoweringKind::Direct, |selected| {
+            selected.lowering()
+        });
+        let selected_executable_shape = Some((|| {
+            let descriptor = parameter
+                .lowering_descriptor(executable)
+                .map_err(|error| error.to_string())?;
+            let mut packed = descriptor.logical_shape().to_vec();
+            let Some(axis) = descriptor.packed_axis() else {
+                return Ok(packed);
+            };
+            let bits = match executable {
+                eredu_checkpoint::LinearFormat::Affine(config) => usize::try_from(config.bits)
+                    .map_err(|_| {
+                        format!(
+                            "selected parameter {:?} has invalid affine packing bits",
+                            parameter.name()
+                        )
+                    })?,
+                eredu_checkpoint::LinearFormat::MxFp4 => 4,
+                eredu_checkpoint::LinearFormat::Dense
+                | eredu_checkpoint::LinearFormat::E4M3BlockFp8(_) => return Ok(packed),
+                eredu_checkpoint::LinearFormat::GgufIQuant { ggml_type, .. } => {
+                    if matches!(
+                        selected_lowering,
+                        crate::WeightLoweringKind::Transform
+                            | crate::WeightLoweringKind::DerivedTransform
+                    ) {
+                        return Err(format!(
+                            "selected parameter {:?} cannot apply a load-time GGUF transform",
+                            parameter.name()
+                        ));
+                    }
+                    let (block, bytes) = ggml_type
+                        .block_and_bytes()
+                        .map_err(|error| error.to_string())?;
+                    let block = usize::try_from(block)
+                        .map_err(|_| "GGUF block width is not representable".to_owned())?;
+                    let bytes = usize::try_from(bytes)
+                        .map_err(|_| "GGUF block bytes are not representable".to_owned())?;
+                    let packed_bytes = packed[axis]
+                        .checked_mul(bytes)
+                        .ok_or_else(|| "GGUF executable geometry overflowed".to_owned())?;
+                    if !packed_bytes.is_multiple_of(block) {
+                        return Err(format!(
+                            "selected parameter {:?} GGUF executable geometry is not block aligned",
+                            parameter.name()
+                        ));
+                    }
+                    packed[axis] = packed_bytes / block;
+                    return Ok(packed);
+                }
+            };
+            let packed_bits = packed[axis].checked_mul(bits).ok_or_else(|| {
+                format!(
+                    "selected parameter {:?} executable geometry overflowed",
+                    parameter.name()
+                )
+            })?;
+            if !packed_bits.is_multiple_of(32) {
+                return Err(format!(
+                    "selected parameter {:?} executable geometry {}x{} bits is not U32 aligned (logical {:?}, physical {:?})",
+                    parameter.name(),
+                    packed[axis],
+                    bits,
+                    descriptor.logical_shape(),
+                    descriptor.physical_shape()
+                ));
+            }
+            packed[axis] = packed_bits / 32;
+            Ok(packed)
+        })()?);
+        let shape_matches = shape == &expected_shape
+            || selected_executable_shape
+                .as_ref()
+                .is_some_and(|selected| shape == selected);
+        if !shape_matches || !owner_matches {
             return Err(format!(
-                "selected parameter {:?} expects shape {expected_shape:?} and owner {:?}, constructed shape {shape:?} and owner {owner:?}",
+                "selected parameter {:?} expects logical shape {expected_shape:?} or selected executable shape {selected_executable_shape:?} and owner {:?}, constructed shape {shape:?} and owner {owner:?}",
                 parameter.name(),
                 parameter.owner()
             ));

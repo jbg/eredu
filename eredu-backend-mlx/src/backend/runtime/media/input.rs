@@ -253,6 +253,12 @@ fn validate_token_ids(tokens: &Array) -> Result<(), Exception> {
             "token ids must have non-empty batch and sequence dimensions, got {shape:?}"
         )));
     }
+    if !matches!(tokens.dtype(), Dtype::Int32 | Dtype::Uint32) {
+        return Err(Exception::custom(format!(
+            "public token ids must use int32 or uint32 storage, got {:?}",
+            tokens.dtype()
+        )));
+    }
     Ok(())
 }
 
@@ -294,6 +300,18 @@ mod tests {
             [input_part(InputModality::Text, InputPayload::TokenIds(tokens), [], []).unwrap()];
 
         validate(ModelInput::new(&parts)).unwrap();
+    }
+
+    #[test]
+    fn rejects_public_int64_token_part() {
+        let tokens = Array::from_slice(&[1_i64, 2], &[1, 2]);
+        let parts =
+            [input_part(InputModality::Text, InputPayload::TokenIds(tokens), [], []).unwrap()];
+
+        let error = validate(ModelInput::new(&parts)).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("public token ids must use int32 or uint32"));
     }
 
     #[test]

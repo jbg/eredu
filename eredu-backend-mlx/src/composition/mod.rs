@@ -1,25 +1,16 @@
 //! Cold-path architecture/backend composition selected by public loaders.
 
+#[cfg(test)]
 pub(crate) mod grouped_provider;
 // Standalone exchange harnesses are available only to crate-internal validation.
 #[cfg(test)]
 #[allow(dead_code)]
 pub(crate) mod expert_dispatch;
 
-use ref_cast::RefCast;
 use safemlx::error::Exception;
 use safemlx::Array;
 
-#[cfg(test)]
-use eredu_checkpoint::recipe::DerivedWeightRecipe;
-use eredu_checkpoint::store::CheckpointSource;
-#[cfg(test)]
-use eredu_nn::Parameterized;
-use eredu_runtime::ArchitectureParameters;
-#[cfg(test)]
-use eredu_runtime::{StaticParameterVisitor, StaticUnitBindings};
-
-use crate::{backend::error::Error, backend::nn::shared::MlxNeuralBackend};
+pub(crate) use crate::backend::nn::shared::MlxNeuralBackend;
 
 impl From<eredu_runtime::ParameterBankLoadOptions>
     for crate::backend::runtime::residency::parameter_bank::ParameterBankOptions
@@ -32,33 +23,6 @@ impl From<eredu_runtime::ParameterBankLoadOptions>
         )
         .expect("architecture-owned expert-cache options were already validated")
     }
-}
-
-/// Derives prompt-cache identity for a complete replicated realization through
-/// the architecture's neutral mutable-state contract.
-pub(crate) fn replicated_prompt_cache_identity<A>(
-    architecture: &A,
-    topology: eredu_core::cache::PromptCacheTopology,
-) -> Result<eredu_core::cache::PromptCacheModelIdentity, Error>
-where
-    A: ArchitectureParameters<MlxNeuralBackend>,
-    A::DefinitionError: std::fmt::Display,
-{
-    let layout = architecture
-        .state_layout()
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    eredu_runtime::PartitionState::new(layout, 0)
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?
-        .prompt_cache_identity::<MlxNeuralBackend, A>(architecture, topology)
-        .map_err(|error| match error {
-            eredu_runtime::ArchitecturePartitionError::ArchitectureState(detail) => {
-                Error::ArchitectureModel(detail)
-            }
-            eredu_runtime::ArchitecturePartitionError::PromptCacheIdentity(detail) => {
-                Error::Parallel(detail)
-            }
-            error => Error::Parallel(error.to_string()),
-        })
 }
 
 /// Adapts public MLX-array observation to the neutral tensor/error contract.
@@ -118,165 +82,6 @@ impl eredu_runtime::ActivationObserver<crate::MlxTensor, eredu_nn::Error>
 }
 
 #[cfg(test)]
-struct StaticBindingVisitor<'a> {
-    store: &'a dyn CheckpointSource,
-    recipes: std::collections::BTreeMap<String, DerivedWeightRecipe>,
-    selected_roles: Option<std::collections::BTreeSet<String>>,
-    units: Vec<StaticUnitBindings>,
-}
-
-#[cfg(test)]
-impl StaticParameterVisitor<MlxNeuralBackend> for StaticBindingVisitor<'_> {
-    type Error = Error;
-
-    fn visit<M>(&mut self, role: &str, module: &M) -> Result<(), Self::Error>
-    where
-        M: Parameterized<crate::MlxTensor>,
-    {
-        if self
-            .selected_roles
-            .as_ref()
-            .is_some_and(|selected| !selected.contains(role))
-        {
-            for name in crate::backend::nn::shared::neutral_parameter_refs(module, false)
-                .flatten()
-                .into_keys()
-            {
-                self.recipes.remove(name.as_ref());
-            }
-            return Ok(());
-        }
-        let bindings =
-            crate::backend::runtime::checkpoint::binding::build_neutral_module_bindings_with_recipes(
-                module,
-                self.store,
-                &mut self.recipes,
-            )?;
-        self.units.push(StaticUnitBindings::new(role, bindings)?);
-        Ok(())
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn architecture_static_units<A>(
-    architecture: &A,
-    store: &dyn CheckpointSource,
-) -> Result<Vec<StaticUnitBindings>, Error>
-where
-    A: ArchitectureParameters<MlxNeuralBackend>,
-{
-    architecture_static_units_selected(architecture, store, None)
-}
-
-#[cfg(test)]
-pub(crate) fn architecture_static_units_for_roles<A>(
-    architecture: &A,
-    store: &dyn CheckpointSource,
-    roles: &[&str],
-) -> Result<Vec<StaticUnitBindings>, Error>
-where
-    A: ArchitectureParameters<MlxNeuralBackend>,
-{
-    architecture_static_units_selected(architecture, store, Some(roles))
-}
-
-#[cfg(test)]
-fn architecture_static_units_selected<A>(
-    architecture: &A,
-    store: &dyn CheckpointSource,
-    roles: Option<&[&str]>,
-) -> Result<Vec<StaticUnitBindings>, Error>
-where
-    A: ArchitectureParameters<MlxNeuralBackend>,
-{
-    let recipes = architecture
-        .static_parameter_recipes(store)
-        .map_err(Error::ArchitectureModel)?;
-    let mut visitor = StaticBindingVisitor {
-        store,
-        recipes,
-        selected_roles: roles.map(|roles| roles.iter().map(|role| (*role).to_owned()).collect()),
-        units: Vec::new(),
-    };
-    architecture.visit_static_parameters(&mut visitor)?;
-    if !visitor.recipes.is_empty() {
-        return Err(Error::ArchitectureModel(format!(
-            "architecture declared static recipes for unknown parameters {:?}",
-            visitor.recipes.into_keys().collect::<Vec<_>>()
-        )));
-    }
-    Ok(visitor.units)
-}
-
-/// Lowers already-selected neutral expert units into native cache entries.
-///
-/// Callers that realize only part of an architecture must consume neutral owner
-/// and distribution policy with [`select_architecture_expert_units`] first.
-pub(crate) fn architecture_expert_units(
-    units: impl IntoIterator<Item = eredu_architectures::ExpertResidencyUnit>,
-    store: &dyn CheckpointSource,
-    layout: Option<&eredu_runtime::LocalModelLayout>,
-) -> Result<Vec<crate::backend::runtime::residency::parameter_bank::ParameterBankEntry>, Error> {
-    use crate::backend::runtime::residency::parameter_bank::ParameterBankEntry;
-    use eredu_runtime::{OffloadUnit, WeightBinding};
-
-    units
-        .into_iter()
-        .map(|unit| {
-            let identity = unit.identity();
-            let mut bindings = unit
-                .into_parameters()
-                .into_iter()
-                .map(|parameter| {
-                    let mut parameter = parameter.into_artifact();
-                    let binding_name = parameter.take_binding_name();
-                    let logical_target = parameter.take_logical_target();
-                    let mut recipe = parameter.take_recipe();
-                    let role = parameter.take_role();
-                    if recipe.infer(store)?.dtype() == &eredu_checkpoint::recipe::RecipeDtype::F4 {
-                        recipe = crate::backend::runtime::checkpoint::recipe::lower_mxfp4_recipe(
-                            recipe, store,
-                        )?;
-                    }
-                    let metadata = recipe.infer(store)?;
-                    let mut binding =
-                        WeightBinding::from_recipe(binding_name, recipe, metadata.byte_len())?
-                            .with_logical_target(logical_target)?;
-                    if let eredu_architectures::ExpertParameterRole::QuantizableProjection {
-                        scales_binding,
-                        biases_binding,
-                    } = role
-                    {
-                        binding =
-                            binding.with_quantization_companions(scales_binding, biases_binding)?;
-                    }
-                    Ok(binding)
-                })
-                .collect::<Result<Vec<_>, Error>>()?;
-            if let Some(layout) = layout {
-                bindings = crate::backend::runtime::execution::layerwise::shard_layer_bindings(
-                    bindings, store, layout,
-                )?;
-            }
-            let bytes = bindings.iter().try_fold(0u64, |total, binding| {
-                total.checked_add(binding.expected_bytes()).ok_or_else(|| {
-                    Error::ArchitectureModel(format!("expert {identity:?} byte total overflowed"))
-                })
-            })?;
-            let key = crate::backend::runtime::residency::parameter_bank::ParameterBankKey::new(
-                identity.unit(),
-                identity.member(),
-            );
-            Ok(ParameterBankEntry::new(
-                key,
-                OffloadUnit::new(key.unit_id(), bindings)?,
-                bytes,
-            )?)
-        })
-        .collect()
-}
-
-#[cfg(test)]
 fn select_architecture_expert_units(
     units: impl IntoIterator<Item = eredu_architectures::ExpertResidencyUnit>,
     mut owns_unit: impl FnMut(&eredu_runtime::ExecutionGroupId, usize) -> bool,
@@ -294,31 +99,11 @@ fn select_architecture_expert_units(
     })
 }
 
-pub(crate) fn tensor_ref(array: &Array) -> &crate::MlxTensor {
-    crate::MlxTensor::ref_cast(array)
-}
-
-pub(crate) fn tensor_opt(array: Option<&Array>) -> Option<&crate::MlxTensor> {
-    array.map(tensor_ref)
-}
-
-pub mod deepseek;
-pub mod deepseek_expert;
-pub mod gemma4;
-pub mod gemma4_expert;
-pub mod gpt_oss;
-pub mod inkling;
-pub mod inkling_expert;
-pub mod kimi_linear;
-// MLX adapter only; the neutral family is always available from
-// `eredu_architectures::lfm2`.
-pub mod lfm2;
 pub mod mlx;
 pub mod moshi;
-pub mod muse_glimmer;
-pub mod muse_glimmer_expert;
-pub mod nemotron_h;
-pub mod qwen;
+
+#[cfg(test)]
+pub(crate) mod checkpoint_fixtures;
 
 #[cfg(test)]
 #[path = "tests/mlx_architecture_conformance.rs"]

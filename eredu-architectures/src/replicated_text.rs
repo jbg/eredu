@@ -35,6 +35,7 @@ use crate::{
 
 struct Lfm2Replicated;
 struct KimiLinearReplicated;
+struct DeepSeekV3DenseReplicated;
 pub(crate) struct NemotronHReplicated;
 struct QwenHybridReplicated;
 
@@ -229,6 +230,67 @@ impl<B: eredu_nn::BlockwiseAttentionBackend> CompressedReplicatedFamily<B>
         C: eredu_nn::CompressedAttentionCache<B::Tensor> + eredu_runtime::RuntimeStateComponents<B>,
     {
         unit.forward(hidden, forward.mask.as_ref(), state, context)
+    }
+}
+
+impl<B: eredu_nn::BlockwiseAttentionBackend> CompressedReplicatedFamily<B>
+    for DeepSeekV3DenseReplicated
+{
+    type Config = crate::deepseek::V3Args;
+    type Unit = crate::deepseek::block::DenseV3Block<B>;
+
+    fn validate(config: &Self::Config) -> Result<(), eredu_nn::Error> {
+        config.validate().map_err(eredu_nn::Error::backend)?;
+        if config.num_nextn_predict_layers != 0
+            || config
+                .layer_schedule
+                .iter()
+                .any(|policy| *policy == crate::deepseek::LayerPolicy::SparseMoe)
+        {
+            return Err(eredu_nn::Error::backend(
+                "replicated DeepSeek-V3 configuration contains routed or prediction layers",
+            ));
+        }
+        Ok(())
+    }
+    fn layer_count(config: &Self::Config) -> Result<usize, eredu_nn::Error> {
+        usize::try_from(config.num_hidden_layers).map_err(eredu_nn::Error::backend)
+    }
+    fn static_spec(config: &Self::Config) -> crate::decoder::StaticModuleSpec {
+        crate::deepseek::v3::static_spec(config)
+    }
+    fn state_layout(config: &Self::Config) -> Result<eredu_runtime::StateLayout, eredu_nn::Error> {
+        crate::deepseek::v3::state_layout(config)
+    }
+    fn state_identity(
+        config: &Self::Config,
+        layout: &eredu_runtime::StateLayout,
+        global_layer_start: usize,
+        topology: eredu_core::cache::PromptCacheTopology,
+    ) -> Result<eredu_runtime::ModelStateIdentity, eredu_nn::Error> {
+        crate::deepseek::v3::state_identity(config, layout, global_layer_start, topology)
+    }
+    fn build_unit(
+        config: &Self::Config,
+        index: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self::Unit, eredu_nn::Error> {
+        crate::deepseek::block::DenseV3Block::new(config, index, context)
+    }
+    fn mask_layer(config: &Self::Config) -> Option<usize> {
+        (!config.layer_schedule.is_empty()).then_some(0)
+    }
+    fn forward_unit<C>(
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut C,
+        forward: &ReplicatedForwardContext<B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, eredu_nn::Error>
+    where
+        C: eredu_nn::CompressedAttentionCache<B::Tensor> + eredu_runtime::RuntimeStateComponents<B>,
+    {
+        unit.forward(hidden, forward.mask.as_ref(), Some(state), context)
     }
 }
 
@@ -673,6 +735,50 @@ where
     )
 }
 
+/// Visits an additional typed architecture through the ordinary production
+/// selection, materialization, and session boundary without extending a
+/// concrete backend family registry.
+#[allow(clippy::too_many_arguments)]
+pub fn visit_replicated_text_extension_architecture<B, S, A, V>(
+    architecture: A,
+    source_architecture: Option<A>,
+    selected: SelectedReplicatedTextRealization,
+    capability_estimate: crate::capability::CapabilityEstimate,
+    effective_model_type: impl Into<String>,
+    prompt_cache_architecture_identity: impl Into<String>,
+    store: eredu_checkpoint::store::SharedCheckpointSource,
+    context: &<B::Tensor as Tensor>::Context,
+    mut visitor: V,
+) -> Result<V::Output, ReplicatedTextDispatchError<V::Error>>
+where
+    B: NeuralBackend,
+    S: LayerRuntimeState<B>,
+    S::LayerState: AttentionCache<B::Tensor>,
+    A: ReplicatedTextArchitecture<B, S, Error = eredu_nn::Error> + 'static,
+    A::StaticModules: Clone,
+    A::Error: std::fmt::Display,
+    V: ReplicatedTextArchitectureVisitor<B, S>,
+{
+    let requirements = selected.requirements().clone();
+    validate_store_handoff(&requirements, store.as_ref())
+        .map_err(ReplicatedTextDispatchError::Architecture)?;
+    visitor.construction_started();
+    let prepared = prepare_architecture_handoff::<B, S, A>(
+        architecture,
+        source_architecture,
+        requirements,
+        selected,
+        capability_estimate,
+        effective_model_type.into(),
+        prompt_cache_architecture_identity.into(),
+        context,
+    )
+    .map_err(ReplicatedTextDispatchError::Architecture)?;
+    visitor
+        .visit(prepared, store)
+        .map_err(ReplicatedTextDispatchError::Backend)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare_architecture_handoff_with_addressable<'a, B, S, A>(
     architecture: A,
@@ -850,24 +956,6 @@ pub(crate) fn validate_store_handoff(
     requirements: &ReplicatedTextRequirements,
     store: &dyn eredu_checkpoint::store::CheckpointSource,
 ) -> Result<(), String> {
-    let mut provenance = BTreeMap::new();
-    for key in store.source_keys() {
-        let source = store.source_provenance(&key).map_err(|error| {
-            format!("checkpoint provenance for {key:?} is unavailable: {error}")
-        })?;
-        let identity = (
-            source.physical_tensor.clone(),
-            source.backing_shard.clone(),
-            source.output.clone(),
-        );
-        if provenance
-            .insert(identity, (source.catalog_key, source.source_encoding))
-            .is_some()
-        {
-            return Err("checkpoint catalog contains ambiguous physical output provenance".into());
-        }
-    }
-    let mut checked = BTreeSet::new();
     for parameter in requirements.parameters() {
         let derived = matches!(
             parameter.presence(),
@@ -876,23 +964,28 @@ pub(crate) fn validate_store_handoff(
         let mut lowering_key = None;
         let mut admitted_keys = BTreeSet::new();
         for source in parameter.physical_sources() {
-            let identity = (
-                source.tensor().to_owned(),
-                Some(source.shard().to_path_buf()),
-                source.output().to_owned(),
-            );
-            let (key, encoding) = provenance.get(&identity).ok_or_else(|| {
-                format!(
-                    "selected physical output {:?}/{:?} in {:?} is unavailable",
-                    source.tensor(),
-                    source.output(),
-                    source.shard()
-                )
+            let key = source.catalog_key();
+            let actual = store.source_provenance(key).map_err(|error| {
+                format!("selected source catalog key {key:?} is unavailable: {error}")
             })?;
+            let metadata = store.source_metadata(key).map_err(|error| {
+                format!("selected source metadata for {key:?} is unavailable: {error}")
+            })?;
+            if actual.catalog_key != key
+                || actual.physical_tensor != source.tensor()
+                || actual.backing_shard.as_deref() != Some(source.shard())
+                || actual.output != source.output()
+                || &actual.source_encoding != source.source_encoding()
+                || metadata.encoded_byte_len != source.encoded_byte_len()
+            {
+                return Err(format!(
+                    "selected physical provenance for catalog key {key:?} differs from the admitted store"
+                ));
+            }
             if !derived
                 && parameter
                     .source_encoding()
-                    .is_some_and(|expected| expected != encoding)
+                    .is_some_and(|expected| expected != source.source_encoding())
             {
                 return Err(format!(
                     "selected physical encoding for {:?} differs from the admitted store",
@@ -900,12 +993,7 @@ pub(crate) fn validate_store_handoff(
                 ));
             }
             lowering_key.get_or_insert(key);
-            admitted_keys.insert(key.as_str());
-            if checked.insert(identity) {
-                store.source_metadata(key).map_err(|error| {
-                    format!("selected source catalog key {key:?} is unavailable: {error}")
-                })?;
-            }
+            admitted_keys.insert(key);
         }
         let selected_keys = parameter
             .sources()
@@ -939,9 +1027,17 @@ pub(crate) fn validate_store_handoff(
         }
     }
     for (target, recipe) in requirements.derived_recipes() {
+        if requirements
+            .auxiliary_parameters()
+            .iter()
+            .any(|parameter| parameter.name() == target)
+        {
+            continue;
+        }
         let parameter = requirements
             .parameters()
             .iter()
+            .chain(requirements.auxiliary_parameters())
             .find(|parameter| parameter.name() == target)
             .ok_or_else(|| format!("selected recipe target {target:?} is undeclared"))?;
         if !matches!(
@@ -967,21 +1063,9 @@ pub(crate) fn validate_store_handoff(
         let admitted = parameter
             .physical_sources()
             .iter()
-            .map(|source| {
-                (
-                    source.tensor().to_owned(),
-                    Some(source.shard().to_path_buf()),
-                    source.output().to_owned(),
-                )
-            })
+            .map(ReplicatedTextPhysicalSource::catalog_key)
             .collect::<BTreeSet<_>>();
-        let mut consumed = BTreeSet::new();
-        for source_key in recipe.source_keys() {
-            let source = store.source_provenance(source_key).map_err(|error| {
-                format!("selected recipe source {source_key:?} is unavailable: {error}")
-            })?;
-            consumed.insert((source.physical_tensor, source.backing_shard, source.output));
-        }
+        let consumed = recipe.source_keys().into_iter().collect::<BTreeSet<_>>();
         if consumed != admitted {
             return Err(format!(
                 "selected recipe sources for {target:?} differ from admitted provenance"
@@ -1511,10 +1595,11 @@ where
     visit_fixed_profile::<B, S, V, Stateless>(plan, selected, store, context, visitor)
 }
 
-trait CompressedProfile<B, S>
+trait CompressedProfile<B, S, F>
 where
     B: eredu_nn::BlockwiseAttentionBackend,
     S: LayerRuntimeState<B>,
+    F: CompressedReplicatedFamily<B>,
 {
     type Model: ReplicatedTextArchitecture<
             B,
@@ -1523,40 +1608,38 @@ where
             StaticModules = crate::decoder::StaticModules<B>,
         > + 'static;
     fn new(
-        config: crate::kimi_linear::ModelArgs,
+        config: F::Config,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self::Model, eredu_nn::Error>;
 }
 
-impl<B, S> CompressedProfile<B, S> for crate::replicated_model::MixedCompressedState
+impl<B, S, F> CompressedProfile<B, S, F> for crate::replicated_model::MixedCompressedState
 where
     B: eredu_nn::BlockwiseAttentionBackend,
     S: LayerRuntimeState<B>,
+    F: CompressedReplicatedFamily<B>,
     S::LayerState:
         eredu_runtime::RuntimeStateComponents<B> + eredu_nn::CompressedAttentionCache<B::Tensor>,
 {
-    type Model = CompressedReplicatedModel<B, KimiLinearReplicated>;
+    type Model = CompressedReplicatedModel<B, F>;
     fn new(
-        config: crate::kimi_linear::ModelArgs,
+        config: F::Config,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self::Model, eredu_nn::Error> {
         CompressedReplicatedModel::new(config, context)
     }
 }
 
-impl<B, S> CompressedProfile<B, S> for crate::replicated_model::CompressedState
+impl<B, S, F> CompressedProfile<B, S, F> for crate::replicated_model::CompressedState
 where
     B: eredu_nn::BlockwiseAttentionBackend,
     S: LayerRuntimeState<B>,
+    F: CompressedReplicatedFamily<B>,
     S::LayerState: eredu_nn::CompressedAttentionCache<B::Tensor>,
 {
-    type Model = CompressedReplicatedModel<
-        B,
-        KimiLinearReplicated,
-        crate::replicated_model::CompressedState,
-    >;
+    type Model = CompressedReplicatedModel<B, F, crate::replicated_model::CompressedState>;
     fn new(
-        config: crate::kimi_linear::ModelArgs,
+        config: F::Config,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self::Model, eredu_nn::Error> {
         CompressedReplicatedModel::new(config, context)
@@ -1574,7 +1657,8 @@ where
     B: eredu_nn::BlockwiseAttentionBackend,
     S: LayerRuntimeState<B>,
     V: ReplicatedTextArchitectureVisitor<B, S>,
-    P: CompressedProfile<B, S>,
+    P: CompressedProfile<B, S, KimiLinearReplicated>
+        + CompressedProfile<B, S, DeepSeekV3DenseReplicated>,
 {
     let requirements = selected.requirements().clone();
     let eligible = eligible_config(plan)?;
@@ -1582,37 +1666,55 @@ where
         .map_err(ReplicatedTextDispatchError::Architecture)?;
     validate_store_handoff(&requirements, store.as_ref())
         .map_err(ReplicatedTextDispatchError::Architecture)?;
-    let EligibleConfig::KimiLinear(args) = eligible else {
-        return Err(ReplicatedTextIneligibility::Unrelated.into());
-    };
-    visitor.construction_started();
-    let capability_estimate = crate::capability::kimi_linear(args)
-        .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-    let effective_model_type = args.model_type.clone();
-    let source_architecture = selected_uses_transform(&selected)
-        .then(|| <P as CompressedProfile<B, S>>::new(args.clone(), context))
-        .transpose()
-        .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-    let args = selected_kimi_linear_args(args, &selected)
-        .map_err(ReplicatedTextDispatchError::Architecture)?;
-    let prompt_cache_architecture_identity =
-        crate::kimi_linear::prompt_cache_architecture_fingerprint(&args);
-    let architecture = <P as CompressedProfile<B, S>>::new(args, context)
-        .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-    let prepared = prepare_architecture_handoff::<B, S, _>(
-        architecture,
-        source_architecture,
-        requirements,
-        selected,
-        capability_estimate,
-        effective_model_type,
-        prompt_cache_architecture_identity,
-        context,
-    )
-    .map_err(ReplicatedTextDispatchError::Architecture)?;
-    visitor
-        .visit(prepared, store)
-        .map_err(ReplicatedTextDispatchError::Backend)
+    macro_rules! visit_family {
+        ($family:ty, $args:expr, $capability:path, $select:path, $identity:path) => {{
+            visitor.construction_started();
+            let args = $args;
+            let capability_estimate = $capability(args)
+                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+            let effective_model_type = args.model_type.clone();
+            let source_architecture = selected_uses_transform(&selected)
+                .then(|| <P as CompressedProfile<B, S, $family>>::new(args.clone(), context))
+                .transpose()
+                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+            let args =
+                $select(args, &selected).map_err(ReplicatedTextDispatchError::Architecture)?;
+            let prompt_cache_architecture_identity = $identity(&args);
+            let architecture = <P as CompressedProfile<B, S, $family>>::new(args, context)
+                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+            let prepared = prepare_architecture_handoff::<B, S, _>(
+                architecture,
+                source_architecture,
+                requirements,
+                selected,
+                capability_estimate,
+                effective_model_type,
+                prompt_cache_architecture_identity,
+                context,
+            )
+            .map_err(ReplicatedTextDispatchError::Architecture)?;
+            visitor
+                .visit(prepared, store)
+                .map_err(ReplicatedTextDispatchError::Backend)
+        }};
+    }
+    match eligible {
+        EligibleConfig::KimiLinear(args) => visit_family!(
+            KimiLinearReplicated,
+            args,
+            crate::capability::kimi_linear,
+            selected_kimi_linear_args,
+            crate::kimi_linear::prompt_cache_architecture_fingerprint
+        ),
+        EligibleConfig::DeepSeekV3(args) => visit_family!(
+            DeepSeekV3DenseReplicated,
+            args,
+            crate::capability::deepseek_v3,
+            selected_deepseek_v3_args,
+            crate::deepseek::v3_architecture_fingerprint
+        ),
+        _ => Err(ReplicatedTextIneligibility::Unrelated.into()),
+    }
 }
 
 /// Constructs a replicated architecture using compressed attention and fixed components.
@@ -2193,6 +2295,14 @@ impl EligibleConfig<'_> {
     }
 
     fn canonical_parameter_name(&self, name: &str, aliases: &[String]) -> String {
+        if name.contains(".experts.") {
+            if let Some(prefix) = name.strip_suffix(".scales") {
+                return format!("{prefix}_scales");
+            }
+            if let Some(prefix) = name.strip_suffix(".biases") {
+                return format!("{prefix}_biases");
+            }
+        }
         match self {
             Self::Inkling(_) => aliases.first().cloned().unwrap_or_else(|| name.to_owned()),
             Self::NemotronH(_) => aliases
@@ -3220,50 +3330,7 @@ pub(crate) fn inspection_recipe_source(
         inspection.gguf_checkpoint(),
     ) {
         (Some(architecture), None, None) => {
-            let selected = architecture.checkpoint_resolution().ok_or_else(|| {
-                ReplicatedTextRequirementsError::InvalidArtifact(
-                    "SafeTensors architecture omitted exact catalog admission".into(),
-                )
-            })?;
-            let shards = inspection.safetensors_shards().ok_or_else(|| {
-                ReplicatedTextRequirementsError::InvalidArtifact(
-                    "SafeTensors inspection omitted its admitted shard set".into(),
-                )
-            })?;
-            let mut metadata = BTreeMap::new();
-            for key in selected.source_keys() {
-                let descriptor = inspection.tensors().get(key).ok_or_else(|| {
-                    ReplicatedTextRequirementsError::InvalidArtifact(format!(
-                        "admitted SafeTensors source {key:?} is absent from its catalog"
-                    ))
-                })?;
-                let backing_shard = shards
-                    .tensor_locations()
-                    .and_then(|locations| locations.get(key))
-                    .cloned()
-                    .or_else(|| {
-                        (shards.payload_paths().len() == 1)
-                            .then(|| shards.payload_paths()[0].clone())
-                    });
-                metadata.insert(
-                    key.clone(),
-                    eredu_checkpoint::store::TensorMetadata {
-                        name: key.clone(),
-                        logical_shape: descriptor.shape.clone(),
-                        physical_shape: descriptor.shape.clone(),
-                        stored_dtype: stored_dtype(&descriptor.dtype)?,
-                        encoded_byte_len: descriptor
-                            .storage
-                            .as_ref()
-                            .map_or(0, |storage| storage.length),
-                        backing_shard,
-                    },
-                );
-            }
-            Ok(Arc::new(InspectionCheckpointSource {
-                metadata,
-                backend: eredu_checkpoint::store::WeightStoreBackend::Safetensors,
-            }))
+            safetensors_inspection_recipe_source(inspection, architecture)
         }
         (None, Some(architecture), Some(checkpoint)) => {
             let primary_mapping = plan
@@ -3313,6 +3380,55 @@ pub(crate) fn inspection_recipe_source(
             "artifact container and admitted architecture plan disagree".into(),
         )),
     }
+}
+
+fn safetensors_inspection_recipe_source(
+    inspection: &ArtifactInspection<ArtifactArchitecturePlan>,
+    architecture: &crate::configuration::SafetensorsArchitecturePlan,
+) -> Result<eredu_checkpoint::store::SharedCheckpointSource, ReplicatedTextRequirementsError> {
+    let selected = architecture.checkpoint_resolution().ok_or_else(|| {
+        ReplicatedTextRequirementsError::InvalidArtifact(
+            "SafeTensors architecture omitted exact catalog admission".into(),
+        )
+    })?;
+    let shards = inspection.safetensors_shards().ok_or_else(|| {
+        ReplicatedTextRequirementsError::InvalidArtifact(
+            "SafeTensors inspection omitted its admitted shard set".into(),
+        )
+    })?;
+    let mut metadata = BTreeMap::new();
+    for key in selected.source_keys() {
+        let descriptor = inspection.tensors().get(key).ok_or_else(|| {
+            ReplicatedTextRequirementsError::InvalidArtifact(format!(
+                "admitted SafeTensors source {key:?} is absent from its catalog"
+            ))
+        })?;
+        let backing_shard = shards
+            .tensor_locations()
+            .and_then(|locations| locations.get(key))
+            .cloned()
+            .or_else(|| {
+                (shards.payload_paths().len() == 1).then(|| shards.payload_paths()[0].clone())
+            });
+        metadata.insert(
+            key.clone(),
+            eredu_checkpoint::store::TensorMetadata {
+                name: key.clone(),
+                logical_shape: descriptor.shape.clone(),
+                physical_shape: descriptor.shape.clone(),
+                stored_dtype: stored_dtype(&descriptor.dtype)?,
+                encoded_byte_len: descriptor
+                    .storage
+                    .as_ref()
+                    .map_or(0, |storage| storage.length),
+                backing_shard,
+            },
+        );
+    }
+    Ok(Arc::new(InspectionCheckpointSource {
+        metadata,
+        backend: eredu_checkpoint::store::WeightStoreBackend::Safetensors,
+    }))
 }
 
 /// Derives the complete replicated execution and checkpoint contract.
@@ -3400,7 +3516,8 @@ fn replicated_text_requirements_for_structure(
     structure: Option<ReplicatedExecutionStructure>,
 ) -> Result<ReplicatedTextRequirements, ReplicatedTextRequirementsError> {
     let plan = inspection.architecture_plan();
-    let mut parameters = match (
+    let recipe_source = inspection_recipe_source(inspection)?;
+    let parameters = match (
         plan.safetensors_architecture(),
         plan.gguf_plan(),
         inspection.gguf_checkpoint(),
@@ -3414,6 +3531,7 @@ fn replicated_text_requirements_for_structure(
                 )
             })?,
             &config,
+            recipe_source.as_ref(),
         )?,
         (None, Some(architecture), Some(checkpoint)) => {
             let primary_mapping = plan
@@ -3421,7 +3539,8 @@ fn replicated_text_requirements_for_structure(
                 .map_or(architecture.tensor_mapping(), |projector| {
                     projector.primary_tensor_mapping()
                 });
-            let mut parameters = gguf_parameters(primary_mapping, checkpoint, &config)?;
+            let mut parameters =
+                gguf_parameters(primary_mapping, checkpoint, &config, recipe_source.as_ref())?;
             if let Some(projector_plan) = plan.gguf_media_projector() {
                 let companion = inspection
                     .validated_gguf()
@@ -3439,6 +3558,7 @@ fn replicated_text_requirements_for_structure(
                         projector_plan.tensor_mapping(),
                         companion.checkpoint(),
                         &config,
+                        recipe_source.as_ref(),
                     )?
                     .into_iter()
                     .filter(|parameter| parameter.presence().has_physical_source()),
@@ -3474,15 +3594,288 @@ fn replicated_text_requirements_for_structure(
             (graph, units, vec![config.group_transport()], state)
         }
     };
-    let recipe_source = inspection_recipe_source(inspection)?;
-    let derived_recipes = config
-        .derived_recipes(recipe_source.as_ref())
+    let (parameters, derived_recipes, derived_recipe_outputs) =
+        finalize_materialization_parameters(&config, parameters, recipe_source.as_ref())?;
+    let auxiliary = plan
+        .prediction_extension()
+        .map(|extension| prediction_extension_materialization_parameters(inspection, extension))
+        .transpose()?;
+    let mut requirements = ReplicatedTextRequirements::new(
+        config.architecture_identity(),
+        config.operators(),
+        execution_graph,
+        execution_units,
+        group_transports,
+        state_layout,
+        config.state_access(),
+        parameters,
+    )
+    .and_then(|requirements| {
+        requirements.with_derived_recipes(derived_recipes, derived_recipe_outputs)
+    })
+    .map_err(|error| ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string()))?;
+    if let Some((parameters, recipes, outputs)) = auxiliary {
+        requirements = requirements
+            .with_auxiliary_parameters(parameters, recipes, outputs)
+            .map_err(|error| {
+                ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string())
+            })?;
+    }
+    Ok(requirements)
+}
+
+fn prediction_extension_materialization_parameters(
+    inspection: &ArtifactInspection<ArtifactArchitecturePlan>,
+    extension: &crate::configuration::PredictionExtensionPlan,
+) -> Result<FinalizedMaterializationParameters, ReplicatedTextRequirementsError> {
+    let complete = extension.complete_architecture();
+    let recipe_source = safetensors_inspection_recipe_source(inspection, complete)?;
+    let config = match complete.model() {
+        SafetensorsModelConfig::DeepSeekV3(args) => EligibleConfig::DeepSeekV3(args),
+        SafetensorsModelConfig::DeepSeekV4(args) => EligibleConfig::DeepSeekV4(args),
+        SafetensorsModelConfig::Inkling(args) => EligibleConfig::Inkling(args),
+        SafetensorsModelConfig::QwenHybrid(args) => EligibleConfig::QwenHybrid(&args.text),
+        SafetensorsModelConfig::NemotronH(args) => EligibleConfig::NemotronH(args),
+        _ => {
+            return Err(ReplicatedTextRequirementsError::InvalidArchitecture(
+                "prediction extension has no supported materialization contract".into(),
+            ));
+        }
+    };
+    let shards = inspection.safetensors_shards().ok_or_else(|| {
+        ReplicatedTextRequirementsError::InvalidArtifact(
+            "prediction extension omitted its admitted SafeTensors shard set".into(),
+        )
+    })?;
+    let parameters = safetensors_parameters(
+        complete,
+        inspection.tensors(),
+        shards,
+        &config,
+        recipe_source.as_ref(),
+    )?;
+    let extra_recipes = prediction_extension_recipes(extension, recipe_source.as_ref())?;
+    let extra_targets = extra_recipes.keys().cloned().collect::<BTreeSet<_>>();
+    let (mut parameters, mut recipes, mut outputs) =
+        finalize_materialization_parameters_with_recipes(
+            &config,
+            parameters,
+            recipe_source.as_ref(),
+            extra_recipes,
+        )?;
+    let missing_recipe_parameters = extra_targets
+        .iter()
+        .filter(|target| {
+            !parameters
+                .iter()
+                .any(|parameter| parameter.name() == *target)
+        })
+        .collect::<Vec<_>>();
+    if !missing_recipe_parameters.is_empty() {
+        return Err(ReplicatedTextRequirementsError::InvalidArchitecture(
+            format!(
+                "prediction recipes have no parameter requirements: {missing_recipe_parameters:?}"
+            ),
+        ));
+    }
+    let target = inspection
+        .architecture_plan()
+        .safetensors_architecture()
+        .ok_or_else(|| {
+            ReplicatedTextRequirementsError::InvalidArtifact(
+                "prediction target is not a SafeTensors architecture".into(),
+            )
+        })?;
+    let source_keys = extension
+        .source_keys(target)
+        .map_err(|error| ReplicatedTextRequirementsError::InvalidArtifact(error.to_string()))?;
+    let target_config = match target.model() {
+        SafetensorsModelConfig::DeepSeekV3(args) => EligibleConfig::DeepSeekV3(args),
+        SafetensorsModelConfig::DeepSeekV4(args) => EligibleConfig::DeepSeekV4(args),
+        SafetensorsModelConfig::Inkling(args) => EligibleConfig::Inkling(args),
+        SafetensorsModelConfig::QwenHybrid(args) => EligibleConfig::QwenHybrid(&args.text),
+        SafetensorsModelConfig::NemotronH(args) => EligibleConfig::NemotronH(args),
+        _ => {
+            return Err(ReplicatedTextRequirementsError::InvalidArchitecture(
+                "prediction target has no supported materialization contract".into(),
+            ));
+        }
+    };
+    let target_units = target_config
+        .unit_count()
+        .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?;
+    parameters.retain(|parameter| {
+        extra_targets.contains(parameter.name())
+            || parameter
+                .physical_sources()
+                .iter()
+                .any(|source| source_keys.contains(source.catalog_key()))
+            || matches!(
+                parameter.owner(),
+                ReplicatedTextParameterOwner::ExecutionUnit { unit, .. }
+                    if *unit >= target_units
+            )
+    });
+    let names = parameters
+        .iter()
+        .map(|parameter| parameter.name().to_owned())
+        .collect::<BTreeSet<_>>();
+    recipes.retain(|target, _| names.contains(target));
+    outputs.retain(|target, _| names.contains(target));
+    if parameters.is_empty() {
+        return Err(ReplicatedTextRequirementsError::InvalidArtifact(
+            "prediction extension produced no exact materialization parameters".into(),
+        ));
+    }
+    Ok((parameters, recipes, outputs))
+}
+
+fn prediction_extension_recipes(
+    extension: &crate::configuration::PredictionExtensionPlan,
+    source: &dyn eredu_checkpoint::store::CheckpointSource,
+) -> Result<
+    BTreeMap<String, eredu_checkpoint::recipe::DerivedWeightRecipe>,
+    ReplicatedTextRequirementsError,
+> {
+    let mut recipes = BTreeMap::new();
+    let mut extend = |next: BTreeMap<_, _>| -> Result<(), ReplicatedTextRequirementsError> {
+        for (target, recipe) in next {
+            if let Some(previous) = recipes.get(&target) {
+                if previous != &recipe {
+                    return Err(ReplicatedTextRequirementsError::InvalidArchitecture(
+                        format!("prediction extension conflicts at recipe target {target:?}"),
+                    ));
+                }
+            } else {
+                recipes.insert(target, recipe);
+            }
+        }
+        Ok(())
+    };
+    match extension.complete_architecture().model() {
+        SafetensorsModelConfig::DeepSeekV3(args) => {
+            let target = usize::try_from(args.num_hidden_layers).map_err(|_| {
+                ReplicatedTextRequirementsError::InvalidArchitecture(
+                    "DeepSeek-V3 target depth exceeds usize".into(),
+                )
+            })?;
+            for depth in 0..extension.depth() {
+                extend(
+                    crate::deepseek::v3_unit_recipes(source, args, target + depth, true)
+                        .map_err(ReplicatedTextRequirementsError::InvalidArtifact)?,
+                )?;
+            }
+        }
+        SafetensorsModelConfig::DeepSeekV4(args) => {
+            let target = usize::try_from(args.num_hidden_layers).map_err(|_| {
+                ReplicatedTextRequirementsError::InvalidArchitecture(
+                    "DeepSeek-V4 target depth exceeds usize".into(),
+                )
+            })?;
+            for depth in 0..extension.depth() {
+                let expert = crate::deepseek::v4_expert_recipes(source, args, target + depth)
+                    .map_err(ReplicatedTextRequirementsError::InvalidArtifact)?;
+                extend(BTreeMap::from([
+                    (expert.target_gate_up, expert.gate_up),
+                    (expert.target_down, expert.down),
+                ]))?;
+            }
+        }
+        SafetensorsModelConfig::Inkling(args) => {
+            extend(
+                crate::inkling::mtp_safetensors_recipes(args, source)
+                    .map_err(ReplicatedTextRequirementsError::InvalidArtifact)?,
+            )?;
+        }
+        SafetensorsModelConfig::QwenHybrid(args) => {
+            let target = usize::try_from(args.text.num_hidden_layers).map_err(|_| {
+                ReplicatedTextRequirementsError::InvalidArchitecture(
+                    "Qwen hybrid target depth exceeds usize".into(),
+                )
+            })?;
+            for depth in 0..extension.depth() {
+                extend(
+                    crate::qwen::hybrid::unit_recipes(source, &args.text, target + depth)
+                        .map_err(ReplicatedTextRequirementsError::InvalidArtifact)?,
+                )?;
+            }
+        }
+        SafetensorsModelConfig::NemotronH(args) => {
+            let policies = args.mtp_policies().map_err(|error| {
+                ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string())
+            })?;
+            let pattern = policies
+                .len()
+                .checked_div(extension.depth())
+                .ok_or_else(|| {
+                    ReplicatedTextRequirementsError::InvalidArchitecture(
+                        "Nemotron-H prediction pattern is empty".into(),
+                    )
+                })?;
+            for prediction in 0..extension.depth() {
+                for relative in 0..pattern {
+                    extend(
+                        crate::nemotron_h::unit_recipes(
+                            source,
+                            args,
+                            prediction + 1,
+                            relative,
+                            true,
+                        )
+                        .map_err(ReplicatedTextRequirementsError::InvalidArtifact)?,
+                    )?;
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(recipes)
+}
+
+type FinalizedMaterializationParameters = (
+    Vec<ReplicatedTextParameterRequirement>,
+    BTreeMap<String, eredu_checkpoint::recipe::DerivedWeightRecipe>,
+    BTreeMap<String, eredu_checkpoint::recipe::RecipeMetadata>,
+);
+
+fn finalize_materialization_parameters(
+    config: &EligibleConfig<'_>,
+    parameters: Vec<ReplicatedTextParameterRequirement>,
+    recipe_source: &dyn eredu_checkpoint::store::CheckpointSource,
+) -> Result<FinalizedMaterializationParameters, ReplicatedTextRequirementsError> {
+    finalize_materialization_parameters_with_recipes(
+        config,
+        parameters,
+        recipe_source,
+        BTreeMap::new(),
+    )
+}
+
+fn finalize_materialization_parameters_with_recipes(
+    config: &EligibleConfig<'_>,
+    mut parameters: Vec<ReplicatedTextParameterRequirement>,
+    recipe_source: &dyn eredu_checkpoint::store::CheckpointSource,
+    extra_recipes: BTreeMap<String, eredu_checkpoint::recipe::DerivedWeightRecipe>,
+) -> Result<FinalizedMaterializationParameters, ReplicatedTextRequirementsError> {
+    let mut derived_recipes = config
+        .derived_recipes(recipe_source)
         .map_err(ReplicatedTextRequirementsError::InvalidArtifact)?;
+    for (target, recipe) in extra_recipes {
+        if let Some(previous) = derived_recipes.get(&target) {
+            if previous != &recipe {
+                return Err(ReplicatedTextRequirementsError::InvalidArchitecture(
+                    format!("prediction extension conflicts at derived target {target:?}"),
+                ));
+            }
+        } else {
+            derived_recipes.insert(target, recipe);
+        }
+    }
     let derived_recipe_outputs = derived_recipes
         .iter()
         .map(|(target, recipe)| {
             recipe
-                .infer(recipe_source.as_ref())
+                .infer(recipe_source)
                 .map(|metadata| (target.clone(), metadata))
                 .map_err(|error| {
                     ReplicatedTextRequirementsError::InvalidArtifact(format!(
@@ -3498,6 +3891,9 @@ fn replicated_text_requirements_for_structure(
         if target.ends_with("_scales")
             || target.ends_with("_biases")
             || target.ends_with("_scale_inv")
+            || target.ends_with(".scales")
+            || target.ends_with(".biases")
+            || target.ends_with(".weight_scale_inv")
         {
             ReplicatedTextParameterRole::FormatCompanion
         } else {
@@ -3516,55 +3912,62 @@ fn replicated_text_requirements_for_structure(
         let physical_sources = recipe
             .source_keys()
             .iter()
-            .map(|source_key| {
-                let provenance = recipe_source
-                    .source_provenance(source_key)
-                    .map_err(|error| {
-                        ReplicatedTextRequirementsError::InvalidArtifact(format!(
-                            "derived recipe source {source_key:?} has no provenance: {error}"
-                        ))
-                    })?;
-                let shard = provenance.backing_shard.ok_or_else(|| {
-                    ReplicatedTextRequirementsError::InvalidArtifact(format!(
-                        "derived recipe source {source_key:?} has no backing shard"
-                    ))
-                })?;
-                ReplicatedTextPhysicalSource::new(
-                    provenance.physical_tensor,
-                    shard,
-                    provenance.output,
-                )
-                .map_err(|error| {
-                    ReplicatedTextRequirementsError::InvalidArtifact(error.to_string())
-                })
-            })
+            .map(|source_key| exact_physical_source(recipe_source, source_key))
             .collect::<Result<Vec<_>, _>>()?;
-        let existing = parameters
-            .iter()
-            .position(|parameter| parameter.name() == target);
+        let existing = parameters.iter().position(|parameter| {
+            parameter.name() == target || parameter.aliases().iter().any(|alias| alias == target)
+        });
         let replacement = if let Some(index) = existing {
             let parameter = &parameters[index];
-            let role = if matches!(config, EligibleConfig::GptOss(_))
+            let role = if parameter.linear_companion().is_some() {
+                ReplicatedTextParameterRole::FormatCompanion
+            } else if matches!(config, EligibleConfig::GptOss(_))
                 && target.contains(".mlp.experts.")
                 && target.ends_with("_proj_bias")
             {
                 ReplicatedTextParameterRole::LinearBias
             } else {
-                parameter.role()
+                derived_target_role(target)
             };
-            ReplicatedTextParameterRequirement::new(
+            let owner = parameter_owner(config, target);
+            let native = parameter.native_executable();
+            let mut logical_shape = parameter.logical_shape().to_vec();
+            if output.dtype == eredu_checkpoint::recipe::RecipeDtype::U32
+                && logical_shape == output.shape
+            {
+                let packed_bits = match native {
+                    LinearFormat::Affine(format) => usize::try_from(format.bits).ok(),
+                    LinearFormat::MxFp4 => Some(4),
+                    _ => None,
+                };
+                if let (Some(bits), Some(extent)) = (packed_bits, logical_shape.last_mut()) {
+                    *extent = extent
+                        .checked_mul(32)
+                        .and_then(|value| value.checked_div(bits))
+                        .ok_or_else(|| {
+                            ReplicatedTextRequirementsError::InvalidArchitecture(format!(
+                                "derived packed geometry for {target:?} overflowed"
+                            ))
+                        })?;
+                }
+            }
+            let mut replacement = ReplicatedTextParameterRequirement::new(
                 target.clone(),
-                Vec::new(),
+                recipe
+                    .source_keys()
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
                 physical_sources,
                 parameter.aliases().to_vec(),
-                Some(SourceTensorEncoding::Safetensors(recipe_stored_dtype(
+                Some(SourceTensorEncoding::RecipeOutput(recipe_stored_dtype(
                     &output.dtype,
                 )?)),
                 Some(output.shape.clone()),
-                parameter.logical_shape().to_vec(),
-                parameter.native_executable(),
+                logical_shape,
+                native,
                 role,
-                parameter.owner().clone(),
+                owner,
                 ReplicatedTextParameterPresence::Derived {
                     recipe: format!("architecture-output:{target}"),
                 },
@@ -3572,23 +3975,65 @@ fn replicated_text_requirements_for_structure(
             )
             .map_err(|error| {
                 ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string())
-            })?
+            })?;
+            if let Some((scale, bias)) = parameter.transform_companions() {
+                replacement =
+                    replacement
+                        .with_transform_companions(scale, bias)
+                        .map_err(|error| {
+                            ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string())
+                        })?;
+            }
+            if let Some((role, primary)) = parameter.linear_companion() {
+                replacement = replacement
+                    .with_linear_companion(role, primary.to_owned())
+                    .map_err(|error| {
+                        ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string())
+                    })?;
+            }
+            replacement
         } else {
             let role = derived_target_role(target);
+            let native = config.native_format(target);
+            let mut logical_shape = linear_shapes
+                .get(target)
+                .cloned()
+                .unwrap_or_else(|| output.shape.clone());
+            if output.dtype == eredu_checkpoint::recipe::RecipeDtype::U32 {
+                let packed_bits = match native {
+                    LinearFormat::Affine(format) => usize::try_from(format.bits).ok(),
+                    LinearFormat::MxFp4 => Some(4),
+                    _ => None,
+                };
+                if let (Some(bits), Some(extent)) = (packed_bits, logical_shape.last_mut()) {
+                    *extent = extent
+                        .checked_mul(32)
+                        .and_then(|value| value.checked_div(bits))
+                        .ok_or_else(|| {
+                            ReplicatedTextRequirementsError::InvalidArchitecture(format!(
+                                "derived packed geometry for {target:?} overflowed"
+                            ))
+                        })?;
+                }
+            }
             parameter_requirement(
                 target.clone(),
-                Vec::new(),
+                recipe
+                    .source_keys()
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
                 physical_sources,
                 Vec::new(),
-                Some(SourceTensorEncoding::Safetensors(recipe_stored_dtype(
+                Some(SourceTensorEncoding::RecipeOutput(recipe_stored_dtype(
                     &output.dtype,
                 )?)),
                 Some(output.shape.clone()),
-                output.shape.clone(),
-                config.native_format(target),
+                logical_shape,
+                native,
                 role == ReplicatedTextParameterRole::LinearWeight,
                 role,
-                parameter_owner(&config, target),
+                parameter_owner(config, target),
                 ReplicatedTextParameterPresence::Derived {
                     recipe: format!("architecture-output:{target}"),
                 },
@@ -3632,20 +4077,11 @@ fn replicated_text_requirements_for_structure(
             }
         }
     }
-    ReplicatedTextRequirements::new(
-        config.architecture_identity(),
-        config.operators(),
-        execution_graph,
-        execution_units,
-        group_transports,
-        state_layout,
-        config.state_access(),
-        parameters,
-    )
-    .and_then(|requirements| {
-        requirements.with_derived_recipes(derived_recipes, derived_recipe_outputs)
-    })
-    .map_err(|error| ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string()))
+    Ok((
+        finish_parameters(parameters)?,
+        derived_recipes,
+        derived_recipe_outputs,
+    ))
 }
 
 fn recipe_stored_dtype(
@@ -3735,7 +4171,7 @@ fn safetensors_eligible_config(
         }
         SafetensorsModelConfig::DeepSeekV4(_) => Err(ReplicatedTextIneligibility::Routed),
         SafetensorsModelConfig::GptOss(_) => Err(ReplicatedTextIneligibility::Routed),
-        SafetensorsModelConfig::DeepSeekV3(_) => Err(ReplicatedTextIneligibility::Unrelated),
+        SafetensorsModelConfig::DeepSeekV3(args) => Ok(EligibleConfig::DeepSeekV3(args)),
     }
 }
 
@@ -3799,7 +4235,7 @@ fn gguf_eligible_config(
         }
         GgufModelConfig::DeepSeekV4(_) => Err(ReplicatedTextIneligibility::Routed),
         GgufModelConfig::GptOss(_) => Err(ReplicatedTextIneligibility::Routed),
-        GgufModelConfig::DeepSeekV3(_) => Err(ReplicatedTextIneligibility::Unrelated),
+        GgufModelConfig::DeepSeekV3(args) => Ok(EligibleConfig::DeepSeekV3(args)),
     }
 }
 
@@ -3928,11 +4364,50 @@ fn qwen_next_fused_targets(
     Ok(Some(targets))
 }
 
+fn exact_physical_source(
+    catalog: &dyn eredu_checkpoint::store::CheckpointSource,
+    key: &str,
+) -> Result<ReplicatedTextPhysicalSource, ReplicatedTextRequirementsError> {
+    let provenance = catalog.source_provenance(key).map_err(|error| {
+        ReplicatedTextRequirementsError::InvalidArtifact(format!(
+            "admitted source {key:?} has no exact provenance: {error}"
+        ))
+    })?;
+    let metadata = catalog.source_metadata(key).map_err(|error| {
+        ReplicatedTextRequirementsError::InvalidArtifact(format!(
+            "admitted source {key:?} has no exact metadata: {error}"
+        ))
+    })?;
+    if matches!(
+        &provenance.source_encoding,
+        SourceTensorEncoding::RecipeOutput(_)
+    ) {
+        return Err(ReplicatedTextRequirementsError::InvalidArtifact(format!(
+            "admitted physical source {key:?} has a recipe-output encoding"
+        )));
+    }
+    let shard = provenance.backing_shard.ok_or_else(|| {
+        ReplicatedTextRequirementsError::InvalidArtifact(format!(
+            "admitted source {key:?} has no backing shard"
+        ))
+    })?;
+    ReplicatedTextPhysicalSource::new(
+        provenance.catalog_key,
+        provenance.physical_tensor,
+        shard,
+        provenance.output,
+        provenance.source_encoding,
+        metadata.encoded_byte_len,
+    )
+    .map_err(|error| ReplicatedTextRequirementsError::InvalidArtifact(error.to_string()))
+}
+
 fn safetensors_parameters(
     architecture: &crate::configuration::SafetensorsArchitecturePlan,
     catalog: &TensorCatalog,
-    shards: &eredu_checkpoint::safetensors::SafetensorsShards,
+    _shards: &eredu_checkpoint::safetensors::SafetensorsShards,
     config: &EligibleConfig<'_>,
+    source_catalog: &dyn eredu_checkpoint::store::CheckpointSource,
 ) -> Result<Vec<ReplicatedTextParameterRequirement>, ReplicatedTextRequirementsError> {
     let source_linear_shapes = config
         .linear_parameter_shapes()
@@ -3960,6 +4435,30 @@ fn safetensors_parameters(
             }
         }
     }
+    let declared_companions = constraints
+        .iter()
+        .filter_map(|constraint| {
+            constraint.linear_companion.as_ref().map(|companion| {
+                let primary = constraints
+                    .iter()
+                    .find(|candidate| candidate.key == companion.primary)
+                    .map(|candidate| {
+                        config.canonical_parameter_name(&candidate.key, &candidate.aliases)
+                    })
+                    .unwrap_or_else(|| companion.primary.clone());
+                let name = config.canonical_parameter_name(&constraint.key, &constraint.aliases);
+                let role = match companion.kind {
+                    eredu_checkpoint::schema::LinearCompanionKind::Scale => {
+                        eredu_nn::LinearCompanionRole::Scale
+                    }
+                    eredu_checkpoint::schema::LinearCompanionKind::AffineBias => {
+                        eredu_nn::LinearCompanionRole::AffineBias
+                    }
+                };
+                (name, (role, primary))
+            })
+        })
+        .collect::<BTreeMap<_, _>>();
     let linear_shapes = source_linear_shapes
         .into_iter()
         .map(|(name, shape)| {
@@ -4028,22 +4527,7 @@ fn safetensors_parameters(
             .collect::<Vec<_>>();
         let physical_sources = source
             .as_ref()
-            .map(|source| {
-                let shard = shards
-                    .tensor_locations()
-                    .and_then(|locations| locations.get(source))
-                    .or_else(|| {
-                        (shards.payload_paths().len() == 1).then(|| &shards.payload_paths()[0])
-                    })
-                    .ok_or_else(|| {
-                        ReplicatedTextRequirementsError::InvalidArtifact(format!(
-                            "admitted SafeTensors source {source:?} has no exact shard membership"
-                        ))
-                    })?;
-                ReplicatedTextPhysicalSource::new(source, shard, source).map_err(|error| {
-                    ReplicatedTextRequirementsError::InvalidArtifact(error.to_string())
-                })
-            })
+            .map(|source| exact_physical_source(source_catalog, source))
             .transpose()?
             .into_iter()
             .collect::<Vec<_>>();
@@ -4117,6 +4601,16 @@ fn safetensors_parameters(
             presence,
         )?);
     }
+    for parameter in &mut parameters {
+        if let Some((role, primary)) = declared_companions.get(parameter.name()) {
+            *parameter = parameter
+                .clone()
+                .with_linear_companion(*role, primary.clone())
+                .map_err(|error| {
+                    ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string())
+                })?;
+        }
+    }
     finish_parameters_with_tied_output(parameters, config)
 }
 
@@ -4124,6 +4618,7 @@ fn gguf_parameters(
     tensor_mapping: &[eredu_gguf::TranslatedTensorLayout],
     checkpoint: &eredu_gguf::Checkpoint,
     config: &EligibleConfig<'_>,
+    source_catalog: &dyn eredu_checkpoint::store::CheckpointSource,
 ) -> Result<Vec<ReplicatedTextParameterRequirement>, ReplicatedTextRequirementsError> {
     let linear_shapes = config
         .linear_parameter_shapes()
@@ -4135,7 +4630,6 @@ fn gguf_parameters(
                 tensor.descriptor().name.as_str(),
                 (
                     tensor,
-                    shard.path(),
                     SourceTensorEncoding::Gguf {
                         ggml_type: tensor.descriptor().ggml_type,
                         endian: shard.endian(),
@@ -4146,8 +4640,7 @@ fn gguf_parameters(
     }
     let mut parameters = Vec::new();
     for mapping in tensor_mapping {
-        let Some((tensor, shard, source_encoding)) = physical.get(mapping.physical_name.as_str())
-        else {
+        let Some((tensor, source_encoding)) = physical.get(mapping.physical_name.as_str()) else {
             return Err(ReplicatedTextRequirementsError::InvalidArtifact(format!(
                 "admitted GGUF mapping references absent tensor {:?}",
                 mapping.physical_name
@@ -4211,14 +4704,7 @@ fn gguf_parameters(
                             mapping.physical_name
                         ))
                     })?;
-                let provenance = ReplicatedTextPhysicalSource::new(
-                    mapping.physical_name.clone(),
-                    *shard,
-                    mapping.original_name.clone(),
-                )
-                .map_err(|error| {
-                    ReplicatedTextRequirementsError::InvalidArtifact(error.to_string())
-                })?;
+                let provenance = exact_physical_source(source_catalog, &mapping.layout.name)?;
                 for (target, shape) in targets {
                     let role = if companion {
                         ReplicatedTextParameterRole::FormatCompanion
@@ -4233,10 +4719,7 @@ fn gguf_parameters(
                     };
                     parameters.push(parameter_requirement(
                         target.clone(),
-                        selects_lowering
-                            .then(|| mapping.layout.name.clone())
-                            .into_iter()
-                            .collect(),
+                        vec![mapping.layout.name.clone()],
                         vec![provenance.clone()],
                         vec![mapping.original_name.clone()],
                         Some(source_encoding.clone()),
@@ -4284,18 +4767,8 @@ fn gguf_parameters(
         };
         parameters.push(parameter_requirement(
             mapping.layout.name.clone(),
-            (!derived)
-                .then(|| mapping.layout.name.clone())
-                .into_iter()
-                .collect(),
-            vec![ReplicatedTextPhysicalSource::new(
-                mapping.physical_name.clone(),
-                *shard,
-                mapping.original_name.clone(),
-            )
-            .map_err(|error| {
-                ReplicatedTextRequirementsError::InvalidArtifact(error.to_string())
-            })?],
+            vec![mapping.layout.name.clone()],
+            vec![exact_physical_source(source_catalog, &mapping.layout.name)?],
             vec![mapping.original_name.clone()],
             Some(source_encoding.clone()),
             Some({
@@ -4365,6 +4838,11 @@ fn parameter_requirement(
     owner: ReplicatedTextParameterOwner,
     presence: ReplicatedTextParameterPresence,
 ) -> Result<ReplicatedTextParameterRequirement, ReplicatedTextRequirementsError> {
+    let owner = if role == ReplicatedTextParameterRole::Embedding {
+        ReplicatedTextParameterOwner::StaticRole("embedding".into())
+    } else {
+        owner
+    };
     let transform = if transformable {
         ParameterTransformConstraint::Linear {
             packed_axis: logical_shape.len().checked_sub(1).ok_or_else(|| {
@@ -4376,7 +4854,7 @@ fn parameter_requirement(
     } else {
         ParameterTransformConstraint::None
     };
-    ReplicatedTextParameterRequirement::new(
+    let requirement = ReplicatedTextParameterRequirement::new(
         name,
         sources,
         physical_sources,
@@ -4390,7 +4868,23 @@ fn parameter_requirement(
         presence,
         transform,
     )
-    .map_err(|error| ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string()))
+    .map_err(|error| ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string()))?;
+    if transformable {
+        let name = requirement.name();
+        let (scale, bias) = if name.contains(".experts.") && !name.ends_with(".weight") {
+            (format!("{name}_scales"), format!("{name}_biases"))
+        } else {
+            let prefix = name.strip_suffix(".weight").unwrap_or(name);
+            (format!("{prefix}.scales"), format!("{prefix}.biases"))
+        };
+        requirement
+            .with_transform_companions(scale, bias)
+            .map_err(|error| {
+                ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string())
+            })
+    } else {
+        Ok(requirement)
+    }
 }
 
 fn parameter_owner(config: &EligibleConfig<'_>, name: &str) -> ReplicatedTextParameterOwner {
@@ -4519,6 +5013,10 @@ fn parameter_owner(config: &EligibleConfig<'_>, name: &str) -> ReplicatedTextPar
     } else if matches!(config, EligibleConfig::MuseGlimmer(_)) && name.starts_with("model.vision_")
     {
         "vision"
+    } else if matches!(config, EligibleConfig::MuseGlimmer(_))
+        && name == "model.embed_tokens.weight"
+    {
+        "embedding"
     } else if matches!(config, EligibleConfig::DeepSeekV4(_)) && name.starts_with("hc_head_") {
         "hyper_head"
     } else if name == embedding || name.starts_with(embedding_prefix) {
@@ -4553,6 +5051,63 @@ fn finish_parameters(
         return Err(ReplicatedTextRequirementsError::InvalidArtifact(
             "replicated text artifact contains no admitted linear parameters".into(),
         ));
+    }
+    let primaries = parameters
+        .iter()
+        .filter(|parameter| {
+            matches!(
+                parameter.role(),
+                ReplicatedTextParameterRole::LinearWeight | ReplicatedTextParameterRole::Embedding
+            )
+        })
+        .map(|parameter| parameter.name().to_owned())
+        .collect::<Vec<_>>();
+    for parameter in &mut parameters {
+        if parameter.role() != ReplicatedTextParameterRole::FormatCompanion {
+            continue;
+        }
+        if parameter.linear_companion().is_some() {
+            continue;
+        }
+        let candidates = primaries
+            .iter()
+            .filter_map(|primary| {
+                let prefix = primary.strip_suffix(".weight").unwrap_or(primary);
+                let role = if parameter.name() == format!("{prefix}.scales")
+                    || parameter.name() == format!("{primary}_scales")
+                    || parameter.name() == format!("{prefix}.weight_scale_inv")
+                    || parameter.name() == format!("{primary}_scale_inv")
+                {
+                    Some(eredu_nn::LinearCompanionRole::Scale)
+                } else if parameter.name() == format!("{prefix}.biases")
+                    || parameter.name() == format!("{primary}_biases")
+                {
+                    Some(eredu_nn::LinearCompanionRole::AffineBias)
+                } else {
+                    None
+                };
+                role.map(|role| (role, primary.clone()))
+            })
+            .collect::<Vec<_>>();
+        match candidates.as_slice() {
+            [(role, primary)] => {
+                *parameter = parameter
+                    .clone()
+                    .with_linear_companion(*role, primary.clone())
+                    .map_err(|error| {
+                        ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string())
+                    })?;
+            }
+            [] => {}
+            _ => {
+                return Err(ReplicatedTextRequirementsError::InvalidArchitecture(
+                    format!(
+                        "format companion {:?} ambiguously names multiple linear weights",
+                        parameter.name()
+                    ),
+                ));
+            }
+        }
     }
     Ok(parameters)
 }
@@ -6518,8 +7073,6 @@ pub enum ReplicatedTextExecutionClass {
     Routed(crate::RoutedTextRequirements),
     /// The admitted artifact uses replicated text with composite ingress.
     Composite(CompositeTextRequirements),
-    /// The admitted artifact uses a distinct architecture execution class.
-    Other(NonReplicatedTextArchitecture),
 }
 
 /// Supplies backend policy selection without exposing the semantic branch to
@@ -6531,8 +7084,6 @@ pub trait ReplicatedTextExecutionClassDispatcher: Sized {
     type Routed;
     /// Backend-private policy retained for replicated composite construction.
     type Composite;
-    /// Backend-private policy retained for an excluded construction path.
-    type Other;
     /// Backend policy-selection failure.
     type Error;
 
@@ -6553,26 +7104,21 @@ pub trait ReplicatedTextExecutionClassDispatcher: Sized {
         self,
         requirements: CompositeTextRequirements,
     ) -> Result<Self::Composite, Self::Error>;
-
-    /// Selects mechanisms for an architecture-owned exclusion. The semantic
-    /// reason remains private to architecture dispatch.
-    fn other(self) -> Result<Self::Other, Self::Error>;
 }
 
-enum SelectedReplicatedTextExecutionKind<R, T, C, O> {
+enum SelectedReplicatedTextExecutionKind<R, T, C> {
     Replicated(R),
     Routed(T),
     Composite(C),
-    Other(O),
 }
 
 /// Opaque architecture-owned semantic selection carrying backend-private
 /// construction policy.
-pub struct SelectedReplicatedTextExecution<R, T, C, O> {
-    kind: SelectedReplicatedTextExecutionKind<R, T, C, O>,
+pub struct SelectedReplicatedTextExecution<R, T, C> {
+    kind: SelectedReplicatedTextExecutionKind<R, T, C>,
 }
 
-impl<R, T, C, O> std::fmt::Debug for SelectedReplicatedTextExecution<R, T, C, O> {
+impl<R, T, C> std::fmt::Debug for SelectedReplicatedTextExecution<R, T, C> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("SelectedReplicatedTextExecution")
@@ -6580,7 +7126,7 @@ impl<R, T, C, O> std::fmt::Debug for SelectedReplicatedTextExecution<R, T, C, O>
     }
 }
 
-impl<R: Clone, T: Clone, C: Clone, O: Clone> Clone for SelectedReplicatedTextExecution<R, T, C, O> {
+impl<R: Clone, T: Clone, C: Clone> Clone for SelectedReplicatedTextExecution<R, T, C> {
     fn clone(&self) -> Self {
         Self {
             kind: match &self.kind {
@@ -6593,16 +7139,13 @@ impl<R: Clone, T: Clone, C: Clone, O: Clone> Clone for SelectedReplicatedTextExe
                 SelectedReplicatedTextExecutionKind::Composite(value) => {
                     SelectedReplicatedTextExecutionKind::Composite(value.clone())
                 }
-                SelectedReplicatedTextExecutionKind::Other(value) => {
-                    SelectedReplicatedTextExecutionKind::Other(value.clone())
-                }
             },
         }
     }
 }
 
 /// Backend adapter invoked by an opaque selected execution value.
-pub trait SelectedReplicatedTextExecutionDispatcher<R, T, C, O>: Sized {
+pub trait SelectedReplicatedTextExecutionDispatcher<R, T, C>: Sized {
     /// Completed adapter output.
     type Output;
     /// Adapter failure.
@@ -6616,17 +7159,14 @@ pub trait SelectedReplicatedTextExecutionDispatcher<R, T, C, O>: Sized {
 
     /// Enters generic replicated composite composition.
     fn composite(self, selected: C) -> Result<Self::Output, Self::Error>;
-
-    /// Enters the existing excluded execution adapter.
-    fn other(self, selected: O) -> Result<Self::Output, Self::Error>;
 }
 
-impl<R, T, C, O> SelectedReplicatedTextExecution<R, T, C, O> {
+impl<R, T, C> SelectedReplicatedTextExecution<R, T, C> {
     /// Invokes exactly one backend adapter while keeping the semantic branch
     /// inside architecture-owned code.
     pub fn dispatch<D>(self, dispatcher: D) -> Result<D::Output, D::Error>
     where
-        D: SelectedReplicatedTextExecutionDispatcher<R, T, C, O>,
+        D: SelectedReplicatedTextExecutionDispatcher<R, T, C>,
     {
         match self.kind {
             SelectedReplicatedTextExecutionKind::Replicated(selected) => {
@@ -6636,7 +7176,6 @@ impl<R, T, C, O> SelectedReplicatedTextExecution<R, T, C, O> {
             SelectedReplicatedTextExecutionKind::Composite(selected) => {
                 dispatcher.composite(selected)
             }
-            SelectedReplicatedTextExecutionKind::Other(selected) => dispatcher.other(selected),
         }
     }
 }
@@ -6648,19 +7187,16 @@ pub fn dispatch_replicated_text_execution_class<D>(
     topology: Option<eredu_core::topology::ParallelTopology>,
     dispatcher: D,
 ) -> Result<
-    SelectedReplicatedTextExecution<D::Replicated, D::Routed, D::Composite, D::Other>,
+    SelectedReplicatedTextExecution<D::Replicated, D::Routed, D::Composite>,
     ReplicatedTextDispatchError<D::Error>,
 >
 where
     D: ReplicatedTextExecutionClassDispatcher,
 {
     if topology.is_some_and(|topology| !topology.is_replicated()) {
-        return dispatcher
-            .other()
-            .map(|selected| SelectedReplicatedTextExecution {
-                kind: SelectedReplicatedTextExecutionKind::Other(selected),
-            })
-            .map_err(ReplicatedTextDispatchError::Backend);
+        return Err(ReplicatedTextDispatchError::Architecture(
+            "non-replicated topology requires partitioned admission".into(),
+        ));
     }
     match replicated_text_execution_class(inspection)
         .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?
@@ -6683,25 +7219,6 @@ where
                 kind: SelectedReplicatedTextExecutionKind::Composite(selected),
             })
             .map_err(ReplicatedTextDispatchError::Backend),
-        ReplicatedTextExecutionClass::Other(_) => dispatcher
-            .other()
-            .map(|selected| SelectedReplicatedTextExecution {
-                kind: SelectedReplicatedTextExecutionKind::Other(selected),
-            })
-            .map_err(ReplicatedTextDispatchError::Backend),
-    }
-}
-
-/// Proof that an admitted artifact must not enter replicated-text construction.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct NonReplicatedTextArchitecture {
-    reason: ReplicatedTextIneligibility,
-}
-
-impl NonReplicatedTextArchitecture {
-    /// Returns why the architecture registry selected another execution class.
-    pub const fn reason(&self) -> &ReplicatedTextIneligibility {
-        &self.reason
     }
 }
 
@@ -6717,15 +7234,11 @@ pub fn replicated_text_execution_class(
                     Ok(requirements) => {
                         return Ok(ReplicatedTextExecutionClass::Composite(requirements))
                     }
-                    Err(ReplicatedTextRequirementsError::Ineligible(
-                        ReplicatedTextIneligibility::EmbeddedPrediction,
-                    )) => {
-                        return Ok(ReplicatedTextExecutionClass::Other(
-                            NonReplicatedTextArchitecture {
-                                reason: ReplicatedTextIneligibility::EmbeddedPrediction,
-                            },
-                        ))
-                    }
+                    Err(
+                        error @ ReplicatedTextRequirementsError::Ineligible(
+                            ReplicatedTextIneligibility::EmbeddedPrediction,
+                        ),
+                    ) => return Err(error),
                     Err(error) => return Err(error),
                 }
             }
@@ -6740,9 +7253,7 @@ pub fn replicated_text_execution_class(
                     Err(crate::RoutedTextRequirementsError::Ineligible) => {}
                 }
             }
-            Ok(ReplicatedTextExecutionClass::Other(
-                NonReplicatedTextArchitecture { reason },
-            ))
+            Err(ReplicatedTextRequirementsError::Ineligible(reason))
         }
         Err(error) => Err(error),
     }
@@ -7008,6 +7519,40 @@ mod tests {
             }),
             _ => unreachable!("heterogeneous test model type"),
         }
+    }
+
+    fn dense_deepseek_v3_config() -> serde_json::Value {
+        serde_json::json!({
+            "architectures": ["DeepseekV3ForCausalLM"],
+            "model_type": "deepseek_v3",
+            "hidden_size": 16,
+            "intermediate_size": 32,
+            "moe_intermediate_size": 8,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 2,
+            "vocab_size": 128,
+            "max_position_embeddings": 4096,
+            "q_lora_rank": 4,
+            "kv_lora_rank": 4,
+            "qk_nope_head_dim": 6,
+            "qk_rope_head_dim": 2,
+            "v_head_dim": 8,
+            "first_k_dense_replace": 4,
+            "moe_layer_freq": 2,
+            "n_routed_experts": 8,
+            "n_shared_experts": 1,
+            "num_experts_per_tok": 2,
+            "n_group": 2,
+            "topk_group": 1,
+            "topk_method": "noaux_tc",
+            "scoring_func": "sigmoid",
+            "norm_topk_prob": true,
+            "routed_scaling_factor": 1.0,
+            "tie_word_embeddings": false,
+            "attention_dropout": 0.0,
+            "hidden_act": "silu",
+            "num_nextn_predict_layers": 0
+        })
     }
 
     #[test]
@@ -7464,38 +8009,117 @@ mod tests {
     }
 
     #[test]
-    fn embedded_prediction_is_a_distinct_ineligibility() {
-        let config = serde_json::json!({
-            "architectures": ["DeepseekV3ForCausalLM"],
-            "model_type": "deepseek_v3",
-            "hidden_size": 16,
-            "intermediate_size": 32,
-            "moe_intermediate_size": 8,
-            "num_hidden_layers": 4,
-            "num_attention_heads": 2,
-            "vocab_size": 128,
-            "max_position_embeddings": 4096,
-            "q_lora_rank": 4,
-            "kv_lora_rank": 4,
-            "qk_nope_head_dim": 6,
-            "qk_rope_head_dim": 2,
-            "v_head_dim": 8,
-            "first_k_dense_replace": 1,
-            "moe_layer_freq": 2,
-            "n_routed_experts": 8,
-            "n_shared_experts": 1,
-            "num_experts_per_tok": 2,
-            "n_group": 2,
-            "topk_group": 1,
-            "topk_method": "noaux_tc",
-            "scoring_func": "sigmoid",
-            "norm_topk_prob": true,
-            "routed_scaling_factor": 1.0,
-            "tie_word_embeddings": false,
-            "attention_dropout": 0.0,
-            "hidden_act": "silu",
-            "num_nextn_predict_layers": 1
-        });
+    fn all_dense_deepseek_v3_selects_replicated_compressed_attention() {
+        let config = dense_deepseek_v3_config();
+        let resolved = crate::configuration::MODEL_CONFIGURATIONS
+            .resolve_safetensors(&config)
+            .unwrap();
+        let safetensors = resolved
+            .architecture_plan()
+            .safetensors_architecture()
+            .unwrap();
+        assert_eq!(
+            safetensors_replicated_text_eligibility(safetensors),
+            Ok(ReplicatedTextStateAccess::CompressedAttention)
+        );
+        let args = match safetensors.model() {
+            SafetensorsModelConfig::DeepSeekV3(args) => args,
+            _ => unreachable!("test resolves DeepSeek-V3"),
+        };
+        let gguf = crate::configuration::GgufArchitecturePlan::new(
+            GgufArchitecture::DeepSeek2,
+            GgufModelConfig::DeepSeekV3(args.clone()),
+            crate::deepseek::v3_gguf_plan(args).unwrap(),
+            Vec::new(),
+        );
+        assert_eq!(
+            gguf_replicated_text_eligibility(&gguf),
+            Ok(ReplicatedTextStateAccess::CompressedAttention)
+        );
+
+        let (_root, inspection) = inspected_config(config);
+        let ReplicatedTextExecutionClass::Replicated(requirements) =
+            replicated_text_execution_class(&inspection).unwrap()
+        else {
+            panic!("dense DeepSeek-V3 must select replicated text");
+        };
+        assert_eq!(
+            requirements.state_access(),
+            ReplicatedTextStateAccess::CompressedAttention
+        );
+        assert!(requirements.grouped_operations().is_empty());
+
+        let lowerings = requirements
+            .parameters()
+            .iter()
+            .filter(|parameter| parameter.has_lowering_source())
+            .map(|parameter| {
+                eredu_runtime::WeightLoweringCapability::new(
+                    parameter
+                        .lowering_descriptor(parameter.native_executable())
+                        .unwrap(),
+                    eredu_runtime::WeightLoweringKind::Direct,
+                )
+            })
+            .collect();
+        let state: Vec<_> = requirements
+            .state_layout()
+            .layers()
+            .iter()
+            .enumerate()
+            .flat_map(|(layer, policy)| {
+                policy.components().into_iter().map(move |component| {
+                    eredu_runtime::StateComponentMechanism::new(
+                        layer,
+                        component,
+                        Some(eredu_runtime::StateComponentPlacement::Device),
+                        None,
+                    )
+                })
+            })
+            .collect();
+        let capabilities = eredu_runtime::BackendMechanismCapabilities::new(
+            requirements.operators(),
+            lowerings,
+            vec![eredu_runtime::WeightResidencyMechanism::Resident],
+            eredu_runtime::StateMechanismCapabilities::new(state)
+                .with_transactions(true, true)
+                .with_reset(true),
+        );
+        eredu_runtime::select_replicated_text_realization(
+            &requirements,
+            &eredu_runtime::ReplicatedTextSelectionRequest::new(
+                eredu_runtime::LayerWeightResidency::FullyResident,
+                eredu_runtime::CacheResidencyPolicy::Device,
+            ),
+            &capabilities,
+        )
+        .expect("dense DeepSeek-V3 requirements select without grouped mechanisms");
+
+        let request = crate::partitioned_execution::PartitionedSelectionRequest::new(
+            eredu_core::ParallelTopology::new(2, 1, 1, 1).unwrap(),
+            0,
+            1,
+            32,
+            eredu_runtime::PipelineActivationDtype::Float32,
+        )
+        .unwrap()
+        .with_completion_policy(partitioned_test_completion_policy());
+        let error = crate::partitioned_execution::dispatch_partitioned_admission(
+            &inspection,
+            request,
+            CollectPartitionedAdmission,
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("dense DeepSeek-V3 has no exact neutral partition constructor"));
+    }
+
+    #[test]
+    fn embedded_prediction_is_a_distinct_ineligibility_even_for_a_dense_target() {
+        let mut config = dense_deepseek_v3_config();
+        config["num_nextn_predict_layers"] = 1.into();
         let resolved = crate::configuration::MODEL_CONFIGURATIONS
             .resolve_safetensors(&config)
             .unwrap();
@@ -7849,14 +8473,12 @@ mod tests {
         replicated: std::rc::Rc<std::cell::Cell<usize>>,
         routed: std::rc::Rc<std::cell::Cell<usize>>,
         composite: std::rc::Rc<std::cell::Cell<usize>>,
-        other: std::rc::Rc<std::cell::Cell<usize>>,
     }
 
     impl ReplicatedTextExecutionClassDispatcher for CountingClassDispatcher {
         type Replicated = &'static str;
         type Routed = &'static str;
         type Composite = &'static str;
-        type Other = &'static str;
         type Error = String;
 
         fn replicated(
@@ -7882,27 +8504,16 @@ mod tests {
             self.composite.set(self.composite.get() + 1);
             Ok("composite")
         }
-
-        fn other(self) -> Result<Self::Other, Self::Error> {
-            self.other.set(self.other.get() + 1);
-            Ok("other")
-        }
     }
 
     struct CountingSelectedDispatcher {
         replicated: std::rc::Rc<std::cell::Cell<usize>>,
         routed: std::rc::Rc<std::cell::Cell<usize>>,
         composite: std::rc::Rc<std::cell::Cell<usize>>,
-        other: std::rc::Rc<std::cell::Cell<usize>>,
     }
 
-    impl
-        SelectedReplicatedTextExecutionDispatcher<
-            &'static str,
-            &'static str,
-            &'static str,
-            &'static str,
-        > for CountingSelectedDispatcher
+    impl SelectedReplicatedTextExecutionDispatcher<&'static str, &'static str, &'static str>
+        for CountingSelectedDispatcher
     {
         type Output = &'static str;
         type Error = String;
@@ -7919,11 +8530,6 @@ mod tests {
 
         fn composite(self, selected: &'static str) -> Result<Self::Output, Self::Error> {
             self.composite.set(self.composite.get() + 1);
-            Ok(selected)
-        }
-
-        fn other(self, selected: &'static str) -> Result<Self::Output, Self::Error> {
-            self.other.set(self.other.get() + 1);
             Ok(selected)
         }
     }
@@ -7963,11 +8569,9 @@ mod tests {
             let selected_replicated = std::rc::Rc::new(std::cell::Cell::new(0));
             let selected_routed = std::rc::Rc::new(std::cell::Cell::new(0));
             let selected_composite = std::rc::Rc::new(std::cell::Cell::new(0));
-            let selected_other = std::rc::Rc::new(std::cell::Cell::new(0));
             let constructed_replicated = std::rc::Rc::new(std::cell::Cell::new(0));
             let constructed_routed = std::rc::Rc::new(std::cell::Cell::new(0));
             let constructed_composite = std::rc::Rc::new(std::cell::Cell::new(0));
-            let constructed_other = std::rc::Rc::new(std::cell::Cell::new(0));
             let selected = dispatch_replicated_text_execution_class(
                 inspection,
                 None,
@@ -7975,7 +8579,6 @@ mod tests {
                     replicated: selected_replicated.clone(),
                     routed: selected_routed.clone(),
                     composite: selected_composite.clone(),
-                    other: selected_other.clone(),
                 },
             )
             .unwrap();
@@ -7984,47 +8587,31 @@ mod tests {
                     replicated: constructed_replicated.clone(),
                     routed: constructed_routed.clone(),
                     composite: constructed_composite.clone(),
-                    other: constructed_other.clone(),
                 })
                 .unwrap();
 
             assert_eq!(actual, expected);
-            if expected == "other" {
-                assert_eq!(selected_replicated.get(), 0);
-                assert_eq!(selected_routed.get(), 0);
-                assert_eq!(selected_composite.get(), 0);
-                assert_eq!(selected_other.get(), 1);
-                assert_eq!(constructed_replicated.get(), 0);
-                assert_eq!(constructed_routed.get(), 0);
-                assert_eq!(constructed_composite.get(), 0);
-                assert_eq!(constructed_other.get(), 1);
-            } else if expected == "routed" {
+            if expected == "routed" {
                 assert_eq!(selected_replicated.get(), 0);
                 assert_eq!(selected_routed.get(), 1);
                 assert_eq!(selected_composite.get(), 0);
-                assert_eq!(selected_other.get(), 0);
                 assert_eq!(constructed_replicated.get(), 0);
                 assert_eq!(constructed_routed.get(), 1);
                 assert_eq!(constructed_composite.get(), 0);
-                assert_eq!(constructed_other.get(), 0);
             } else if expected == "replicated" {
                 assert_eq!(selected_replicated.get(), 1);
                 assert_eq!(selected_routed.get(), 0);
                 assert_eq!(selected_composite.get(), 0);
-                assert_eq!(selected_other.get(), 0);
                 assert_eq!(constructed_replicated.get(), 1);
                 assert_eq!(constructed_routed.get(), 0);
                 assert_eq!(constructed_composite.get(), 0);
-                assert_eq!(constructed_other.get(), 0);
             } else {
                 assert_eq!(selected_replicated.get(), 0);
                 assert_eq!(selected_routed.get(), 0);
                 assert_eq!(selected_composite.get(), 1);
-                assert_eq!(selected_other.get(), 0);
                 assert_eq!(constructed_replicated.get(), 0);
                 assert_eq!(constructed_routed.get(), 0);
                 assert_eq!(constructed_composite.get(), 1);
-                assert_eq!(constructed_other.get(), 0);
             }
         }
     }

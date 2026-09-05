@@ -1,6 +1,5 @@
-use eredu_checkpoint::AffineQuantization;
-
-use eredu_checkpoint::WeightQuantization;
+#[cfg(test)]
+use eredu_checkpoint::{AffineQuantization, WeightQuantization};
 
 use std::{
     collections::HashMap,
@@ -11,6 +10,7 @@ use eredu_gguf::MetadataValue as GgufMetadataValue;
 use safemlx::{Array, Stream};
 
 use crate::backend::error::Error;
+use crate::backend::runtime::checkpoint::gguf::GgufCheckpoint;
 #[cfg(all(
     test,
     any(feature = "cuda", all(feature = "metal", target_os = "macos"))
@@ -26,10 +26,8 @@ use crate::module::FlattenedModuleParamMut;
     any(feature = "cuda", all(feature = "metal", target_os = "macos"))
 ))]
 use crate::module::PhysicalParameters;
-use crate::{
-    backend::runtime::checkpoint::gguf::GgufCheckpoint,
-    native_quantization::NativeQuantizationFormat,
-};
+#[cfg(test)]
+use crate::native_quantization::NativeQuantizationFormat;
 #[cfg(all(
     test,
     any(feature = "cuda", all(feature = "metal", target_os = "macos"))
@@ -52,6 +50,7 @@ pub(crate) fn gguf_metadata(checkpoint: &GgufCheckpoint) -> HashMap<String, Gguf
 }
 
 /// Lowers affine GGUF encodings under an admitted canonical tensor mapping.
+#[cfg(test)]
 fn gguf_affine_configs(
     checkpoint: &GgufCheckpoint,
     tensor_mapping: &[eredu_gguf::TranslatedTensorLayout],
@@ -83,6 +82,7 @@ fn gguf_affine_configs(
 
 /// Lowers exact mixed affine and native-block GGUF encodings under an admitted
 /// canonical tensor mapping.
+#[cfg(test)]
 pub(crate) fn gguf_quantization_configs(
     checkpoint: &GgufCheckpoint,
     tensor_mapping: &[eredu_gguf::TranslatedTensorLayout],
@@ -128,6 +128,7 @@ pub(crate) fn gguf_quantization_configs(
     Ok(configs)
 }
 
+#[cfg(test)]
 fn canonical_gguf_name(
     tensor_mapping: &[eredu_gguf::TranslatedTensorLayout],
     physical_name: &str,

@@ -5,28 +5,22 @@ use std::{num::NonZeroUsize, path::Path};
 use eredu_core::{
     AutomaticPlanningBackend, AutomaticPlanningError, BackendId, BoundedResidencyRequirement,
     CandidateAdmission, DevicePlan, DraftPlacementPlan, DraftingPlan, DurationSeconds,
-    ExecutionPlan, ExecutionPlanBackendFactory, ExecutionPlanTarget, ExpertCacheTelemetry,
-    ExternalDraftArtifact, HardwareBackendProfile, HardwareDeviceProfile, HardwareMemorySemantics,
-    HardwareProfile, InspectionSeverity, ModelResourceProfile, ModelRuntime, Observed,
+    ExecutionPlan, ExecutionPlanBackendFactory, ExecutionPlanTarget, ExecutionPlanTargetSelection,
+    ExpertCacheTelemetry, ExternalDraftArtifact, HardwareBackendProfile, HardwareDeviceProfile,
+    HardwareMemorySemantics, HardwareProfile, ModelResourceProfile, ModelRuntime, Observed,
     PhysicalMemorySemantics, QuantizationRequest, RealizedDrafting, ResidencyPlan,
-    ResidencyTelemetry, SpeculativeDecodingTelemetry, SpeculativeDraftSource,
-    SpeculativeGenerationBackend, SpeculativeStats, TransferTelemetry, WeightTransformationPlan,
-    AUTOMATIC_SCHEMA_VERSION,
+    ResidencyTelemetry, SelectedExecutionPlanTarget, SpeculativeDecodingTelemetry,
+    SpeculativeDraftSource, SpeculativeGenerationBackend, SpeculativeStats, TransferTelemetry,
+    WeightTransformationPlan, AUTOMATIC_SCHEMA_VERSION,
 };
 use safemlx::{Device, DeviceType, Stream};
 
 use super::{
-    capability::available_memory,
-    inspection::{inspect_model, MlxInspectionOptions},
-    realtime::MlxRealtimeExecutionContext,
-    speculative::MlxDrafter,
-    MlxBackend, MlxLoadRequest,
+    capability::available_memory, inspection::MlxInspectionOptions,
+    realtime::MlxRealtimeExecutionContext, speculative::MlxDrafter, MlxBackend, MlxLoadRequest,
 };
 use crate::{
-    backend::runtime::{
-        execution::layerwise::LayerwiseModelError,
-        residency::parameter_bank::ParameterBankResidencyReport,
-    },
+    backend::runtime::residency::parameter_bank::ParameterBankResidencyReport,
     backend::{error::Error, MlxAcceleratorFamily, MlxDeviceIdentity},
 };
 use eredu_core::residency::{MemoryTier, OffloadConfig, TransferDirection};
@@ -53,6 +47,18 @@ impl MlxBackendFactory {
         self.sample_process_memory = sample_process_memory;
         self
     }
+
+    /// Translates a portable execution plan into its backend load request.
+    ///
+    /// This performs no native device or stream realization and is suitable
+    /// for inspection and admission before an executable target is created.
+    pub fn load_request_for_plan(
+        &self,
+        plan: &ExecutionPlan,
+    ) -> Result<MlxLoadRequest, AutomaticPlanningError> {
+        mlx_load_options(self, plan)
+            .map_err(|error| planning_backend_error("select_execution_plan_target", error))
+    }
 }
 
 /// Selects and materializes one single-device realtime execution route.
@@ -76,6 +82,8 @@ pub fn create_realtime_execution(
 > {
     let selected =
         MlxRealtimeExecutionContext::select_realtime_execution(preparation, &options, false)?;
+    #[cfg(test)]
+    super::path_instrumentation::target_native_resource_realization_attempt();
     let realized =
         mlx_device(device).map_err(|error| Error::AutomaticPlanning(error.to_string()))?;
     let stream = Stream::try_new_with_device(&realized.device)?;
@@ -311,6 +319,10 @@ fn mlx_drafter_load_options(plan: &ExecutionPlan) -> Result<MlxLoadRequest, Erro
 }
 
 impl AutomaticPlanningBackend for MlxBackendFactory {
+    type Inspection = eredu_core::ArtifactInspection<
+        eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+    >;
+
     fn backend_id(&self) -> BackendId {
         BackendId::new("mlx").expect("MLX is a valid backend identifier")
     }
@@ -322,144 +334,318 @@ impl AutomaticPlanningBackend for MlxBackendFactory {
     fn inspect_resources(
         &self,
         model_path: &Path,
-    ) -> Result<ModelResourceProfile, AutomaticPlanningError> {
-        inspect_model(model_path, MlxInspectionOptions::default())
-            .map(|report| report.resources)
-            .map_err(|error| planning_backend_error("inspect_resources", error))
+    ) -> Result<(ModelResourceProfile, Self::Inspection), AutomaticPlanningError> {
+        let inspection = eredu_architectures::configuration::inspect_artifact(model_path)
+            .map_err(|error| planning_backend_error("inspect_resources", error))?;
+        let report = super::inspection::inspect_selected_artifact(
+            &inspection,
+            MlxInspectionOptions::default(),
+        );
+        Ok((report.resources, inspection))
     }
 
     fn admit_candidate(
         &self,
-        model_path: &Path,
+        inspection: &Self::Inspection,
         plan: &ExecutionPlan,
     ) -> Result<CandidateAdmission, AutomaticPlanningError> {
         let load = mlx_load_options(self, plan)
             .map_err(|error| planning_backend_error("realize_plan", error))?;
-        let report = inspect_model(model_path, MlxInspectionOptions::new(load))
-            .map_err(|error| planning_backend_error("admit_candidate", error))?;
-        let supported = report.is_loadable();
-        let rejection = (!supported).then(|| {
-            report
-                .issues
-                .iter()
-                .find(|issue| issue.severity == InspectionSeverity::Error)
-                .map(|issue| issue.detail.clone())
-                .unwrap_or_else(|| {
-                    "checkpoint inspection did not admit this MLX load policy".into()
-                })
-        });
-        Ok(CandidateAdmission {
-            supported,
-            rejection,
-        })
+        let policy = load
+            .preparation_policy()
+            .map_err(|error| planning_backend_error("admit_candidate_policy", error))?;
+        match super::loading::select_preparation(inspection, load, policy) {
+            Ok(_) => Ok(CandidateAdmission {
+                supported: true,
+                rejection: None,
+            }),
+            Err(error) => Ok(CandidateAdmission {
+                supported: false,
+                rejection: Some(error.to_string()),
+            }),
+        }
     }
 
     fn bounded_residency_requirement(
         &self,
-        model_path: &Path,
+        inspection: &Self::Inspection,
         plan: &ExecutionPlan,
     ) -> Result<BoundedResidencyRequirement, AutomaticPlanningError> {
-        let mut probe = plan.clone().with_expert_cache(None);
-        let residency = match probe.residency().clone() {
-            ResidencyPlan::LayerwiseHost {
-                device_layer_window,
-                host_budget_bytes,
-                ..
-            } => ResidencyPlan::LayerwiseHost {
-                device_layer_window,
-                device_budget_bytes: Some(1),
-                host_budget_bytes,
-            },
-            ResidencyPlan::DenseDiskStream {
-                host_budget_bytes,
-                host_lookahead,
-                background_queue,
-                ..
-            } => ResidencyPlan::DenseDiskStream {
-                device_budget_bytes: 1,
-                host_budget_bytes,
-                host_lookahead,
-                background_queue,
-            },
-            ResidencyPlan::FullyResident => {
-                return Err(AutomaticPlanningError::Invalid(
-                    "fully resident execution has no bounded device window".into(),
-                ));
+        if matches!(plan.residency(), ResidencyPlan::FullyResident) {
+            return Err(AutomaticPlanningError::Invalid(
+                "fully resident execution has no bounded device window".into(),
+            ));
+        }
+        let options = self
+            .load_request_for_plan(plan)
+            .map_err(|error| planning_backend_error("bounded_residency_options", error))?;
+        let policy = options
+            .preparation_policy()
+            .map_err(|error| planning_backend_error("bounded_residency_policy", error))?;
+        let selected = super::loading::select_preparation(inspection, options, policy)
+            .map_err(|error| planning_backend_error("select_model_preparation", error))?;
+        let (text, excluded) = selected
+            .selected_bounded_residency()
+            .map_err(|error| planning_backend_error("selected_text_residency", error))?;
+        selected_text_bounded_requirement(&text, &excluded)
+            .map_err(|error| planning_backend_error("selected_text_residency", error))
+    }
+}
+
+fn selected_text_bounded_requirement(
+    selected: &eredu_runtime::SelectedReplicatedTextRealization,
+    excluded: &std::collections::BTreeSet<String>,
+) -> Result<BoundedResidencyRequirement, String> {
+    let tasks = eredu_runtime::replicated_text_materialization_tasks(selected)
+        .map_err(|error| error.to_string())?;
+    let mut static_bytes = 0u64;
+    let mut groups =
+        std::collections::BTreeMap::<String, std::collections::BTreeMap<usize, u64>>::new();
+    for task in tasks {
+        if excluded.contains(task.name()) {
+            continue;
+        }
+        let bytes = eredu_runtime::selected_materialization_task_bytes(&task)
+            .map_err(|error| error.to_string())?;
+        match task.owner() {
+            eredu_runtime::ReplicatedTextParameterOwner::StaticRole(_) => {
+                static_bytes = static_bytes
+                    .checked_add(bytes)
+                    .ok_or_else(|| "selected static parameter bytes overflowed".to_owned())?;
             }
-            _ => {
-                return Err(AutomaticPlanningError::Invalid(
-                    "unsupported residency plan".into(),
-                ))
+            eredu_runtime::ReplicatedTextParameterOwner::ExecutionUnit { group, unit } => {
+                let total = groups
+                    .entry(group.clone())
+                    .or_default()
+                    .entry(*unit)
+                    .or_default();
+                *total = total
+                    .checked_add(bytes)
+                    .ok_or_else(|| "selected execution-unit bytes overflowed".to_owned())?;
             }
-        };
-        probe = probe.with_residency(residency);
-        let realized = mlx_device(probe.device())?;
-        let stream = Stream::try_new_with_device(&realized.device)
-            .map_err(|error| planning_backend_error("create_execution_stream", error))?;
-        let weights_stream = Stream::try_new_with_device(&Device::new(DeviceType::Cpu, 0))
-            .map_err(|error| planning_backend_error("create_weights_stream", error))?;
-        let backend = MlxBackend::for_execution_plan(&stream, &weights_stream, realized.identity);
-        let options = mlx_load_options(self, &probe)
-            .map_err(|error| planning_backend_error("realize_probe", error))?;
-        match eredu_core::load_model(&backend, model_path, options) {
-            Err(eredu_core::ModelLoadError::Backend(Error::LayerwiseModel(
-                LayerwiseModelError::DeviceBudgetTooSmall {
-                    static_bytes,
-                    window_bytes,
-                    depth,
-                    required,
-                    ..
-                },
-            ))) => Ok(BoundedResidencyRequirement {
-                static_bytes,
-                window_bytes,
-                required_bytes: required,
-                depth,
-            }),
-            Err(error) => Err(planning_backend_error("bounded_residency_probe", error)),
-            Ok(_) => Ok(BoundedResidencyRequirement {
-                static_bytes: 0,
-                window_bytes: 0,
-                required_bytes: 1,
-                depth: 0,
-            }),
+            _ => return Err("selected parameter has an unsupported residency owner".into()),
         }
     }
+    let unit_count = groups
+        .values()
+        .map(|units| units.keys().next_back().map_or(0, |unit| unit + 1))
+        .sum::<usize>();
+    let depth = selected.residency().device_depth(unit_count);
+    let mut window_bytes = 0u64;
+    for units in groups.values() {
+        let count = units.keys().next_back().map_or(0, |unit| unit + 1);
+        let bytes = (0..count)
+            .map(|unit| units.get(&unit).copied().unwrap_or(0))
+            .collect::<Vec<_>>();
+        for start in 0..bytes.len() {
+            let current = bytes
+                .iter()
+                .skip(start)
+                .take(depth)
+                .try_fold(0u64, |total, bytes| total.checked_add(*bytes))
+                .ok_or_else(|| "selected device-window bytes overflowed".to_owned())?;
+            window_bytes = window_bytes.max(current);
+        }
+    }
+    let required_bytes = static_bytes
+        .checked_add(window_bytes)
+        .ok_or_else(|| "selected bounded-residency bytes overflowed".to_owned())?;
+    Ok(BoundedResidencyRequirement {
+        static_bytes,
+        window_bytes,
+        required_bytes,
+        depth,
+    })
+}
+
+/// Cold-selected external assistant plus MLX reader-cache mechanism policy.
+pub struct SelectedMlxExternalAssistantPreparation {
+    preparation: eredu_architectures::CompatibleExternalAssistantPreparation,
+    speculative: eredu_runtime::SelectedSpeculativeRealization,
+    max_cached_shards: usize,
 }
 
 impl ExecutionPlanBackendFactory for MlxBackendFactory {
     type Backend = MlxBackend<'static>;
     type DrafterPreparation = eredu_architectures::ExternalAssistantPreparation;
+    type SelectedDrafterPreparation = SelectedMlxExternalAssistantPreparation;
     type Drafter = MlxDrafter;
+
+    fn select_target(
+        &self,
+        inspection: &eredu_core::ArtifactInspection<
+            eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+        >,
+        plan: &ExecutionPlan,
+    ) -> Result<ExecutionPlanTargetSelection<Self::Backend>, AutomaticPlanningError> {
+        let options = self.load_request_for_plan(plan)?;
+        let policy = options
+            .preparation_policy()
+            .map_err(|error| planning_backend_error("select_preparation_policy", error))?;
+        let selected = super::loading::select_preparation(inspection, options, policy)
+            .map_err(|error| planning_backend_error("select_model_preparation", error))?;
+        let capabilities = super::structural::inspected_session_capabilities(inspection, policy)
+            .map_err(|error| planning_backend_error("select_session_capabilities", error))?;
+        Ok(ExecutionPlanTargetSelection::new(
+            policy,
+            selected,
+            capabilities,
+        ))
+    }
 
     fn realize_target(
         &self,
-        plan: &ExecutionPlan,
+        selected: SelectedExecutionPlanTarget<Self::Backend>,
     ) -> Result<ExecutionPlanTarget<Self::Backend>, AutomaticPlanningError> {
-        let realized = mlx_device(plan.device())?;
+        #[cfg(test)]
+        super::path_instrumentation::target_native_resource_realization_attempt();
+        let realized = mlx_device(selected.execution_plan().device())?;
         let stream = Stream::try_new_with_device(&realized.device)
             .map_err(|error| planning_backend_error("create_execution_stream", error))?;
         let weights_stream = Stream::try_new_with_device(&Device::new(DeviceType::Cpu, 0))
             .map_err(|error| planning_backend_error("create_weights_stream", error))?;
-        let options = mlx_load_options(self, plan)
-            .map_err(|error| planning_backend_error("realize_execution_plan_target", error))?;
         Ok(ExecutionPlanTarget::new(
             MlxBackend::for_execution_plan(&stream, &weights_stream, realized.identity),
-            options,
+            selected,
         ))
+    }
+
+    fn select_drafting(
+        &self,
+        plan: &ExecutionPlan,
+        target: &SelectedExecutionPlanTarget<Self::Backend>,
+        external_artifact: Option<ExternalDraftArtifact<Self::DrafterPreparation>>,
+    ) -> Result<
+        Option<ExternalDraftArtifact<Self::SelectedDrafterPreparation>>,
+        AutomaticPlanningError,
+    > {
+        let Some(artifact) = external_artifact else {
+            return Ok(None);
+        };
+        let options = mlx_drafter_load_options(plan)
+            .map_err(|error| planning_backend_error("select_external_drafter", error))?;
+        if !options.weight_residency.is_fully_resident() {
+            return Err(AutomaticPlanningError::Invalid(
+                "external assistants require fully resident weights".into(),
+            ));
+        }
+        if options
+            .parallel_topology()
+            .is_some_and(|topology| !topology.is_replicated())
+        {
+            return Err(AutomaticPlanningError::Invalid(
+                "external assistants require replicated placement".into(),
+            ));
+        }
+        let max_cached_shards = options.weight_residency.max_cached_shards();
+        let preparation = artifact
+            .preparation
+            .select_materialization(options.quantization, |descriptor, transforms| {
+                if transforms && super::replicated_text::supports_transform(descriptor) {
+                    Some(eredu_runtime::WeightLoweringKind::Transform)
+                } else if !transforms && super::replicated_text::supports_direct(descriptor) {
+                    Some(eredu_runtime::WeightLoweringKind::Direct)
+                } else {
+                    None
+                }
+            })
+            .map_err(|message| AutomaticPlanningError::Backend {
+                operation: "select_external_drafter",
+                message,
+            })?;
+        let target_profile = target
+            .inspection()
+            .architecture_plan()
+            .external_assistant_target_profile()
+            .ok_or_else(|| {
+                AutomaticPlanningError::Invalid(
+                    "selected target does not admit an external assistant".into(),
+                )
+            })?;
+        let preparation = preparation
+            .prove_target_compatibility(&target_profile)
+            .map_err(|error| {
+                AutomaticPlanningError::Invalid(format!(
+                    "external assistant is incompatible with the selected target: {error}"
+                ))
+            })?;
+        let placement = match plan.drafting() {
+            DraftingPlan::External { placement, .. } => placement,
+            _ => {
+                return Err(AutomaticPlanningError::Invalid(
+                    "external assistant selection requires an external drafting plan".into(),
+                ))
+            }
+        };
+        let maximum_draft_tokens = match plan.drafting() {
+            DraftingPlan::External {
+                max_draft_tokens, ..
+            } => NonZeroUsize::new(*max_draft_tokens).ok_or_else(|| {
+                AutomaticPlanningError::Invalid("external draft capacity must be positive".into())
+            })?,
+            _ => unreachable!("external drafting plan checked above"),
+        };
+        let placement_request = eredu_runtime::SpeculativePlacementRequest::from_topology(
+            placement.execution_topology(plan.device()),
+        )
+        .map_err(|error| AutomaticPlanningError::Invalid(error.to_string()))?;
+        let rank_topology = eredu_core::ParallelRankTopology::new(*plan.topology(), 0)
+            .map_err(|error| AutomaticPlanningError::Invalid(error.to_string()))?;
+        let processor = eredu_runtime::SpeculativeIdentity::new("prepared-chat/text-token-ids/v1")
+            .map_err(|error| AutomaticPlanningError::Invalid(error.to_string()))?;
+        let contract = preparation
+            .speculative_contract(
+                eredu_architectures::ExternalSpeculativeContractRequest::new(
+                    rank_topology,
+                    processor,
+                    artifact.tokenizer_compatibility,
+                    artifact.tokenizer_compatibility.fingerprint(),
+                    maximum_draft_tokens,
+                ),
+            )
+            .map_err(|error| {
+                AutomaticPlanningError::Invalid(format!(
+                    "external speculative contract is invalid: {error}"
+                ))
+            })?;
+        let speculative = eredu_runtime::select_and_prepare_speculative_realization_observed(
+            contract.requirements(),
+            &contract.selection_request(placement_request),
+            &super::speculative::speculative_mechanism_capabilities(),
+            &|_| Ok(()),
+            |_| Ok::<_, AutomaticPlanningError>(()),
+            |_, &()| Ok::<_, AutomaticPlanningError>(()),
+            |_, &()| Ok::<_, AutomaticPlanningError>(()),
+            |_| Ok::<_, AutomaticPlanningError>(()),
+            |_, &()| Ok::<_, AutomaticPlanningError>(()),
+        )
+        .map_err(|error| AutomaticPlanningError::Invalid(error.to_string()))?
+        .into_parts()
+        .0;
+        Ok(Some(ExternalDraftArtifact {
+            preparation: SelectedMlxExternalAssistantPreparation {
+                preparation,
+                speculative,
+                max_cached_shards,
+            },
+            tokenizer_compatibility: artifact.tokenizer_compatibility,
+        }))
     }
 
     fn realize_drafting(
         &self,
         plan: &ExecutionPlan,
         target: &ModelRuntime<Self::Backend>,
-        external_artifact: Option<ExternalDraftArtifact<Self::DrafterPreparation>>,
+        selected: eredu_core::SelectedExecutionPlanDrafting<Self::SelectedDrafterPreparation>,
     ) -> Result<RealizedDrafting<MlxDrafter>, AutomaticPlanningError> {
-        let capability =
-            <MlxBackend<'static> as SpeculativeGenerationBackend>::speculative_capability(target);
+        let external_artifact = selected.into_external_artifact(plan, target)?;
         match plan.drafting() {
             DraftingPlan::Disabled => Ok(RealizedDrafting::Disabled),
             DraftingPlan::Embedded { .. } => {
+                let capability =
+                    <MlxBackend<'static> as SpeculativeGenerationBackend>::speculative_capability(
+                        target,
+                    );
                 if !capability.is_ready_for(SpeculativeDraftSource::Embedded) {
                     return Err(AutomaticPlanningError::Invalid(format!(
                         "execution plan selects embedded drafting but target capability is {capability:?}"
@@ -467,78 +653,15 @@ impl ExecutionPlanBackendFactory for MlxBackendFactory {
                 }
                 Ok(RealizedDrafting::Embedded)
             }
-            DraftingPlan::External {
-                placement,
-                max_draft_tokens,
-                ..
-            } => {
-                if !capability.admits_source(SpeculativeDraftSource::Separate) {
-                    return Err(AutomaticPlanningError::Invalid(format!(
-                        "execution plan selects external drafting but target capability is {capability:?}"
-                    )));
-                }
+            DraftingPlan::External { placement, .. } => {
                 let artifact = external_artifact.ok_or_else(|| {
                     AutomaticPlanningError::Invalid(
                         "external drafting is missing proven tokenizer compatibility".into(),
                     )
                 })?;
-                let target_profile = target
-                    .session()
-                    .external_assistant_target_profile()
-                    .map_err(|error| {
-                        planning_backend_error("prove_external_drafter_compatibility", error)
-                    })?;
-                let preparation = artifact
-                    .preparation
-                    .prove_target_compatibility(&target_profile)
-                    .map_err(|error| {
-                        AutomaticPlanningError::Invalid(format!(
-                            "external assistant is incompatible with the selected target: {error}"
-                        ))
-                    })?;
-                let topology = placement.execution_topology(plan.device());
-                let placement_request =
-                    eredu_runtime::SpeculativePlacementRequest::from_topology(topology)
-                        .map_err(|error| AutomaticPlanningError::Invalid(error.to_string()))?;
-                let rank_topology = eredu_core::ParallelRankTopology::new(*plan.topology(), 0)
-                    .map_err(|error| AutomaticPlanningError::Invalid(error.to_string()))?;
-                let processor =
-                    eredu_runtime::SpeculativeIdentity::new("prepared-chat/text-token-ids/v1")
-                        .map_err(|error| AutomaticPlanningError::Invalid(error.to_string()))?;
-                let maximum_draft_tokens =
-                    NonZeroUsize::new(*max_draft_tokens).ok_or_else(|| {
-                        AutomaticPlanningError::Invalid(
-                            "external draft capacity must be positive".into(),
-                        )
-                    })?;
-                let contract = preparation
-                    .speculative_contract(
-                        eredu_architectures::ExternalSpeculativeContractRequest::new(
-                            rank_topology,
-                            processor,
-                            artifact.tokenizer_compatibility,
-                            artifact.tokenizer_compatibility.fingerprint(),
-                            maximum_draft_tokens,
-                        ),
-                    )
-                    .map_err(|error| {
-                        AutomaticPlanningError::Invalid(format!(
-                            "external speculative contract is invalid: {error}"
-                        ))
-                    })?;
-                let prepared = eredu_runtime::select_and_prepare_speculative_realization_observed(
-                    contract.requirements(),
-                    &contract.selection_request(placement_request),
-                    &super::speculative::speculative_mechanism_capabilities(),
-                    &|_| Ok(()),
-                    |_| Ok::<_, AutomaticPlanningError>(()),
-                    |_, &()| Ok::<_, AutomaticPlanningError>(()),
-                    |_, &()| Ok::<_, AutomaticPlanningError>(()),
-                    |_| Ok::<_, AutomaticPlanningError>(()),
-                    |_, &()| Ok::<_, AutomaticPlanningError>(()),
-                )
-                .map_err(|error| AutomaticPlanningError::Invalid(error.to_string()))?;
-                let selected = prepared.into_parts().0;
+                let max_cached_shards = artifact.preparation.max_cached_shards;
+                let preparation = artifact.preparation.preparation;
+                let selected = artifact.preparation.speculative;
                 let draft_stream = match placement {
                     DraftPlacementPlan::Target => target.backend().stream().clone(),
                     DraftPlacementPlan::Device { device } => {
@@ -553,12 +676,10 @@ impl ExecutionPlanBackendFactory for MlxBackendFactory {
                         ))
                     }
                 };
-                let options = mlx_drafter_load_options(plan)
-                    .map_err(|error| planning_backend_error("realize_external_drafter", error))?;
                 let drafter = MlxDrafter::materialize_with_compatibility(
                     preparation,
                     artifact.tokenizer_compatibility,
-                    options,
+                    max_cached_shards,
                     &draft_stream,
                     target.backend().weights_stream(),
                     selected,
@@ -744,6 +865,7 @@ mod tests {
 
     #[test]
     fn realtime_capability_rejection_precedes_device_and_stream_realization() {
+        super::super::path_instrumentation::reset();
         let directory = tempfile::tempdir().expect("tiny realtime artifact directory");
         super::super::realtime::tests::write_tiny_native_artifact(directory.path(), None);
         let preparation = eredu_architectures::moshi::prepare_realtime_model(directory.path())
@@ -758,6 +880,10 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("activation_inspection"));
+        assert_eq!(
+            super::super::path_instrumentation::target_native_resource_realization_attempts(),
+            0
+        );
     }
 
     #[test]
@@ -775,6 +901,98 @@ mod tests {
         let plan = ExecutionPlan::fully_resident(DevicePlan::new("mlx", "cpu:0").unwrap())
             .with_topology(eredu_core::ParallelTopology::new(2, 1, 1, 1).unwrap());
         assert!(mlx_load_options(&MlxBackendFactory::default(), &plan).is_err());
+    }
+
+    #[test]
+    fn failed_target_selection_creates_no_native_resources() {
+        super::super::path_instrumentation::reset();
+        let directory = tempfile::tempdir().expect("tiny inspected artifact directory");
+        super::super::realtime::tests::write_tiny_native_artifact(directory.path(), None);
+        let inspection = eredu_architectures::configuration::inspect_artifact(directory.path())
+            .expect("tiny artifact inspection succeeds");
+        let plan = ExecutionPlan::fully_resident(DevicePlan::new("mlx", "cpu:0").unwrap())
+            .with_topology(eredu_core::ParallelTopology::new(2, 1, 1, 1).unwrap());
+
+        let error = match eredu_core::select_execution_plan_target(
+            &MlxBackendFactory::default(),
+            &plan,
+            inspection,
+        ) {
+            Ok(_) => panic!("distributed topology must fail before native realization"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("1x1x1"));
+        assert_eq!(
+            super::super::path_instrumentation::target_native_resource_realization_attempts(),
+            0
+        );
+    }
+
+    #[test]
+    fn bounded_probe_selects_before_native_resources() {
+        super::super::path_instrumentation::reset();
+        let directory = tempfile::tempdir().expect("tiny realtime artifact directory");
+        super::super::realtime::tests::write_tiny_native_artifact(directory.path(), None);
+        let plan = ExecutionPlan::fully_resident(DevicePlan::new("mlx", "cpu:0").unwrap())
+            .with_residency(ResidencyPlan::LayerwiseHost {
+                device_layer_window: 1,
+                device_budget_bytes: None,
+                host_budget_bytes: None,
+            });
+
+        let inspection = eredu_architectures::configuration::inspect_artifact(directory.path())
+            .expect("realtime artifact inspection");
+        let error = MlxBackendFactory::default()
+            .bounded_residency_requirement(&inspection, &plan)
+            .expect_err("realtime architecture must not enter ordinary bounded probing");
+
+        assert!(matches!(
+            error,
+            AutomaticPlanningError::Backend {
+                operation: "select_model_preparation",
+                ref message,
+            } if message.contains("Realtime loading protocol")
+        ));
+        assert_eq!(
+            super::super::path_instrumentation::target_native_resource_realization_attempts(),
+            0
+        );
+    }
+
+    #[test]
+    fn bounded_requirement_for_ordinary_text_uses_only_the_cold_selected_tasks() {
+        super::super::path_instrumentation::reset();
+        let directory = super::super::replicated_text::tests::tiny_artifact("llama", false);
+        let plan = ExecutionPlan::fully_resident(DevicePlan::new("mlx", "cpu:0").unwrap())
+            .with_residency(ResidencyPlan::LayerwiseHost {
+                device_layer_window: 1,
+                device_budget_bytes: None,
+                host_budget_bytes: None,
+            });
+
+        let inspection = eredu_architectures::configuration::inspect_artifact(directory.path())
+            .expect("ordinary artifact inspection");
+        let requirement = MlxBackendFactory::default()
+            .bounded_residency_requirement(&inspection, &plan)
+            .expect("ordinary selected tasks have an exact bounded requirement");
+
+        assert!(requirement.static_bytes > 0);
+        assert!(requirement.window_bytes > 0);
+        assert_eq!(
+            requirement.required_bytes,
+            requirement.static_bytes + requirement.window_bytes
+        );
+        assert_eq!(requirement.depth, 1);
+        assert_eq!(
+            super::super::path_instrumentation::target_native_resource_realization_attempts(),
+            0
+        );
+        let counts = super::super::path_instrumentation::snapshot();
+        assert_eq!(counts.payload_opens, 0);
+        assert_eq!(counts.architecture_constructions, 0);
+        assert_eq!(counts.constructors, 0);
+        assert_eq!(counts.materializations, 0);
     }
 
     #[test]
@@ -831,11 +1049,11 @@ mod tests {
         if !safemlx::metal::is_available().unwrap() {
             return;
         }
-        let plan = ExecutionPlan::fully_resident(DevicePlan::new("mlx", "metal:0").unwrap());
-        let target =
-            eredu_core::realize_execution_plan_target(&MlxBackendFactory::default(), &plan)
-                .unwrap();
-        let devices = target.backend().devices().unwrap();
+        let plan = DevicePlan::new("mlx", "metal:0").unwrap();
+        let realized = mlx_device(&plan).unwrap();
+        let stream = Stream::try_new_with_device(&realized.device).unwrap();
+        let backend = MlxBackend::for_execution_plan(&stream, &stream, realized.identity);
+        let devices = backend.devices().unwrap();
 
         assert_eq!(devices[0].0.id(), "metal:0");
         assert_eq!(devices[0].0.family(), "metal");

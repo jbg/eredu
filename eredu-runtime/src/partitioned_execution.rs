@@ -89,7 +89,7 @@ struct CommunicationPoison {
 /// Backend-owned operations adjacent to the neutral partition driver must
 /// retain this authority instead of a bare native group. Every clone observes
 /// the first terminal communication failure and fails before later submission.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct PartitionCommunicationAuthority {
     policy: Option<crate::CommunicationCompletionPolicy>,
     poison: std::sync::Arc<std::sync::Mutex<Option<CommunicationPoison>>>,
@@ -101,6 +101,18 @@ impl PartitionCommunicationAuthority {
             policy,
             poison: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    /// Creates the poison and bounded-completion authority selected by one manifest.
+    pub fn from_manifest(
+        manifest: &CommunicationManifest,
+    ) -> Result<Self, PartitionExecutionError> {
+        if manifest.completion_policy().is_none()
+            && (!manifest.groups().is_empty() || !manifest.routes().is_empty())
+        {
+            return Err(PartitionExecutionError::MissingBoundedCompletionPolicy);
+        }
+        Ok(Self::new(manifest.completion_policy()))
     }
 
     fn poison_guard(&self) -> std::sync::MutexGuard<'_, Option<CommunicationPoison>> {
@@ -120,6 +132,11 @@ impl PartitionCommunicationAuthority {
             }),
             None => Ok(()),
         }
+    }
+
+    /// Returns the bounded completion policy selected by the communication manifest.
+    pub const fn completion_policy(&self) -> Option<crate::CommunicationCompletionPolicy> {
+        self.policy
     }
 
     fn mark_poisoned(&self, poison: CommunicationPoison) {
@@ -152,6 +169,32 @@ impl PartitionCommunicationAuthority {
             cancellation,
         });
         PartitionExecutionError::CommunicationSubmissionFailed {
+            operation,
+            phase,
+            route,
+            error: error.to_string(),
+        }
+    }
+
+    /// Records an exact native completion failure in the shared poison domain.
+    pub fn completion_error(
+        &self,
+        error: impl std::fmt::Display,
+        operation: CommunicationOperation,
+        phase: DistributedExecutionPhase,
+        route: Option<CommunicationRouteId>,
+    ) -> PartitionExecutionError {
+        let cancellation = self
+            .policy
+            .expect("communication completion requires a selected completion policy")
+            .cancellation();
+        self.mark_poisoned(CommunicationPoison {
+            operation,
+            phase,
+            route,
+            cancellation,
+        });
+        PartitionExecutionError::CommunicationCompletionFailed {
             operation,
             phase,
             route,
@@ -329,9 +372,19 @@ where
         routes: Vec<RealizedCommunicationRoute<R>>,
         inspector: I,
     ) -> Result<Self, PartitionExecutionError> {
-        if manifest.completion_policy().is_none()
-            && (!manifest.groups().is_empty() || !manifest.routes().is_empty())
-        {
+        let authority = PartitionCommunicationAuthority::from_manifest(&manifest)?;
+        Self::new_with_authority(manifest, groups, routes, inspector, authority)
+    }
+
+    /// Pairs native resources with an authority already retained by adjacent session APIs.
+    pub fn new_with_authority(
+        manifest: CommunicationManifest,
+        groups: Vec<RealizedCommunicationGroup<G>>,
+        routes: Vec<RealizedCommunicationRoute<R>>,
+        inspector: I,
+        authority: PartitionCommunicationAuthority,
+    ) -> Result<Self, PartitionExecutionError> {
+        if authority.policy != manifest.completion_policy() {
             return Err(PartitionExecutionError::MissingBoundedCompletionPolicy);
         }
         if groups.len() != manifest.groups().len() || routes.len() != manifest.routes().len() {
@@ -358,7 +411,6 @@ where
                 });
             }
         }
-        let authority = PartitionCommunicationAuthority::new(manifest.completion_policy());
         Ok(Self {
             manifest,
             groups,

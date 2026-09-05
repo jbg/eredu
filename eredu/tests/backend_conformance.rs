@@ -31,21 +31,22 @@ use eredu_core::{
     },
     AdmissionRequest, AdmissionResult, ArtifactFormat, AutomaticPlanRequest, AutomaticPlanner,
     AutomaticPlanningBackend, AutomaticPlanningError, BackendDescriptor, BackendId,
-    BackendProvider, BackendSession, BoundedResidencyRequirement, CacheStateStrategy,
-    CandidateAdmission, CapabilityError, CollectiveGroupDescriptor, CollectiveGroupId,
-    CollectiveScope, Completion, DeviceCapabilities, DeviceDescriptor, DevicePlan,
-    DistributedBackend, DistributedCapabilities, DistributedSession, DistributedSessionDescriptor,
-    DraftPlacementPlan, DraftingPlan, EstimationCompleteness, ExecutionPlan,
-    ExecutionPlanBackendFactory, ExecutionPlanReport, ExecutionPlanTarget, ExternalDraftArtifact,
-    FinishReason, GenerationConfigOverrides, HardwareBackendProfile, HardwareDeviceProfile,
+    BackendProvider, BackendSession, BoundedCompletion, BoundedCompletionOutcome,
+    BoundedCompletionWait, BoundedResidencyRequirement, CacheStateStrategy, CandidateAdmission,
+    CapabilityError, CollectiveGroupDescriptor, CollectiveGroupId, CollectiveScope, Completion,
+    DeviceCapabilities, DeviceDescriptor, DevicePlan, DistributedBackend, DistributedCapabilities,
+    DistributedSession, DistributedSessionDescriptor, DraftPlacementPlan, DraftingPlan,
+    EstimationCompleteness, ExecutionPlan, ExecutionPlanBackendFactory, ExecutionPlanReport,
+    ExecutionPlanTarget, ExecutionPlanTargetSelection, ExternalDraftArtifact, FinishReason,
+    GenerationConfigOverrides, HardwareBackendProfile, HardwareDeviceProfile,
     HardwareMemorySemantics, HardwareProfile, InputModalities, InputTokenCount, Media,
     ModelCapabilities, ModelCapabilityBackend, ModelLoadingBackend, ModelResourceProfile,
     ModelRuntime, MultimodalPreparationBackend, MultimodalPreparationFailure, MultimodalRequest,
     MultimodalSegment, ObservationSet, ObservationValue, Observed, PhysicalMemorySemantics,
     PreparedModel, PreparedSpeculativeLane, RealizedDrafting, ResidencyPlan, RgbImage,
-    RuntimeStateEstimate, SamplingPlacement, SemanticEvent, SessionCapabilities,
-    SpeculativeCallbackPublisher, SpeculativeCapability, SpeculativeCommit, SpeculativeDraft,
-    SpeculativeDraftRandomPosition, SpeculativeDraftSource, SpeculativeExecutor,
+    RuntimeStateEstimate, SamplingPlacement, SelectedExecutionPlanTarget, SemanticEvent,
+    SessionCapabilities, SpeculativeCallbackPublisher, SpeculativeCapability, SpeculativeCommit,
+    SpeculativeDraft, SpeculativeDraftRandomPosition, SpeculativeDraftSource, SpeculativeExecutor,
     SpeculativeGenerationBackend, SpeculativeGenerationBatchOutput,
     SpeculativeGenerationBatchRequest, SpeculativeGenerationOutput, SpeculativeGenerationVisitor,
     SpeculativeOutputRuntime, SpeculativePrefill, SpeculativeRandomness, SpeculativeSampling,
@@ -126,6 +127,15 @@ impl Completion for Done {
 
     fn wait(&self) -> Result<(), Self::Error> {
         Ok(())
+    }
+}
+
+impl BoundedCompletion for Done {
+    fn wait_bounded(
+        self,
+        _policy: BoundedCompletionWait,
+    ) -> Result<BoundedCompletionOutcome, Self::Error> {
+        Ok(BoundedCompletionOutcome::Completed)
     }
 }
 
@@ -514,17 +524,19 @@ impl ModelLoadingBackend for MockBackend {
 
     fn model_config(
         &self,
-        plan: eredu_core::ModelPreparationPlan<
-            eredu_architectures::processor_plan::ArtifactArchitecturePlan,
-        >,
-        _: Self::SelectedPreparation,
+        selected: eredu_core::SelectedModelPreparation<Self>,
     ) -> Result<Self::ModelConfig, Self::Error> {
+        let (plan, ()) = selected.into_parts();
         assert_eq!(plan.inspection().configuration().family(), "llama");
         Ok(())
     }
 }
 
 impl AutomaticPlanningBackend for MockBackend {
+    type Inspection = eredu_core::ArtifactInspection<
+        eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+    >;
+
     fn backend_id(&self) -> BackendId {
         BackendId::new("mock").unwrap()
     }
@@ -556,8 +568,10 @@ impl AutomaticPlanningBackend for MockBackend {
     fn inspect_resources(
         &self,
         model_path: &Path,
-    ) -> Result<ModelResourceProfile, AutomaticPlanningError> {
+    ) -> Result<(ModelResourceProfile, Self::Inspection), AutomaticPlanningError> {
         assert!(model_path.join("model.safetensors").is_file());
+        let inspection = eredu_architectures::configuration::inspect_artifact(model_path)
+            .map_err(|error| AutomaticPlanningError::Invalid(error.to_string()))?;
         let mut profile =
             ModelResourceProfile::unmeasured(model_path.into(), ArtifactFormat::SafeTensors);
         profile.model_family = Some(ModelKind::Llama.canonical_name().into());
@@ -568,12 +582,12 @@ impl AutomaticPlanningBackend for MockBackend {
         profile.stored_tensor_bytes = Observed::exact(4, "conformance fixture");
         profile.largest_stored_tensor_bytes = Observed::exact(4, "conformance fixture");
         profile.materialized_parameter_bytes = Observed::exact(16 * 1024, "conformance fixture");
-        Ok(profile)
+        Ok((profile, inspection))
     }
 
     fn admit_candidate(
         &self,
-        _: &Path,
+        _: &Self::Inspection,
         plan: &ExecutionPlan,
     ) -> Result<CandidateAdmission, AutomaticPlanningError> {
         assert_eq!(plan.device().backend(), &self.backend_id());
@@ -586,7 +600,7 @@ impl AutomaticPlanningBackend for MockBackend {
 
     fn bounded_residency_requirement(
         &self,
-        _: &Path,
+        _: &Self::Inspection,
         plan: &ExecutionPlan,
     ) -> Result<BoundedResidencyRequirement, AutomaticPlanningError> {
         assert!(matches!(
@@ -605,21 +619,49 @@ impl AutomaticPlanningBackend for MockBackend {
 impl ExecutionPlanBackendFactory for MockBackend {
     type Backend = Self;
     type DrafterPreparation = eredu_architectures::ExternalAssistantPreparation;
+    type SelectedDrafterPreparation = eredu_architectures::ExternalAssistantPreparation;
     type Drafter = MockDrafter;
+
+    fn select_target(
+        &self,
+        _: &eredu_core::ArtifactInspection<
+            eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+        >,
+        _: &ExecutionPlan,
+    ) -> Result<ExecutionPlanTargetSelection<Self::Backend>, AutomaticPlanningError> {
+        Ok(ExecutionPlanTargetSelection::new(
+            eredu_core::PreparationPolicy::default(),
+            (),
+            SessionCapabilities::new(true, true, false),
+        ))
+    }
 
     fn realize_target(
         &self,
-        _: &ExecutionPlan,
+        selected: SelectedExecutionPlanTarget<Self::Backend>,
     ) -> Result<ExecutionPlanTarget<Self::Backend>, AutomaticPlanningError> {
-        Ok(ExecutionPlanTarget::new(MockBackend, ()))
+        Ok(ExecutionPlanTarget::new(MockBackend, selected))
+    }
+
+    fn select_drafting(
+        &self,
+        _: &ExecutionPlan,
+        _: &SelectedExecutionPlanTarget<Self::Backend>,
+        external_artifact: Option<ExternalDraftArtifact<Self::DrafterPreparation>>,
+    ) -> Result<
+        Option<ExternalDraftArtifact<Self::SelectedDrafterPreparation>>,
+        AutomaticPlanningError,
+    > {
+        Ok(external_artifact)
     }
 
     fn realize_drafting(
         &self,
         plan: &ExecutionPlan,
-        _: &ModelRuntime<Self::Backend>,
-        external_artifact: Option<ExternalDraftArtifact<Self::DrafterPreparation>>,
+        target: &ModelRuntime<Self::Backend>,
+        selected: eredu_core::SelectedExecutionPlanDrafting<Self::SelectedDrafterPreparation>,
     ) -> Result<RealizedDrafting<MockDrafter>, AutomaticPlanningError> {
+        let external_artifact = selected.into_external_artifact(plan, target)?;
         Ok(match plan.drafting() {
             DraftingPlan::Disabled => {
                 assert!(external_artifact.is_none());
@@ -1340,8 +1382,12 @@ fn planned_loading_client_code<F>(
 )
 where
     F: ExecutionPlanBackendFactory<
-        DrafterPreparation = eredu_architectures::ExternalAssistantPreparation,
-    >,
+            DrafterPreparation = eredu_architectures::ExternalAssistantPreparation,
+        > + AutomaticPlanningBackend<
+            Inspection = eredu_core::ArtifactInspection<
+                eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+            >,
+        >,
     F::Backend: TextGenerationBackend,
     <F::Backend as ModelLoadingBackend>::ConfigurationResolver:
         eredu_core::ModelConfigurationResolver<
@@ -1415,8 +1461,9 @@ fn assert_automatic_planning_conformance() {
         Some(&2048)
     );
 
+    let inspection = eredu_architectures::configuration::inspect_artifact(artifact.path()).unwrap();
     let requirement = backend
-        .bounded_residency_requirement(artifact.path(), &report.plan)
+        .bounded_residency_requirement(&inspection, &report.plan)
         .unwrap();
     assert_eq!(requirement.required_bytes, 3072);
     assert_eq!(
@@ -1436,7 +1483,11 @@ fn assert_automatic_planning_conformance() {
         .clone()
         .with_device(DevicePlan::new("other", "gpu:0").unwrap());
     assert!(matches!(
-        eredu_core::realize_execution_plan_target(&backend, &wrong_backend),
+        eredu_core::select_execution_plan_target(
+            &backend,
+            &wrong_backend,
+            eredu_architectures::configuration::inspect_artifact(artifact.path()).unwrap(),
+        ),
         Err(AutomaticPlanningError::Invalid(message))
             if message.contains("factory owns mock")
     ));
@@ -1445,10 +1496,37 @@ fn assert_automatic_planning_conformance() {
         .plan
         .clone()
         .with_device(DevicePlan::new("mock", "gpu:1").unwrap());
+    let missing_device_selection = eredu_core::select_execution_plan_target(
+        &backend,
+        &missing_device,
+        eredu_architectures::configuration::inspect_artifact(artifact.path()).unwrap(),
+    )
+    .unwrap();
     assert!(matches!(
-        eredu_core::realize_execution_plan_target(&backend, &missing_device),
+        eredu_core::realize_execution_plan_target(
+            &backend,
+            &missing_device,
+            missing_device_selection,
+        ),
         Err(AutomaticPlanningError::Invalid(message))
             if message.contains("does not expose selected device gpu:1")
+    ));
+
+    let retained_selection = eredu_core::select_execution_plan_target(
+        &backend,
+        &report.plan,
+        eredu_architectures::configuration::inspect_artifact(artifact.path()).unwrap(),
+    )
+    .unwrap();
+    let changed_plan = report.plan.clone().with_drafting(DraftingPlan::Embedded {
+        max_draft_tokens: 1,
+        lookahead: false,
+        adaptive_lookahead: false,
+    });
+    assert!(matches!(
+        eredu_core::realize_execution_plan_target(&backend, &changed_plan, retained_selection),
+        Err(AutomaticPlanningError::Invalid(message))
+            if message.contains("different execution plan")
     ));
 
     let mut external = report.plan.clone();
@@ -1461,6 +1539,104 @@ fn assert_automatic_planning_conformance() {
         lookahead: true,
         adaptive_lookahead: true,
     });
+    let selected_target = eredu_core::select_execution_plan_target(
+        &backend,
+        &external,
+        eredu_architectures::configuration::inspect_artifact(artifact.path()).unwrap(),
+    )
+    .unwrap();
+    let changed_external = external.clone().with_drafting(DraftingPlan::External {
+        model: assistant.path().display().to_string(),
+        placement: DraftPlacementPlan::Target,
+        max_draft_tokens: 5,
+        lookahead: true,
+        adaptive_lookahead: true,
+    });
+    assert!(matches!(
+        eredu_core::select_execution_plan_drafting(
+            &backend,
+            &changed_external,
+            &selected_target,
+            Some(ExternalDraftArtifact {
+                preparation: eredu_architectures::prepare_external_assistant(assistant.path())
+                    .unwrap(),
+                tokenizer_compatibility: eredu_core::TokenizerCompatibilityProof::prove(
+                    [11; 32], [11; 32],
+                )
+                .unwrap(),
+            }),
+        ),
+        Err(AutomaticPlanningError::Invalid(message))
+            if message.contains("selected target was established for a different execution plan")
+    ));
+    let selected_drafting = eredu_core::select_execution_plan_drafting(
+        &backend,
+        &external,
+        &selected_target,
+        Some(ExternalDraftArtifact {
+            preparation: eredu_architectures::prepare_external_assistant(assistant.path()).unwrap(),
+            tokenizer_compatibility: eredu_core::TokenizerCompatibilityProof::prove(
+                [11; 32], [11; 32],
+            )
+            .unwrap(),
+        }),
+    )
+    .unwrap();
+    let realization =
+        eredu_core::realize_execution_plan_target(&backend, &external, selected_target).unwrap();
+    let selected_runtime = realization.into_runtime().unwrap();
+    assert!(matches!(
+        eredu_core::realize_execution_plan_drafting(
+            &backend,
+            &changed_external,
+            &selected_runtime,
+            selected_drafting,
+        ),
+        Err(AutomaticPlanningError::Invalid(message))
+            if message.contains("selected drafting was established for a different execution plan")
+    ));
+
+    let first_target = eredu_core::select_execution_plan_target(
+        &backend,
+        &external,
+        eredu_architectures::configuration::inspect_artifact(artifact.path()).unwrap(),
+    )
+    .unwrap();
+    let first_drafting = eredu_core::select_execution_plan_drafting(
+        &backend,
+        &external,
+        &first_target,
+        Some(ExternalDraftArtifact {
+            preparation: eredu_architectures::prepare_external_assistant(assistant.path()).unwrap(),
+            tokenizer_compatibility: eredu_core::TokenizerCompatibilityProof::prove(
+                [11; 32], [11; 32],
+            )
+            .unwrap(),
+        }),
+    )
+    .unwrap();
+    let second_target = eredu_core::select_execution_plan_target(
+        &backend,
+        &external,
+        eredu_architectures::configuration::inspect_artifact(artifact.path()).unwrap(),
+    )
+    .unwrap();
+    let second_runtime =
+        eredu_core::realize_execution_plan_target(&backend, &external, second_target)
+            .unwrap()
+            .into_runtime()
+            .unwrap();
+    assert!(matches!(
+        eredu_core::realize_execution_plan_drafting(
+            &backend,
+            &external,
+            &second_runtime,
+            first_drafting,
+        ),
+        Err(AutomaticPlanningError::Invalid(message))
+            if message.contains("different realized target")
+    ));
+
     let mut planned = LoadedModel::load_execution_plan(&backend, artifact.path(), &external)
         .expect("generic plan loading realizes the external assistant");
     assert!(planned.drafting().is_external());

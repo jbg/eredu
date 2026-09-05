@@ -678,7 +678,7 @@ fn safe_matrix_constraints(
             companion.clone(),
             companion_dtype(),
         )
-        .companion(),
+        .linear_companion(name, eredu_checkpoint::schema::LinearCompanionKind::Scale),
     );
     if quantization.has_biases() {
         constraints.push(
@@ -687,7 +687,10 @@ fn safe_matrix_constraints(
                 companion,
                 companion_dtype(),
             )
-            .companion(),
+            .linear_companion(
+                name,
+                eredu_checkpoint::schema::LinearCompanionKind::AffineBias,
+            ),
         );
     }
     Ok(constraints)

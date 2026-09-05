@@ -24,7 +24,12 @@ use eredu_architectures::{
     PlannedAddressableGatedProduct, PlannedAddressableRelu2, PlannedResidentGatedProduct,
     PreparedRoutedTextArchitecture, RoutedTextExecutionError,
 };
-use eredu_checkpoint::store::MemoryWeightStore;
+use eredu_checkpoint::{
+    recipe::DerivedWeightRecipe,
+    store::{
+        EncodedTensorLease, ReadPolicy, SharedCheckpointSource, TensorReadRequest, TensorSelection,
+    },
+};
 use eredu_core::cache::{LayerCachePolicy, PromptCacheTopology, StateTensorRole};
 use eredu_core::{
     CollectiveGroupId, Completion, CompletionCancellationMode, DistributedCommitOutcome,
@@ -82,6 +87,100 @@ use safetensors::tensor::Dtype;
 
 fn dense_linear_format() -> eredu_nn::LinearFormatSpec {
     eredu_nn::LinearFormatSpec::unscaled(eredu_checkpoint::LinearFormat::Dense).unwrap()
+}
+
+#[cfg(test)]
+mod unified_conformance_compatibility_wrappers {
+    use super::*;
+
+    fn run_on_reference_stack(case: fn()) {
+        std::thread::Builder::new()
+            .name("reference-numeric-compatibility-wrapper".into())
+            .stack_size(32 * 1024 * 1024)
+            .spawn(case)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn typed_routed_extension() {
+        run_on_reference_stack(
+            new_architecture_uses_production_selection_materialization_and_session_without_backend_case,
+        );
+    }
+
+    #[test]
+    fn dense_stream_failure_timing() {
+        run_on_reference_stack(dense_stream_acquisition_failure_is_atomic_before_first_real_unit);
+    }
+
+    #[test]
+    fn compressed_cache_rollback() {
+        run_on_reference_stack(compressed_cache_growth_boundaries_and_rollback_are_backend_neutral);
+    }
+
+    #[test]
+    fn authoritative_partitioned_sessions() {
+        run_on_reference_stack(
+            authoritative_partitioned_numeric_sessions_match_tp_pp_and_tp_pp_reference,
+        );
+    }
+
+    #[test]
+    fn deepseek_cartesian_sessions() {
+        run_on_reference_stack(
+            prediction_free_deepseek_v3_v4_routed_sessions_cover_cartesian_state_cache_and_failure,
+        );
+    }
+
+    #[test]
+    fn resident_and_addressable_routing() {
+        run_on_reference_stack(
+            non_mlx_session_executes_resident_and_addressable_routing_through_one_driver,
+        );
+    }
+
+    #[test]
+    fn relu2_routing() {
+        run_on_reference_stack(non_mlx_session_executes_relu2_routing_through_the_same_driver);
+    }
+
+    #[test]
+    fn routed_composite_partition_axes() {
+        run_on_reference_stack(
+            routed_muse_and_inkling_use_the_ordinary_partition_session_across_admitted_axes,
+        );
+    }
+
+    #[test]
+    fn routed_composite_observation_transaction() {
+        run_on_reference_stack(placed_routed_composite_observation_intervention_is_transactional);
+    }
+
+    #[test]
+    fn transformed_replicated_materialization() {
+        run_on_reference_stack(|| {
+            let evidence = run_reference_conformance_transformed_replicated_production();
+            assert!(evidence
+                .lowering_kinds
+                .iter()
+                .any(|kind| kind == "Transform"));
+            assert!(evidence.generated_companions > 0);
+        });
+    }
+
+    #[test]
+    fn transformed_addressable_materialization() {
+        run_on_reference_stack(|| {
+            let evidence = run_reference_conformance_transformed_addressable_route();
+            assert!(evidence
+                .lowering_kinds
+                .iter()
+                .any(|kind| kind == "Transform"));
+            assert!(evidence.generated_companions > 0);
+        });
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1718,6 +1817,15 @@ where
     visitor.visit_mut(metadata.clone(), value);
 }
 
+fn numeric_companion_metadata(
+    companion: &ParameterSpec,
+    primary: &ParameterSpec,
+) -> ParameterMetadata {
+    let mut metadata = ParameterMetadata::from_spec(companion, companion.trainable);
+    metadata.linear_companion_of = Some(primary.id.clone());
+    metadata
+}
+
 fn linear(
     input: &NumericTensor,
     weight: &NumericTensor,
@@ -1758,6 +1866,8 @@ struct NumericLinear {
     weight: NumericTensor,
     weight_metadata: ParameterMetadata,
     bias: Option<(NumericTensor, ParameterMetadata)>,
+    execution_weight: Option<NumericTensor>,
+    format_companions: Vec<(NumericTensor, ParameterMetadata)>,
 }
 
 impl Parameterized<NumericTensor> for NumericLinear {
@@ -1769,6 +1879,9 @@ impl Parameterized<NumericTensor> for NumericLinear {
         if let Some((bias, metadata)) = &self.bias {
             visit(metadata, bias, visitor);
         }
+        for (companion, metadata) in &self.format_companions {
+            visit(metadata, companion, visitor);
+        }
     }
 
     fn visit_parameters_mut<'a, V>(&'a mut self, visitor: &mut V)
@@ -1779,11 +1892,17 @@ impl Parameterized<NumericTensor> for NumericLinear {
         if let Some((bias, metadata)) = &mut self.bias {
             visit_mut(metadata, bias, visitor);
         }
+        for (companion, metadata) in &mut self.format_companions {
+            visit_mut(metadata, companion, visitor);
+        }
     }
 
     fn set_trainable(&mut self, trainable: bool) {
         self.weight_metadata.trainable = trainable;
         if let Some((_, metadata)) = &mut self.bias {
+            metadata.trainable = trainable;
+        }
+        for (_, metadata) in &mut self.format_companions {
             metadata.trainable = trainable;
         }
     }
@@ -1797,7 +1916,7 @@ impl LinearOperator<NumericTensor> for NumericLinear {
     ) -> Result<NumericTensor, Error> {
         linear(
             input,
-            &self.weight,
+            self.execution_weight.as_ref().unwrap_or(&self.weight),
             self.bias.as_ref().map(|(bias, _)| bias),
         )
     }
@@ -1808,6 +1927,14 @@ struct NumericEmbedding {
     weight: NumericTensor,
     metadata: ParameterMetadata,
     vocabulary_range: Option<VocabularyParallelRange>,
+    execution_weight: Option<NumericTensor>,
+    format_companions: Vec<(NumericTensor, ParameterMetadata)>,
+}
+
+impl NumericEmbedding {
+    fn execution_weight(&self) -> &NumericTensor {
+        self.execution_weight.as_ref().unwrap_or(&self.weight)
+    }
 }
 
 impl Parameterized<NumericTensor> for NumericEmbedding {
@@ -1816,6 +1943,9 @@ impl Parameterized<NumericTensor> for NumericEmbedding {
         V: ParameterVisitor<'a, NumericTensor>,
     {
         visit(&self.metadata, &self.weight, visitor);
+        for (companion, metadata) in &self.format_companions {
+            visit(metadata, companion, visitor);
+        }
     }
 
     fn visit_parameters_mut<'a, V>(&'a mut self, visitor: &mut V)
@@ -1823,10 +1953,16 @@ impl Parameterized<NumericTensor> for NumericEmbedding {
         V: ParameterVisitorMut<'a, NumericTensor>,
     {
         visit_mut(&self.metadata, &mut self.weight, visitor);
+        for (companion, metadata) in &mut self.format_companions {
+            visit_mut(metadata, companion, visitor);
+        }
     }
 
     fn set_trainable(&mut self, trainable: bool) {
         self.metadata.trainable = trainable;
+        for (_, metadata) in &mut self.format_companions {
+            metadata.trainable = trainable;
+        }
     }
 }
 
@@ -1836,13 +1972,12 @@ impl EmbeddingOperator<NumericTensor> for NumericEmbedding {
         input: &NumericTensor,
         _: &NumericContext,
     ) -> Result<NumericTensor, Error> {
+        let weight = self.execution_weight();
         let vocabulary = self
             .vocabulary_range
             .as_ref()
-            .map_or(self.weight.shape[0] as usize, |range| {
-                range.global_vocabulary
-            });
-        let dimensions = self.weight.shape[1] as usize;
+            .map_or(weight.shape[0] as usize, |range| range.global_vocabulary);
+        let dimensions = weight.shape[1] as usize;
         let mut shape = input.shape.clone();
         shape.push(dimensions as i32);
         let mut output = NumericTensor::zeros(shape);
@@ -1859,9 +1994,7 @@ impl EmbeddingOperator<NumericTensor> for NumericEmbedding {
             });
             if let Some(local) = local {
                 output.data[token_index * dimensions..(token_index + 1) * dimensions]
-                    .copy_from_slice(
-                        &self.weight.data[local * dimensions..(local + 1) * dimensions],
-                    );
+                    .copy_from_slice(&weight.data[local * dimensions..(local + 1) * dimensions]);
             }
         }
         Ok(output)
@@ -1872,7 +2005,7 @@ impl EmbeddingOperator<NumericTensor> for NumericEmbedding {
         input: &NumericTensor,
         _: &NumericContext,
     ) -> Result<NumericTensor, Error> {
-        linear(input, &self.weight, None)
+        linear(input, self.execution_weight(), None)
     }
 
     fn lookup(
@@ -1885,13 +2018,12 @@ impl EmbeddingOperator<NumericTensor> for NumericEmbedding {
         let EmbeddingLookupPolicy::ZeroSentinel(sentinel) = policy else {
             return self.forward(input, context);
         };
+        let weight = self.execution_weight();
         let vocabulary = self
             .vocabulary_range
             .as_ref()
-            .map_or(self.weight.shape[0] as usize, |range| {
-                range.global_vocabulary
-            });
-        let dimensions = self.weight.shape[1] as usize;
+            .map_or(weight.shape[0] as usize, |range| range.global_vocabulary);
+        let dimensions = weight.shape[1] as usize;
         let mut shape = input.shape.clone();
         shape.push(dimensions as i32);
         let mut output = NumericTensor::zeros(shape);
@@ -1908,9 +2040,7 @@ impl EmbeddingOperator<NumericTensor> for NumericEmbedding {
             });
             if let Some(local) = local {
                 output.data[token_index * dimensions..(token_index + 1) * dimensions]
-                    .copy_from_slice(
-                        &self.weight.data[local * dimensions..(local + 1) * dimensions],
-                    );
+                    .copy_from_slice(&weight.data[local * dimensions..(local + 1) * dimensions]);
             }
         }
         Ok(output)
@@ -4108,7 +4238,28 @@ impl NeuralBackend for NumericBackend {
     type ParallelContext = NumericParallelContext;
 
     fn linear(spec: LinearSpec, context: &NumericContext) -> Result<Self::Linear, Error> {
-        let weight = local_parameter(&spec.weight, vec![spec.output, spec.input], false, context)?;
+        let logical_weight =
+            local_parameter(&spec.weight, vec![spec.output, spec.input], false, context)?;
+        let (weight, execution_weight, format_companions) = match spec.format.encoding() {
+            eredu_checkpoint::LinearFormat::Affine(format) => {
+                let groups = spec
+                    .input
+                    .checked_div(format.group_size)
+                    .ok_or_else(|| Error::backend("numeric affine companion shape overflowed"))?;
+                let mut companions = Vec::new();
+                for parameter in [spec.format.scale(), spec.format.affine_bias()]
+                    .into_iter()
+                    .flatten()
+                {
+                    companions.push((
+                        local_parameter(parameter, vec![spec.output, groups], false, context)?,
+                        numeric_companion_metadata(parameter, &spec.weight),
+                    ));
+                }
+                (logical_weight, None, companions)
+            }
+            _ => (logical_weight, None, Vec::new()),
+        };
         let weight_metadata = ParameterMetadata::from_spec(&spec.weight, spec.weight.trainable);
         let bias = spec
             .bias
@@ -4122,19 +4273,46 @@ impl NeuralBackend for NumericBackend {
             weight,
             weight_metadata,
             bias,
+            execution_weight,
+            format_companions,
         })
     }
 
     fn embedding(spec: EmbeddingSpec, context: &NumericContext) -> Result<Self::Embedding, Error> {
+        let logical_weight = local_parameter(
+            &spec.weight,
+            vec![spec.vocabulary, spec.dimensions],
+            false,
+            context,
+        )?;
+        let (weight, execution_weight, format_companions) = match spec.format.encoding() {
+            eredu_checkpoint::LinearFormat::Affine(format) => {
+                let groups = spec
+                    .dimensions
+                    .checked_div(format.group_size)
+                    .ok_or_else(|| {
+                        Error::backend("numeric affine embedding companion shape overflowed")
+                    })?;
+                let mut companions = Vec::new();
+                for parameter in [spec.format.scale(), spec.format.affine_bias()]
+                    .into_iter()
+                    .flatten()
+                {
+                    companions.push((
+                        local_parameter(parameter, vec![spec.vocabulary, groups], false, context)?,
+                        numeric_companion_metadata(parameter, &spec.weight),
+                    ));
+                }
+                (logical_weight, None, companions)
+            }
+            _ => (logical_weight, None, Vec::new()),
+        };
         Ok(NumericEmbedding {
-            weight: local_parameter(
-                &spec.weight,
-                vec![spec.vocabulary, spec.dimensions],
-                false,
-                context,
-            )?,
+            weight,
             metadata: ParameterMetadata::from_spec(&spec.weight, spec.weight.trainable),
             vocabulary_range: None,
+            execution_weight,
+            format_companions,
         })
     }
 
@@ -4747,6 +4925,8 @@ impl eredu_nn::DistributedNeuralBackend for NumericBackend {
             weight: global.axis_slice(0, range.local.start, range.local.end),
             metadata: ParameterMetadata::from_spec(&spec.weight, spec.weight.trainable),
             vocabulary_range: Some(range),
+            execution_weight: None,
+            format_companions: Vec::new(),
         })
     }
 
@@ -4771,6 +4951,8 @@ impl eredu_nn::DistributedNeuralBackend for NumericBackend {
             weight,
             weight_metadata: ParameterMetadata::from_spec(&spec.weight, spec.weight.trainable),
             bias,
+            execution_weight: None,
+            format_companions: Vec::new(),
         })
     }
 
@@ -4805,6 +4987,8 @@ impl eredu_nn::DistributedNeuralBackend for NumericBackend {
             weight: embedding.weight.clone(),
             weight_metadata: embedding.metadata.clone(),
             bias: None,
+            execution_weight: embedding.execution_weight.clone(),
+            format_companions: Vec::new(),
         };
         let local = linear.forward(input, context)?;
         parallel.collective(NumericCollectiveKind::GatherVocabulary, local)
@@ -5624,6 +5808,98 @@ fn numeric_expert_bank_spec(
     .unwrap()
 }
 
+fn numeric_grouped_projection_parameters(
+    projection: &eredu_nn::GroupedProjectionSpec,
+    logical: NumericTensor,
+    group_count: i32,
+    output: i32,
+    input: i32,
+    context: &NumericContext,
+) -> Result<Vec<(NumericTensor, ParameterMetadata)>, Error> {
+    let mut parameters = Vec::new();
+    match projection.format().encoding() {
+        eredu_checkpoint::LinearFormat::MxFp4 => {
+            let groups = input.checked_div(32).ok_or_else(|| {
+                Error::backend("numeric grouped MXFP4 companion shape overflowed")
+            })?;
+            parameters.push((
+                logical,
+                ParameterMetadata::from_spec(projection.weight(), projection.weight().trainable),
+            ));
+            if let Some(companion) = projection.format().scale() {
+                parameters.push((
+                    local_parameter(companion, vec![group_count, output, groups], false, context)?,
+                    numeric_companion_metadata(companion, projection.weight()),
+                ));
+            }
+        }
+        eredu_checkpoint::LinearFormat::Affine(format) => {
+            let groups = input.checked_div(format.group_size).ok_or_else(|| {
+                Error::backend("numeric grouped affine companion shape overflowed")
+            })?;
+            parameters.push((
+                logical,
+                ParameterMetadata::from_spec(projection.weight(), projection.weight().trainable),
+            ));
+            for companion in [
+                projection.format().scale(),
+                projection.format().affine_bias(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                parameters.push((
+                    local_parameter(companion, vec![group_count, output, groups], false, context)?,
+                    numeric_companion_metadata(companion, projection.weight()),
+                ));
+            }
+        }
+        _ => parameters.push((
+            logical,
+            ParameterMetadata::from_spec(projection.weight(), projection.weight().trainable),
+        )),
+    }
+    Ok(parameters)
+}
+
+fn numeric_independent_projection_parameters(
+    projection: &eredu_nn::GroupedProjectionSpec,
+    logical: NumericTensor,
+    output: i32,
+    input: i32,
+    context: &NumericContext,
+) -> Result<Vec<(NumericTensor, ParameterMetadata)>, Error> {
+    let mut parameters = Vec::new();
+    match projection.format().encoding() {
+        eredu_checkpoint::LinearFormat::Affine(format) => {
+            let groups = input.checked_div(format.group_size).ok_or_else(|| {
+                Error::backend("numeric expert affine companion shape overflowed")
+            })?;
+            parameters.push((
+                logical,
+                ParameterMetadata::from_spec(projection.weight(), projection.weight().trainable),
+            ));
+            for companion in [
+                projection.format().scale(),
+                projection.format().affine_bias(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                parameters.push((
+                    local_parameter(companion, vec![output, groups], false, context)?,
+                    numeric_companion_metadata(companion, projection.weight()),
+                ));
+            }
+        }
+        _ => parameters.push((
+            logical,
+            ParameterMetadata::from_spec(projection.weight(), projection.weight().trainable),
+        )),
+    }
+    Ok(parameters)
+}
+
 #[derive(Debug, Clone)]
 struct NumericRelu2Groups {
     spec: GroupedRelu2Spec,
@@ -6340,10 +6616,14 @@ impl GroupedNeuralBackend for NumericBackend {
                         }),
                     });
                 }
-                parameters.push((
+                parameters.extend(numeric_grouped_projection_parameters(
+                    gate_up,
                     packed_gate_up,
-                    ParameterMetadata::from_spec(gate_up.weight(), gate_up.weight().trainable),
-                ));
+                    spec.group_count(),
+                    2 * intermediate,
+                    hidden,
+                    context,
+                )?);
                 if let (Some(parameter_spec), Some(value)) = (gate_up.bias(), packed_gate_up_bias) {
                     parameters.push((
                         value,
@@ -6356,10 +6636,14 @@ impl GroupedNeuralBackend for NumericBackend {
                         ParameterMetadata::from_spec(parameter_spec, parameter_spec.trainable),
                     ));
                 }
-                parameters.push((
+                parameters.extend(numeric_grouped_projection_parameters(
+                    down,
                     packed_down,
-                    ParameterMetadata::from_spec(down.weight(), down.weight().trainable),
-                ));
+                    spec.group_count(),
+                    spec.output_dimensions(),
+                    intermediate,
+                    context,
+                )?);
             }
             GatedProductGroupLayout::Independent(specs) => {
                 for expert_spec in specs {
@@ -6406,29 +6690,27 @@ impl GroupedNeuralBackend for NumericBackend {
                         down: down.clone(),
                         down_bias: down_bias.clone(),
                     });
-                    parameters.extend([
-                        (
-                            gate,
-                            ParameterMetadata::from_spec(
-                                expert_spec.gate().weight(),
-                                expert_spec.gate().weight().trainable,
-                            ),
-                        ),
-                        (
-                            up,
-                            ParameterMetadata::from_spec(
-                                expert_spec.up().weight(),
-                                expert_spec.up().weight().trainable,
-                            ),
-                        ),
-                        (
-                            down,
-                            ParameterMetadata::from_spec(
-                                expert_spec.down().weight(),
-                                expert_spec.down().weight().trainable,
-                            ),
-                        ),
-                    ]);
+                    parameters.extend(numeric_independent_projection_parameters(
+                        expert_spec.gate(),
+                        gate,
+                        intermediate,
+                        hidden,
+                        context,
+                    )?);
+                    parameters.extend(numeric_independent_projection_parameters(
+                        expert_spec.up(),
+                        up,
+                        intermediate,
+                        hidden,
+                        context,
+                    )?);
+                    parameters.extend(numeric_independent_projection_parameters(
+                        expert_spec.down(),
+                        down,
+                        spec.output_dimensions(),
+                        intermediate,
+                        context,
+                    )?);
                     for (projection, value) in [
                         (expert_spec.gate(), gate_bias),
                         (expert_spec.up(), up_bias),
@@ -7148,6 +7430,8 @@ fn explicit_numeric_linear(name: &str, output: i32, input: i32, values: &[f32]) 
         weight: NumericTensor::new([output, input], values.to_vec()),
         weight_metadata: ParameterMetadata::from_spec(&spec, spec.trainable),
         bias: None,
+        execution_weight: None,
+        format_companions: Vec::new(),
     }
 }
 
@@ -7292,6 +7576,8 @@ fn zero_sentinel_and_ordered_multi_table_sum_have_exact_scalar_results() {
         weight: NumericTensor::new([3, 2], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
         metadata: ParameterMetadata::from_spec(&parameter, parameter.trainable),
         vocabulary_range: None,
+        execution_weight: None,
+        format_companions: Vec::new(),
     };
     let looked_up = sentinel
         .lookup(
@@ -7961,7 +8247,7 @@ fn moshi_numeric_rejects_out_of_range_tokens_before_cache_mutation() {
 }
 
 #[derive(Debug, Clone)]
-struct SinkDecoderConfig(qwen::ModelArgs);
+struct SinkDecoderConfig(qwen::ModelArgs, bool);
 
 impl decoder::Config for SinkDecoderConfig {
     fn model_family(&self) -> &'static str {
@@ -7976,7 +8262,7 @@ impl decoder::Config for SinkDecoderConfig {
             "reference_sink_decoder",
             [
                 ("base", decoder::Config::architecture_fingerprint(&self.0)),
-                ("learned_attention_sinks", "true".into()),
+                ("learned_attention_sinks", self.1.to_string()),
             ],
         )
     }
@@ -8014,7 +8300,7 @@ impl decoder::Config for SinkDecoderConfig {
         decoder::Config::attention_bias(&self.0, projection)
     }
     fn learned_attention_sinks(&self) -> bool {
-        true
+        self.1
     }
     fn query_key_norm_epsilon(&self) -> Option<f32> {
         decoder::Config::query_key_norm_epsilon(&self.0)
@@ -8044,7 +8330,8 @@ fn shared_decoder_constructs_optional_trainable_attention_sinks() {
     assert!(ordinary.sinks.is_none());
 
     let sink_aware =
-        decoder::Attention::<NumericBackend>::new(&SinkDecoderConfig(args), 0, &context).unwrap();
+        decoder::Attention::<NumericBackend>::new(&SinkDecoderConfig(args, true), 0, &context)
+            .unwrap();
     assert_eq!(sink_aware.sinks.as_ref().unwrap().as_ref().shape, [2]);
     assert!(validate_parameter_topology::<NumericTensor, _>(&sink_aware)
         .unwrap()
@@ -8381,8 +8668,11 @@ impl AddressableGatedProductBank<NumericBackend> for NumericAddressableBank {
     }
 }
 
-#[test]
-fn routed_extension_translates_architecture_identity_to_grouped_mechanisms() {
+#[allow(
+    dead_code,
+    reason = "owned by the unified reference_conformance target"
+)]
+pub(crate) fn routed_extension_translates_architecture_identity_to_grouped_mechanisms() {
     let mut value = config("qwen3_moe", false);
     value["num_attention_heads"] = 4.into();
     value["num_key_value_heads"] = 2.into();
@@ -9477,8 +9767,11 @@ fn real_decoder_and_hybrid_models_match_resident_and_dense_streamed_traversal() 
     }
 }
 
-#[test]
-fn dense_stream_acquisition_failure_is_atomic_before_first_real_unit() {
+#[allow(
+    dead_code,
+    reason = "owned by the unified reference_conformance target"
+)]
+pub(crate) fn dense_stream_acquisition_failure_is_atomic_before_first_real_unit() {
     let mut value = config("qwen3", false);
     value["num_hidden_layers"] = 2.into();
     let args = qwen::model_args_from_config_value(&value).unwrap();
@@ -13072,8 +13365,11 @@ fn hyper_connection_sinkhorn_and_head_match_reference_semantics() {
     assert_close(collapsed.data[0], 4.008);
 }
 
-#[test]
-fn compressed_cache_growth_boundaries_and_rollback_are_backend_neutral() {
+#[allow(
+    dead_code,
+    reason = "owned by the unified reference_conformance target"
+)]
+pub(crate) fn compressed_cache_growth_boundaries_and_rollback_are_backend_neutral() {
     let context = NumericContext::default();
     let state = |start: i32, tokens: i32| CompressedAttentionState {
         latent: NumericTensor::new(
@@ -13174,6 +13470,8 @@ fn reference_router_and_packed_experts_match_analytical_values() {
             ),
             weight_metadata: ParameterMetadata::from_spec(&router_spec, true),
             bias: None,
+            execution_weight: None,
+            format_companions: Vec::new(),
         },
         selection: TopKGroupSelectionSpec::new(3, 2, eredu_nn::GroupScoring::Softmax, true)
             .unwrap(),
@@ -13347,6 +13645,8 @@ fn selected_softmax_router_applies_rms_input_and_per_expert_scales() {
             weight: NumericTensor::new(vec![3, 2], vec![1.0, 0.0, 0.0, 1.0, -1.0, 0.0]),
             weight_metadata: ParameterMetadata::from_spec(&weight, true),
             bias: None,
+            execution_weight: None,
+            format_companions: Vec::new(),
         },
         selection: TopKGroupSelectionSpec::new(
             3,
@@ -15446,7 +15746,344 @@ fn assert_state_exact(
     }
 }
 
-struct NumericReplicatedMechanisms;
+#[derive(Default)]
+struct NumericReplicatedMechanisms {
+    checkpoint: Option<SharedCheckpointSource>,
+}
+
+impl NumericReplicatedMechanisms {
+    fn with_checkpoint(checkpoint: SharedCheckpointSource) -> Self {
+        Self {
+            checkpoint: Some(checkpoint),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ReferencePayloadRead {
+    pub(crate) task: String,
+    pub(crate) source: String,
+    pub(crate) selection: TensorSelection,
+    pub(crate) output_shape: Vec<usize>,
+    pub(crate) encoded_bytes: u64,
+    pub(crate) physically_bounded: bool,
+}
+
+fn recipe_source_reads(
+    task: &str,
+    recipe: &DerivedWeightRecipe,
+    checkpoint: &dyn eredu_checkpoint::store::CheckpointSource,
+) -> Result<Vec<ReferencePayloadRead>, Error> {
+    fn visit(
+        task: &str,
+        recipe: &DerivedWeightRecipe,
+        checkpoint: &dyn eredu_checkpoint::store::CheckpointSource,
+        reads: &mut Vec<ReferencePayloadRead>,
+    ) -> Result<(), Error> {
+        match recipe {
+            DerivedWeightRecipe::Source { key, selection } => {
+                let catalog = checkpoint
+                    .source_metadata(key)
+                    .map_err(|error| Error::backend(error.to_string()))?;
+                let lease = checkpoint
+                    .acquire_lease(TensorReadRequest {
+                        key: key.clone(),
+                        selection: selection.clone(),
+                        policy: ReadPolicy::RequireBounded,
+                    })
+                    .map_err(|error| Error::backend(error.to_string()))?;
+                if lease.metadata() != &catalog || lease.selection() != selection {
+                    return Err(Error::backend(format!(
+                        "reference payload lease for {key:?} differs from its catalog request"
+                    )));
+                }
+                let expected = recipe
+                    .infer(checkpoint)
+                    .map_err(|error| Error::backend(error.to_string()))?;
+                if lease.output_shape() != expected.shape() {
+                    return Err(Error::backend(format!(
+                        "reference payload lease for {key:?} has shape {:?}, expected {:?}",
+                        lease.output_shape(),
+                        expected.shape()
+                    )));
+                }
+                let proof = lease.bounded_read_proof().clone();
+                let (retained_bytes, retained_is_source_encoding) = match &lease {
+                    eredu_checkpoint::store::CheckpointLease::Gguf(lease) => {
+                        let converted = lease
+                            .materialize_portable()
+                            .map_err(|error| Error::backend(error.to_string()))?;
+                        if !converted
+                            .output_names()
+                            .iter()
+                            .any(|output| output == lease.logical_output_name())
+                        {
+                            return Err(Error::backend(format!(
+                                "reference GGUF payload for {key:?} omitted translated output {:?}",
+                                lease.logical_output_name()
+                            )));
+                        }
+                        let bytes = match converted.converted() {
+                            eredu_gguf::ConvertedTensor::Dense(tensor) => tensor.data.len(),
+                            eredu_gguf::ConvertedTensor::IQuant(tensor) => tensor.data.len(),
+                            eredu_gguf::ConvertedTensor::Affine(tensor) => tensor
+                                .weights
+                                .len()
+                                .checked_mul(std::mem::size_of::<u32>())
+                                .and_then(|bytes| {
+                                    bytes.checked_add(
+                                        (tensor.scales.len() + tensor.biases.len())
+                                            * std::mem::size_of::<u16>(),
+                                    )
+                                })
+                                .ok_or_else(|| {
+                                    Error::backend("reference GGUF affine payload overflowed")
+                                })?,
+                            eredu_gguf::ConvertedTensor::MxFp4(tensor) => tensor
+                                .weights
+                                .len()
+                                .checked_mul(std::mem::size_of::<u32>())
+                                .and_then(|bytes| bytes.checked_add(tensor.scales.len()))
+                                .ok_or_else(|| {
+                                    Error::backend("reference GGUF MXFP4 payload overflowed")
+                                })?,
+                        };
+                        (bytes, false)
+                    }
+                    _ => (
+                        lease.encoded_bytes().map(<[u8]>::len).ok_or_else(|| {
+                            Error::backend(format!(
+                                "reference payload lease for {key:?} does not retain encoded bytes"
+                            ))
+                        })?,
+                        true,
+                    ),
+                };
+                if retained_bytes == 0
+                    || proof.length_bytes == 0
+                    || proof.length_bytes > catalog.encoded_byte_len
+                    || !proof.physically_bounded
+                    || (retained_is_source_encoding
+                        && u64::try_from(retained_bytes).map_err(Error::backend)?
+                            != proof.length_bytes)
+                {
+                    return Err(Error::backend(format!(
+                        "reference payload lease for {key:?} has invalid byte proof {:?}",
+                        proof
+                    )));
+                }
+                reads.push(ReferencePayloadRead {
+                    task: task.to_owned(),
+                    source: key.clone(),
+                    selection: selection.clone(),
+                    output_shape: lease.output_shape().to_vec(),
+                    encoded_bytes: proof.length_bytes,
+                    physically_bounded: proof.physically_bounded,
+                });
+            }
+            DerivedWeightRecipe::Concatenate { inputs, .. }
+            | DerivedWeightRecipe::Stack { inputs, .. } => {
+                for input in inputs {
+                    visit(task, input, checkpoint, reads)?;
+                }
+            }
+            DerivedWeightRecipe::Select { input, .. }
+            | DerivedWeightRecipe::Reshape { input, .. }
+            | DerivedWeightRecipe::Transpose { input, .. }
+            | DerivedWeightRecipe::Cast { input, .. }
+            | DerivedWeightRecipe::View { input, .. }
+            | DerivedWeightRecipe::NegLog { input }
+            | DerivedWeightRecipe::SubtractOne { input } => {
+                visit(task, input, checkpoint, reads)?;
+            }
+        }
+        Ok(())
+    }
+
+    let mut reads = Vec::new();
+    visit(task, recipe, checkpoint, &mut reads)?;
+    Ok(reads)
+}
+
+fn verify_materialization_task_payloads(
+    task: &ReplicatedTextMaterializationTask,
+    checkpoint: &dyn eredu_checkpoint::store::CheckpointSource,
+) -> Result<Vec<ReferencePayloadRead>, Error> {
+    let recipe = task
+        .source_recipe()
+        .map_err(|error| Error::backend(error.to_string()))?;
+    let inferred = recipe
+        .infer(checkpoint)
+        .map_err(|error| Error::backend(error.to_string()))?;
+    if inferred.shape() != task.logical_shape() {
+        return Err(Error::backend(format!(
+            "reference task {:?} recipe shape {:?} differs from logical shape {:?}",
+            task.name(),
+            inferred.shape(),
+            task.logical_shape()
+        )));
+    }
+    if let Some(expected) = task.derived_output() {
+        if &inferred != expected {
+            return Err(Error::backend(format!(
+                "reference task {:?} recipe metadata differs from its admitted output",
+                task.name()
+            )));
+        }
+    }
+
+    let admitted = task
+        .physical_sources()
+        .iter()
+        .map(|source| {
+            (
+                source.tensor().to_owned(),
+                Some(source.shard().to_path_buf()),
+                source.output().to_owned(),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    let mut consumed = BTreeSet::new();
+    let source_keys = recipe.source_keys();
+    let directly_encoded_source =
+        source_keys.len() == 1 && task.lowering() == eredu_runtime::WeightLoweringKind::Direct;
+    for key in source_keys {
+        let source = checkpoint
+            .source_provenance(key)
+            .map_err(|error| Error::backend(error.to_string()))?;
+        if directly_encoded_source && &source.source_encoding != task.source_encoding() {
+            return Err(Error::backend(format!(
+                "reference task {:?} source {key:?} encoding differs from admission",
+                task.name()
+            )));
+        }
+        consumed.insert((source.physical_tensor, source.backing_shard, source.output));
+    }
+    if consumed != admitted {
+        return Err(Error::backend(format!(
+            "reference task {:?} selected payload provenance differs from admission",
+            task.name()
+        )));
+    }
+
+    let mut reads = recipe_source_reads(task.name(), &recipe, checkpoint)?;
+    for companion in task.output_companions() {
+        if let Some(exact) = companion.materialization_task() {
+            reads.extend(verify_materialization_task_payloads(exact, checkpoint)?);
+        } else if let (Some(recipe), Some(expected)) =
+            (companion.derived_recipe(), companion.derived_output())
+        {
+            let inferred = recipe
+                .infer(checkpoint)
+                .map_err(|error| Error::backend(error.to_string()))?;
+            if &inferred != expected || inferred.shape() != companion.logical_shape() {
+                return Err(Error::backend(format!(
+                    "reference companion {:?} differs from its admitted recipe output",
+                    companion.name()
+                )));
+            }
+            reads.extend(recipe_source_reads(companion.name(), recipe, checkpoint)?);
+        } else if let Some(source) = companion.catalog_source() {
+            let provenance = checkpoint
+                .source_provenance(companion.name())
+                .map_err(|error| Error::backend(error.to_string()))?;
+            if provenance.physical_tensor != source.tensor()
+                || provenance.output != source.output()
+                || provenance.backing_shard.as_deref() != Some(source.shard())
+                || &provenance.source_encoding != task.source_encoding()
+            {
+                return Err(Error::backend(format!(
+                    "reference companion {:?} differs from admitted catalog provenance",
+                    companion.name()
+                )));
+            }
+            reads.extend(recipe_source_reads(
+                companion.name(),
+                &DerivedWeightRecipe::source(companion.name(), TensorSelection::Full),
+                checkpoint,
+            )?);
+        }
+    }
+    Ok(reads)
+}
+
+fn verify_addressable_member_payloads(
+    members: &[eredu_runtime::AddressableBankMember],
+    checkpoint: &dyn eredu_checkpoint::store::CheckpointSource,
+) -> Result<(), String> {
+    if members.is_empty() {
+        return Err("numeric routed construction received no addressable members".into());
+    }
+    let mut reads = Vec::new();
+    for member in members {
+        let source_bytes = member
+            .parameters()
+            .iter()
+            .try_fold(0u64, |total, parameter| {
+                let inferred = parameter
+                    .recipe()
+                    .infer(checkpoint)
+                    .map_err(|error| error.to_string())?;
+                if &inferred != parameter.source_output() {
+                    return Err(format!(
+                        "numeric addressable parameter {:?} differs from its admitted recipe output",
+                        parameter.binding_name()
+                    ));
+                }
+                let declared = parameter
+                    .task()
+                    .sources()
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<BTreeSet<_>>();
+                let consumed = parameter
+                    .recipe()
+                    .source_keys()
+                    .into_iter()
+                    .collect::<BTreeSet<_>>();
+                if !consumed.is_subset(&declared) {
+                    return Err(format!(
+                        "numeric addressable parameter {:?} reads outside its selected task",
+                        parameter.binding_name()
+                    ));
+                }
+                for source in &consumed {
+                    let provenance = checkpoint
+                        .source_provenance(source)
+                        .map_err(|error| error.to_string())?;
+                    let admitted = parameter.task().physical_sources().iter().any(|physical| {
+                        physical.tensor() == provenance.physical_tensor
+                            && physical.output() == provenance.output
+                            && provenance.backing_shard.as_deref() == Some(physical.shard())
+                    });
+                    if !admitted {
+                        return Err(format!(
+                            "numeric addressable parameter {:?} source {source:?} differs from admitted provenance",
+                            parameter.binding_name()
+                        ));
+                    }
+                }
+                reads.extend(
+                    recipe_source_reads(parameter.task().name(), parameter.recipe(), checkpoint)
+                        .map_err(|error| error.to_string())?,
+                );
+                total
+                    .checked_add(parameter.source_bytes())
+                    .ok_or_else(|| "numeric addressable source byte accounting overflowed".into())
+            })?;
+        if source_bytes != member.source_bytes() || member.selected_bytes() == 0 {
+            return Err(format!(
+                "numeric addressable member {:?} byte closure differs from its parameters",
+                member.key()
+            ));
+        }
+    }
+    if reads.is_empty() {
+        return Err("numeric addressable members resolved no payload reads".into());
+    }
+    record_reference_payload_reads(reads);
+    Ok(())
+}
 
 struct NumericReplicatedLease<U> {
     ordinal: usize,
@@ -15592,6 +16229,21 @@ where
                 "numeric replicated construction received no materialization tasks",
             ));
         }
+        if let Some(checkpoint) = self.checkpoint.as_deref() {
+            let mut reads = Vec::new();
+            for task in tasks {
+                reads.extend(verify_materialization_task_payloads(task, checkpoint)?);
+            }
+            if reads.is_empty() {
+                return Err(Error::backend(
+                    "numeric replicated construction resolved no checkpoint payload reads",
+                ));
+            }
+            record_reference_payload_reads(reads);
+        }
+        record_reference_lowerings(tasks);
+        record_reference_materialization_tasks(tasks.len());
+        record_reference_stage("materialization");
         if let Some(partition) = &context.partition {
             partition
                 .world
@@ -16305,7 +16957,7 @@ impl
             .record_prompt_cache_identity(rank, prompt_cache_identity);
         let session = eredu_runtime::construct_replicated_text_session_with_runtime(
             binding,
-            NumericReplicatedMechanisms,
+            NumericReplicatedMechanisms::default(),
             eredu_runtime::PartitionedTextExecution::new(),
         )
         .map_err(|error| Error::backend(error.to_string()))?;
@@ -16958,7 +17610,7 @@ impl
                 DeviceState<NumericBackend, NumericHybridLayerState>,
             >>::Boundary,
         >,
-        _store: eredu_checkpoint::store::SharedCheckpointSource,
+        store: eredu_checkpoint::store::SharedCheckpointSource,
     ) -> Result<Self::Output, Self::Error>
     where
         A: eredu_architectures::partitioned_execution::TextPartitionArchitecture<
@@ -16979,9 +17631,9 @@ impl
             .pipeline_parallel_size()
             > 1
         {
-            bind_numeric_pipeline(prepared, self.world, self.context)
+            bind_numeric_pipeline(prepared, self.world, self.context, store)
         } else {
-            bind_numeric_direct(prepared, self.world, self.context)
+            bind_numeric_direct(prepared, self.world, self.context, store)
         }
     }
 }
@@ -17006,7 +17658,7 @@ impl
                 DeviceState<NumericBackend, NumericHybridLayerState>,
             >>::Boundary,
         >,
-        _store: eredu_checkpoint::store::SharedCheckpointSource,
+        store: eredu_checkpoint::store::SharedCheckpointSource,
     ) -> Result<Self::Output, Self::Error>
     where
         A: eredu_architectures::partitioned_execution::TextPartitionArchitecture<
@@ -17029,6 +17681,7 @@ impl
             self.context,
             self.provider_calls,
             self.omit_inactive,
+            store,
         )
     }
 }
@@ -17076,6 +17729,7 @@ fn bind_numeric_direct<A, G>(
     prepared: NumericPreparedPartition<A, G>,
     world: Arc<NumericPartitionWorld>,
     context: NumericContext,
+    checkpoint: SharedCheckpointSource,
 ) -> Result<NumericPartitionExecutable, Error>
 where
     A: eredu_architectures::partitioned_execution::TextPartitionArchitecture<
@@ -17165,7 +17819,7 @@ where
         .map_err(|error| Error::backend(error.to_string()))?;
     let session = eredu_runtime::construct_replicated_text_session_with_runtime(
         binding,
-        NumericReplicatedMechanisms,
+        NumericReplicatedMechanisms::with_checkpoint(checkpoint),
         eredu_runtime::PartitionedTextExecution::new(),
     )
     .map_err(|error| Error::backend(error.to_string()))?;
@@ -17180,6 +17834,7 @@ fn bind_numeric_pipeline<A, G>(
     prepared: NumericPreparedPartition<A, G>,
     world: Arc<NumericPartitionWorld>,
     context: NumericContext,
+    checkpoint: SharedCheckpointSource,
 ) -> Result<NumericPartitionExecutable, Error>
 where
     A: eredu_architectures::partitioned_execution::TextPartitionArchitecture<
@@ -17269,7 +17924,7 @@ where
         .map_err(|error| Error::backend(error.to_string()))?;
     let session = eredu_runtime::construct_replicated_text_session_with_runtime(
         binding,
-        NumericReplicatedMechanisms,
+        NumericReplicatedMechanisms::with_checkpoint(checkpoint),
         eredu_runtime::PartitionedTextExecution::new(),
     )
     .map_err(|error| Error::backend(error.to_string()))?;
@@ -17296,6 +17951,7 @@ fn bind_numeric_routed_direct<A, G>(
     world: Arc<NumericPartitionWorld>,
     context: NumericContext,
     provider_calls: Arc<AtomicUsize>,
+    checkpoint: SharedCheckpointSource,
 ) -> Result<NumericPartitionExecutable, Error>
 where
     A: eredu_architectures::partitioned_execution::TextPartitionArchitecture<
@@ -17390,7 +18046,7 @@ where
         .map_err(|error| Error::backend(error.to_string()))?;
     let session = eredu_runtime::construct_replicated_text_session_with_runtime(
         binding,
-        NumericReplicatedMechanisms,
+        NumericReplicatedMechanisms::with_checkpoint(checkpoint),
         eredu_runtime::PartitionedTextExecution::new(),
     )
     .map_err(|error| Error::backend(error.to_string()))?;
@@ -17407,6 +18063,7 @@ fn bind_numeric_routed_pipeline<A, G>(
     context: NumericContext,
     provider_calls: Arc<AtomicUsize>,
     omit_inactive: Option<Arc<AtomicBool>>,
+    checkpoint: SharedCheckpointSource,
 ) -> Result<NumericPartitionExecutable, Error>
 where
     A: eredu_architectures::partitioned_execution::TextPartitionArchitecture<
@@ -17424,17 +18081,18 @@ where
     G: 'static,
 {
     prepared.dispatch_execution(
-        (world, context, provider_calls, omit_inactive),
-        |prepared, (world, context, provider_calls, _)| {
-            bind_numeric_routed_direct(prepared, world, context, provider_calls)
+        (world, context, provider_calls, omit_inactive, checkpoint),
+        |prepared, (world, context, provider_calls, _, checkpoint)| {
+            bind_numeric_routed_direct(prepared, world, context, provider_calls, checkpoint)
         },
-        |prepared, (world, context, provider_calls, omit_inactive)| {
+        |prepared, (world, context, provider_calls, omit_inactive, checkpoint)| {
             bind_numeric_routed_pipeline_impl(
                 prepared,
                 world,
                 context,
                 provider_calls,
                 omit_inactive,
+                checkpoint,
             )
         },
     )
@@ -17446,6 +18104,7 @@ fn bind_numeric_routed_pipeline_impl<A, G>(
     context: NumericContext,
     provider_calls: Arc<AtomicUsize>,
     omit_inactive: Option<Arc<AtomicBool>>,
+    checkpoint: SharedCheckpointSource,
 ) -> Result<NumericPartitionExecutable, Error>
 where
     A: eredu_architectures::partitioned_execution::TextPartitionArchitecture<
@@ -17548,7 +18207,7 @@ where
         .map_err(|error| Error::backend(error.to_string()))?;
     let session = eredu_runtime::construct_replicated_text_session_with_runtime(
         binding,
-        NumericReplicatedMechanisms,
+        NumericReplicatedMechanisms::with_checkpoint(checkpoint),
         eredu_runtime::PartitionedTextExecution::new(),
     )
     .map_err(|error| Error::backend(error.to_string()))?;
@@ -17833,8 +18492,11 @@ fn numeric_partition_capabilities() -> eredu_runtime::CommunicationCapabilities 
     )
 }
 
-#[test]
-fn authoritative_partitioned_numeric_sessions_match_tp_pp_and_tp_pp_reference() {
+#[allow(
+    dead_code,
+    reason = "owned by the unified reference_conformance target"
+)]
+pub(crate) fn authoritative_partitioned_numeric_sessions_match_tp_pp_and_tp_pp_reference() {
     use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
 
     for (architecture_name, model_type) in [
@@ -18780,7 +19442,7 @@ fn assert_authoritative_routed_numeric_sessions(
                             omit_inactive,
                         };
                         let mut executable = if deepseek_v4 {
-                            eredu_architectures::partitioned_execution::visit_deepseek_v4_routed_partitioned_production::<
+                            eredu_architectures::partitioned_execution::visit_pooling_routed_partitioned_production::<
                                 NumericBackend,
                                 DeviceState<NumericBackend, NumericHybridLayerState>,
                                 _,
@@ -19118,8 +19780,12 @@ fn authoritative_qwen_routed_numeric_sessions_match_partitioned_reference() {
     );
 }
 
-#[test]
-fn prediction_free_deepseek_v3_v4_routed_sessions_cover_cartesian_state_cache_and_failure() {
+#[allow(
+    dead_code,
+    reason = "owned by the unified reference_conformance target"
+)]
+pub(crate) fn prediction_free_deepseek_v3_v4_routed_sessions_cover_cartesian_state_cache_and_failure(
+) {
     let v3 = serde_json::json!({
         "model_type":"deepseek_v3", "vocab_size":16, "hidden_size":8,
         "intermediate_size":12, "moe_intermediate_size":8, "num_hidden_layers":4,
@@ -19355,7 +20021,7 @@ impl<'a>
     fn visit<A>(
         self,
         prepared: PreparedCompositeTextArchitecture<A, A::AdmissionConfig>,
-        _: eredu_checkpoint::store::SharedCheckpointSource,
+        checkpoint: eredu_checkpoint::store::SharedCheckpointSource,
     ) -> Result<Self::Output, Self::Error>
     where
         A: eredu_architectures::composite_execution::CompositeArchitecture<
@@ -19377,7 +20043,7 @@ impl<'a>
             architecture,
             source_architecture,
             contract,
-            NumericReplicatedMechanisms,
+            NumericReplicatedMechanisms::with_checkpoint(checkpoint),
             self.context,
         )
         .map_err(|error| error.to_string())?;
@@ -19436,7 +20102,7 @@ impl<'a>
             A,
             A::AdmissionConfig,
         >,
-        _: eredu_checkpoint::store::SharedCheckpointSource,
+        checkpoint: eredu_checkpoint::store::SharedCheckpointSource,
     ) -> Result<Self::Output, Self::Error>
     where
         A: eredu_architectures::composite_execution::CompositeArchitecture<
@@ -19454,6 +20120,7 @@ impl<'a>
         assert!(self.construction_started);
         let layout = prepared.requirements().state_layout().clone();
         let (routed, _, admission) = prepared.into_parts();
+        verify_addressable_member_payloads(routed.addressable_members(), checkpoint.as_ref())?;
         macro_rules! run_session {
             ($session:expr) => {{
                 let mut session = $session;
@@ -19518,11 +20185,12 @@ impl<'a>
             let bank = numeric_addressable_gated_bank(
                 routed.plan(),
                 routed.catalog(),
+                routed.addressable_members(),
                 routed.routes_per_token(),
                 self.context,
             )?;
             let session = routed.construct_addressable_session::<NumericBackend, _, _, _>(
-                NumericReplicatedMechanisms,
+                NumericReplicatedMechanisms::with_checkpoint(checkpoint),
                 bank,
                 NumericIndexedMovement,
                 self.context,
@@ -19540,7 +20208,7 @@ impl<'a>
             })
         } else {
             let session = routed.construct_resident_session::<NumericBackend, _>(
-                NumericReplicatedMechanisms,
+                NumericReplicatedMechanisms::with_checkpoint(checkpoint),
                 self.context,
             )?;
             let (outputs, state, _) = run_session!(session);
@@ -19583,7 +20251,7 @@ impl<'a>
     fn visit<A>(
         self,
         prepared: eredu_architectures::PreparedRelu2RoutedTextArchitecture<A>,
-        _: eredu_checkpoint::store::SharedCheckpointSource,
+        checkpoint: eredu_checkpoint::store::SharedCheckpointSource,
     ) -> Result<Self::Output, Self::Error>
     where
         A: eredu_runtime::ReplicatedTextArchitecture<
@@ -19619,11 +20287,12 @@ impl<'a>
             }};
         }
 
+        verify_addressable_member_payloads(prepared.addressable_members(), checkpoint.as_ref())?;
         if self.addressable {
             let bank =
                 numeric_addressable_relu2_bank(prepared.plan(), prepared.catalog(), self.context)?;
             let session = prepared.construct_addressable_session::<NumericBackend, _, _, _>(
-                NumericReplicatedMechanisms,
+                NumericReplicatedMechanisms::with_checkpoint(checkpoint),
                 bank,
                 NumericIndexedMovement,
                 self.context,
@@ -19641,7 +20310,7 @@ impl<'a>
             })
         } else {
             let session = prepared.construct_resident_session::<NumericBackend, _>(
-                NumericReplicatedMechanisms,
+                NumericReplicatedMechanisms::with_checkpoint(checkpoint),
                 self.context,
             )?;
             let (outputs, state, _) = run_session!(session);
@@ -19666,7 +20335,7 @@ impl<'a>
     fn visit<A>(
         self,
         prepared: PreparedRoutedTextArchitecture<A>,
-        _: eredu_checkpoint::store::SharedCheckpointSource,
+        checkpoint: eredu_checkpoint::store::SharedCheckpointSource,
     ) -> Result<Self::Output, Self::Error>
     where
         A: eredu_runtime::ReplicatedTextArchitecture<
@@ -19702,15 +20371,17 @@ impl<'a>
             }};
         }
 
+        verify_addressable_member_payloads(prepared.addressable_members(), checkpoint.as_ref())?;
         if self.addressable {
             let bank = numeric_addressable_gated_bank(
                 prepared.plan(),
                 prepared.catalog(),
+                prepared.addressable_members(),
                 prepared.routes_per_token(),
                 self.context,
             )?;
             let session = prepared.construct_addressable_session::<NumericBackend, _, _, _>(
-                NumericReplicatedMechanisms,
+                NumericReplicatedMechanisms::with_checkpoint(checkpoint),
                 bank,
                 NumericIndexedMovement,
                 self.context,
@@ -19728,7 +20399,7 @@ impl<'a>
             })
         } else {
             let session = prepared.construct_resident_session::<NumericBackend, _>(
-                NumericReplicatedMechanisms,
+                NumericReplicatedMechanisms::with_checkpoint(checkpoint),
                 self.context,
             )?;
             let (outputs, state, _) = run_session!(session);
@@ -19744,6 +20415,7 @@ impl<'a>
 fn numeric_addressable_gated_bank(
     plan: &ExpertRealizationPlan<GroupedGatedProductSpec>,
     catalog: &ExpertResidencyCatalog,
+    selected: &[eredu_runtime::AddressableBankMember],
     capacity: usize,
     context: &NumericContext,
 ) -> Result<NumericGroupedBankMechanism, String> {
@@ -19782,11 +20454,13 @@ fn numeric_addressable_gated_bank(
                 spec: full.spec.clone(),
             },
         );
-        bytes.insert(
-            unit.identity(),
-            unit.byte_len()
-                .ok_or_else(|| "numeric addressable unit has no byte geometry".to_owned())?,
-        );
+        let selected_bytes = selected
+            .iter()
+            .find(|member| member.key() == unit.identity())
+            .map(eredu_runtime::AddressableBankMember::selected_bytes)
+            .or(unit.byte_len())
+            .ok_or_else(|| "numeric addressable unit has no admitted geometry".to_owned())?;
+        bytes.insert(unit.identity(), selected_bytes);
     }
     Ok(NumericGroupedBankMechanism {
         banks,
@@ -19858,6 +20532,73 @@ fn numeric_addressable_relu2_bank(
     })
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ReferenceStageEvidence {
+    pub(crate) family: String,
+    pub(crate) format: String,
+    pub(crate) stages: Vec<&'static str>,
+    pub(crate) materialization_tasks: usize,
+    pub(crate) payload_reads: Vec<ReferencePayloadRead>,
+    pub(crate) lowering_kinds: Vec<String>,
+    pub(crate) generated_companions: usize,
+}
+
+thread_local! {
+    static REFERENCE_STAGE_EVIDENCE: RefCell<ReferenceStageEvidence> =
+        RefCell::new(ReferenceStageEvidence::default());
+}
+
+fn reset_reference_stage_evidence(format: impl Into<String>) {
+    REFERENCE_STAGE_EVIDENCE.with(|evidence| {
+        *evidence.borrow_mut() = ReferenceStageEvidence {
+            format: format.into(),
+            ..ReferenceStageEvidence::default()
+        };
+    });
+}
+
+fn record_reference_stage(stage: &'static str) {
+    REFERENCE_STAGE_EVIDENCE.with(|evidence| evidence.borrow_mut().stages.push(stage));
+}
+
+fn record_reference_family(family: &str) {
+    REFERENCE_STAGE_EVIDENCE.with(|evidence| evidence.borrow_mut().family = family.to_owned());
+}
+
+fn record_reference_materialization_tasks(tasks: usize) {
+    REFERENCE_STAGE_EVIDENCE.with(|evidence| {
+        evidence.borrow_mut().materialization_tasks += tasks;
+    });
+}
+
+fn record_reference_lowerings(tasks: &[ReplicatedTextMaterializationTask]) {
+    REFERENCE_STAGE_EVIDENCE.with(|evidence| {
+        let mut evidence = evidence.borrow_mut();
+        evidence
+            .lowering_kinds
+            .extend(tasks.iter().map(|task| format!("{:?}", task.lowering())));
+        evidence.generated_companions += tasks
+            .iter()
+            .flat_map(ReplicatedTextMaterializationTask::output_companions)
+            .filter(|companion| {
+                companion.materialization_task().is_none()
+                    && companion.derived_recipe().is_none()
+                    && companion.catalog_source().is_none()
+            })
+            .count();
+    });
+}
+
+fn record_reference_payload_reads(reads: Vec<ReferencePayloadRead>) {
+    REFERENCE_STAGE_EVIDENCE.with(|evidence| {
+        evidence.borrow_mut().payload_reads.extend(reads);
+    });
+}
+
+fn last_reference_stage_evidence() -> ReferenceStageEvidence {
+    REFERENCE_STAGE_EVIDENCE.with(|evidence| evidence.borrow().clone())
+}
+
 struct NumericReplicatedVisitor<'a> {
     context: &'a NumericContext,
     tokens: &'a NumericTensor,
@@ -19875,12 +20616,13 @@ impl<'a>
 
     fn construction_started(&mut self) {
         self.construction_started = true;
+        record_reference_stage("construction_started");
     }
 
     fn visit<A>(
         self,
         prepared: PreparedReplicatedTextArchitecture<A>,
-        _: eredu_checkpoint::store::SharedCheckpointSource,
+        checkpoint: eredu_checkpoint::store::SharedCheckpointSource,
     ) -> Result<Self::Output, Self::Error>
     where
         A: eredu_runtime::ReplicatedTextArchitecture<
@@ -19898,6 +20640,8 @@ impl<'a>
             prepared.prompt_cache_identity().topology(),
             &PromptCacheTopology::default()
         );
+        record_reference_family(prepared.effective_model_type());
+        record_reference_stage("typed_architecture");
         let mut modules = prepared.into_modules();
         let architecture = modules.take_architecture();
         let source_architecture = modules.take_source_architecture();
@@ -19906,25 +20650,30 @@ impl<'a>
             architecture,
             source_architecture,
             contract,
-            NumericReplicatedMechanisms,
+            NumericReplicatedMechanisms::with_checkpoint(checkpoint),
             self.context,
         )
         .map_err(|error| error.to_string())?;
-        let mut outputs = vec![session
+        record_reference_stage("session_constructed");
+        let prefill = session
             .prefill(self.tokens, None, self.context)
-            .map_err(|error| error.to_string())?];
+            .map_err(|error| error.to_string())?;
+        record_reference_stage("prefill");
+        let mut outputs = vec![prefill];
         for token in [4, 5] {
             outputs.push(
                 session
                     .decode(&NumericTensor::token_ids(&[token]), self.context)
                     .map_err(|error| error.to_string())?,
             );
+            record_reference_stage("decode");
         }
         let state = session
             .report()
             .map_err(|error| error.to_string())?
             .state_report()
             .clone();
+        record_reference_stage("report");
         assert_eq!(state.layout(), &layout);
         Ok(NumericReplicatedRun {
             outputs,
@@ -19981,6 +20730,16 @@ fn execute_numeric_replicated_visitor(
     context: &NumericContext,
     tokens: &NumericTensor,
 ) -> NumericReplicatedRun {
+    execute_numeric_replicated_visitor_with_quantization(config, parameters, context, tokens, None)
+}
+
+fn execute_numeric_replicated_visitor_with_quantization(
+    config: &serde_json::Value,
+    parameters: Vec<(String, Vec<usize>)>,
+    context: &NumericContext,
+    tokens: &NumericTensor,
+    quantization: Option<eredu_core::QuantizationRequest>,
+) -> NumericReplicatedRun {
     use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
 
     let artifact = tempfile::tempdir().unwrap();
@@ -20007,19 +20766,44 @@ fn execute_numeric_replicated_visitor(
         .collect::<Vec<_>>();
     serialize_to_file(views, None, &artifact.path().join("model.safetensors")).unwrap();
     let inspection = eredu_architectures::configuration::inspect_artifact(artifact.path()).unwrap();
+    let store: eredu_checkpoint::store::SharedCheckpointSource = std::sync::Arc::new(
+        eredu_checkpoint::store::SafetensorsWeightStore::open(artifact.path()).unwrap(),
+    );
+    execute_numeric_replicated_inspection(&inspection, store, context, tokens, quantization)
+}
+
+fn execute_numeric_replicated_inspection(
+    inspection: &eredu_core::ArtifactInspection<
+        eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+    >,
+    store: eredu_checkpoint::store::SharedCheckpointSource,
+    context: &NumericContext,
+    tokens: &NumericTensor,
+    quantization: Option<eredu_core::QuantizationRequest>,
+) -> NumericReplicatedRun {
+    reset_reference_stage_evidence(format!("{:?}", inspection.format()));
     let requirements =
-        eredu_architectures::replicated_text::replicated_text_requirements(&inspection).unwrap();
+        eredu_architectures::replicated_text::replicated_text_requirements(inspection).unwrap();
     let lowerings = requirements
         .parameters()
         .iter()
         .filter(|parameter| parameter.has_lowering_source())
-        .map(|parameter| {
-            eredu_runtime::WeightLoweringCapability::new(
+        .flat_map(|parameter| {
+            let mut values = vec![eredu_runtime::WeightLoweringCapability::new(
                 parameter
                     .lowering_descriptor(parameter.native_executable())
                     .unwrap(),
                 eredu_runtime::WeightLoweringKind::Direct,
-            )
+            )];
+            if let Some(target) =
+                quantization.and_then(|request| parameter.transform_target(request).unwrap())
+            {
+                values.push(eredu_runtime::WeightLoweringCapability::new(
+                    target.descriptor().clone(),
+                    eredu_runtime::WeightLoweringKind::Transform,
+                ));
+            }
+            values
         })
         .collect();
     let state = eredu_runtime::StateMechanismCapabilities::new(
@@ -20048,29 +20832,46 @@ fn execute_numeric_replicated_visitor(
         vec![eredu_runtime::WeightResidencyMechanism::Resident],
         state,
     );
-    let request = eredu_runtime::ReplicatedTextSelectionRequest::new(
+    let mut request = eredu_runtime::ReplicatedTextSelectionRequest::new(
         eredu_runtime::LayerWeightResidency::FullyResident,
         eredu_runtime::CacheResidencyPolicy::Device,
     );
+    if let Some(quantization) = quantization {
+        request = request.with_quantization(quantization);
+    }
     let selected =
         eredu_runtime::select_replicated_text_realization(&requirements, &request, &capabilities)
             .unwrap();
-    let store: eredu_checkpoint::store::SharedCheckpointSource = std::sync::Arc::new(
-        eredu_checkpoint::store::SafetensorsWeightStore::open(artifact.path()).unwrap(),
-    );
     let visitor = NumericReplicatedVisitor {
         context,
         tokens,
         construction_started: false,
     };
-    dispatch_replicated_text_architecture(
+    let run = dispatch_replicated_text_architecture(
         inspection.architecture_plan(),
         selected,
         store,
         context,
         visitor,
     )
-    .unwrap()
+    .unwrap();
+    let evidence = last_reference_stage_evidence();
+    assert_eq!(
+        evidence.stages,
+        [
+            "construction_started",
+            "typed_architecture",
+            "materialization",
+            "session_constructed",
+            "prefill",
+            "decode",
+            "decode",
+            "report",
+        ],
+        "production stages must occur once in causal order"
+    );
+    assert!(evidence.materialization_tasks > 0);
+    run
 }
 
 fn execute_numeric_routed_visitor(
@@ -20078,6 +20879,16 @@ fn execute_numeric_routed_visitor(
     context: &NumericContext,
     tokens: &NumericTensor,
     addressable: bool,
+) -> NumericReplicatedRun {
+    execute_numeric_routed_visitor_with_quantization(config, context, tokens, addressable, None)
+}
+
+fn execute_numeric_routed_visitor_with_quantization(
+    config: &serde_json::Value,
+    context: &NumericContext,
+    tokens: &NumericTensor,
+    addressable: bool,
+    quantization: Option<eredu_core::QuantizationRequest>,
 ) -> NumericReplicatedRun {
     use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
 
@@ -20109,21 +20920,20 @@ fn execute_numeric_routed_visitor(
         constraint.requirement == eredu_checkpoint::schema::TensorRequirement::Required
     }) {
         tensors.entry(constraint.key.clone()).or_insert_with(|| {
-            let dtype = if constraint
-                .dtype
-                .accepts(&eredu_checkpoint::StoredDtype::I32)
-                && !constraint
-                    .dtype
-                    .accepts(&eredu_checkpoint::StoredDtype::F32)
-            {
-                Dtype::I32
-            } else {
-                Dtype::F32
+            let dtype = match &constraint.dtype {
+                eredu_checkpoint::schema::StoredDtypeConstraint::Exact(
+                    eredu_checkpoint::StoredDtype::I32,
+                ) => Dtype::I32,
+                eredu_checkpoint::schema::StoredDtypeConstraint::Exact(
+                    eredu_checkpoint::StoredDtype::U8,
+                ) => Dtype::U8,
+                _ => Dtype::F32,
             };
+            let element_bytes = if dtype == Dtype::U8 { 1 } else { 4 };
             (
                 constraint.shape.clone(),
                 dtype,
-                vec![0_u8; constraint.shape.iter().product::<usize>() * 4],
+                vec![0_u8; constraint.shape.iter().product::<usize>() * element_bytes],
             )
         });
     }
@@ -20145,7 +20955,7 @@ fn execute_numeric_routed_visitor(
         .parameters()
         .iter()
         .filter(|parameter| parameter.source_encoding().is_some())
-        .map(|parameter| {
+        .flat_map(|parameter| {
             let descriptor = parameter
                 .lowering_descriptor(parameter.native_executable())
                 .unwrap();
@@ -20157,7 +20967,26 @@ fn execute_numeric_routed_visitor(
             } else {
                 eredu_runtime::WeightLoweringKind::Direct
             };
-            eredu_runtime::WeightLoweringCapability::new(descriptor, kind)
+            let mut values = vec![eredu_runtime::WeightLoweringCapability::new(
+                descriptor, kind,
+            )];
+            if let Some(target) =
+                quantization.and_then(|request| parameter.transform_target(request).unwrap())
+            {
+                let kind = if matches!(
+                    parameter.presence(),
+                    eredu_runtime::ReplicatedTextParameterPresence::Derived { .. }
+                ) {
+                    eredu_runtime::WeightLoweringKind::DerivedTransform
+                } else {
+                    eredu_runtime::WeightLoweringKind::Transform
+                };
+                values.push(eredu_runtime::WeightLoweringCapability::new(
+                    target.descriptor().clone(),
+                    kind,
+                ));
+            }
+            values
         })
         .collect();
     let state = eredu_runtime::StateMechanismCapabilities::new(
@@ -20201,10 +21030,13 @@ fn execute_numeric_routed_visitor(
                 u64::MAX,
             ));
     }
-    let text_request = eredu_runtime::ReplicatedTextSelectionRequest::new(
+    let mut text_request = eredu_runtime::ReplicatedTextSelectionRequest::new(
         eredu_runtime::LayerWeightResidency::FullyResident,
         eredu_runtime::CacheResidencyPolicy::Device,
     );
+    if let Some(quantization) = quantization {
+        text_request = text_request.with_quantization(quantization);
+    }
     let weights = if addressable {
         let member_bytes = requirements
             .catalog()
@@ -20235,6 +21067,19 @@ fn execute_numeric_routed_visitor(
     let store: eredu_checkpoint::store::SharedCheckpointSource = std::sync::Arc::new(
         eredu_checkpoint::store::SafetensorsWeightStore::open(artifact.path()).unwrap(),
     );
+    let uses_pooling_attention = selected
+        .text()
+        .state()
+        .components()
+        .iter()
+        .any(|component| {
+            matches!(
+                component.component().role(),
+                eredu_core::cache::StateComponentRole::Fixed(
+                    eredu_core::cache::StateTensorRole::Pooling { .. }
+                )
+            )
+        });
     if requirements.plan().relu2().is_some() {
         eredu_architectures::visit_relu2_routed_text_architecture::<
             NumericBackend,
@@ -20246,6 +21091,23 @@ fn execute_numeric_routed_visitor(
             store,
             context,
             NumericRelu2RoutedVisitor {
+                context,
+                tokens,
+                addressable,
+            },
+        )
+        .unwrap()
+    } else if uses_pooling_attention {
+        eredu_architectures::visit_pooling_routed_text_architecture::<
+            NumericBackend,
+            DeviceState<NumericBackend, NumericHybridLayerState>,
+            _,
+        >(
+            &inspection,
+            selected,
+            store,
+            context,
+            NumericRoutedVisitor {
                 context,
                 tokens,
                 addressable,
@@ -20578,8 +21440,7 @@ fn prepare_numeric_qwen_image_request(
     (prepared, mechanisms)
 }
 
-#[test]
-fn non_mlx_composite_session_runs_image_prefill_and_repeated_text_decode() {
+pub(crate) fn non_mlx_composite_session_runs_image_prefill_and_repeated_text_decode() {
     let config = serde_json::json!({
         "model_type": "qwen3_vl", "image_token_id": 5, "video_token_id": 6,
         "vision_start_token_id": 3, "vision_end_token_id": 4,
@@ -20850,8 +21711,7 @@ fn non_mlx_composite_preserves_video_and_projected_part_order() {
     );
 }
 
-#[test]
-fn non_mlx_routed_composite_reuses_the_planned_provider() {
+pub(crate) fn non_mlx_routed_composite_reuses_the_planned_provider() {
     let config = serde_json::json!({
         "model_type": "qwen3_vl_moe", "image_token_id": 5, "video_token_id": 6,
         "tie_word_embeddings": false,
@@ -20985,8 +21845,7 @@ fn non_mlx_routed_composite_reuses_the_planned_provider() {
     assert!(report.evictions > 0);
 }
 
-#[test]
-fn non_mlx_inkling_composite_executes_routed_and_shared_banks() {
+pub(crate) fn non_mlx_inkling_composite_executes_routed_and_shared_banks() {
     let config = serde_json::json!({
         "model_type":"inkling_mm_model","image_token_id":5,
         "text_config":{
@@ -21108,8 +21967,7 @@ fn non_mlx_inkling_composite_executes_routed_and_shared_banks() {
     assert!(report.evictions > 0);
 }
 
-#[test]
-fn non_mlx_muse_glimmer_composite_matches_established_image_video_text_graph() {
+pub(crate) fn non_mlx_muse_glimmer_composite_matches_established_image_video_text_graph() {
     let config = serde_json::json!({
         "architectures":["MuseGlimmerForConditionalGeneration"],"model_type":"muse_glimmer",
         "image_token_id":5,"video_token_id":6,"out_hidden_size":32,"projector_hidden_size":8,
@@ -21276,8 +22134,7 @@ fn non_mlx_muse_glimmer_composite_matches_established_image_video_text_graph() {
     );
 }
 
-#[test]
-fn non_mlx_conditional_qwen_composite_runs_without_prediction_depth() {
+pub(crate) fn non_mlx_conditional_qwen_composite_runs_without_prediction_depth() {
     let config = serde_json::json!({
         "model_type": "qwen3_5", "image_token_id": 5, "video_token_id": 6,
         "text_config": {
@@ -21393,8 +22250,7 @@ fn non_mlx_conditional_qwen_composite_runs_without_prediction_depth() {
     );
 }
 
-#[test]
-fn non_mlx_composite_session_runs_mixed_audio_prefill_and_repeated_decode() {
+pub(crate) fn non_mlx_composite_session_runs_mixed_audio_prefill_and_repeated_decode() {
     let config = serde_json::json!({
         "model_type":"gemma4_unified", "tie_word_embeddings":false,
         "image_token_id":5, "audio_token_id":6,
@@ -21569,8 +22425,39 @@ fn non_mlx_composite_session_runs_mixed_audio_prefill_and_repeated_decode() {
     );
 }
 
+pub(crate) fn run_reference_conformance_composite_families() -> Vec<&'static str> {
+    non_mlx_composite_session_runs_image_prefill_and_repeated_text_decode();
+    non_mlx_routed_composite_reuses_the_planned_provider();
+    non_mlx_inkling_composite_executes_routed_and_shared_banks();
+    non_mlx_muse_glimmer_composite_matches_established_image_video_text_graph();
+    non_mlx_conditional_qwen_composite_runs_without_prediction_depth();
+    non_mlx_composite_session_runs_mixed_audio_prefill_and_repeated_decode();
+    vec![
+        "gemma4",
+        "inkling",
+        "muse_glimmer",
+        "qwen3_5",
+        "qwen3_vl",
+        "qwen3_vl_moe",
+    ]
+}
+
 #[test]
-fn non_mlx_session_executes_resident_and_addressable_routing_through_one_driver() {
+fn reference_conformance_composite_families() {
+    std::thread::Builder::new()
+        .name("reference-composite-families".into())
+        .stack_size(32 * 1024 * 1024)
+        .spawn(|| assert_eq!(run_reference_conformance_composite_families().len(), 6))
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[allow(
+    dead_code,
+    reason = "owned by the unified reference_conformance target"
+)]
+pub(crate) fn non_mlx_session_executes_resident_and_addressable_routing_through_one_driver() {
     let config = serde_json::json!({
         "model_type":"lfm2_moe", "vocab_size":16, "hidden_size":8,
         "intermediate_size":10, "num_hidden_layers":2,
@@ -21615,8 +22502,11 @@ fn non_mlx_session_executes_resident_and_addressable_routing_through_one_driver(
     assert_eq!(report.peak_resident, 1);
 }
 
-#[test]
-fn non_mlx_session_executes_relu2_routing_through_the_same_driver() {
+#[allow(
+    dead_code,
+    reason = "owned by the unified reference_conformance target"
+)]
+pub(crate) fn non_mlx_session_executes_relu2_routing_through_the_same_driver() {
     let config = serde_json::json!({
         "model_type":"nemotron_h", "vocab_size":16, "hidden_size":8,
         "intermediate_size":12, "num_hidden_layers":2,
@@ -21659,9 +22549,129 @@ fn non_mlx_session_executes_relu2_routing_through_the_same_driver() {
     assert!(report.peak_entries <= 2);
 }
 
-#[test]
-fn heterogeneous_replicated_visitors_match_established_numeric_family_models() {
+pub(crate) fn run_reference_conformance_routed_safetensors_families() -> Vec<String> {
     let cases = [
+        config("qwen3_moe", false),
+        serde_json::json!({
+            "model_type": "gpt_oss", "architectures": ["GptOssForCausalLM"],
+            "hidden_size": 32, "intermediate_size": 32, "num_hidden_layers": 1,
+            "num_attention_heads": 1, "num_key_value_heads": 1, "head_dim": 32,
+            "vocab_size": 32, "num_local_experts": 2, "num_experts_per_tok": 1,
+            "rms_norm_eps": 1e-5, "sliding_window": 8,
+            "max_position_embeddings": 128, "rope_theta": 150000.0,
+            "layer_types": ["sliding_attention"],
+            "quantization_config": {"quant_method": "mxfp4"}, "swiglu_limit": 7.0
+        }),
+        serde_json::json!({
+            "model_type":"lfm2_moe", "vocab_size":16, "hidden_size":8,
+            "intermediate_size":10, "num_hidden_layers":2,
+            "num_attention_heads":4, "num_key_value_heads":2,
+            "max_position_embeddings":32, "layer_types":["conv","full_attention"],
+            "conv_L_cache":3, "block_multiple_of":2,
+            "block_ffn_dim_multiplier":1.0, "block_auto_adjust_ff_dim":true,
+            "num_dense_layers":1, "moe_intermediate_size":6,
+            "num_experts":2, "num_experts_per_tok":1, "tie_word_embeddings":false
+        }),
+        serde_json::json!({
+            "model_type":"kimi_linear", "vocab_size":16, "hidden_size":8,
+            "num_hidden_layers":2, "num_attention_heads":2, "num_key_value_heads":2,
+            "intermediate_size":10, "head_dim":4, "model_max_length":64,
+            "linear_attn_config":{"kda_layers":[1],"full_attn_layers":[2],"num_heads":2,"head_dim":4,"short_conv_kernel_size":3},
+            "num_experts":2,"moe_intermediate_size":6,"kv_lora_rank":4,
+            "qk_nope_head_dim":4,"qk_rope_head_dim":2,"v_head_dim":4,
+            "mla_use_nope":true,"num_experts_per_token":1,"num_shared_experts":1,
+            "routed_scaling_factor":1.0,"first_k_dense_replace":1,
+            "num_expert_group":1,"topk_group":1,"tie_word_embeddings":false
+        }),
+        serde_json::json!({
+            "model_type":"nemotron_h", "vocab_size":16, "hidden_size":8,
+            "intermediate_size":12, "num_hidden_layers":2,
+            "hybrid_override_pattern":"ME", "num_attention_heads":2,
+            "num_key_value_heads":1, "head_dim":4, "mamba_num_heads":2,
+            "n_groups":1, "mamba_head_dim":4, "ssm_state_size":3,
+            "conv_kernel":3, "chunk_size":2, "n_routed_experts":4,
+            "n_shared_experts":1, "moe_intermediate_size":6,
+            "moe_shared_expert_intermediate_size":6, "num_experts_per_tok":2,
+            "n_group":2, "topk_group":1, "num_nextn_predict_layers":0,
+            "tie_word_embeddings":false
+        }),
+        serde_json::json!({
+            "model_type":"deepseek_v3", "vocab_size":16, "hidden_size":8,
+            "intermediate_size":12, "moe_intermediate_size":8, "num_hidden_layers":2,
+            "num_attention_heads":2, "max_position_embeddings":64,
+            "q_lora_rank":2, "kv_lora_rank":2, "qk_nope_head_dim":2,
+            "qk_rope_head_dim":2, "v_head_dim":4, "first_k_dense_replace":1,
+            "n_routed_experts":2, "n_shared_experts":1, "num_experts_per_tok":1,
+            "n_group":1, "topk_group":1, "num_nextn_predict_layers":0,
+            "tie_word_embeddings":false
+        }),
+        serde_json::json!({
+            "model_type":"deepseek_v4", "hidden_size":4, "moe_intermediate_size":4,
+            "num_hidden_layers":2, "num_attention_heads":2, "num_key_value_heads":1,
+            "head_dim":4, "qk_rope_head_dim":2, "q_lora_rank":2, "o_lora_rank":2,
+            "o_groups":2, "vocab_size":16, "max_position_embeddings":128,
+            "sliding_window":4, "compress_ratios":[0,128], "index_n_heads":2,
+            "index_head_dim":4, "index_topk":1, "hc_mult":2, "hc_sinkhorn_iters":2,
+            "n_routed_experts":2, "n_shared_experts":1, "num_experts_per_tok":1,
+            "num_hash_layers":0, "scoring_func":"sqrtsoftplus", "topk_method":"noaux_tc",
+            "norm_topk_prob":true, "routed_scaling_factor":1.0, "swiglu_limit":4.0,
+            "num_nextn_predict_layers":0
+        }),
+    ];
+    let context = NumericContext::default();
+    let tokens = NumericTensor::token_ids(&[1, 3, 2]);
+    let mut families = Vec::new();
+    for config in cases {
+        let run = execute_numeric_routed_visitor(&config, &context, &tokens, false);
+        assert_eq!(
+            run.outputs.len(),
+            3,
+            "{} did not complete routed production execution",
+            config["model_type"].as_str().unwrap()
+        );
+        families.push(config["model_type"].as_str().unwrap().to_owned());
+    }
+    families
+}
+
+#[test]
+pub(crate) fn reference_conformance_routed_safetensors_families() {
+    assert_eq!(
+        run_reference_conformance_routed_safetensors_families().len(),
+        7
+    );
+}
+
+#[allow(
+    dead_code,
+    reason = "called by the unified reference_conformance integration target"
+)]
+pub(crate) fn run_reference_conformance_transformed_addressable_route() -> ReferenceStageEvidence {
+    let mut config = config("qwen3_moe", false);
+    config["hidden_size"] = 32.into();
+    config["head_dim"] = 16.into();
+    config["moe_intermediate_size"] = 32.into();
+    config["vocab_size"] = 32.into();
+    reset_reference_stage_evidence("SafeTensors");
+    record_reference_family("qwen3_moe");
+    let context = NumericContext::default();
+    let run = execute_numeric_routed_visitor_with_quantization(
+        &config,
+        &context,
+        &NumericTensor::token_ids(&[1, 3, 2]),
+        true,
+        Some(eredu_core::QuantizationRequest::Affine {
+            group_size: 16,
+            bits: 4,
+        }),
+    );
+    assert_eq!(run.outputs.len(), 3);
+    assert!(run.bank_report.is_some());
+    last_reference_stage_evidence()
+}
+
+fn heterogeneous_replicated_configs() -> Vec<serde_json::Value> {
+    vec![
         serde_json::json!({
             "model_type":"lfm2", "vocab_size":16, "hidden_size":8,
             "intermediate_size":10, "num_hidden_layers":2,
@@ -21710,7 +22720,12 @@ fn heterogeneous_replicated_visitors_match_established_numeric_family_models() {
             "linear_num_key_heads":2,"linear_num_value_heads":2,"num_experts":0,
             "layer_types":["linear_attention","full_attention"],"tie_word_embeddings":false
         }),
-    ];
+    ]
+}
+
+#[test]
+fn heterogeneous_replicated_visitors_match_established_numeric_family_models() {
+    let cases = heterogeneous_replicated_configs();
     for config in cases {
         let context = NumericContext::default();
         let tokens = NumericTensor::token_ids(&[1, 3, 2]);
@@ -21799,6 +22814,333 @@ fn heterogeneous_replicated_visitors_match_established_numeric_family_models() {
             &format!("{label} replicated state"),
         );
     }
+}
+
+fn required_safetensors_parameters(config: &serde_json::Value) -> Vec<(String, Vec<usize>)> {
+    let resolved = eredu_architectures::configuration::MODEL_CONFIGURATIONS
+        .resolve_safetensors(config)
+        .unwrap();
+    let checkpoint = resolved
+        .architecture_plan()
+        .safetensors_architecture()
+        .unwrap()
+        .checkpoint();
+    let mut constraints = checkpoint.common_tensors.iter().collect::<Vec<_>>();
+    constraints.extend(
+        checkpoint
+            .layout_groups
+            .iter()
+            .filter(|group| group.required)
+            .filter_map(|group| group.variants.first())
+            .flat_map(|variant| variant.tensors.iter()),
+    );
+    constraints
+        .into_iter()
+        .filter(|constraint| {
+            constraint.requirement == eredu_checkpoint::schema::TensorRequirement::Required
+        })
+        .map(|constraint| (constraint.key.clone(), constraint.shape.clone()))
+        .collect::<BTreeMap<_, _>>()
+        .into_iter()
+        .collect()
+}
+
+pub(crate) fn new_architecture_uses_production_selection_materialization_and_session_without_backend_case(
+) {
+    use safetensors::tensor::{serialize_to_file, TensorView};
+
+    let value = config("qwen2", false);
+    let artifact = tempfile::tempdir().unwrap();
+    std::fs::write(
+        artifact.path().join("config.json"),
+        serde_json::to_vec(&value).unwrap(),
+    )
+    .unwrap();
+    let tensors = required_safetensors_parameters(&value)
+        .into_iter()
+        .map(|(name, shape)| {
+            let bytes = vec![0_u8; shape.iter().product::<usize>() * 4];
+            (name, shape, bytes)
+        })
+        .collect::<Vec<_>>();
+    let views = tensors
+        .iter()
+        .map(|(name, shape, bytes)| {
+            (
+                name.as_str(),
+                TensorView::new(Dtype::F32, shape.clone(), bytes.as_slice()).unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    serialize_to_file(views, None, &artifact.path().join("model.safetensors")).unwrap();
+    let inspection = eredu_architectures::configuration::inspect_artifact(artifact.path()).unwrap();
+    let store: SharedCheckpointSource =
+        Arc::new(eredu_checkpoint::store::SafetensorsWeightStore::open(artifact.path()).unwrap());
+    let requirements =
+        eredu_architectures::replicated_text::replicated_text_requirements(&inspection)
+            .unwrap()
+            .with_extension_architecture_identity("sink_decoder_fixture")
+            .unwrap();
+    let lowerings = requirements
+        .parameters()
+        .iter()
+        .filter(|parameter| parameter.has_lowering_source())
+        .map(|parameter| {
+            eredu_runtime::WeightLoweringCapability::new(
+                parameter
+                    .lowering_descriptor(parameter.native_executable())
+                    .unwrap(),
+                eredu_runtime::WeightLoweringKind::Direct,
+            )
+        })
+        .collect();
+    let state = eredu_runtime::StateMechanismCapabilities::new(
+        (0..requirements.state_layout().len()).flat_map(|layer| {
+            requirements
+                .state_layout()
+                .components(layer)
+                .unwrap()
+                .iter()
+                .cloned()
+                .map(move |component| {
+                    eredu_runtime::StateComponentMechanism::new(
+                        layer,
+                        component,
+                        Some(eredu_runtime::StateComponentPlacement::Device),
+                        None,
+                    )
+                })
+        }),
+    )
+    .with_transactions(true, true)
+    .with_reset(true);
+    let capabilities = eredu_runtime::BackendMechanismCapabilities::new(
+        eredu_nn::NeuralOperatorCapabilities::ALL,
+        lowerings,
+        vec![eredu_runtime::WeightResidencyMechanism::Resident],
+        state,
+    );
+    let request = eredu_runtime::ReplicatedTextSelectionRequest::new(
+        LayerWeightResidency::FullyResident,
+        eredu_runtime::CacheResidencyPolicy::Device,
+    );
+    let selected =
+        eredu_runtime::select_replicated_text_realization(&requirements, &request, &capabilities)
+            .unwrap();
+    assert_eq!(
+        selected.requirements().architecture_identity(),
+        "sink_decoder_fixture"
+    );
+    assert!(
+        !eredu_runtime::replicated_text_materialization_tasks(&selected)
+            .unwrap()
+            .is_empty()
+    );
+
+    let args = qwen::model_args_from_config_value(&value).unwrap();
+    let estimate = eredu_architectures::capability::qwen(&args)
+        .unwrap()
+        .for_architecture_extension("sink_decoder_fixture");
+    let extension = SinkDecoderConfig(args, false);
+    let cache_identity = decoder::Config::architecture_fingerprint(&extension);
+    let context = NumericContext::default();
+    let architecture =
+        decoder::LayeredModel::<NumericBackend, SinkDecoderConfig>::new(extension, &context)
+            .unwrap();
+    let tokens = NumericTensor::token_ids(&[1, 3, 2]);
+    reset_reference_stage_evidence("synthetic-extension");
+    let run = eredu_architectures::replicated_text::visit_replicated_text_extension_architecture(
+        architecture,
+        None,
+        selected,
+        estimate,
+        "sink_decoder_fixture",
+        cache_identity,
+        store,
+        &context,
+        NumericReplicatedVisitor {
+            context: &context,
+            tokens: &tokens,
+            construction_started: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(run.outputs.len(), 3);
+    let evidence = last_reference_stage_evidence();
+    assert_eq!(evidence.family, "sink_decoder_fixture");
+    assert!(evidence.materialization_tasks > 0);
+    assert_eq!(
+        evidence.stages,
+        [
+            "construction_started",
+            "typed_architecture",
+            "materialization",
+            "session_constructed",
+            "prefill",
+            "decode",
+            "decode",
+            "report",
+        ]
+    );
+}
+
+pub(crate) fn run_reference_conformance_replicated_safetensors_families(
+) -> Vec<ReferenceStageEvidence> {
+    let mut cases = vec![
+        config("llama", false),
+        config("qwen2", false),
+        config("qwen3", false),
+        serde_json::json!({
+            "model_type":"deepseek_v3", "vocab_size":16, "hidden_size":8,
+            "intermediate_size":12, "moe_intermediate_size":8, "num_hidden_layers":2,
+            "num_attention_heads":2, "max_position_embeddings":64,
+            "q_lora_rank":2, "kv_lora_rank":2, "qk_nope_head_dim":2,
+            "qk_rope_head_dim":2, "v_head_dim":4, "first_k_dense_replace":2,
+            "moe_layer_freq":1, "n_routed_experts":2, "n_shared_experts":1,
+            "num_experts_per_tok":1, "n_group":1, "topk_group":1,
+            "num_nextn_predict_layers":0, "tie_word_embeddings":false
+        }),
+    ];
+    cases.extend(heterogeneous_replicated_configs());
+    let context = NumericContext::default();
+    let tokens = NumericTensor::token_ids(&[1, 3, 2]);
+    let mut evidence = Vec::new();
+    for config in cases {
+        let parameters = required_safetensors_parameters(&config);
+        let run = execute_numeric_replicated_visitor(&config, parameters, &context, &tokens);
+        assert_eq!(
+            run.outputs.len(),
+            3,
+            "{} did not complete prefill plus repeated decode",
+            config["model_type"].as_str().unwrap()
+        );
+        evidence.push(last_reference_stage_evidence());
+    }
+    evidence
+}
+
+#[test]
+pub(crate) fn reference_conformance_replicated_safetensors_families() {
+    assert_eq!(
+        run_reference_conformance_replicated_safetensors_families().len(),
+        9
+    );
+}
+
+#[allow(
+    dead_code,
+    reason = "called by the unified reference_conformance integration target"
+)]
+pub(crate) fn run_reference_conformance_transformed_replicated_production() -> ReferenceStageEvidence
+{
+    let mut config = config("llama", false);
+    config["hidden_size"] = 16.into();
+    config["intermediate_size"] = 32.into();
+    config["head_dim"] = 8.into();
+    let parameters = required_safetensors_parameters(&config);
+    let context = NumericContext::default();
+    let run = execute_numeric_replicated_visitor_with_quantization(
+        &config,
+        parameters,
+        &context,
+        &NumericTensor::token_ids(&[1, 3, 2]),
+        Some(eredu_core::QuantizationRequest::Affine {
+            group_size: 16,
+            bits: 4,
+        }),
+    );
+    assert_eq!(run.outputs.len(), 3);
+    last_reference_stage_evidence()
+}
+
+pub(crate) fn run_reference_conformance_gguf_replicated_production() -> ReferenceStageEvidence {
+    use eredu_gguf::{GgmlType, MetadataValue, TensorInput, Writer};
+    use std::fs::File;
+
+    let artifact = tempfile::tempdir().unwrap();
+    let path = artifact.path().join("model.gguf");
+    let metadata = BTreeMap::from([
+        (
+            "general.architecture".into(),
+            MetadataValue::String("llama".into()),
+        ),
+        ("llama.embedding_length".into(), MetadataValue::Uint32(2)),
+        (
+            "llama.attention.head_count".into(),
+            MetadataValue::Uint32(1),
+        ),
+        (
+            "llama.attention.head_count_kv".into(),
+            MetadataValue::Uint32(1),
+        ),
+        ("llama.block_count".into(), MetadataValue::Uint32(1)),
+        ("llama.feed_forward_length".into(), MetadataValue::Uint32(2)),
+        (
+            "llama.attention.layer_norm_rms_epsilon".into(),
+            MetadataValue::Float32(1e-5),
+        ),
+        ("llama.vocab_size".into(), MetadataValue::Uint32(8)),
+        ("llama.context_length".into(), MetadataValue::Uint32(32)),
+    ]);
+    let tensors = [
+        ("token_embd.weight", vec![2_u64, 8]),
+        ("output_norm.weight", vec![2]),
+        ("blk.0.attn_norm.weight", vec![2]),
+        ("blk.0.ffn_norm.weight", vec![2]),
+        ("blk.0.attn_q.weight", vec![2, 2]),
+        ("blk.0.attn_k.weight", vec![2, 2]),
+        ("blk.0.attn_v.weight", vec![2, 2]),
+        ("blk.0.attn_output.weight", vec![2, 2]),
+        ("blk.0.ffn_gate.weight", vec![2, 2]),
+        ("blk.0.ffn_up.weight", vec![2, 2]),
+        ("blk.0.ffn_down.weight", vec![2, 2]),
+    ]
+    .into_iter()
+    .map(|(name, dimensions)| {
+        let bytes = vec![0_u8; dimensions.iter().product::<u64>() as usize * 4];
+        (name, dimensions, bytes)
+    })
+    .collect::<Vec<_>>();
+    let inputs = tensors
+        .iter()
+        .map(|(name, dimensions, bytes)| TensorInput {
+            name,
+            dimensions,
+            ggml_type: GgmlType::F32,
+            data: bytes,
+        })
+        .collect::<Vec<_>>();
+    Writer::default()
+        .write(File::create(&path).unwrap(), &metadata, &inputs)
+        .unwrap();
+
+    let inspection = eredu_architectures::configuration::inspect_artifact(&path).unwrap();
+    let plan = inspection.architecture_plan().gguf_plan().unwrap();
+    let store = eredu_checkpoint::gguf_store::GgufWeightStore::builder()
+        .add_checkpoint(
+            inspection.gguf_checkpoint().unwrap().clone(),
+            plan.checkpoint(),
+            plan.tensor_mapping(),
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+    let context = NumericContext::default();
+    let run = execute_numeric_replicated_inspection(
+        &inspection,
+        std::sync::Arc::new(store),
+        &context,
+        &NumericTensor::token_ids(&[1, 3, 2]),
+        None,
+    );
+    assert_eq!(run.outputs.len(), 3);
+    last_reference_stage_evidence()
+}
+
+#[test]
+pub(crate) fn reference_conformance_gguf_replicated_production() {
+    let evidence = run_reference_conformance_gguf_replicated_production();
+    assert_eq!(evidence.format, "Gguf");
 }
 
 #[test]
@@ -22733,6 +24075,8 @@ fn grouped_sigmoid_and_caller_selected_routes_preserve_unbiased_scores() {
             weight: NumericTensor::new(vec![4, 1], vec![2.0, 1.0, 3.0, 0.0]),
             weight_metadata: ParameterMetadata::from_spec(&router_weight, true),
             bias: None,
+            execution_weight: None,
+            format_companions: Vec::new(),
         },
         selection: routing,
         correction_bias: Some((
@@ -23530,46 +24874,11 @@ fn deepseek_execution_graphs_run_target_mtp_and_dspark_transactions() {
         "dspark_markov_rank": 2
     });
     let v4 = deepseek::parse_v4_config(&v4_config).unwrap();
-    let architecture_plan = eredu_architectures::configuration::resolve_model_config(&v4_config)
-        .unwrap()
-        .architecture;
-    let (_, extension_plan) = architecture_plan
-        .prediction_target_projection()
-        .unwrap()
-        .unwrap();
-    let store = MemoryWeightStore::from_safetensors([
-        (
-            "mtp.0.ffn.switch_mlp.gate_up_proj".to_owned(),
-            Dtype::F16,
-            vec![2, 8, 4],
-            vec![0; 2 * 8 * 4 * 2],
-        ),
-        (
-            "mtp.0.ffn.switch_mlp.down_proj".to_owned(),
-            Dtype::F16,
-            vec![2, 4, 4],
-            vec![0; 2 * 4 * 4 * 2],
-        ),
-    ])
-    .unwrap();
-    let prepared =
-        eredu_architectures::prediction_extension::prepare_replicated_prediction_extension::<
-            NumericBackend,
-        >(&extension_plan, &store, &context, &context)
-        .unwrap();
-    let eredu_architectures::prediction_extension::PreparedPredictionExtension::DeepSeekV4Dspark {
-        extension,
-        units,
-        state,
-        ..
-    } = prepared
-    else {
-        panic!("DSpark configuration prepared a sequential prediction extension")
-    };
-    assert_eq!(extension.strategy().target_layer_ids(), [0, 1]);
-    assert_eq!(extension.strategy().proposal_capacity(), 2);
-    assert_eq!(units.len(), 1);
-    assert_eq!(state.len(), 1);
+    let strategy =
+        eredu_architectures::prediction_extension::DsparkPredictionStrategy::from_args(&v4)
+            .unwrap();
+    assert_eq!(strategy.target_layer_ids(), [0, 1]);
+    assert_eq!(strategy.proposal_capacity(), 2);
     let mut v4_state = DeviceState::<NumericBackend, _>::create(
         deepseek::v4::state_layout(&v4).unwrap(),
         |_, _| Ok::<_, Error>(NumericPoolingCache::new(8, &[])),
@@ -25037,6 +26346,18 @@ fn inkling_partition_projected_input() -> eredu_runtime::PreparedModelInput<Nume
 
 #[test]
 fn gemma4_composite_partitioned_session_executes_optional_roots_pipeline_and_decode() {
+    std::thread::Builder::new()
+        .name("reference-gemma4-partitioned-composite".into())
+        .stack_size(32 * 1024 * 1024)
+        .spawn(
+            gemma4_composite_partitioned_session_executes_optional_roots_pipeline_and_decode_inner,
+        )
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+fn gemma4_composite_partitioned_session_executes_optional_roots_pipeline_and_decode_inner() {
     let config = serde_json::json!({
         "model_type":"gemma4_unified", "tie_word_embeddings":false,
         "image_token_id":5, "audio_token_id":6,
@@ -25285,8 +26606,11 @@ fn remaining_dense_composites_admit_only_rank_local_safe_tensor_topology() {
     }
 }
 
-#[test]
-fn routed_muse_and_inkling_use_the_ordinary_partition_session_across_admitted_axes() {
+#[allow(
+    dead_code,
+    reason = "owned by the unified reference_conformance target"
+)]
+pub(crate) fn routed_muse_and_inkling_use_the_ordinary_partition_session_across_admitted_axes() {
     let cases = [
         (
             "Muse-Glimmer",
@@ -25347,8 +26671,11 @@ fn routed_muse_and_inkling_use_the_ordinary_partition_session_across_admitted_ax
     }
 }
 
-#[test]
-fn placed_routed_composite_observation_intervention_is_transactional() {
+#[allow(
+    dead_code,
+    reason = "owned by the unified reference_conformance target"
+)]
+pub(crate) fn placed_routed_composite_observation_intervention_is_transactional() {
     let config = routed_muse_partition_fixture();
     let topology = ParallelTopology::new(1, 2, 2, 1).unwrap();
     let inputs = [

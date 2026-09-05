@@ -17,14 +17,14 @@ use safemlx::{
     ops::indexing::{NewAxis, TryIndexOp},
     Array, Dtype, Stream,
 };
-use std::path::Path;
+use std::{cell::Cell, path::Path, rc::Rc};
 
 use crate::{
+    backend::error::Error,
     backend::nn::tensor::{TokenValidationBatch, TokenValidationScope},
     backend::random::RandomState,
     backend::runtime::generation::MlxSamplingBackend,
     backend::runtime::media::input,
-    backend::{error::Error, MlxModelKind},
     MlxTensor,
 };
 #[cfg(any(feature = "image", feature = "audio"))]
@@ -355,29 +355,61 @@ impl Sampler<MlxSamplingBackend> for FilteredTextSampler<'_> {
 
 enum MlxSessionCompletionKind {
     Model {
-        completion: MlxCompletion,
         token_validations: TokenValidationBatch,
+        _retained: Vec<Array>,
+        submission_lease: SessionSubmissionLease,
     },
+}
+
+#[derive(Clone)]
+struct SessionSubmissionLease {
+    owner: Rc<Cell<Option<u64>>>,
+    ticket: u64,
+}
+
+impl SessionSubmissionLease {
+    fn release(&self) {
+        if self.owner.get() == Some(self.ticket) {
+            self.owner.set(None);
+        }
+    }
+}
+
+impl MlxSessionCompletion {
+    fn resolve(&self) -> Result<(), Error> {
+        match &self.inner {
+            MlxSessionCompletionKind::Model {
+                token_validations,
+                submission_lease,
+                ..
+            } => {
+                let result = token_validations.validate_completed().map_err(Into::into);
+                submission_lease.release();
+                result
+            }
+        }
+    }
 }
 
 impl Completion for MlxSessionCompletion {
     type Error = Error;
 
     fn is_complete(&self) -> Result<bool, Self::Error> {
-        match &self.inner {
-            MlxSessionCompletionKind::Model { completion, .. } => completion.is_complete(),
-        }
+        self.resolve()?;
+        Ok(true)
     }
 
     fn wait(&self) -> Result<(), Self::Error> {
+        self.resolve()
+    }
+}
+
+impl Drop for MlxSessionCompletion {
+    fn drop(&mut self) {
         match &self.inner {
             MlxSessionCompletionKind::Model {
-                completion,
-                token_validations,
-            } => {
-                completion.wait()?;
-                token_validations.validate_completed().map_err(Into::into)
-            }
+                submission_lease, ..
+            } => submission_lease.release(),
         }
     }
 }
@@ -448,7 +480,9 @@ impl MlxModelInput {
 /// session so callers cannot accidentally execute a sharded model with an
 /// unrelated communicator.
 pub struct MlxModelSession {
-    inner: MlxSessionKind,
+    model: Executable,
+    submission_in_flight: Rc<Cell<Option<u64>>>,
+    next_submission_ticket: Cell<u64>,
     floating_state_dtype_bytes: std::num::NonZeroU8,
     distributed: Option<MlxDistributedSession>,
     capabilities: eredu_core::SessionCapabilities,
@@ -457,34 +491,21 @@ pub struct MlxModelSession {
     processor: Option<ModelProcessor>,
 }
 
-enum MlxSessionKind {
-    Complete(Executable),
-}
-
-pub(super) enum MlxSpeculativeSessionParts<'session> {
-    Complete { model: &'session mut Executable },
-}
-
 impl MlxModelSession {
     /// Creates a session and validates that its communicator matches the model topology.
     pub(crate) fn from_model(
-        model: MlxModel,
+        mut model: MlxModel,
         admitted_capabilities: eredu_core::SessionCapabilities,
     ) -> Result<Self, Error> {
         let floating_state_dtype_bytes = model.floating_state_dtype_bytes();
         let state_residency = model.state_residency().clone();
         #[cfg(any(feature = "image", feature = "audio"))]
-        let mut model = model;
-        #[cfg(any(feature = "image", feature = "audio"))]
         let processor = model.take_processor();
-        let inner = match model.into_kind() {
-            MlxModelKind::Complete(mut model) => {
-                model
-                    .reset_cache_with_options(state_residency.clone())
-                    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-                MlxSessionKind::Complete(model)
-            }
-        };
+        let distributed = model.take_distributed();
+        let mut executable = model.into_executable();
+        executable
+            .reset_cache_with_options(state_residency.clone())
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         let realized_capabilities = eredu_core::SessionCapabilities::new(true, true, true);
         if admitted_capabilities != realized_capabilities {
             return Err(Error::ArchitectureModel(format!(
@@ -492,9 +513,11 @@ impl MlxModelSession {
             )));
         }
         Ok(Self {
-            inner,
+            model: executable,
+            submission_in_flight: Rc::new(Cell::new(None)),
+            next_submission_ticket: Cell::new(1),
             floating_state_dtype_bytes,
-            distributed: None,
+            distributed,
             capabilities: realized_capabilities,
             state_residency,
             #[cfg(any(feature = "image", feature = "audio"))]
@@ -506,29 +529,47 @@ impl MlxModelSession {
         self.floating_state_dtype_bytes
     }
 
+    fn begin_submission(&self) -> Result<SessionSubmissionLease, Error> {
+        if self.submission_in_flight.get().is_some() {
+            return Err(Error::ArchitectureModel(
+                "model session already owns an unresolved submission completion".into(),
+            ));
+        }
+        let ticket = self.next_submission_ticket.get();
+        let next = ticket.checked_add(1).ok_or_else(|| {
+            Error::ArchitectureModel("model session submission ticket space exhausted".into())
+        })?;
+        self.next_submission_ticket.set(next);
+        self.submission_in_flight.set(Some(ticket));
+        Ok(SessionSubmissionLease {
+            owner: self.submission_in_flight.clone(),
+            ticket,
+        })
+    }
+
+    fn ensure_no_submission_in_flight(&self) -> Result<(), Error> {
+        if self.submission_in_flight.get().is_some() {
+            Err(Error::ArchitectureModel(
+                "model session state cannot be changed while a submission completion is unresolved"
+                    .into(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
     #[cfg(any(feature = "image", feature = "audio"))]
     pub(crate) fn processor(&self) -> Option<&ModelProcessor> {
         self.processor.as_ref()
     }
 
-    #[cfg(test)]
-    pub(crate) fn model_family(&self) -> eredu_architectures::ModelKind {
-        match &self.inner {
-            MlxSessionKind::Complete(model) => model.model_family(),
-        }
-    }
-
     pub(crate) fn effective_model_type(&self) -> &str {
-        match &self.inner {
-            MlxSessionKind::Complete(model) => model.effective_model_type(),
-        }
+        self.model.effective_model_type()
     }
 
     /// Reports how the session-owned model exposes speculative weights.
     pub fn speculative_capability(&self) -> SpeculativeCapability {
-        match &self.inner {
-            MlxSessionKind::Complete(model) => model.speculative_capability(),
-        }
+        self.model.speculative_capability()
     }
 
     /// Installs causal observers on this session's selected embedded-prediction executor.
@@ -541,12 +582,12 @@ impl MlxModelSession {
         TensorObserver: RuntimeActivationObserver<MlxTensor, Exception> + 'static,
         LogitsObserver: RuntimeActivationObserver<Array, Exception> + 'static,
     {
+        self.ensure_no_submission_in_flight()?;
         let observers =
             eredu_architectures::speculative_execution::EmbeddedPredictionObservers::new(
                 tensors, logits,
             );
-        let MlxSessionKind::Complete(model) = &mut self.inner;
-        if model.install_embedded_prediction_observers(observers) {
+        if self.model.install_embedded_prediction_observers(observers) {
             Ok(())
         } else {
             Err(Error::ArchitectureModel(
@@ -557,18 +598,14 @@ impl MlxModelSession {
 
     /// Returns bounded parameter-residency telemetry when available.
     pub fn residency_report(&self) -> Result<Option<eredu_runtime::ResidencyReport>, Error> {
-        match &self.inner {
-            MlxSessionKind::Complete(model) => model.residency_report(),
-        }
+        self.model.residency_report()
     }
 
     /// Returns dense checkpoint-streaming telemetry when enabled.
     pub fn dense_stream_report(
         &self,
     ) -> Result<Option<eredu_runtime::DenseDiskStreamReport>, Error> {
-        match &self.inner {
-            MlxSessionKind::Complete(model) => model.dense_stream_report(),
-        }
+        self.model.dense_stream_report()
     }
 
     /// Returns sparse routed-expert cache telemetry when enabled.
@@ -578,49 +615,21 @@ impl MlxModelSession {
         Option<crate::backend::runtime::residency::parameter_bank::ParameterBankResidencyReport>,
         Error,
     > {
-        match &self.inner {
-            MlxSessionKind::Complete(model) => model.parameter_bank_report(),
-        }
+        self.model.parameter_bank_report()
     }
 
     /// Returns the complete model-derived identity for a reusable prompt cache.
     pub fn prompt_cache_model_identity(
         &self,
     ) -> Result<eredu_core::cache::PromptCacheModelIdentity, Error> {
-        match &self.inner {
-            MlxSessionKind::Complete(model) => {
-                model.prompt_cache_model_identity().map_err(Into::into)
-            }
-        }
-    }
-
-    pub(super) fn external_assistant_target_profile(
-        &self,
-    ) -> Result<eredu_architectures::external_assistant::ExternalAssistantTargetProfile, Error>
-    {
-        match &self.inner {
-            MlxSessionKind::Complete(Executable::ReplicatedText(_, target)) => target
-                .external_prediction()
-                .map(|target| target.external_assistant_target_profile())
-                .ok_or_else(|| {
-                    Error::ArchitectureModel(
-                        "selected target does not publish an external-assistant profile".into(),
-                    )
-                }),
-            MlxSessionKind::Complete(model) => Err(Error::ArchitectureModel(format!(
-                "external assistants are unavailable for target {}",
-                model.effective_model_type()
-            ))),
-        }
+        self.model.prompt_cache_model_identity().map_err(Into::into)
     }
 
     pub(super) fn capability_estimate(
         &self,
     ) -> Result<eredu_architectures::capability::CapabilityEstimate, eredu_core::CapabilityError>
     {
-        match &self.inner {
-            MlxSessionKind::Complete(model) => model.architecture_capability_estimate(),
-        }
+        self.model.architecture_capability_estimate()
     }
 
     pub(super) fn prepared_input_part_plan(
@@ -628,39 +637,27 @@ impl MlxModelSession {
         input: &crate::backend::runtime::media::input::InputPart,
     ) -> Result<eredu_architectures::media_plan::PreparedInputPartPlan, eredu_core::CapabilityError>
     {
-        match &self.inner {
-            MlxSessionKind::Complete(model) => model.prepared_input_part_plan(input),
-        }
+        self.model.prepared_input_part_plan(input)
     }
 
-    pub(super) fn speculative_parts_mut(
-        &mut self,
-    ) -> Result<MlxSpeculativeSessionParts<'_>, Error> {
-        match &mut self.inner {
-            MlxSessionKind::Complete(model) => Ok(MlxSpeculativeSessionParts::Complete { model }),
-        }
+    pub(super) fn speculative_model_mut(&mut self) -> &mut Executable {
+        &mut self.model
     }
 
     #[cfg(test)]
     pub(crate) fn neutral_prediction_target_mut(
         &mut self,
     ) -> Result<&mut dyn super::replicated_text::ErasedReplicatedTextExecutable, Error> {
-        match &mut self.inner {
-            MlxSessionKind::Complete(Executable::ReplicatedText(_, target)) => Ok(target.as_mut()),
-            MlxSessionKind::Complete(model) => Err(Error::ArchitectureModel(format!(
-                "test session retained a non-neutral prediction target for {}",
-                model.effective_model_type()
-            ))),
-        }
+        Ok(self.model.erased_mut())
     }
 
     /// Clears all MLX cache state under the authoritative selected policy.
     pub fn reset(&mut self) -> Result<(), Error> {
-        let MlxSessionKind::Complete(model) = &mut self.inner;
-        if model.has_neutral_partitioned_control() {
-            return model.reset_cache_distributed().map_err(Into::into);
+        self.ensure_no_submission_in_flight()?;
+        if self.model.has_neutral_partitioned_control() {
+            return self.model.reset_cache_distributed().map_err(Into::into);
         }
-        model
+        self.model
             .reset_cache_with_options(self.state_residency.clone())
             .map_err(Into::into)
     }
@@ -681,11 +678,9 @@ impl MlxModelSession {
     pub fn cache_residency_report(
         &self,
     ) -> Result<Option<eredu_runtime::CacheResidencyReport>, Error> {
-        match &self.inner {
-            MlxSessionKind::Complete(model) => model
-                .cache_residency_report()
-                .map_err(|error| Error::Parallel(error.to_string())),
-        }
+        self.model
+            .cache_residency_report()
+            .map_err(|error| Error::Parallel(error.to_string()))
     }
 
     /// Atomically persists the completed prefix owned by this session.
@@ -697,16 +692,18 @@ impl MlxModelSession {
         prefix_token_ids: &[u32],
         options: &PromptCacheOptions,
     ) -> Result<PromptCacheManifest, Error> {
+        self.ensure_no_submission_in_flight()?;
         let root = root.as_ref();
-        match &mut self.inner {
-            MlxSessionKind::Complete(model) if model.has_neutral_partitioned_control() => model
+        if self.model.has_neutral_partitioned_control() {
+            self.model
                 .save_prompt_cache_distributed(root, descriptor, prefix_token_ids, options)?
                 .ok_or_else(|| {
                     Error::ArchitectureModel(
                         "this partition rank owns no prompt-cache state".into(),
                     )
-                }),
-            MlxSessionKind::Complete(model) => model
+                })
+        } else {
+            self.model
                 .save_prompt_cache(
                     root,
                     descriptor,
@@ -714,7 +711,7 @@ impl MlxModelSession {
                     options,
                     backend.stream(),
                 )
-                .map_err(Into::into),
+                .map_err(Into::into)
         }
     }
 
@@ -726,6 +723,7 @@ impl MlxModelSession {
         expected: &PromptCacheDescriptor,
         prefix_token_ids: &[u32],
     ) -> Result<PromptCacheManifest, Error> {
+        self.ensure_no_submission_in_flight()?;
         let root = root.as_ref();
         let CacheResidencyPolicy::Paged(options) = &self.state_residency else {
             return Err(Error::ArchitectureModel(
@@ -733,21 +731,22 @@ impl MlxModelSession {
             ));
         };
         let options = options.clone();
-        let manifest = match &mut self.inner {
-            MlxSessionKind::Complete(model) if model.has_neutral_partitioned_control() => model
+        let manifest = if self.model.has_neutral_partitioned_control() {
+            self.model
                 .load_prompt_cache_distributed(root, expected, prefix_token_ids)?
                 .ok_or_else(|| {
                     Error::ArchitectureModel(
                         "this partition rank owns no prompt-cache state".into(),
                     )
-                })?,
-            MlxSessionKind::Complete(model) => model.load_prompt_cache(
+                })?
+        } else {
+            self.model.load_prompt_cache(
                 root,
                 expected,
                 prefix_token_ids,
                 options,
                 backend.stream(),
-            )?,
+            )?
         };
         Ok(manifest)
     }
@@ -761,6 +760,7 @@ impl MlxModelSession {
         prefix_token_ids: &[u32],
         input: &MlxModelInput,
     ) -> Result<PromptCacheManifest, Error> {
+        self.ensure_no_submission_in_flight()?;
         let identity = input.cache_identity.clone().ok_or_else(|| {
             Error::ArchitectureModel(
                 "prompt-cache loading requires prepared-input semantic identity".into(),
@@ -772,8 +772,8 @@ impl MlxModelSession {
             ));
         };
         let root = root.as_ref();
-        match &mut self.inner {
-            MlxSessionKind::Complete(model) if model.has_neutral_partitioned_control() => model
+        if self.model.has_neutral_partitioned_control() {
+            self.model
                 .load_prompt_cache_for_input_distributed(
                     root,
                     expected,
@@ -784,8 +784,9 @@ impl MlxModelSession {
                     Error::ArchitectureModel(
                         "this partition rank owns no prompt-cache state".into(),
                     )
-                }),
-            MlxSessionKind::Complete(model) => model
+                })
+        } else {
+            self.model
                 .load_prompt_cache_for_input(
                     root,
                     expected,
@@ -794,7 +795,7 @@ impl MlxModelSession {
                     options.clone(),
                     backend.stream(),
                 )
-                .map_err(Into::into),
+                .map_err(Into::into)
         }
     }
 
@@ -804,12 +805,7 @@ impl MlxModelSession {
     }
 
     fn synchronizes_sampling(&self) -> bool {
-        self.distributed.is_some()
-            || matches!(
-                &self.inner,
-                MlxSessionKind::Complete(Executable::ReplicatedText(_, executable))
-                    if executable.partition_sampling_context().is_some()
-            )
+        self.model.erased().partition_sampling_context().is_some()
     }
 
     /// Samples on the canonical rank and synchronizes the result for this
@@ -824,139 +820,25 @@ impl MlxModelSession {
         prng_state: Option<&mut RandomState>,
         finished: bool,
     ) -> Result<crate::backend::runtime::distributed::parallel::SynchronizedToken, Error> {
-        match &self.inner {
-            MlxSessionKind::Complete(model) => {
-                if self.distributed.is_some() {
-                    return Err(Error::Parallel(
-                        "complete-model execution has no distributed production path".into(),
-                    ));
-                }
-                let Executable::ReplicatedText(_, executable) = model else {
-                    return Err(Error::Parallel(
-                        "sampling synchronization requires a distributed model session".into(),
-                    ));
-                };
-                let (group, authority, stream, sampling_rank) =
-                    executable.partition_sampling_context().ok_or_else(|| {
-                        Error::Parallel(
-                            "sampling synchronization requires a distributed model session".into(),
-                        )
-                    })?;
-                crate::backend::runtime::distributed::parallel::sample_and_synchronize_bounded(
-                    logits,
-                    batch_size,
-                    sampler,
-                    temperature,
-                    prng_state,
-                    finished,
-                    sampling_rank,
-                    group,
-                    authority,
-                    stream,
+        let executable = self.model.erased();
+        let (group, authority, stream, sampling_rank) =
+            executable.partition_sampling_context().ok_or_else(|| {
+                Error::Parallel(
+                    "sampling synchronization requires a distributed model session".into(),
                 )
-            }
-        }
-    }
-
-    /// Runs one MLX instrumented pass through the architecture-erased adapter.
-    pub(crate) fn forward_with_observer(
-        model: &mut Executable,
-        input_tokens: &Array,
-        mask: Option<&Array>,
-        stream: &Stream,
-        observer: &mut impl RuntimeActivationObserver<MlxTensor, Exception>,
-    ) -> Result<Array, Error> {
-        let mut observer = ArrayObserverAdapter { inner: observer };
-        let result = match model {
-            Executable::DeepSeek(_, model, cache) => {
-                model.forward_with_observer(input_tokens, mask, cache, stream, &mut observer)
-            }
-            Executable::Gemma4(_, model, cache) => {
-                if mask.is_some() {
-                    return Err(Error::ArchitectureModel(
-                        "an explicit Gemma observer mask is unsupported; the adapter constructs its per-layer masks from cache state".into(),
-                    ));
-                }
-                model
-                    .forward_tokens_with_observer(
-                        MlxTensor::ref_cast(input_tokens),
-                        cache,
-                        stream,
-                        &mut observer,
-                    )
-                    .map(MlxTensor::into_array)
-            }
-            Executable::GptOss(_, model, cache) => {
-                model.forward_with_observer(input_tokens, mask, cache, stream, &mut observer)
-            }
-            Executable::Inkling(_, model, cache) => {
-                if mask.is_some() {
-                    return Err(Error::ArchitectureModel(
-                        "explicit Inkling observer masks are unsupported".into(),
-                    ));
-                }
-                model
-                    .forward_tokens_with_observer(
-                        MlxTensor::ref_cast(input_tokens),
-                        cache,
-                        stream,
-                        &mut observer,
-                    )
-                    .map(MlxTensor::into_array)
-            }
-            Executable::KimiLinear(_, model, cache) => {
-                if mask.is_some() {
-                    return Err(Error::ArchitectureModel(
-                        "an explicit Kimi Linear observer mask is unsupported; the adapter constructs the causal mask from cache state".into(),
-                    ));
-                }
-                model.forward_with_observer(input_tokens, mask, cache, stream, &mut observer)
-            }
-            Executable::Lfm2(_, model, cache) => {
-                model.forward_with_observer(input_tokens, mask, cache, stream, &mut observer)
-            }
-            Executable::ReplicatedText(_, model) => {
-                model.forward_with_observer(input_tokens, mask, stream, &mut observer)
-            }
-            Executable::MuseGlimmer(_, model, cache) => {
-                if mask.is_some() {
-                    return Err(Error::ArchitectureModel(
-                        "explicit Muse-Glimmer observer masks are unsupported".into(),
-                    ));
-                }
-                model
-                    .forward_tokens_with_observer(
-                        MlxTensor::ref_cast(input_tokens),
-                        cache,
-                        stream,
-                        &mut observer,
-                    )
-                    .map(MlxTensor::into_array)
-            }
-            Executable::NemotronH(_, model, cache) => {
-                model.forward_with_observer(input_tokens, mask, cache, stream, &mut observer)
-            }
-            Executable::Qwen(_, model, cache) => {
-                model.forward_with_observer(input_tokens, mask, cache, stream, &mut observer)
-            }
-            Executable::Qwen3Next(_, model, cache) => {
-                if mask.is_some() {
-                    return Err(Error::ArchitectureModel(
-                        "an explicit Qwen hybrid observer mask is unsupported; the adapter constructs the causal mask from cache state".into(),
-                    ));
-                }
-                model.forward_with_observer(input_tokens, cache, stream, &mut observer)
-            }
-            Executable::Qwen35(_, model, cache) => {
-                if mask.is_some() {
-                    return Err(Error::ArchitectureModel(
-                        "an explicit Qwen hybrid observer mask is unsupported; the adapter constructs the causal mask from cache state".into(),
-                    ));
-                }
-                model.forward_with_observer(input_tokens, cache, stream, &mut observer)
-            }
-        };
-        result.map_err(|error| safemlx::error::Exception::custom(error.to_string()).into())
+            })?;
+        crate::backend::runtime::distributed::parallel::sample_and_synchronize_bounded(
+            logits,
+            batch_size,
+            sampler,
+            temperature,
+            prng_state,
+            finished,
+            sampling_rank,
+            group,
+            authority,
+            stream,
+        )
     }
 
     /// Submits instrumented prefill through this selected MLX session.
@@ -965,146 +847,28 @@ impl MlxModelSession {
         backend: &MlxBackend<'_>,
         input: MlxModelInput,
         observer: &mut impl RuntimeActivationObserver<MlxTensor, Exception>,
-    ) -> Result<Submission<Array, MlxCompletion>, Error> {
-        match &mut self.inner {
-            MlxSessionKind::Complete(model) => {
-                if self.distributed.is_some() {
-                    return Err(Error::Parallel(
-                        "complete-model execution has no distributed production path".into(),
-                    ));
-                }
-                Self::submit_complete_prefill_with_observer(
-                    model,
-                    input,
-                    backend.stream(),
-                    observer,
-                )
-            }
-        }
-    }
-
-    /// Submits an instrumented prefill for a non-pipeline executable.
-    pub(crate) fn submit_complete_prefill_with_observer(
-        model: &mut Executable,
-        input: MlxModelInput,
-        stream: &Stream,
-        observer: &mut impl RuntimeActivationObserver<MlxTensor, Exception>,
-    ) -> Result<Submission<Array, MlxCompletion>, Error> {
-        let output = input.with_borrowed(|input| {
-            if let Executable::ReplicatedText(_, family) = model {
-                return family.prefill_with_observer(
+    ) -> Result<Submission<Array, MlxSessionCompletion>, Error> {
+        let submission_lease = self.begin_submission()?;
+        let result = (|| {
+            let token_validation_scope = TokenValidationScope::begin()?;
+            let output = input.with_borrowed(|input| {
+                self.model.erased_mut().prefill_with_observer(
                     input,
                     None,
-                    stream,
+                    backend.stream(),
                     &mut ArrayObserverAdapter { inner: observer },
-                );
-            }
-            let logits = match model {
-                Executable::DeepSeek(_, family, cache) => {
-                    let tokens = input::text_token_ids(input, stream)?;
-                    family.forward_with_observer(
-                        &tokens,
-                        None,
-                        cache,
-                        stream,
-                        &mut ArrayObserverAdapter { inner: observer },
-                    )?
-                }
-                Executable::Gemma4(_, family, cache) => family
-                    .prefill_with_observer(
-                        input,
-                        cache,
-                        stream,
-                        &mut ArrayObserverAdapter { inner: observer },
-                    )?
-                    .into_array(),
-                Executable::GptOss(_, family, cache) => {
-                    let tokens = input::text_token_ids(input, stream)?;
-                    family.forward_with_observer(
-                        &tokens,
-                        None,
-                        cache,
-                        stream,
-                        &mut ArrayObserverAdapter { inner: observer },
-                    )?
-                }
-                Executable::Inkling(_, family, cache) => family
-                    .forward_input_with_observer(
-                        input,
-                        cache,
-                        stream,
-                        &mut ArrayObserverAdapter { inner: observer },
-                    )?
-                    .into_array(),
-                Executable::KimiLinear(_, family, cache) => {
-                    let tokens = input::text_token_ids(input, stream)?;
-                    family.forward_with_observer(
-                        &tokens,
-                        None,
-                        cache,
-                        stream,
-                        &mut ArrayObserverAdapter { inner: observer },
-                    )?
-                }
-                Executable::Lfm2(_, family, cache) => {
-                    let tokens = input::text_token_ids(input, stream)?;
-                    family.forward_with_observer(
-                        &tokens,
-                        None,
-                        cache,
-                        stream,
-                        &mut ArrayObserverAdapter { inner: observer },
-                    )?
-                }
-                Executable::ReplicatedText(_, _) => unreachable!(
-                    "replicated observed prefill returned through neutral output selection"
-                ),
-                Executable::MuseGlimmer(_, family, cache) => family
-                    .forward_input_with_observer(
-                        input,
-                        cache,
-                        stream,
-                        &mut ArrayObserverAdapter { inner: observer },
-                    )?
-                    .into_array(),
-                Executable::NemotronH(_, family, cache) => {
-                    let tokens = input::text_token_ids(input, stream)?;
-                    family.forward_with_observer(
-                        &tokens,
-                        None,
-                        cache,
-                        stream,
-                        &mut ArrayObserverAdapter { inner: observer },
-                    )?
-                }
-                Executable::Qwen(_, family, cache) => {
-                    let tokens = input::text_token_ids(input, stream)?;
-                    family.forward_with_observer(
-                        &tokens,
-                        None,
-                        cache,
-                        stream,
-                        &mut ArrayObserverAdapter { inner: observer },
-                    )?
-                }
-                Executable::Qwen3Next(_, family, cache) => family.prefill_input_with_observer(
-                    input,
-                    cache,
-                    stream,
-                    &mut ArrayObserverAdapter { inner: observer },
-                )?,
-                Executable::Qwen35(_, family, cache) => family.prefill_input_with_observer(
-                    input,
-                    cache,
-                    stream,
-                    &mut ArrayObserverAdapter { inner: observer },
-                )?,
-            };
-            logits
-                .try_index_device((.., -1, ..), stream)
-                .map_err(Error::from)
-        })?;
-        MlxCompletion::submission(output)
+                )
+            })?;
+            Ok(model_array_submission(
+                output,
+                token_validation_scope.finish(),
+                submission_lease.clone(),
+            ))
+        })();
+        if result.is_err() {
+            submission_lease.release();
+        }
+        result
     }
 
     fn submit_decode_with_observer(
@@ -1112,32 +876,25 @@ impl MlxModelSession {
         backend: &MlxBackend<'_>,
         input: Array,
         observer: &mut impl RuntimeActivationObserver<MlxTensor, Exception>,
-    ) -> Result<Submission<Array, MlxCompletion>, Error> {
-        match &mut self.inner {
-            MlxSessionKind::Complete(model) => {
-                if self.distributed.is_some() {
-                    return Err(Error::Parallel(
-                        "complete-model execution has no distributed production path".into(),
-                    ));
-                }
-                let output = match model {
-                    Executable::ReplicatedText(_, family) => family.decode_with_observer(
-                        &input,
-                        backend.stream(),
-                        &mut ArrayObserverAdapter { inner: observer },
-                    )?,
-                    other => Self::forward_with_observer(
-                        other,
-                        &input,
-                        None,
-                        backend.stream(),
-                        observer,
-                    )?
-                    .try_index_device((.., -1, ..), backend.stream())?,
-                };
-                MlxCompletion::submission(output)
-            }
+    ) -> Result<Submission<Array, MlxSessionCompletion>, Error> {
+        let submission_lease = self.begin_submission()?;
+        let result = (|| {
+            let token_validation_scope = TokenValidationScope::begin()?;
+            let output = self.model.erased_mut().decode_with_observer(
+                &input,
+                backend.stream(),
+                &mut ArrayObserverAdapter { inner: observer },
+            )?;
+            Ok(model_array_submission(
+                output,
+                token_validation_scope.finish(),
+                submission_lease.clone(),
+            ))
+        })();
+        if result.is_err() {
+            submission_lease.release();
         }
+        result
     }
 }
 
@@ -1156,25 +913,23 @@ impl<'a> BackendSession<MlxBackend<'a>> for MlxModelSession {
         backend: &MlxBackend<'a>,
         input: Self::PrefillInput,
     ) -> Result<Submission<Self::Output, Self::Completion>, Error> {
-        match &mut self.inner {
-            MlxSessionKind::Complete(model) => {
-                if self.distributed.is_some() {
-                    return Err(Error::Parallel(
-                        "complete-model execution has no distributed production path".into(),
-                    ));
-                }
-                let token_validation_scope = TokenValidationScope::begin()?;
-                let output =
-                    input.with_borrowed(|input| prefill_model(model, input, backend.stream()))?;
-                let public_output = match model {
-                    Executable::ReplicatedText(_, executable) => {
-                        executable.partition_public_output()
-                    }
-                    _ => true,
-                };
-                model_submission(output, token_validation_scope.finish(), public_output)
-            }
+        let submission_lease = self.begin_submission()?;
+        let result = (|| {
+            let token_validation_scope = TokenValidationScope::begin()?;
+            let output = input
+                .with_borrowed(|input| prefill_model(&mut self.model, input, backend.stream()))?;
+            let public_output = self.model.erased().partition_public_output();
+            Ok(model_submission(
+                output,
+                token_validation_scope.finish(),
+                public_output,
+                submission_lease.clone(),
+            ))
+        })();
+        if result.is_err() {
+            submission_lease.release();
         }
+        result
     }
 
     fn decode(
@@ -1182,24 +937,22 @@ impl<'a> BackendSession<MlxBackend<'a>> for MlxModelSession {
         backend: &MlxBackend<'a>,
         input: Self::DecodeInput,
     ) -> Result<Submission<Self::Output, Self::Completion>, Error> {
-        match &mut self.inner {
-            MlxSessionKind::Complete(model) => {
-                if self.distributed.is_some() {
-                    return Err(Error::Parallel(
-                        "complete-model execution has no distributed production path".into(),
-                    ));
-                }
-                let token_validation_scope = TokenValidationScope::begin()?;
-                let output = decode_model(model, &input, backend.stream())?;
-                let public_output = match model {
-                    Executable::ReplicatedText(_, executable) => {
-                        executable.partition_public_output()
-                    }
-                    _ => true,
-                };
-                model_submission(output, token_validation_scope.finish(), public_output)
-            }
+        let submission_lease = self.begin_submission()?;
+        let result = (|| {
+            let token_validation_scope = TokenValidationScope::begin()?;
+            let output = decode_model(&mut self.model, &input, backend.stream())?;
+            let public_output = self.model.erased().partition_public_output();
+            Ok(model_submission(
+                output,
+                token_validation_scope.finish(),
+                public_output,
+                submission_lease.clone(),
+            ))
+        })();
+        if result.is_err() {
+            submission_lease.release();
         }
+        result
     }
 
     fn observe_output(
@@ -1228,21 +981,12 @@ impl<'a> InspectableBackendSession<MlxBackend<'a>> for MlxModelSession {
         request: &ObservationRequest,
     ) -> Result<InspectedOutput<Self::Output>, Error> {
         let mut collector = InspectionCollector::new(request);
-        let output = match &mut self.inner {
-            MlxSessionKind::Complete(_) => {
-                let submission =
-                    self.submit_prefill_with_observer(backend, input, &mut collector)?;
-                let logits = submission.wait()?;
-                MlxModelOutput::new(Some(MlxTensor::from_array(logits)))
-            }
-        };
-        let output = match &self.inner {
-            MlxSessionKind::Complete(Executable::ReplicatedText(_, executable))
-                if !executable.partition_public_output() =>
-            {
-                MlxModelOutput::new(None)
-            }
-            _ => output,
+        let submission = self.submit_prefill_with_observer(backend, input, &mut collector)?;
+        let logits = submission.wait()?;
+        let output = if self.model.erased().partition_public_output() {
+            MlxModelOutput::new(Some(MlxTensor::from_array(logits)))
+        } else {
+            MlxModelOutput::new(None)
         };
         let observations = collector.materialize(backend.stream())?;
         Ok(InspectedOutput {
@@ -1258,21 +1002,12 @@ impl<'a> InspectableBackendSession<MlxBackend<'a>> for MlxModelSession {
         request: &ObservationRequest,
     ) -> Result<InspectedOutput<Self::Output>, Error> {
         let mut collector = InspectionCollector::new(request);
-        let output = match &mut self.inner {
-            MlxSessionKind::Complete(_) => {
-                let submission =
-                    self.submit_decode_with_observer(backend, input, &mut collector)?;
-                let logits = submission.wait()?;
-                MlxModelOutput::new(Some(MlxTensor::from_array(logits)))
-            }
-        };
-        let output = match &self.inner {
-            MlxSessionKind::Complete(Executable::ReplicatedText(_, executable))
-                if !executable.partition_public_output() =>
-            {
-                MlxModelOutput::new(None)
-            }
-            _ => output,
+        let submission = self.submit_decode_with_observer(backend, input, &mut collector)?;
+        let logits = submission.wait()?;
+        let output = if self.model.erased().partition_public_output() {
+            MlxModelOutput::new(Some(MlxTensor::from_array(logits)))
+        } else {
+            MlxModelOutput::new(None)
         };
         let observations = collector.materialize(backend.stream())?;
         Ok(InspectedOutput {
@@ -1423,24 +1158,39 @@ fn sample_text_submission(
     })
 }
 
+fn model_array_submission(
+    output: Array,
+    token_validations: TokenValidationBatch,
+    submission_lease: SessionSubmissionLease,
+) -> Submission<Array, MlxSessionCompletion> {
+    let mut retained = Vec::with_capacity(1 + token_validations.arrays().count());
+    retained.push(output.clone());
+    retained.extend(token_validations.arrays().cloned());
+    Submission {
+        output,
+        completion: MlxSessionCompletion {
+            inner: MlxSessionCompletionKind::Model {
+                token_validations,
+                _retained: retained,
+                submission_lease,
+            },
+        },
+    }
+}
+
 fn model_submission(
     output: Array,
     token_validations: TokenValidationBatch,
     public_output: bool,
-) -> Result<Submission<MlxModelOutput, MlxSessionCompletion>, Error> {
-    let submission =
-        MlxCompletion::submission_retaining(output, token_validations.arrays().cloned())?;
-    Ok(Submission {
+    submission_lease: SessionSubmissionLease,
+) -> Submission<MlxModelOutput, MlxSessionCompletion> {
+    let submission = model_array_submission(output, token_validations, submission_lease);
+    Submission {
         output: MlxModelOutput::new(
             public_output.then(|| MlxTensor::from_array(submission.output)),
         ),
-        completion: MlxSessionCompletion {
-            inner: MlxSessionCompletionKind::Model {
-                completion: submission.completion,
-                token_validations,
-            },
-        },
-    })
+        completion: submission.completion,
+    }
 }
 
 #[cfg(test)]
@@ -1498,18 +1248,42 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires local MLX Metal execution"]
-    fn complete_model_submission_completes_token_validation() {
-        let execution = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+    fn completed_model_submission_validates_tokens_and_releases_its_gate() {
+        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let stream = execution.stream();
         let submit = |token| {
             let scope = TokenValidationScope::begin().unwrap();
             validate_token_domain(&Array::from_int(token), 4, None, stream).unwrap();
-            model_submission(Array::from_int(0), scope.finish(), true).unwrap()
+            let validations = scope.finish();
+            safemlx::transforms::async_eval_with_event(validations.arrays())
+                .unwrap()
+                .synchronize()
+                .unwrap();
+            let gate = Rc::new(Cell::new(Some(1)));
+            let submission = model_submission(
+                Array::from_int(0),
+                validations,
+                true,
+                SessionSubmissionLease {
+                    owner: gate.clone(),
+                    ticket: 1,
+                },
+            );
+            (submission, gate)
         };
 
-        submit(3).completion.wait().unwrap();
-        let error = submit(4).completion.wait().unwrap_err();
+        let (valid, valid_gate) = submit(3);
+        valid.completion.wait().unwrap();
+        assert_eq!(valid_gate.get(), None);
+        valid_gate.set(Some(2));
+        drop(valid.completion);
+        assert_eq!(valid_gate.get(), Some(2));
+        let (invalid, invalid_gate) = submit(4);
+        let invalid = invalid.completion;
+        let error = invalid.wait().unwrap_err();
+        assert!(error.to_string().contains("outside 0..4"));
+        assert_eq!(invalid_gate.get(), None);
+        let error = invalid.is_complete().unwrap_err();
         assert!(error.to_string().contains("outside 0..4"));
     }
 

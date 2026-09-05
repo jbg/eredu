@@ -83,12 +83,31 @@ impl<P> RealizedRealtimePolicy<P> {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct RealtimeMaterializationComponent {
     requirement: RealtimeWeightComponentRequirement,
+    source_provenance: Vec<eredu_checkpoint::store::TensorSourceProvenance>,
 }
 
 impl RealtimeMaterializationComponent {
-    /// Pairs an exact selected component with recipe data, when source-backed.
-    pub const fn new(requirement: RealtimeWeightComponentRequirement) -> Self {
-        Self { requirement }
+    /// Pairs an exact selected component with its admission-time physical sources.
+    pub fn new(
+        requirement: RealtimeWeightComponentRequirement,
+        source_provenance: impl IntoIterator<Item = eredu_checkpoint::store::TensorSourceProvenance>,
+    ) -> Result<Self, RealtimeModelContractError> {
+        let source_provenance = source_provenance.into_iter().collect::<Vec<_>>();
+        if requirement.source_occurrences().len() != source_provenance.len()
+            || requirement
+                .source_occurrences()
+                .iter()
+                .zip(&source_provenance)
+                .any(|(expected, actual)| expected.as_str() != actual.catalog_key)
+        {
+            return Err(RealtimeModelContractError::SourceProvenanceMismatch {
+                target: requirement.target().as_str().to_owned(),
+            });
+        }
+        Ok(Self {
+            requirement,
+            source_provenance,
+        })
     }
 
     /// Returns the exact selected component requirement.
@@ -104,6 +123,11 @@ impl RealtimeMaterializationComponent {
     /// Returns admission-time recipe output metadata.
     pub const fn recipe_output(&self) -> Option<&RecipeMetadata> {
         self.requirement.recipe_output()
+    }
+
+    /// Returns exact physical source provenance in recipe traversal order.
+    pub fn source_provenance(&self) -> &[eredu_checkpoint::store::TensorSourceProvenance] {
+        &self.source_provenance
     }
 }
 
@@ -181,6 +205,7 @@ impl RealtimeMaterializationTask {
 }
 
 /// Selected realization paired with complete architecture recipe payloads.
+#[derive(Debug)]
 pub struct PreparedRealtimeModelContract {
     selected: SelectedRealtimeRealization,
     tasks: Vec<RealtimeMaterializationTask>,
@@ -706,6 +731,12 @@ where
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
 #[non_exhaustive]
 pub enum RealtimeModelContractError {
+    /// A component's retained physical sources differ from its selected recipe traversal.
+    #[error("realtime source provenance differs for target {target}")]
+    SourceProvenanceMismatch {
+        /// Affected selected component target.
+        target: String,
+    },
     /// A source-backed companion's inferred geometry differs from selection.
     #[error("realtime recipe geometry differs for target {target}")]
     RecipeGeometryMismatch {

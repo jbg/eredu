@@ -63,6 +63,7 @@ impl SpeculativePublisher<Constraint> for Publisher {
         _: bool,
     ) -> Result<bool, SpeculativeOutputError> {
         self.publications.set(self.publications.get() + 1);
+        record_reference_publication();
         Ok(false)
     }
 
@@ -149,10 +150,54 @@ fn assert_construction_stages(outcome: &ReferenceProductionOutcome) {
             eredu_core::SpeculativeLifecycleStage::Execution,
         ]
     );
+    assert_eq!(
+        outcome.execution_stages,
+        [
+            eredu_core::SpeculativeLifecycleStage::Input,
+            eredu_core::SpeculativeLifecycleStage::Execution,
+            eredu_core::SpeculativeLifecycleStage::Publication,
+            eredu_core::SpeculativeLifecycleStage::Execution,
+            eredu_core::SpeculativeLifecycleStage::Execution,
+            eredu_core::SpeculativeLifecycleStage::Completion,
+            eredu_core::SpeculativeLifecycleStage::Observation,
+            eredu_core::SpeculativeLifecycleStage::CachePersistence,
+            eredu_core::SpeculativeLifecycleStage::Publication,
+        ],
+        "production speculative lifecycle order must be exact"
+    );
+    let committed_speculative_rounds = outcome.accepted.len();
+    for stage in [
+        eredu_core::SpeculativeLifecycleStage::Completion,
+        eredu_core::SpeculativeLifecycleStage::Observation,
+        eredu_core::SpeculativeLifecycleStage::CachePersistence,
+    ] {
+        assert_eq!(
+            outcome
+                .execution_stages
+                .iter()
+                .filter(|observed| **observed == stage)
+                .count(),
+            committed_speculative_rounds,
+            "each committed speculative round must cross {stage:?} exactly once; stages={:?}",
+            outcome.execution_stages
+        );
+    }
+    assert_eq!(
+        outcome
+            .execution_stages
+            .iter()
+            .filter(|observed| **observed == eredu_core::SpeculativeLifecycleStage::Publication)
+            .count(),
+        outcome.publications,
+        "every target-only or speculative commit must cross Publication exactly once"
+    );
 }
 
-#[test]
-fn sequential_embedded_runs_the_inspected_materialized_scheduler_path() {
+#[allow(
+    dead_code,
+    reason = "owned by the unified reference_conformance target"
+)]
+pub(crate) fn sequential_embedded_runs_the_inspected_materialized_scheduler_path() {
     std::thread::Builder::new()
         .name("reference-embedded-sequential".into())
         .stack_size(32 * 1024 * 1024)
@@ -167,8 +212,11 @@ fn sequential_embedded_runs_the_inspected_materialized_scheduler_path() {
         .unwrap();
 }
 
-#[test]
-fn fused_dspark_runs_the_inspected_materialized_scheduler_path() {
+#[allow(
+    dead_code,
+    reason = "owned by the unified reference_conformance target"
+)]
+pub(crate) fn fused_dspark_runs_the_inspected_materialized_scheduler_path() {
     std::thread::Builder::new()
         .name("reference-embedded-fused".into())
         .stack_size(32 * 1024 * 1024)
@@ -184,8 +232,11 @@ fn fused_dspark_runs_the_inspected_materialized_scheduler_path() {
         .unwrap();
 }
 
-#[test]
-fn gemma_runs_the_inspected_materialized_scheduler_path() {
+#[allow(
+    dead_code,
+    reason = "owned by the unified reference_conformance target"
+)]
+pub(crate) fn gemma_runs_the_inspected_materialized_scheduler_path() {
     std::thread::Builder::new()
         .name("reference-gemma-production".into())
         .stack_size(32 * 1024 * 1024)
@@ -208,8 +259,121 @@ fn gemma_runs_the_inspected_materialized_scheduler_path() {
         .unwrap();
 }
 
-#[test]
-fn released_muse_dflash_runs_the_inspected_materialized_scheduler_path() {
+#[allow(
+    dead_code,
+    reason = "owned by the unified reference_conformance target"
+)]
+pub(crate) fn exact_completion_retains_resources_and_failure_rolls_back_before_publication() {
+    std::thread::Builder::new()
+        .name("reference-exact-completion".into())
+        .stack_size(32 * 1024 * 1024)
+        .spawn(|| {
+            let delayed_assistant = reference_gemma_assistant_artifact();
+            let (delayed, delayed_evidence) = with_reference_completion_control(
+                ReferenceCompletionMode::Delayed {
+                    incomplete_polls: 1,
+                },
+                || {
+                    run_reference_external_production(
+                        &production_gemma_target_config(),
+                        delayed_assistant.path(),
+                    )
+                },
+            );
+            let delayed = delayed.expect("delayed exact completion must eventually resolve");
+            assert_construction_stages(&delayed);
+            assert_eq!(delayed_evidence.submissions, 1);
+            assert!(delayed_evidence.polls >= 2);
+            assert_eq!(delayed_evidence.incomplete_polls, 1);
+            assert!(delayed_evidence.retained_at_incomplete_poll > 0);
+            assert!(delayed_evidence.retained_at_wait > 0);
+            assert_eq!(delayed_evidence.waits, 1);
+            assert_eq!(delayed_evidence.failures, 0);
+            assert_eq!(delayed_evidence.drops, delayed_evidence.submissions);
+            assert_eq!(
+                delayed_evidence.released_resources,
+                delayed_evidence.retained_at_wait
+            );
+            assert_eq!(delayed_evidence.publications, delayed.publications);
+            assert_eq!(delayed_evidence.restores, 1);
+            assert_eq!(delayed_evidence.exact_restores, 1);
+            assert_eq!(delayed_evidence.lifecycle, delayed.execution_stages);
+
+            let failed_assistant = reference_gemma_assistant_artifact();
+            let (failed, failed_evidence) = with_reference_completion_control(
+                ReferenceCompletionMode::FailWait,
+                || {
+                    run_reference_external_production(
+                        &production_gemma_target_config(),
+                        failed_assistant.path(),
+                    )
+                },
+            );
+            let error = failed.expect_err("failed exact completion must abort the production run");
+            assert!(error.contains("injected reference exact-completion failure"));
+            assert_eq!(failed_evidence.submissions, 1);
+            assert!(failed_evidence.polls >= 1);
+            assert_eq!(failed_evidence.incomplete_polls, 0);
+            assert_eq!(failed_evidence.waits, 1);
+            assert_eq!(failed_evidence.failures, 1);
+            assert!(failed_evidence.retained_at_wait > 0);
+            assert_eq!(failed_evidence.drops, failed_evidence.submissions);
+            assert_eq!(
+                failed_evidence.released_resources,
+                failed_evidence.retained_at_wait
+            );
+            assert_eq!(
+                failed_evidence.publications, 1,
+                "completion failure must not publish the pending verification"
+            );
+            assert_eq!(failed_evidence.restores, 1);
+            assert_eq!(failed_evidence.exact_restores, 1);
+            assert_eq!(
+                failed_evidence.lifecycle,
+                [
+                    eredu_core::SpeculativeLifecycleStage::Input,
+                    eredu_core::SpeculativeLifecycleStage::Execution,
+                    eredu_core::SpeculativeLifecycleStage::Publication,
+                    eredu_core::SpeculativeLifecycleStage::Execution,
+                    eredu_core::SpeculativeLifecycleStage::Execution,
+                    eredu_core::SpeculativeLifecycleStage::Completion,
+                ],
+                "failed completion must occur after submission and before observation, cache persistence, or publication"
+            );
+
+            let never_assistant = reference_gemma_assistant_artifact();
+            let (never, never_evidence) = with_reference_completion_control(
+                ReferenceCompletionMode::Never,
+                || {
+                    run_reference_external_production(
+                        &production_gemma_target_config(),
+                        never_assistant.path(),
+                    )
+                },
+            );
+            let error = never.expect_err("never-completing work must be quarantined");
+            assert!(error.contains("completion deadline exceeded"));
+            assert_eq!(never_evidence.submissions, 1);
+            assert!(never_evidence.incomplete_polls >= 1);
+            assert!(never_evidence.retained_at_incomplete_poll > 0);
+            assert_eq!(never_evidence.waits, 0);
+            assert_eq!(never_evidence.failures, 0);
+            assert_eq!(never_evidence.quarantines, 1);
+            assert_eq!(never_evidence.drops, 0);
+            assert_eq!(never_evidence.released_resources, 0);
+            assert_eq!(never_evidence.restores, 1);
+            assert_eq!(never_evidence.exact_restores, 1);
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[allow(
+    dead_code,
+    reason = "owned by the unified reference_conformance target"
+)]
+pub(crate) fn released_muse_dflash_runs_the_inspected_materialized_scheduler_path() {
     std::thread::Builder::new()
         .name("reference-muse-production".into())
         .stack_size(64 * 1024 * 1024)
@@ -228,4 +392,34 @@ fn released_muse_dflash_runs_the_inspected_materialized_scheduler_path() {
         .unwrap()
         .join()
         .unwrap();
+}
+
+#[cfg(test)]
+mod unified_conformance_compatibility_wrappers {
+    use super::*;
+
+    #[test]
+    fn sequential_embedded() {
+        sequential_embedded_runs_the_inspected_materialized_scheduler_path();
+    }
+
+    #[test]
+    fn fused_dspark() {
+        fused_dspark_runs_the_inspected_materialized_scheduler_path();
+    }
+
+    #[test]
+    fn gemma_external() {
+        gemma_runs_the_inspected_materialized_scheduler_path();
+    }
+
+    #[test]
+    fn exact_completion_lifetime_and_failure() {
+        exact_completion_retains_resources_and_failure_rolls_back_before_publication();
+    }
+
+    #[test]
+    fn muse_dflash_external() {
+        released_muse_dflash_runs_the_inspected_materialized_scheduler_path();
+    }
 }

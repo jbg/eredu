@@ -4,7 +4,8 @@ use eredu::api::{
 use eredu_architectures::ModelKind;
 use eredu_core::{
     ArtifactFormat, AutomaticPlanRequest, BackendDescriptor, BackendProvider, BackendSession,
-    Completion, DeviceCapabilities, DeviceDescriptor, DevicePlan, GenerationConfigOverrides,
+    BoundedCompletion, BoundedCompletionOutcome, BoundedCompletionWait, Completion,
+    DeviceCapabilities, DeviceDescriptor, DevicePlan, GenerationConfigOverrides,
     InspectionReadiness, ModelInspectionReport, ModelRuntime, ObservationSet, ObservationValue,
     PreparedModel, SessionCapabilities, Submission, TextGenerationBackend, TextGenerationConfig,
     TokenFilter, TokenOutput,
@@ -33,6 +34,15 @@ impl Completion for Complete {
 
     fn wait(&self) -> Result<(), Self::Error> {
         Ok(())
+    }
+}
+
+impl BoundedCompletion for Complete {
+    fn wait_bounded(
+        self,
+        _policy: BoundedCompletionWait,
+    ) -> Result<BoundedCompletionOutcome, Self::Error> {
+        Ok(BoundedCompletionOutcome::Completed)
     }
 }
 

@@ -1,5 +1,8 @@
 //! Portable generation configuration, lifecycle, and speculative bookkeeping.
 
+use crate::backend::{
+    BoundedCompletionWait, BoundedCompletionWaitError, CompletionCancellationMode,
+};
 use serde::{Deserialize, Serialize};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -359,6 +362,7 @@ impl SpeculativeConfig {
 
 /// Bounded fair-scheduler settings for speculative requests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SpeculativeSchedulerOptions {
     /// Maximum retained target verification transactions.
     pub max_in_flight_verifications: usize,
@@ -370,6 +374,10 @@ pub struct SpeculativeSchedulerOptions {
     pub adaptive_lookahead: bool,
     /// Resolved branches required before adaptive disabling.
     pub adaptive_lookahead_min_blocks: usize,
+    /// Maximum milliseconds spent awaiting one exact verification completion.
+    pub completion_timeout_milliseconds: u64,
+    /// Safe disposition required if verification remains live at its deadline.
+    pub completion_cancellation: CompletionCancellationMode,
 }
 
 impl Default for SpeculativeSchedulerOptions {
@@ -380,6 +388,8 @@ impl Default for SpeculativeSchedulerOptions {
             lookahead_blocks: 1,
             adaptive_lookahead: true,
             adaptive_lookahead_min_blocks: 4,
+            completion_timeout_milliseconds: 30_000,
+            completion_cancellation: CompletionCancellationMode::QuarantineUntilComplete,
         }
     }
 }
@@ -392,6 +402,35 @@ impl SpeculativeSchedulerOptions {
             self.max_optimistic_branches = self.max_optimistic_branches.max(1);
         }
         self
+    }
+
+    /// Selects the exact-completion deadline and safe timeout disposition.
+    pub fn with_completion_wait(
+        mut self,
+        timeout: std::time::Duration,
+        cancellation: CompletionCancellationMode,
+    ) -> Result<Self, GenerationError> {
+        let timeout = u64::try_from(timeout.as_millis())
+            .map_err(|_| GenerationError::SpeculativeCompletionTimeoutTooLarge)?;
+        if timeout == 0 {
+            return Err(GenerationError::ZeroSpeculativeCompletionTimeout);
+        }
+        self.completion_timeout_milliseconds = timeout;
+        self.completion_cancellation = cancellation;
+        Ok(self)
+    }
+
+    /// Resolves the portable fields into the bounded backend completion policy.
+    pub fn completion_wait(self) -> Result<BoundedCompletionWait, GenerationError> {
+        BoundedCompletionWait::new(
+            std::time::Duration::from_millis(self.completion_timeout_milliseconds),
+            self.completion_cancellation,
+        )
+        .map_err(|error| match error {
+            BoundedCompletionWaitError::ZeroTimeout => {
+                GenerationError::ZeroSpeculativeCompletionTimeout
+            }
+        })
     }
 
     /// Validates scheduler capacity and lookahead invariants.
@@ -411,6 +450,7 @@ impl SpeculativeSchedulerOptions {
         {
             return Err(GenerationError::ZeroAdaptiveLookaheadWindow);
         }
+        self.completion_wait()?;
         Ok(self)
     }
 }
@@ -917,6 +957,12 @@ pub enum GenerationError {
     /// Adaptive lookahead needs a non-zero observation window.
     #[error("speculative adaptive_lookahead_min_blocks must be positive")]
     ZeroAdaptiveLookaheadWindow,
+    /// Exact verification must always have a positive completion deadline.
+    #[error("speculative completion timeout must be positive")]
+    ZeroSpeculativeCompletionTimeout,
+    /// The host duration cannot be represented by the portable millisecond field.
+    #[error("speculative completion timeout is too large")]
+    SpeculativeCompletionTimeoutTooLarge,
     /// Active requests expose no legal scheduler action.
     #[error("speculative scheduler reached a non-terminal state with no eligible operation")]
     StalledSpeculativeSchedule,

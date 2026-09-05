@@ -808,6 +808,13 @@ pub struct CapabilityEstimate {
 }
 
 impl CapabilityEstimate {
+    /// Reuses an exact mechanism/state estimate for an architecture extension
+    /// that implements the same validated neutral geometry under a new identity.
+    pub fn for_architecture_extension(mut self, effective_model_type: impl Into<String>) -> Self {
+        self.capabilities.effective_model_type = effective_model_type.into();
+        self
+    }
+
     /// Returns validated portable model capabilities.
     pub const fn capabilities(&self) -> &ModelCapabilities {
         &self.capabilities

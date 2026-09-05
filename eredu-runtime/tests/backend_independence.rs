@@ -3159,8 +3159,11 @@ fn try_select_reference_text(
         vec!["decoder.weight".into()],
         vec![ReplicatedTextPhysicalSource::new(
             "decoder.weight",
+            "decoder.weight",
             "model.safetensors",
             "decoder.weight",
+            source.clone(),
+            4,
         )
         .unwrap()],
         vec!["decoder.weight.alias".into()],

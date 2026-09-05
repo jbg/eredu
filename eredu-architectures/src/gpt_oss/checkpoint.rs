@@ -553,7 +553,10 @@ fn safetensors_expert_constraints(
             vec![geometry.experts, fused, geometry.hidden / MXFP4_GROUP_SIZE],
             StoredDtypeConstraint::Exact(StoredDtype::U8),
         )
-        .companion(),
+        .linear_companion(
+            format!("{root}.gate_up_proj_blocks"),
+            eredu_checkpoint::schema::LinearCompanionKind::Scale,
+        ),
         floating(
             format!("{root}.gate_up_proj_bias"),
             vec![geometry.experts, fused],
@@ -578,7 +581,10 @@ fn safetensors_expert_constraints(
             ],
             StoredDtypeConstraint::Exact(StoredDtype::U8),
         )
-        .companion(),
+        .linear_companion(
+            format!("{root}.down_proj_blocks"),
+            eredu_checkpoint::schema::LinearCompanionKind::Scale,
+        ),
         floating(
             format!("{root}.down_proj_bias"),
             vec![geometry.experts, geometry.hidden],

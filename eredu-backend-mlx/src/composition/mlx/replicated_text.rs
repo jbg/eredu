@@ -158,6 +158,7 @@ use crate::{
     backend::{
         error::Error,
         nn::shared::MlxNeuralBackend,
+        nn::tensor::{active_token_validation_arrays, validate_active_token_validations},
         runtime::{
             cache::{
                 residency::{
@@ -504,7 +505,11 @@ pub(crate) fn capabilities(
     request: &ReplicatedTextSelectionRequest,
 ) -> BackendMechanismCapabilities {
     let mut weight_lowerings = Vec::new();
-    for parameter in requirements.parameters() {
+    for parameter in requirements
+        .parameters()
+        .iter()
+        .chain(requirements.auxiliary_parameters())
+    {
         if !parameter.has_lowering_source() {
             continue;
         }
@@ -940,12 +945,18 @@ where
     M: Parameterized<MlxTensor>,
 {
     use crate::backend::runtime::checkpoint::binding::{
-        build_module_bindings_with_recipes, materialize_module_bindings,
+        build_exact_replicated_text_bindings, materialize_module_bindings,
         populate_module_from_arrays_excluding,
     };
 
-    let (source, mut local, recipes) = prepared.into_parts();
-    let bindings = build_module_bindings_with_recipes(&source, "", store, recipes)?;
+    let (source, mut local, selected_tasks) = prepared.into_parts();
+    let task_refs = selected_tasks.iter().collect::<Vec<_>>();
+    let bindings = build_exact_replicated_text_bindings(
+        &source,
+        store,
+        &task_refs,
+        &std::collections::BTreeSet::new(),
+    )?;
     let bindings = match layout {
         Some(layout) => shard_unmaterialized_bindings(
             bindings,
@@ -1093,9 +1104,6 @@ where
 }
 
 pub(crate) trait ErasedExternalPredictionExecutable: 'static {
-    fn external_assistant_target_profile(
-        &self,
-    ) -> eredu_architectures::external_assistant::ExternalAssistantTargetProfile;
     fn prepare_external_prediction_target_cache(
         &mut self,
     ) -> Result<MlxPredictionTargetState, Error>;
@@ -1173,9 +1181,6 @@ pub(crate) trait ErasedReplicatedTextExecutable {
     ) -> bool {
         false
     }
-    fn external_prediction(&self) -> Option<&(dyn ErasedExternalPredictionExecutable + 'static)> {
-        None
-    }
     fn external_prediction_mut(
         &mut self,
     ) -> Option<&mut (dyn ErasedExternalPredictionExecutable + 'static)> {
@@ -1238,6 +1243,7 @@ pub(crate) trait ErasedReplicatedTextExecutable {
     fn cache_residency_report(&self) -> Result<Option<CacheResidencyReport>, Exception>;
     fn prefill(&mut self, input: input::ModelInput<'_>, stream: &Stream) -> Result<Array, Error>;
     fn decode(&mut self, tokens: &Array, stream: &Stream) -> Result<Array, Error>;
+    #[cfg(test)]
     fn forward_with_observer(
         &mut self,
         tokens: &Array,
@@ -1327,6 +1333,7 @@ pub(crate) trait MlxStateMechanisms: LayerRuntimeState<MlxNeuralBackend> + Sized
     fn residency_report(&self) -> Result<Option<CacheResidencyReport>, Exception>;
     fn retained_arrays(&self) -> Vec<&Array>;
     fn deep_checkpoint(&self) -> Result<Self, Exception>;
+    fn fork_prediction_target_state(&self, stream: &Stream) -> Result<Self, Exception>;
     fn restore_checkpoint(&mut self, checkpoint: &Self, stream: &Stream) -> Result<(), Exception>;
     #[cfg(test)]
     fn state_snapshot(&self) -> Vec<(i32, Vec<(eredu_core::cache::StateTensorRole, bool)>)>;
@@ -1344,6 +1351,15 @@ pub(crate) trait MlxStateMechanisms: LayerRuntimeState<MlxNeuralBackend> + Sized
     >;
     #[cfg(test)]
     fn retained_numeric_snapshot(&self) -> Result<RetainedNumericStateSnapshot, Exception>;
+}
+
+fn fork_mlx_prediction_target_state<S: MlxStateMechanisms>(
+    state: &S,
+    stream: &Stream,
+) -> Result<S, Error> {
+    state
+        .fork_prediction_target_state(stream)
+        .map_err(Into::into)
 }
 
 fn selected_state_manager(
@@ -1443,6 +1459,10 @@ impl MlxStateMechanisms for MlxKeyValueState {
 
     fn deep_checkpoint(&self) -> Result<Self, Exception> {
         self.deep_clone_state()
+    }
+
+    fn fork_prediction_target_state(&self, stream: &Stream) -> Result<Self, Exception> {
+        MlxKeyValueState::fork_prediction_target_state(self, stream)
     }
 
     fn restore_checkpoint(&mut self, checkpoint: &Self, stream: &Stream) -> Result<(), Exception> {
@@ -1559,6 +1579,10 @@ impl MlxStateMechanisms for MlxHybridState {
 
     fn deep_checkpoint(&self) -> Result<Self, Exception> {
         self.deep_clone_state()
+    }
+
+    fn fork_prediction_target_state(&self, stream: &Stream) -> Result<Self, Exception> {
+        MlxHybridState::fork_prediction_target_state(self, stream)
     }
 
     fn restore_checkpoint(&mut self, checkpoint: &Self, stream: &Stream) -> Result<(), Exception> {
@@ -1715,6 +1739,10 @@ impl MlxStateMechanisms for MlxPoolingAttentionState {
         eredu_runtime::DeviceState::create(self.layout().clone(), |layer, _| {
             self.as_ref()[layer].deep_clone_state()
         })
+    }
+
+    fn fork_prediction_target_state(&self, stream: &Stream) -> Result<Self, Exception> {
+        MlxPoolingAttentionStateFactory::fork_prediction_target_state(self, stream)
     }
 
     fn restore_checkpoint(&mut self, checkpoint: &Self, stream: &Stream) -> Result<(), Exception> {
@@ -2523,6 +2551,15 @@ where
             .map_err(Into::into)
     }
 
+    fn fork_prediction_target_state(
+        &mut self,
+        state: &S,
+        _selected: &SelectedStateRealization,
+        context: &Stream,
+    ) -> Result<S, Error> {
+        fork_mlx_prediction_target_state(state, context)
+    }
+
     fn load_prompt_cache(
         &mut self,
         directory: &Path,
@@ -2590,9 +2627,14 @@ where
     fn complete(&mut self, output: &MlxTensor, state: &S, _context: &Stream) -> Result<(), Error> {
         #[cfg(test)]
         super::path_instrumentation::completion();
-        async_eval_with_event(std::iter::once(output.as_array()).chain(state.retained_arrays()))?
-            .synchronize()
-            .map_err(Into::into)
+        let token_validations = active_token_validation_arrays();
+        async_eval_with_event(
+            std::iter::once(output.as_array())
+                .chain(state.retained_arrays())
+                .chain(token_validations.iter()),
+        )?
+        .synchronize()?;
+        validate_active_token_validations().map_err(Into::into)
     }
 }
 
@@ -3202,6 +3244,7 @@ where
         Ok(self.published(output))
     }
 
+    #[cfg(test)]
     fn forward_with_observer(
         &mut self,
         tokens: &Array,
@@ -3897,10 +3940,6 @@ where
         self.partition_public_output
     }
 
-    fn external_prediction(&self) -> Option<&(dyn ErasedExternalPredictionExecutable + 'static)> {
-        A::external_assistant_target_profile(&self.admission).map(|_| self as _)
-    }
-
     fn external_prediction_mut(
         &mut self,
     ) -> Option<&mut (dyn ErasedExternalPredictionExecutable + 'static)> {
@@ -4199,6 +4238,7 @@ where
         Ok(self.published(output))
     }
 
+    #[cfg(test)]
     fn forward_with_observer(
         &mut self,
         tokens: &Array,
@@ -4286,13 +4326,6 @@ where
         + 'static,
     P: 'static,
 {
-    fn external_assistant_target_profile(
-        &self,
-    ) -> eredu_architectures::external_assistant::ExternalAssistantTargetProfile {
-        A::external_assistant_target_profile(&self.admission)
-            .expect("external prediction capability checked before borrowing")
-    }
-
     fn prepare_external_prediction_target_cache(
         &mut self,
     ) -> Result<MlxPredictionTargetState, Error> {
@@ -4654,7 +4687,6 @@ impl
             eredu_runtime::ParameterBankResidency::IndependentCache(options) => {
                 let bank = selected_addressable_bank(
                     routed.addressable_members(),
-                    routed.addressable_quantization(),
                     store,
                     options,
                     self.weights_stream,
@@ -4788,7 +4820,6 @@ impl CompositeTextArchitectureVisitor<MlxNeuralBackend, MlxHybridState>
             eredu_runtime::ParameterBankResidency::IndependentCache(options) => {
                 let bank = selected_addressable_bank(
                     routed.addressable_members(),
-                    routed.addressable_quantization(),
                     store,
                     options,
                     self.weights_stream,
@@ -4903,38 +4934,24 @@ pub(super) fn bind_routed_text(
 
 fn selected_addressable_bank(
     members: &[eredu_runtime::AddressableBankMember],
-    quantization: Option<eredu_checkpoint::WeightQuantization>,
     store: Arc<dyn CheckpointSource>,
     options: eredu_runtime::ParameterBankLoadOptions,
     weights_stream: &Stream,
     stream: &Stream,
 ) -> Result<crate::backend::runtime::residency::parameter_bank::AddressableParameterBank, Error> {
-    let entries =
+    let selected =
         crate::backend::runtime::residency::parameter_bank::entries_from_selected_members(
             members,
             store.as_ref(),
         )?;
-    match quantization {
-        Some(quantization) =>
-            crate::backend::runtime::residency::parameter_bank::AddressableParameterBank::new_quantized_shared(
-                store,
-                entries,
-                options,
-                quantization,
-                weights_stream.clone(),
-                stream.clone(),
-            )
-            .map_err(Into::into),
-        None =>
-            crate::backend::runtime::residency::parameter_bank::AddressableParameterBank::new_shared(
-                store,
-                entries,
-                options,
-                weights_stream.clone(),
-                stream.clone(),
-            )
-            .map_err(Into::into),
-    }
+    crate::backend::runtime::residency::parameter_bank::AddressableParameterBank::new_selected_shared(
+        store,
+        selected,
+        options,
+        weights_stream.clone(),
+        stream.clone(),
+    )
+    .map_err(Into::into)
 }
 
 fn shard_addressable_members(
@@ -4945,20 +4962,50 @@ fn shard_addressable_members(
     members
         .iter()
         .map(|member| {
-            let bindings = shard_addressable_member_bindings(
-                member.source().bindings().to_vec(),
-                store,
-                layout,
-            )?;
-            let selected_bytes = bindings.iter().try_fold(0u64, |total, binding| {
-                total.checked_add(binding.expected_bytes()).ok_or_else(|| {
-                    Error::ArchitectureModel(
-                        "rank-local addressable member byte geometry overflowed".into(),
-                    )
+            let source_bindings = member
+                .parameters()
+                .iter()
+                .map(|parameter| {
+                    eredu_runtime::WeightBinding::from_recipe(
+                        parameter.binding_name(),
+                        parameter.recipe().clone(),
+                        parameter.source_bytes(),
+                    )?
+                    .with_logical_target(parameter.task().name())
+                    .map_err(Into::into)
                 })
-            })?;
-            eredu_runtime::AddressableBankMember::new(member.key(), bindings, selected_bytes)
-                .map_err(|error| Error::ArchitectureModel(error.to_string()))
+                .collect::<Result<Vec<_>, Error>>()?;
+            let bindings = shard_addressable_member_bindings(source_bindings, store, layout)?;
+            let parameters = member
+                .parameters()
+                .iter()
+                .zip(bindings)
+                .map(|(parameter, binding)| {
+                    let recipe = binding.source_recipe();
+                    let metadata = recipe.infer(store)?;
+                    let selected_bytes = eredu_runtime::selected_addressable_parameter_bytes(
+                        parameter.task(),
+                        &metadata,
+                    )
+                    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+                    let companions = parameter.quantization_companions().cloned();
+                    eredu_runtime::AddressableBankParameter::new(
+                        parameter.binding_name(),
+                        parameter.task().clone(),
+                        recipe,
+                        metadata,
+                        selected_bytes,
+                        companions,
+                    )
+                    .map_err(|error| Error::ArchitectureModel(error.to_string()))
+                })
+                .collect::<Result<Vec<_>, Error>>()?;
+            eredu_runtime::AddressableBankMember::new(
+                member.key(),
+                member.placement().clone(),
+                parameters,
+            )
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))
         })
         .collect()
 }
@@ -4966,7 +5013,6 @@ fn shard_addressable_members(
 #[allow(clippy::too_many_arguments)]
 fn selected_addressable_partition_bank(
     members: &[eredu_runtime::AddressableBankMember],
-    quantization: Option<eredu_checkpoint::WeightQuantization>,
     store: Arc<dyn CheckpointSource>,
     options: eredu_runtime::ParameterBankLoadOptions,
     layout: &eredu_runtime::LocalModelLayout,
@@ -4980,14 +5026,7 @@ fn selected_addressable_partition_bank(
     Error,
 > {
     let members = shard_addressable_members(members, store.as_ref(), layout)?;
-    let bank = selected_addressable_bank(
-        &members,
-        quantization,
-        store,
-        options,
-        weights_stream,
-        stream,
-    )?;
+    let bank = selected_addressable_bank(&members, store, options, weights_stream, stream)?;
     let selected_member_bytes = members
         .iter()
         .map(|member| {
@@ -5074,7 +5113,6 @@ impl eredu_architectures::Relu2RoutedTextArchitectureVisitor<MlxNeuralBackend, M
             eredu_runtime::ParameterBankResidency::IndependentCache(options) => {
                 let bank = selected_addressable_bank(
                     prepared.addressable_members(),
-                    prepared.addressable_quantization(),
                     store,
                     options,
                     self.weights_stream,
@@ -5183,7 +5221,6 @@ where
         eredu_runtime::ParameterBankResidency::IndependentCache(options) => {
             let bank = selected_addressable_bank(
                 prepared.addressable_members(),
-                prepared.addressable_quantization(),
                 store,
                 options,
                 weights_stream,
@@ -5292,7 +5329,6 @@ where
         eredu_runtime::ParameterBankResidency::IndependentCache(options) => {
             let bank = selected_addressable_bank(
                 prepared.addressable_members(),
-                prepared.addressable_quantization(),
                 store,
                 options,
                 weights_stream,
@@ -5808,6 +5844,64 @@ impl_partitioned_prediction_binding!(MlxHybridState);
 impl_partitioned_prediction_binding!(MlxPoolingAttentionState);
 
 impl
+    eredu_architectures::partitioned_execution::RoutedPartitionedPredictionTargetProductionVisitor<
+        MlxNeuralBackend,
+        MlxHybridState,
+        MlxEmbeddedPredictionMaterializer,
+        eredu_nn::GroupedRelu2Spec,
+    > for PartitionedPredictionBindingVisitor<'_>
+{
+    type Output = Box<dyn ErasedReplicatedTextExecutable>;
+    type Error = Error;
+
+    fn visit<A, G>(
+        self,
+        prepared: eredu_architectures::partitioned_execution::PreparedRoutedPartitionedArchitecture<
+            MlxNeuralBackend,
+            A,
+            G,
+            <A as eredu_runtime::PartitionedLayeredArchitecture<
+                MlxNeuralBackend,
+                MlxHybridState,
+            >>::Boundary,
+            eredu_nn::GroupedRelu2Spec,
+        >,
+        extension: <A as eredu_architectures::prediction_extension::MaterializedPredictionTarget<
+            MlxNeuralBackend,
+        >>::Extension<MlxEmbeddedPredictionMaterializer>,
+        store: Arc<dyn CheckpointSource>,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        A: eredu_architectures::partitioned_execution::TextPartitionArchitecture<
+                MlxNeuralBackend,
+                MlxHybridState,
+            > + ReplicatedTextArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error>
+            + eredu_runtime::ParallelRoutedLayeredArchitecture<MlxNeuralBackend, MlxHybridState>
+            + eredu_architectures::prediction_extension::MaterializedPredictionTarget<
+                MlxNeuralBackend,
+            > + 'static,
+        A::StaticModules: Clone,
+        G: 'static,
+    {
+        bind_partitioned_relu2_resident(
+            prepared,
+            store,
+            self.distributed,
+            self.additional_claimed_sources,
+            self.stream,
+            self.weights_stream,
+            PredictionReplicatedFinalizer {
+                prediction: SelectedPrediction {
+                    extension,
+                    selected: self.selected,
+                },
+                capability: self.capability,
+            },
+        )
+    }
+}
+
+impl
     eredu_architectures::partitioned_execution::RoutedPartitionedProductionVisitor<
         MlxNeuralBackend,
         MlxHybridState,
@@ -5888,8 +5982,10 @@ impl
             prepared,
             store,
             self.distributed,
+            std::collections::BTreeSet::new(),
             self.stream,
             self.weights_stream,
+            OrdinaryReplicatedFinalizer,
         )
     }
 }
@@ -6295,7 +6391,6 @@ where
             }
             let (selected_member_bytes, bank) = selected_addressable_partition_bank(
                 prepared.addressable_members(),
-                prepared.addressable_quantization(),
                 Arc::clone(&store),
                 options,
                 prepared.layout(),
@@ -6328,7 +6423,7 @@ where
     }
 }
 
-fn bind_partitioned_relu2_resident<A, G>(
+fn bind_partitioned_relu2_resident<A, G, F>(
     prepared: eredu_architectures::partitioned_execution::PreparedRoutedPartitionedArchitecture<
         MlxNeuralBackend,
         A,
@@ -6341,8 +6436,10 @@ fn bind_partitioned_relu2_resident<A, G>(
     >,
     store: Arc<dyn CheckpointSource>,
     distributed: crate::backend::distributed::MlxDistributedSession,
+    additional_claimed_sources: std::collections::BTreeSet<String>,
     stream: &Stream,
     weights_stream: &Stream,
+    finalizer: F,
 ) -> Result<Box<dyn ErasedReplicatedTextExecutable>, Error>
 where
     A: eredu_architectures::partitioned_execution::TextPartitionArchitecture<
@@ -6353,6 +6450,7 @@ where
         + 'static,
     A::StaticModules: Clone,
     G: 'static,
+    F: ReplicatedExecutableFinalizer<A, MlxHybridState>,
 {
     match prepared.bank_residency() {
         eredu_runtime::ParameterBankResidency::WithLayer => {
@@ -6365,10 +6463,10 @@ where
                 distributed,
                 provider,
                 None,
-                std::collections::BTreeSet::new(),
+                additional_claimed_sources,
                 stream,
                 weights_stream,
-                OrdinaryReplicatedFinalizer,
+                finalizer,
             )
         }
         eredu_runtime::ParameterBankResidency::IndependentCache(options) => {
@@ -6380,15 +6478,14 @@ where
                     distributed,
                     provider,
                     None,
-                    std::collections::BTreeSet::new(),
+                    additional_claimed_sources,
                     stream,
                     weights_stream,
-                    OrdinaryReplicatedFinalizer,
+                    finalizer,
                 );
             }
             let (selected_member_bytes, bank) = selected_addressable_partition_bank(
                 prepared.addressable_members(),
-                prepared.addressable_quantization(),
                 Arc::clone(&store),
                 options,
                 prepared.layout(),
@@ -6409,10 +6506,10 @@ where
                 distributed,
                 provider,
                 Some(bank),
-                std::collections::BTreeSet::new(),
+                additional_claimed_sources,
                 stream,
                 weights_stream,
-                OrdinaryReplicatedFinalizer,
+                finalizer,
             )
         }
         _ => Err(Error::ArchitectureModel(
@@ -7705,7 +7802,7 @@ pub(crate) fn bind_partitioned_routed_decoder(
             .map_err(|error| Error::ArchitectureModel(error.to_string()))
         },
         |(store, distributed, _, stream, weights_stream), inspection, selected| {
-            eredu_architectures::partitioned_execution::visit_deepseek_v4_routed_partitioned_production::<
+            eredu_architectures::partitioned_execution::visit_pooling_routed_partitioned_production::<
                 MlxNeuralBackend,
                 MlxPoolingAttentionState,
                 _,
@@ -7790,11 +7887,39 @@ pub(crate) fn bind_partitioned_routed_prediction_decoder(
             )
             .map_err(|error| Error::ArchitectureModel(error.to_string()))
         },
-        |_, _, _| {
-            Err(Error::ArchitectureModel(
-                "the selected ReLU-squared routed partition has no embedded prediction target"
-                    .into(),
-            ))
+        |(
+            extension,
+            realization,
+            capability,
+            store,
+            distributed,
+            additional,
+            stream,
+            weights_stream,
+        ),
+         inspection,
+         selected| {
+            eredu_architectures::partitioned_execution::visit_relu2_routed_partitioned_prediction_target_production::<
+                MlxNeuralBackend,
+                MlxHybridState,
+                MlxEmbeddedPredictionMaterializer,
+                _,
+            >(
+                inspection,
+                selected,
+                extension,
+                store,
+                stream,
+                PartitionedPredictionBindingVisitor {
+                    distributed,
+                    additional_claimed_sources: additional,
+                    stream,
+                    weights_stream,
+                    selected: realization,
+                    capability,
+                },
+            )
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))
         },
         |(
             extension,
@@ -7808,7 +7933,7 @@ pub(crate) fn bind_partitioned_routed_prediction_decoder(
         ),
          inspection,
          selected| {
-            eredu_architectures::partitioned_execution::visit_deepseek_v4_routed_partitioned_prediction_target_production::<
+            eredu_architectures::partitioned_execution::visit_pooling_routed_partitioned_prediction_target_production::<
                 MlxNeuralBackend,
                 MlxPoolingAttentionState,
                 MlxEmbeddedPredictionMaterializer,
@@ -7925,6 +8050,11 @@ impl ReplicatedTextProfileDispatcher<MlxNeuralBackend> for BindingVisitor<'_> {
 }
 
 fn valid_packed_geometry(descriptor: &WeightLoweringDescriptor) -> bool {
+    if descriptor.executable() != LinearFormat::Dense
+        && descriptor.packed_axis() != descriptor.logical_shape().len().checked_sub(1)
+    {
+        return false;
+    }
     let Some(extent) = descriptor.packed_extent() else {
         return false;
     };
@@ -7999,6 +8129,17 @@ fn valid_direct_source_geometry(descriptor: &WeightLoweringDescriptor) -> bool {
                     == descriptor.logical_shape()[axis].checked_mul(bits)
             }) && valid_packed_geometry(descriptor)
         }
+        SourceTensorEncoding::RecipeOutput(dtype) => {
+            let equivalent = WeightLoweringDescriptor::new(
+                SourceTensorEncoding::Safetensors(dtype.clone()),
+                descriptor.executable(),
+                descriptor.physical_shape().to_vec(),
+                descriptor.logical_shape().to_vec(),
+                descriptor.packed_axis(),
+            )
+            .expect("validated recipe-output descriptor remains valid");
+            valid_direct_source_geometry(&equivalent)
+        }
         _ => {
             descriptor.physical_shape() == descriptor.logical_shape()
                 && (descriptor.executable() == LinearFormat::Dense
@@ -8007,13 +8148,24 @@ fn valid_direct_source_geometry(descriptor: &WeightLoweringDescriptor) -> bool {
     }
 }
 
-fn supports_direct(descriptor: &WeightLoweringDescriptor) -> bool {
+pub(crate) fn supports_direct(descriptor: &WeightLoweringDescriptor) -> bool {
     let source = descriptor.source();
     let executable = descriptor.executable();
     let supported = match (source, executable) {
         (
             SourceTensorEncoding::Safetensors(
                 StoredDtype::F16 | StoredDtype::BF16 | StoredDtype::F32,
+            ),
+            LinearFormat::Dense,
+        ) => true,
+        (
+            SourceTensorEncoding::RecipeOutput(
+                StoredDtype::F16
+                | StoredDtype::BF16
+                | StoredDtype::F32
+                | StoredDtype::U8
+                | StoredDtype::I32
+                | StoredDtype::F8E8M0,
             ),
             LinearFormat::Dense,
         ) => true,
@@ -8029,14 +8181,24 @@ fn supports_direct(descriptor: &WeightLoweringDescriptor) -> bool {
         (SourceTensorEncoding::Safetensors(StoredDtype::U32), LinearFormat::MxFp4) => true,
         (SourceTensorEncoding::Safetensors(StoredDtype::U8), LinearFormat::MxFp4) => true,
         (SourceTensorEncoding::Safetensors(StoredDtype::F4), LinearFormat::MxFp4) => true,
+        (SourceTensorEncoding::RecipeOutput(StoredDtype::U32), LinearFormat::Affine(format)) => {
+            format.validate().is_ok()
+        }
+        (SourceTensorEncoding::RecipeOutput(StoredDtype::U32), LinearFormat::MxFp4) => true,
+        (SourceTensorEncoding::RecipeOutput(StoredDtype::U8), LinearFormat::MxFp4) => true,
+        (SourceTensorEncoding::RecipeOutput(StoredDtype::F4), LinearFormat::MxFp4) => true,
         (
             SourceTensorEncoding::Safetensors(StoredDtype::F8E4M3),
             LinearFormat::E4M3BlockFp8(format),
         ) => format.validate().is_ok(),
-        (SourceTensorEncoding::Gguf { ggml_type, .. }, LinearFormat::Dense) => matches!(
-            ggml_type,
-            eredu_gguf::GgmlType::F16 | eredu_gguf::GgmlType::F32 | eredu_gguf::GgmlType::Bf16
-        ),
+        (SourceTensorEncoding::Gguf { ggml_type, .. }, LinearFormat::Dense) => {
+            matches!(
+                ggml_type,
+                eredu_gguf::GgmlType::F16 | eredu_gguf::GgmlType::F32 | eredu_gguf::GgmlType::Bf16
+            ) || gguf_affine(*ggml_type).is_some()
+                || *ggml_type == eredu_gguf::GgmlType::MxFp4
+                || NativeQuantizationFormat::from_ggml_type(*ggml_type).is_some()
+        }
         (SourceTensorEncoding::Gguf { ggml_type, .. }, LinearFormat::Affine(format)) => {
             gguf_affine(*ggml_type).is_some_and(|native| native == format)
         }
@@ -8059,11 +8221,15 @@ fn supports_direct(descriptor: &WeightLoweringDescriptor) -> bool {
     supported && valid_direct_source_geometry(descriptor)
 }
 
-fn supports_transform(descriptor: &WeightLoweringDescriptor) -> bool {
+pub(crate) fn supports_transform(descriptor: &WeightLoweringDescriptor) -> bool {
     let source = descriptor.source();
     let executable = descriptor.executable();
     let decodable = match source {
         SourceTensorEncoding::Safetensors(dtype) => matches!(
+            dtype,
+            StoredDtype::F16 | StoredDtype::BF16 | StoredDtype::F32 | StoredDtype::F64
+        ),
+        SourceTensorEncoding::RecipeOutput(dtype) => matches!(
             dtype,
             StoredDtype::F16 | StoredDtype::BF16 | StoredDtype::F32 | StoredDtype::F64
         ),
@@ -8075,6 +8241,7 @@ fn supports_transform(descriptor: &WeightLoweringDescriptor) -> bool {
     };
     decodable
         && descriptor.physical_shape() == descriptor.logical_shape()
+        && descriptor.packed_axis() == descriptor.logical_shape().len().checked_sub(1)
         && valid_packed_geometry(descriptor)
         && match executable {
             LinearFormat::Affine(format) => format.validate().is_ok(),
@@ -8103,9 +8270,10 @@ fn gguf_affine(ggml_type: eredu_gguf::GgmlType) -> Option<eredu_checkpoint::Affi
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
+    use crate::backend::ExecutionContext;
     use eredu_checkpoint::SourceTensorEncoding;
     use eredu_core::{
         cache::LayerCachePolicy, AttentionPolicy, LayerSchedule, ModelConfigurationResolver,
@@ -8114,6 +8282,66 @@ mod tests {
         ParameterTransformConstraint, ReplicatedTextParameterRequirement,
         ReplicatedTextStateAccess, StateLayout, WeightLoweringDescriptor,
     };
+    use safemlx::{Device, DeviceType};
+
+    fn prediction_cache_manager() -> CacheResidencyManager {
+        CacheResidencyManager::new(
+            PagedCacheOptions::new(1, 1 << 20, 1 << 20, 1)
+                .unwrap()
+                .with_full_attention(true),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn prediction_target_forks_preserve_kv_and_compressed_paging_sessions() {
+        let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let stream = context.stream();
+        let key_value_layout = StateLayout::new(
+            LayerSchedule::new(
+                1,
+                vec![LayerCachePolicy::key_value(AttentionPolicy::Full, 1, 8).unwrap()],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let canonical =
+            MlxKeyValueState::paged(key_value_layout, prediction_cache_manager(), None).unwrap();
+        let canonical_checkpoint = canonical.deep_checkpoint().unwrap();
+        let mut fork = fork_mlx_prediction_target_state(&canonical, stream).unwrap();
+        let fork_checkpoint = fork.deep_checkpoint().unwrap();
+        fork.restore_checkpoint(&fork_checkpoint, stream).unwrap();
+        assert_eq!(fork.offset(), canonical.offset());
+        assert!(fork
+            .restore_checkpoint(&canonical_checkpoint, stream)
+            .unwrap_err()
+            .to_string()
+            .contains("does not belong to the same paged layer"));
+
+        let compressed_layout = StateLayout::new(
+            LayerSchedule::new(
+                1,
+                vec![
+                    LayerCachePolicy::compressed_latent_rotary(AttentionPolicy::Full, 8, 4)
+                        .unwrap(),
+                ],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let canonical =
+            MlxHybridState::paged(compressed_layout, prediction_cache_manager(), None).unwrap();
+        let canonical_checkpoint = canonical.deep_checkpoint().unwrap();
+        let mut fork = fork_mlx_prediction_target_state(&canonical, stream).unwrap();
+        let fork_checkpoint = fork.deep_checkpoint().unwrap();
+        fork.restore_checkpoint(&fork_checkpoint, stream).unwrap();
+        assert_eq!(fork.offset(), canonical.offset());
+        assert!(fork
+            .restore_checkpoint(&canonical_checkpoint, stream)
+            .unwrap_err()
+            .to_string()
+            .contains("does not belong to the same paged layer"));
+    }
 
     #[test]
     fn exact_local_transform_output_is_not_sharded_twice() {
@@ -8292,6 +8520,25 @@ mod tests {
             vec![64, 32],
         );
         assert!(!supports_transform(&transform));
+        let non_final_axis = WeightLoweringDescriptor::new(
+            SourceTensorEncoding::Safetensors(StoredDtype::F16),
+            affine,
+            vec![64, 64],
+            vec![64, 64],
+            Some(0),
+        )
+        .unwrap();
+        assert!(!supports_direct(&non_final_axis));
+        assert!(!supports_transform(&non_final_axis));
+        let final_axis = WeightLoweringDescriptor::new(
+            SourceTensorEncoding::RecipeOutput(StoredDtype::F16),
+            affine,
+            vec![64, 64],
+            vec![64, 64],
+            Some(1),
+        )
+        .unwrap();
+        assert!(supports_transform(&final_axis));
     }
 
     #[test]
@@ -8409,8 +8656,11 @@ mod tests {
             vec!["projection.weight".into()],
             vec![eredu_runtime::ReplicatedTextPhysicalSource::new(
                 "projection.weight",
+                "projection.weight",
                 "/checkpoint/model.safetensors",
                 "projection.weight",
+                SourceTensorEncoding::Safetensors(StoredDtype::F16),
+                64 * 64 * 2,
             )
             .unwrap()],
             Vec::new(),
@@ -8473,7 +8723,7 @@ mod tests {
         }));
     }
 
-    fn tiny_artifact(model_type: &str, tied: bool) -> tempfile::TempDir {
+    pub(crate) fn tiny_artifact(model_type: &str, tied: bool) -> tempfile::TempDir {
         tiny_safetensors_artifact(model_type, tied, false, false)
     }
 
@@ -9549,10 +9799,8 @@ mod tests {
                 &weights_stream,
             )
             .unwrap_or_else(|error| panic!("{model_type}: {error}"));
-            let mut executable = model.into_complete().unwrap();
-            let super::super::Executable::ReplicatedText(_, executable) = &mut executable else {
-                panic!("ordinary replicated text must use the generic executable")
-            };
+            let mut executable = model.into_executable();
+            let executable = executable.erased_mut();
             for token in [1_u32, 2] {
                 let logits = executable
                     .decode(&Array::from_slice(&[token], &[1, 1]), &stream)
@@ -9581,6 +9829,89 @@ mod tests {
     }
 
     #[test]
+    fn invalid_token_completion_rolls_back_session_state_before_publication() {
+        let (stream, weights_stream) = execution_streams();
+        let root = tiny_artifact("llama", true);
+        let inspection = eredu_architectures::configuration::inspect_artifact(root.path()).unwrap();
+        let plan = eredu_core::plan_model_preparation(
+            inspection,
+            eredu_core::PreparationPolicy::default(),
+            eredu_core::SessionCapabilities::default(),
+        )
+        .unwrap();
+        let model = materialize_model_plan(
+            plan,
+            crate::MlxLoadRequest::default(),
+            &stream,
+            &weights_stream,
+        )
+        .unwrap();
+        let backend = crate::backend::MlxBackend::new(&stream, &weights_stream);
+        let mut session = crate::composition::mlx::MlxModelSession::from_model(
+            model,
+            eredu_core::SessionCapabilities::new(true, true, true),
+        )
+        .unwrap();
+        let first = eredu_core::BackendSession::decode(
+            &mut session,
+            &backend,
+            Array::from_slice(&[1_u32], &[1, 1]),
+        )
+        .unwrap();
+        let overlap = eredu_core::BackendSession::decode(
+            &mut session,
+            &backend,
+            Array::from_slice(&[2_u32], &[1, 1]),
+        )
+        .err()
+        .expect("an unresolved completion must gate the next state mutation");
+        assert!(overlap
+            .to_string()
+            .contains("unresolved submission completion"));
+        eredu_core::Completion::wait(&first.completion).unwrap();
+        let before = session
+            .neutral_prediction_target_mut()
+            .unwrap()
+            .state_snapshot();
+        let before_numeric = session
+            .neutral_prediction_target_mut()
+            .unwrap()
+            .fixed_numeric_state_snapshot()
+            .unwrap();
+
+        let error = eredu_core::BackendSession::decode(
+            &mut session,
+            &backend,
+            Array::from_slice(&[-1_i32], &[1, 1]),
+        )
+        .err()
+        .expect("out-of-domain token must fail exact mechanism completion");
+        assert!(error.to_string().contains("outside 0..64"));
+        assert_eq!(
+            session
+                .neutral_prediction_target_mut()
+                .unwrap()
+                .state_snapshot(),
+            before
+        );
+        assert_eq!(
+            session
+                .neutral_prediction_target_mut()
+                .unwrap()
+                .fixed_numeric_state_snapshot()
+                .unwrap(),
+            before_numeric
+        );
+        let recovered = eredu_core::BackendSession::decode(
+            &mut session,
+            &backend,
+            Array::from_slice(&[2_u32], &[1, 1]),
+        )
+        .expect("failed token completion must release the submission gate");
+        eredu_core::Completion::wait(&recovered.completion).unwrap();
+    }
+
+    #[test]
     fn routed_qwen_gguf_executes_resident_and_addressable_through_generic_composition() {
         let (stream, weights_stream) = execution_streams();
         let artifact = tiny_qwen_moe_gguf(&stream);
@@ -9604,10 +9935,8 @@ mod tests {
             .unwrap();
             let model = materialize_model_plan(plan, options, &stream, &weights_stream)
                 .unwrap_or_else(|error| panic!("addressable={addressable}: {error}"));
-            let mut executable = model.into_complete().unwrap();
-            let super::super::Executable::ReplicatedText(_, generic) = &mut executable else {
-                panic!("routed Qwen GGUF must use generic replicated composition")
-            };
+            let mut executable = model.into_executable();
+            let generic = executable.erased_mut();
             let logits = generic
                 .decode(&Array::from_slice(&[1_u32], &[1, 1]), &stream)
                 .unwrap();
@@ -9636,11 +9965,9 @@ mod tests {
             .unwrap();
             let model = materialize_model_plan(plan, options, &stream, &weights_stream)
                 .unwrap_or_else(|error| panic!("{model_type}: {error}"));
-            let mut complete = model.into_complete().unwrap();
+            let mut complete = model.into_executable();
             {
-                let super::super::Executable::ReplicatedText(_, executable) = &mut complete else {
-                    panic!("routed addressable text must use the generic executable")
-                };
+                let executable = complete.erased_mut();
                 let prompt = Array::from_slice(&[1_u32, 2], &[1, 2]);
                 let parts = [input::token_ids_part(&prompt).unwrap()];
                 executable
@@ -9712,11 +10039,9 @@ mod tests {
             .unwrap();
             let model = materialize_model_plan(plan, options, &stream, &weights_stream)
                 .unwrap_or_else(|error| panic!("{name}: {error}"));
-            let mut complete = model.into_complete().unwrap();
+            let mut complete = model.into_executable();
             {
-                let super::super::Executable::ReplicatedText(_, executable) = &mut complete else {
-                    panic!("{name}: routed transform did not use generic composition")
-                };
+                let executable = complete.erased_mut();
                 executable
                     .decode(&Array::from_slice(&[1_u32], &[1, 1]), &stream)
                     .unwrap_or_else(|error| panic!("{name}: {error}"))
@@ -9728,10 +10053,10 @@ mod tests {
                 .unwrap()
                 .unwrap_or_else(|| panic!("{name}: no addressable-bank telemetry"));
             assert_eq!(
-                report.weight_quantization(),
-                Some(eredu_checkpoint::WeightQuantization::Affine(
+                report.weight_quantizations(),
+                [eredu_checkpoint::WeightQuantization::Affine(
                     eredu_checkpoint::AffineQuantization::new(32, 4).unwrap()
-                )),
+                )],
                 "{name}"
             );
             let materialization = report
@@ -9826,10 +10151,8 @@ mod tests {
                     .is_some_and(|report| report.transformed_weights > 0),
                 "addressable={addressable}"
             );
-            let mut complete = model.into_complete().unwrap();
-            let super::super::Executable::ReplicatedText(_, generic) = &mut complete else {
-                panic!("GPT-OSS must use generic replicated composition")
-            };
+            let mut complete = model.into_executable();
+            let generic = complete.erased_mut();
             generic
                 .decode(&Array::from_slice(&[1_u32], &[1, 1]), &stream)
                 .unwrap_or_else(|error| panic!("addressable={addressable}: {error}"))
@@ -9864,10 +10187,8 @@ mod tests {
             .unwrap();
             let model = materialize_model_plan(plan, options, &stream, &weights_stream)
                 .unwrap_or_else(|error| panic!("addressable={addressable}: {error}"));
-            let mut executable = model.into_complete().unwrap();
-            let super::super::Executable::ReplicatedText(_, executable) = &mut executable else {
-                panic!("routed Nemotron-H text must use the generic executable")
-            };
+            let mut executable = model.into_executable();
+            let executable = executable.erased_mut();
             for token in [1_u32, 2, 3] {
                 let logits = executable
                     .decode(&Array::from_slice(&[token], &[1, 1]), &stream)
@@ -9914,11 +10235,8 @@ mod tests {
                 .unwrap();
                 let model = materialize_model_plan(plan, options, &stream, &weights_stream)
                     .unwrap_or_else(|error| panic!("{name} addressable={addressable}: {error}"));
-                let mut executable = model.into_complete().unwrap();
-                let super::super::Executable::ReplicatedText(_, executable) = &mut executable
-                else {
-                    panic!("{name} routed text must use the generic executable")
-                };
+                let mut executable = model.into_executable();
+                let executable = executable.erased_mut();
                 for token in [1_u32, 2, 3] {
                     let logits = executable
                         .decode(&Array::from_slice(&[token], &[1, 1]), &stream)
@@ -9996,10 +10314,8 @@ mod tests {
             )
             .unwrap();
             let model = materialize_model_plan(plan, options, &stream, &weights_stream).unwrap();
-            let mut executable = model.into_complete().unwrap();
-            let super::super::Executable::ReplicatedText(_, generic) = &mut executable else {
-                panic!("routed Kimi must use generic replicated composition")
-            };
+            let mut executable = model.into_executable();
+            let generic = executable.erased_mut();
             let tokens = Array::from_slice(&[3_u32], &[1, 1]);
             let baseline = generic
                 .decode(&tokens, &stream)
@@ -10082,10 +10398,8 @@ mod tests {
         )
         .unwrap();
         let model = materialize_model_plan(plan, options, &stream, &weights_stream).unwrap();
-        let mut executable = model.into_complete().unwrap();
-        let super::super::Executable::ReplicatedText(_, generic) = &mut executable else {
-            panic!("routed Qwen must use generic replicated composition")
-        };
+        let mut executable = model.into_executable();
+        let generic = executable.erased_mut();
         let tokens = Array::from_slice(&[3_u32], &[1, 1]);
         let baseline = generic
             .decode(&tokens, &stream)
@@ -10137,10 +10451,8 @@ mod tests {
             .unwrap();
             let model = materialize_model_plan(plan, options, &stream, &weights_stream)
                 .unwrap_or_else(|error| panic!("addressable={addressable}: {error}"));
-            let mut executable = model.into_complete().unwrap();
-            let super::super::Executable::ReplicatedText(_, executable) = &mut executable else {
-                panic!("routed DeepSeek-V4 text must use the generic executable")
-            };
+            let mut executable = model.into_executable();
+            let executable = executable.erased_mut();
             for token in [1_u32, 2, 3, 4, 5] {
                 let logits = executable
                     .decode(&Array::from_slice(&[token], &[1, 1]), &stream)
@@ -10180,10 +10492,8 @@ mod tests {
         )
         .unwrap();
         let model = materialize_model_plan(plan, options, &stream, &weights_stream).unwrap();
-        let mut executable = model.into_complete().unwrap();
-        let super::super::Executable::ReplicatedText(_, generic) = &mut executable else {
-            panic!("routed DeepSeek-V4 text must use the generic executable")
-        };
+        let mut executable = model.into_executable();
+        let generic = executable.erased_mut();
         let prefix = [1_u32, 2, 3, 4, 5];
         let prompt = Array::from_slice(&prefix, &[1, 5]);
         let parts = [input::token_ids_part(&prompt).unwrap()];
@@ -10287,10 +10597,8 @@ mod tests {
                 &weights_stream,
             )
             .unwrap_or_else(|error| panic!("{name}: {error}"));
-            let mut executable = model.into_complete().unwrap();
-            let super::super::Executable::ReplicatedText(_, executable) = &mut executable else {
-                panic!("{name} did not use generic replicated composition")
-            };
+            let mut executable = model.into_executable();
+            let executable = executable.erased_mut();
             let prompt = Array::from_slice(&[1_u32, 2], &[1, 2]);
             let parts = [input::token_ids_part(&prompt).unwrap()];
             let logits = executable
@@ -10457,10 +10765,8 @@ mod tests {
                 &weights_stream,
             )
             .unwrap_or_else(|error| panic!("{name}: {error}"));
-            let mut executable = model.into_complete().unwrap();
-            let super::super::Executable::ReplicatedText(_, generic) = &mut executable else {
-                panic!("{name} did not use replicated composition")
-            };
+            let mut executable = model.into_executable();
+            let generic = executable.erased_mut();
             let prompt = Array::from_slice(&[1_u32, 2], &[1, 2]);
             let parts = [input::token_ids_part(&prompt).unwrap()];
             generic
@@ -10552,10 +10858,8 @@ mod tests {
                     &weights_stream,
                 )
                 .unwrap_or_else(|error| panic!("{name} GGUF: {error}"));
-                let mut executable = model.into_complete().unwrap();
-                let super::super::Executable::ReplicatedText(_, generic) = &mut executable else {
-                    panic!("{name} GGUF did not use generic replicated composition")
-                };
+                let mut executable = model.into_executable();
+                let generic = executable.erased_mut();
                 let prompt = Array::from_slice(&[1_u32, 2], &[1, 2]);
                 let parts = [input::token_ids_part(&prompt).unwrap()];
                 generic
@@ -10642,10 +10946,8 @@ mod tests {
             .unwrap();
             let model = materialize_model_plan(plan, options, &stream, &weights_stream)
                 .unwrap_or_else(|error| panic!("addressable={addressable}: {error}"));
-            let mut executable = model.into_complete().unwrap();
-            let super::super::Executable::ReplicatedText(_, generic) = &mut executable else {
-                panic!("GPT-OSS GGUF must use generic replicated composition")
-            };
+            let mut executable = model.into_executable();
+            let generic = executable.erased_mut();
             let prompt = Array::from_slice(&[1_u32, 2], &[1, 2]);
             let parts = [input::token_ids_part(&prompt).unwrap()];
             generic
@@ -10726,10 +11028,8 @@ mod tests {
             &weights_stream,
         )
         .unwrap();
-        let mut executable = model.into_complete().unwrap();
-        let super::super::Executable::ReplicatedText(_, generic) = &mut executable else {
-            panic!("packed Qwen3-Next did not use generic replicated composition")
-        };
+        let mut executable = model.into_executable();
+        let generic = executable.erased_mut();
         let prompt = Array::from_slice(&[1_u32, 2], &[1, 2]);
         let parts = [input::token_ids_part(&prompt).unwrap()];
         generic
@@ -10778,7 +11078,7 @@ mod tests {
             parameter.has_lowering_source()
                 && matches!(
                     parameter.source_encoding(),
-                    Some(eredu_checkpoint::SourceTensorEncoding::Safetensors(
+                    Some(eredu_checkpoint::SourceTensorEncoding::RecipeOutput(
                         eredu_checkpoint::StoredDtype::F32
                     ))
                 )
@@ -10819,10 +11119,8 @@ mod tests {
             &weights_stream,
         )
         .unwrap();
-        let mut executable = model.into_complete().unwrap();
-        let super::super::Executable::ReplicatedText(_, generic) = &mut executable else {
-            panic!("fused SafeTensors Qwen3-Next did not use replicated composition")
-        };
+        let mut executable = model.into_executable();
+        let generic = executable.erased_mut();
         let prompt = Array::from_slice(&[1_u32, 2], &[1, 2]);
         let parts = [input::token_ids_part(&prompt).unwrap()];
         generic
@@ -10889,10 +11187,8 @@ mod tests {
                 &weights_stream,
             )
             .unwrap_or_else(|error| panic!("{model_type}: {error}"));
-            let mut executable = model.into_complete().unwrap();
-            let super::super::Executable::ReplicatedText(_, generic) = &mut executable else {
-                panic!("packed SafeTensors text must use replicated composition")
-            };
+            let mut executable = model.into_executable();
+            let generic = executable.erased_mut();
             let logits = generic
                 .decode(&Array::from_slice(&[1_u32], &[1, 1]), &stream)
                 .unwrap()
@@ -10986,10 +11282,8 @@ mod tests {
             &weights_stream,
         )
         .unwrap();
-        let mut executable = model.into_complete().unwrap();
-        let super::super::Executable::ReplicatedText(_, generic) = &mut executable else {
-            panic!("packed Nemotron-H must use replicated composition")
-        };
+        let mut executable = model.into_executable();
+        let generic = executable.erased_mut();
         let logits = generic
             .decode(&Array::from_slice(&[1_u32], &[1, 1]), &stream)
             .unwrap()
@@ -11023,10 +11317,8 @@ mod tests {
 
             let model = materialize_model_plan(plan, options, &stream, &weights_stream)
                 .unwrap_or_else(|error| panic!("{model_type}: {error}"));
-            let mut executable = model.into_complete().unwrap();
-            let super::super::Executable::ReplicatedText(_, executable) = &mut executable else {
-                panic!("ordinary sharded text must use the generic executable")
-            };
+            let mut executable = model.into_executable();
+            let executable = executable.erased_mut();
             executable
                 .decode(&Array::from_slice(&[1_u32, 2], &[1, 2]), &stream)
                 .unwrap()
@@ -11695,10 +11987,13 @@ mod tests {
             &GROUPED_OPERATION_CAPABILITIES,
         )
         .expect_err("dense replicated text silently discarded addressable residency");
-        assert!(
-            error.to_string().contains("architecture-routed text class"),
-            "{error}"
-        );
+        assert!(matches!(
+            error,
+            Error::Artifact(eredu_core::artifact::ArtifactError::UnsupportedResidencyPolicy(
+                ref detail
+            )) if detail.contains("independent expert caching")
+                && detail.contains("llama")
+        ));
         assert_eq!(
             super::super::path_instrumentation::snapshot(),
             super::super::path_instrumentation::Counts::default()
@@ -12047,10 +12342,8 @@ mod tests {
             .unwrap();
             let model = materialize_model_plan(plan, options, &stream, &weights_stream).unwrap();
             assert!(model.materialization_report().is_some());
-            let mut executable = model.into_complete().unwrap();
-            let super::super::Executable::ReplicatedText(_, executable) = &mut executable else {
-                panic!("ordinary replicated text must use the generic executable")
-            };
+            let mut executable = model.into_executable();
+            let executable = executable.erased_mut();
             executable
                 .decode(&Array::from_slice(&[1_u32], &[1, 1]), &stream)
                 .unwrap()
@@ -12145,10 +12438,8 @@ mod tests {
                 .materialization_report()
                 .unwrap_or_else(|| panic!("{name}: no materialization report"));
             assert!(report.transformed_weights > 0, "{name}");
-            let mut executable = model.into_complete().unwrap();
-            let super::super::Executable::ReplicatedText(_, generic) = &mut executable else {
-                panic!("{name} did not use generic replicated composition")
-            };
+            let mut executable = model.into_executable();
+            let generic = executable.erased_mut();
             generic
                 .decode(&Array::from_slice(&[1_u32], &[1, 1]), &stream)
                 .unwrap_or_else(|error| panic!("{name}: {error}"))
@@ -12182,10 +12473,8 @@ mod tests {
                 &weights_stream,
             )
             .unwrap();
-            let mut executable = model.into_complete().unwrap();
-            let super::super::Executable::ReplicatedText(_, executable) = &mut executable else {
-                panic!("ordinary replicated GGUF text must use the generic executable")
-            };
+            let mut executable = model.into_executable();
+            let executable = executable.erased_mut();
             let logits = executable
                 .decode(&Array::from_slice(&[1_u32], &[1, 1]), &stream)
                 .unwrap();
@@ -12264,10 +12553,8 @@ mod tests {
                 &weights_stream,
             )
             .unwrap_or_else(|error| panic!("{architecture} {format:?}: {error}"));
-            let mut executable = model.into_complete().unwrap();
-            let super::super::Executable::ReplicatedText(_, executable) = &mut executable else {
-                panic!("ordinary packed GGUF text must use the generic executable")
-            };
+            let mut executable = model.into_executable();
+            let executable = executable.erased_mut();
             executable
                 .decode(&Array::from_slice(&[1_u32], &[1, 1]), &stream)
                 .unwrap()
@@ -12342,10 +12629,8 @@ mod tests {
                     )
                 )
             );
-            let mut executable = model.into_complete().unwrap();
-            let super::super::Executable::ReplicatedText(_, generic) = &mut executable else {
-                panic!("ordinary replicated text must use the generic executable")
-            };
+            let mut executable = model.into_executable();
+            let generic = executable.erased_mut();
             assert_eq!(generic.selected_residency(), residency.layers());
             generic
                 .decode(&Array::from_slice(&[1_u32, 2], &[1, 2]), &stream)
@@ -12547,10 +12832,8 @@ mod tests {
                 ),
                 "{name}"
             );
-            let mut executable = model.into_complete().unwrap();
-            let super::super::Executable::ReplicatedText(_, generic) = &mut executable else {
-                panic!("{name} did not use generic replicated composition")
-            };
+            let mut executable = model.into_executable();
+            let generic = executable.erased_mut();
             assert_eq!(generic.selected_residency(), residency.layers(), "{name}");
             assert_eq!(
                 generic.cache_residency_report().unwrap().is_some(),
@@ -12752,10 +13035,8 @@ mod tests {
                 .unwrap();
                 let model = materialize_model_plan(plan, options, &stream, &weights_stream)
                     .unwrap_or_else(|error| panic!("{name}: {error}"));
-                let mut executable = model.into_complete().unwrap();
-                let super::super::Executable::ReplicatedText(_, generic) = &mut executable else {
-                    panic!("{name} did not use generic replicated composition")
-                };
+                let mut executable = model.into_executable();
+                let generic = executable.erased_mut();
                 let prompt = Array::from_slice(&[1_u32, 2], &[1, 2]);
                 let parts = [input::token_ids_part(&prompt).unwrap()];
                 generic

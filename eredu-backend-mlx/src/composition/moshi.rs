@@ -586,7 +586,7 @@ impl MlxRealtimeExecution {
     }
 }
 
-struct SelectedMlxConstructionVisitor {
+struct SelectedMoshiRealtimeMechanismVisitor {
     artifact_identity: LoadedArtifactIdentity,
     transform: Option<eredu_checkpoint::WeightQuantization>,
     target_quantization: Option<eredu_checkpoint::WeightQuantization>,
@@ -599,7 +599,7 @@ struct SelectedMlxConstructionVisitor {
 }
 
 impl moshi::MoshiRealtimeArchitectureVisitor<MlxNeuralBackend, MlxKeyValueState>
-    for SelectedMlxConstructionVisitor
+    for SelectedMoshiRealtimeMechanismVisitor
 {
     type Output = MlxRealtimeExecution;
     type Error = Error;
@@ -788,7 +788,7 @@ pub fn materialize_selected(
             prepared,
             store,
             stream,
-            SelectedMlxConstructionVisitor {
+            SelectedMoshiRealtimeMechanismVisitor {
                 artifact_identity,
                 transform,
                 target_quantization,

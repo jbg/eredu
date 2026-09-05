@@ -240,6 +240,28 @@ fn binding_from_exact_replicated_text_task(
     task: &ReplicatedTextMaterializationTask,
     store: &dyn eredu_checkpoint::store::CheckpointSource,
 ) -> Result<WeightBinding, ModuleBindingError> {
+    if !matches!(
+        task.lowering(),
+        WeightLoweringKind::Transform | WeightLoweringKind::DerivedTransform
+    ) {
+        for physical in task.physical_sources() {
+            let provenance = store.source_provenance(physical.catalog_key())?;
+            let metadata = store.source_metadata(physical.catalog_key())?;
+            if provenance.catalog_key != physical.catalog_key()
+                || provenance.physical_tensor != physical.tensor()
+                || provenance.output != physical.output()
+                || provenance.backing_shard.as_deref() != Some(physical.shard())
+                || provenance.source_encoding != *physical.source_encoding()
+                || metadata.encoded_byte_len != physical.encoded_byte_len()
+            {
+                return Err(ModuleBindingError::BindingPlan(format!(
+                    "exact task {:?} differs from admitted physical provenance for {:?}",
+                    task.name(),
+                    physical.catalog_key()
+                )));
+            }
+        }
+    }
     let binding = match task.lowering() {
         WeightLoweringKind::Transform | WeightLoweringKind::DerivedTransform => {
             if !store.is_authoritative_materialized_key(task.name()) {
@@ -369,21 +391,23 @@ where
                 WeightBinding::from_recipe(companion.name(), recipe.clone(), metadata.byte_len())?
                     .with_logical_target(companion.name())?
             } else if let Some(source) = companion.catalog_source() {
-                let provenance = store.source_provenance(companion.name())?;
-                if provenance.physical_tensor != source.tensor()
+                let provenance = store.source_provenance(source.catalog_key())?;
+                let metadata = store.source_metadata(source.catalog_key())?;
+                if provenance.catalog_key != source.catalog_key()
+                    || provenance.physical_tensor != source.tensor()
                     || provenance.output != source.output()
                     || provenance.backing_shard.as_deref() != Some(source.shard())
-                    || &provenance.source_encoding != task.source_encoding()
+                    || provenance.source_encoding != *source.source_encoding()
+                    || metadata.encoded_byte_len != source.encoded_byte_len()
                 {
                     return Err(ModuleBindingError::BindingPlan(format!(
                         "translated catalog companion {:?} differs from its admitted provenance",
                         companion.name()
                     )));
                 }
-                let metadata = store.source_metadata(companion.name())?;
                 WeightBinding::new(
                     companion.name(),
-                    companion.name(),
+                    source.catalog_key(),
                     TensorSelection::Full,
                     metadata.encoded_byte_len,
                 )?
@@ -422,7 +446,18 @@ where
         .cloned()
         .collect::<Vec<_>>();
     if !missing.is_empty() {
-        let selected = tasks.iter().map(|task| task.name()).collect::<Vec<_>>();
+        let selected = tasks
+            .iter()
+            .map(|task| {
+                (
+                    task.name(),
+                    task.output_companions()
+                        .iter()
+                        .map(|companion| companion.name())
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
         return Err(ModuleBindingError::BindingPlan(format!(
             "native module parameters have no exact materialization tasks: {missing:?}; selected tasks: {selected:?}"
         )));

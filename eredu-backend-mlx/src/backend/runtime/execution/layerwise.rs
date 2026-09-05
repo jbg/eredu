@@ -23,9 +23,11 @@ use std::{
 
 use safemlx::{Dtype, Stream};
 
+#[cfg(test)]
+use crate::backend::runtime::checkpoint::binding::build_module_bindings;
 use crate::{
     backend::error::Error,
-    backend::runtime::checkpoint::binding::{build_module_bindings, ModuleBindingError},
+    backend::runtime::checkpoint::binding::ModuleBindingError,
     backend::runtime::checkpoint::bounded_quantization::{
         BoundedQuantizationPlan, BoundedQuantizationTarget, BoundedQuantizedWeightStore,
     },
@@ -920,7 +922,8 @@ mod packed_weight_companion_tests {
 }
 
 /// Builds a quantized checkpoint overlay from neutral parameter topologies.
-pub fn quantize_parameterized_store<SM, U, SF, TF>(
+#[cfg(test)]
+fn quantize_parameterized_store<SM, U, SF, TF>(
     store: SharedCheckpointSource,
     source_static: &SM,
     target_static: &SM,
@@ -996,7 +999,8 @@ where
 }
 
 /// Builds a bounded packed overlay for one fully resident neutral module tree.
-pub fn quantize_parameterized_module_store<M>(
+#[cfg(test)]
+fn quantize_parameterized_module_store<M>(
     store: SharedCheckpointSource,
     source: &M,
     target: &M,
@@ -1520,9 +1524,7 @@ pub fn shard_layer_bindings(
                 binding: binding.name().to_owned(),
             })?
             .to_owned();
-        let quantization_companions = binding
-            .quantization_companions()
-            .map(|(scales, biases)| (scales.to_owned(), biases.to_owned()));
+        let quantization_companions = binding.quantization_companions().cloned();
         let tensor = layout.tensor(&logical_target).ok_or_else(|| {
             LayerwiseModelError::UnknownParallelBindingTarget {
                 binding: binding.name().to_owned(),
@@ -1567,8 +1569,11 @@ pub fn shard_layer_bindings(
                 expected_bytes,
             )?;
             sharded = sharded.with_logical_target(logical_target)?;
-            if let Some((scales, biases)) = quantization_companions {
-                sharded = sharded.with_quantization_companions(scales, biases)?;
+            if let Some(companions) = quantization_companions {
+                sharded = sharded.with_quantization_companions(
+                    companions.scale(),
+                    companions.affine_bias().map(str::to_owned),
+                )?;
             }
             output.push(sharded);
             continue;
@@ -1599,8 +1604,11 @@ pub fn shard_layer_bindings(
         let expected_bytes = recipe.infer(store)?.byte_len();
         let mut sharded = WeightBinding::from_recipe(binding.name(), recipe, expected_bytes)?;
         sharded = sharded.with_logical_target(logical_target)?;
-        if let Some((scales, biases)) = quantization_companions {
-            sharded = sharded.with_quantization_companions(scales, biases)?;
+        if let Some(companions) = quantization_companions {
+            sharded = sharded.with_quantization_companions(
+                companions.scale(),
+                companions.affine_bias().map(str::to_owned),
+            )?;
         }
         output.push(sharded);
     }
@@ -1659,13 +1667,14 @@ pub fn shard_addressable_member_bindings(
             continue;
         }
         let expected_bytes = recipe.infer(store)?.byte_len();
-        let quantization_companions = binding
-            .quantization_companions()
-            .map(|(scales, biases)| (scales.to_owned(), biases.to_owned()));
+        let quantization_companions = binding.quantization_companions().cloned();
         let mut sharded = WeightBinding::from_recipe(binding.name(), recipe, expected_bytes)?
             .with_logical_target(logical_target)?;
-        if let Some((scales, biases)) = quantization_companions {
-            sharded = sharded.with_quantization_companions(scales, biases)?;
+        if let Some(companions) = quantization_companions {
+            sharded = sharded.with_quantization_companions(
+                companions.scale(),
+                companions.affine_bias().map(str::to_owned),
+            )?;
         }
         output.push(sharded);
     }

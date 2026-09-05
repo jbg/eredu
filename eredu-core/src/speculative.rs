@@ -2,7 +2,8 @@
 
 use crate::{
     backend::{
-        Completion, ModelRuntime, SpeculativeTokenFilterController, Submission,
+        BoundedCompletion, BoundedCompletionOutcome, BoundedCompletionWait, Completion,
+        CompletionCancellationMode, ModelRuntime, SpeculativeTokenFilterController, Submission,
         TextGenerationBackend, TextGenerationConfig,
     },
     generation::{
@@ -732,7 +733,7 @@ pub trait SpeculativeExecutor {
     /// Backend execution assignment for one operation.
     type Context<'a>: Copy;
     /// Exact completion for submitted verification work.
-    type Completion: Completion<Error = Self::Error>;
+    type Completion: BoundedCompletion<Error = Self::Error>;
     /// Optional backend-specific component telemetry.
     type Telemetry: SpeculativeTelemetry;
     /// Structured backend error.
@@ -1476,7 +1477,9 @@ pub trait SpeculativeConstraint: Sized {
 pub trait SpeculativePublisher<C> {
     /// Publishes tokens and staged semantic output after cache commit.
     ///
-    /// Returns `true` when cancellation was observed during publication.
+    /// Returns `true` when cancellation won this boundary. A successful call
+    /// is one atomic publication boundary; implementations must stage any
+    /// already-pending cancellation before exposing tokens or semantic events.
     fn publish_committed(
         &mut self,
         constraint: &mut C,
@@ -1550,17 +1553,24 @@ impl SpeculativeConstraint for SpeculativeSemanticConstraint {
     }
 }
 
+/// Fallible atomic committed-token batch callback.
+type SpeculativeTokenCallback<'a> = dyn FnMut(&[u32]) -> Result<(), SpeculativeOutputError> + 'a;
+
 /// Core-owned committed-token and semantic-event publication adapter.
 pub struct SpeculativeCallbackPublisher<'a> {
-    on_token: Box<dyn FnMut(u32) -> Result<(), SpeculativeOutputError> + 'a>,
+    on_tokens: Box<SpeculativeTokenCallback<'a>>,
     on_event: Option<Box<dyn FnMut(crate::generation::SemanticEvent) + 'a>>,
 }
 
 impl<'a> SpeculativeCallbackPublisher<'a> {
     /// Publishes committed token ids without decoded semantic events.
-    pub fn tokens(on_token: impl FnMut(u32) -> Result<(), SpeculativeOutputError> + 'a) -> Self {
+    /// The callback is one atomic publication attempt: returning an error must
+    /// leave every token in the supplied batch unpublished.
+    pub fn tokens(
+        on_tokens: impl FnMut(&[u32]) -> Result<(), SpeculativeOutputError> + 'a,
+    ) -> Self {
         Self {
-            on_token: Box::new(on_token),
+            on_tokens: Box::new(on_tokens),
             on_event: None,
         }
     }
@@ -1568,7 +1578,7 @@ impl<'a> SpeculativeCallbackPublisher<'a> {
     /// Publishes transactional semantic events and ignores raw token callbacks.
     pub fn semantic(on_event: impl FnMut(crate::generation::SemanticEvent) + 'a) -> Self {
         Self {
-            on_token: Box::new(|_| Ok(())),
+            on_tokens: Box::new(|_| Ok(())),
             on_event: Some(Box::new(on_event)),
         }
     }
@@ -1582,20 +1592,29 @@ impl SpeculativePublisher<SpeculativeSemanticConstraint> for SpeculativeCallback
         cancellation: &GenerationCancellationToken,
         sequence_finished: bool,
     ) -> Result<bool, SpeculativeOutputError> {
-        for &token in tokens {
-            (self.on_token)(token)?;
+        let cancellation_won = cancellation.is_cancelled() && !sequence_finished;
+        if cancellation_won {
+            if let Some(state) = &mut constraint.state {
+                state.cancel()?;
+            }
         }
-        let mut cancellation_won = false;
+        (self.on_tokens)(tokens)?;
         if let (Some(state), Some(on_event)) = (&mut constraint.state, &mut self.on_event) {
             for event in state.take_events() {
                 on_event(event);
-                if cancellation.is_cancelled() && !sequence_finished {
-                    cancellation_won = true;
-                    break;
+            }
+        }
+        let cancellation_after_callbacks =
+            !cancellation_won && cancellation.is_cancelled() && !sequence_finished;
+        if cancellation_after_callbacks {
+            if let (Some(state), Some(on_event)) = (&mut constraint.state, &mut self.on_event) {
+                state.cancel()?;
+                for event in state.take_events() {
+                    on_event(event);
                 }
             }
         }
-        Ok(cancellation_won || (cancellation.is_cancelled() && !sequence_finished))
+        Ok(cancellation_won || cancellation_after_callbacks)
     }
 
     fn publish_cancelled(
@@ -1702,12 +1721,14 @@ where
 
     /// Applies cancellation and publishes its terminal semantic state.
     pub fn cancel(&mut self) -> Result<(), SpeculativeOutputError> {
-        if !self.sequence.is_finished() {
-            self.observe_lifecycle(SpeculativeLifecycleStage::Cancellation)?;
+        if self.sequence.is_finished() {
+            return Ok(());
         }
-        if self.sequence.cancel() {
-            self.publisher.publish_cancelled(&mut self.constraint)?;
-        }
+        let mut constraint = self.constraint.fork()?;
+        let mut sequence = self.sequence.clone();
+        self.cancel_candidate(&mut constraint, &mut sequence)?;
+        self.constraint = constraint;
+        self.sequence = sequence;
         Ok(())
     }
 
@@ -1734,9 +1755,42 @@ where
         )? || (self.cancellation.is_cancelled()
             && !self.sequence.is_finished());
         if cancellation_won {
-            self.cancel()?;
+            self.sequence.cancel();
         }
         Ok(cancellation_won)
+    }
+
+    fn publish_candidate(
+        &mut self,
+        constraint: &mut C,
+        sequence: &mut GenerationSequence,
+        tokens: &[u32],
+    ) -> Result<bool, SpeculativeOutputError> {
+        self.observe_lifecycle(SpeculativeLifecycleStage::Publication)?;
+        let cancellation_won = self.publisher.publish_committed(
+            constraint,
+            tokens,
+            &self.cancellation,
+            sequence.is_finished(),
+        )? || (self.cancellation.is_cancelled() && !sequence.is_finished());
+        if cancellation_won {
+            sequence.cancel();
+        }
+        Ok(cancellation_won)
+    }
+
+    fn cancel_candidate(
+        &mut self,
+        constraint: &mut C,
+        sequence: &mut GenerationSequence,
+    ) -> Result<(), SpeculativeOutputError> {
+        if !sequence.is_finished() {
+            self.observe_lifecycle(SpeculativeLifecycleStage::Cancellation)?;
+        }
+        if sequence.cancel() {
+            self.publisher.publish_cancelled(constraint)?;
+        }
+        Ok(())
     }
 
     /// Consumes the runtime into its backend-owned parts.
@@ -1758,6 +1812,18 @@ pub enum SpeculativeDriverError<E: std::error::Error + 'static> {
     /// Portable lifecycle validation failed.
     #[error(transparent)]
     Generation(GenerationError),
+    /// Exact verification exceeded its deadline after entering a safe disposition.
+    #[error("speculative verification completion deadline exceeded ({cancellation:?})")]
+    CompletionDeadline {
+        /// Cancellation or retained-orphan mechanism actually applied.
+        cancellation: CompletionCancellationMode,
+    },
+    /// The backend completion cannot honor the selected timeout disposition.
+    #[error("speculative completion does not support {cancellation:?}")]
+    UnsupportedCompletionCancellation {
+        /// Disposition rejected before any speculative submission.
+        cancellation: CompletionCancellationMode,
+    },
 }
 
 /// Resolved speculative transaction ready for backend cache commit.
@@ -2085,14 +2151,50 @@ where
         submitted,
         submitted_tokens: _,
     } = pending;
+    let completion_wait = match options.completion_wait() {
+        Ok(wait) => wait,
+        Err(error) => {
+            let emergency_wait = BoundedCompletionWait::new(
+                Duration::from_nanos(1),
+                CompletionCancellationMode::QuarantineUntilComplete,
+            )
+            .expect("emergency completion disposition is positive");
+            let disposition = completion.wait_bounded(emergency_wait);
+            executor.restore_checkpoint(cache, &checkpoint, context)?;
+            disposition?;
+            return Err(SpeculativeDriverError::Generation(error));
+        }
+    };
     if let Err(error) = runtime.observe_lifecycle(SpeculativeLifecycleStage::Completion) {
+        let disposition = completion.wait_bounded(completion_wait);
         executor.restore_checkpoint(cache, &checkpoint, context)?;
+        disposition?;
         return Err(SpeculativeDriverError::Output(error));
     }
-    if let Err(error) = completion.wait() {
-        drop(completion);
-        executor.restore_checkpoint(cache, &checkpoint, context)?;
-        return Err(error.into());
+    match completion.is_complete() {
+        Ok(true) => {
+            if let Err(error) = completion.wait() {
+                drop(completion);
+                executor.restore_checkpoint(cache, &checkpoint, context)?;
+                return Err(error.into());
+            }
+        }
+        Ok(false) => match completion.wait_bounded(completion_wait) {
+            Ok(BoundedCompletionOutcome::Completed) => {}
+            Ok(BoundedCompletionOutcome::DeadlineExceeded { cancellation }) => {
+                executor.restore_checkpoint(cache, &checkpoint, context)?;
+                return Err(SpeculativeDriverError::CompletionDeadline { cancellation });
+            }
+            Err(error) => {
+                executor.restore_checkpoint(cache, &checkpoint, context)?;
+                return Err(error.into());
+            }
+        },
+        Err(error) => {
+            drop(completion);
+            executor.restore_checkpoint(cache, &checkpoint, context)?;
+            return Err(error.into());
+        }
     }
     let telemetry = match executor.take_verification_telemetry(&mut verification) {
         Ok(telemetry) => telemetry,
@@ -2108,7 +2210,7 @@ where
     }
     let mut canonical_proposal_prefix = runtime.sequence().tokens().to_vec();
     canonical_proposal_prefix.extend(block.proposals.iter().map(|proposal| proposal.token));
-    let resolved = match resolve_round::<E, S, C>(
+    let mut resolved = match resolve_round::<E, S, C>(
         executor,
         &verification,
         block.proposals,
@@ -2165,10 +2267,18 @@ where
     stats.target_tokens += commit.replayed_tokens;
     stats.emitted_tokens += committed_tokens.len();
     let target_randomness = resolved.target_randomness;
+    let cancelled = match runtime.publish_candidate(
+        &mut resolved.constraint,
+        &mut resolved.sequence,
+        &committed_tokens,
+    ) {
+        Ok(cancelled) => cancelled,
+        Err(error) => {
+            executor.restore_checkpoint(cache, &checkpoint, context)?;
+            return Err(SpeculativeDriverError::Output(error));
+        }
+    };
     runtime.install_committed_state(resolved.sampler, resolved.constraint, resolved.sequence);
-    let cancelled = runtime
-        .publish_committed(&committed_tokens)
-        .map_err(SpeculativeDriverError::Output)?;
     let status = if cancelled {
         discard_continuation(&mut stats, continuation);
         SpeculativePublicationStatus::Cancelled
@@ -2199,6 +2309,7 @@ pub fn cancel_pending_verification<'a, E, S, C, P>(
     pending: PendingSpeculativeVerification<E, S::Distribution>,
     runtime: &mut SpeculativeOutputRuntime<S, C, P>,
     mut stats: SpeculativeStats,
+    completion_wait: BoundedCompletionWait,
     context: E::Context<'a>,
 ) -> Result<(SpeculativeStats, E::Telemetry), SpeculativeDriverError<E::Error>>
 where
@@ -2217,13 +2328,35 @@ where
         submitted_tokens: _,
     } = pending;
     if let Err(error) = runtime.observe_lifecycle(SpeculativeLifecycleStage::Completion) {
+        let disposition = completion.wait_bounded(completion_wait);
         executor.restore_checkpoint(cache, &checkpoint, context)?;
+        disposition?;
         return Err(SpeculativeDriverError::Output(error));
     }
-    if let Err(error) = completion.wait() {
-        drop(completion);
-        executor.restore_checkpoint(cache, &checkpoint, context)?;
-        return Err(error.into());
+    match completion.is_complete() {
+        Ok(true) => {
+            if let Err(error) = completion.wait() {
+                drop(completion);
+                executor.restore_checkpoint(cache, &checkpoint, context)?;
+                return Err(error.into());
+            }
+        }
+        Ok(false) => match completion.wait_bounded(completion_wait) {
+            Ok(BoundedCompletionOutcome::Completed) => {}
+            Ok(BoundedCompletionOutcome::DeadlineExceeded { cancellation }) => {
+                executor.restore_checkpoint(cache, &checkpoint, context)?;
+                return Err(SpeculativeDriverError::CompletionDeadline { cancellation });
+            }
+            Err(error) => {
+                executor.restore_checkpoint(cache, &checkpoint, context)?;
+                return Err(error.into());
+            }
+        },
+        Err(error) => {
+            drop(completion);
+            executor.restore_checkpoint(cache, &checkpoint, context)?;
+            return Err(error.into());
+        }
     }
     let telemetry = match executor.take_verification_telemetry(&mut verification) {
         Ok(telemetry) => telemetry,
@@ -2242,6 +2375,14 @@ where
         executor.restore_checkpoint(cache, &checkpoint, context)?;
         return Err(SpeculativeDriverError::Output(error));
     }
+    let mut constraint = match runtime.constraint().fork() {
+        Ok(constraint) => constraint,
+        Err(error) => {
+            executor.restore_checkpoint(cache, &checkpoint, context)?;
+            return Err(SpeculativeDriverError::Output(error));
+        }
+    };
+    let mut sequence = runtime.sequence().clone();
     let commit = match executor.commit_verification(
         verification,
         block.state,
@@ -2257,7 +2398,11 @@ where
         }
     };
     stats.target_tokens += commit.replayed_tokens;
-    runtime.cancel().map_err(SpeculativeDriverError::Output)?;
+    if let Err(error) = runtime.cancel_candidate(&mut constraint, &mut sequence) {
+        executor.restore_checkpoint(cache, &checkpoint, context)?;
+        return Err(SpeculativeDriverError::Output(error));
+    }
+    runtime.install_committed_state(runtime.sampler().clone(), constraint, sequence);
     Ok((stats, telemetry))
 }
 
@@ -2467,6 +2612,7 @@ where
     }
 
     fn request_cancellation(&mut self) -> Result<(), SpeculativeDriverError<E::Error>> {
+        let lifecycle = self.lifecycle.clone();
         match self
             .lifecycle
             .request_cancellation(self.pending.is_some())
@@ -2475,10 +2621,11 @@ where
             SpeculativeCancellationDisposition::AlreadyTerminal
             | SpeculativeCancellationDisposition::Deferred => {}
             SpeculativeCancellationDisposition::CancelNow => {
+                if let Err(error) = self.runtime.cancel() {
+                    self.lifecycle = lifecycle;
+                    return Err(SpeculativeDriverError::Output(error));
+                }
                 self.block = None;
-                self.runtime
-                    .cancel()
-                    .map_err(SpeculativeDriverError::Output)?;
                 self.stats.elapsed = self.started.elapsed();
             }
         }
@@ -2489,6 +2636,7 @@ where
         &self,
         executor: &E,
         optimistic_execution_available: bool,
+        completion_wait: BoundedCompletionWait,
     ) -> Result<SpeculativeCandidate, SpeculativeDriverError<E::Error>>
     where
         E: 'context,
@@ -2498,14 +2646,15 @@ where
                 Context<'context> = E::Context<'context>,
             > + 'context,
     {
-        let verification_complete = if let Some(pending) = self.pending.as_ref() {
-            self.runtime
-                .observe_lifecycle(SpeculativeLifecycleStage::Completion)
-                .map_err(SpeculativeDriverError::Output)?;
-            pending.is_complete()?
-        } else {
-            false
-        };
+        let (verification_complete, verification_deadline_expired) =
+            if let Some(pending) = self.pending.as_ref() {
+                (
+                    pending.is_complete()?,
+                    pending.submitted.elapsed() >= completion_wait.timeout(),
+                )
+            } else {
+                (false, false)
+            };
         let optimistic_eligible = if self.lifecycle.status()
             != SpeculativeRequestStatus::TargetVerificationInFlight
             || !optimistic_execution_available
@@ -2536,6 +2685,7 @@ where
             status: self.lifecycle.status(),
             optimistic_eligible,
             verification_complete,
+            verification_deadline_expired,
         })
     }
 
@@ -2762,6 +2912,9 @@ where
                 pending,
                 &mut self.runtime,
                 self.stats.clone(),
+                options
+                    .completion_wait()
+                    .map_err(SpeculativeDriverError::Generation)?,
                 context,
             )?;
             telemetry.record(&mut stats);
@@ -3032,42 +3185,60 @@ where
             runtime
                 .observe_lifecycle(SpeculativeLifecycleStage::Execution)
                 .map_err(SpeculativeDriverError::Output)?;
-            let prefill = executor.prefill(input, cache, context)?;
-            stats.target_tokens = prefill.evaluated_tokens;
+            let checkpoint = executor.checkpoint(cache)?;
+            let attempt = (|| {
+                let prefill = executor.prefill(input, cache, context)?;
+                let mut sampler = runtime.sampler().clone();
+                let mut constraint = runtime
+                    .constraint()
+                    .fork()
+                    .map_err(SpeculativeDriverError::Output)?;
+                let mut sequence = runtime.sequence().clone();
+                let mut target_randomness = target_randomness.clone();
+                let first_logits = sampler.process_logits(
+                    &prefill.logits,
+                    config.temperature,
+                    &[],
+                    SamplingPlacement::Target,
+                    context,
+                )?;
+                let first = sampler.sample(
+                    &first_logits,
+                    config.temperature,
+                    target_randomness.as_mut(),
+                    SamplingPlacement::Target,
+                    context,
+                )?;
+                sampler.update_sampler_state(
+                    &first_logits,
+                    first,
+                    SamplingPlacement::Target,
+                    context,
+                )?;
+                let reason =
+                    commit_terminal_token(&mut sequence, &mut sampler, &mut constraint, first)?;
+                let cancelled = runtime
+                    .publish_candidate(&mut constraint, &mut sequence, &[first])
+                    .map_err(SpeculativeDriverError::Output)?;
+                runtime.install_committed_state(sampler, constraint, sequence);
+                Ok::<_, SpeculativeDriverError<E::Error>>((
+                    prefill.evaluated_tokens,
+                    prefill.state,
+                    target_randomness,
+                    reason,
+                    cancelled,
+                ))
+            })();
+            let (evaluated_tokens, target_state, target_randomness, reason, cancelled) =
+                match attempt {
+                    Ok(result) => result,
+                    Err(error) => {
+                        executor.restore_checkpoint(cache, &checkpoint, context)?;
+                        return Err(error);
+                    }
+                };
+            stats.target_tokens = evaluated_tokens;
             stats.scheduler_turns = 1;
-            let mut sampler = runtime.sampler().clone();
-            let mut constraint = runtime
-                .constraint()
-                .fork()
-                .map_err(SpeculativeDriverError::Output)?;
-            let mut sequence = runtime.sequence().clone();
-            let mut target_randomness = target_randomness.clone();
-            let first_logits = sampler.process_logits(
-                &prefill.logits,
-                config.temperature,
-                &[],
-                SamplingPlacement::Target,
-                context,
-            )?;
-            let first = sampler.sample(
-                &first_logits,
-                config.temperature,
-                target_randomness.as_mut(),
-                SamplingPlacement::Target,
-                context,
-            )?;
-            sampler.update_sampler_state(
-                &first_logits,
-                first,
-                SamplingPlacement::Target,
-                context,
-            )?;
-            let reason =
-                commit_terminal_token(&mut sequence, &mut sampler, &mut constraint, first)?;
-            runtime.install_committed_state(sampler, constraint, sequence);
-            let cancelled = runtime
-                .publish_committed(&[first])
-                .map_err(SpeculativeDriverError::Output)?;
             stats.emitted_tokens = 1;
             let lifecycle = if cancelled {
                 stats.elapsed = started.elapsed();
@@ -3092,7 +3263,7 @@ where
                 draft_randomness,
                 stats,
                 started,
-                target_state: Some(prefill.state),
+                target_state: Some(target_state),
                 block: None,
                 pending: None,
                 lifecycle,
@@ -3162,7 +3333,16 @@ where
         let candidates = self
             .requests
             .iter()
-            .map(|request| request.candidate(executor, optimistic_execution_available))
+            .map(|request| {
+                request.candidate(
+                    executor,
+                    optimistic_execution_available,
+                    self.schedule
+                        .options()
+                        .completion_wait()
+                        .expect("speculative schedule retains validated completion options"),
+                )
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let Some(action) = self
             .schedule
@@ -3286,6 +3466,8 @@ pub struct SpeculativeCandidate {
     optimistic_eligible: bool,
     /// Whether retained verification reached exact completion without blocking.
     verification_complete: bool,
+    /// Whether an incomplete verification reached its selected bounded deadline.
+    verification_deadline_expired: bool,
 }
 
 /// One backend action selected by the portable fair scheduler.
@@ -3390,7 +3572,7 @@ impl SpeculativeSchedule {
                     candidate.status,
                     SpeculativeRequestStatus::TargetVerificationInFlight
                         | SpeculativeRequestStatus::OptimisticDraftReady
-                ) && candidate.verification_complete
+                ) && (candidate.verification_complete || candidate.verification_deadline_expired)
             }) {
                 return Ok(Some(SpeculativeAction::ResolveVerification(index)));
             }
@@ -3400,6 +3582,7 @@ impl SpeculativeSchedule {
                     SpeculativeRequestStatus::TargetVerificationInFlight
                         | SpeculativeRequestStatus::OptimisticDraftReady
                 ) && !candidate.verification_complete
+                    && !candidate.verification_deadline_expired
             }) {
                 return Ok(Some(SpeculativeAction::PollVerification(index)));
             }
@@ -3516,6 +3699,16 @@ mod tests {
                 trace.borrow_mut().push("wait");
             }
             Ok(())
+        }
+    }
+
+    impl BoundedCompletion for Done {
+        fn wait_bounded(
+            self,
+            _policy: BoundedCompletionWait,
+        ) -> Result<BoundedCompletionOutcome, Self::Error> {
+            self.wait()?;
+            Ok(BoundedCompletionOutcome::Completed)
         }
     }
 
@@ -4417,6 +4610,7 @@ mod tests {
             status: SpeculativeRequestStatus::ReadyToSubmitVerification,
             optimistic_eligible: false,
             verification_complete: false,
+            verification_deadline_expired: false,
         };
         assert_eq!(
             schedule.next_action(&[ready, ready]).unwrap(),
@@ -4431,11 +4625,13 @@ mod tests {
             status: SpeculativeRequestStatus::TargetVerificationInFlight,
             optimistic_eligible: false,
             verification_complete: true,
+            verification_deadline_expired: false,
         };
         let draft = SpeculativeCandidate {
             status: SpeculativeRequestStatus::ReadyToDraft,
             optimistic_eligible: false,
             verification_complete: false,
+            verification_deadline_expired: false,
         };
         assert_eq!(
             schedule.next_action(&[in_flight, ready, draft]).unwrap(),
@@ -4791,6 +4987,9 @@ mod tests {
             pending,
             &mut runtime,
             SpeculativeStats::default(),
+            SpeculativeSchedulerOptions::default()
+                .completion_wait()
+                .unwrap(),
             (),
         )
         .unwrap();
@@ -4877,6 +5076,16 @@ mod tests {
             } else {
                 Ok(())
             }
+        }
+    }
+
+    impl BoundedCompletion for DelayedCompletion {
+        fn wait_bounded(
+            self,
+            _policy: BoundedCompletionWait,
+        ) -> Result<BoundedCompletionOutcome, Self::Error> {
+            self.wait()?;
+            Ok(BoundedCompletionOutcome::Completed)
         }
     }
 
@@ -5224,6 +5433,7 @@ mod tests {
         tokens: Vec<u32>,
         cancelled: bool,
         fail_committed: bool,
+        fail_cancelled: bool,
         attempts: Rc<Cell<usize>>,
         trace: FailureTrace,
     }
@@ -5251,6 +5461,11 @@ mod tests {
         ) -> Result<(), SpeculativeOutputError> {
             self.attempts.set(self.attempts.get() + 1);
             self.trace.borrow_mut().push("cancel");
+            if self.fail_cancelled {
+                return Err(SpeculativeOutputError::publication(
+                    "injected cancellation failure",
+                ));
+            }
             self.cancelled = true;
             Ok(())
         }
@@ -5301,6 +5516,7 @@ mod tests {
                 tokens: Vec::new(),
                 cancelled: false,
                 fail_committed,
+                fail_cancelled: false,
                 attempts,
                 trace,
             },
@@ -5321,6 +5537,7 @@ mod tests {
                 tokens: Vec::new(),
                 cancelled: false,
                 fail_committed: false,
+                fail_cancelled: false,
                 attempts,
                 trace,
             },
@@ -5331,6 +5548,7 @@ mod tests {
     #[test]
     fn observation_and_cache_persistence_failures_restore_before_publication() {
         for failure in [
+            SpeculativeLifecycleStage::Completion,
             SpeculativeLifecycleStage::Observation,
             SpeculativeLifecycleStage::CachePersistence,
         ] {
@@ -5379,6 +5597,18 @@ mod tests {
             assert_eq!(cache.draft, [4, 5]);
             assert!(!trace.borrow().contains(&"commit"));
             assert!(trace.borrow().contains(&"restore"));
+            if failure == SpeculativeLifecycleStage::Completion {
+                let trace = trace.borrow();
+                let completion_drop = trace
+                    .iter()
+                    .position(|event| *event == "drop_completion")
+                    .expect("completion failure must dispose retained work");
+                let restore = trace
+                    .iter()
+                    .position(|event| *event == "restore")
+                    .expect("completion failure must restore the checkpoint");
+                assert!(completion_drop < restore);
+            }
             assert_eq!(
                 observer
                     .stages()
@@ -5433,6 +5663,142 @@ mod tests {
         assert_eq!(cache.target, [4, 5]);
         assert_eq!(cache.draft, [4, 5]);
         assert_eq!(observer.stages(), [SpeculativeLifecycleStage::Cancellation]);
+    }
+
+    #[test]
+    fn prefill_publication_failure_restores_cache_and_logical_state() {
+        let trace = FailureTrace::default();
+        let attempts = Rc::new(Cell::new(0));
+        let mut executor = TransactionExecutor::new(trace.clone(), attempts.clone());
+        let mut cache = transaction_cache(trace.clone());
+        let mut runtime = empty_transaction_runtime(3, trace.clone(), attempts.clone());
+        runtime.publisher.fail_committed = true;
+        let mut table = SpeculativeRequestTable::new(
+            SpeculativeSchedulerOptions::default().with_lookahead(false),
+            SpeculativeExecutionTopology::Single,
+        )
+        .unwrap();
+        let error = table
+            .submit(
+                &mut executor,
+                &mut cache,
+                vec![4],
+                SpeculativeConfig {
+                    max_tokens: 3,
+                    max_draft_tokens: 2,
+                    temperature: 0.7,
+                    eos_token_ids: Vec::new(),
+                },
+                runtime,
+                SpeculativeRandomness {
+                    target: Some(0),
+                    draft: Some(0),
+                },
+                false,
+                (),
+            )
+            .unwrap_err();
+        assert!(matches!(error, SpeculativeDriverError::Output(_)));
+        assert_eq!(table.requests.len(), 0);
+        drop(table);
+        assert_eq!(cache.target, [4, 5]);
+        assert_eq!(cache.draft, [4, 5]);
+        assert!(trace.borrow().contains(&"restore"));
+    }
+
+    #[test]
+    fn pending_cancellation_publication_failure_restores_cache_without_cancelling_sequence() {
+        let trace = FailureTrace::default();
+        let attempts = Rc::new(Cell::new(0));
+        let mut executor = TransactionExecutor::new(trace.clone(), attempts.clone());
+        let mut cache = transaction_cache(trace.clone());
+        let mut table = SpeculativeRequestTable::new(
+            SpeculativeSchedulerOptions::default().with_lookahead(false),
+            SpeculativeExecutionTopology::Single,
+        )
+        .unwrap();
+        let id = table
+            .submit(
+                &mut executor,
+                &mut cache,
+                vec![4],
+                SpeculativeConfig {
+                    max_tokens: 3,
+                    max_draft_tokens: 2,
+                    temperature: 0.7,
+                    eos_token_ids: Vec::new(),
+                },
+                empty_transaction_runtime(3, trace.clone(), attempts),
+                SpeculativeRandomness {
+                    target: Some(0),
+                    draft: Some(0),
+                },
+                false,
+                (),
+            )
+            .unwrap();
+        table.step(&mut executor, false, ()).unwrap();
+        table.step(&mut executor, false, ()).unwrap();
+        table.requests[id.index()].runtime.publisher.fail_cancelled = true;
+        table.cancel(id).unwrap();
+        let error = table.step(&mut executor, false, ()).unwrap_err();
+        assert!(matches!(error, SpeculativeDriverError::Output(_)));
+        assert!(!table.requests[id.index()].runtime.sequence().is_finished());
+        drop(table);
+        assert_eq!(cache.target, [4, 5, 4]);
+        assert!(trace.borrow().contains(&"restore"));
+    }
+
+    #[test]
+    fn direct_cancellation_publication_failure_restores_lifecycle_and_sequence() {
+        let trace = FailureTrace::default();
+        let attempts = Rc::new(Cell::new(0));
+        let mut executor = TransactionExecutor::new(trace.clone(), attempts.clone());
+        let mut cache = transaction_cache(trace.clone());
+        let mut table = SpeculativeRequestTable::new(
+            SpeculativeSchedulerOptions::default().with_lookahead(false),
+            SpeculativeExecutionTopology::Single,
+        )
+        .unwrap();
+        let id = table
+            .submit(
+                &mut executor,
+                &mut cache,
+                vec![4],
+                SpeculativeConfig {
+                    max_tokens: 3,
+                    max_draft_tokens: 2,
+                    temperature: 0.7,
+                    eos_token_ids: Vec::new(),
+                },
+                empty_transaction_runtime(3, trace, attempts),
+                SpeculativeRandomness {
+                    target: Some(0),
+                    draft: Some(0),
+                },
+                false,
+                (),
+            )
+            .unwrap();
+        table.step(&mut executor, false, ()).unwrap();
+        assert!(table.requests[id.index()].block().is_some());
+        assert!(!table.requests[id.index()].has_pending_verification());
+        let status = table.requests[id.index()].status();
+        let tokens = table.requests[id.index()].sequence().tokens().to_vec();
+        let finish_reason = table.requests[id.index()].sequence().finish_reason();
+        table.requests[id.index()].runtime.publisher.fail_cancelled = true;
+
+        let error = table.cancel(id).unwrap_err();
+
+        assert!(matches!(error, SpeculativeDriverError::Output(_)));
+        assert_eq!(table.requests[id.index()].status(), status);
+        assert_eq!(table.requests[id.index()].sequence().tokens(), tokens);
+        assert_eq!(
+            table.requests[id.index()].sequence().finish_reason(),
+            finish_reason
+        );
+        assert!(table.requests[id.index()].block().is_some());
+        assert!(!table.requests[id.index()].runtime.publisher.cancelled);
     }
 
     #[test]
@@ -5816,7 +6182,61 @@ mod tests {
     }
 
     #[test]
-    fn publisher_failure_reports_committed_but_unpublished_transaction_state() {
+    fn invalid_direct_completion_policy_disposes_work_before_restore() {
+        let trace = FailureTrace::default();
+        let attempts = Rc::new(Cell::new(0));
+        let draft_drops = Rc::new(Cell::new(0));
+        let mut executor = TransactionExecutor::new(trace.clone(), attempts.clone());
+        executor.ready_after_polls = None;
+        let mut cache = transaction_cache(trace.clone());
+        let pending = submit_verification_transaction(
+            &mut executor,
+            &mut cache,
+            5,
+            transaction_block(trace.clone(), draft_drops),
+            (),
+        )
+        .unwrap();
+        let mut runtime = transaction_runtime(
+            trace.clone(),
+            attempts,
+            false,
+            GenerationCancellationToken::new(),
+        );
+        let options = SpeculativeSchedulerOptions {
+            completion_timeout_milliseconds: 0,
+            ..SpeculativeSchedulerOptions::default()
+        };
+
+        let error = resolve_commit_and_publish(
+            &mut executor,
+            &mut cache,
+            pending,
+            &mut runtime,
+            Some(&0),
+            0.7,
+            SpeculativeStats::default(),
+            options,
+            (),
+        )
+        .err()
+        .expect("invalid completion policy must fail");
+
+        assert!(matches!(
+            error,
+            SpeculativeDriverError::Generation(GenerationError::ZeroSpeculativeCompletionTimeout)
+        ));
+        let trace = trace.borrow();
+        let drop = trace
+            .iter()
+            .position(|event| *event == "drop_completion")
+            .unwrap();
+        let restore = trace.iter().position(|event| *event == "restore").unwrap();
+        assert!(drop < restore);
+    }
+
+    #[test]
+    fn publisher_failure_restores_backend_and_keeps_logical_state_uncommitted() {
         let trace = FailureTrace::default();
         let attempts = Rc::new(Cell::new(0));
         let mut executor = TransactionExecutor::new(trace.clone(), attempts.clone());
@@ -5851,16 +6271,16 @@ mod tests {
         .unwrap();
 
         assert!(matches!(error, SpeculativeDriverError::Output(_)));
-        assert_eq!(cache.target, [4, 5, 5, 1]);
-        assert_eq!(cache.draft, [5, 1, 1]);
+        assert_eq!(cache.target, [4, 5]);
+        assert_eq!(cache.draft, [4, 5]);
         assert_eq!(executor.committed_draft.borrow().as_slice(), [5, 1, 1]);
         let (sampler, sequence, constraint, publisher) = runtime.into_parts();
-        assert_eq!(sampler.committed, [1, 0]);
-        assert_eq!(sequence.tokens(), [5, 1, 0]);
-        assert_eq!(constraint.tokens, [1, 0]);
+        assert!(sampler.committed.is_empty());
+        assert_eq!(sequence.tokens(), [5]);
+        assert!(constraint.tokens.is_empty());
         assert!(publisher.tokens.is_empty());
         assert_eq!(attempts.get(), 1);
-        assert!(!trace.borrow().contains(&"restore"));
+        assert!(trace.borrow().contains(&"restore"));
     }
 
     #[test]
@@ -5941,6 +6361,9 @@ mod tests {
             pending,
             &mut runtime,
             SpeculativeStats::default(),
+            SpeculativeSchedulerOptions::default()
+                .completion_wait()
+                .unwrap(),
             (),
         )
         .unwrap();

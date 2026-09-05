@@ -23,6 +23,7 @@ use eredu_core::{
 /// Family composition receives this object instead of an artifact path so it
 /// cannot rediscover configuration or checkpoint topology after admission.
 pub struct PreparedSafetensorsArtifact {
+    #[cfg(test)]
     architecture: eredu_architectures::configuration::SafetensorsArchitecturePlan,
     store: SharedCheckpointSource,
 }
@@ -48,15 +49,13 @@ impl PreparedSafetensorsArtifact {
             .clone();
         let store = eredu_checkpoint::store::ResolvedCheckpointSource::new(store, resolution);
         Ok(Self {
+            #[cfg(test)]
             architecture,
             store: Arc::new(store),
         })
     }
 
-    pub fn architecture(&self) -> &eredu_architectures::configuration::SafetensorsArchitecturePlan {
-        &self.architecture
-    }
-
+    #[cfg(test)]
     pub fn model(&self) -> &eredu_architectures::configuration::SafetensorsModelConfig {
         self.architecture.model()
     }

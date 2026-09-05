@@ -552,6 +552,13 @@ impl ArtifactArchitecturePlan {
         self.prediction_extension.as_ref()
     }
 
+    /// Removes the additive extension after it has been selected and split
+    /// into its own exact materialization contract.
+    pub fn without_prediction_extension(mut self) -> Self {
+        self.prediction_extension = None;
+        self
+    }
+
     /// Finalizes catalog-dependent SafeTensors admission before processor enrichment.
     pub(crate) fn admit_safetensors_catalog(
         mut self,
@@ -653,6 +660,46 @@ impl ArtifactArchitecturePlan {
         match &self.family {
             ArtifactFamilyPlan::Safetensors(plan) => plan.model_kind(),
             ArtifactFamilyPlan::Gguf(plan) => plan.model_kind(),
+        }
+    }
+
+    /// Returns the exact normalized target facts needed to admit an external assistant.
+    ///
+    /// This is derived from the retained architecture plan before backend resources
+    /// or target payloads exist. Architectures without an external-assistant
+    /// contract return `None` and fail cold drafting selection.
+    pub fn external_assistant_target_profile(
+        &self,
+    ) -> Option<crate::external_assistant::ExternalAssistantTargetProfile> {
+        use crate::configuration::{GgufModelConfig, SafetensorsModelConfig};
+
+        match &self.family {
+            ArtifactFamilyPlan::Safetensors(plan) => match plan.model() {
+                SafetensorsModelConfig::Gemma4(config) => Some(
+                    crate::external_assistant::ExternalAssistantTargetProfile::Gemma4(
+                        config.clone(),
+                    ),
+                ),
+                SafetensorsModelConfig::MuseGlimmer(config) => Some(
+                    crate::external_assistant::ExternalAssistantTargetProfile::MuseGlimmer(
+                        config.clone(),
+                    ),
+                ),
+                _ => None,
+            },
+            ArtifactFamilyPlan::Gguf(plan) => match plan.model() {
+                GgufModelConfig::Gemma4(config) => Some(
+                    crate::external_assistant::ExternalAssistantTargetProfile::Gemma4(
+                        config.clone(),
+                    ),
+                ),
+                GgufModelConfig::MuseGlimmer(config) => Some(
+                    crate::external_assistant::ExternalAssistantTargetProfile::MuseGlimmer(
+                        config.clone(),
+                    ),
+                ),
+                _ => None,
+            },
         }
     }
 

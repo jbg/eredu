@@ -124,6 +124,27 @@ impl MlxPoolingAttentionStateFactory {
             )
         })
     }
+
+    pub(crate) fn fork_prediction_target_state(
+        state: &MlxPoolingAttentionState,
+        stream: &Stream,
+    ) -> Result<MlxPoolingAttentionState, Exception> {
+        let manager = state
+            .as_ref()
+            .iter()
+            .find_map(MlxPoolingAttentionCache::residency_manager);
+        let manager = manager
+            .map(|manager| manager.fork_session(stream))
+            .transpose()
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        DeviceState::create(state.layout().clone(), |layer, _| {
+            let mut cache = state.as_ref()[layer].deep_clone_state()?;
+            if let Some(manager) = manager.as_ref() {
+                cache.rebind_paging_manager(manager.clone());
+            }
+            Ok(cache)
+        })
+    }
 }
 
 impl MlxPoolingAttentionCache {
@@ -201,6 +222,10 @@ impl MlxPoolingAttentionCache {
                 index_pool: index_pool.deep_clone_state()?,
             }),
         }
+    }
+
+    pub(crate) fn rebind_paging_manager(&mut self, manager: CacheResidencyManager) {
+        self.local_mut().rebind_paging_manager(manager);
     }
 
     /// Returns the current source-token frontier.
@@ -1271,6 +1296,36 @@ impl MlxKeyValueState {
         })
     }
 
+    pub(crate) fn fork_prediction_target_state(&self, stream: &Stream) -> Result<Self, Exception> {
+        let manager = self.layers.iter().find_map(|layer| match layer {
+            MlxKeyValueLayerState::Device(_) => None,
+            MlxKeyValueLayerState::Paged(cache) => Some(cache.manager()),
+        });
+        let Some(manager) = manager else {
+            return self.deep_clone_state();
+        };
+        if self.layers.iter().any(|layer| match layer {
+            MlxKeyValueLayerState::Device(_) => false,
+            MlxKeyValueLayerState::Paged(cache) => {
+                cache.manager().session_id() != manager.session_id()
+            }
+        }) {
+            return Err(Exception::custom(
+                "key/value state contains more than one paging session",
+            ));
+        }
+        let manager = manager
+            .fork_session(stream)
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        let mut fork = self.deep_clone_state()?;
+        for layer in &mut fork.layers {
+            if let MlxKeyValueLayerState::Paged(cache) = layer {
+                cache.rebind_paging_manager(manager.clone());
+            }
+        }
+        Ok(fork)
+    }
+
     fn has_same_transaction_identity(&self, other: &Self) -> bool {
         self.layout == other.layout
             && self.global_layer_start == other.global_layer_start
@@ -2213,6 +2268,30 @@ impl MlxHybridState {
                 .collect::<Result<_, _>>()?,
             manager: self.manager.clone(),
         })
+    }
+
+    pub(crate) fn fork_prediction_target_state(&self, stream: &Stream) -> Result<Self, Exception> {
+        let Some(manager) = self.manager.as_ref() else {
+            return self.deep_clone_state();
+        };
+        let manager = manager
+            .fork_session(stream)
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        let mut fork = self.deep_clone_state()?;
+        for layer in &mut fork.layers {
+            match layer.attention.as_mut() {
+                Some(MlxHybridAttentionState::KeyValue(MlxKeyValueLayerState::Paged(cache))) => {
+                    cache.rebind_paging_manager(manager.clone());
+                }
+                Some(MlxHybridAttentionState::Compressed(cache)) => {
+                    cache.rebind_paging_manager(manager.clone());
+                }
+                Some(MlxHybridAttentionState::KeyValue(MlxKeyValueLayerState::Device(_)))
+                | None => {}
+            }
+        }
+        fork.manager = Some(manager);
+        Ok(fork)
     }
 
     /// Restores append-only and fixed state to an exact speculative checkpoint.

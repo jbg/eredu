@@ -215,12 +215,15 @@ fn safe_matrix_constraints(
             companion.clone(),
             dtype(),
         )
-        .companion(),
+        .linear_companion(name, eredu_checkpoint::schema::LinearCompanionKind::Scale),
     );
     if quantization.has_biases() {
         constraints.push(
             SafetensorsTensorConstraint::required(format!("{prefix}.biases"), companion, dtype())
-                .companion(),
+                .linear_companion(
+                    name,
+                    eredu_checkpoint::schema::LinearCompanionKind::AffineBias,
+                ),
         );
     }
     Ok(constraints)

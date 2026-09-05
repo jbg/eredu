@@ -117,8 +117,43 @@ pub struct WeightBinding {
     checkpoint_key: String,
     selection: TensorSelection,
     recipe: Option<DerivedWeightRecipe>,
-    quantization_companions: Option<(String, String)>,
+    quantization_companions: Option<QuantizationCompanionBindings>,
     expected_bytes: u64,
+}
+
+/// Exact local outputs created by one load-time packed-weight transform.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct QuantizationCompanionBindings {
+    scale: String,
+    affine_bias: Option<String>,
+}
+
+impl QuantizationCompanionBindings {
+    /// Creates the role-keyed local companion identities.
+    pub fn new(
+        scale: impl Into<String>,
+        affine_bias: Option<String>,
+    ) -> Result<Self, ResidencyDeclarationError> {
+        let scale = validate_name(scale.into())?;
+        let affine_bias = affine_bias.map(validate_name).transpose()?;
+        if affine_bias.as_ref() == Some(&scale) {
+            return Err(ResidencyDeclarationError::InvalidQuantizationCompanions {
+                name: "packed weight".into(),
+                scales: scale,
+                biases: affine_bias.unwrap(),
+            });
+        }
+        Ok(Self { scale, affine_bias })
+    }
+
+    /// Returns the required scale binding.
+    pub fn scale(&self) -> &str {
+        &self.scale
+    }
+    /// Returns the affine-bias binding when the selected format has one.
+    pub fn affine_bias(&self) -> Option<&str> {
+        self.affine_bias.as_deref()
+    }
 }
 
 impl WeightBinding {
@@ -230,29 +265,30 @@ impl WeightBinding {
     pub fn with_quantization_companions(
         mut self,
         scales_binding: impl Into<String>,
-        biases_binding: impl Into<String>,
+        biases_binding: Option<String>,
     ) -> Result<Self, ResidencyDeclarationError> {
         let scales_binding = validate_name(scales_binding.into())?;
-        let biases_binding = validate_name(biases_binding.into())?;
+        let biases_binding = biases_binding.map(validate_name).transpose()?;
         if scales_binding == self.name
-            || biases_binding == self.name
-            || scales_binding == biases_binding
+            || biases_binding.as_ref() == Some(&self.name)
+            || biases_binding.as_ref() == Some(&scales_binding)
         {
             return Err(ResidencyDeclarationError::InvalidQuantizationCompanions {
                 name: self.name,
                 scales: scales_binding,
-                biases: biases_binding,
+                biases: biases_binding.unwrap_or_default(),
             });
         }
-        self.quantization_companions = Some((scales_binding, biases_binding));
+        self.quantization_companions = Some(QuantizationCompanionBindings {
+            scale: scales_binding,
+            affine_bias: biases_binding,
+        });
         Ok(self)
     }
 
     /// Returns exact local scale and affine-bias bindings for load-time quantization.
-    pub fn quantization_companions(&self) -> Option<(&str, &str)> {
-        self.quantization_companions
-            .as_ref()
-            .map(|(scales, biases)| (scales.as_str(), biases.as_str()))
+    pub const fn quantization_companions(&self) -> Option<&QuantizationCompanionBindings> {
+        self.quantization_companions.as_ref()
     }
 
     /// Returns the first physical checkpoint source.

@@ -1114,6 +1114,46 @@ impl CacheResidencyManager {
         self.session_id
     }
 
+    /// Forks one quiescent cache session into an independent block namespace.
+    ///
+    /// Immutable block arrays may be shared, but lifecycle ownership, mutable-tail accounting,
+    /// budgets, and future block identities belong exclusively to the returned manager.
+    pub(crate) fn fork_session(&self, stream: &Stream) -> Result<Self, CacheResidencyError> {
+        let (blocks, tails) = {
+            let state = self.lock()?;
+            let blocks = state
+                .blocks
+                .keys()
+                .map(|id| {
+                    state
+                        .lifecycle
+                        .is_protected_prefix(id)
+                        .map(|protected| (id.clone(), protected))
+                        .map_err(CacheResidencyError::from)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let tails = state.lifecycle.tails().collect::<Vec<_>>();
+            (blocks, tails)
+        };
+        let fork = Self::new(self.options().clone())?;
+        for (id, protected) in blocks {
+            let lease = self.lease_block(&id, stream)?;
+            let arrays = lease.arrays().clone();
+            fork.seal_block(
+                id.global_layer,
+                id.start,
+                id.end,
+                id.rank,
+                arrays,
+                protected,
+            )?;
+        }
+        for (layer, tail) in tails {
+            fork.set_tail_state(layer, tail.bytes, tail.end)?;
+        }
+        Ok(fork)
+    }
+
     /// Returns validated paged-cache options.
     pub fn options(&self) -> &PagedCacheOptions {
         &self.inner.options

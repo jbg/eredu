@@ -3,7 +3,7 @@
 use std::marker::PhantomData;
 
 use eredu_core::{
-    Completion, SpeculativeCommit, SpeculativeExecutor, SpeculativePrefill, Submission,
+    BoundedCompletion, SpeculativeCommit, SpeculativeExecutor, SpeculativePrefill, Submission,
 };
 
 use super::{AssistantState, SharedAttentionStates};
@@ -383,7 +383,7 @@ pub trait ExternalMechanisms: 'static {
     where
         Self: 'a;
     /// Exact verification completion.
-    type Completion: Completion<Error = Self::Error>;
+    type Completion: BoundedCompletion<Error = Self::Error>;
     /// Optional component telemetry.
     type Telemetry: eredu_core::SpeculativeTelemetry;
     /// Native mechanism failure.
@@ -879,6 +879,15 @@ mod tests {
 
         fn wait(&self) -> Result<(), Self::Error> {
             Ok(())
+        }
+    }
+
+    impl eredu_core::BoundedCompletion for Ready {
+        fn wait_bounded(
+            self,
+            _policy: eredu_core::BoundedCompletionWait,
+        ) -> Result<eredu_core::BoundedCompletionOutcome, Self::Error> {
+            Ok(eredu_core::BoundedCompletionOutcome::Completed)
         }
     }
 

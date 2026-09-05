@@ -204,33 +204,106 @@ impl ParameterBankEntry {
 }
 
 /// Lowers generic selected storage members into MLX residency entries.
+/// MLX entry bindings paired with exact per-binding transformation selections.
+pub struct SelectedAddressableEntries {
+    /// Source-backed entry catalog, before selected load-time transformations.
+    pub entries: Vec<ParameterBankEntry>,
+    /// Packed format keyed by the exact entry and local binding to transform.
+    pub transformations: BTreeMap<(ParameterBankKey, String), SelectedBindingTransform>,
+    /// Neutral selected byte total for each exact member.
+    pub expected_bytes: BTreeMap<ParameterBankKey, u64>,
+    /// Exact architecture ownership retained for every selected entry.
+    pub placements: BTreeMap<ParameterBankKey, eredu_runtime::AddressableBankMemberPlacement>,
+}
+
+/// Exact native lowering values for one selected bank binding.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct SelectedBindingTransform {
+    /// Packed executable format.
+    pub quantization: WeightQuantization,
+    /// Selected scale and affine-bias scalar dtype.
+    pub companion_dtype: eredu_checkpoint::recipe::RecipeDtype,
+}
+
+/// Validates and lowers exact neutral bank tasks without collapsing mechanisms.
 pub fn entries_from_selected_members(
     members: &[eredu_runtime::AddressableBankMember],
     store: &dyn eredu_checkpoint::store::CheckpointSource,
-) -> Result<Vec<ParameterBankEntry>, Error> {
-    members
+) -> Result<SelectedAddressableEntries, Error> {
+    let mut transformations = BTreeMap::new();
+    let entries = members
         .iter()
         .map(|member| {
             let key = ParameterBankKey::new(member.key().unit(), member.key().member());
             let bindings = member
-                .source()
-                .bindings()
+                .parameters()
                 .iter()
-                .map(|binding| {
-                    let mut recipe = binding.source_recipe();
-                    if recipe.infer(store)?.dtype() == &eredu_checkpoint::recipe::RecipeDtype::F4 {
+                .map(|parameter| {
+                    let task = parameter.task();
+                    for source in task.sources() {
+                        let provenance = store.source_provenance(source)?;
+                        let metadata = store.source_metadata(source)?;
+                        let physical = task
+                            .physical_sources()
+                            .iter()
+                            .find(|physical| physical.catalog_key() == source)
+                            .ok_or_else(|| {
+                                Error::ArchitectureModel(format!(
+                                    "addressable task {:?} source {source:?} has no selected physical provenance",
+                                    task.name()
+                                ))
+                            })?;
+                        if provenance.catalog_key != physical.catalog_key()
+                            || provenance.physical_tensor != physical.tensor()
+                            || provenance.output != physical.output()
+                            || provenance.backing_shard.as_deref() != Some(physical.shard())
+                            || provenance.source_encoding != *physical.source_encoding()
+                            || metadata.encoded_byte_len != physical.encoded_byte_len()
+                        {
+                            return Err(Error::ArchitectureModel(format!(
+                                "addressable task {:?} source provenance differs from the selected task",
+                                task.name()
+                            )));
+                        }
+                    }
+                    let mut recipe = parameter.recipe().clone();
+                    let inferred = recipe.infer(store)?;
+                    if &inferred != parameter.source_output() {
+                        return Err(Error::ArchitectureModel(format!(
+                            "addressable task {:?} member-local recipe output drifted",
+                            task.name()
+                        )));
+                    }
+                    if task.executable() == eredu_checkpoint::LinearFormat::MxFp4
+                        && inferred.dtype() == &eredu_checkpoint::recipe::RecipeDtype::F4
+                        && parameter.quantization_companions().is_none()
+                    {
                         recipe = crate::backend::runtime::checkpoint::recipe::lower_mxfp4_recipe(
                             recipe, store,
                         )?;
                     }
                     let metadata = recipe.infer(store)?;
                     let mut selected =
-                        WeightBinding::from_recipe(binding.name(), recipe, metadata.byte_len())?;
-                    if let Some(target) = binding.logical_target() {
-                        selected = selected.with_logical_target(target)?;
-                    }
-                    if let Some((scales, biases)) = binding.quantization_companions() {
-                        selected = selected.with_quantization_companions(scales, biases)?;
+                        WeightBinding::from_recipe(parameter.binding_name(), recipe, metadata.byte_len())?
+                            .with_logical_target(task.name())?;
+                    if let Some(companions) = parameter.quantization_companions() {
+                        let quantization = task.executable().weight_quantization().ok_or_else(|| {
+                            Error::ArchitectureModel(format!(
+                                "addressable transformed task {:?} has no packed format",
+                                task.name()
+                            ))
+                        })?;
+                        transformations.insert(
+                            (key, parameter.binding_name().to_owned()),
+                            SelectedBindingTransform {
+                                quantization,
+                                companion_dtype: parameter.source_output().dtype().clone(),
+                            },
+                        );
+                        selected = selected.with_quantization_companions(
+                            companions.scale(),
+                            companions.affine_bias().map(str::to_owned),
+                        )?;
                     }
                     Ok(selected)
                 })
@@ -246,7 +319,36 @@ pub fn entries_from_selected_members(
             ParameterBankEntry::new(key, OffloadUnit::new(key.unit_id(), bindings)?, bytes)
                 .map_err(Into::into)
         })
-        .collect()
+        .collect::<Result<Vec<_>, Error>>()?;
+    let expected_bytes: BTreeMap<ParameterBankKey, u64> = members
+        .iter()
+        .map(|member| {
+            (
+                ParameterBankKey::new(member.key().unit(), member.key().member()),
+                member.selected_bytes(),
+            )
+        })
+        .collect();
+    let placements = members
+        .iter()
+        .map(|member| {
+            (
+                ParameterBankKey::new(member.key().unit(), member.key().member()),
+                member.placement().clone(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    if placements.len() != members.len() || expected_bytes.len() != members.len() {
+        return Err(Error::ArchitectureModel(
+            "selected addressable members contain duplicate bank keys".into(),
+        ));
+    }
+    Ok(SelectedAddressableEntries {
+        entries,
+        transformations,
+        expected_bytes,
+        placements,
+    })
 }
 
 /// Result of replacing dense entry bindings with a disk-backed packed overlay.
@@ -259,12 +361,118 @@ pub(crate) struct QuantizedParameterBankCatalog {
     pub(crate) report: WeightMaterializationReport,
 }
 
-/// Quantizes every floating entry projection through its authoritative
-/// rank-local semantic recipe and rebuilds the catalog against packed keys.
+#[cfg(test)]
 pub(crate) fn quantize_entry_catalog(
     source: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
     entries: Vec<ParameterBankEntry>,
     quantization: WeightQuantization,
+    max_working_set_bytes: u64,
+    source_stream: &Stream,
+) -> Result<QuantizedParameterBankCatalog, Error> {
+    let selected = entries
+        .iter()
+        .flat_map(|entry| {
+            entry.unit.bindings().iter().filter_map(move |binding| {
+                binding
+                    .quantization_companions()
+                    .map(|_| (entry.identity, binding.name().to_owned()))
+            })
+        })
+        .collect();
+    quantize_selected_entry_catalog_once(
+        source,
+        entries,
+        quantization,
+        &eredu_checkpoint::recipe::RecipeDtype::F32,
+        &selected,
+        max_working_set_bytes,
+        source_stream,
+    )
+}
+
+fn merge_materialization_report(
+    total: &mut WeightMaterializationReport,
+    next: WeightMaterializationReport,
+) {
+    total.admitted_working_set_bytes = total
+        .admitted_working_set_bytes
+        .max(next.admitted_working_set_bytes);
+    total.transformed_weights += next.transformed_weights;
+    total.source_tiles += next.source_tiles;
+    total.peak_in_flight_tiles = total.peak_in_flight_tiles.max(next.peak_in_flight_tiles);
+    total.source_bytes_read += next.source_bytes_read;
+    total.output_bytes += next.output_bytes;
+    total.peak_planned_working_set_bytes = total
+        .peak_planned_working_set_bytes
+        .max(next.peak_planned_working_set_bytes);
+    total.largest_source_tile_bytes = total
+        .largest_source_tile_bytes
+        .max(next.largest_source_tile_bytes);
+    total.largest_output_tile_bytes = total
+        .largest_output_tile_bytes
+        .max(next.largest_output_tile_bytes);
+}
+
+fn selected_transformation_formats(
+    transformations: &BTreeMap<(ParameterBankKey, String), SelectedBindingTransform>,
+) -> Vec<WeightQuantization> {
+    let mut formats = Vec::new();
+    for transform in transformations.values() {
+        if !formats.contains(&transform.quantization) {
+            formats.push(transform.quantization);
+        }
+    }
+    formats
+}
+
+fn quantize_selected_entry_catalog(
+    mut source: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
+    mut entries: Vec<ParameterBankEntry>,
+    transformations: BTreeMap<(ParameterBankKey, String), SelectedBindingTransform>,
+    max_working_set_bytes: u64,
+    source_stream: &Stream,
+) -> Result<QuantizedParameterBankCatalog, Error> {
+    let mut by_format = Vec::<(SelectedBindingTransform, std::collections::BTreeSet<_>)>::new();
+    for (binding, transform) in transformations {
+        if let Some((_, selected)) = by_format
+            .iter_mut()
+            .find(|(candidate, _)| *candidate == transform)
+        {
+            selected.insert(binding);
+        } else {
+            by_format.push((transform, std::iter::once(binding).collect()));
+        }
+    }
+    let mut report = WeightMaterializationReport::default();
+    for (transform, selected) in by_format {
+        let transformed = quantize_selected_entry_catalog_once(
+            source,
+            entries,
+            transform.quantization,
+            &transform.companion_dtype,
+            &selected,
+            max_working_set_bytes,
+            source_stream,
+        )?;
+        source = transformed.store;
+        entries = transformed.entries;
+        merge_materialization_report(&mut report, transformed.report);
+    }
+    Ok(QuantizedParameterBankCatalog {
+        store: source,
+        entries,
+        report,
+    })
+}
+
+/// Quantizes every floating entry projection through its authoritative
+/// rank-local semantic recipe and rebuilds the catalog against packed keys.
+fn quantize_selected_entry_catalog_once(
+    source: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
+    entries: Vec<ParameterBankEntry>,
+    quantization: WeightQuantization,
+    companion_dtype: &eredu_checkpoint::recipe::RecipeDtype,
+    selected: &std::collections::BTreeSet<(ParameterBankKey, String)>,
     max_working_set_bytes: u64,
     source_stream: &Stream,
 ) -> Result<QuantizedParameterBankCatalog, Error> {
@@ -275,9 +483,12 @@ pub(crate) fn quantize_entry_catalog(
     for entry in entries {
         let (identity, unit) = entry.into_parts();
         for binding in unit.bindings() {
-            let Some((scales_binding, biases_binding)) = binding.quantization_companions() else {
+            let Some(companions) = binding.quantization_companions() else {
                 continue;
             };
+            if !selected.contains(&(identity, binding.name().to_owned())) {
+                continue;
+            }
             let recipe = binding.source_recipe();
             let metadata = recipe.infer(source.as_ref())?;
             let target_name = format!(
@@ -292,11 +503,18 @@ pub(crate) fn quantize_entry_catalog(
             let target = BoundedQuantizationTarget::from_recipe(
                 target_name.clone(),
                 format!("{target_prefix}.scales"),
-                Some(format!("{target_prefix}.biases")),
+                companions
+                    .affine_bias()
+                    .map(|_| format!("{target_prefix}.biases")),
                 recipe,
-            )?;
+            )?
+            .with_affine_companion_dtype(companion_dtype.clone())?;
             packed_catalog_bytes = packed_catalog_bytes
-                .checked_add(packed_projection_bytes(metadata.shape(), quantization)?)
+                .checked_add(packed_projection_bytes(
+                    metadata.shape(),
+                    quantization,
+                    companion_dtype,
+                )?)
                 .ok_or_else(|| {
                     Error::Quantization("packed entry catalog size overflowed".into())
                 })?;
@@ -304,8 +522,8 @@ pub(crate) fn quantize_entry_catalog(
                 (identity, binding.name().to_string()),
                 (
                     target.clone(),
-                    scales_binding.to_owned(),
-                    biases_binding.to_owned(),
+                    companions.scale().to_owned(),
+                    companions.affine_bias().map(str::to_owned),
                 ),
             );
             targets.push(target);
@@ -349,7 +567,7 @@ pub(crate) fn quantize_entry_catalog(
                 target.scales_name(),
                 store.as_ref(),
             )?);
-            if quantization.has_biases() {
+            if let Some(biases_name) = biases_name {
                 bindings.push(packed_binding(
                     biases_name,
                     target
@@ -380,6 +598,7 @@ pub(crate) fn quantize_entry_catalog(
 fn packed_projection_bytes(
     shape: &[usize],
     quantization: WeightQuantization,
+    companion_dtype: &eredu_checkpoint::recipe::RecipeDtype,
 ) -> Result<u64, Error> {
     let (&columns, rows) = shape
         .split_last()
@@ -397,16 +616,20 @@ fn packed_projection_bytes(
         .checked_div(quantization.group_size() as usize)
         .ok_or_else(|| Error::Quantization("entry group geometry is invalid".into()))?
         as u64;
+    let scalar_bytes = companion_dtype
+        .bit_width()
+        .map_err(|error| Error::Quantization(error.to_string()))?
+        / 8;
     let scale_bytes = if matches!(quantization, WeightQuantization::MxFp4) {
         groups
     } else {
         groups
-            .checked_mul(4)
+            .checked_mul(scalar_bytes)
             .ok_or_else(|| Error::Quantization("entry scale row size overflowed".into()))?
     };
     let bias_bytes = if quantization.has_biases() {
         groups
-            .checked_mul(4)
+            .checked_mul(scalar_bytes)
             .ok_or_else(|| Error::Quantization("entry bias row size overflowed".into()))?
     } else {
         0
@@ -544,8 +767,13 @@ impl BankPassStatistics {
 
 /// Point-in-time entry residency and execution report.
 pub struct ParameterBankResidencyReport {
-    /// Packed encoding used by load-time transformed entry bindings.
-    weight_quantization: Option<WeightQuantization>,
+    /// Every packed encoding used by exact load-time transformed bindings.
+    weight_quantizations: Vec<WeightQuantization>,
+    /// Exact architecture-selected ownership for every bank entry.
+    placements: Vec<(
+        ParameterBankKey,
+        eredu_runtime::AddressableBankMemberPlacement,
+    )>,
     /// Owned logical entry count.
     owned_entries: usize,
     /// Owned logical entry bytes, including cold checkpoint-only entries.
@@ -574,9 +802,18 @@ pub struct ParameterBankResidencyReport {
 }
 
 impl ParameterBankResidencyReport {
-    /// Returns the optional packed load-time weight encoding.
-    pub const fn weight_quantization(&self) -> Option<WeightQuantization> {
-        self.weight_quantization
+    /// Returns all packed load-time encodings in deterministic first-binding order.
+    pub fn weight_quantizations(&self) -> &[WeightQuantization] {
+        &self.weight_quantizations
+    }
+    /// Returns exact selected entry placement in deterministic key order.
+    pub fn placements(
+        &self,
+    ) -> &[(
+        ParameterBankKey,
+        eredu_runtime::AddressableBankMemberPlacement,
+    )] {
+        &self.placements
     }
     /// Returns the number of owned entries.
     pub const fn owned_entries(&self) -> usize {
@@ -649,12 +886,15 @@ pub struct AddressableParameterBank {
     catalog: BTreeMap<ParameterBankKey, u64>,
     #[cfg(test)]
     namespace_entry_counts: BTreeMap<usize, usize>,
+    #[cfg(test)]
     namespace_global_spans: BTreeMap<usize, usize>,
     host_budget: Option<u64>,
     scratch_limit: u64,
+    #[cfg(test)]
     bulk_bank_target: u64,
     statistics: Mutex<ParameterBankStatistics>,
-    weight_quantization: Option<WeightQuantization>,
+    weight_quantizations: Vec<WeightQuantization>,
+    placements: BTreeMap<ParameterBankKey, eredu_runtime::AddressableBankMemberPlacement>,
     materialization: Option<WeightMaterializationReport>,
 }
 
@@ -691,7 +931,8 @@ impl SharedAddressableParameterBank {
 
 impl AddressableParameterBank {
     /// Creates a disk-planned cache over exactly the supplied owned entries.
-    pub fn new<S, O>(
+    #[cfg(test)]
+    pub(crate) fn new<S, O>(
         store: Arc<S>,
         entries: impl IntoIterator<Item = ParameterBankEntry>,
         options: O,
@@ -707,7 +948,8 @@ impl AddressableParameterBank {
     }
 
     /// Creates a cache from an already type-erased checkpoint store.
-    pub fn new_shared<O>(
+    #[cfg(test)]
+    pub(crate) fn new_shared<O>(
         store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
         entries: impl IntoIterator<Item = ParameterBankEntry>,
         options: O,
@@ -725,18 +967,17 @@ impl AddressableParameterBank {
             MemoryTier::Disk,
             source_stream,
             device_stream,
-            None,
+            Vec::new(),
+            BTreeMap::new(),
             None,
         )
     }
 
-    /// Creates a cache after boundedly transforming its rank-local semantic
-    /// entry recipes into packed checkpoint bindings.
-    pub fn new_quantized_shared<O>(
+    /// Creates a cache from exact per-binding selected transformation tasks.
+    pub fn new_selected_shared<O>(
         store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
-        entries: Vec<ParameterBankEntry>,
+        selected: SelectedAddressableEntries,
         options: O,
-        quantization: WeightQuantization,
         source_stream: Stream,
         device_stream: Stream,
     ) -> Result<Self, AddressableParameterBankError>
@@ -744,17 +985,105 @@ impl AddressableParameterBank {
         O: Into<ParameterBankOptions>,
     {
         let options = options.into();
-        let transformed = quantize_entry_catalog(
+        let selected_keys = selected
+            .entries
+            .iter()
+            .map(|entry| entry.identity)
+            .collect::<std::collections::BTreeSet<_>>();
+        if selected_keys
+            != selected
+                .placements
+                .keys()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+        {
+            return Err(AddressableParameterBankError::Transformation {
+                source: Box::new(Error::ArchitectureModel(
+                    "selected addressable placements do not cover the exact entry keys".into(),
+                )),
+            });
+        }
+        for entry in &selected.entries {
+            let expected = selected
+                .expected_bytes
+                .get(&entry.identity)
+                .ok_or_else(|| AddressableParameterBankError::Transformation {
+                    source: Box::new(Error::ArchitectureModel(format!(
+                        "selected addressable entry {:?} has no neutral byte total",
+                        entry.identity
+                    ))),
+                })?;
+            let projected = entry
+                .unit
+                .bindings()
+                .iter()
+                .try_fold(0u64, |total, binding| {
+                    let bytes = if let Some(transform) = selected
+                        .transformations
+                        .get(&(entry.identity, binding.name().to_owned()))
+                    {
+                        let metadata = binding.source_recipe().infer(store.as_ref())?;
+                        packed_projection_bytes(
+                            metadata.shape(),
+                            transform.quantization,
+                            &transform.companion_dtype,
+                        )?
+                    } else {
+                        binding.expected_bytes()
+                    };
+                    total.checked_add(bytes).ok_or_else(|| {
+                        Error::ArchitectureModel(
+                            "selected addressable entry bytes overflowed".into(),
+                        )
+                    })
+                })
+                .map_err(|source| AddressableParameterBankError::Transformation {
+                    source: Box::new(source),
+                })?;
+            if projected != *expected {
+                return Err(AddressableParameterBankError::Transformation {
+                    source: Box::new(Error::ArchitectureModel(format!(
+                        "selected addressable entry {:?} bytes differ: expected {}, projected {}",
+                        entry.identity, expected, projected
+                    ))),
+                });
+            }
+        }
+        if selected.transformations.is_empty() {
+            return Self::new_shared_with_policy(
+                store,
+                selected.entries,
+                options,
+                ResidencyPolicy::Cacheable,
+                MemoryTier::Disk,
+                source_stream,
+                device_stream,
+                Vec::new(),
+                selected.placements,
+                None,
+            );
+        }
+        let telemetry_formats = selected_transformation_formats(&selected.transformations);
+        let transformed = quantize_selected_entry_catalog(
             store,
-            entries,
-            quantization,
+            selected.entries,
+            selected.transformations,
             options.compact_bank_scratch_bytes,
             &source_stream,
         )
         .map_err(|source| AddressableParameterBankError::Transformation {
             source: Box::new(source),
         })?;
-        let report = transformed.report;
+        for entry in &transformed.entries {
+            if selected.expected_bytes.get(&entry.identity) != Some(&entry.bytes) {
+                return Err(AddressableParameterBankError::Transformation {
+                    source: Box::new(Error::ArchitectureModel(format!(
+                        "materialized addressable entry {:?} differs from its neutral selected bytes",
+                        entry.identity
+                    ))),
+                });
+            }
+        }
         Self::new_shared_with_policy(
             transformed.store,
             transformed.entries,
@@ -763,8 +1092,9 @@ impl AddressableParameterBank {
             MemoryTier::Disk,
             source_stream,
             device_stream,
-            Some(quantization),
-            Some(report),
+            telemetry_formats,
+            selected.placements,
+            Some(transformed.report),
         )
     }
 
@@ -774,7 +1104,8 @@ impl AddressableParameterBank {
     /// same selection compaction and backend-neutral binding machinery is used
     /// by sparse and resident execution, but resident entries cannot be evicted
     /// and never trigger checkpoint reads during a forward pass.
-    pub fn new_resident_shared(
+    #[cfg(test)]
+    pub(crate) fn new_resident_shared(
         store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
         entries: impl IntoIterator<Item = ParameterBankEntry>,
         source_stream: Stream,
@@ -788,42 +1119,9 @@ impl AddressableParameterBank {
             MemoryTier::Device,
             source_stream,
             device_stream,
+            Vec::new(),
+            BTreeMap::new(),
             None,
-            None,
-        )
-    }
-
-    /// Creates a fully resident cache after boundedly transforming the exact
-    /// rank-local entry catalog into its requested packed representation.
-    pub fn new_quantized_resident_shared(
-        store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
-        entries: Vec<ParameterBankEntry>,
-        quantization: WeightQuantization,
-        source_stream: Stream,
-        device_stream: Stream,
-    ) -> Result<Self, AddressableParameterBankError> {
-        let options = ParameterBankOptions::default();
-        let transformed = quantize_entry_catalog(
-            store,
-            entries,
-            quantization,
-            options.compact_bank_scratch_bytes,
-            &source_stream,
-        )
-        .map_err(|source| AddressableParameterBankError::Transformation {
-            source: Box::new(source),
-        })?;
-        let report = transformed.report;
-        Self::new_shared_with_policy(
-            transformed.store,
-            transformed.entries,
-            options,
-            ResidencyPolicy::Pinned,
-            MemoryTier::Device,
-            source_stream,
-            device_stream,
-            Some(quantization),
-            Some(report),
         )
     }
 
@@ -836,7 +1134,8 @@ impl AddressableParameterBank {
         initial_tier: MemoryTier,
         source_stream: Stream,
         device_stream: Stream,
-        weight_quantization: Option<WeightQuantization>,
+        weight_quantizations: Vec<WeightQuantization>,
+        placements: BTreeMap<ParameterBankKey, eredu_runtime::AddressableBankMemberPlacement>,
         materialization: Option<WeightMaterializationReport>,
     ) -> Result<Self, AddressableParameterBankError> {
         options.validate()?;
@@ -845,6 +1144,7 @@ impl AddressableParameterBank {
         let mut specs = Vec::new();
         #[cfg(test)]
         let mut namespace_entry_counts = BTreeMap::new();
+        #[cfg(test)]
         let mut namespace_global_spans = BTreeMap::new();
         for entry in entries {
             if catalog.insert(entry.identity, entry.bytes).is_some() {
@@ -858,10 +1158,13 @@ impl AddressableParameterBank {
                     .entry(entry.identity.namespace)
                     .or_insert(0) += 1;
             }
-            namespace_global_spans
-                .entry(entry.identity.namespace)
-                .and_modify(|span: &mut usize| *span = (*span).max(entry.identity.index + 1))
-                .or_insert(entry.identity.index + 1);
+            #[cfg(test)]
+            {
+                namespace_global_spans
+                    .entry(entry.identity.namespace)
+                    .and_modify(|span: &mut usize| *span = (*span).max(entry.identity.index + 1))
+                    .or_insert(entry.identity.index + 1);
+            }
             specs.push(OffloadUnitSpec::new(
                 entry.identity.unit_id(),
                 entry.bytes,
@@ -882,6 +1185,7 @@ impl AddressableParameterBank {
             catalog,
             #[cfg(test)]
             namespace_entry_counts,
+            #[cfg(test)]
             namespace_global_spans,
             host_budget: if initial_tier == MemoryTier::Device {
                 Some(0)
@@ -889,16 +1193,18 @@ impl AddressableParameterBank {
                 options.storage.host_budget_bytes()
             },
             scratch_limit: options.compact_bank_scratch_bytes,
+            #[cfg(test)]
             bulk_bank_target: options.bulk_compact_bank_target_bytes,
             statistics: Mutex::new(ParameterBankStatistics::default()),
-            weight_quantization,
+            weight_quantizations,
+            placements,
             materialization,
         })
     }
 
-    /// Returns the load-time encoding of transformed entry bindings.
-    pub const fn weight_quantization(&self) -> Option<WeightQuantization> {
-        self.weight_quantization
+    /// Returns all load-time encodings of transformed entry bindings.
+    pub fn weight_quantizations(&self) -> &[WeightQuantization] {
+        &self.weight_quantizations
     }
 
     /// Returns the underlying reusable residency manager.
@@ -907,26 +1213,31 @@ impl AddressableParameterBank {
     }
 
     /// Returns the largest source member in the generic storage catalog.
+    #[cfg(test)]
     pub(crate) fn maximum_member_bytes(&self) -> u64 {
         self.catalog.values().copied().max().unwrap_or(0)
     }
 
     /// Returns the hard compact-bank byte limit.
+    #[cfg(test)]
     pub(crate) const fn compact_bank_scratch_bytes(&self) -> u64 {
         self.scratch_limit
     }
 
     /// Returns the bulk compact-bank working-set target.
+    #[cfg(test)]
     pub(crate) const fn bulk_compact_bank_target_bytes(&self) -> u64 {
         self.bulk_bank_target
     }
 
     /// Returns the admitted global member span for a caller-owned namespace.
+    #[cfg(test)]
     pub(crate) fn namespace_global_span(&self, namespace: usize) -> Option<usize> {
         self.namespace_global_spans.get(&namespace).copied()
     }
 
     /// Completes one generic acquisition after its dependent output is evaluated.
+    #[cfg(test)]
     pub(crate) fn complete_acquisition(
         &self,
         mut acquisition: AcquiredParameterGroups,
@@ -1178,7 +1489,12 @@ impl AddressableParameterBank {
             .lock()
             .map_err(|_| AddressableParameterBankError::StatisticsPoisoned)?;
         Ok(ParameterBankResidencyReport {
-            weight_quantization: self.weight_quantization,
+            weight_quantizations: self.weight_quantizations.clone(),
+            placements: self
+                .placements
+                .iter()
+                .map(|(key, placement)| (*key, placement.clone()))
+                .collect(),
             owned_entries: self.catalog.len(),
             owned_bytes: self.catalog.values().copied().sum(),
             host_resident_entries,
@@ -1871,6 +2187,147 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn selected_entry_byte_corruption_fails_before_checkpoint_work() {
+        let (_dir, store) = fixture();
+        let entry = entries().into_iter().next().unwrap();
+        let identity = entry.identity;
+        let selected = SelectedAddressableEntries {
+            entries: vec![entry],
+            transformations: BTreeMap::new(),
+            expected_bytes: BTreeMap::from([(identity, 15)]),
+            placements: BTreeMap::from([(
+                identity,
+                eredu_runtime::AddressableBankMemberPlacement::new(
+                    eredu_runtime::ExecutionGroupId::new("decoder").unwrap(),
+                    identity.namespace,
+                    "decoder.unit",
+                    eredu_runtime::AddressableBankDistribution::Replicated,
+                )
+                .unwrap(),
+            )]),
+        };
+        let before = store.source_diagnostics().unwrap().physical_reads;
+        let error = AddressableParameterBank::new_selected_shared(
+            store.clone(),
+            selected,
+            ParameterBankOptions::default(),
+            stream(),
+            stream(),
+        )
+        .err()
+        .expect("corrupt selected bytes must fail");
+        assert!(error.to_string().contains("bytes differ"));
+        assert_eq!(store.source_diagnostics().unwrap().physical_reads, before);
+    }
+
+    #[test]
+    fn selected_entry_placement_coverage_fails_before_checkpoint_work() {
+        let (_dir, store) = fixture();
+        let entry = entries().into_iter().next().unwrap();
+        let identity = entry.identity;
+        let selected = SelectedAddressableEntries {
+            entries: vec![entry],
+            transformations: BTreeMap::new(),
+            expected_bytes: BTreeMap::from([(identity, 16)]),
+            placements: BTreeMap::new(),
+        };
+        let before = store.source_diagnostics().unwrap().physical_reads;
+        let error = AddressableParameterBank::new_selected_shared(
+            store.clone(),
+            selected,
+            ParameterBankOptions::default(),
+            stream(),
+            stream(),
+        )
+        .err()
+        .expect("incomplete selected placement must fail");
+        assert!(error.to_string().contains("placements do not cover"));
+        assert_eq!(store.source_diagnostics().unwrap().physical_reads, before);
+    }
+
+    #[test]
+    fn residency_report_retains_exact_selected_entry_placement() {
+        let (_dir, store) = fixture();
+        let entry = entries().into_iter().next().unwrap();
+        let identity = entry.identity;
+        let placement = eredu_runtime::AddressableBankMemberPlacement::new(
+            eredu_runtime::ExecutionGroupId::new("decoder").unwrap(),
+            identity.namespace,
+            "decoder.unit",
+            eredu_runtime::AddressableBankDistribution::Replicated,
+        )
+        .unwrap();
+        let selected = SelectedAddressableEntries {
+            entries: vec![entry],
+            transformations: BTreeMap::new(),
+            expected_bytes: BTreeMap::from([(identity, 16)]),
+            placements: BTreeMap::from([(identity, placement.clone())]),
+        };
+        let bank = AddressableParameterBank::new_selected_shared(
+            store,
+            selected,
+            ParameterBankOptions::default(),
+            stream(),
+            stream(),
+        )
+        .unwrap();
+        assert_eq!(
+            bank.report().unwrap().placements(),
+            &[(identity, placement)]
+        );
+    }
+
+    #[test]
+    fn affine_selected_bytes_use_the_exact_non_f32_companion_dtype() {
+        let affine =
+            WeightQuantization::Affine(eredu_checkpoint::AffineQuantization::new(64, 4).unwrap());
+        assert_eq!(
+            packed_projection_bytes(
+                &[2, 64],
+                affine,
+                &eredu_checkpoint::recipe::RecipeDtype::F16,
+            )
+            .unwrap(),
+            72
+        );
+        assert_eq!(
+            packed_projection_bytes(
+                &[2, 64],
+                affine,
+                &eredu_checkpoint::recipe::RecipeDtype::F32,
+            )
+            .unwrap(),
+            80
+        );
+    }
+
+    #[test]
+    fn mixed_selected_transforms_remain_explicit_in_telemetry() {
+        let affine =
+            WeightQuantization::Affine(eredu_checkpoint::AffineQuantization::new(64, 4).unwrap());
+        let transformations = BTreeMap::from([
+            (
+                (ParameterBankKey::new(0, 0), "weight".into()),
+                SelectedBindingTransform {
+                    quantization: affine,
+                    companion_dtype: eredu_checkpoint::recipe::RecipeDtype::F16,
+                },
+            ),
+            (
+                (ParameterBankKey::new(0, 1), "weight".into()),
+                SelectedBindingTransform {
+                    quantization: WeightQuantization::MxFp4,
+                    companion_dtype: eredu_checkpoint::recipe::RecipeDtype::F16,
+                },
+            ),
+        ]);
+        assert_eq!(
+            selected_transformation_formats(&transformations),
+            [affine, WeightQuantization::MxFp4]
+        );
+    }
+
     fn cache(
         store: Arc<SafetensorsWeightStore>,
         device: u64,
@@ -1961,7 +2418,7 @@ mod tests {
                         .unwrap()
                         .with_quantization_companions(
                             format!("{projection}_proj_scales"),
-                            format!("{projection}_proj_biases"),
+                            Some(format!("{projection}_proj_biases")),
                         )
                         .unwrap()
                 });
@@ -1972,19 +2429,33 @@ mod tests {
         let options =
             ParameterBankOptions::new(OffloadConfig::new(None, None, 1).unwrap(), 1_024, 1_024)
                 .unwrap();
-        let cache = AddressableParameterBank::new_quantized_shared(
+        let source_stream = stream();
+        let quantization = WeightQuantization::Affine(Default::default());
+        let transformed = quantize_entry_catalog(
             store,
             entries,
+            quantization,
+            options.compact_bank_scratch_bytes,
+            &source_stream,
+        )
+        .unwrap();
+        let cache = AddressableParameterBank::new_shared_with_policy(
+            transformed.store,
+            transformed.entries,
             options,
-            WeightQuantization::Affine(Default::default()),
+            ResidencyPolicy::Cacheable,
+            MemoryTier::Disk,
+            source_stream,
             stream(),
-            stream(),
+            vec![quantization],
+            BTreeMap::new(),
+            Some(transformed.report),
         )
         .unwrap();
 
         assert_eq!(
-            cache.weight_quantization(),
-            Some(WeightQuantization::Affine(Default::default()))
+            cache.weight_quantizations(),
+            [WeightQuantization::Affine(Default::default())]
         );
         let report = cache.report().unwrap();
         assert_eq!(report.owned_entries, 2);
@@ -2056,7 +2527,7 @@ mod tests {
             bytes.len() as u64,
         )
         .unwrap()
-        .with_quantization_companions("declared.scale", "declared.bias")
+        .with_quantization_companions("declared.scale", Some("declared.bias".into()))
         .unwrap();
         let preserved = WeightBinding::from_recipe(
             "ordinary_matrix",

@@ -6,7 +6,6 @@ use std::{
 };
 
 use crate::backend::runtime::checkpoint::gguf::GgufCheckpoint;
-use crate::composition::mlx::structural;
 #[cfg(test)]
 use eredu_architectures::GgufArchitecture;
 use eredu_core::{
@@ -61,6 +60,17 @@ impl MlxInspectionOptions {
     }
 }
 
+fn validate_exact_preparation(
+    inspection: &eredu_core::ArtifactInspection<
+        eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+    >,
+    options: &MlxInspectionOptions,
+) -> Result<(), Error> {
+    let load = options.load();
+    let policy = load.preparation_policy()?;
+    super::loading::select_preparation(inspection, load, policy).map(drop)
+}
+
 /// Inspects a local SafeTensors model directory or GGUF checkpoint without
 /// instantiating a model, materializing tensor payloads, or creating an MLX
 /// execution stream.
@@ -90,6 +100,34 @@ pub fn inspect_model(
     report.resources.tensor_count = report.tensor_count;
     report.resources.checkpoint_shards = report.checkpoint_shards;
     Ok(report)
+}
+
+/// Inspects backend mechanisms against one already admitted portable artifact.
+pub(crate) fn inspect_selected_artifact(
+    inspection: &eredu_core::ArtifactInspection<
+        eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+    >,
+    options: MlxInspectionOptions,
+) -> ModelInspectionReport {
+    let path = inspection.path();
+    let report = ModelInspectionReport::unverified(
+        path,
+        if inspection.validated_gguf().is_some() {
+            ArtifactFormat::Gguf
+        } else {
+            ArtifactFormat::SafeTensors
+        },
+    );
+    let mut report = if inspection.validated_gguf().is_some() {
+        inspect_selected_gguf(report, inspection, options)
+    } else {
+        inspect_selected_safetensors(report, inspection, options)
+    };
+    report.resources.model_family = report.model_family.clone();
+    report.resources.architecture = report.architecture.clone();
+    report.resources.tensor_count = report.tensor_count;
+    report.resources.checkpoint_shards = report.checkpoint_shards;
+    report
 }
 
 fn is_gguf_file(path: &Path) -> bool {
@@ -127,6 +165,17 @@ fn inspect_safetensors(path: &Path, options: MlxInspectionOptions) -> ModelInspe
             return report;
         }
     };
+    inspect_selected_safetensors(report, &portable, options)
+}
+
+fn inspect_selected_safetensors(
+    mut report: ModelInspectionReport,
+    portable: &eredu_core::ArtifactInspection<
+        eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+    >,
+    options: MlxInspectionOptions,
+) -> ModelInspectionReport {
+    let path = portable.path();
     let configuration = portable.configuration();
     let architecture_plan = portable.architecture_plan();
     let catalog = portable.tensors();
@@ -185,11 +234,7 @@ fn inspect_safetensors(path: &Path, options: MlxInspectionOptions) -> ModelInspe
         Ok(capabilities) => {
             record_embedded_drafting(&mut report, capabilities);
             report.expected_modalities = artifact_modalities(capabilities.input_modalities());
-            match options
-                .load()
-                .preparation_policy()
-                .and_then(|policy| structural::validate_inspected_preparation(&portable, policy))
-            {
+            match validate_exact_preparation(portable, &options) {
                 Ok(()) => report.requested_load = InspectionReadiness::Ready,
                 Err(error) => reject_load_policy(&mut report, &error),
             }
@@ -302,6 +347,17 @@ fn inspect_gguf(path: &Path, options: MlxInspectionOptions) -> ModelInspectionRe
             return report;
         }
     };
+    inspect_selected_gguf(report, &portable, options)
+}
+
+fn inspect_selected_gguf(
+    mut report: ModelInspectionReport,
+    portable: &eredu_core::ArtifactInspection<
+        eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+    >,
+    options: MlxInspectionOptions,
+) -> ModelInspectionReport {
+    let path = portable.path();
     let validated = portable
         .validated_gguf()
         .expect("GGUF inspection must expose its validated GGUF result");
@@ -373,11 +429,7 @@ fn inspect_gguf(path: &Path, options: MlxInspectionOptions) -> ModelInspectionRe
             .expect("GGUF inspection must retain its validated architecture plan"),
     );
     record_embedded_drafting(&mut report, capabilities);
-    match options
-        .load()
-        .preparation_policy()
-        .and_then(|policy| structural::validate_inspected_preparation(&portable, policy))
-    {
+    match validate_exact_preparation(portable, &options) {
         Ok(()) => match options
             .load()
             .weight_quantization()
@@ -752,7 +804,7 @@ mod tests {
                 ),
                 (
                     "llama.attention.head_count".into(),
-                    eredu_gguf::MetadataValue::Uint32(1),
+                    eredu_gguf::MetadataValue::Uint32(2),
                 ),
                 (
                     "llama.feed_forward_length".into(),
@@ -1094,6 +1146,37 @@ mod tests {
             .issues
             .iter()
             .any(|issue| issue.code == InspectionIssueCode::UnsupportedQuantizationRequest));
+    }
+
+    #[test]
+    fn requested_load_readiness_uses_exact_data_parallel_selection() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("model.gguf");
+        write_minimal_llama_gguf(&path, true, None);
+        let topology = eredu_core::ParallelRankTopology::new(
+            eredu_core::ParallelTopology::new(1, 1, 1, 2).unwrap(),
+            0,
+        )
+        .unwrap();
+        let options = MlxInspectionOptions::new(MlxLoadRequest::default().with_parallel_topology(
+            topology,
+            crate::backend::DeviceAssignment::new(safemlx::DeviceType::Cpu, 0),
+            eredu_runtime::PipelineWireContract::new(
+                eredu_runtime::PipelineActivationDtype::Float32,
+            ),
+            1,
+            128,
+            MlxLoadRequest::test_communication_completion_policy(),
+        ));
+
+        let report = inspect_model(&path, options).unwrap();
+
+        assert_ne!(report.requested_load, InspectionReadiness::Ready);
+        assert!(report.issues.iter().any(|issue| {
+            issue
+                .detail
+                .contains("data-parallel execution is not supported")
+        }));
     }
 
     #[test]

@@ -83,6 +83,24 @@ pub enum SourceTensorEncoding {
         /// Byte order declared by the containing shard.
         endian: Endian,
     },
+    /// Scalar tensor produced by an admitted architecture recipe before an
+    /// optional executable-format lowering.
+    RecipeOutput(StoredDtype),
+}
+
+impl SourceTensorEncoding {
+    /// Returns the scalar dtype when this encoding is an unpacked tensor.
+    pub fn scalar_dtype(&self) -> Option<StoredDtype> {
+        match self {
+            Self::Safetensors(dtype) | Self::RecipeOutput(dtype) => Some(dtype.clone()),
+            Self::Gguf { ggml_type, .. } => match ggml_type {
+                GgmlType::F16 => Some(StoredDtype::F16),
+                GgmlType::Bf16 => Some(StoredDtype::BF16),
+                GgmlType::F32 => Some(StoredDtype::F32),
+                _ => None,
+            },
+        }
+    }
 }
 
 /// Invalid backend-neutral checkpoint metadata.

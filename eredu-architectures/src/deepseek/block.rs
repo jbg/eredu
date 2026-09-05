@@ -21,7 +21,7 @@ use super::{
 /// Ordinary DeepSeek SwiGLU used by dense-prefix V3 layers.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct DenseSwiGlu<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
+pub struct DenseSwiGlu<B: NeuralBackend> {
     gate: B::Linear,
     up: B::Linear,
     down: B::Linear,
@@ -498,7 +498,7 @@ where
     }
 }
 
-impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> DenseSwiGlu<B> {
+impl<B: NeuralBackend> DenseSwiGlu<B> {
     fn new(
         args: &V3Args,
         layer: usize,
@@ -538,6 +538,107 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> DenseSwiGlu<B> {
         let activated =
             B::gated_product(gate, up, eredu_nn::GatedProductPolicy::default(), context)?;
         self.down.forward(&activated, context)
+    }
+}
+
+fn forward_v3_block<B, C, F>(
+    attention: &mut V3Attention<B>,
+    input_norm: &mut B::Normalization,
+    post_attention_norm: &mut B::Normalization,
+    input: &B::Tensor,
+    mask: Option<&B::Tensor>,
+    cache: Option<&mut C>,
+    context: &<B::Tensor as Tensor>::Context,
+    feed_forward: F,
+) -> Result<B::Tensor, Error>
+where
+    B: BlockwiseAttentionBackend,
+    C: CompressedAttentionCache<B::Tensor>,
+    F: FnOnce(&B::Tensor, &<B::Tensor as Tensor>::Context) -> Result<B::Tensor, Error>,
+{
+    let normalized = input_norm.forward(input, context)?;
+    let attention = attention.forward(&normalized, mask, cache, context)?;
+    let residual = input.add(&attention, context)?;
+    let normalized = post_attention_norm.forward(&residual, context)?;
+    let feed_forward = feed_forward(&normalized, context)?;
+    residual.add(&feed_forward, context)
+}
+
+/// One V3 decoder block whose validated schedule contains no routed experts.
+///
+/// Keeping this type separate from [`V3Block`] lets ordinary dense V3 models
+/// use the neutral compressed-attention path without imposing grouped or
+/// distributed backend capabilities that only sparse layers need.
+#[derive(Debug, Clone, Parameterized)]
+#[parameterized(tensor = "B::Tensor")]
+pub struct DenseV3Block<B: BlockwiseAttentionBackend> {
+    /// V3 multi-head latent attention.
+    pub attention: V3Attention<B>,
+    feed_forward: DenseSwiGlu<B>,
+    input_norm: B::Normalization,
+    post_attention_norm: B::Normalization,
+}
+
+impl<B: BlockwiseAttentionBackend> DenseV3Block<B> {
+    /// Builds one unloaded dense target block from the validated layer schedule.
+    pub fn new(
+        args: &V3Args,
+        layer: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        args.validate().map_err(Error::backend)?;
+        match args.layer_schedule.get(layer) {
+            Some(LayerPolicy::DenseMlp) => {}
+            Some(LayerPolicy::SparseMoe) => {
+                return Err(Error::backend(format!(
+                    "dense V3 block received routed layer {layer}"
+                )))
+            }
+            None => return Err(Error::backend(format!("missing V3 layer policy {layer}"))),
+        }
+        let root = format!("model.layers.{layer}");
+        let norm = |field: &str| {
+            B::normalization(
+                NormalizationConstructionSpec::learned(
+                    args.hidden_size,
+                    args.rms_norm_eps,
+                    parameter(format!("{root}.{field}.weight"))?,
+                ),
+                context,
+            )
+        };
+        Ok(Self {
+            attention: V3Attention::new(args, layer, context)?,
+            feed_forward: DenseSwiGlu::new(args, layer, context)?,
+            input_norm: norm("input_layernorm")?,
+            post_attention_norm: norm("post_attention_layernorm")?,
+        })
+    }
+
+    /// Executes pre-norm MLA and dense SwiGLU residual sequencing.
+    pub fn forward<C: CompressedAttentionCache<B::Tensor>>(
+        &mut self,
+        input: &B::Tensor,
+        mask: Option<&B::Tensor>,
+        cache: Option<&mut C>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        let Self {
+            attention,
+            feed_forward,
+            input_norm,
+            post_attention_norm,
+        } = self;
+        forward_v3_block(
+            attention,
+            input_norm,
+            post_attention_norm,
+            input,
+            mask,
+            cache,
+            context,
+            |normalized, context| feed_forward.forward(normalized, context),
+        )
     }
 }
 
@@ -658,17 +759,27 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAtt
         cache: Option<&mut C>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        let normalized = self.input_norm.forward(input, context)?;
-        let attention = self.attention.forward(&normalized, mask, cache, context)?;
-        let residual = input.add(&attention, context)?;
-        let normalized = self.post_attention_norm.forward(&residual, context)?;
-        let feed_forward = match &mut self.feed_forward {
-            V3FeedForward::Dense(mlp) => mlp.forward(&normalized, context)?,
-            V3FeedForward::Routed(moe) => {
-                moe.forward(&normalized, RouteSource::Learned, context)?
-            }
-        };
-        residual.add(&feed_forward, context)
+        let Self {
+            attention,
+            feed_forward,
+            input_norm,
+            post_attention_norm,
+        } = self;
+        forward_v3_block(
+            attention,
+            input_norm,
+            post_attention_norm,
+            input,
+            mask,
+            cache,
+            context,
+            |normalized, context| match feed_forward {
+                V3FeedForward::Dense(mlp) => mlp.forward(normalized, context),
+                V3FeedForward::Routed(moe) => {
+                    moe.forward(normalized, RouteSource::Learned, context)
+                }
+            },
+        )
     }
 
     /// Executes the V3 block with routed experts supplied by runtime policy.

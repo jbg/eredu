@@ -634,7 +634,6 @@ fn transform_target(
         let one_row = target
             .source
             .select_bounded_matrix_rows(source, matrix, 0, 1)?;
-        one_row.preflight_bounded(source)?;
         one_row_source_bytes = one_row_source_bytes.max(one_row.infer(source)?.byte_len());
         one_row_peak = one_row_peak.max(
             one_row
@@ -648,6 +647,12 @@ fn transform_target(
             "bounded quantization target {:?} requires at least {} working-set bytes for one row, but the plan permits {}",
             target.weight_name, one_row_peak, plan.max_working_set_bytes
         )));
+    }
+    for matrix in 0..leading {
+        target
+            .source
+            .select_bounded_matrix_rows(source, matrix, 0, 1)?
+            .preflight_bounded(source)?;
     }
     let tile_buffers = if one_row_peak
         .checked_mul(BOUNDED_QUANTIZATION_TILE_BUFFERS as u64)

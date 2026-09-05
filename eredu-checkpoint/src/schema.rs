@@ -295,14 +295,14 @@ pub fn matrix_for_linear_format(
         };
         return Ok(vec![
             SafetensorsTensorConstraint::required(
-                name,
+                name.clone(),
                 shape,
                 StoredDtypeConstraint::Exact(StoredDtype::F8E4M3),
             )
             .with_aliases(aliases),
             SafetensorsTensorConstraint::required(scale.key, scale_shape, scale_dtype)
                 .with_aliases(scale.aliases)
-                .companion(),
+                .linear_companion(name.clone(), LinearCompanionKind::Scale),
         ]);
     }
     let quantization = format
@@ -358,7 +358,7 @@ pub fn matrix_for_linear_format(
             .collect::<Vec<_>>()
     };
     let mut constraints = vec![SafetensorsTensorConstraint::required(
-        name,
+        name.clone(),
         packed,
         StoredDtypeConstraint::Exact(StoredDtype::U32),
     )
@@ -370,7 +370,7 @@ pub fn matrix_for_linear_format(
     constraints.push(
         SafetensorsTensorConstraint::required(scale.key, companion.clone(), companion_dtype())
             .with_aliases(scale.aliases)
-            .companion(),
+            .linear_companion(name.clone(), LinearCompanionKind::Scale),
     );
     if quantization.has_biases() {
         constraints.push(
@@ -380,7 +380,7 @@ pub fn matrix_for_linear_format(
                 companion_dtype(),
             )
             .with_aliases(companion_alias("biases"))
-            .companion(),
+            .linear_companion(name.clone(), LinearCompanionKind::AffineBias),
         );
     }
     Ok(constraints)
@@ -398,6 +398,24 @@ pub enum TensorRequirement {
 pub enum TensorRole {
     Tensor,
     Companion,
+}
+
+/// Semantic role of one encoded-linear companion output.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
+pub enum LinearCompanionKind {
+    /// Per-group or per-block scale values.
+    Scale,
+    /// Per-group affine zero-point/bias values.
+    AffineBias,
+}
+
+/// Exact primary relationship for a physical encoded-linear companion.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct LinearCompanionConstraint {
+    /// Canonical primary weight identity.
+    pub primary: String,
+    /// Companion semantic role.
+    pub kind: LinearCompanionKind,
 }
 
 /// Declarative SafeTensors storage constraint.
@@ -444,6 +462,8 @@ pub struct SafetensorsTensorConstraint {
     pub dtype: StoredDtypeConstraint,
     pub requirement: TensorRequirement,
     pub role: TensorRole,
+    /// Exact primary relationship when this is an encoded-linear companion.
+    pub linear_companion: Option<LinearCompanionConstraint>,
 }
 
 impl SafetensorsTensorConstraint {
@@ -461,6 +481,7 @@ impl SafetensorsTensorConstraint {
             dtype,
             requirement: TensorRequirement::Required,
             role: TensorRole::Tensor,
+            linear_companion: None,
         }
     }
 
@@ -489,6 +510,20 @@ impl SafetensorsTensorConstraint {
 
     pub fn companion(mut self) -> Self {
         self.role = TensorRole::Companion;
+        self
+    }
+
+    /// Marks this tensor as an exact encoded-linear companion.
+    pub fn linear_companion(
+        mut self,
+        primary: impl Into<String>,
+        kind: LinearCompanionKind,
+    ) -> Self {
+        self.role = TensorRole::Companion;
+        self.linear_companion = Some(LinearCompanionConstraint {
+            primary: primary.into(),
+            kind,
+        });
         self
     }
 }

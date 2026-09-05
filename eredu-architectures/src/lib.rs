@@ -34,7 +34,8 @@ pub use external_assistant::{
     ExternalAssistantPreparation, ExternalAssistantPreparationVisitor,
     ExternalAssistantTargetProfile, ExternalAssistantTensorPlacement, ExternalAssistantTransfer,
     ExternalSpeculativeContract, ExternalSpeculativeContractRequest, MaterializedExternalAssistant,
-    MaterializedExternalAssistantVisitor, PreparedExternalAssistant,
+    MaterializedExternalAssistantVisitor, SelectedExternalAssistant,
+    SelectedExternalAssistantPreparation,
 };
 /// Backend-neutral schedules and recipes for independent expert residency.
 pub mod expert_residency;

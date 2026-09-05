@@ -42,23 +42,185 @@ use crate::backend::{
 #[must_use = "distributed work has been submitted; retain, wait on, or synchronize its completion"]
 pub struct DistributedCompletion<T> {
     value: T,
-    event: Event,
+    event: Rc<Event>,
     _retained: Vec<Array>,
+    _count_buffers: Vec<Vec<usize>>,
+    _groups: Vec<Group>,
+    _routes: Vec<CommunicationRouteRealization>,
+    _streams: Vec<Stream>,
+    authority: Option<AuthorizedCompletion>,
+    quarantined: Cell<bool>,
+    #[cfg(test)]
+    force_pending: Rc<Cell<bool>>,
+}
+
+#[derive(Debug)]
+struct AuthorizedCompletion {
+    authority: eredu_runtime::PartitionCommunicationAuthority,
+    operation: eredu_runtime::CommunicationOperation,
+    phase: eredu_runtime::DistributedExecutionPhase,
+}
+
+#[derive(Debug)]
+struct DistributedCompletionOrphan {
+    event: Rc<Event>,
+    _arrays: Vec<Array>,
+    _count_buffers: Vec<Vec<usize>>,
+    _groups: Vec<Group>,
+    _routes: Vec<CommunicationRouteRealization>,
+    _streams: Vec<Stream>,
+    #[cfg(test)]
+    force_pending: Rc<Cell<bool>>,
+}
+
+#[derive(Debug, Default)]
+struct DistributedCompletionOrphanQuarantine {
+    work: Vec<DistributedCompletionOrphan>,
+}
+
+impl DistributedCompletionOrphanQuarantine {
+    fn reap(&mut self) {
+        self.work.retain(|work| {
+            #[cfg(test)]
+            if work.force_pending.get() {
+                return true;
+            }
+            matches!(work.event.is_complete(), Ok(false))
+        });
+    }
+}
+
+impl Drop for DistributedCompletionOrphanQuarantine {
+    fn drop(&mut self) {
+        self.reap();
+        for work in self.work.drain(..) {
+            let _ = work.event.synchronize();
+        }
+    }
+}
+
+fn reap_distributed_completion_orphans() {
+    let empty = DISTRIBUTED_COMPLETION_ORPHANS.try_with(|orphans| {
+        if let Ok(mut orphans) = orphans.try_borrow_mut() {
+            orphans.reap();
+            return orphans.work.is_empty();
+        }
+        false
+    });
+    if matches!(empty, Ok(true)) {
+        safemlx::unregister_thread_runtime_housekeeping(reap_distributed_completion_orphans);
+    }
 }
 
 impl<T> DistributedCompletion<T> {
+    fn ensure_authority_active(&self) -> Result<(), Error> {
+        match &self.authority {
+            Some(context) => context
+                .authority
+                .ensure_active()
+                .map_err(|error| Error::Parallel(error.to_string())),
+            None => Ok(()),
+        }
+    }
+
     /// Submits the supplied output arrays and couples their event to `value`.
     pub fn submit<'a>(
         value: T,
         outputs: impl IntoIterator<Item = &'a Array>,
     ) -> Result<Self, Error> {
         let retained = outputs.into_iter().cloned().collect::<Vec<_>>();
-        let event = async_eval_with_event(retained.iter())?;
+        let event = Rc::new(async_eval_with_event(retained.iter())?);
         Ok(Self {
             value,
             event,
             _retained: retained,
+            _count_buffers: Vec::new(),
+            _groups: Vec::new(),
+            _routes: Vec::new(),
+            _streams: Vec::new(),
+            authority: None,
+            quarantined: Cell::new(false),
+            #[cfg(test)]
+            force_pending: Rc::new(Cell::new(false)),
         })
+    }
+
+    /// Submits one selected session operation and retains every native dependency.
+    pub(crate) fn submit_authorized<'a>(
+        value: T,
+        outputs: impl IntoIterator<Item = &'a Array>,
+        retained: Vec<Array>,
+        count_buffers: Vec<Vec<usize>>,
+        groups: Vec<Group>,
+        routes: Vec<CommunicationRouteRealization>,
+        streams: Vec<Stream>,
+        authority: eredu_runtime::PartitionCommunicationAuthority,
+        operation: eredu_runtime::CommunicationOperation,
+    ) -> Result<Self, Error> {
+        let outputs = outputs.into_iter().cloned().collect::<Vec<_>>();
+        let event = Rc::new(async_eval_with_event(outputs.iter()).map_err(|error| {
+            Error::Parallel(
+                authority
+                    .submission_error(
+                        error,
+                        operation,
+                        eredu_runtime::DistributedExecutionPhase::Execution,
+                        None,
+                    )
+                    .to_string(),
+            )
+        })?);
+        #[cfg(test)]
+        let force_pending = Rc::new(Cell::new(
+            FORCE_NEXT_COMMUNICATION_PENDING.with(|force| force.replace(false)),
+        ));
+        Ok(Self {
+            value,
+            event,
+            _retained: retained,
+            _count_buffers: count_buffers,
+            _groups: groups,
+            _routes: routes,
+            _streams: streams,
+            authority: Some(AuthorizedCompletion {
+                authority,
+                operation,
+                phase: eredu_runtime::DistributedExecutionPhase::Execution,
+            }),
+            quarantined: Cell::new(false),
+            #[cfg(test)]
+            force_pending,
+        })
+    }
+
+    fn completion_error(&self, error: safemlx::error::Exception) -> Error {
+        match &self.authority {
+            Some(context) => Error::Parallel(
+                context
+                    .authority
+                    .completion_error(error, context.operation, context.phase, None)
+                    .to_string(),
+            ),
+            None => Error::from(error),
+        }
+    }
+
+    fn quarantine(&self) {
+        if self.quarantined.replace(true) {
+            return;
+        }
+        let work = DistributedCompletionOrphan {
+            event: self.event.clone(),
+            _arrays: self._retained.clone(),
+            _count_buffers: self._count_buffers.clone(),
+            _groups: self._groups.clone(),
+            _routes: self._routes.clone(),
+            _streams: self._streams.clone(),
+            #[cfg(test)]
+            force_pending: self.force_pending.clone(),
+        };
+        safemlx::register_thread_runtime_housekeeping(reap_distributed_completion_orphans);
+        DISTRIBUTED_COMPLETION_ORPHANS.with(|orphans| orphans.borrow_mut().work.push(work));
     }
 
     /// Returns the submitted value without waiting for its backend completion.
@@ -74,13 +236,30 @@ impl<T> DistributedCompletion<T> {
     /// Because MLX graphs are lazy, the consumer graph must be evaluated after
     /// this call. Constructing it before or after the call does not submit it.
     pub fn wait_on(&self, stream: &Stream) -> Result<(), Error> {
-        self.event.wait_on(stream)?;
+        if self.quarantined.get() {
+            return Err(Error::Parallel(
+                "distributed completion is quarantined after a bounded timeout".into(),
+            ));
+        }
+        self.ensure_authority_active()?;
+        self.event
+            .wait_on(stream)
+            .map_err(|error| self.completion_error(error))?;
+        self.ensure_authority_active()?;
         Ok(())
     }
 
     /// Returns whether the exact distributed operation has completed.
     pub fn is_complete(&self) -> Result<bool, Error> {
-        Ok(self.event.is_complete()?)
+        self.ensure_authority_active()?;
+        let complete = self
+            .event
+            .is_complete()
+            .map_err(|error| self.completion_error(error))?;
+        if complete {
+            self.ensure_authority_active()?;
+        }
+        Ok(complete)
     }
 
     /// Returns the backend which owns this exact completion.
@@ -93,15 +272,64 @@ impl<T> DistributedCompletion<T> {
         self._retained.len()
     }
 
+    /// Returns retained count buffers, groups, routes, and streams in that order.
+    #[cfg(test)]
+    pub(crate) fn retained_native_resources(&self) -> (usize, usize, usize, usize) {
+        (
+            self._count_buffers.len(),
+            self._groups.len(),
+            self._routes.len(),
+            self._streams.len(),
+        )
+    }
+
     /// Blocks the host for this exact completion, not the remainder of a stream.
     pub fn synchronize(&self) -> Result<(), Error> {
-        self.event.synchronize()?;
-        Ok(())
+        self.ensure_authority_active()?;
+        let Some(context) = &self.authority else {
+            return self
+                .event
+                .synchronize()
+                .map_err(|error| self.completion_error(error));
+        };
+        let policy = context.authority.completion_policy().ok_or_else(|| {
+            Error::Parallel("authorized distributed completion has no bounded policy".into())
+        })?;
+        let Some(deadline) = std::time::Instant::now().checked_add(policy.timeout()) else {
+            self.quarantine();
+            return Err(self.completion_error(safemlx::error::Exception::custom(
+                "distributed completion deadline overflowed; live work was quarantined",
+            )));
+        };
+        loop {
+            #[cfg(test)]
+            let complete = if self.force_pending.get() {
+                Ok(false)
+            } else {
+                self.event.is_complete()
+            };
+            #[cfg(not(test))]
+            let complete = self.event.is_complete();
+            match complete {
+                Ok(true) => {
+                    self.ensure_authority_active()?;
+                    return Ok(());
+                }
+                Ok(false) if std::time::Instant::now() < deadline => std::thread::yield_now(),
+                Ok(false) => {
+                    self.quarantine();
+                    return Err(self.completion_error(safemlx::error::Exception::custom(
+                        "bounded distributed completion deadline exceeded; live work was quarantined",
+                    )));
+                }
+                Err(error) => return Err(self.completion_error(error)),
+            }
+        }
     }
 
     /// Waits for exact completion and returns the owned result.
     pub fn into_value(self) -> Result<T, Error> {
-        self.event.synchronize()?;
+        self.synchronize()?;
         Ok(self.value)
     }
 }
@@ -137,6 +365,7 @@ pub struct MlxCommunicationCompletion {
     flag: Option<FlagResolution>,
     words: Option<WordResolution>,
     boundary_headers: Vec<BoundaryHeaderResolution>,
+    authority: Option<AuthorizedCommunicationCompletion>,
     #[cfg(test)]
     submitted_outputs: usize,
     #[cfg(test)]
@@ -145,6 +374,13 @@ pub struct MlxCommunicationCompletion {
     teardown_observed: Option<Arc<AtomicBool>>,
     #[cfg(test)]
     owner_exit_completion_observed: Option<Arc<AtomicBool>>,
+}
+
+#[derive(Debug)]
+struct AuthorizedCommunicationCompletion {
+    authority: eredu_runtime::PartitionCommunicationAuthority,
+    operation: eredu_runtime::CommunicationOperation,
+    phase: eredu_runtime::DistributedExecutionPhase,
 }
 
 impl Drop for MlxCommunicationCompletion {
@@ -278,6 +514,8 @@ impl Drop for CommunicationOrphanQuarantine {
 }
 
 thread_local! {
+    static DISTRIBUTED_COMPLETION_ORPHANS: RefCell<DistributedCompletionOrphanQuarantine> =
+        RefCell::new(DistributedCompletionOrphanQuarantine::default());
     static COMMUNICATION_ORPHANS: RefCell<CommunicationOrphanQuarantine> =
         RefCell::new(CommunicationOrphanQuarantine::default());
     #[cfg(test)]
@@ -290,7 +528,20 @@ pub(crate) fn force_next_communication_pending() {
 }
 
 #[cfg(test)]
+pub(crate) fn distributed_completion_orphan_count() -> usize {
+    DISTRIBUTED_COMPLETION_ORPHANS.with(|orphans| orphans.borrow().work.len())
+}
+
+#[cfg(test)]
 pub(crate) fn release_forced_pending_orphans() {
+    DISTRIBUTED_COMPLETION_ORPHANS.with(|orphans| {
+        let mut orphans = orphans.borrow_mut();
+        for work in &mut orphans.work {
+            work.force_pending.set(false);
+            work.event.synchronize().unwrap();
+        }
+        orphans.reap();
+    });
     COMMUNICATION_ORPHANS.with(|orphans| {
         let mut orphans = orphans.borrow_mut();
         for work in &mut orphans.work {
@@ -368,6 +619,7 @@ impl MlxCommunicationCompletion {
             flag: None,
             words: None,
             boundary_headers: Vec::new(),
+            authority: None,
             #[cfg(test)]
             submitted_outputs,
             #[cfg(test)]
@@ -377,6 +629,30 @@ impl MlxCommunicationCompletion {
             #[cfg(test)]
             owner_exit_completion_observed: None,
         })
+    }
+
+    /// Joins this exact completion to the selected session poison authority.
+    pub(crate) fn with_authority(
+        mut self,
+        authority: eredu_runtime::PartitionCommunicationAuthority,
+        operation: eredu_runtime::CommunicationOperation,
+        phase: eredu_runtime::DistributedExecutionPhase,
+    ) -> Self {
+        self.authority = Some(AuthorizedCommunicationCompletion {
+            authority,
+            operation,
+            phase,
+        });
+        self
+    }
+
+    fn mark_authority_failure(&self, error: impl std::fmt::Display) {
+        if let Some(context) = &self.authority {
+            let _ =
+                context
+                    .authority
+                    .completion_error(error, context.operation, context.phase, None);
+        }
     }
 
     pub(crate) fn with_failure_agreement(
@@ -536,15 +812,21 @@ impl eredu_core::BoundedCompletion for MlxCommunicationCompletion {
         loop {
             #[cfg(test)]
             let complete = !self.force_pending
-                && self
-                    .event
-                    .try_with_complete(|| self.resolve_host_results())?
-                    .is_some();
+                && match self.event.try_with_complete(|| self.resolve_host_results()) {
+                    Ok(result) => result.is_some(),
+                    Err(error) => {
+                        self.mark_authority_failure(&error);
+                        return Err(error);
+                    }
+                };
             #[cfg(not(test))]
-            let complete = self
-                .event
-                .try_with_complete(|| self.resolve_host_results())?
-                .is_some();
+            let complete = match self.event.try_with_complete(|| self.resolve_host_results()) {
+                Ok(result) => result.is_some(),
+                Err(error) => {
+                    self.mark_authority_failure(&error);
+                    return Err(error);
+                }
+            };
             if complete {
                 // A completed query is authoritative and reports any retained
                 // asynchronous error without a second lock-taking host wait.
@@ -552,6 +834,7 @@ impl eredu_core::BoundedCompletion for MlxCommunicationCompletion {
             }
             if std::time::Instant::now() >= deadline {
                 let selected = policy.cancellation();
+                self.mark_authority_failure("bounded communication deadline exceeded");
                 quarantine(self);
                 if selected != eredu_core::CompletionCancellationMode::QuarantineUntilComplete {
                     return Err(safemlx::error::Exception::custom(
@@ -571,15 +854,24 @@ impl eredu_core::Completion for MlxCommunicationCompletion {
     type Error = safemlx::error::Exception;
 
     fn is_complete(&self) -> Result<bool, Self::Error> {
-        Ok(self
-            .event
-            .try_with_complete(|| self.resolve_host_results())?
-            .is_some())
+        match self.event.try_with_complete(|| self.resolve_host_results()) {
+            Ok(result) => Ok(result.is_some()),
+            Err(error) => {
+                self.mark_authority_failure(&error);
+                Err(error)
+            }
+        }
     }
 
     fn wait(&self) -> Result<(), Self::Error> {
-        self.event.synchronize()?;
-        self.resolve_host_results()
+        let result = self
+            .event
+            .synchronize()
+            .and_then(|()| self.resolve_host_results());
+        if let Err(error) = &result {
+            self.mark_authority_failure(error);
+        }
+        result
     }
 }
 

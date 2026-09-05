@@ -374,10 +374,11 @@ pub fn all_to_all_v_axis(
 /// implementations may borrow its axis groups internally, but callers cannot
 /// construct or route around those groups independently of the selected
 /// backend session.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct MlxDistributedSession {
     communicators: ParallelCommunicators,
     stream: Stream,
+    authority: eredu_runtime::PartitionCommunicationAuthority,
 }
 
 impl MlxDistributedSession {
@@ -388,9 +389,12 @@ impl MlxDistributedSession {
         stream: &Stream,
     ) -> Result<Self, Error> {
         let communicators = ParallelCommunicators::from_manifest(manifest, world, stream)?;
+        let authority = eredu_runtime::PartitionCommunicationAuthority::from_manifest(manifest)
+            .map_err(|error| Error::Parallel(error.to_string()))?;
         Ok(Self {
             communicators,
             stream: stream.clone(),
+            authority,
         })
     }
 
@@ -446,13 +450,15 @@ impl MlxDistributedSession {
         let Self {
             communicators,
             stream,
+            authority,
         } = self;
         let (groups, routes) = communicators.into_partition_resources(&manifest)?;
-        let communication = eredu_runtime::PartitionCommunication::new(
+        let communication = eredu_runtime::PartitionCommunication::new_with_authority(
             manifest,
             groups,
             routes,
             crate::backend::nn::shared::MlxCommunicationTensorMetadata,
+            authority,
         )
         .map_err(|error| Error::Parallel(error.to_string()))?;
         Ok((communication, parallel, sampling, stream))
@@ -493,17 +499,68 @@ impl MlxDistributedSession {
                 capability: "manifest-realized sessions have no uncontracted world data plane"
                     .into(),
             })),
-            CollectiveScope::Group(id) => self.communicators.group(id).ok_or_else(|| {
-                Error::Backend(BackendError::Unsupported {
-                    backend: "mlx".into(),
-                    capability: format!("collective group {} is inactive", id.value()),
+            CollectiveScope::Group(id) => {
+                self.communicators.communication_group(id).ok_or_else(|| {
+                    Error::Backend(BackendError::Unsupported {
+                        backend: "mlx".into(),
+                        capability: format!("collective group {} is inactive", id.value()),
+                    })
                 })
-            }),
+            }
             _ => Err(Error::Backend(BackendError::Unsupported {
                 backend: "mlx".into(),
                 capability: "unknown collective scope".into(),
             })),
         }
+    }
+
+    fn ensure_active(&self) -> Result<(), Error> {
+        self.authority
+            .ensure_active()
+            .map_err(|error| Error::Parallel(error.to_string()))
+    }
+
+    fn submission_error(
+        &self,
+        error: impl std::fmt::Display,
+        operation: eredu_runtime::CommunicationOperation,
+    ) -> Error {
+        Error::Parallel(
+            self.authority
+                .submission_error(
+                    error,
+                    operation,
+                    eredu_runtime::DistributedExecutionPhase::Execution,
+                    None,
+                )
+                .to_string(),
+        )
+    }
+
+    fn selected_submission(
+        &self,
+        output: Array,
+        retained: Vec<Array>,
+        count_buffers: Vec<Vec<usize>>,
+        group: Group,
+        operation: eredu_runtime::CommunicationOperation,
+    ) -> Result<Submission<MlxTensor, DistributedCompletion<MlxTensor>>, Error> {
+        let value = MlxTensor::from_array(output.clone());
+        let completion = DistributedCompletion::submit_authorized(
+            MlxTensor::from_array(output.clone()),
+            [&output],
+            retained,
+            count_buffers,
+            vec![group],
+            Vec::new(),
+            vec![self.stream.clone()],
+            self.authority.clone(),
+            operation,
+        )?;
+        Ok(Submission {
+            output: value,
+            completion,
+        })
     }
 
     /// Returns whether `scope` is implemented by an MLX logical subgroup.
@@ -583,13 +640,19 @@ impl DistributedSession for MlxDistributedSession {
         scope: CollectiveScope,
         input: &MlxTensor,
     ) -> Result<Submission<MlxTensor, Self::Completion>, Error> {
-        let output = distributed::all_sum(input.as_array(), self.group(scope)?, &self.stream)?;
-        let completion =
-            DistributedCompletion::submit(MlxTensor::from_array(output.clone()), [&output])?;
-        Ok(Submission {
-            output: MlxTensor::from_array(output),
-            completion,
-        })
+        self.ensure_active()?;
+        let group = self.group(scope)?.clone();
+        let output =
+            distributed::all_sum(input.as_array(), &group, &self.stream).map_err(|error| {
+                self.submission_error(error, eredu_runtime::CommunicationOperation::AllReduceSum)
+            })?;
+        self.selected_submission(
+            output.clone(),
+            vec![input.as_array().clone(), output],
+            Vec::new(),
+            group,
+            eredu_runtime::CommunicationOperation::AllReduceSum,
+        )
     }
 
     fn all_gather(
@@ -597,13 +660,19 @@ impl DistributedSession for MlxDistributedSession {
         scope: CollectiveScope,
         input: &MlxTensor,
     ) -> Result<Submission<MlxTensor, Self::Completion>, Error> {
-        let output = distributed::all_gather(input.as_array(), self.group(scope)?, &self.stream)?;
-        let completion =
-            DistributedCompletion::submit(MlxTensor::from_array(output.clone()), [&output])?;
-        Ok(Submission {
-            output: MlxTensor::from_array(output),
-            completion,
-        })
+        self.ensure_active()?;
+        let group = self.group(scope)?.clone();
+        let output =
+            distributed::all_gather(input.as_array(), &group, &self.stream).map_err(|error| {
+                self.submission_error(error, eredu_runtime::CommunicationOperation::AllGatherEven)
+            })?;
+        self.selected_submission(
+            output.clone(),
+            vec![input.as_array().clone(), output],
+            Vec::new(),
+            group,
+            eredu_runtime::CommunicationOperation::AllGatherEven,
+        )
     }
 
     fn all_to_all_v(
@@ -613,19 +682,28 @@ impl DistributedSession for MlxDistributedSession {
         send_counts: &[usize],
         receive_counts: &[usize],
     ) -> Result<Submission<MlxTensor, Self::Completion>, Error> {
+        self.ensure_active()?;
+        let group = self.group(scope)?.clone();
         let output = distributed::all_to_all_v(
             input.as_array(),
             send_counts,
             receive_counts,
-            self.group(scope)?,
+            &group,
             &self.stream,
-        )?;
-        let completion =
-            DistributedCompletion::submit(MlxTensor::from_array(output.clone()), [&output])?;
-        Ok(Submission {
-            output: MlxTensor::from_array(output),
-            completion,
-        })
+        )
+        .map_err(|error| {
+            self.submission_error(
+                error,
+                eredu_runtime::CommunicationOperation::VariableAllToAll,
+            )
+        })?;
+        self.selected_submission(
+            output.clone(),
+            vec![input.as_array().clone(), output],
+            vec![send_counts.to_vec(), receive_counts.to_vec()],
+            group,
+            eredu_runtime::CommunicationOperation::VariableAllToAll,
+        )
     }
 
     fn send(
@@ -634,13 +712,19 @@ impl DistributedSession for MlxDistributedSession {
         peer: usize,
         input: &MlxTensor,
     ) -> Result<Submission<MlxTensor, Self::Completion>, Error> {
-        let output = distributed::send(input.as_array(), peer, self.group(scope)?, &self.stream)?;
-        let completion =
-            DistributedCompletion::submit(MlxTensor::from_array(output.clone()), [&output])?;
-        Ok(Submission {
-            output: MlxTensor::from_array(output),
-            completion,
-        })
+        self.ensure_active()?;
+        let group = self.group(scope)?.clone();
+        let output =
+            distributed::send(input.as_array(), peer, &group, &self.stream).map_err(|error| {
+                self.submission_error(error, eredu_runtime::CommunicationOperation::SendReceive)
+            })?;
+        self.selected_submission(
+            output.clone(),
+            vec![input.as_array().clone(), output],
+            Vec::new(),
+            group,
+            eredu_runtime::CommunicationOperation::SendReceive,
+        )
     }
 
     fn receive(
@@ -649,20 +733,26 @@ impl DistributedSession for MlxDistributedSession {
         peer: usize,
         value: &ValueDescriptor,
     ) -> Result<Submission<MlxTensor, Self::Completion>, Error> {
+        self.ensure_active()?;
         let shape = Self::value_shape(value)?;
+        let group = self.group(scope)?.clone();
         let output = distributed::recv(
             &shape,
             Self::value_dtype(value)?,
             peer,
-            self.group(scope)?,
+            &group,
             &self.stream,
-        )?;
-        let completion =
-            DistributedCompletion::submit(MlxTensor::from_array(output.clone()), [&output])?;
-        Ok(Submission {
-            output: MlxTensor::from_array(output),
-            completion,
-        })
+        )
+        .map_err(|error| {
+            self.submission_error(error, eredu_runtime::CommunicationOperation::SendReceive)
+        })?;
+        self.selected_submission(
+            output.clone(),
+            vec![output],
+            Vec::new(),
+            group,
+            eredu_runtime::CommunicationOperation::SendReceive,
+        )
     }
 
     fn all_gather_words(&self, local: &[u32]) -> Result<Vec<u32>, Error> {
@@ -697,11 +787,14 @@ impl eredu_core::consensus::BoundedConsensusTransport for MlxDistributedSession 
         &self,
         local: &[u32],
     ) -> Result<Submission<Self::GatherOutput, Self::Completion>, Self::Error> {
+        self.ensure_active()?;
         let length = i32::try_from(local.len())
             .map_err(|_| Error::Parallel("distributed metadata exceeds i32".into()))?;
         let local = Array::from_slice(local, &[length]);
         let group = self.communicators.control_world().clone();
-        let gathered = distributed::all_gather(&local, &group, &self.stream)?;
+        let operation = eredu_runtime::CommunicationOperation::AllGatherEven;
+        let gathered = distributed::all_gather(&local, &group, &self.stream)
+            .map_err(|error| self.submission_error(error, operation))?;
         let completion = MlxCommunicationCompletion::submit(
             [&gathered],
             vec![local, gathered.clone()],
@@ -709,7 +802,13 @@ impl eredu_core::consensus::BoundedConsensusTransport for MlxDistributedSession 
             vec![group],
             Vec::new(),
             vec![self.stream.clone()],
-        )?;
+        )
+        .map_err(|error| self.submission_error(error, operation))?
+        .with_authority(
+            self.authority.clone(),
+            operation,
+            eredu_runtime::DistributedExecutionPhase::Execution,
+        );
         Ok(Submission {
             output: MlxTensor::from_array(gathered),
             completion,
@@ -732,6 +831,39 @@ mod bounded_consensus_tests {
         CompletionCancellationMode,
     };
     use safemlx::{Device, DeviceType};
+
+    fn singleton_data_manifest() -> (
+        eredu_runtime::CommunicationManifest,
+        eredu_core::CollectiveGroupId,
+    ) {
+        let id = eredu_core::CollectiveGroupId::new(41);
+        let requirement = eredu_runtime::CommunicationOperationRequirement::tensors(
+            eredu_runtime::CommunicationOperation::AllReduceSum,
+            [eredu_core::checkpoint::TensorDtype::F32],
+            eredu_runtime::CommunicationTensorLimits::new(1, 1, 8, None).unwrap(),
+            true,
+        )
+        .unwrap();
+        let group = eredu_runtime::CommunicationGroupDescriptor::new(
+            id,
+            0,
+            vec![0],
+            Some(0),
+            eredu_runtime::CommunicationGroupRequirements::new([requirement]).unwrap(),
+        )
+        .unwrap();
+        let policy = eredu_runtime::CommunicationCompletionPolicy::new(
+            std::time::Duration::from_secs(1),
+            CompletionCancellationMode::QuarantineUntilComplete,
+        )
+        .unwrap();
+        (
+            eredu_runtime::CommunicationManifest::new(1, 0, vec![group], Vec::new())
+                .unwrap()
+                .with_completion_policy(policy),
+            id,
+        )
+    }
 
     #[test]
     fn bounded_consensus_submission_retains_exact_native_work_until_resolution() {
@@ -796,6 +928,85 @@ mod bounded_consensus_tests {
         assert_eq!(
             manifest_session.resolve_all_gather_words(output).unwrap(),
             [17, u32::MAX]
+        );
+    }
+
+    #[test]
+    fn retained_public_view_and_partition_runtime_share_one_poison_authority() {
+        let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+        let world = safemlx::distributed::init(false, safemlx::distributed::Backend::Ring)
+            .expect("singleton Ring world should initialize");
+        let (manifest, group) = singleton_data_manifest();
+        let session = MlxDistributedSession::from_manifest(&manifest, &world, &stream).unwrap();
+        let retained = session.clone();
+        let (communication, _, _, _) = session
+            .into_partition_communication(manifest, None, group)
+            .unwrap();
+
+        let _ = retained.authority.completion_error(
+            "injected public completion failure",
+            eredu_runtime::CommunicationOperation::AllReduceSum,
+            eredu_runtime::DistributedExecutionPhase::Execution,
+            None,
+        );
+        assert!(communication.authority().ensure_active().is_err());
+    }
+
+    #[test]
+    fn public_collective_completion_retains_inputs_group_and_stream_after_session_drop() {
+        use eredu_core::Completion as _;
+
+        let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+        let world = safemlx::distributed::init(false, safemlx::distributed::Backend::Ring)
+            .expect("singleton Ring world should initialize");
+        let (manifest, group) = singleton_data_manifest();
+        let session = MlxDistributedSession::from_manifest(&manifest, &world, &stream).unwrap();
+        let input = MlxTensor::from_array(Array::from_slice(&[3.0_f32], &[1]));
+        let submission = session
+            .all_reduce_sum(CollectiveScope::Group(group), &input)
+            .unwrap();
+        assert_eq!(submission.completion.retained_resources(), 2);
+        assert_eq!(
+            submission.completion.retained_native_resources(),
+            (0, 1, 0, 1)
+        );
+        drop(session);
+        drop(input);
+        submission.completion.wait().unwrap();
+    }
+
+    #[test]
+    fn public_collective_wait_uses_manifest_deadline_and_shared_poison() {
+        use eredu_core::Completion as _;
+
+        let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+        let world = safemlx::distributed::init(false, safemlx::distributed::Backend::Ring)
+            .expect("singleton Ring world should initialize");
+        let (manifest, group) = singleton_data_manifest();
+        let manifest = manifest.with_completion_policy(
+            eredu_runtime::CommunicationCompletionPolicy::new(
+                std::time::Duration::from_millis(1),
+                CompletionCancellationMode::QuarantineUntilComplete,
+            )
+            .unwrap(),
+        );
+        let session = MlxDistributedSession::from_manifest(&manifest, &world, &stream).unwrap();
+        crate::backend::runtime::distributed::completion::force_next_communication_pending();
+        let input = MlxTensor::from_array(Array::from_slice(&[3.0_f32], &[1]));
+        let submission = session
+            .all_reduce_sum(CollectiveScope::Group(group), &input)
+            .unwrap();
+        assert!(submission.completion.wait().is_err());
+        assert!(submission.completion.wait_on(&stream).is_err());
+        assert!(session.authority.ensure_active().is_err());
+        assert_eq!(
+            crate::backend::runtime::distributed::completion::distributed_completion_orphan_count(),
+            1
+        );
+        crate::backend::runtime::distributed::completion::release_forced_pending_orphans();
+        assert_eq!(
+            crate::backend::runtime::distributed::completion::distributed_completion_orphan_count(),
+            0
         );
     }
 }

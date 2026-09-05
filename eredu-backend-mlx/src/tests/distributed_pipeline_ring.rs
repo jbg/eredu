@@ -25,12 +25,11 @@ use crate::{
         },
         DeviceAssignment, MlxBackend,
     },
-    composition::{kimi_linear as neutral_kimi_linear, lfm2, nemotron_h as neutral_nemotron_h},
+    composition::checkpoint_fixtures,
 };
 use crate::{MlxLoadRequest, MlxTensor};
 use eredu_architectures::gpt_oss;
 use eredu_architectures::qwen::hybrid as qwen_hybrid;
-use eredu_architectures::ModelKind;
 use eredu_core::cache::{PromptCacheDescriptor, PromptCacheOptions};
 use eredu_core::{
     load_model, residency::OffloadConfig, BackendSession as _, DevicePlan, DraftPlacementPlan,
@@ -1004,9 +1003,6 @@ fn pipeline_ring_worker() {
             );
         }
         let expected_effective_model_type = family.effective_model_type();
-        let expected_model_family =
-            ModelKind::resolve_model_type(expected_effective_model_type).unwrap();
-        assert_eq!(model.model_family(), expected_model_family);
         assert_eq!(model.effective_model_type(), expected_effective_model_type);
         if dense_stream {
             let report = model.dense_stream_report().unwrap().unwrap();
@@ -1046,6 +1042,17 @@ fn pipeline_ring_worker() {
             );
         }
         let mut runtime = eredu_core::ModelRuntime::from_prepared(backend, model).unwrap();
+        let distributed_view =
+            <MlxBackend<'_> as eredu_core::DistributedBackend>::distributed_session(
+                runtime.session(),
+            )
+            .expect("partitioned MLX session must retain its selected communication view");
+        let distributed_descriptor = eredu_core::DistributedSession::descriptor(distributed_view);
+        assert_eq!(
+            distributed_descriptor.world_size(),
+            topology.topology().world_size()
+        );
+        assert_eq!(distributed_descriptor.rank(), topology.global_rank());
         if prove_prepared_communication_lifecycle {
             assert_eq!(
                 crate::composition::mlx::path_instrumentation::communication_realization_attempts(),
@@ -1073,7 +1080,6 @@ fn pipeline_ring_worker() {
             assert_eq!(generated.len(), 3);
             return;
         }
-        assert_eq!(runtime.session().model_family(), expected_model_family);
         assert_eq!(
             runtime.session().effective_model_type(),
             expected_effective_model_type
@@ -1834,10 +1840,9 @@ fn pipeline_ring_worker() {
 #[test]
 fn complete_qwen3_vl_variants_accept_paged_cache() {
     let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
-    for (expected_family, expected_effective_model_type, moe) in [
-        (ModelKind::Qwen3Vl, "qwen3_vl_text", false),
-        (ModelKind::Qwen3VlMoe, "qwen3_vl_moe_text", true),
-    ] {
+    for (expected_effective_model_type, moe) in
+        [("qwen3_vl_text", false), ("qwen3_vl_moe_text", true)]
+    {
         let checkpoint = tempfile::tempdir().unwrap();
         write_qwen3_vl_fixture(checkpoint.path(), moe);
         let backend = crate::native::backend(&stream, &stream);
@@ -1849,7 +1854,6 @@ fn complete_qwen3_vl_variants_accept_paged_cache() {
         let model = load_model(&backend, checkpoint.path(), request).unwrap();
         assert_eq!(model.effective_model_type(), expected_effective_model_type);
         let runtime = ModelRuntime::from_prepared(backend, model).unwrap();
-        assert_eq!(runtime.session().model_family(), expected_family);
         assert_eq!(
             runtime.session().effective_model_type(),
             expected_effective_model_type
@@ -1876,7 +1880,6 @@ fn complete_gemma4_preserves_nested_effective_model_type() {
     write_gemma_fixture(checkpoint.path());
     let backend = crate::native::backend(&stream, &stream);
     let model = load_model(&backend, checkpoint.path(), MlxLoadRequest::default()).unwrap();
-    assert_eq!(model.model_family(), ModelKind::Gemma4);
     assert_eq!(model.effective_model_type(), "gemma4_text");
     let runtime = ModelRuntime::from_prepared(backend, model).unwrap();
     assert_eq!(runtime.session().effective_model_type(), "gemma4_text");
@@ -2316,23 +2319,26 @@ fn execute_public_gemma_external_scheduler(
         adaptive_lookahead: false,
     });
     let factory = crate::composition::mlx::automatic::MlxBackendFactory::default();
-    let realization = eredu_core::realize_execution_plan_target(&factory, &plan).unwrap();
-    let (backend, options) = realization.into_parts();
-    let model = load_model(&backend, target, options).unwrap();
-    let mut runtime = ModelRuntime::from_prepared(backend, model).unwrap();
-
     let tokenizer_compatibility = TokenizerCompatibilityProof::prove([7; 32], [7; 32]).unwrap();
     let preparation = eredu_architectures::prepare_external_assistant(assistant).unwrap();
-    let mut drafting = eredu_core::realize_execution_plan_drafting(
+    let inspection = eredu_architectures::configuration::inspect_artifact(target).unwrap();
+    let selected = eredu_core::select_execution_plan_target(&factory, &plan, inspection).unwrap();
+    let external_artifact = eredu_core::select_execution_plan_drafting(
         &factory,
         &plan,
-        &runtime,
+        &selected,
         Some(ExternalDraftArtifact {
             preparation,
             tokenizer_compatibility,
         }),
     )
     .unwrap();
+    let realization = eredu_core::realize_execution_plan_target(&factory, &plan, selected).unwrap();
+    let mut runtime = realization.into_runtime().unwrap();
+
+    let mut drafting =
+        eredu_core::realize_execution_plan_drafting(&factory, &plan, &runtime, external_artifact)
+            .unwrap();
     let mut draft = drafting
         .as_speculative_draft()
         .expect("the external plan must realize a reusable assistant");
@@ -4302,7 +4308,8 @@ fn write_lfm2_pipeline_fixture(directory: &Path, moe: bool) {
     let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = execution.stream();
     let args = eredu_architectures::lfm2::model_args_from_config_value(&config).unwrap();
-    let mut model = MlxModule::new(lfm2::Lfm2CheckpointTemplate::new(args, stream).unwrap());
+    let mut model =
+        MlxModule::new(checkpoint_fixtures::Lfm2CheckpointTemplate::new(args, stream).unwrap());
     for (name, parameter) in neutral_parameter_refs_mut(&mut model).flatten() {
         let shape = parameter.shape().to_vec();
         *parameter = if name.ends_with("norm.weight") {
@@ -4371,8 +4378,9 @@ fn write_lfm2_moe_gguf_fixture(path: &Path) {
     let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = execution.stream();
     let args = eredu_architectures::lfm2::model_args_from_config_value(&config).unwrap();
-    let mut model =
-        MlxModule::new(lfm2::Lfm2CheckpointTemplate::new(args.clone(), stream).unwrap());
+    let mut model = MlxModule::new(
+        checkpoint_fixtures::Lfm2CheckpointTemplate::new(args.clone(), stream).unwrap(),
+    );
     initialize_fixture(&mut model, stream);
     let mut specs = Vec::new();
     for (runtime_name, value) in neutral_parameter_refs(&model, false).flatten() {
@@ -4644,7 +4652,7 @@ fn write_kimi_linear_fixture_from_config(directory: &Path, config: serde_json::V
     let stream = execution.stream();
     let args = eredu_architectures::kimi_linear::model_args_from_config_value(&config).unwrap();
     let mut model = MlxModule::new(
-        neutral_kimi_linear::KimiLinearCheckpointTemplate::new(args.clone(), stream).unwrap(),
+        checkpoint_fixtures::KimiLinearCheckpointTemplate::new(args.clone(), stream).unwrap(),
     );
     initialize_fixture(&mut model, stream);
     let mut arrays = Vec::<(String, Array)>::new();
@@ -4823,7 +4831,7 @@ fn write_nemotron_fixture_with_config(directory: &Path, config: serde_json::Valu
     let stream = execution.stream();
     let args = eredu_architectures::nemotron_h::model_args_from_config_value(&config).unwrap();
     let mut model = MlxModule::new(
-        neutral_nemotron_h::NemotronHCheckpointTemplate::new(args.clone(), stream).unwrap(),
+        checkpoint_fixtures::NemotronHCheckpointTemplate::new(args.clone(), stream).unwrap(),
     );
     initialize_fixture(&mut model, stream);
     let mut arrays = Vec::<(String, Array)>::new();
@@ -4864,7 +4872,7 @@ fn write_nemotron_h_moe_gguf_fixture(path: &Path) {
     let stream = execution.stream();
     let args = eredu_architectures::nemotron_h::model_args_from_config_value(&config).unwrap();
     let mut model = MlxModule::new(
-        neutral_nemotron_h::NemotronHCheckpointTemplate::new(args.clone(), stream).unwrap(),
+        checkpoint_fixtures::NemotronHCheckpointTemplate::new(args.clone(), stream).unwrap(),
     );
     initialize_fixture(&mut model, stream);
     let mut specs = Vec::new();
@@ -5026,8 +5034,11 @@ fn write_qwen_hybrid_fixture(directory: &Path, model_type: &str) {
     let stream = execution.stream();
     let parsed = qwen_hybrid::model_args_from_config_value(&config).unwrap();
     let mut model = MlxModule::new(
-        crate::composition::qwen::hybrid::QwenHybridCheckpointTemplate::new(parsed.text, stream)
-            .unwrap(),
+        crate::composition::checkpoint_fixtures::QwenHybridCheckpointTemplate::new(
+            parsed.text,
+            stream,
+        )
+        .unwrap(),
     );
     initialize_fixture(&mut model, stream);
     save_parameter_fixture(directory, &config, &model);
@@ -5039,8 +5050,11 @@ fn write_qwen_hybrid_moe_fixture(directory: &Path, model_type: &str) {
     let stream = execution.stream();
     let parsed = qwen_hybrid::model_args_from_config_value(&config).unwrap();
     let mut model = MlxModule::new(
-        crate::composition::qwen::hybrid::QwenHybridCheckpointTemplate::new(parsed.text, stream)
-            .unwrap(),
+        crate::composition::checkpoint_fixtures::QwenHybridCheckpointTemplate::new(
+            parsed.text,
+            stream,
+        )
+        .unwrap(),
     );
     initialize_fixture(&mut model, stream);
     save_parameter_fixture(directory, &config, &model);
@@ -5098,8 +5112,10 @@ fn write_qwen35_multimodal_fixture_with_prediction(
     let stream = execution.stream();
     let parsed = qwen_hybrid::model_args_from_config_value(&config).unwrap();
     let mut model = MlxModule::new(
-        crate::composition::qwen::hybrid::QwenConditionalCheckpointTemplate::new(parsed, stream)
-            .unwrap(),
+        crate::composition::checkpoint_fixtures::QwenConditionalCheckpointTemplate::new(
+            parsed, stream,
+        )
+        .unwrap(),
     );
     initialize_fixture(&mut model, stream);
     save_parameter_fixture(directory, &config, &model);
@@ -5149,7 +5165,8 @@ fn write_qwen3_vl_fixture(directory: &Path, moe: bool) {
     let stream = execution.stream();
     let args = eredu_architectures::qwen::vl::model_args_from_config_value(&config).unwrap();
     let mut model = MlxModule::new(
-        crate::composition::qwen::vl::QwenVlCheckpointTemplate::new(args, stream).unwrap(),
+        crate::composition::checkpoint_fixtures::QwenVlCheckpointTemplate::new(args, stream)
+            .unwrap(),
     );
     initialize_fixture(&mut model, stream);
     let arrays = neutral_parameter_refs(&model, false)

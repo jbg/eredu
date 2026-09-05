@@ -18,13 +18,12 @@ use safemlx::{
 };
 
 use super::{
-    session::MlxSpeculativeSessionParts,
     speculative::{
         scheduler::{component_timing_enabled, MlxSpeculativeRuntime},
         MlxAssistantPreparationVisitor, MlxDrafter, MlxSpeculativeSampling,
         SpeculativeExecutionStreams,
     },
-    Executable, MlxBackend, MlxModelInput,
+    MlxBackend, MlxModelInput,
 };
 use crate::backend::error::Error;
 use crate::backend::nn::{shared::MlxNeuralBackend, tensor::TokenValidationScope};
@@ -365,7 +364,7 @@ fn validate_lane_proposal_capacity(
 }
 
 struct MlxExternalBatchRunner<'target, 'lane, C, V> {
-    target: &'target mut (dyn super::replicated_text::ErasedReplicatedTextExecutable + 'static),
+    target: &'target mut (dyn super::replicated_text::ErasedReplicatedTextExecutable + 'target),
     lanes: Vec<MlxSpeculativeLaneRuntime<'lane, C>>,
     streams: SpeculativeExecutionStreams<'target>,
     visitor: V,
@@ -641,25 +640,17 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
         let prepared_lanes = Self::prepare_speculative_batch_lanes(lanes, proposal_capacity)?;
         let capture = drafter.capture().clone();
         let selected = drafter.selected().clone();
-        let model = match self.runtime.session_mut().speculative_parts_mut()? {
-            MlxSpeculativeSessionParts::Complete { model, .. } => model,
-        };
-        match model {
-            Executable::ReplicatedText(_, target) => drafter.visit(MlxExternalBatchVisitor {
-                runner: MlxExternalBatchRunner {
-                    target: target.as_mut(),
-                    lanes: prepared_lanes,
-                    streams,
-                    visitor,
-                    capture,
-                    selected,
-                },
-            }),
-            model => Err(Error::Speculative(format!(
-                "speculative runtime adapter is unavailable for model type {}",
-                model.effective_model_type(),
-            ))),
-        }
+        let model = self.runtime.session_mut().speculative_model_mut();
+        drafter.visit(MlxExternalBatchVisitor {
+            runner: MlxExternalBatchRunner {
+                target: model.erased_mut(),
+                lanes: prepared_lanes,
+                streams,
+                visitor,
+                capture,
+                selected,
+            },
+        })
     }
 
     fn generate_speculative_batch_with_embedded_draft<C, V>(
@@ -673,21 +664,14 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
     {
         let stream = self.runtime.backend().stream().clone();
         let streams = SpeculativeExecutionStreams::single(&stream);
-        let MlxSpeculativeSessionParts::Complete { model, .. } =
-            self.runtime.session_mut().speculative_parts_mut()?;
-        let Executable::ReplicatedText(_, target) = model else {
-            return Err(Error::Speculative(format!(
-                "embedded prediction requires the selected neutral target, got {}",
-                model.effective_model_type()
-            )));
-        };
+        let model = self.runtime.session_mut().speculative_model_mut();
+        let target = model.erased_mut();
         let mut continuation = MlxEmbeddedBatchContinuation {
             lanes,
             streams,
             visitor: Some(visitor),
         };
         target
-            .as_mut()
             .with_embedded_prediction(&mut continuation)
             .ok_or_else(|| {
                 Error::Speculative(

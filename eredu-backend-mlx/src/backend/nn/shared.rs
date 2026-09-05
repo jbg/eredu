@@ -516,7 +516,7 @@ pub struct MlxEmbedding {
 
 impl EmbeddingOperator<MlxTensor> for MlxEmbedding {
     fn forward(&mut self, input: &MlxTensor, context: &Stream) -> Result<MlxTensor, ComputeError> {
-        compute_tensor(self.module.forward(input.as_array(), context))
+        self.lookup(input, EmbeddingLookupPolicy::Strict, context)
     }
 
     fn lookup(
@@ -536,10 +536,6 @@ impl EmbeddingOperator<MlxTensor> for MlxEmbedding {
             sentinel,
             context,
         ))?;
-        let Some(sentinel) = sentinel else {
-            return compute_tensor(self.module.forward(&input, context));
-        };
-        let sentinel_mask = compute(input.eq(Array::from_int(sentinel), context))?;
         let nonnegative = compute(input.ge(Array::from_int(0), context))?;
         let below_vocabulary = compute(input.lt(Array::from_int(self.vocabulary), context))?;
         let ordinary_mask = compute(nonnegative.logical_and(&below_vocabulary, context))?;
@@ -551,6 +547,10 @@ impl EmbeddingOperator<MlxTensor> for MlxEmbedding {
             context,
         ))?;
         let embedded = compute(self.module.forward(&safe_tokens, context))?;
+        let Some(sentinel) = sentinel else {
+            return Ok(MlxTensor::from_array(embedded));
+        };
+        let sentinel_mask = compute(input.eq(Array::from_int(sentinel), context))?;
         let output_mask = compute(sentinel_mask.expand_dims(-1, context))?;
         let zero_embeddings = compute(safemlx::ops::zeros_like(&embedded, context))?;
         compute_tensor(safemlx::ops::r#where(

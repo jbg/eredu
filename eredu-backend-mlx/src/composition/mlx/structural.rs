@@ -1,15 +1,11 @@
 //! MLX architecture binding against portable checkpoint catalogs.
 
-use std::collections::HashMap;
-
 use crate::backend::runtime::checkpoint::gguf::GgufCheckpoint;
-use eredu_gguf::MetadataValue as GgufMetadataValue;
 #[cfg(test)]
 use serde_json::Value;
 
-use eredu_architectures::{GgufArchitecture, ModelKind};
+use eredu_architectures::ModelKind;
 
-use super::realization::{AddressableParameterBankBinding, FamilyBinding, GgufBinding};
 #[cfg(test)]
 use super::MlxLoadRequest;
 use crate::backend::error::Error;
@@ -21,7 +17,6 @@ use crate::backend::error::Error;
 pub(crate) struct AdmittedGguf {
     plan: eredu_architectures::configuration::GgufArchitecturePlan,
     checkpoint: GgufCheckpoint,
-    metadata: HashMap<String, GgufMetadataValue>,
 }
 
 /// Native projector payload paired with its architecture-owned admission proof.
@@ -40,12 +35,6 @@ impl AdmittedGgufProjector {
         &self.plan
     }
 
-    pub(crate) const fn model(
-        &self,
-    ) -> &eredu_architectures::gguf_companion::GgufMediaProjectorConfig {
-        self.plan.model()
-    }
-
     pub(crate) fn checkpoint(&self) -> &GgufCheckpoint {
         &self.checkpoint
     }
@@ -59,7 +48,6 @@ impl AdmittedGguf {
     ) -> Result<(Self, Option<AdmittedGgufProjector>), Error> {
         let (checkpoint, mut companions) = validated.into_parts();
         let checkpoint = GgufCheckpoint::from_portable(checkpoint);
-        let metadata = crate::backend::runtime::checkpoint::load::gguf_metadata(&checkpoint);
         let projector = companions.remove(&eredu_core::GgufCompanionRole::MediaProjector);
         let projector = match (projector_plan, projector) {
             (Some(plan), Some(projector)) => Some(AdmittedGgufProjector {
@@ -80,50 +68,16 @@ impl AdmittedGguf {
                 ));
             }
         };
-        Ok((
-            Self {
-                plan,
-                checkpoint,
-                metadata,
-            },
-            projector,
-        ))
-    }
-
-    pub(crate) const fn architecture(&self) -> GgufArchitecture {
-        self.plan.architecture()
+        Ok((Self { plan, checkpoint }, projector))
     }
 
     pub(crate) const fn plan(&self) -> &eredu_architectures::configuration::GgufArchitecturePlan {
         &self.plan
     }
 
-    pub(crate) const fn model(&self) -> &eredu_architectures::configuration::GgufModelConfig {
-        self.plan.model()
-    }
-
     pub(crate) fn checkpoint(&self) -> &GgufCheckpoint {
         &self.checkpoint
     }
-
-    pub(crate) fn metadata(&self) -> &HashMap<String, GgufMetadataValue> {
-        &self.metadata
-    }
-}
-
-pub(crate) fn validate_complete_gguf_quantization(
-    kind: ModelKind,
-    requested: bool,
-) -> Result<(), Error> {
-    if !requested || GgufBinding::for_kind(kind).is_some_and(GgufBinding::accepts_quantization) {
-        return Ok(());
-    }
-    Err(Error::Artifact(
-        eredu_core::artifact::ArtifactError::UnsupportedQuantizationPolicy(format!(
-            "load-time quantization is unavailable for complete GGUF {} materialization on MLX",
-            kind.canonical_name()
-        )),
-    ))
 }
 
 fn validate_quantization_capability(
@@ -144,11 +98,13 @@ fn validate_quantization_capability(
         return Ok(());
     }
     if format == eredu_core::ArtifactFormat::Gguf {
-        return validate_complete_gguf_quantization(kind, true);
+        // The neutral execution selection validates whether the chosen MLX
+        // linear mechanisms can realize the requested transform. Payload
+        // inspection separately rejects implicit transcoding of packed GGUF.
+        return Ok(());
     }
-    let supported = FamilyBinding::for_kind(kind).is_some()
-        && (policy.residency() == eredu_core::ResidencyRequest::FullyResident
-            || capabilities.nonresident_safetensors_quantization());
+    let supported = policy.residency() == eredu_core::ResidencyRequest::FullyResident
+        || capabilities.nonresident_safetensors_quantization();
     if supported {
         return Ok(());
     }
@@ -165,9 +121,7 @@ fn validate_parameter_bank_capability(
     kind: ModelKind,
     capabilities: eredu_architectures::preparation::ArchitectureCapabilities,
 ) -> Result<(), Error> {
-    if capabilities.independently_addressable_experts()
-        && AddressableParameterBankBinding::for_kind(kind).is_some()
-    {
+    if capabilities.independently_addressable_experts() {
         return Ok(());
     }
     Err(Error::Artifact(
@@ -232,35 +186,6 @@ pub(crate) fn validate_inspected_preparation(
     policy: eredu_core::PreparationPolicy,
 ) -> Result<(), Error> {
     eredu_core::validate_preparation_policy(inspection.configuration().loading_protocol(), policy)?;
-    if policy
-        .topology()
-        .is_none_or(|topology| topology.is_replicated())
-    {
-        let execution =
-            eredu_architectures::replicated_text::replicated_text_execution_class(inspection)
-                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        if matches!(
-            execution,
-            eredu_architectures::replicated_text::ReplicatedTextExecutionClass::Replicated(_)
-        ) && policy.residency() == eredu_core::ResidencyRequest::AddressableParameterBanks
-        {
-            return Err(Error::Artifact(
-                eredu_core::artifact::ArtifactError::UnsupportedResidencyPolicy(
-                    "independent parameter banks require an architecture-routed text class".into(),
-                ),
-            ));
-        }
-        if matches!(
-            execution,
-            eredu_architectures::replicated_text::ReplicatedTextExecutionClass::Replicated(_)
-                | eredu_architectures::replicated_text::ReplicatedTextExecutionClass::Routed(_)
-        ) {
-            // Generic text classes validate concrete MLX mechanisms through
-            // their neutral selection immediately after this protocol check.
-            // Excluded-family bindings are only authoritative for `Other`.
-            return Ok(());
-        }
-    }
     if !requires_architecture_capabilities(policy) {
         return Ok(());
     }
@@ -505,7 +430,7 @@ mod admission_policy_tests {
     }
 
     #[test]
-    fn replicated_gguf_quantization_requires_a_bound_complete_loader() {
+    fn replicated_gguf_quantization_is_deferred_to_neutral_mechanism_selection() {
         let policy = eredu_core::PreparationPolicy::new(
             Some(eredu_core::QuantizationRequest::MxFp4),
             eredu_core::ResidencyRequest::FullyResident,
@@ -519,20 +444,13 @@ mod admission_policy_tests {
             capabilities,
         )
         .unwrap();
-        let error = validate_quantization_capability(
+        validate_quantization_capability(
             ModelKind::DeepSeekV3,
             eredu_core::ArtifactFormat::Gguf,
             policy,
             capabilities,
         )
-        .unwrap_err();
-
-        assert!(matches!(
-            error,
-            Error::Artifact(
-                eredu_core::artifact::ArtifactError::UnsupportedQuantizationPolicy(message)
-            ) if message.contains("deepseek_v3") && message.contains("GGUF")
-        ));
+        .unwrap();
     }
 
     #[test]

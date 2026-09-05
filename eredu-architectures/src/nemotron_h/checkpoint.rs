@@ -1073,7 +1073,14 @@ fn safe_alias_constraints(
                 companion_dtype(),
             )
             .with_aliases(aliases)
-            .companion(),
+            .linear_companion(
+                official,
+                if suffix == "scales" {
+                    eredu_checkpoint::schema::LinearCompanionKind::Scale
+                } else {
+                    eredu_checkpoint::schema::LinearCompanionKind::AffineBias
+                },
+            ),
         );
     }
     Ok(constraints)

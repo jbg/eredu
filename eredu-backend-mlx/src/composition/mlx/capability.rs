@@ -61,76 +61,17 @@ impl Executable {
         &self,
         input: &input::InputPart,
     ) -> Result<PreparedInputPartPlan, CapabilityError> {
-        match self {
-            Self::Gemma4(_, model, _) => {
-                media_plan::gemma4_input_part(model.args(), input, &input::MlxInputInspector)
-                    .map(Into::into)
-            }
-            Self::Inkling(_, model, _) => {
-                media_plan::inkling_input_part(model.args(), input, &input::MlxInputInspector)
-                    .map(Into::into)
-            }
-            Self::MuseGlimmer(_, model, _) => {
-                media_plan::muse_glimmer_input_part(model.args(), input, &input::MlxInputInspector)
-                    .map(Into::into)
-            }
-            Self::Qwen3Next(_, model, _) | Self::Qwen35(_, model, _) => {
-                if model.vision_config().is_some() {
-                    media_plan::qwen_hybrid_input_part(
-                        model.parsed_args(),
-                        input,
-                        &input::MlxInputInspector,
-                    )
-                    .map(Into::into)
-                } else {
-                    media_plan::qwen_hybrid_text_input_part(
-                        model.args(),
-                        input,
-                        &input::MlxInputInspector,
-                    )
-                    .map(Into::into)
-                }
-            }
-            Self::DeepSeek(_, _, _)
-            | Self::GptOss(_, _, _)
-            | Self::KimiLinear(_, _, _)
-            | Self::ReplicatedText(_, _)
-            | Self::Lfm2(_, _, _)
-            | Self::NemotronH(_, _, _)
-            | Self::Qwen(_, _, _) => media_plan::text_only_input_part(
-                self.effective_model_type(),
-                input,
-                &input::MlxInputInspector,
-            ),
-        }
+        media_plan::text_only_input_part(
+            self.effective_model_type(),
+            input,
+            &input::MlxInputInspector,
+        )
     }
 
     pub(super) fn architecture_capability_estimate(
         &self,
     ) -> Result<eredu_architectures::capability::CapabilityEstimate, CapabilityError> {
-        use eredu_architectures::capability;
-
-        match self {
-            Self::DeepSeek(_, model, _) => {
-                if let Some(args) = model.v3_args() {
-                    capability::deepseek_v3(args)
-                } else {
-                    capability::deepseek_v4(model.v4_args().expect("DeepSeek family"))
-                }
-            }
-            Self::ReplicatedText(_, model) => Ok(model.capability_estimate().clone()),
-            Self::Qwen(_, model, _) => capability::qwen(model.args()),
-            Self::MuseGlimmer(_, model, _) => capability::muse_glimmer(model.args()),
-            Self::GptOss(_, model, _) => capability::gpt_oss(model.args()),
-            Self::Gemma4(_, model, _) => capability::gemma4(model.args()),
-            Self::Inkling(_, model, _) => capability::inkling(model.args()),
-            Self::KimiLinear(_, model, _) => capability::kimi_linear(model.args()),
-            Self::Lfm2(_, model, _) => capability::lfm2(model.args()),
-            Self::NemotronH(_, model, _) => capability::nemotron_h(model.args()),
-            Self::Qwen3Next(_, model, _) | Self::Qwen35(_, model, _) => {
-                capability::qwen_hybrid(model.parsed_args())
-            }
-        }
+        Ok(self.erased().capability_estimate().clone())
     }
 }
 fn unavailable_counter(error: safemlx::error::Exception) -> Observed<u64> {

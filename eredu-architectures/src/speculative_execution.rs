@@ -3,8 +3,8 @@
 use std::marker::PhantomData;
 
 use eredu_core::{
-    Completion, SpeculativeCommit, SpeculativeExecutor, SpeculativePrefill, SpeculativeTelemetry,
-    Submission,
+    BoundedCompletion, SpeculativeCommit, SpeculativeExecutor, SpeculativePrefill,
+    SpeculativeTelemetry, Submission,
 };
 use eredu_runtime::DraftStateTransaction;
 
@@ -316,7 +316,7 @@ pub trait SpeculativeTensorMechanisms: 'static {
     /// Selected target/draft execution assignment.
     type Context<'a>: Copy;
     /// Exact completion retaining submitted verification resources.
-    type Completion: Completion<Error = Self::Error>;
+    type Completion: BoundedCompletion<Error = Self::Error>;
     /// Native mechanism failure.
     type Error: std::error::Error + Send + Sync + 'static;
 
@@ -1230,7 +1230,7 @@ pub trait EmbeddedExecutorTypes: 'static {
     where
         Self: 'a;
     /// Exact native completion.
-    type Completion: Completion<Error = Self::Error>;
+    type Completion: BoundedCompletion<Error = Self::Error>;
     /// Optional component telemetry.
     type Telemetry: SpeculativeTelemetry;
     /// Structured backend failure.
@@ -2058,6 +2058,15 @@ mod tests {
 
         fn wait(&self) -> Result<(), Self::Error> {
             Ok(())
+        }
+    }
+
+    impl eredu_core::BoundedCompletion for Done {
+        fn wait_bounded(
+            self,
+            _policy: eredu_core::BoundedCompletionWait,
+        ) -> Result<eredu_core::BoundedCompletionOutcome, Self::Error> {
+            Ok(eredu_core::BoundedCompletionOutcome::Completed)
         }
     }
 

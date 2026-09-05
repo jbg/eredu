@@ -7,38 +7,352 @@ use eredu_nn::{
 
 use crate::ExpertPass;
 use crate::{
-    observe_and_intervene, ActivationObserver, OffloadUnit, ParameterBankAccess, ParameterBankKey,
-    ResidencyDeclarationError, RoutingObservation, WeightBinding,
+    observe_and_intervene, ActivationObserver, ParameterBankAccess, ParameterBankKey,
+    ReplicatedTextMaterializationTask, ReplicatedTextParameterOwner, RoutingObservation,
+    WeightLoweringKind,
 };
+
+/// One exact selected parameter in an independently addressable bank member.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct AddressableBankParameter {
+    binding_name: String,
+    task: ReplicatedTextMaterializationTask,
+    recipe: eredu_checkpoint::recipe::DerivedWeightRecipe,
+    source_output: eredu_checkpoint::recipe::RecipeMetadata,
+    selected_bytes: u64,
+    quantization_companions: Option<crate::QuantizationCompanionBindings>,
+}
+
+impl AddressableBankParameter {
+    /// Retains and validates one selected task and its member-local recipe.
+    pub fn new(
+        binding_name: impl Into<String>,
+        task: ReplicatedTextMaterializationTask,
+        recipe: eredu_checkpoint::recipe::DerivedWeightRecipe,
+        source_output: eredu_checkpoint::recipe::RecipeMetadata,
+        selected_bytes: u64,
+        quantization_companions: Option<crate::QuantizationCompanionBindings>,
+    ) -> Result<Self, AddressableBankMemberError> {
+        let binding_name = binding_name.into();
+        if binding_name.trim().is_empty() {
+            return Err(AddressableBankMemberError::InvalidParameter {
+                parameter: task.name().to_owned(),
+                detail: "addressable binding name is empty".into(),
+            });
+        }
+        task.source_recipe()
+            .map_err(|error| AddressableBankMemberError::InvalidParameter {
+                parameter: task.name().to_owned(),
+                detail: error.to_string(),
+            })?;
+        let descriptor = task.lowering_descriptor();
+        if descriptor.source() != task.source_encoding()
+            || descriptor.executable() != task.executable()
+            || descriptor.physical_shape() != task.physical_shape()
+            || descriptor.logical_shape() != task.logical_shape()
+        {
+            return Err(AddressableBankMemberError::InvalidParameter {
+                parameter: task.name().to_owned(),
+                detail: "selected source, executable, or lowering descriptor drifted".into(),
+            });
+        }
+        let declared_sources = task
+            .sources()
+            .iter()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        let recipe_sources = recipe
+            .source_keys()
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        if recipe_sources.is_empty() || !recipe_sources.is_subset(&declared_sources) {
+            return Err(AddressableBankMemberError::InvalidParameter {
+                parameter: task.name().to_owned(),
+                detail: "member recipe consumes sources outside the selected task".into(),
+            });
+        }
+        if source_output.byte_len() == 0 {
+            return Err(AddressableBankMemberError::ZeroSourceBytes {
+                parameter: task.name().to_owned(),
+            });
+        }
+        if selected_bytes == 0 {
+            return Err(AddressableBankMemberError::ZeroSelectedBytes {
+                parameter: task.name().to_owned(),
+            });
+        }
+        let transforms = matches!(
+            task.lowering(),
+            WeightLoweringKind::Transform | WeightLoweringKind::DerivedTransform
+        );
+        if !transforms && quantization_companions.is_some() {
+            return Err(AddressableBankMemberError::InvalidParameter {
+                parameter: task.name().to_owned(),
+                detail: "non-transform lowering declared local transform companions".into(),
+            });
+        }
+        if transforms
+            && quantization_companions.is_none()
+            && source_output.dtype() != &eredu_checkpoint::recipe::RecipeDtype::F4
+        {
+            return Err(AddressableBankMemberError::InvalidParameter {
+                parameter: task.name().to_owned(),
+                detail: "floating transform omitted its local output companions".into(),
+            });
+        }
+        if transforms
+            && source_output.dtype() != &eredu_checkpoint::recipe::RecipeDtype::F4
+            && task.output_companions().is_empty()
+        {
+            return Err(AddressableBankMemberError::InvalidParameter {
+                parameter: task.name().to_owned(),
+                detail: "floating transform omitted its exact selected output companions".into(),
+            });
+        }
+        if let Some(companions) = quantization_companions.as_ref() {
+            let declared_roles = task
+                .output_companions()
+                .iter()
+                .map(|companion| companion.role())
+                .collect::<std::collections::BTreeSet<_>>();
+            let mut bound_roles =
+                std::collections::BTreeSet::from([eredu_nn::LinearCompanionRole::Scale]);
+            if companions.affine_bias().is_some() {
+                bound_roles.insert(eredu_nn::LinearCompanionRole::AffineBias);
+            }
+            if declared_roles != bound_roles {
+                return Err(AddressableBankMemberError::InvalidParameter {
+                    parameter: task.name().to_owned(),
+                    detail: "selected quantization companion roles differ from exact outputs"
+                        .into(),
+                });
+            }
+            for companion in task.output_companions() {
+                let local = match companion.role() {
+                    eredu_nn::LinearCompanionRole::Scale => companions.scale(),
+                    eredu_nn::LinearCompanionRole::AffineBias => companions
+                        .affine_bias()
+                        .expect("validated affine-bias role has one binding"),
+                };
+                if companion.name() != local && !companion.name().ends_with(&format!(".{local}")) {
+                    return Err(AddressableBankMemberError::InvalidParameter {
+                        parameter: task.name().to_owned(),
+                        detail: format!(
+                            "local companion {local:?} differs from selected output {:?}",
+                            companion.name()
+                        ),
+                    });
+                }
+                let owner_matches = match (task.owner(), companion.owner()) {
+                    (
+                        ReplicatedTextParameterOwner::ExecutionUnit { group, unit },
+                        crate::ParameterGroupOwner::ExecutionUnit {
+                            group: companion_group,
+                            global_unit,
+                        },
+                    ) => group == companion_group.as_str() && unit == global_unit,
+                    (
+                        ReplicatedTextParameterOwner::StaticRole(role),
+                        crate::ParameterGroupOwner::StaticRole(companion_role),
+                    ) => role == companion_role,
+                    _ => false,
+                };
+                if !owner_matches {
+                    return Err(AddressableBankMemberError::InvalidParameter {
+                        parameter: task.name().to_owned(),
+                        detail: format!(
+                            "selected companion {:?} has a different owner",
+                            companion.name()
+                        ),
+                    });
+                }
+            }
+        }
+        let expected = selected_addressable_parameter_bytes(&task, &source_output)?;
+        if selected_bytes != expected {
+            return Err(AddressableBankMemberError::SelectedByteMismatch {
+                parameter: task.name().to_owned(),
+                expected,
+                actual: selected_bytes,
+            });
+        }
+        Ok(Self {
+            binding_name,
+            task,
+            recipe,
+            source_output,
+            selected_bytes,
+            quantization_companions,
+        })
+    }
+
+    /// Returns the local grouped-operator binding name.
+    pub fn binding_name(&self) -> &str {
+        &self.binding_name
+    }
+
+    /// Returns the complete authoritative selected materialization task.
+    pub const fn task(&self) -> &ReplicatedTextMaterializationTask {
+        &self.task
+    }
+
+    /// Returns the exact member-local source recipe.
+    pub const fn recipe(&self) -> &eredu_checkpoint::recipe::DerivedWeightRecipe {
+        &self.recipe
+    }
+
+    /// Returns admitted metadata for the member-local source recipe.
+    pub const fn source_output(&self) -> &eredu_checkpoint::recipe::RecipeMetadata {
+        &self.source_output
+    }
+
+    /// Returns source bytes before an optional lowering.
+    pub const fn source_bytes(&self) -> u64 {
+        self.source_output.byte_len()
+    }
+
+    /// Returns executable bytes after the selected lowering.
+    pub const fn selected_bytes(&self) -> u64 {
+        self.selected_bytes
+    }
+
+    /// Returns exact local scale and affine-bias binding names for a transform.
+    pub const fn quantization_companions(&self) -> Option<&crate::QuantizationCompanionBindings> {
+        self.quantization_companions.as_ref()
+    }
+}
 
 /// Exact generic storage member projected from an architecture-owned bank catalog.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct AddressableBankMember {
     key: ParameterBankKey,
-    source: OffloadUnit,
+    placement: AddressableBankMemberPlacement,
+    parameters: Vec<AddressableBankParameter>,
     source_bytes: u64,
     selected_bytes: u64,
 }
 
+/// Neutral placement class for one independently addressable member.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum AddressableBankDistribution {
+    /// The member is present on every execution rank.
+    Replicated,
+    /// The member follows an architecture-selected expert partition.
+    ExpertParallel,
+}
+
+/// Architecture-selected ownership retained with an addressable member.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct AddressableBankMemberPlacement {
+    owner_group: crate::ExecutionGroupId,
+    owner_unit: usize,
+    unit_path: String,
+    distribution: AddressableBankDistribution,
+    owner_rank: Option<usize>,
+}
+
+impl AddressableBankMemberPlacement {
+    /// Creates exact architecture-global member placement.
+    pub fn new(
+        owner_group: crate::ExecutionGroupId,
+        owner_unit: usize,
+        unit_path: impl Into<String>,
+        distribution: AddressableBankDistribution,
+    ) -> Result<Self, AddressableBankMemberError> {
+        let unit_path = unit_path.into();
+        if unit_path.trim().is_empty() {
+            return Err(AddressableBankMemberError::InvalidPlacement(
+                "addressable member unit path is empty".into(),
+            ));
+        }
+        Ok(Self {
+            owner_group,
+            owner_unit,
+            unit_path,
+            distribution,
+            owner_rank: None,
+        })
+    }
+
+    /// Binds this selected member projection to one global partition rank.
+    pub fn with_owner_rank(mut self, owner_rank: usize) -> Self {
+        self.owner_rank = Some(owner_rank);
+        self
+    }
+
+    /// Returns the architecture execution group that owns this member.
+    pub const fn owner_group(&self) -> &crate::ExecutionGroupId {
+        &self.owner_group
+    }
+    /// Returns the architecture-global execution-unit index.
+    pub const fn owner_unit(&self) -> usize {
+        self.owner_unit
+    }
+    /// Returns the stable architecture path of the owning unit.
+    pub fn unit_path(&self) -> &str {
+        &self.unit_path
+    }
+    /// Returns the architecture-selected distribution class.
+    pub const fn distribution(&self) -> AddressableBankDistribution {
+        self.distribution
+    }
+    /// Returns the global partition rank after rank-local projection.
+    pub const fn owner_rank(&self) -> Option<usize> {
+        self.owner_rank
+    }
+}
+
 impl AddressableBankMember {
-    /// Validates one atomic source unit and its selected executable byte geometry.
+    /// Validates one atomic member and all of its selected parameter tasks.
     pub fn new(
         key: ParameterBankKey,
-        bindings: impl IntoIterator<Item = WeightBinding>,
-        selected_bytes: u64,
+        placement: AddressableBankMemberPlacement,
+        parameters: impl IntoIterator<Item = AddressableBankParameter>,
     ) -> Result<Self, AddressableBankMemberError> {
-        if selected_bytes == 0 {
-            return Err(AddressableBankMemberError::ZeroSelectedBytes { key });
+        let parameters = parameters.into_iter().collect::<Vec<_>>();
+        if parameters.is_empty() {
+            return Err(AddressableBankMemberError::EmptyMember { key });
         }
-        let source = OffloadUnit::new(key.unit_id(), bindings)?;
-        let source_bytes = source.bindings().iter().try_fold(0u64, |total, binding| {
-            total
-                .checked_add(binding.expected_bytes())
-                .ok_or(AddressableBankMemberError::SourceByteOverflow { key })
-        })?;
+        if placement.owner_unit() != key.unit() {
+            return Err(AddressableBankMemberError::InvalidPlacement(format!(
+                "addressable member unit {} differs from placement unit {}",
+                key.unit(),
+                placement.owner_unit()
+            )));
+        }
+        let mut bindings = std::collections::BTreeSet::new();
+        let mut targets = std::collections::BTreeSet::new();
+        let mut source_bytes = 0u64;
+        let mut selected_bytes = 0u64;
+        for parameter in &parameters {
+            if !bindings.insert(parameter.binding_name())
+                || !targets.insert(parameter.task().name())
+            {
+                return Err(AddressableBankMemberError::DuplicateParameter { key });
+            }
+            if !matches!(
+                parameter.task().owner(),
+                ReplicatedTextParameterOwner::ExecutionUnit { group, unit }
+                    if *unit == placement.owner_unit()
+                        && group == placement.owner_group().as_str()
+            ) {
+                return Err(AddressableBankMemberError::InvalidParameter {
+                    parameter: parameter.task().name().to_owned(),
+                    detail: "selected task has a non-bank owner".into(),
+                });
+            }
+            source_bytes = source_bytes
+                .checked_add(parameter.source_bytes())
+                .ok_or(AddressableBankMemberError::SourceByteOverflow { key })?;
+            selected_bytes = selected_bytes
+                .checked_add(parameter.selected_bytes())
+                .ok_or(AddressableBankMemberError::SelectedByteOverflow { key })?;
+        }
         Ok(Self {
             key,
-            source,
+            placement,
+            parameters,
             source_bytes,
             selected_bytes,
         })
@@ -49,39 +363,203 @@ impl AddressableBankMember {
         self.key
     }
 
-    /// Returns exact source bindings without architecture roles or naming policy.
-    pub const fn source(&self) -> &OffloadUnit {
-        &self.source
+    /// Exact group/unit/distribution/rank ownership selected for this member.
+    pub const fn placement(&self) -> &AddressableBankMemberPlacement {
+        &self.placement
     }
 
-    /// Returns admitted source bytes before an optional lowering.
+    /// Retains the global rank selected by a partition projection.
+    pub fn with_owner_rank(mut self, owner_rank: usize) -> Self {
+        self.placement = self.placement.with_owner_rank(owner_rank);
+        self
+    }
+
+    /// Returns every exact selected parameter in deterministic binding order.
+    pub fn parameters(&self) -> &[AddressableBankParameter] {
+        &self.parameters
+    }
+
+    /// Returns admitted source bytes before optional lowerings.
     pub const fn source_bytes(&self) -> u64 {
         self.source_bytes
     }
 
-    /// Returns executable bytes after the selected lowering.
+    /// Returns executable bytes after selected lowerings.
     pub const fn selected_bytes(&self) -> u64 {
         self.selected_bytes
     }
 }
 
+/// Computes executable storage bytes for one admitted member-local task output.
+///
+/// A task's own derived output describes whole-parameter derivation before a
+/// member projection. `metadata` instead describes the exact member-local
+/// recipe retained by [`AddressableBankParameter`], including rank-local
+/// sharding. This function is the single neutral authority for their selected
+/// executable byte geometry.
+pub fn selected_addressable_parameter_bytes(
+    task: &ReplicatedTextMaterializationTask,
+    metadata: &eredu_checkpoint::recipe::RecipeMetadata,
+) -> Result<u64, AddressableBankMemberError> {
+    if !matches!(
+        task.lowering(),
+        WeightLoweringKind::Transform | WeightLoweringKind::DerivedTransform
+    ) {
+        return Ok(metadata.byte_len());
+    }
+    let quantization = task.executable().weight_quantization().ok_or_else(|| {
+        AddressableBankMemberError::InvalidParameter {
+            parameter: task.name().to_owned(),
+            detail: "transform lowering has no packed executable format".into(),
+        }
+    })?;
+    if matches!(
+        quantization,
+        eredu_checkpoint::WeightQuantization::GgufIQuant { .. }
+    ) {
+        return Err(AddressableBankMemberError::InvalidParameter {
+            parameter: task.name().to_owned(),
+            detail: "load-time transform selected checkpoint-native GGUF encoding".into(),
+        });
+    }
+    if task.lowering_descriptor().packed_axis() != metadata.shape().len().checked_sub(1) {
+        return Err(AddressableBankMemberError::InvalidParameter {
+            parameter: task.name().to_owned(),
+            detail: "transform packed axis is not the final logical matrix axis".into(),
+        });
+    }
+    let shape = metadata.shape();
+    let (&columns, row_shape) =
+        shape
+            .split_last()
+            .ok_or_else(|| AddressableBankMemberError::InvalidParameter {
+                parameter: task.name().to_owned(),
+                detail: "transform target is not a matrix".into(),
+            })?;
+    let rows = row_shape
+        .iter()
+        .try_fold(1u64, |total, dimension| {
+            total.checked_mul(*dimension as u64)
+        })
+        .ok_or_else(|| AddressableBankMemberError::InvalidParameter {
+            parameter: task.name().to_owned(),
+            detail: "transform row geometry overflowed".into(),
+        })?;
+    let group = usize::try_from(quantization.group_size()).map_err(|_| {
+        AddressableBankMemberError::InvalidParameter {
+            parameter: task.name().to_owned(),
+            detail: "transform group size is invalid".into(),
+        }
+    })?;
+    if group == 0 || !columns.is_multiple_of(group) || !columns.is_multiple_of(32) {
+        return Err(AddressableBankMemberError::InvalidParameter {
+            parameter: task.name().to_owned(),
+            detail: "transform geometry is incompatible with its packed format".into(),
+        });
+    }
+    let groups = (columns / group) as u64;
+    let packed = (columns as u64)
+        .checked_mul(quantization.bits() as u64)
+        .and_then(|bits| bits.checked_div(8))
+        .ok_or_else(|| AddressableBankMemberError::InvalidParameter {
+            parameter: task.name().to_owned(),
+            detail: "packed row byte geometry overflowed".into(),
+        })?;
+    let scalar_bytes = metadata.dtype().bit_width().map_err(|error| {
+        AddressableBankMemberError::InvalidParameter {
+            parameter: task.name().to_owned(),
+            detail: error.to_string(),
+        }
+    })? / 8;
+    let companion = if matches!(quantization, eredu_checkpoint::WeightQuantization::MxFp4) {
+        groups
+    } else {
+        groups.checked_mul(scalar_bytes).ok_or_else(|| {
+            AddressableBankMemberError::InvalidParameter {
+                parameter: task.name().to_owned(),
+                detail: "scale byte geometry overflowed".into(),
+            }
+        })?
+    };
+    let bias = if quantization.has_biases() {
+        companion
+    } else {
+        0
+    };
+    rows.checked_mul(
+        packed
+            .checked_add(companion)
+            .and_then(|bytes| bytes.checked_add(bias))
+            .ok_or_else(|| AddressableBankMemberError::InvalidParameter {
+                parameter: task.name().to_owned(),
+                detail: "selected row byte geometry overflowed".into(),
+            })?,
+    )
+    .ok_or_else(|| AddressableBankMemberError::InvalidParameter {
+        parameter: task.name().to_owned(),
+        detail: "selected byte geometry overflowed".into(),
+    })
+}
+
 /// Invalid generic addressable-bank member projection.
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
 pub enum AddressableBankMemberError {
-    /// Source binding declarations were invalid.
-    #[error(transparent)]
-    Residency(#[from] ResidencyDeclarationError),
+    /// Member placement was empty or disagreed with task ownership.
+    #[error("invalid addressable bank member placement: {0}")]
+    InvalidPlacement(String),
+    /// A member contained no parameter task.
+    #[error("addressable bank member {key:?} is empty")]
+    EmptyMember {
+        /// Invalid member identity.
+        key: ParameterBankKey,
+    },
+    /// A member repeated a local binding or logical task.
+    #[error("addressable bank member {key:?} repeats a parameter")]
+    DuplicateParameter {
+        /// Invalid member identity.
+        key: ParameterBankKey,
+    },
+    /// One parameter's exact task closure was inconsistent.
+    #[error("invalid addressable bank parameter {parameter:?}: {detail}")]
+    InvalidParameter {
+        /// Invalid logical parameter.
+        parameter: String,
+        /// Exact validation failure.
+        detail: String,
+    },
+    /// A source recipe selected no bytes.
+    #[error("addressable bank parameter {parameter:?} source byte geometry is zero")]
+    ZeroSourceBytes {
+        /// Invalid logical parameter.
+        parameter: String,
+    },
     /// Source binding byte accounting overflowed.
     #[error("addressable bank member {key:?} source byte geometry overflowed")]
     SourceByteOverflow {
         /// Invalid member.
         key: ParameterBankKey,
     },
-    /// Selected executable storage was empty.
-    #[error("addressable bank member {key:?} selected byte geometry is zero")]
-    ZeroSelectedBytes {
-        /// Invalid member.
+    /// Selected executable byte accounting overflowed.
+    #[error("addressable bank member {key:?} selected byte geometry overflowed")]
+    SelectedByteOverflow {
+        /// Invalid member identity.
         key: ParameterBankKey,
+    },
+    /// Selected executable storage was empty.
+    #[error("addressable bank parameter {parameter:?} selected byte geometry is zero")]
+    ZeroSelectedBytes {
+        /// Invalid parameter.
+        parameter: String,
+    },
+    /// Selected executable byte geometry differed from the task.
+    #[error("addressable bank parameter {parameter:?} selected bytes differ: expected {expected}, got {actual}")]
+    SelectedByteMismatch {
+        /// Invalid logical parameter.
+        parameter: String,
+        /// Authoritative computed byte total.
+        expected: u64,
+        /// Supplied selected byte total.
+        actual: u64,
     },
 }
 

@@ -56,14 +56,17 @@ pub use artifact::{
 };
 pub use attention::{AttentionPolicy, LayerSchedule, LayerScheduleError};
 pub use automatic::{
-    realize_execution_plan_drafting, realize_execution_plan_target, AllocatorTelemetry,
-    AutomaticPlanRequest, AutomaticPlanner, AutomaticPlannerPolicy, AutomaticPlanningBackend,
-    AutomaticPlanningError, BoundedResidencyRequirement, CandidateAdmission, DurationSeconds,
-    ExecutionPlanBackendFactory, ExecutionPlanReport, ExecutionPlanTarget, ExecutionTelemetry,
-    ExpertCacheTelemetry, ExternalDraftArtifact, HardwareBackendProfile, HardwareDeviceProfile,
-    HardwareMemorySemantics, HardwareProfile, ModelResourceProfile, ObservationKind, Observed,
-    PlanExplanation, PlanExplanationEntry, PlanExplanationLevel, RealizedDrafting,
-    ResidencyTelemetry, SpeculativeDecodingTelemetry, TimingTelemetry, TokenizerCompatibilityError,
+    realize_execution_plan_drafting, realize_execution_plan_target, select_execution_plan_drafting,
+    select_execution_plan_target, AllocatorTelemetry, AutomaticPlanRequest, AutomaticPlanner,
+    AutomaticPlannerPolicy, AutomaticPlanningBackend, AutomaticPlanningError,
+    BoundedResidencyRequirement, CandidateAdmission, DurationSeconds, ExecutionPlanBackendFactory,
+    ExecutionPlanReport, ExecutionPlanTarget, ExecutionPlanTargetLoadError,
+    ExecutionPlanTargetSelection, ExecutionTelemetry, ExpertCacheTelemetry, ExternalDraftArtifact,
+    HardwareBackendProfile, HardwareDeviceProfile, HardwareMemorySemantics, HardwareProfile,
+    ModelResourceProfile, ObservationKind, Observed, PlanExplanation, PlanExplanationEntry,
+    PlanExplanationLevel, PreparedExecutionPlanTarget, RealizedDrafting, ResidencyTelemetry,
+    RetainedAutomaticPlan, SelectedExecutionPlanDrafting, SelectedExecutionPlanTarget,
+    SpeculativeDecodingTelemetry, TimingTelemetry, TokenizerCompatibilityError,
     TokenizerCompatibilityProof, TransferTelemetry, AUTOMATIC_SCHEMA_VERSION,
 };
 pub use backend::{
@@ -76,10 +79,10 @@ pub use backend::{
     DistributedCommitOutcome, DistributedCommitPhase, DistributedSession,
     DistributedSessionDescriptor, InspectableBackendSession, ModelCapabilityBackend,
     ModelLoadError, ModelLoadingBackend, ModelRuntime, MultimodalPreparationBackend,
-    MultimodalPreparationFailure, PreparedModel, SessionCapabilities, SessionCapabilityError,
-    SpeculativeTokenFilterController, Submission, TextGeneration, TextGenerationBackend,
-    TextGenerationConfig, TextSamplingStrategy, TokenFilter, TokenFilterController,
-    TokenFilterError, TokenOutput, ValueDescriptor,
+    MultimodalPreparationFailure, PreparedModel, SelectedModelPreparation, SessionCapabilities,
+    SessionCapabilityError, SpeculativeTokenFilterController, Submission, TextGeneration,
+    TextGenerationBackend, TextGenerationConfig, TextSamplingStrategy, TokenFilter,
+    TokenFilterController, TokenFilterError, TokenOutput, ValueDescriptor,
 };
 pub use capability::{
     apply_admission_policy, estimate_runtime_state, Admission, AdmissionRejection,

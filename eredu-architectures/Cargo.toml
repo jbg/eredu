@@ -1,6 +1,6 @@
 [package]
 name = "eredu-architectures"
-version = "0.7.0"
+version = "0.8.0"
 edition.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -26,3 +26,8 @@ thiserror.workspace = true
 [dev-dependencies]
 safetensors = "0.8"
 tempfile.workspace = true
+
+[[test]]
+name = "reference_conformance"
+path = "tests/reference_conformance.rs"
+harness = false
