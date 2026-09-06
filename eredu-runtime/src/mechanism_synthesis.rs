@@ -3,6 +3,7 @@
 use eredu_checkpoint::{LinearFormat, SourceTensorEncoding, StoredDtype};
 use eredu_core::{
     cache::{StateComponentPolicy, StateResidencyClass},
+    checkpoint::TensorDtype,
     SessionCapabilities,
 };
 use eredu_nn::NeuralOperatorCapabilities;
@@ -11,8 +12,8 @@ use crate::{
     AddressableStorageCapabilities, BackendMechanismCapabilities, CacheResidencyPolicy,
     GroupedOperationRequirement, ReplicatedTextParameterRole, ReplicatedTextRequirements,
     ReplicatedTextSelectionRequest, StateComponentMechanism, StateComponentPlacement, StateLayout,
-    StateMechanismCapabilities, WeightLoweringCapability, WeightLoweringDescriptor,
-    WeightLoweringKind, WeightResidencyMechanism,
+    StateMechanismCapabilities, StateStorageDtype, WeightLoweringCapability,
+    WeightLoweringDescriptor, WeightLoweringKind, WeightResidencyMechanism,
 };
 
 /// Collection-independent facilities of a backend's mutable-state implementation.
@@ -157,10 +158,16 @@ pub trait ReplicatedTextMechanismSupport {
     /// Reports native realization of one semantically valid transform descriptor.
     fn supports_transform(&self, descriptor: &WeightLoweringDescriptor) -> bool;
 
-    /// Reports support for the exact component geometry, dtype, and placement.
+    /// Resolves native floating-state storage from one architecture-selected source dtype.
+    /// Packed embeddings may produce a different native scalar representation.
+    /// This metadata-only query must not inspect names or acquire payloads.
+    fn floating_state_dtype(&self, source: &TensorDtype) -> Option<StateStorageDtype>;
+
+    /// Reports support for the exact component geometry, native storage dtype, and placement.
     fn supports_state_component(
         &self,
         component: &StateComponentPolicy,
+        storage_dtype: StateStorageDtype,
         placement: StateComponentPlacement,
     ) -> bool;
 }
@@ -224,14 +231,21 @@ pub fn synthesize_replicated_text_capabilities(
         }
     }
 
-    let state =
+    let floating_dtype = requirements
+        .floating_state_source()
+        .and_then(|source| support.floating_state_dtype(source))
+        .filter(|dtype| dtype.is_floating());
+    let mut state =
         synthesize_state_components(requirements.state_layout(), facts.state, |component| {
+            let Some(dtype) = StateStorageDtype::resolve(component.dtype(), floating_dtype) else {
+                return (None, None);
+            };
             let device = support
-                .supports_state_component(component, StateComponentPlacement::Device)
+                .supports_state_component(component, dtype, StateComponentPlacement::Device)
                 .then_some(StateComponentPlacement::Device);
             let paged = match component.residency() {
                 StateResidencyClass::SealablePaged => support
-                    .supports_state_component(component, StateComponentPlacement::Paged)
+                    .supports_state_component(component, dtype, StateComponentPlacement::Paged)
                     .then_some(StateComponentPlacement::Paged),
                 StateResidencyClass::AlwaysDeviceMutable
                 | StateResidencyClass::LayerScopedOffloadable => device,
@@ -239,6 +253,9 @@ pub fn synthesize_replicated_text_capabilities(
             (device, paged)
         });
 
+    if let (Some(source), Some(dtype)) = (requirements.floating_state_source(), floating_dtype) {
+        state = state.with_floating_state_dtype(source.clone(), dtype);
+    }
     let capabilities = BackendMechanismCapabilities::new(
         facts.operators,
         weight_lowerings,

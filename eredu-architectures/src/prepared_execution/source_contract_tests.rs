@@ -23,6 +23,7 @@ type Events = Rc<RefCell<Vec<&'static str>>>;
 struct AssemblyProbe {
     events: Events,
     reject_width: bool,
+    wrong_dtype: bool,
 }
 
 impl AssemblyProbe {
@@ -30,6 +31,7 @@ impl AssemblyProbe {
         Self {
             events: Rc::clone(events),
             reject_width: false,
+            wrong_dtype: false,
         }
     }
 }
@@ -39,16 +41,21 @@ impl PreparedExecutableAssembler<CommunicationManifest> for AssemblyProbe {
     type Output = (&'static str, NonZeroU8, bool);
     type Error = &'static str;
 
-    fn floating_state_bytes(
+    fn floating_state_dtype(
         &mut self,
         source: &crate::preparation::FloatingStateDtypeSource,
-    ) -> Result<NonZeroU8, Self::Error> {
+    ) -> Result<eredu_runtime::StateStorageDtype, Self::Error> {
         self.events.borrow_mut().push("native-width");
         assert_eq!(source.dtype(), &eredu_core::checkpoint::TensorDtype::F32);
         if self.reject_width {
             Err("unsupported native floating width")
         } else {
-            Ok(NonZeroU8::new(4).unwrap())
+            // I32 occupies the same four bytes, but is not the admitted F32 representation.
+            Ok(if self.wrong_dtype {
+                eredu_runtime::StateStorageDtype::I32
+            } else {
+                eredu_runtime::StateStorageDtype::F32
+            })
         }
     }
 
@@ -281,6 +288,23 @@ fn invalid_architecture_floating_source_stops_before_native_width_or_constructio
     };
     assert!(message.contains("floating-state dtype source"));
     assert!(events.borrow().is_empty());
+}
+
+#[test]
+fn native_dtype_must_match_admission_even_when_the_byte_width_is_equal() {
+    let (_root, inspection) = inspected_llama();
+    let sources = prepare(inspection, NormalizedLoadRequest::default());
+    let events = Events::default();
+    let routes = PreparedExecutionRoutes::new()
+        .with_replicated(RouteProbe(Rc::clone(&events), "constructor"));
+    let mut assembler = AssemblyProbe::new(&events);
+    assembler.wrong_dtype = true;
+    let result = construct_prepared_execution(sources, None, routes, assembler);
+    assert!(
+        matches!(result, Err(PreparedExecutionError::Architecture(message))
+        if message.contains("differs from the admitted storage dtype"))
+    );
+    assert_eq!(*events.borrow(), ["native-width"]);
 }
 
 #[test]

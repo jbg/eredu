@@ -133,16 +133,19 @@ impl PreparedExecutableAssembler<MlxDistributedSession> for MlxExecutableAssembl
     type Output = MlxModel;
     type Error = Error;
 
-    fn floating_state_bytes(
+    fn floating_state_dtype(
         &mut self,
         source: &eredu_architectures::preparation::FloatingStateDtypeSource,
-    ) -> Result<std::num::NonZeroU8, Error> {
-        mlx_floating_state_dtype_bytes(source.dtype()).map_err(|dtype| {
-            Error::ArchitectureModel(format!(
-                "floating-state dtype source {:?} has unsupported MLX activation dtype {dtype:?}",
-                source.checkpoint_tensor()
-            ))
-        })
+    ) -> Result<eredu_runtime::StateStorageDtype, Error> {
+        super::super::replicated_text::floating_state_storage_dtype(source.dtype()).ok_or_else(
+            || {
+                Error::ArchitectureModel(format!(
+                    "floating-state dtype source {:?} has unsupported MLX activation dtype {:?}",
+                    source.checkpoint_tensor(),
+                    source.dtype()
+                ))
+            },
+        )
     }
 
     fn validate_communication(
@@ -226,23 +229,13 @@ pub(super) fn inspected_floating_state_dtype_bytes(
     })
 }
 
+#[cfg(test)]
 pub(super) fn mlx_floating_state_dtype_bytes(
     dtype: &eredu_core::checkpoint::TensorDtype,
 ) -> Result<std::num::NonZeroU8, eredu_core::checkpoint::TensorDtype> {
-    use eredu_core::checkpoint::TensorDtype;
-
-    let bytes = match dtype {
-        TensorDtype::F16 | TensorDtype::Bf16 => 2,
-        TensorDtype::F32 => 4,
-        TensorDtype::F64 | TensorDtype::Complex64 => 8,
-        // MLX materializes supported packed embeddings as Float32 activations.
-        // These cases are reached only after the architecture schema resolved
-        // the exact embedding parameter; they are not a fallback for an
-        // unknown checkpoint name.
-        TensorDtype::U32 | TensorDtype::Encoded(_) => 4,
-        dtype => return Err(dtype.clone()),
-    };
-    Ok(std::num::NonZeroU8::new(bytes).expect("supported MLX activation widths are nonzero"))
+    super::super::replicated_text::floating_state_storage_dtype(dtype)
+        .map(eredu_runtime::StateStorageDtype::bytes)
+        .ok_or_else(|| dtype.clone())
 }
 
 #[cfg(test)]

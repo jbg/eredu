@@ -375,7 +375,8 @@ fn invalid_source_and_missing_grouped_mechanism_never_reach_production_paths() {
         requirements.state_access(),
         parameters,
     )
-    .unwrap();
+    .unwrap()
+    .with_floating_state_source(eredu_core::checkpoint::TensorDtype::F32);
     let error = eredu_runtime::select_replicated_text_realization(
         &invalid_requirements,
         &request,
@@ -468,7 +469,8 @@ fn invalid_source_and_missing_grouped_mechanism_never_reach_production_paths() {
         requirements.state_access(),
         parameters,
     )
-    .unwrap();
+    .unwrap()
+    .with_floating_state_source(eredu_core::checkpoint::TensorDtype::F32);
     let mxfp4_request = request
         .clone()
         .with_quantization(eredu_core::QuantizationRequest::MxFp4);

@@ -3658,6 +3658,8 @@ fn replicated_text_requirements_for_structure(
         .prediction_extension()
         .map(|extension| prediction_extension_materialization_parameters(inspection, extension))
         .transpose()?;
+    let floating_source = crate::preparation::prepared_floating_state_dtype_source(inspection)
+        .map_err(|error| ReplicatedTextRequirementsError::InvalidArtifact(error.to_string()))?;
     let mut requirements = ReplicatedTextRequirements::new(
         config.architecture_identity(),
         config.operators(),
@@ -3669,11 +3671,13 @@ fn replicated_text_requirements_for_structure(
         parameters,
     )
     .and_then(|requirements| {
-        requirements.with_derived_recipes_and_shared_sources(
-            derived_recipes,
-            derived_recipe_outputs,
-            shared_source_keys,
-        )
+        requirements
+            .with_floating_state_source(floating_source.dtype().clone())
+            .with_derived_recipes_and_shared_sources(
+                derived_recipes,
+                derived_recipe_outputs,
+                shared_source_keys,
+            )
     })
     .map_err(|error| ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string()))?;
     if let Some((parameters, recipes, outputs)) = auxiliary {
@@ -8088,6 +8092,10 @@ mod tests {
             lowerings,
             vec![eredu_runtime::WeightResidencyMechanism::Resident],
             eredu_runtime::StateMechanismCapabilities::new(state)
+                .with_floating_state_dtype(
+                    requirements.text().floating_state_source().unwrap().clone(),
+                    eredu_runtime::StateStorageDtype::F32,
+                )
                 .with_transactions(true, true)
                 .with_reset(true),
         )
@@ -8259,6 +8267,10 @@ mod tests {
             lowerings,
             vec![eredu_runtime::WeightResidencyMechanism::Resident],
             eredu_runtime::StateMechanismCapabilities::new(state)
+                .with_floating_state_dtype(
+                    requirements.floating_state_source().unwrap().clone(),
+                    eredu_runtime::StateStorageDtype::F32,
+                )
                 .with_transactions(true, true)
                 .with_reset(true),
         );

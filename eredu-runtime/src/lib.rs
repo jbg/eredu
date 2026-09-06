@@ -325,8 +325,9 @@ pub use replicated_text::{
     ReplicatedTextSelectionError, ReplicatedTextSelectionRequest, ReplicatedTextStateAccess,
     ReplicatedTextTransformGroup, SelectedParameterRealization, SelectedReplicatedTextRealization,
     SelectedStateComponentRealization, SelectedStateRealization, StateComponentMechanism,
-    StateComponentPlacement, StateMechanismCapabilities, WeightLoweringCapability,
-    WeightLoweringDescriptor, WeightLoweringKind, WeightResidencyMechanism,
+    StateComponentPlacement, StateMechanismCapabilities, StateStorageDtype,
+    WeightLoweringCapability, WeightLoweringDescriptor, WeightLoweringKind,
+    WeightResidencyMechanism,
 };
 pub use residency::{
     DeviceLayerWindow, OffloadUnit, QuantizationCompanionBindings, ResidencyAcquisition,

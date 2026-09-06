@@ -7,7 +7,9 @@ use std::{
 
 use eredu_checkpoint::{LinearFormat, SourceTensorEncoding, StoredDtype};
 use eredu_core::{
-    cache::StateComponentPolicy, ParallelTopology, QuantizationRequest, SessionCapabilities,
+    cache::{StateComponentPolicy, StateTensorDtype},
+    checkpoint::TensorDtype,
+    ParallelTopology, QuantizationRequest, SessionCapabilities,
 };
 use eredu_nn::{NeuralBackend, NeuralOperatorCapabilities};
 
@@ -197,6 +199,56 @@ pub enum StateComponentPlacement {
     Paged,
 }
 
+/// Physical scalar representation selected for native mutable state.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum StateStorageDtype {
+    /// IEEE half precision.
+    F16,
+    /// Brain floating point.
+    Bf16,
+    /// IEEE single precision.
+    F32,
+    /// IEEE double precision.
+    F64,
+    /// Two IEEE single-precision components.
+    Complex64,
+    /// Signed 32-bit integer.
+    I32,
+    /// Unsigned 32-bit integer.
+    U32,
+}
+
+impl StateStorageDtype {
+    /// Exact bytes occupied by one native state element.
+    pub const fn bytes(self) -> std::num::NonZeroU8 {
+        let bytes = match self {
+            Self::F16 | Self::Bf16 => 2,
+            Self::F32 | Self::I32 | Self::U32 => 4,
+            Self::F64 | Self::Complex64 => 8,
+        };
+        std::num::NonZeroU8::new(bytes).unwrap()
+    }
+
+    /// Whether this representation belongs to the model's floating state family.
+    pub const fn is_floating(self) -> bool {
+        !matches!(self, Self::I32 | Self::U32)
+    }
+
+    /// Resolves an architecture dtype policy without overriding fixed-width tensors.
+    pub const fn resolve(policy: StateTensorDtype, floating: Option<Self>) -> Option<Self> {
+        match policy {
+            StateTensorDtype::Floating => match floating {
+                Some(dtype) if dtype.is_floating() => Some(dtype),
+                _ => None,
+            },
+            StateTensorDtype::Float32 => Some(Self::F32),
+            StateTensorDtype::Int32 => Some(Self::I32),
+            StateTensorDtype::Uint32 => Some(Self::U32),
+        }
+    }
+}
+
 /// Exact state component and placements implemented by a backend mechanism.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct StateComponentMechanism {
@@ -247,6 +299,7 @@ impl StateComponentMechanism {
 /// Exact, family-neutral mutable-state mechanisms reported by a backend.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct StateMechanismCapabilities {
+    floating_state: Option<(TensorDtype, StateStorageDtype)>,
     components: Vec<StateComponentMechanism>,
     checkpoint: bool,
     rollback: bool,
@@ -259,6 +312,7 @@ impl StateMechanismCapabilities {
     /// Creates a fail-closed report for exact architecture-declared components.
     pub fn new(components: impl IntoIterator<Item = StateComponentMechanism>) -> Self {
         Self {
+            floating_state: None,
             components: components.into_iter().collect(),
             checkpoint: false,
             rollback: false,
@@ -266,6 +320,23 @@ impl StateMechanismCapabilities {
             prompt_cache: false,
             observation_retention: false,
         }
+    }
+
+    /// Binds floating-state support to the exact architecture-selected source dtype.
+    pub fn with_floating_state_dtype(
+        mut self,
+        source: TensorDtype,
+        dtype: StateStorageDtype,
+    ) -> Self {
+        self.floating_state = Some((source, dtype));
+        self
+    }
+
+    /// Returns the source and native representation used for floating-state support queries.
+    pub fn floating_state_dtype(&self) -> Option<(&TensorDtype, StateStorageDtype)> {
+        self.floating_state
+            .as_ref()
+            .map(|(source, dtype)| (source, *dtype))
     }
 
     /// Declares transactional checkpoint and rollback facilities.
@@ -963,6 +1034,7 @@ impl ReplicatedTextContractError {
 /// Exact architecture and artifact requirements for replicated text execution.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ReplicatedTextRequirements {
+    floating_state_source: Option<TensorDtype>,
     architecture_identity: String,
     /// Optional neural operations required by the architecture equations.
     operators: NeuralOperatorCapabilities,
@@ -1041,6 +1113,7 @@ impl ReplicatedTextRequirements {
             ));
         }
         Ok(Self {
+            floating_state_source: None,
             architecture_identity,
             operators,
             execution_graph,
@@ -1055,6 +1128,18 @@ impl ReplicatedTextRequirements {
             shared_source_keys: BTreeSet::new(),
             grouped_operations: Vec::new(),
         })
+    }
+
+    /// Records the dtype of the architecture-declared activation source before native selection.
+    /// This is source metadata, not a request to convert checkpoint weights.
+    pub fn with_floating_state_source(mut self, dtype: TensorDtype) -> Self {
+        self.floating_state_source = Some(dtype);
+        self
+    }
+
+    /// Returns the exact source dtype used to resolve generic floating state.
+    pub fn floating_state_source(&self) -> Option<&TensorDtype> {
+        self.floating_state_source.as_ref()
     }
 
     /// Attaches exact additive auxiliary parameter requirements before backend selection.
@@ -2858,12 +2943,18 @@ impl SelectedParameterRealization {
 /// Selected physical realization of one exact semantic state component.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct SelectedStateComponentRealization {
+    storage_dtype: StateStorageDtype,
     layer: usize,
     component: StateComponentPolicy,
     placement: StateComponentPlacement,
 }
 
 impl SelectedStateComponentRealization {
+    /// Exact native scalar representation admitted for this component.
+    pub const fn storage_dtype(&self) -> StateStorageDtype {
+        self.storage_dtype
+    }
+
     /// Returns the architecture-global state layer.
     pub const fn layer(&self) -> usize {
         self.layer
@@ -2883,6 +2974,7 @@ impl SelectedStateComponentRealization {
 /// Authoritative mutable-state realization selected before allocation.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct SelectedStateRealization {
+    floating_dtype: Option<StateStorageDtype>,
     layout: StateLayout,
     access: ReplicatedTextStateAccess,
     policy: CacheResidencyPolicy,
@@ -2895,6 +2987,11 @@ pub struct SelectedStateRealization {
 }
 
 impl SelectedStateRealization {
+    /// Native representation selected from the architecture's floating-state source.
+    pub const fn floating_dtype(&self) -> Option<StateStorageDtype> {
+        self.floating_dtype
+    }
+
     /// Returns the exact architecture-owned state layout.
     pub const fn layout(&self) -> &StateLayout {
         &self.layout
@@ -2943,6 +3040,7 @@ impl SelectedStateRealization {
             ));
         }
         Ok(Self {
+            floating_dtype: self.floating_dtype,
             layout: partition.layout().clone(),
             access: self.access,
             policy: self.policy.clone(),
@@ -3018,11 +3116,13 @@ impl SelectedStateRealization {
                 components.push(SelectedStateComponentRealization {
                     layer: local_layer,
                     component: local_policy.clone(),
+                    storage_dtype: selected.storage_dtype,
                     placement: selected.placement,
                 });
             }
         }
         Ok(Self {
+            floating_dtype: self.floating_dtype,
             layout: partition.layout().clone(),
             access: self.access,
             policy: self.policy.clone(),
@@ -3211,6 +3311,18 @@ pub fn select_replicated_text_realization(
     {
         issues.push(format!("weight residency {residency_mechanism:?}"));
     }
+    let floating_dtype = match capabilities.state.floating_state_dtype() {
+        Some((source, dtype))
+            if Some(source) == requirements.floating_state_source() && dtype.is_floating() =>
+        {
+            Some(dtype)
+        }
+        Some(_) => {
+            issues.push("floating-state dtype support differs from the selected source".into());
+            None
+        }
+        None => None,
+    };
     let mut state_components = Vec::new();
     for layer in 0..requirements.state_layout.len() {
         for component in requirements
@@ -3218,6 +3330,14 @@ pub fn select_replicated_text_realization(
             .components(layer)
             .expect("state layout exposes every validated layer")
         {
+            let Some(storage_dtype) = StateStorageDtype::resolve(component.dtype(), floating_dtype)
+            else {
+                issues.push(format!(
+                    "state component {} at layer {layer} has no selected floating storage dtype",
+                    component.role().stable_name()
+                ));
+                continue;
+            };
             let matches = capabilities
                 .state
                 .components
@@ -3231,6 +3351,7 @@ pub fn select_replicated_text_realization(
                         state_components.push(SelectedStateComponentRealization {
                             layer,
                             component: component.clone(),
+                            storage_dtype,
                             placement,
                         });
                     }
@@ -3395,6 +3516,7 @@ pub fn select_replicated_text_realization(
             .unwrap_or_else(|| ParallelTopology::new(1, 1, 1, 1).expect("replicated topology")),
         residency: request.residency,
         state: SelectedStateRealization {
+            floating_dtype,
             layout: requirements.state_layout.clone(),
             access: requirements.state_access,
             policy: request.state.clone(),
@@ -3581,6 +3703,7 @@ mod tests {
             ],
         )
         .unwrap()
+        .with_floating_state_source(TensorDtype::F16)
     }
 
     #[test]
@@ -3746,6 +3869,7 @@ mod tests {
                     })
             }),
         )
+        .with_floating_state_dtype(TensorDtype::F16, StateStorageDtype::F16)
         .with_transactions(true, true)
         .with_reset(true)
         .with_prompt_cache(true)

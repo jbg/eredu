@@ -107,9 +107,26 @@ impl ReplicatedTextMechanismSupport for Support {
             && descriptor.source().scalar_dtype() == Some(eredu_checkpoint::StoredDtype::F32)
             && matches!(descriptor.executable(), eredu_checkpoint::LinearFormat::Affine(format) if format.bits == 4 && format.group_size == 16)
     }
+    fn floating_state_dtype(
+        &self,
+        source: &eredu_core::checkpoint::TensorDtype,
+    ) -> Option<eredu_runtime::StateStorageDtype> {
+        use eredu_core::checkpoint::TensorDtype;
+        use eredu_runtime::StateStorageDtype;
+        match source {
+            TensorDtype::F16 => Some(StateStorageDtype::F32),
+            TensorDtype::Bf16 => Some(StateStorageDtype::F32),
+            TensorDtype::F32 | TensorDtype::U32 | TensorDtype::Encoded(_) => {
+                Some(StateStorageDtype::F32)
+            }
+            _ => None,
+        }
+    }
+
     fn supports_state_component(
         &self,
         component: &eredu_core::cache::StateComponentPolicy,
+        _storage_dtype: eredu_runtime::StateStorageDtype,
         placement: eredu_runtime::StateComponentPlacement,
     ) -> bool {
         placement == eredu_runtime::StateComponentPlacement::Device
@@ -251,11 +268,11 @@ impl PreparedExecutableAssembler<()> for Assembler {
     type Executable = Box<dyn Body>;
     type Output = Session;
     type Error = String;
-    fn floating_state_bytes(
+    fn floating_state_dtype(
         &mut self,
         _: &eredu_architectures::preparation::FloatingStateDtypeSource,
-    ) -> Result<std::num::NonZeroU8, String> {
-        Ok(std::num::NonZeroU8::new(4).unwrap())
+    ) -> Result<eredu_runtime::StateStorageDtype, String> {
+        Ok(eredu_runtime::StateStorageDtype::F32)
     }
     fn validate_communication(&mut self, _: &CommunicationManifest, _: &()) -> Result<(), String> {
         Err("scalar shadow has no distributed mechanism".into())

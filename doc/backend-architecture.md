@@ -1905,6 +1905,24 @@ They do not expose model/cache parts or architecture-specific constructors to
 callers. Operations unavailable for a valid session topology return typed
 errors rather than relying on unreachable or panicking accessors.
 
+Cold replicated-text requirements retain the dtype of the architecture-declared
+floating-state source. Architecture code resolves its checkpoint aliases and
+container metadata once; backends receive that exact dtype through
+`ReplicatedTextMechanismSupport::floating_state_dtype`. The backend reports the
+native `StateStorageDtype`, including any packed-embedding conversion. Runtime
+synthesis resolves each component's floating or fixed dtype policy and passes the
+exact physical dtype into `supports_state_component` for device and paged placement
+checks. Unknown floating representations are rejected before native allocation.
+
+State capability reports retain the source-to-storage mapping. Selection rejects a
+report for another source dtype and records physical dtypes in
+`SelectedStateComponentRealization`, preserving them through partitioning. F16
+activation storage does not narrow fixed F32 or integer components. Construction
+checks its native floating dtype against the admitted representation, including
+same-width distinctions such as F16 versus BF16. MLX shares
+one source-to-storage mapping between cold support and construction accounting;
+backend providers do not repeat architecture checkpoint-name or family dispatch.
+
 `Completion::resources_releasable` exposes native resource safety separately from
 `is_complete` and `wait`, which report execution/output success or failure. A failed
 submission can eventually become releasable without losing its error. Pending work,

@@ -530,6 +530,10 @@ fn replicated_requirement_catalog_matches_authoritative_architecture_parameters(
                 })
         }),
     )
+    .with_floating_state_dtype(
+        requirements.floating_state_source().unwrap().clone(),
+        eredu_runtime::StateStorageDtype::F32,
+    )
     .with_transactions(true, true)
     .with_reset(true);
     let capabilities = eredu_runtime::BackendMechanismCapabilities::new(
@@ -1735,6 +1739,10 @@ fn selection_for(
                 })
         }),
     )
+    .with_floating_state_dtype(
+        requirements.floating_state_source().unwrap().clone(),
+        eredu_runtime::StateStorageDtype::F32,
+    )
     .with_transactions(true, true)
     .with_reset(true);
     let backend = eredu_runtime::BackendMechanismCapabilities::new(
@@ -2255,6 +2263,10 @@ fn authoritative_qwen_visitor_selects_tp_pp_partition_and_exact_mixed_state() {
                     )
                 })
         }),
+    )
+    .with_floating_state_dtype(
+        requirements.floating_state_source().unwrap().clone(),
+        eredu_runtime::StateStorageDtype::F32,
     )
     .with_transactions(true, true)
     .with_reset(true);
@@ -5281,6 +5293,10 @@ fn composite_reference_selection(
                     )
                 })
         }),
+    )
+    .with_floating_state_dtype(
+        execution.floating_state_source().unwrap().clone(),
+        eredu_runtime::StateStorageDtype::F32,
     )
     .with_transactions(true, true)
     .with_reset(true);

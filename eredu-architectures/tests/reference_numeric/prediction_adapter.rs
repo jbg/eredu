@@ -408,11 +408,11 @@ impl PreparedExecutableAssembler<()> for Assembler {
     type Executable = Run;
     type Output = Run;
     type Error = String;
-    fn floating_state_bytes(
+    fn floating_state_dtype(
         &mut self,
         _: &eredu_architectures::preparation::FloatingStateDtypeSource,
-    ) -> Result<std::num::NonZeroU8, String> {
-        Ok(std::num::NonZeroU8::new(4).unwrap())
+    ) -> Result<eredu_runtime::StateStorageDtype, String> {
+        Ok(eredu_runtime::StateStorageDtype::F32)
     }
     fn validate_communication(&mut self, _: &CommunicationManifest, _: &()) -> Result<(), String> {
         Err("scalar embedded route has no communication".into())

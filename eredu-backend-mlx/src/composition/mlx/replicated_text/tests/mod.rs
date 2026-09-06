@@ -786,6 +786,10 @@ fn capabilities_with(
     operators: eredu_nn::NeuralOperatorCapabilities,
     state: StateMechanismCapabilities,
 ) -> BackendMechanismCapabilities {
+    let state = match full.state().floating_state_dtype() {
+        Some((source, dtype)) => state.with_floating_state_dtype(source.clone(), dtype),
+        None => state,
+    };
     BackendMechanismCapabilities::new(
         operators,
         full.weight_lowerings().to_vec(),

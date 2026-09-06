@@ -124,12 +124,12 @@ impl PreparedExecutableAssembler<()> for RunAssembler {
     type Output = NumericReplicatedRun;
     type Error = String;
 
-    fn floating_state_bytes(
+    fn floating_state_dtype(
         &mut self,
         _: &eredu_architectures::preparation::FloatingStateDtypeSource,
-    ) -> Result<std::num::NonZeroU8, String> {
+    ) -> Result<eredu_runtime::StateStorageDtype, String> {
         // The scalar mechanism computes all floating activations in f32.
-        Ok(std::num::NonZeroU8::new(4).unwrap())
+        Ok(eredu_runtime::StateStorageDtype::F32)
     }
 
     fn validate_communication(&mut self, _: &CommunicationManifest, _: &()) -> Result<(), String> {

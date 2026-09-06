@@ -157,7 +157,8 @@ fn report_distinguishes_native_and_transforming_lowerings() {
         eredu_runtime::ReplicatedTextStateAccess::KeyValue,
         vec![parameter],
     )
-    .unwrap();
+    .unwrap()
+    .with_floating_state_source(eredu_core::checkpoint::TensorDtype::F32);
     let request = eredu_runtime::ReplicatedTextSelectionRequest::new(
         eredu_runtime::LayerWeightResidency::FullyResident,
         CacheResidencyPolicy::Device,
@@ -201,6 +202,7 @@ fn selected_graph_mismatch_rejects_before_module_construction() {
         requirements.parameters().to_vec(),
     )
     .unwrap()
+    .with_floating_state_source(eredu_core::checkpoint::TensorDtype::F32)
     .with_derived_recipes(
         requirements.derived_recipes().clone(),
         requirements.derived_recipe_outputs().clone(),

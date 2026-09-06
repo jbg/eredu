@@ -81,11 +81,12 @@ pub trait PreparedExecutableAssembler<C>: Sized {
     /// Native mechanism failure.
     type Error;
 
-    /// Reports the physical floating-state width of this exact admitted source dtype.
-    fn floating_state_bytes(
+    /// Reports the physical floating-state dtype of this exact admitted source.
+    /// Construction compares it with the representation accepted during cold selection.
+    fn floating_state_dtype(
         &mut self,
         source: &FloatingStateDtypeSource,
-    ) -> Result<NonZeroU8, Self::Error>;
+    ) -> Result<eredu_runtime::StateStorageDtype, Self::Error>;
 
     /// Checks the realized native handle against the exact selected manifest.
     fn validate_communication(
@@ -446,9 +447,21 @@ where
     let inspection = inspection.map_architecture_plan(|_| graph.architecture().clone());
     let source = crate::preparation::prepared_floating_state_dtype_source(&inspection)
         .map_err(|error| PreparedExecutionError::Architecture(error.to_string()))?;
-    let floating_state_bytes = assembler
-        .floating_state_bytes(&source)
+    let floating_state_dtype = assembler
+        .floating_state_dtype(&source)
         .map_err(PreparedExecutionError::Backend)?;
+    if !floating_state_dtype.is_floating()
+        || selected
+            .text_realization()
+            .state()
+            .floating_dtype()
+            .is_some_and(|dtype| dtype != floating_state_dtype)
+    {
+        return Err(PreparedExecutionError::Architecture(
+            "native floating-state dtype differs from the admitted storage dtype".into(),
+        ));
+    }
+    let floating_state_bytes = floating_state_dtype.bytes();
     let retained_communication = communication.clone();
     let context = BranchContext {
         inspection,

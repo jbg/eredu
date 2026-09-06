@@ -67,7 +67,8 @@ fn selected_state(
         access,
         Vec::new(),
     )
-    .unwrap();
+    .unwrap()
+    .with_floating_state_source(eredu_core::checkpoint::TensorDtype::F32);
     let components = (0..requirements.state_layout().len()).flat_map(|layer| {
         requirements
             .state_layout()
@@ -92,6 +93,10 @@ fn selected_state(
             })
     });
     let state = StateMechanismCapabilities::new(components)
+        .with_floating_state_dtype(
+            eredu_core::checkpoint::TensorDtype::F32,
+            eredu_runtime::StateStorageDtype::F32,
+        )
         .with_transactions(true, true)
         .with_reset(true);
     let capabilities = BackendMechanismCapabilities::new(

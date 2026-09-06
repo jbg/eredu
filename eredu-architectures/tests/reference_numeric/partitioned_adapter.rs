@@ -88,11 +88,11 @@ impl<E> PreparedExecutableAssembler<NumericPreparedCommunication> for PartitionA
     type Output = E;
     type Error = Error;
 
-    fn floating_state_bytes(
+    fn floating_state_dtype(
         &mut self,
         _: &eredu_architectures::preparation::FloatingStateDtypeSource,
-    ) -> Result<std::num::NonZeroU8, Error> {
-        Ok(std::num::NonZeroU8::new(4).unwrap())
+    ) -> Result<eredu_runtime::StateStorageDtype, Error> {
+        Ok(eredu_runtime::StateStorageDtype::F32)
     }
 
     fn validate_communication(

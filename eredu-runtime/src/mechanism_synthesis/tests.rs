@@ -24,6 +24,8 @@ struct Support {
     transform: bool,
     paged: bool,
     rejected_dtype: Option<StateTensorDtype>,
+    maximum_element_bytes: Option<u8>,
+    storage_queries: RefCell<Vec<StateStorageDtype>>,
     queries: RefCell<Vec<(WeightLoweringKind, WeightLoweringDescriptor)>>,
     state_queries: RefCell<Vec<(StateComponentPolicy, StateComponentPlacement)>>,
 }
@@ -57,15 +59,28 @@ impl ReplicatedTextMechanismSupport for Support {
             )
     }
 
+    fn floating_state_dtype(&self, source: &TensorDtype) -> Option<StateStorageDtype> {
+        match source {
+            TensorDtype::F16 => Some(StateStorageDtype::F16),
+            TensorDtype::Bf16 => Some(StateStorageDtype::Bf16),
+            TensorDtype::F32 => Some(StateStorageDtype::F32),
+            _ => None,
+        }
+    }
+
     fn supports_state_component(
         &self,
         component: &StateComponentPolicy,
+        storage_dtype: StateStorageDtype,
         placement: StateComponentPlacement,
     ) -> bool {
+        self.storage_queries.borrow_mut().push(storage_dtype);
         self.state_queries
             .borrow_mut()
             .push((component.clone(), placement));
-        self.rejected_dtype != Some(component.dtype())
+        self.maximum_element_bytes
+            .is_none_or(|maximum| storage_dtype.bytes().get() <= maximum)
+            && self.rejected_dtype != Some(component.dtype())
             && (placement == StateComponentPlacement::Device || self.paged)
     }
 }
@@ -132,6 +147,7 @@ fn requirements(
         parameters,
     )
     .unwrap()
+    .with_floating_state_source(TensorDtype::F32)
 }
 
 fn dense_requirements(
@@ -531,4 +547,95 @@ fn portable_lowering_geometry_preserves_padding_packing_and_overflow_rejections(
         Some(1)
     )
     .is_err());
+}
+
+#[test]
+fn floating_storage_width_changes_admission_and_cannot_reuse_another_sources_report() {
+    let requirements = requirements(
+        Vec::new(),
+        LayerCachePolicy::key_value(AttentionPolicy::Full, 2, 8).unwrap(),
+        ReplicatedTextStateAccess::KeyValue,
+    );
+    let half = requirements
+        .clone()
+        .with_floating_state_source(TensorDtype::F16);
+    let support = Support {
+        maximum_element_bytes: Some(2),
+        ..Support::default()
+    };
+    let half_report = synthesize_replicated_text_capabilities(&half, &request(), &support);
+    let selected = select_replicated_text_realization(&half, &request(), &half_report).unwrap();
+    assert!(selected
+        .state()
+        .components()
+        .iter()
+        .all(|component| component.storage_dtype() == StateStorageDtype::F16));
+    assert!(support
+        .storage_queries
+        .borrow()
+        .iter()
+        .all(|dtype| *dtype == StateStorageDtype::F16));
+    let full_report = synthesize_replicated_text_capabilities(&requirements, &request(), &support);
+    assert!(select_replicated_text_realization(&requirements, &request(), &full_report).is_err());
+    let stale =
+        select_replicated_text_realization(&requirements, &request(), &half_report).unwrap_err();
+    assert!(stale
+        .to_string()
+        .contains("differs from the selected source"));
+    let unknown = requirements.with_floating_state_source(TensorDtype::Encoded("unknown".into()));
+    support.storage_queries.borrow_mut().clear();
+    let report = synthesize_replicated_text_capabilities(&unknown, &request(), &support);
+    assert!(support.storage_queries.borrow().is_empty());
+    assert!(select_replicated_text_realization(&unknown, &request(), &report).is_err());
+}
+
+#[test]
+fn half_precision_activations_preserve_fixed_float_and_integer_state_dtypes() {
+    let fixed = [
+        (StateTensorRole::Recurrent, StateTensorDtype::Float32),
+        (
+            StateTensorRole::Convolution { slot: 0 },
+            StateTensorDtype::Int32,
+        ),
+    ]
+    .into_iter()
+    .map(|(role, dtype)| {
+        StateTensorPolicy::new(
+            role,
+            vec![
+                StateTensorDimension::Batch,
+                StateTensorDimension::fixed(8).unwrap(),
+            ],
+            dtype,
+            match role {
+                StateTensorRole::Convolution { .. } => MutableStateResidency::AlwaysDeviceMutable,
+                _ => MutableStateResidency::LayerScopedOffloadable,
+            },
+        )
+        .unwrap()
+    })
+    .collect();
+    let requirements = requirements(
+        Vec::new(),
+        LayerCachePolicy::key_value_with_fixed_state(AttentionPolicy::Full, 2, 8, fixed).unwrap(),
+        ReplicatedTextStateAccess::AttentionWithFixed,
+    )
+    .with_floating_state_source(TensorDtype::F16);
+    let report =
+        synthesize_replicated_text_capabilities(&requirements, &request(), &Support::default());
+    let selected = select_replicated_text_realization(&requirements, &request(), &report).unwrap();
+    assert_eq!(
+        selected
+            .state()
+            .components()
+            .iter()
+            .map(|c| c.storage_dtype())
+            .collect::<Vec<_>>(),
+        [
+            StateStorageDtype::F16,
+            StateStorageDtype::F16,
+            StateStorageDtype::F32,
+            StateStorageDtype::I32
+        ]
+    );
 }

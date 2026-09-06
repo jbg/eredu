@@ -1076,6 +1076,7 @@ fn reference_text_capabilities(
                 })
         }),
     )
+    .with_floating_state_dtype(execution.floating_state_source().unwrap().clone(), eredu_runtime::StateStorageDtype::F32)
     .with_transactions(true, true)
     .with_reset(true);
     eredu_runtime::BackendMechanismCapabilities::new(

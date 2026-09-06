@@ -3627,7 +3627,8 @@ fn try_select_reference_text(
         ReplicatedTextStateAccess::KeyValue,
         vec![parameter],
     )
-    .unwrap();
+    .unwrap()
+    .with_floating_state_source(eredu_core::checkpoint::TensorDtype::F32);
     let component_mechanisms = if denied == Some(DeniedReferenceMechanism::State) {
         Vec::new()
     } else {
@@ -3652,6 +3653,10 @@ fn try_select_reference_text(
             .collect::<Vec<_>>()
     };
     let state_mechanisms = StateMechanismCapabilities::new(component_mechanisms)
+        .with_floating_state_dtype(
+            eredu_core::checkpoint::TensorDtype::F32,
+            eredu_runtime::StateStorageDtype::F32,
+        )
         .with_transactions(true, true)
         .with_reset(true)
         .with_prompt_cache(denied != Some(DeniedReferenceMechanism::Persistence))
@@ -7526,7 +7531,8 @@ fn selected_reference_composite(
         ReplicatedTextStateAccess::KeyValue,
         Vec::new(),
     )
-    .unwrap();
+    .unwrap()
+    .with_floating_state_source(eredu_core::checkpoint::TensorDtype::F32);
     let state = StateMechanismCapabilities::new(
         state_layout
             .layers()
@@ -7543,6 +7549,10 @@ fn selected_reference_composite(
                 })
             })
             .collect::<Vec<_>>(),
+    )
+    .with_floating_state_dtype(
+        eredu_core::checkpoint::TensorDtype::F32,
+        eredu_runtime::StateStorageDtype::F32,
     )
     .with_transactions(true, true)
     .with_reset(true)

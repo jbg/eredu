@@ -15834,9 +15834,26 @@ impl eredu_runtime::ReplicatedTextMechanismSupport for NumericMechanismSupport {
         )
     }
 
+    fn floating_state_dtype(
+        &self,
+        source: &eredu_core::checkpoint::TensorDtype,
+    ) -> Option<eredu_runtime::StateStorageDtype> {
+        use eredu_core::checkpoint::TensorDtype;
+        use eredu_runtime::StateStorageDtype;
+        match source {
+            TensorDtype::F16 => Some(StateStorageDtype::F32),
+            TensorDtype::Bf16 => Some(StateStorageDtype::F32),
+            TensorDtype::F32 | TensorDtype::U32 | TensorDtype::Encoded(_) => {
+                Some(StateStorageDtype::F32)
+            }
+            _ => None,
+        }
+    }
+
     fn supports_state_component(
         &self,
         _: &eredu_core::cache::StateComponentPolicy,
+        _storage_dtype: eredu_runtime::StateStorageDtype,
         placement: eredu_runtime::StateComponentPlacement,
     ) -> bool {
         placement == eredu_runtime::StateComponentPlacement::Device
