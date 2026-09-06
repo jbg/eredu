@@ -222,6 +222,18 @@ impl<T: Retention, P: Probe> Recovery<T, P> {
             }
         })
     }
+
+    /// Waits for successful work to settle, returning immediately on failure.
+    /// Error and teardown paths must keep using nonblocking progress instead.
+    pub fn wait(&self) -> Status {
+        loop {
+            let status = self.progress();
+            if status.settled || status.failed || status.blocked {
+                return status;
+            }
+            std::thread::yield_now();
+        }
+    }
 }
 
 impl<T: Retention, P: Probe> Drop for Recovery<T, P> {
@@ -263,6 +275,82 @@ mod tests {
         fn drop(&mut self) {
             self.0.fetch_add(1, Ordering::SeqCst);
         }
+    }
+
+    fn await_retirement(drops: &AtomicUsize) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while drops.load(Ordering::SeqCst) == 0 {
+            reap();
+            assert!(Instant::now() < deadline, "terminal owner was not retired");
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn successful_wait_advances_pending_work_before_retirement() {
+        struct Deferred(std::cell::Cell<usize>);
+        impl Probe for Deferred {
+            fn seal(&mut self) {}
+            fn progress(&self) -> Status {
+                let remaining = self.0.get();
+                self.0.set(remaining.saturating_sub(1));
+                Status {
+                    settled: remaining == 0,
+                    failed: false,
+                    blocked: false,
+                }
+            }
+        }
+        let drops = Arc::new(AtomicUsize::new(0));
+        let recovery = Recovery::with_probe(
+            CountDrop(Arc::clone(&drops)),
+            Deferred(std::cell::Cell::new(3)),
+        );
+        let status = recovery.wait();
+        assert!(status.settled && !status.failed && !status.blocked);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        drop(recovery);
+        await_retirement(&drops);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn failed_wait_returns_without_releasing_pending_work() {
+        struct FailedPending {
+            complete: Rc<std::cell::Cell<bool>>,
+            polls: std::cell::Cell<usize>,
+        }
+        impl Probe for FailedPending {
+            fn seal(&mut self) {}
+            fn progress(&self) -> Status {
+                self.polls.set(self.polls.get() + 1);
+                assert!(
+                    self.complete.get() || self.polls.get() <= 2,
+                    "failed work must not be polled until completion by wait or drop"
+                );
+                Status {
+                    settled: self.complete.get(),
+                    failed: true,
+                    blocked: true,
+                }
+            }
+        }
+        let complete = Rc::new(std::cell::Cell::new(false));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let recovery = Recovery::with_probe(
+            CountDrop(Arc::clone(&drops)),
+            FailedPending {
+                complete: Rc::clone(&complete),
+                polls: std::cell::Cell::new(0),
+            },
+        );
+        let status = recovery.wait();
+        assert!(!status.settled && status.failed && status.blocked);
+        drop(recovery);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        complete.set(true);
+        await_retirement(&drops);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 
     #[test]

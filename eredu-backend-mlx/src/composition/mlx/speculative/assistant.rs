@@ -183,7 +183,14 @@ impl DrafterOperation<'_> {
         self.retained
             .replace(Some(Rc::clone(&self.drafter.payload)));
         self.recovery.seal();
-        let status = self.recovery.progress();
+        // One nonblocking poll may leave healthy CPU work or native recovery
+        // records pending. A successful synchronous operation must wait for
+        // completion; failures retain their nonblocking recovery path.
+        let status = if result.is_ok() {
+            self.recovery.wait()
+        } else {
+            self.recovery.progress()
+        };
         if !status.settled || status.failed || status.blocked {
             self.drafter.poisoned.set(true);
             return Err(Error::Speculative(
@@ -205,7 +212,7 @@ impl Drop for DrafterOperation<'_> {
             .replace(Some(Rc::clone(&self.drafter.payload)));
         self.recovery.seal();
         let status = self.recovery.progress();
-        if !status.settled || status.failed || status.blocked || std::thread::panicking() {
+        if status.failed || status.blocked || std::thread::panicking() {
             self.drafter.poisoned.set(true);
         }
     }
@@ -288,7 +295,7 @@ impl MlxDrafter {
         }));
         retained.replace(Some(Rc::clone(&payload)));
         recovery.seal();
-        let status = recovery.progress();
+        let status = recovery.wait();
         if !status.settled || status.failed || status.blocked {
             return Err(Error::Speculative(
                 "native drafter materialization failed or remains unresolved".into(),
