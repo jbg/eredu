@@ -361,7 +361,6 @@ fn build_and_link_mlx_c(out_path: &Path) {
         env::var("CARGO_CFG_TARGET_ARCH").expect("target architecture was not set by Cargo");
     let target_vendor =
         env::var("CARGO_CFG_TARGET_VENDOR").expect("target vendor was not set by Cargo");
-    #[cfg(feature = "cuda")]
     let target_env = env::var("CARGO_CFG_TARGET_ENV").expect("target environment was not set");
     let is_apple = target_vendor == "apple";
 
@@ -385,6 +384,11 @@ fn build_and_link_mlx_c(out_path: &Path) {
 
     let mut config = Config::new("src/mlx-c");
     config.very_verbose(true);
+    if target_os == "windows" && target_env == "msvc" {
+        // Cargo supplies CMAKE_CXX_FLAGS, replacing CMake's default /EHsc.
+        // Native recovery requires destructors to run across exception frames.
+        config.cxxflag("/EHsc");
+    }
     config.define("CMAKE_INSTALL_PREFIX", ".");
     config.define(
         "CMAKE_BUILD_TYPE",
