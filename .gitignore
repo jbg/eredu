@@ -4,3 +4,4 @@ __pycache__/
 *.pyc
 /examples/eredu-ios/Build/
 /examples/eredu-ios/*.xcodeproj/
+/.native-build

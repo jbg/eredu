@@ -1,0 +1,17 @@
+name: Save a successful native build
+description: Preserve native compilation before later Rust builds or tests can fail.
+inputs:
+  key:
+    description: Primary key from the build-cache action.
+    required: true
+  hit:
+    description: Exact native cache hit from the build-cache action.
+    required: true
+runs:
+  using: composite
+  steps:
+    - uses: actions/cache/save@v4
+      if: inputs.hit != 'true'
+      with:
+        path: .native-build
+        key: ${{ inputs.key }}

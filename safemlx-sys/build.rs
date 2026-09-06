@@ -383,6 +383,30 @@ fn build_and_link_mlx_c(out_path: &Path) {
         .unwrap_or_else(|error| panic!("{error}"));
 
     let mut config = Config::new("src/mlx-c");
+    println!("cargo:rerun-if-env-changed=SAFEMLX_NATIVE_BUILD_ROOT");
+    if let Some(root) = env::var_os("SAFEMLX_NATIVE_BUILD_ROOT") {
+        let root = PathBuf::from(root);
+        assert!(
+            root.is_absolute(),
+            "SAFEMLX_NATIVE_BUILD_ROOT must be absolute"
+        );
+        // Opt-in CI cache: Cargo's OUT_DIR changes with Rust dependency versions.
+        // Keep CMake's tree stable across those changes, with separate trees for
+        // native configurations. CMake still configures every invocation and
+        // rebuilds when sources, patches, compilers, or flags change.
+        let configuration = format!(
+            "metal{}-accelerate{}-cuda{}-nccl{}",
+            is_apple && cfg!(feature = "metal"),
+            is_apple && cfg!(feature = "accelerate"),
+            cfg!(feature = "cuda"),
+            cfg!(feature = "nccl"),
+        );
+        config.out_dir(
+            root.join(&target)
+                .join(env::var("PROFILE").unwrap())
+                .join(configuration),
+        );
+    }
     config.very_verbose(true);
     if target_os == "windows" && target_env == "msvc" {
         // Cargo supplies CMAKE_CXX_FLAGS, replacing CMake's default /EHsc.
