@@ -16,34 +16,41 @@ use the next patch. Leave unchanged crates at their published version and
 start new crates at `0.1.0`. A binary-only crate can take a patch for internal
 dependency updates when its command-line interface remains compatible.
 
-## Pending workspace versions
+## Workspace releases on 2026-09-06
 
-The following baselines were checked against the crates.io API and published
+The following pre-release baselines were checked against the crates.io API and published
 source archives on 2026-09-06. Archive checksums were verified against the API,
 and the source was compared with main at `5b30e9d8`. The `0.1.0` archives below
 come from `5d26950c`, as does `safemlx-internal-macros` `0.2.0`. The MLX
 `0.1.2`, CLI `0.1.1`, `safemlx` `0.2.2`, and `safemlx-sys` `0.2.1`
 archives come from `f3a0b862`. Recheck the registry before publishing.
 
-| Crate | Published | Next / retained | Reason |
+The 13 changed crates below were published on 2026-09-06 from
+`c5b6f080`, including the Windows DLL linkage and C++ exception unwinding
+repairs in `safemlx-sys`, repeatable GPU submission recovery, and MLX
+partition binding, session completion, and synchronous resource-retirement repairs. The release passed the
+[native release gate](https://github.com/jbg/eredu/actions/runs/34055527048)
+and [archive validation](https://github.com/jbg/eredu/actions/runs/34055504464).
+
+| Crate | Previous release | Released / retained | Reason |
 | --- | --- | --- | --- |
-| `eredu` | [0.1.0](https://crates.io/crates/eredu/0.1.0) | 0.2.0 | Public load options and backend contracts changed; the local speculative telemetry helper was removed. |
-| `eredu-core` | [0.1.0](https://crates.io/crates/eredu-core/0.1.0) | 0.2.0 | Planning and loading traits have new required items and changed signatures. |
-| `eredu-checkpoint` | [0.1.0](https://crates.io/crates/eredu-checkpoint/0.1.0) | 0.2.0 | `CheckpointLease::Gguf` now contains a boxed lease, changing public construction and matching. |
-| `eredu-nn` | [0.1.0](https://crates.io/crates/eredu-nn/0.1.0) | 0.2.0 | `GroupedRelu2Operator` requires a new `spec` method. |
-| `eredu-runtime` | [0.1.0](https://crates.io/crates/eredu-runtime/0.1.0) | 0.2.0 | Parameter binding and state-support traits have incompatible signatures and new requirements. |
-| `eredu-architectures` | [0.1.0](https://crates.io/crates/eredu-architectures/0.1.0) | 0.2.0 | Public preparation types and execution interfaces were replaced or changed. |
-| `eredu-codec` | [0.1.0](https://crates.io/crates/eredu-codec/0.1.0) | 0.2.0 | Codec construction changed and public `Error` variants were removed. |
-| `eredu-evaluation` | [0.1.0](https://crates.io/crates/eredu-evaluation/0.1.0) | 0.2.0 | Realtime evaluation now requires a `RealtimeEvaluationDriver` instead of a `RealtimeModel` loader. |
-| `eredu-backend-mlx` | [0.1.2](https://crates.io/crates/eredu-backend-mlx/0.1.2) | 0.2.0 | Native adapters implement the new contracts; public composition APIs and the `codec` feature changed. |
-| `eredu-cli` | [0.1.1](https://crates.io/crates/eredu-cli/0.1.1) | 0.1.2 | Internal API updates and retained automatic inspection preserve the command-line interface. |
-| `eredu-media` | Unpublished | 0.1.0 | First release. |
+| `eredu` | [0.1.0](https://crates.io/crates/eredu/0.1.0) | [0.2.0](https://crates.io/crates/eredu/0.2.0) | Public load options and backend contracts changed; the local speculative telemetry helper was removed. |
+| `eredu-core` | [0.1.0](https://crates.io/crates/eredu-core/0.1.0) | [0.2.0](https://crates.io/crates/eredu-core/0.2.0) | Planning and loading traits have new required items and changed signatures. |
+| `eredu-checkpoint` | [0.1.0](https://crates.io/crates/eredu-checkpoint/0.1.0) | [0.2.0](https://crates.io/crates/eredu-checkpoint/0.2.0) | `CheckpointLease::Gguf` now contains a boxed lease, changing public construction and matching. |
+| `eredu-nn` | [0.1.0](https://crates.io/crates/eredu-nn/0.1.0) | [0.2.0](https://crates.io/crates/eredu-nn/0.2.0) | `GroupedRelu2Operator` requires a new `spec` method. |
+| `eredu-runtime` | [0.1.0](https://crates.io/crates/eredu-runtime/0.1.0) | [0.2.0](https://crates.io/crates/eredu-runtime/0.2.0) | Parameter binding and state-support traits have incompatible signatures and new requirements. |
+| `eredu-architectures` | [0.1.0](https://crates.io/crates/eredu-architectures/0.1.0) | [0.2.0](https://crates.io/crates/eredu-architectures/0.2.0) | Public preparation types and execution interfaces were replaced or changed. |
+| `eredu-codec` | [0.1.0](https://crates.io/crates/eredu-codec/0.1.0) | [0.2.0](https://crates.io/crates/eredu-codec/0.2.0) | Codec construction changed and public `Error` variants were removed. |
+| `eredu-evaluation` | [0.1.0](https://crates.io/crates/eredu-evaluation/0.1.0) | [0.2.0](https://crates.io/crates/eredu-evaluation/0.2.0) | Realtime evaluation now requires a `RealtimeEvaluationDriver` instead of a `RealtimeModel` loader. |
+| `eredu-backend-mlx` | [0.1.2](https://crates.io/crates/eredu-backend-mlx/0.1.2) | [0.2.0](https://crates.io/crates/eredu-backend-mlx/0.2.0) | Native adapters implement the new contracts; public composition APIs and the `codec` feature changed. |
+| `eredu-cli` | [0.1.1](https://crates.io/crates/eredu-cli/0.1.1) | [0.1.2](https://crates.io/crates/eredu-cli/0.1.2) | Internal API updates and retained automatic inspection preserve the command-line interface. |
+| `eredu-media` | Unpublished | [0.1.0](https://crates.io/crates/eredu-media/0.1.0) | First release. |
 | `eredu-gguf` | [0.1.0](https://crates.io/crates/eredu-gguf/0.1.0) | 0.1.0 (retained) | Source and dependency requirements are unchanged. |
 | `eredu-text` | [0.1.0](https://crates.io/crates/eredu-text/0.1.0) | 0.1.0 (retained) | Source and dependency requirements are unchanged. |
 | `eredu-nn-macros` | [0.1.0](https://crates.io/crates/eredu-nn-macros/0.1.0) | 0.1.0 (retained) | Source and dependency requirements are unchanged. |
 | `eredu-backend-mlx-macros` | [0.1.0](https://crates.io/crates/eredu-backend-mlx-macros/0.1.0) | 0.1.0 (retained) | Source and dependency requirements are unchanged. |
-| `safemlx` | [0.2.2](https://crates.io/crates/safemlx/0.2.2) | 0.3.0 | Adding `Misaligned` and `TooLarge` to the exhaustive public `AsSliceError` enum breaks downstream matches. |
-| `safemlx-sys` | [0.2.1](https://crates.io/crates/safemlx-sys/0.2.1) | 0.2.2 | Native lifetime repairs and additional FFI entry points preserve the existing interface. |
+| `safemlx` | [0.2.2](https://crates.io/crates/safemlx/0.2.2) | [0.3.0](https://crates.io/crates/safemlx/0.3.0) | Adding `Misaligned` and `TooLarge` to the exhaustive public `AsSliceError` enum breaks downstream matches. |
+| `safemlx-sys` | [0.2.1](https://crates.io/crates/safemlx-sys/0.2.1) | [0.2.2](https://crates.io/crates/safemlx-sys/0.2.2) | Native lifetime repairs and additional FFI entry points preserve the existing interface. |
 | `safemlx-internal-macros` | [0.2.0](https://crates.io/crates/safemlx-internal-macros/0.2.0) | 0.2.0 (retained) | Source and dependency requirements are unchanged. |
 
 The `eredu-ios` example and `safemlx-tests` remain `0.1.0` with
