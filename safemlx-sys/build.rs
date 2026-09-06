@@ -394,13 +394,23 @@ fn build_and_link_mlx_c(out_path: &Path) {
         // Keep CMake's tree stable across those changes, with separate trees for
         // native configurations. CMake still configures every invocation and
         // rebuilds when sources, patches, compilers, or flags change.
-        let configuration = format!(
-            "metal{}-accelerate{}-cuda{}-nccl{}",
-            is_apple && cfg!(feature = "metal"),
-            is_apple && cfg!(feature = "accelerate"),
-            cfg!(feature = "cuda"),
-            cfg!(feature = "nccl"),
-        );
+        let configuration = if target_os == "windows" {
+            // nvcc still uses Windows APIs with MAX_PATH limits. Leave room
+            // for the content-identified MLX source tree and CUDA filenames.
+            format!(
+                "m0a0c{}n{}",
+                u8::from(cfg!(feature = "cuda")),
+                u8::from(cfg!(feature = "nccl")),
+            )
+        } else {
+            format!(
+                "metal{}-accelerate{}-cuda{}-nccl{}",
+                is_apple && cfg!(feature = "metal"),
+                is_apple && cfg!(feature = "accelerate"),
+                cfg!(feature = "cuda"),
+                cfg!(feature = "nccl"),
+            )
+        };
         config.out_dir(
             root.join(&target)
                 .join(env::var("PROFILE").unwrap())
