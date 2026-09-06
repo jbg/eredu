@@ -41,7 +41,8 @@ runs:
       if: inputs.rust == 'true'
       with:
         path: target
-        key: rust-v2-${{ runner.os }}-${{ runner.arch }}-${{ inputs.variant }}-${{ steps.tools.outputs.native }}-${{ steps.tools.outputs.rust }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml') }}-${{ github.sha }}
+        # Keep one dependency baseline, rather than a large entry per commit.
+        key: rust-v2-${{ runner.os }}-${{ runner.arch }}-${{ inputs.variant }}-${{ steps.tools.outputs.native }}-${{ steps.tools.outputs.rust }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml') }}
         restore-keys: |
           ${{ steps.native.outputs.cache-matched-key != '' && format('rust-v2-{0}-{1}-{2}-{3}-{4}-', runner.os, runner.arch, inputs.variant, steps.tools.outputs.native, steps.tools.outputs.rust) || 'no-native-cache-no-rust-restore-' }}
         lookup-only: ${{ steps.native.outputs.cache-matched-key == '' }}

@@ -69,7 +69,9 @@ CUDA/cuDNN versions and target architecture. Rust artifacts use a separate
 key with the Rust toolchain and Cargo dependency versions. Only the shared
 macOS preflight build caches Rust artifacts: caching full Rust test trees for
 every matrix entry would quickly exhaust the repository's 10 GB budget and
-evict the expensive native builds. Native files must be available before
+evict the expensive native builds. That Rust cache keeps one baseline per
+toolchain and dependency set, rather than a new entry for every source commit.
+Native files must be available before
 restoring Rust artifacts that may refer to them.
 
 Successful native builds are saved before downstream tests and Rust builds,
