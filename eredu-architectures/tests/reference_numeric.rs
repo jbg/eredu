@@ -25419,7 +25419,15 @@ fn run_numeric_composite_partitions(
                 let inputs = inputs.to_vec();
                 let world = Arc::clone(&world);
                 scope.spawn(move || {
-                    let sources = partitioned_adapter::prepare(&inspection, topology, rank, false)?;
+                    // Eight-rank fixture construction can outlast the short
+                    // deadlines used by deliberate failure cases on CI hosts.
+                    let sources = partitioned_adapter::prepare_with_timeout(
+                        &inspection,
+                        topology,
+                        rank,
+                        false,
+                        std::time::Duration::from_secs(30),
+                    )?;
                     let rank_topology = ParallelRankTopology::new(topology, rank).unwrap();
                     let layout = eredu_architectures::partitioned_execution::derive_partitioned_local_layout(
                         &description,

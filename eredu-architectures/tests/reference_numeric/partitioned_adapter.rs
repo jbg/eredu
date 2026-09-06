@@ -11,6 +11,24 @@ pub(super) fn prepare(
     rank: usize,
     prompt_cache_persistence: bool,
 ) -> Result<PreparedModelSources, String> {
+    prepare_with_timeout(
+        inspection,
+        topology,
+        rank,
+        prompt_cache_persistence,
+        std::time::Duration::from_secs(2),
+    )
+}
+
+pub(super) fn prepare_with_timeout(
+    inspection: &eredu_core::ArtifactInspection<
+        eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+    >,
+    topology: ParallelTopology,
+    rank: usize,
+    prompt_cache_persistence: bool,
+    completion_timeout: std::time::Duration,
+) -> Result<PreparedModelSources, String> {
     let plan = prepared_adapter::plan(None)
         .with_topology(topology)
         .with_prompt_cache_persistence(prompt_cache_persistence);
@@ -20,7 +38,7 @@ pub(super) fn prepare(
         1,
         8,
         CommunicationCompletionPolicy::new(
-            std::time::Duration::from_secs(2),
+            completion_timeout,
             CompletionCancellationMode::QuarantineUntilComplete,
         )
         .map_err(|error| error.to_string())?,
