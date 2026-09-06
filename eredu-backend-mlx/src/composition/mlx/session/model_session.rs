@@ -213,8 +213,8 @@ pub(super) fn complete_model_operation<T, P: Probe>(
     owner: Rc<SubmissionResources>,
     recovery: Recovery<ScopeRetention, P>,
 ) -> Result<T, Error> {
-    let status = recovery.progress();
     owner.request_release();
+    let status = recovery.finish();
     if !status.settled || status.failed || status.blocked {
         owner.reject_unresolved();
         return Err(Error::ArchitectureModel(
@@ -222,7 +222,6 @@ pub(super) fn complete_model_operation<T, P: Probe>(
                 .into(),
         ));
     }
-    drop(recovery);
     Ok(value)
 }
 
@@ -501,7 +500,7 @@ impl MlxModelSession {
         // Successful host reads can leave completion bookkeeping pending. Wait
         // for that work before reusing the session; errors remain nonblocking.
         let status = if result.is_ok() {
-            recovery.wait()
+            recovery.finish()
         } else {
             recovery.progress()
         };

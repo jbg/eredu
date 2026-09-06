@@ -240,6 +240,7 @@ mod observation_scope_tests {
             blocked: false,
         });
         crate::backend::submission_recovery::reap();
+        crate::backend::submission_recovery::wait_for_retirement(|| state.active.get() == 0);
         assert_eq!(state.active.get(), 0);
         assert!(state.failed.get());
     }

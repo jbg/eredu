@@ -193,21 +193,25 @@ impl DrafterOperation<'_> {
         };
         if !status.settled || status.failed || status.blocked {
             self.drafter.poisoned.set(true);
-            return Err(Error::Speculative(
-                "native drafter work failed or remains unresolved".into(),
-            ));
+            let message = match &result {
+                Ok(_) => "native drafter work failed or remains unresolved".to_owned(),
+                Err(error) => format!("native drafter work failed or remains unresolved: {error}"),
+            };
+            return Err(Error::Speculative(message));
         }
         let value = result?;
         self.completed = true;
+        self.retained.take();
         Ok(value)
     }
 }
 
 impl Drop for DrafterOperation<'_> {
     fn drop(&mut self) {
-        if !self.completed {
-            self.drafter.poisoned.set(true);
+        if self.completed {
+            return;
         }
+        self.drafter.poisoned.set(true);
         self.retained
             .replace(Some(Rc::clone(&self.drafter.payload)));
         self.recovery.seal();

@@ -35,7 +35,9 @@ use safemlx::{Device, DeviceType};
 #[cfg(test)]
 static MANIFEST_GROUP_REALIZATIONS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(test)]
-static PARTITION_NATIVE_MATERIALIZATION_ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    static PARTITION_NATIVE_MATERIALIZATION_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 #[cfg(test)]
 pub(super) fn reset_manifest_group_realizations() {

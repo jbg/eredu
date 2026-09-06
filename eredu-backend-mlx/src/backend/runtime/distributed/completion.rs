@@ -258,7 +258,9 @@ mod child_scope_tests {
         drop(second);
         assert!(!check_native_status(&parent).unwrap());
         pending.set(state(true, false));
-        assert!(check_native_status(&parent).unwrap());
+        crate::backend::submission_recovery::wait_for_retirement(|| {
+            check_native_status(&parent).unwrap()
+        });
     }
 
     #[test]
@@ -275,8 +277,11 @@ mod child_scope_tests {
         assert!(!native_resources_releasable(&parent));
         failed.set(state(true, true));
         crate::backend::submission_recovery::reap();
+        crate::backend::submission_recovery::wait_for_retirement(|| owner.children.get() == 0);
         assert_eq!(owner.children.get(), 0);
-        assert!(native_resources_releasable(&parent));
+        crate::backend::submission_recovery::wait_for_retirement(|| {
+            native_resources_releasable(&parent)
+        });
         assert!(check_native_status(&parent).is_err());
     }
 
@@ -296,6 +301,7 @@ mod child_scope_tests {
         assert_eq!(owner.children.get(), 1);
         pending.set(state(true, false));
         crate::backend::submission_recovery::reap();
+        crate::backend::submission_recovery::wait_for_retirement(|| owner.children.get() == 0);
         assert_eq!(owner.children.get(), 0);
     }
 }

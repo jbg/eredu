@@ -1969,6 +1969,14 @@ reports before publication, rather than accepting a subset or assuming universal
 backend facilities. Sampled-token completion and model validation both finish
 before a text submission releases its authority.
 
+Successful synchronous MLX operations retire their native owners under the same
+runtime guard that confirms completion, then finish staged host destruction at
+an ordinary unlocked boundary. This prevents another runtime user from delaying
+lease release between a successful wait and the next session mutation or bounded
+checkpoint acquisition. Polling, errors, and teardown remain nonblocking: when
+the runtime is busy, failure still reaches the retained owner, but resource
+release waits for both terminal evidence and safe runtime access.
+
 The backend is selected for the entire model/session. Per-operation backend
 selection would make cache ownership ambiguous and introduce implicit data
 movement. Explicit transfer and collective capabilities cover the cases where

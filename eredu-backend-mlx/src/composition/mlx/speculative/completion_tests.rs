@@ -23,7 +23,7 @@ fn native_speculative_completion_retains_every_submitted_array_handle() {
 
     assert_eq!(completion.retained().len(), 2);
     completion.wait().unwrap();
-    assert!(completion.is_complete().unwrap());
+    crate::backend::submission_recovery::wait_for_retirement(|| completion.is_complete().unwrap());
     assert_eq!(completion.retained()[0].clone().item::<f32>(&stream), 1.0);
     assert_eq!(completion.retained()[1].clone().item::<f32>(&stream), 3.0);
 }

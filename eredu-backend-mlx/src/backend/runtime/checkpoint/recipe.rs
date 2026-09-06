@@ -458,6 +458,7 @@ impl MlxWeightRecipeExt for DerivedWeightRecipe {
                     .all(false, stream)?
                     .try_item::<bool>(stream)?;
                 if !all_negative {
+                    prepared.finish()?;
                     return Err(WeightRecipeError::NonNegativeNegLogInput);
                 }
                 let output = prepared.inputs()[0]

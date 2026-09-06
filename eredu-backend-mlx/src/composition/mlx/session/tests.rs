@@ -80,7 +80,12 @@ fn completed_model_submission_validates_tokens_and_releases_its_gate() {
     let error = invalid.wait().unwrap_err();
     assert!(error.to_string().contains("outside 0..4"));
     assert_eq!(invalid_gate.require_idle(), Ok(()));
-    let error = invalid.is_complete().unwrap_err();
+    let mut polled_error = None;
+    crate::backend::submission_recovery::wait_for_retirement(|| {
+        polled_error = invalid.is_complete().err();
+        polled_error.is_some()
+    });
+    let error = polled_error.unwrap();
     assert!(error.to_string().contains("outside 0..4"));
 }
 
@@ -202,6 +207,9 @@ fn text_completion_keeps_authority_through_pending_and_failed_native_observation
             token.state.set(1);
             output_completion::token_then_model_wait(&token, &model).unwrap();
         }
+        crate::backend::submission_recovery::wait_for_retirement(|| {
+            authority.require_idle().is_ok()
+        });
         assert_eq!(authority.require_idle(), Ok(()));
     }
 }

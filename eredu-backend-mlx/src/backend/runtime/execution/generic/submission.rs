@@ -75,6 +75,21 @@ impl<U: 'static> MlxUnitLease<U> {
     pub(super) fn wait(&self) -> Result<(), Error> {
         wait_for_unit(&self.recovery)
     }
+
+    pub(super) fn finish(mut self) -> Result<(), Error> {
+        self.wait()?;
+        match &mut self.recovery.retention_mut().resources._transfer {
+            MlxUnitTransfer::Ordinary { _transfer } => _transfer.synchronize()?,
+            MlxUnitTransfer::Dense { _transfer } => _transfer.synchronize()?,
+        }
+        let status = self.recovery.finish();
+        if status.failed || status.blocked {
+            return Err(Error::ArchitectureModel(
+                "native execution-unit retirement failed".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 fn unit_status<U: 'static, P: Probe>(

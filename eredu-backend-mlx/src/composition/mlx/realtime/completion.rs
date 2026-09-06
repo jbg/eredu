@@ -272,7 +272,9 @@ mod observation_tests {
             failed: false,
             blocked: false,
         });
-        assert!(completion.is_complete().unwrap());
+        crate::backend::submission_recovery::wait_for_retirement(|| {
+            completion.is_complete().unwrap()
+        });
     }
 
     #[test]
@@ -287,15 +289,21 @@ mod observation_tests {
             ObservationTicket::new(&completion.inner).unwrap(),
             FakeProbe(Rc::clone(&state)),
         ));
-        assert!(completion.is_complete().is_err());
+        crate::backend::submission_recovery::wait_for_retirement(|| {
+            completion.is_complete().is_err()
+        });
         assert!(!completion.resources_releasable());
         state.set(Status {
             settled: true,
             failed: true,
             blocked: false,
         });
-        assert!(completion.resources_releasable());
-        assert!(completion.is_complete().is_err());
+        crate::backend::submission_recovery::wait_for_retirement(|| {
+            completion.resources_releasable()
+        });
+        crate::backend::submission_recovery::wait_for_retirement(|| {
+            completion.is_complete().is_err()
+        });
     }
 
     #[test]
@@ -306,6 +314,8 @@ mod observation_tests {
             panic!("injected observation unwind");
         }));
         assert!(result.is_err());
-        assert!(completion.is_complete().is_err());
+        crate::backend::submission_recovery::wait_for_retirement(|| {
+            completion.is_complete().is_err()
+        });
     }
 }

@@ -951,7 +951,7 @@ fn late_partition_preflight_failure_performs_zero_payload_reads_or_native_work()
         .unwrap();
     plan.insert_expected("z.invalid", vec![3], TensorPlacement::Local)
         .unwrap();
-    PARTITION_NATIVE_MATERIALIZATION_ATTEMPTS.store(0, Ordering::Relaxed);
+    PARTITION_NATIVE_MATERIALIZATION_ATTEMPTS.with(|count| count.set(0));
     let source_stream = stream();
     let execution_stream = stream();
 
@@ -961,7 +961,7 @@ fn late_partition_preflight_failure_performs_zero_payload_reads_or_native_work()
     ));
     assert_eq!(store.source_diagnostics().unwrap().physical_reads, 0);
     assert_eq!(
-        PARTITION_NATIVE_MATERIALIZATION_ATTEMPTS.load(Ordering::Relaxed),
+        PARTITION_NATIVE_MATERIALIZATION_ATTEMPTS.with(std::cell::Cell::get),
         0
     );
 }

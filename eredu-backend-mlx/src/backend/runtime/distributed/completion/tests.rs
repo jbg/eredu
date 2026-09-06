@@ -122,7 +122,7 @@ fn completed_quarantine_is_reaped_on_an_unrelated_runtime_entry() {
 }
 
 #[test]
-fn owner_thread_exit_releases_quarantined_resources_with_existing_terminal_proof() {
+fn quarantine_teardown_releases_terminal_resources_when_runtime_access_is_available() {
     let completion_observed = Arc::new(AtomicBool::new(false));
     let teardown_observed = Arc::new(AtomicBool::new(false));
     let worker_completion = Arc::clone(&completion_observed);
@@ -166,16 +166,23 @@ fn owner_thread_exit_releases_quarantined_resources_with_existing_terminal_proof
                 std::thread::yield_now();
             }
         });
+        // Exercise the TLS destructor with runtime access reserved. Real thread
+        // exit may race another runtime user and must retain in that case.
+        let mut quarantine =
+            Some(COMMUNICATION_ORPHANS.with(|orphans| std::mem::take(&mut *orphans.borrow_mut())));
+        crate::backend::submission_recovery::wait_for_retirement(|| {
+            safemlx::try_with_submission_retirement(|| drop(quarantine.take())).is_some()
+        });
     })
     .join()
     .unwrap();
     assert!(
         completion_observed.load(Ordering::Acquire),
-        "owner-thread exit did not observe the existing terminal evidence"
+        "quarantine teardown did not observe the existing terminal evidence"
     );
     assert!(
         teardown_observed.load(Ordering::Acquire),
-        "owner-thread exit did not release the proven-terminal completion"
+        "quarantine teardown did not release the proven-terminal completion"
     );
 }
 

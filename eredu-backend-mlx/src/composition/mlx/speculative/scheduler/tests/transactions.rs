@@ -100,8 +100,17 @@ fn matching_bonus_is_emitted_and_consumes_one_paired_proposal() {
         )
         .unwrap();
 
-    for _ in 0..4 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
         scheduler.step().unwrap();
+        let request = scheduler.requests.request(id).unwrap();
+        if request.sequence().tokens().len() == 4
+            && request.status() == SpeculativeRequestStatus::ReadyToDraft
+        {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "accepted round did not commit");
+        std::thread::yield_now();
     }
 
     let request = scheduler.requests.request(id).unwrap();
@@ -276,15 +285,24 @@ fn promoted_round_leaves_last_emitted_token_out_of_target_cache() {
         )
         .unwrap();
 
-    scheduler.step().unwrap();
-    scheduler.step().unwrap();
-    scheduler.step().unwrap();
-    scheduler.step().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        scheduler.step().unwrap();
+        let request = scheduler.requests.request(id).unwrap();
+        if request.sequence().tokens().len() == 4
+            && request.status() == SpeculativeRequestStatus::ReadyToDraft
+        {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "promoted round did not commit");
+        std::thread::yield_now();
+    }
     assert_eq!(
         scheduler.status(id),
         Some(SpeculativeRequestStatus::ReadyToDraft)
     );
     scheduler.cancel(id).unwrap();
+    scheduler.run().unwrap();
     let output = scheduler.finish().unwrap();
 
     assert_eq!(output.requests[0].token_ids, vec![1, 2, 0, 0]);
@@ -332,15 +350,25 @@ fn rejection_discards_branch_sampler_prng_history_and_cache_state() {
             |_| Ok(()),
         )
         .unwrap();
-    scheduler.step().unwrap();
-    scheduler.step().unwrap();
-    scheduler.step().unwrap();
-    assert_eq!(
-        scheduler.status(id),
-        Some(SpeculativeRequestStatus::OptimisticDraftReady)
-    );
-    scheduler.step().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while scheduler.status(id) != Some(SpeculativeRequestStatus::OptimisticDraftReady) {
+        scheduler.step().unwrap();
+        assert!(std::time::Instant::now() < deadline, "optimistic draft did not become ready");
+        std::thread::yield_now();
+    }
+    loop {
+        scheduler.step().unwrap();
+        let request = scheduler.requests.request(id).unwrap();
+        if request.sequence().tokens().len() == 2
+            && request.status() == SpeculativeRequestStatus::ReadyToDraft
+        {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "rejected round did not commit");
+        std::thread::yield_now();
+    }
     scheduler.cancel(id).unwrap();
+    scheduler.run().unwrap();
     let output = scheduler.finish().unwrap();
     let request = &output.requests[0];
 

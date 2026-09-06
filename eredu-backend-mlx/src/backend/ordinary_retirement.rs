@@ -121,6 +121,25 @@ pub(crate) fn reclaim() {
     });
 }
 
+/// Finishes staged destruction at an explicit synchronous host boundary.
+/// Destructors may stage further owners, so consume those later snapshots too.
+pub(crate) fn reclaim_all() {
+    if !safemlx::can_reclaim_submission_resources()
+        || RECLAIMING.try_with(Cell::get).unwrap_or(true)
+    {
+        return;
+    }
+    loop {
+        reclaim();
+        if !RETIRED
+            .try_with(|retired| retired.borrow().0.is_some())
+            .unwrap_or(false)
+        {
+            return;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

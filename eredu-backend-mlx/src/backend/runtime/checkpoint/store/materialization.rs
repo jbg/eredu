@@ -224,11 +224,13 @@ impl WeightMaterialization {
         while !self.check_native_status()? {
             std::thread::yield_now();
         }
-        Ok(std::mem::take(
+        let sources = std::mem::take(
             &mut Rc::get_mut(self.retained.retention_mut())
                 .expect("unpublished preparation")
                 ._sources,
-        ))
+        );
+        self.finish()?;
+        Ok(sources)
     }
 
     pub(crate) fn submit_outputs(
@@ -340,7 +342,24 @@ impl WeightMaterialization {
     /// Waits explicitly for exact completion and returns the independently owned output.
     pub fn synchronize(self) -> Result<Array, CheckpointMaterializationError> {
         self.wait()?;
-        Ok(self.output().clone())
+        let output = self.output().clone();
+        self.finish()?;
+        Ok(output)
+    }
+
+    pub(crate) fn finish(mut self) -> Result<(), CheckpointMaterializationError> {
+        self.retained.seal();
+        let status = self.retained.finish();
+        if status.failed || status.blocked {
+            return Err(materialization_error(
+                &self.key,
+                "retirement",
+                safemlx::error::Exception::custom(
+                    "native materialization failed; unresolved resources remain retained",
+                ),
+            ));
+        }
+        Ok(())
     }
 
     fn mlx_error(

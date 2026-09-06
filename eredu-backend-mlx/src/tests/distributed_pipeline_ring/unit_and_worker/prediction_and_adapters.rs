@@ -455,7 +455,10 @@ fn public_embedded_observers_are_installed_causally_and_transactionally() {
         Ok(_) => panic!("injected embedded observation failure unexpectedly succeeded"),
         Err(error) => error,
     };
-    assert!(error.contains("injected external observation failure"));
+    assert!(
+        error.contains("injected external observation failure"),
+        "unexpected observation error: {error}"
+    );
     assert_eq!(failed_publications, 0);
     let failed_trace = failed_trace.lock().unwrap();
     assert_eq!(failed_trace.count(TARGET_CAPTURE), 1);

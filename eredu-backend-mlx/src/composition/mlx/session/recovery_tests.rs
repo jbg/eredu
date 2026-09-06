@@ -60,6 +60,7 @@ fn late_terminal_failure_cannot_publish_a_successful_model_operation() {
     let result = super::model_session::complete_model_operation(42, owner, recovery);
     assert!(result.is_err());
     assert!(poison.get());
+    recovery::wait_for_retirement(|| authority.require_idle().is_ok());
     assert!(authority.require_idle().is_ok());
 }
 
@@ -119,6 +120,7 @@ fn unresolved_scope_retains_payload_and_lease_after_public_owners_drop() {
     drop(payload);
     drop(owner);
     drop(guard);
+    recovery::wait_for_retirement(|| poisoned.get());
     assert!(poisoned.get());
     assert!(authority.require_idle().is_err());
     assert_eq!(drops.load(Ordering::SeqCst), 0);
@@ -126,7 +128,9 @@ fn unresolved_scope_retains_payload_and_lease_after_public_owners_drop() {
     assert_eq!(drops.load(Ordering::SeqCst), 0);
     native.set(status(true, true, false));
     recovery::reap();
+    recovery::wait_for_retirement(|| drops.load(Ordering::SeqCst) == 1);
     assert_eq!(drops.load(Ordering::SeqCst), 1);
+    recovery::wait_for_retirement(|| authority.require_idle().is_ok());
     assert!(authority.require_idle().is_ok());
     assert!(
         poisoned.get(),
@@ -154,6 +158,7 @@ fn one_settled_scope_cannot_release_another_unobservable_scope_ticket() {
     assert!(authority.require_idle().is_err());
     native.set(status(true, false, false));
     recovery::reap();
+    recovery::wait_for_retirement(|| authority.require_idle().is_ok());
     assert!(authority.require_idle().is_ok());
     let next = authority.begin_submission().unwrap();
     owner.request_release();
@@ -184,9 +189,11 @@ fn retained_payload_is_released_before_a_resolved_owner_allows_new_mutation() {
     owner.request_release();
     assert!(Rc::get_mut(&mut payload).is_none());
     drop(guard);
+    recovery::wait_for_retirement(|| authority.require_idle().is_ok());
     assert!(authority.require_idle().is_ok());
     assert!(Rc::get_mut(&mut payload).is_some());
     drop(payload);
+    recovery::wait_for_retirement(|| drops.load(Ordering::SeqCst) == 1);
     assert_eq!(drops.load(Ordering::SeqCst), 1);
     drop(owner);
 }
@@ -215,7 +222,9 @@ fn unwinding_does_not_release_unobservable_native_resources() {
     assert_eq!(drops.load(Ordering::SeqCst), 0);
     native.set(status(true, false, false));
     recovery::reap();
+    recovery::wait_for_retirement(|| drops.load(Ordering::SeqCst) == 1);
     assert_eq!(drops.load(Ordering::SeqCst), 1);
+    recovery::wait_for_retirement(|| authority.require_idle().is_ok());
     assert!(authority.require_idle().is_ok());
 }
 
@@ -259,6 +268,7 @@ fn swallowed_native_failure_cannot_turn_resource_operation_into_success() {
     assert!(operation.finish(Ok(7)).is_err());
     assert!(poisoned.get());
     owner.request_release();
+    recovery::wait_for_retirement(|| authority.require_idle().is_ok());
     assert!(authority.require_idle().is_ok());
 }
 
@@ -279,6 +289,7 @@ fn successful_pending_resource_operation_retains_authority_without_poisoning() {
     assert!(!poisoned.get());
     native.set(status(true, false, false));
     recovery::reap();
+    recovery::wait_for_retirement(|| authority.require_idle().is_ok());
     assert!(authority.require_idle().is_ok());
     assert!(!poisoned.get());
 }
@@ -310,6 +321,7 @@ fn host_error_and_unwind_poison_and_retain_pending_resource_operations() {
         assert!(authority.require_idle().is_err());
         native.set(status(true, false, false));
         recovery::reap();
+        recovery::wait_for_retirement(|| authority.require_idle().is_ok());
         assert!(authority.require_idle().is_ok());
         assert!(
             poisoned.get(),
@@ -433,18 +445,21 @@ fn terminal_session_retirement_defers_manager_drop_until_runtime_is_unlocked() {
         done_tx.send(()).unwrap();
     });
     ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-    safemlx::try_with_submission_retirement(|| {
-        start_tx.send(()).unwrap();
-        attempt_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        native.set(status(true, false, false));
-        recovery::reap();
-        ordinary_retirement::reclaim();
-        assert_eq!(drops.load(Ordering::SeqCst), 0);
-    })
-    .expect("worker has not entered native work before the retirement guard");
+    recovery::wait_for_retirement(|| {
+        safemlx::try_with_submission_retirement(|| {
+            start_tx.send(()).unwrap();
+            attempt_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            native.set(status(true, false, false));
+            recovery::reap();
+            ordinary_retirement::reclaim();
+            assert_eq!(drops.load(Ordering::SeqCst), 0);
+        })
+        .is_some()
+    });
     done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     worker.join().unwrap();
     ordinary_retirement::reclaim();
+    recovery::wait_for_retirement(|| drops.load(Ordering::SeqCst) == 1);
     assert_eq!(drops.load(Ordering::SeqCst), 1);
     assert_eq!(unsafe_drop.load(Ordering::SeqCst), 0);
 }

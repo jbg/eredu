@@ -351,7 +351,7 @@ impl ResidentTransfer {
     pub fn is_complete(&self) -> Result<bool, ResidencyError> {
         // Already-resident transfers have no native work or event to observe.
         if self.retained.is_none() {
-            return Ok(true);
+            return self.check_native_status();
         }
         safemlx::try_with_submission_retirement(|| {
             if !self.check_native_status()? {
@@ -378,6 +378,16 @@ impl ResidentTransfer {
     pub fn synchronize(&mut self) -> Result<(), ResidencyError> {
         while !self.is_complete()? {
             std::thread::yield_now();
+        }
+        if let Some(retained) = self.retained.take() {
+            let status = retained.finish();
+            if status.failed || status.blocked {
+                self.application.mark_failed();
+                return Err(transfer_error(
+                    "resident transfer retirement",
+                    safemlx::error::Exception::custom("native transfer failed"),
+                ));
+            }
         }
         self.application.resolve()?;
         Ok(())
@@ -634,7 +644,7 @@ pub(super) fn ensure_many_resident(
                         )?
                         .submit_outputs(resources.retained_arrays.clone())?;
                         prior.wait()?;
-                        drop(prior);
+                        prior.finish()?;
                     }
                     Err(error) => return Err(error),
                 }

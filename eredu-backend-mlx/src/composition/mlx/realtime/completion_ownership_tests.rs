@@ -56,6 +56,7 @@ fn failed_submission_keeps_completion_and_roots_without_retrying_evaluation() {
         blocked: false,
     });
     submission_recovery::reap();
+    crate::backend::submission_recovery::wait_for_retirement(|| drops.get() == 1);
     assert_eq!(drops.get(), 1, "terminal failure is safe to release");
 }
 
@@ -73,6 +74,7 @@ fn only_terminal_proof_allows_an_error_without_an_owned_completion() {
         failure,
         RealtimeCompletionCreationError::BeforeSubmission(_)
     ));
+    crate::backend::submission_recovery::wait_for_retirement(|| drops.get() == 1);
     assert_eq!(drops.get(), 1);
 }
 
@@ -98,6 +100,7 @@ fn pending_without_a_failure_is_not_a_release_proof() {
         blocked: false,
     });
     submission_recovery::reap();
+    crate::backend::submission_recovery::wait_for_retirement(|| drops.get() == 1);
     assert_eq!(drops.get(), 1);
 }
 

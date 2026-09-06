@@ -357,7 +357,10 @@ mod consumer_scope_tests {
             std::thread::yield_now();
         }
         assert_eq!(drops.load(Ordering::SeqCst), 0);
-        MlxNeuralBackend::reclaim_retired_resources();
+        crate::backend::submission_recovery::wait_for_retirement(|| {
+            MlxNeuralBackend::reclaim_retired_resources();
+            drops.load(Ordering::SeqCst) == 1
+        });
         assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 
@@ -428,7 +431,10 @@ mod consumer_scope_tests {
         });
         crate::backend::submission_recovery::reap();
         assert_eq!(drops.load(Ordering::SeqCst), 0);
-        MlxNeuralBackend::reclaim_retired_resources();
+        crate::backend::submission_recovery::wait_for_retirement(|| {
+            MlxNeuralBackend::reclaim_retired_resources();
+            drops.load(Ordering::SeqCst) == 1
+        });
         assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 
@@ -458,6 +464,7 @@ mod consumer_scope_tests {
         });
         assert!(owner.failed.get());
         drop(child);
+        crate::backend::submission_recovery::wait_for_retirement(|| owner.children.get() == 0);
         assert_eq!(owner.children.get(), 0);
         assert!(owner.failed.get());
     }

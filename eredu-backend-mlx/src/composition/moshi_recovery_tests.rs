@@ -88,6 +88,9 @@ fn realtime_host_error_poison_prevents_reentry_after_resources_settle() {
     let error =
         model.with_submission(|_| Err::<(), _>(Error::ArchitectureModel("host failure".into())));
     assert!(error.is_err());
+    crate::backend::submission_recovery::wait_for_retirement(|| {
+        Rc::strong_count(&model.payload) == 1
+    });
     assert_eq!(Rc::strong_count(&model.payload), 1);
     let mut entered = false;
     assert!(model
@@ -147,6 +150,7 @@ fn unresolved_realtime_work_owns_entire_execution_after_public_model_drop() {
         "terminal native retirement only stages semantic owners"
     );
     ordinary_retirement::reclaim();
+    crate::backend::submission_recovery::wait_for_retirement(|| drops.get() == 1);
     assert_eq!(drops.get(), 1);
     assert!(
         poison.get(),
@@ -205,12 +209,15 @@ fn last_completion_resource_owner_stages_store_drop_outside_native_retirement() 
     drop(model);
     ordinary_retirement::reclaim();
     assert_eq!(Arc::strong_count(&resources), 1);
-    safemlx::try_with_submission_retirement(|| {
-        drop(resources);
-        ordinary_retirement::reclaim();
-        assert_eq!(drops.load(Ordering::SeqCst), 0);
-    })
-    .unwrap();
+    let mut resources = Some(resources);
+    crate::backend::submission_recovery::wait_for_retirement(|| {
+        safemlx::try_with_submission_retirement(|| {
+            drop(resources.take());
+            ordinary_retirement::reclaim();
+            assert_eq!(drops.load(Ordering::SeqCst), 0);
+        })
+        .is_some()
+    });
     ordinary_retirement::reclaim();
     assert_eq!(drops.load(Ordering::SeqCst), 1);
 }

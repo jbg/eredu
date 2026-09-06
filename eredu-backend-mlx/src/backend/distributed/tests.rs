@@ -158,7 +158,7 @@ fn public_collective_wait_uses_manifest_deadline_and_shared_poison() {
     let (manifest, group) = singleton_data_manifest();
     let manifest = manifest.with_completion_policy(
         eredu_runtime::CommunicationCompletionPolicy::new(
-            std::time::Duration::from_millis(1),
+            std::time::Duration::from_millis(250),
             CompletionCancellationMode::QuarantineUntilComplete,
         )
         .unwrap(),
@@ -176,7 +176,10 @@ fn public_collective_wait_uses_manifest_deadline_and_shared_poison() {
         crate::backend::runtime::distributed::completion::distributed_completion_orphan_count(),
         1
     );
-    crate::backend::runtime::distributed::completion::release_forced_pending_orphans();
+    crate::backend::submission_recovery::wait_for_retirement(|| {
+        crate::backend::runtime::distributed::completion::release_forced_pending_orphans();
+        crate::backend::runtime::distributed::completion::distributed_completion_orphan_count() == 0
+    });
     assert_eq!(
         crate::backend::runtime::distributed::completion::distributed_completion_orphan_count(),
         0

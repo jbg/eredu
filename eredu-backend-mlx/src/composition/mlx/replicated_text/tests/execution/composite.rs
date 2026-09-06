@@ -1,5 +1,5 @@
 #[test]
-fn invalid_token_completion_rolls_back_session_state_before_publication() {
+fn invalid_token_failure_requires_restoration_proof_or_fences_session_mutation() {
     let (stream, weights_stream) = execution_streams();
     let root = tiny_artifact("llama", true);
     let inspection = eredu_architectures::configuration::inspect_artifact(root.path()).unwrap();
@@ -99,10 +99,14 @@ fn invalid_token_completion_rolls_back_session_state_before_publication() {
         counts
     );
     eredu_core::Completion::wait(&first.completion).unwrap();
-    let before = session
-        .neutral_prediction_target_mut()
-        .unwrap()
-        .state_snapshot();
+    let next = eredu_core::BackendSession::decode(
+        &mut session,
+        &backend,
+        Array::from_slice(&[2_u32], &[1, 1]),
+    )
+    .expect("successful completion must release the submission gate");
+    eredu_core::Completion::wait(&next.completion).unwrap();
+    let before = session.neutral_prediction_target_mut().unwrap().state_snapshot();
     let before_numeric = session
         .neutral_prediction_target_mut()
         .unwrap()
@@ -117,28 +121,28 @@ fn invalid_token_completion_rolls_back_session_state_before_publication() {
     .err()
     .expect("out-of-domain token must fail exact mechanism completion");
     assert!(error.to_string().contains("outside 0..64"));
-    assert_eq!(
-        session
-            .neutral_prediction_target_mut()
-            .unwrap()
-            .state_snapshot(),
-        before
-    );
-    assert_eq!(
-        session
-            .neutral_prediction_target_mut()
-            .unwrap()
-            .fixed_numeric_state_snapshot()
-            .unwrap(),
-        before_numeric
-    );
-    let recovered = eredu_core::BackendSession::decode(
-        &mut session,
-        &backend,
-        Array::from_slice(&[2_u32], &[1, 1]),
-    )
-    .expect("failed token completion must release the submission gate");
-    eredu_core::Completion::wait(&recovered.completion).unwrap();
+    if let Ok(target) = session.neutral_prediction_target_mut() {
+        assert!(error.model_state_preserved());
+        assert_eq!(target.state_snapshot(), before);
+        assert_eq!(target.fixed_numeric_state_snapshot().unwrap(), before_numeric);
+        let recovered = eredu_core::BackendSession::decode(
+            &mut session,
+            &backend,
+            Array::from_slice(&[2_u32], &[1, 1]),
+        )
+        .expect("proven restoration permits retry");
+        eredu_core::Completion::wait(&recovered.completion).unwrap();
+    } else {
+        assert!(session.reset().is_err());
+        let retry = eredu_core::BackendSession::decode(
+            &mut session,
+            &backend,
+            Array::from_slice(&[2_u32], &[1, 1]),
+        )
+        .err()
+        .expect("unresolved or failed native validation must fence later mutation");
+        assert!(retry.to_string().contains("fenced after prior operation failure"));
+    }
 }
 
 #[test]

@@ -713,21 +713,20 @@ fn empty_selections_do_not_materialize_or_build_a_bank() {
 fn lfu_uses_duplicate_selection_demand_and_deterministic_recency_ties() {
     let (_dir, store) = fixture();
     let cache = cache(store, 32, 0, 32, CacheEvictionPolicy::LeastFrequentlyUsed);
-    drop(
-        cache
-            .acquire_selection_slice(2, &[0, 0, 0], &[3], BankAccessClass::Incremental, &stream())
-            .unwrap(),
-    );
-    drop(
-        cache
-            .acquire_selection_slice(2, &[1], &[1], BankAccessClass::Incremental, &stream())
-            .unwrap(),
-    );
-    drop(
-        cache
-            .acquire_selection_slice(2, &[2], &[1], BankAccessClass::Incremental, &stream())
-            .unwrap(),
-    );
+    for selection in [&[0, 0, 0][..], &[1][..], &[2][..]] {
+        let mut acquired = cache
+            .acquire_selection_slice(
+                2,
+                selection,
+                &[selection.len() as i32],
+                BankAccessClass::Incremental,
+                &stream(),
+            )
+            .unwrap();
+        acquired.transfer.synchronize().unwrap();
+        drop(acquired);
+        crate::backend::ordinary_retirement::reclaim_all();
+    }
     let report = cache.report().unwrap();
     let resident = report
         .residency

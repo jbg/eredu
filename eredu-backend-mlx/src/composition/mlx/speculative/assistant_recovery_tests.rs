@@ -99,7 +99,11 @@ fn terminal_retained_drafter_owner_rejects_mutation_until_exclusive_without_pois
     eval([&value]).unwrap();
     scope.seal();
     assert!(scope.status().has_work());
-    assert!(scope.status().is_settled());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !scope.progress().is_settled() {
+        assert!(Instant::now() < deadline, "native scope did not settle");
+        std::thread::yield_now();
+    }
     assert!(!scope.status().failed());
     let recovery = Recovery::with_probe(
         DrafterRetention {
@@ -135,6 +139,9 @@ fn terminal_retained_drafter_owner_rejects_mutation_until_exclusive_without_pois
     release_tx.send(()).unwrap();
     holder.join().unwrap();
     submission_recovery::reap();
+    crate::backend::submission_recovery::wait_for_retirement(|| {
+        Rc::strong_count(&drafter.payload) == 1
+    });
     assert_eq!(Rc::strong_count(&drafter.payload), 1);
     drafter.visit(CountVisit(&visits)).unwrap();
     assert_eq!(visits.get(), 1);

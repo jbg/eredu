@@ -277,6 +277,10 @@ pub struct DensePreparedTransfer {
 }
 
 impl DensePreparedTransfer {
+    pub(crate) fn synchronize(&mut self) -> Result<(), Error> {
+        self.transfer.synchronize().map_err(Into::into)
+    }
+
     /// Returns the index in the group's authoritative unit list.
     pub const fn index(&self) -> usize {
         self.index

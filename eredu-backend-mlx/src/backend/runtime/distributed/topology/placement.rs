@@ -210,7 +210,7 @@ pub fn load_partition_from_store_on_streams(
             opened_shards.insert(path.to_path_buf());
         }
         #[cfg(test)]
-        PARTITION_NATIVE_MATERIALIZATION_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+        PARTITION_NATIVE_MATERIALIZATION_ATTEMPTS.with(|count| count.set(count.get() + 1));
         let value = context
             .weight_lease(lease)?
             .materialize(source_stream, execution_stream)?

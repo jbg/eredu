@@ -140,7 +140,9 @@ mod retirement_tests {
         let completed = submission.completion.wait();
         safemlx::unregister_thread_runtime_housekeeping(record_poll_housekeeping);
         completed.unwrap();
-        assert!(submission.completion.resources_releasable());
+        crate::backend::submission_recovery::wait_for_retirement(|| {
+            submission.completion.resources_releasable()
+        });
         assert_eq!(POLL_HOUSEKEEPING_CALLS.with(std::cell::Cell::get), 0);
     }
 

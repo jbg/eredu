@@ -185,6 +185,14 @@ pub(super) fn materialize_host_buffers(
             });
         }
         buffers.insert(binding.name().to_owned(), Arc::new(buffer.freeze()));
+        let status = retained.finish();
+        if status.failed || status.blocked {
+            return Err(ResidencyError::Mlx {
+                id: id.clone(),
+                operation: "host materialization retirement",
+                source: safemlx::error::Exception::custom("native host materialization failed"),
+            });
+        }
     }
     Ok(ResidentHostBuffers { buffers })
 }
@@ -256,12 +264,13 @@ pub(super) fn prepare_from_disk(
                         && !retained.sources.is_empty()
                         && is_shard_cache_capacity_error(&error) =>
                 {
-                    WeightMaterialization::prepare_retained(
+                    let prior = WeightMaterialization::prepare_retained(
                         Vec::new(),
                         std::mem::take(&mut retained.sources),
                     )?
-                    .submit_outputs(retained.retained_arrays.clone())?
-                    .wait()?;
+                    .submit_outputs(retained.retained_arrays.clone())?;
+                    prior.wait()?;
+                    prior.finish()?;
                     retried_after_capacity = true;
                 }
                 Err(error) => return Err(error),

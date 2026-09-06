@@ -68,6 +68,7 @@ pub(crate) fn detached<T>(
 
 trait Pending {
     fn progress(&self) -> bool;
+    fn observe_pending(&self);
     fn take_next(&mut self) -> Option<Box<dyn Pending>>;
     fn set_next(&mut self, next: Option<Box<dyn Pending>>);
 }
@@ -85,6 +86,13 @@ impl<T: Retention, P: Probe> Pending for Node<T, P> {
         status.settled
     }
 
+    fn observe_pending(&self) {
+        self.retention.observe(Status {
+            settled: false,
+            ..self.probe.progress()
+        });
+    }
+
     fn take_next(&mut self) -> Option<Box<dyn Pending>> {
         self.next.take()
     }
@@ -99,12 +107,15 @@ struct Orphans(Option<Box<dyn Pending>>);
 
 fn retire(node: Box<dyn Pending>) -> Option<Box<dyn Pending>> {
     let mut retained = Some(node);
-    let _ = safemlx::try_with_submission_retirement(|| {
+    let observed = safemlx::try_with_submission_retirement(|| {
         if retained.as_ref().expect("retained node").progress() {
             // Keep the nonblocking runtime guard through native-handle Drop.
             drop(retained.take());
         }
     });
+    if observed.is_none() {
+        retained.as_ref().expect("retained node").observe_pending();
+    }
     retained
 }
 
@@ -216,10 +227,14 @@ impl<T: Retention, P: Probe> Recovery<T, P> {
         .unwrap_or_else(|| {
             // Native terminal evidence alone does not permit a potentially
             // locking payload destructor while another thread owns the runtime.
-            Status {
+            let status = Status {
                 settled: false,
                 ..node.probe.progress()
-            }
+            };
+            // Failure remains observable while native destruction is deferred.
+            // A nonterminal observation must retain every native resource.
+            node.retention.observe(status);
+            status
         })
     }
 
@@ -233,6 +248,45 @@ impl<T: Retention, P: Probe> Recovery<T, P> {
             }
             std::thread::yield_now();
         }
+    }
+
+    /// Completes a synchronous operation and retires its resources under the
+    /// same runtime guard that establishes completion. Failure stays nonblocking.
+    pub fn finish(mut self) -> Status {
+        loop {
+            let status = safemlx::try_with_submission_retirement(|| {
+                let status = self.progress();
+                if status.settled {
+                    drop(self.node.take());
+                }
+                status
+            })
+            .unwrap_or_else(|| Status {
+                settled: false,
+                ..self.progress()
+            });
+            if status.settled || status.failed || status.blocked {
+                return status;
+            }
+            std::thread::yield_now();
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn wait_for_retirement(mut complete: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        reap();
+        crate::backend::ordinary_retirement::reclaim();
+        if complete() {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "terminal resources did not retire"
+        );
+        std::thread::yield_now();
     }
 }
 
@@ -284,6 +338,75 @@ mod tests {
             assert!(Instant::now() < deadline, "terminal owner was not retired");
             std::thread::yield_now();
         }
+    }
+
+    #[test]
+    fn successful_finish_retires_resources_before_returning() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let recovery = Recovery::with_probe(CountDrop(Arc::clone(&drops)), Terminal);
+        let status = recovery.finish();
+        assert!(status.settled && !status.failed && !status.blocked);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn busy_runtime_preserves_failure_observation_without_releasing_resources() {
+        struct Failed;
+        impl Probe for Failed {
+            fn seal(&mut self) {}
+            fn progress(&self) -> Status {
+                Status {
+                    settled: true,
+                    failed: true,
+                    blocked: false,
+                }
+            }
+        }
+        struct Observed {
+            failed: Rc<std::cell::Cell<bool>>,
+            _drop: CountDrop,
+        }
+        impl Retention for Observed {
+            fn observe(&self, status: Status) {
+                self.failed.set(self.failed.get() || status.failed);
+            }
+        }
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let holder = std::thread::spawn(move || loop {
+            if safemlx::try_with_submission_retirement(|| {
+                ready_tx.send(()).unwrap();
+                let _ = release_rx.recv_timeout(Duration::from_secs(5));
+            })
+            .is_some()
+            {
+                break;
+            }
+            std::thread::yield_now();
+        });
+        ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let failed = Rc::new(std::cell::Cell::new(false));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let recovery = Recovery::with_probe(
+            Observed {
+                failed: Rc::clone(&failed),
+                _drop: CountDrop(Arc::clone(&drops)),
+            },
+            Failed,
+        );
+        let started = Instant::now();
+        let status = recovery.progress();
+        assert!(status.failed && !status.settled);
+        assert!(failed.get());
+        failed.set(false);
+        drop(recovery);
+        assert!(failed.get(), "drop must also preserve failure observation");
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        await_retirement(&drops);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -383,7 +506,7 @@ mod tests {
         assert_eq!(drops.load(Ordering::SeqCst), 0);
         release_tx.send(()).unwrap();
         holder.join().unwrap();
-        reap();
+        await_retirement(&drops);
         assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 }

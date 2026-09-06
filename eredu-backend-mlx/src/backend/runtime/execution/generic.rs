@@ -204,16 +204,15 @@ impl<U: 'static, P> MlxLayerwisePolicy<U, P> {
             if !lease.is_complete()? {
                 return Ok(());
             }
-            self.pending.pop_front();
-            crate::backend::ordinary_retirement::reclaim();
+            self.pending.pop_front().expect("completed unit").finish()?;
+            crate::backend::ordinary_retirement::reclaim_all();
         }
     }
 
     fn drain_one(&mut self) -> Result<(), Error> {
-        if let Some(lease) = self.pending.front() {
-            lease.wait()?;
-            self.pending.pop_front();
-            crate::backend::ordinary_retirement::reclaim();
+        if let Some(lease) = self.pending.pop_front() {
+            lease.finish()?;
+            crate::backend::ordinary_retirement::reclaim_all();
         }
         Ok(())
     }
