@@ -20,6 +20,14 @@ def digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()[:24]
 
 
+def metal_version(banner):
+    # Apple's downloaded Metal toolchain is mounted under a random cryptex path
+    # on each host. Its location is not part of the compiler's identity; CMake
+    # discovers the current executable again when it configures the build.
+    return "\n".join(line for line in banner.strip().splitlines()
+                     if not line.startswith("InstalledDir:"))
+
+
 def main():
     native = {
         "system": platform.system(),
@@ -42,7 +50,7 @@ def main():
             result = subprocess.run(command, text=True, stdout=subprocess.PIPE,
                                     stderr=subprocess.STDOUT, check=False)
             if result.returncode == 0:
-                native["metal"] = result.stdout.strip()
+                native["metal"] = metal_version(result.stdout)
                 break
         else:
             raise RuntimeError("Install the Metal toolchain before restoring native builds")

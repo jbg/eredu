@@ -64,7 +64,9 @@ when a completely fresh native build is wanted.
 The shared CI cache action identifies the installed compiler, CMake, runner
 image, Xcode and Metal or the CUDA toolkit, and Linux CUDA/cuDNN/NCCL package versions. Its
 native key also includes the native sources and build scripts, but excludes
-Rust crate manifests and Cargo.lock. The toolkit variant includes Windows
+Rust crate manifests and Cargo.lock. Metal's random installation mount path
+is excluded from its compiler fingerprint; its version and target remain.
+The toolkit variant includes Windows
 CUDA/cuDNN versions and target architecture. Rust artifacts use a separate
 key with the Rust toolchain and Cargo dependency versions. Only the shared
 macOS preflight build caches Rust artifacts: caching full Rust test trees for
