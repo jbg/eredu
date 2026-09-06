@@ -71,6 +71,19 @@ def cargo_metadata(workspace: Path) -> dict[str, Any]:
     )
 
 
+def toolchain_environment(workspace: Path) -> dict[str, str]:
+    """Keep archive and consumer checks on the invoking workspace's toolchain."""
+    environment = os.environ.copy()
+    if "RUSTUP_TOOLCHAIN" not in environment and shutil.which("rustup") is not None:
+        active = run(
+            ["rustup", "show", "active-toolchain"], cwd=workspace, capture=True
+        ).split()
+        if not active:
+            raise RuntimeError("rustup did not report an active workspace toolchain")
+        environment["RUSTUP_TOOLCHAIN"] = active[0]
+    return environment
+
+
 def publishable_packages(metadata: dict[str, Any]) -> dict[str, dict[str, Any]]:
     members = set(metadata["workspace_members"])
     return {
@@ -417,7 +430,7 @@ def main() -> int:
         config = root / "cargo-config.toml"
         staged: list[dict[str, Any]] = []
         write_cargo_config(config, index, staged)
-        environment = os.environ.copy()
+        environment = toolchain_environment(workspace)
         environment["CARGO_TARGET_DIR"] = str(target_dir)
 
         for crate_name in RELEASE_ORDER:

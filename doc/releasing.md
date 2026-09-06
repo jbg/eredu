@@ -13,6 +13,20 @@ Every publishable crate must pass the same archive validation before a release:
 python3 validation/validate_release_packages.py
 ```
 
+The validator keeps the invoking workspace's active Rust toolchain for package,
+archive, and downstream-consumer checks, including checks in temporary
+directories outside the workspace. An explicit `RUSTUP_TOOLCHAIN` takes
+precedence; otherwise it preserves rustup's active environment, directory
+override, or repository toolchain selection.
+
+Validate the minimum supported Rust version explicitly with an installed
+toolchain:
+
+```bash
+rustup toolchain install 1.89.0 --profile minimal
+RUSTUP_TOOLCHAIN=1.89.0 python3 validation/validate_release_packages.py
+```
+
 The validator copies the Git package candidates to a temporary workspace, then
 runs `cargo package` for each crate. It unpacks each archive, compiles its
 library unit tests, and runs its doctests with default features disabled before
@@ -37,11 +51,19 @@ This catches:
   declared order.
 
 The release-package CI job runs this validation on Ubuntu with both the minimum
-supported Rust version and stable, using the CPU MLX prerequisites. Archive unit
-tests are compiled and doctests run without default features, while Cargo's
-normal package verification still compiles each crate's default packaged
-targets. Packaging does not need an Apple or NVIDIA runner: target-native Metal
-and CUDA coverage remains in the platform workflows.
+supported Rust version and stable, using the CPU MLX prerequisites. Its matrix
+explicitly selects Rust 1.89.0 or stable for every package, taking precedence over
+the repository toolchain pin. To run the stable leg locally:
+
+```bash
+rustup toolchain install stable --profile minimal
+RUSTUP_TOOLCHAIN=stable python3 validation/validate_release_packages.py
+```
+
+Archive test targets are compiled and doctests run without default features,
+while Cargo's normal package verification still compiles each crate's default
+packaged targets. Packaging does not need an Apple or NVIDIA runner:
+target-native Metal and CUDA coverage remains in the platform workflows.
 
 The Linux build workflow separately denies all workspace Clippy warnings and
 checks each weakly forwarded facade feature (`metal`, `cuda`, `nccl`, `image`,
@@ -97,18 +119,19 @@ available in the registry index before continuing:
 9. `safemlx`
 10. `eredu-nn`
 11. `eredu-runtime`
-12. `eredu-architectures`
-13. `eredu-codec`
-14. `eredu-evaluation`
-15. `eredu-backend-mlx`
-16. `eredu`
-17. `eredu-cli`
+12. `eredu-media`
+13. `eredu-architectures`
+14. `eredu-codec`
+15. `eredu-evaluation`
+16. `eredu-backend-mlx`
+17. `eredu`
+18. `eredu-cli`
 
 This is a valid topological order for normal, build, and development
 dependencies. In particular, `eredu-evaluation` precedes
 `eredu-backend-mlx` because the backend uses it as a development dependency.
-The order is intentionally maintained once in the validator and checked
-against Cargo metadata so CI fails when it becomes stale.
+`eredu-media` precedes its architecture consumers. The validator's declared
+order is checked against Cargo metadata so CI fails when it becomes stale.
 
 For a local check of uncommitted source, pass `--allow-dirty`. CI and release
 preparation should use a clean checkout and the command without that option.
