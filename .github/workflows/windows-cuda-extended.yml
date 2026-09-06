@@ -13,11 +13,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  preflight:
-    uses: ./.github/workflows/preflight.yml
-
   cuda-msvc:
-    needs: preflight
     name: CUDA ${{ matrix.cuda }} compatibility
     strategy:
       fail-fast: false

@@ -137,7 +137,8 @@ and 13.0.2 in the same run, together with the complete platform and archive
 checks. Reuse that successful run; do not launch a second release matrix for
 an already-validated commit. Pull-request runs cover CUDA 12.9.1 only and are
 not the full release gate. The Windows CUDA compatibility workflow retains
-nightly and manual coverage of both toolkits, also after native preflight.
+nightly and manual coverage of both toolkits. It runs independently of the
+macOS queue, so Windows-only retries can start immediately.
 Self-hosted GPU execution remains explicit opt-in through the gate's
 `run_windows_gpu` and `run_linux_gpu` inputs.
 

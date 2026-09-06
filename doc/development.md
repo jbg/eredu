@@ -90,3 +90,6 @@ after native feedback has succeeded. A successful main/manual gate already
 validates that exact release commit, so publication does not need another
 identical matrix. The first build under a new native cache key still needs to
 compile the native library; subsequent Rust-only changes reuse it.
+
+For a Windows-only change or retry, dispatch `Windows CUDA compatibility`.
+That focused workflow covers both toolkits without waiting for a macOS runner.
