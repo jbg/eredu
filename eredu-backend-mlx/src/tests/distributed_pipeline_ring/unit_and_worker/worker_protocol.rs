@@ -752,37 +752,6 @@ fn pipeline_ring_worker() {
             }
             let max_tokens = 3;
             let proposal_capacity = if deepseek_dspark_target_mode { 2 } else { 1 };
-            if deepseek_mtp_target_mode {
-                let vocabulary_size = if family == FixtureFamily::DeepSeekV4 {
-                    16
-                } else {
-                    8
-                };
-                let invalid_prompt = Array::from_slice(&[vocabulary_size], &[1, 1]);
-                let invalid_parts = [text_input_part(&invalid_prompt)];
-                let error = match run_neutral_embedded_mtp(
-                    &mut runtime,
-                    synthetic_prediction_input(
-                        &invalid_parts,
-                        &[u32::try_from(vocabulary_size).unwrap()],
-                    ),
-                    SpeculativeConfig {
-                        max_tokens,
-                        max_draft_tokens: 1,
-                        temperature: 0.0,
-                        eos_token_ids: Vec::new(),
-                    },
-                ) {
-                    Ok(_) => panic!("out-of-domain target token unexpectedly entered prediction"),
-                    Err(error) => error,
-                };
-                assert!(
-                    error
-                        .to_string()
-                        .contains(&format!("token ID is outside 0..{vocabulary_size}")),
-                    "invalid prediction target failed for an unexpected reason: {error}"
-                );
-            }
             let output = run_neutral_embedded_mtp(
                 &mut runtime,
                 synthetic_prediction_input(&parts, &prefix_tokens),
@@ -830,6 +799,54 @@ fn pipeline_ring_worker() {
                 );
                 assert_eq!(replay.stats().emitted_tokens(), max_tokens);
                 assert!(replay.stats().draft_tokens() > 0);
+            }
+            if deepseek_mtp_target_mode {
+                let vocabulary_size = if family == FixtureFamily::DeepSeekV4 {
+                    16
+                } else {
+                    8
+                };
+                let invalid_prompt = Array::from_slice(&[vocabulary_size], &[1, 1]);
+                let invalid_parts = [text_input_part(&invalid_prompt)];
+                let error = match run_neutral_embedded_mtp(
+                    &mut runtime,
+                    synthetic_prediction_input(
+                        &invalid_parts,
+                        &[u32::try_from(vocabulary_size).unwrap()],
+                    ),
+                    SpeculativeConfig {
+                        max_tokens,
+                        max_draft_tokens: 1,
+                        temperature: 0.0,
+                        eos_token_ids: Vec::new(),
+                    },
+                ) {
+                    Ok(_) => panic!("out-of-domain target token unexpectedly entered prediction"),
+                    Err(error) => error,
+                };
+                assert!(
+                    error
+                        .to_string()
+                        .contains(&format!("token ID is outside 0..{vocabulary_size}")),
+                    "invalid prediction target failed for an unexpected reason: {error}"
+                );
+                let retry = match run_neutral_embedded_mtp(
+                    &mut runtime,
+                    synthetic_prediction_input(&parts, &prefix_tokens),
+                    SpeculativeConfig {
+                        max_tokens,
+                        max_draft_tokens: 1,
+                        temperature: 0.0,
+                        eos_token_ids: Vec::new(),
+                    },
+                ) {
+                    Ok(_) => panic!("fenced prediction session unexpectedly accepted a retry"),
+                    Err(error) => error,
+                };
+                assert!(
+                    retry.to_string().contains("session is fenced"),
+                    "prediction retry was not rejected by the causal fence: {retry}"
+                );
             }
             return;
         }
