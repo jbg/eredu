@@ -498,7 +498,13 @@ impl MlxModelSession {
             self.record_failure(error);
         }
         recovery.seal();
-        let status = recovery.progress();
+        // Successful host reads can leave completion bookkeeping pending. Wait
+        // for that work before reusing the session; errors remain nonblocking.
+        let status = if result.is_ok() {
+            recovery.wait()
+        } else {
+            recovery.progress()
+        };
         if !status.settled || status.failed || status.blocked {
             owner.reject_unresolved();
             return Err(Error::ArchitectureModel(
