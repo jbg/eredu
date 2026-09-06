@@ -177,6 +177,10 @@ fn conformance_realtime_production() {
 }
 
 fn main() {
+    let mut arguments = libtest_mimic::Arguments::from_args();
+    // These aggregate cases already exercise concurrent rank execution. Keep
+    // the outer suites serial by default, as they were in the original runner.
+    arguments.test_threads.get_or_insert(1);
     let cases: [(&str, fn()); 8] = [
         (
             "replicated_families_formats_and_materialization",
@@ -203,26 +207,25 @@ fn main() {
         ("realtime_production", conformance_realtime_production),
     ];
     let selected_case = std::env::var("EREDU_REFERENCE_CASE").ok();
-    let mut failures = Vec::new();
-    println!("running {} reference conformance cases", cases.len());
-    for (name, case) in cases {
-        if selected_case
-            .as_deref()
-            .is_some_and(|selected| selected != name)
-        {
-            continue;
-        }
-        match std::panic::catch_unwind(case) {
-            Ok(()) => println!("case {name} ... ok"),
-            Err(_) => {
-                println!("case {name} ... FAILED");
-                failures.push(name);
-            }
-        }
+    if let Some(selected) = &selected_case {
+        assert!(
+            cases.iter().any(|(name, _)| name == selected),
+            "unknown EREDU_REFERENCE_CASE: {selected}"
+        );
     }
-    assert!(
-        failures.is_empty(),
-        "reference conformance failures: {}",
-        failures.join(", ")
-    );
+    let trials = cases
+        .into_iter()
+        .filter(|(name, _)| {
+            selected_case
+                .as_deref()
+                .is_none_or(|selected| selected == *name)
+        })
+        .map(|(name, case)| {
+            libtest_mimic::Trial::test(name, move || {
+                case();
+                Ok(())
+            })
+        })
+        .collect();
+    libtest_mimic::run(&arguments, trials).exit();
 }
