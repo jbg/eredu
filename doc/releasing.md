@@ -123,31 +123,33 @@ and `audio`) without `mlx` at the minimum supported Rust version. These checks
 keep optional facade features from accidentally activating the native backend
 or depending on its availability.
 
-The manually dispatched `Native release gate` workflow must pass before
-publication. Its Windows jobs compile and link the complete CUDA surface with
-CUDA 12.9.1 and 13.0.2; the same matrix runs nightly and can be dispatched
-manually through the `Windows CUDA compatibility` workflow. Normal pull-request
-and main-branch CI requires only the CUDA 12.9.1 build.
+The `Native release gate` is the single CI entry point. It runs automatically
+for code changes on main and pull requests, and can be dispatched manually.
+Its native preflight runs ordinary backend tests with normal parallelism,
+then all self-contained Ring tests serially, using Metal and Accelerate throughout. Only
+after preflight succeeds do the Apple, Linux, Windows, and archive-validation
+workflows start. The Apple cross-build matrix therefore cannot delay native
+feedback for the same candidate.
 
-The release gate's macOS job first proves that native MLX execution is
-available; failure to initialize Metal is a test failure, never a skip. The
-same job runs every self-contained ignored distributed Ring test serially
-across the Cartesian-topology, expert-exchange, checkpoint-partition, pipeline,
-and realtime suites rather than sampling the representative cases used by
-pull-request CI. To run the Apple portion locally on an Apple silicon host,
-outside a sandbox:
+Before publication, require a successful **main push or manual dispatch** of
+this workflow for the exact release commit. Both include Windows CUDA 12.9.1
+and 13.0.2 in the same run, together with the complete platform and archive
+checks. Reuse that successful run; do not launch a second release matrix for
+an already-validated commit. Pull-request runs cover CUDA 12.9.1 only and are
+not the full release gate. The Windows CUDA compatibility workflow retains
+nightly and manual coverage of both toolkits, also after native preflight.
+Self-hosted GPU execution remains explicit opt-in through the gate's
+`run_windows_gpu` and `run_linux_gpu` inputs.
+
+To run the same preflight locally on an Apple silicon host outside a sandbox:
 
 ```bash
-cargo test -p eredu-backend-mlx --features metal --lib \
-  composition::mlx_architecture_conformance::native_mlx_execution_is_available -- \
-  --exact
-cargo test -p eredu-backend-mlx --lib \
-  _ring:: -- \
-  --ignored \
-  --skip moshi_ring_tp2_native_model_parity \
-  --skip moshi_ring_tp2_personaplex_model_parity \
-  --test-threads=1 --nocapture
+bash validation/preflight.sh
 ```
+
+Native initialization failure is an error, never a skip. See
+[the development iteration guide](development.md) for focused test commands,
+reference-harness filtering, and the independent native build cache.
 
 The two production-model realtime parity tests are explicit opt-in gates
 because their released model directories are not stored in the repository or

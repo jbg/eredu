@@ -91,24 +91,27 @@ jobs:
           ninja --version
           Get-Command cl
           nvcc --version
-      - name: Cache CUDA build artifacts
-        uses: actions/cache@v4
+      - uses: ./.github/actions/build-cache
+        id: cache
         with:
-          path: target
-          key: cuda-target-v1-windows-2022-${{ runner.arch }}-cuda${{ inputs.toolkit_version }}-cudnn${{ inputs.cudnn_version }}-sm${{ env.SAFEMLX_CUDA_ARCHITECTURES }}-rust${{ hashFiles('rust-toolchain.toml') }}-test-${{ hashFiles('Cargo.lock', '**/Cargo.toml', 'safemlx-sys/**') }}
-          restore-keys: |
-            cuda-target-v1-windows-2022-${{ runner.arch }}-cuda${{ inputs.toolkit_version }}-cudnn${{ inputs.cudnn_version }}-sm${{ env.SAFEMLX_CUDA_ARCHITECTURES }}-rust${{ hashFiles('rust-toolchain.toml') }}-test-
+          variant: cuda${{ inputs.toolkit_version }}-cudnn${{ inputs.cudnn_version }}-sm${{ inputs.cuda_architectures }}
+      - name: Build the native CUDA library
+        run: cargo build --locked -j 1 -p safemlx-sys --no-default-features --features cuda
+      - uses: ./.github/actions/save-native-cache
+        with:
+          key: ${{ steps.cache.outputs.native-key }}
+          hit: ${{ steps.cache.outputs.native-hit }}
       - name: Build and final-link safemlx CUDA tests
         run: |
-          cargo test -j 1 -p safemlx --features cuda --lib --no-run --no-default-features
-          cargo test -j 1 -p safemlx --features cuda --test events --no-run --no-default-features
+          cargo test --locked -j 1 -p safemlx --features cuda --lib --no-run --no-default-features
+          cargo test --locked -j 1 -p safemlx --features cuda --test events --no-run --no-default-features
       - name: Build the linked CUDA smoke executable
-        run: cargo test -j 1 -p safemlx --features cuda --example cuda_smoke --no-default-features --no-run
+        run: cargo test --locked -j 1 -p safemlx --features cuda --example cuda_smoke --no-default-features --no-run
       - name: Build and final-link eredu configurations
-        run: cargo test -j 1 -p eredu --no-default-features --features "cuda,image,audio" --no-run
+        run: cargo test --locked -j 1 -p eredu --no-default-features --features "cuda,image,audio" --no-run
       - name: Build and final-link the eredu CLI tests
-        run: cargo test -j 1 -p eredu-cli --no-default-features --features cuda --no-run
+        run: cargo test --locked -j 1 -p eredu-cli --no-default-features --features cuda --no-run
       - name: Compile CUDA Mimi and integration tests
         run: |
-          cargo test -j 1 -p eredu-backend-mlx --features cuda --test mimi_codec --no-run
-          cargo test -j 1 -p safemlx-tests --no-default-features --features cuda --no-run
+          cargo test --locked -j 1 -p eredu-backend-mlx --features cuda --test mimi_codec --no-run
+          cargo test --locked -j 1 -p safemlx-tests --no-default-features --features cuda --no-run

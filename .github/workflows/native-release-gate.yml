@@ -1,63 +1,78 @@
 name: Native release gate
 
 on:
+  pull_request:
+    paths:
+      - '.github/**'
+      - '.cargo/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'LICENSE-*'
+      - 'safemlx/**'
+      - 'safemlx-*/**'
+      - 'eredu/**'
+      - 'eredu-*/**'
+      - 'examples/eredu-ios/**'
+      - 'validation/**'
+      - 'doc/releasing.md'
+      - 'doc/README.md'
+  push:
+    branches: [main]
+    paths:
+      - '.github/**'
+      - '.cargo/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'LICENSE-*'
+      - 'safemlx/**'
+      - 'safemlx-*/**'
+      - 'eredu/**'
+      - 'eredu-*/**'
+      - 'examples/eredu-ios/**'
+      - 'validation/**'
   workflow_dispatch:
+    inputs:
+      run_windows_gpu:
+        description: Also run on the preconfigured self-hosted Windows NVIDIA runner
+        type: boolean
+        default: false
+      run_linux_gpu:
+        description: Also run on the preconfigured self-hosted Linux NVIDIA runner
+        type: boolean
+        default: false
   workflow_call:
 
 permissions:
   contents: read
 
-jobs:
-  windows-cuda:
-    name: Windows CUDA ${{ matrix.cuda }} release compatibility
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - cuda: "12.9"
-            toolkit_version: "12.9.1"
-            cudnn_version: "9.23.2.1"
-            installer: "https://developer.download.nvidia.com/compute/cuda/12.9.1/local_installers/cuda_12.9.1_576.57_windows.exe"
-            cudnn: "https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/windows-x86_64/cudnn-windows-x86_64-9.23.2.1_cuda12-archive.zip"
-          - cuda: "13.0"
-            toolkit_version: "13.0.2"
-            cudnn_version: "9.23.2.1"
-            installer: "https://developer.download.nvidia.com/compute/cuda/13.0.2/local_installers/cuda_13.0.2_windows.exe"
-            cudnn: "https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/windows-x86_64/cudnn-windows-x86_64-9.23.2.1_cuda13-archive.zip"
-    uses: ./.github/workflows/windows-cuda-build.yml
-    with:
-      cuda: ${{ matrix.cuda }}
-      toolkit_version: ${{ matrix.toolkit_version }}
-      cudnn_version: ${{ matrix.cudnn_version }}
-      installer: ${{ matrix.installer }}
-      cudnn: ${{ matrix.cudnn }}
+concurrency:
+  group: native-release-gate-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
 
-  macos:
-    name: Native MLX and self-contained Ring conformance
-    runs-on: macos-26
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install the repository Rust toolchain
-        run: rustup toolchain install
-      - name: Install Metal toolchain when required
-        run: |
-          if xcrun --toolchain Metal metal --version; then
-            exit 0
-          fi
-          if xcrun metal --version; then
-            exit 0
-          fi
-          xcodebuild -downloadComponent MetalToolchain
-      - name: Require native MLX execution
-        run: |
-          cargo test -p eredu-backend-mlx --features metal --lib \
-            composition::mlx_architecture_conformance::native_mlx_execution_is_available -- \
-            --exact
-      - name: Test every self-contained distributed Ring case
-        run: |
-          cargo test -p eredu-backend-mlx --lib \
-            _ring:: -- \
-            --ignored \
-            --skip moshi_ring_tp2_native_model_parity \
-            --skip moshi_ring_tp2_personaplex_model_parity \
-            --test-threads=1 --nocapture
+jobs:
+  preflight:
+    uses: ./.github/workflows/preflight.yml
+
+  apple:
+    needs: preflight
+    uses: ./.github/workflows/apple-platforms.yml
+
+  linux:
+    needs: preflight
+    uses: ./.github/workflows/linux.yml
+    with:
+      run_gpu: ${{ github.event_name == 'workflow_dispatch' && inputs.run_linux_gpu == true }}
+
+  windows:
+    needs: preflight
+    uses: ./.github/workflows/windows.yml
+    with:
+      # Main and explicit release validation cover both toolkits in one matrix.
+      extended_cuda: ${{ github.event_name != 'pull_request' }}
+      run_windows_gpu: ${{ github.event_name == 'workflow_dispatch' && inputs.run_windows_gpu == true }}
+
+  packages:
+    needs: preflight
+    uses: ./.github/workflows/release-packages.yml

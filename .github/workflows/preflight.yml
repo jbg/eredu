@@ -1,0 +1,30 @@
+name: Native preflight
+on:
+  workflow_call:
+permissions:
+  contents: read
+jobs:
+  native:
+    name: Parallel backend tests and full Ring conformance
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the repository Rust toolchain
+        run: rustup toolchain install
+      - name: Install Metal toolchain when required
+        run: |
+          if xcrun --toolchain Metal metal --version; then exit 0; fi
+          if xcrun metal --version; then exit 0; fi
+          xcodebuild -downloadComponent MetalToolchain
+      - uses: ./.github/actions/build-cache
+        id: cache
+        with:
+          variant: macos-metal
+      - name: Build the native library
+        run: cargo build --locked -p safemlx-sys --no-default-features --features metal,accelerate
+      - uses: ./.github/actions/save-native-cache
+        with:
+          key: ${{ steps.cache.outputs.native-key }}
+          hit: ${{ steps.cache.outputs.native-hit }}
+      - name: Run native preflight
+        run: bash validation/preflight.sh

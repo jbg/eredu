@@ -1,24 +1,7 @@
 name: Release package validation
 
 on:
-  pull_request:
-    paths:
-      - ".github/workflows/release-packages.yml"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - ".cargo/**"
-      - "LICENSE-*"
-      - "rust-toolchain.toml"
-      - "validation/validate_release_packages.py"
-      - "doc/README.md"
-      - "doc/releasing.md"
-      - "eredu/**"
-      - "eredu-*/**"
-      - "safemlx/**"
-      - "safemlx-*/**"
-  push:
-    branches: [main]
-  workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read

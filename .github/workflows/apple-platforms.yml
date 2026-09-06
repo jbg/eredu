@@ -1,21 +1,10 @@
 name: Apple platform builds
 
 on:
-  pull_request:
-    paths:
-      - ".github/workflows/apple-platforms.yml"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "rust-toolchain.toml"
-      - "safemlx/**"
-      - "safemlx-sys/**"
-      - "safemlx-internal-macros/**"
-      - "safemlx-tests/**"
-      - "eredu/**"
-      - "eredu-*/**"
-      - "examples/eredu-ios/**"
-  push:
-    branches: [main]
+  workflow_call:
+
+permissions:
+  contents: read
 
 jobs:
   macos:
@@ -33,53 +22,57 @@ jobs:
             exit 0
           fi
           xcodebuild -downloadComponent MetalToolchain
+      - uses: ./.github/actions/build-cache
+        id: cache
+        with:
+          variant: macos-metal
       - name: Require native MLX execution
         run: |
-          cargo test -p eredu-backend-mlx --features metal --lib \
+          cargo test -p eredu-backend-mlx --features metal,accelerate --lib \
             composition::mlx_architecture_conformance::native_mlx_execution_is_available -- \
             --exact
       - name: Test the macOS workspace
         run: |
-          cargo test --workspace -- \
+          cargo test --locked --workspace --features eredu-backend-mlx/metal,eredu-backend-mlx/accelerate -- \
             --skip cpu_stream_creation_is_concurrent_safe \
             --skip async_eval_cpu_streams_are_concurrent_safe
       - name: Test MLX neutral semantic operator parity
         run: |
-          cargo test -p eredu-backend-mlx --features metal --lib \
+          cargo test -p eredu-backend-mlx --features metal,accelerate --lib \
             backend::nn::shared::neutral_semantic_operator_tests -- \
             --ignored
       - name: Test Metal cache residency and prefetch regressions
         run: |
-          cargo test -p eredu-backend-mlx --features metal --lib \
+          cargo test -p eredu-backend-mlx --features metal,accelerate --lib \
             backend::runtime::cache::residency::tests::metal_cache_backend_preserves_ordering_persistence_and_aggregate_budgets -- \
             --ignored --exact
-          cargo test -p eredu-backend-mlx --features metal --lib \
+          cargo test -p eredu-backend-mlx --features metal,accelerate --lib \
             backend::runtime::cache::residency::tests::two_block_metal_prefetch_is_gpu_ordered_without_host_synchronization -- \
             --ignored --exact
       - name: Test distributed partition lifecycles
         run: |
-          cargo test -p eredu-backend-mlx --lib \
+          cargo test --locked -p eredu-backend-mlx --features metal,accelerate --lib \
             tests::distributed_pipeline_ring::ring_two_process_pipeline -- \
             --ignored --exact --nocapture
-          cargo test -p eredu-backend-mlx --lib \
+          cargo test --locked -p eredu-backend-mlx --features metal,accelerate --lib \
             tests::distributed_pipeline_ring::ring_two_process_qwen3_moe_pipeline -- \
             --ignored --exact --nocapture
-          cargo test -p eredu-backend-mlx --lib \
+          cargo test --locked -p eredu-backend-mlx --features metal,accelerate --lib \
             tests::distributed_pipeline_ring::ring_two_process_lfm2_moe_pipeline -- \
             --ignored --exact --nocapture
-          cargo test -p eredu-backend-mlx --lib \
+          cargo test --locked -p eredu-backend-mlx --features metal,accelerate --lib \
             tests::distributed_pipeline_ring::ring_two_process_kimi_linear_dense_stream_pipeline -- \
             --ignored --exact --nocapture
-          cargo test -p eredu-backend-mlx --lib \
+          cargo test --locked -p eredu-backend-mlx --features metal,accelerate --lib \
             tests::distributed_pipeline_ring::ring_four_process_deepseek_tensor_pipeline -- \
             --ignored --exact --nocapture
-          cargo test -p eredu-backend-mlx --lib \
+          cargo test --locked -p eredu-backend-mlx --features metal,accelerate --lib \
             tests::distributed_pipeline_ring::ring_four_process_deepseek_v4_tensor_pipeline -- \
             --ignored --exact --nocapture
       - name: Test neutral codec construction with MLX
-        run: cargo test -p eredu-backend-mlx --test mimi_codec
+        run: cargo test --locked -p eredu-backend-mlx --features metal,accelerate --test mimi_codec
       - name: Test concurrent MLX use
-        run: cargo test --workspace concurrent_safe -- --test-threads=1
+        run: cargo test --locked -p safemlx --features metal,accelerate --lib concurrent_safe -- --test-threads=1
 
   target-mapping:
     runs-on: macos-26
@@ -119,11 +112,21 @@ jobs:
             exit 0
           fi
           xcodebuild -downloadComponent MetalToolchain
+      - uses: ./.github/actions/build-cache
+        id: cache
+        with:
+          variant: apple-${{ matrix.target }}
+      - name: Cross-build the native library
+        run: cargo build --locked --release -p safemlx-sys --target "${{ matrix.target }}"
+      - uses: ./.github/actions/save-native-cache
+        with:
+          key: ${{ steps.cache.outputs.native-key }}
+          hit: ${{ steps.cache.outputs.native-hit }}
       - name: Cross-build the MLX stack and facade
         run: |
           cargo build --locked --release -p safemlx --target "${{ matrix.target }}"
-          cargo build --locked --release -p eredu-backend-mlx --target "${{ matrix.target }}"
-          cargo build --locked --release -p eredu --no-default-features --features mlx --target "${{ matrix.target }}"
+          cargo build --locked --release -p eredu-backend-mlx --features metal,accelerate --target "${{ matrix.target }}"
+          cargo build --locked --release -p eredu --no-default-features --features mlx,metal --target "${{ matrix.target }}"
       - name: Cross-build the iOS example
         if: startsWith(matrix.target, 'aarch64-apple-ios')
         run: cargo build --locked --release -p eredu-ios --target "${{ matrix.target }}"

@@ -1,31 +1,17 @@
 name: Windows builds
 
 on:
-  pull_request:
-    paths:
-      - ".github/workflows/windows.yml"
-      - ".github/workflows/windows-cuda-build.yml"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "rust-toolchain.toml"
-      - "safemlx/**"
-      - "safemlx-sys/**"
-      - "eredu/**"
-      - "eredu-*/**"
-      - "safemlx-tests/**"
-  push:
-    branches: [main]
-  workflow_dispatch:
+  workflow_call:
     inputs:
+      extended_cuda:
+        type: boolean
+        default: false
       run_windows_gpu:
-        description: Run tests on a preconfigured self-hosted Windows NVIDIA runner
-        required: false
         type: boolean
         default: false
 
-concurrency:
-  group: windows-builds-${{ github.event_name }}-${{ github.ref }}
-  cancel-in-progress: true
+permissions:
+  contents: read
 
 env:
   CMAKE_GENERATOR: Ninja
@@ -78,8 +64,19 @@ jobs:
       installer: "https://developer.download.nvidia.com/compute/cuda/12.9.1/local_installers/cuda_12.9.1_576.57_windows.exe"
       cudnn: "https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/windows-x86_64/cudnn-windows-x86_64-9.23.2.1_cuda12-archive.zip"
 
+  cuda-msvc-13:
+    name: CUDA 13.0 release compatibility
+    if: inputs.extended_cuda
+    uses: ./.github/workflows/windows-cuda-build.yml
+    with:
+      cuda: "13.0"
+      toolkit_version: "13.0.2"
+      cudnn_version: "9.23.2.1"
+      installer: "https://developer.download.nvidia.com/compute/cuda/13.0.2/local_installers/cuda_13.0.2_windows.exe"
+      cudnn: "https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/windows-x86_64/cudnn-windows-x86_64-9.23.2.1_cuda13-archive.zip"
+
   cuda-gpu-runtime:
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_windows_gpu }}
+    if: inputs.run_windows_gpu
     runs-on: [self-hosted, Windows, X64, cuda]
     env:
       SAFEMLX_CUDA_ARCHITECTURES: "75"

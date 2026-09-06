@@ -35,6 +35,9 @@ relevant model, execution, or platform guide here.
 
 ## Maintainer references
 
+- [Development iteration](development.md): fast preflight, focused tests, and
+  native build caching.
+
 - [Adding a native tool protocol](tool-protocol-development.md): evidence,
   fixtures, recognizers, constraints, and validation for a new wire format.
 - [Releasing workspace crates](releasing.md): package validation and the
