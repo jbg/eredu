@@ -7,6 +7,7 @@ use super::*;
 /// not exposed through the public loading API.
 pub struct MlxModel {
     executable: Executable,
+    target: MlxPreparedTarget,
     floating_state_dtype_bytes: NonZeroU8,
     state_residency: eredu_runtime::CacheResidencyPolicy,
     distributed: Option<MlxDistributedSession>,
@@ -19,9 +20,11 @@ impl MlxModel {
         model: Executable,
         floating_state_dtype_bytes: NonZeroU8,
         state_residency: eredu_runtime::CacheResidencyPolicy,
+        target: MlxPreparedTarget,
     ) -> Self {
         Self {
             executable: model,
+            target,
             floating_state_dtype_bytes,
             state_residency,
             distributed: None,
@@ -44,8 +47,17 @@ impl MlxModel {
         self.executable.speculative_capability()
     }
 
+    #[cfg(test)]
     pub(crate) fn into_executable(self) -> Executable {
         self.executable
+    }
+
+    pub(crate) const fn native_target(&self) -> &MlxPreparedTarget {
+        &self.target
+    }
+
+    pub(crate) fn into_execution_parts(self) -> (Executable, MlxPreparedTarget) {
+        (self.executable, self.target)
     }
 
     pub(crate) fn take_distributed(&mut self) -> Option<MlxDistributedSession> {

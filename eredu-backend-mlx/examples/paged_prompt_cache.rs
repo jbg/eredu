@@ -116,7 +116,10 @@ fn main() -> anyhow::Result<()> {
     let request = selected_paged
         .clone()
         .map_or_else(MlxLoadRequest::default, |paged| {
-            MlxLoadRequest::default().with_state_residency(CacheResidencyPolicy::Paged(paged))
+            MlxLoadRequest::from_normalized(
+                eredu_runtime::NormalizedLoadRequest::default()
+                    .with_state_residency(CacheResidencyPolicy::Paged(paged)),
+            )
         });
     let model = load_model(&backend, &args.model_dir, request)?;
     let mut session = backend.create_session(model)?;

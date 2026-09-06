@@ -17,10 +17,8 @@ use std::{
 };
 
 use safemlx::{
-    host_transfer_capacity_upper_bound,
-    transforms::{async_eval_with_event, eval},
-    Array, DeviceType, Event, HostTransferBuffer, HostTransferPolicy, ImmutableHostTransferBuffer,
-    Stream,
+    host_transfer_capacity_upper_bound, transforms::async_eval_with_event, Array, DeviceType,
+    Event, HostTransferBuffer, HostTransferPolicy, ImmutableHostTransferBuffer, Stream,
 };
 
 use crate::{
@@ -29,7 +27,7 @@ use crate::{
     backend::runtime::checkpoint::recipe::{MlxWeightRecipeExt, WeightRecipeError},
     backend::runtime::checkpoint::store::{
         CheckpointMaterializationError, MlxParameterMaterializationContext,
-        PendingWeightMaterialization,
+        PendingWeightMaterialization, WeightMaterialization,
     },
 };
 use eredu_core::residency::{
@@ -39,8 +37,8 @@ use eredu_core::residency::{
 
 use eredu_runtime::residency::{
     OffloadUnit, ResidencyController, ResidencyControllerError, ResidencyLease,
-    ResidencyLeaseOwner, ResidencyLeaseStorage, ResidencyTransfer, ResidencyTransferOwner,
-    ResidencyWindowError, ResidencyWindowManager, WeightBinding,
+    ResidencyLeaseOwner, ResidencyLeaseStorage, ResidencyWindowError, ResidencyWindowManager,
+    WeightBinding,
 };
 use eredu_runtime::ResidencyReport;
 
@@ -115,10 +113,6 @@ impl ResidencyLeaseStorage for ResidentLeaseStorage {
         }
     }
 }
-
-/// Caller-owned completion and source-lifetime guard for one residency batch.
-pub type ResidentTransfer =
-    ResidencyTransfer<ResidentUnitLease, Event, ResidentTransferResources, ManagerInner>;
 
 /// Structured failures from residency validation and state transitions.
 #[derive(Debug, thiserror::Error)]
@@ -328,10 +322,13 @@ impl ResidencyManager {
             .units()
             .map(|unit| (unit.id().clone(), UnitStorage::default()))
             .collect();
+        let failed_transfer = Arc::new(std::sync::atomic::AtomicBool::new(false));
         Ok(Self {
             inner: Arc::new(ManagerInner {
                 store,
+                failed_transfer: Arc::clone(&failed_transfer),
                 state: Mutex::new(ManagerState {
+                    failed_transfer,
                     control,
                     storage,
                     alias_owner_pins: BTreeSet::new(),
@@ -391,11 +388,7 @@ impl ResidencyManager {
             if !copy.is_some_and(|copy| copy.in_flight().is_some()) {
                 break;
             }
-            state = self
-                .inner
-                .changed
-                .wait(state)
-                .map_err(|_| ResidencyError::StatePoisoned)?;
+            state = self.wait_for_transfer(state)?;
         }
         prefetch_locked(&mut state, self.inner.store.as_ref(), id, tier)
     }
@@ -454,15 +447,7 @@ impl ResidencyManager {
         let (leases, submitted) = self.acquire_many_with_mode(requests, tier, true)?;
         let transfer = match submitted {
             None => ResidentTransfer::immediate(leases, tier),
-            Some(submitted) => ResidentTransfer::submitted(
-                leases,
-                submitted.event,
-                submitted.retained,
-                Arc::downgrade(&self.inner),
-                submitted.ids,
-                tier,
-                submitted.generation,
-            ),
+            Some(submitted) => ResidentTransfer::submitted(leases, submitted),
         };
         Ok(transfer)
     }
@@ -497,11 +482,7 @@ impl ResidencyManager {
             if !waiting {
                 break;
             }
-            state = self
-                .inner
-                .changed
-                .wait(state)
-                .map_err(|_| ResidencyError::StatePoisoned)?;
+            state = self.wait_for_transfer(state)?;
         }
         let missing = requests
             .iter()
@@ -529,10 +510,12 @@ impl ResidencyManager {
                 .record_prefetch_stall(started.elapsed());
         }
         let (_, submitted) = residency?;
-        let leases = requests
-            .iter()
-            .map(|(id, demand)| {
-                state.control.ledger_mut().pin(id, tier, *demand)?;
+        if let Some(submitted) = &submitted {
+            submitted.attach_owner(Arc::downgrade(&self.inner));
+        }
+        let mut leases = crate::backend::ordinary_retirement::OrdinaryRetirement::new(Vec::new());
+        let acquired = (|| -> Result<(), ResidencyError> {
+            for (id, demand) in requests {
                 let unit = state.storage.get(id).ok_or(ResidencyError::StatePoisoned)?;
                 let storage = match tier {
                     MemoryTier::Host => ResidentLeaseStorage::Host(Arc::clone(
@@ -543,15 +526,23 @@ impl ResidencyManager {
                     )),
                     MemoryTier::Disk => unreachable!("validated above"),
                 };
-                Ok(ResidentUnitLease::new(
+                state.control.ledger_mut().pin(id, tier, *demand)?;
+                leases.push(ResidentUnitLease::new(
                     id.clone(),
                     tier,
                     storage,
                     Arc::downgrade(&self.inner),
-                ))
-            })
-            .collect::<Result<Vec<_>, ResidencyError>>()?;
-        Ok((leases, submitted))
+                ));
+            }
+            Ok(())
+        })();
+        if let Err(error) = acquired {
+            if let Some(submitted) = &submitted {
+                submitted.retain_partial_leases(leases.into_inner());
+            }
+            return Err(error);
+        }
+        Ok((leases.into_inner(), submitted))
     }
 
     /// Returns whether a logical copy currently resides in a memory tier.
@@ -609,11 +600,7 @@ impl ResidencyManager {
             if !waiting {
                 break;
             }
-            state = self
-                .inner
-                .changed
-                .wait(state)
-                .map_err(|_| ResidencyError::StatePoisoned)?;
+            state = self.wait_for_transfer(state)?;
         }
         let selected = state
             .control
@@ -721,10 +708,39 @@ impl ResidencyManager {
     }
 
     fn lock(&self) -> Result<MutexGuard<'_, ManagerState>, ResidencyError> {
+        crate::backend::submission_recovery::reap();
+        crate::backend::ordinary_retirement::reclaim();
+        if self
+            .inner
+            .failed_transfer
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(ResidencyError::Mlx {
+                id: internal_id(),
+                operation: "resident transfer admission",
+                source: safemlx::error::Exception::custom(
+                    "residency manager is poisoned by a failed or unobservable native transfer",
+                ),
+            });
+        }
         self.inner
             .state
             .lock()
             .map_err(|_| ResidencyError::StatePoisoned)
+    }
+
+    fn wait_for_transfer<'a>(
+        &'a self,
+        state: MutexGuard<'a, ManagerState>,
+    ) -> Result<MutexGuard<'a, ManagerState>, ResidencyError> {
+        let (state, _) = self
+            .inner
+            .changed
+            .wait_timeout(state, std::time::Duration::from_millis(25))
+            .map_err(|_| ResidencyError::StatePoisoned)?;
+        drop(state);
+        // Recovery may stage manager-lock owners; never reclaim under this mutex.
+        self.lock()
     }
 }
 
@@ -761,7 +777,9 @@ impl ResidencyWindowManager for ResidencyManager {
 
 mod transfer;
 use transfer::*;
-pub use transfer::{ManagerInner, ResidentArrays, ResidentHostBuffers, ResidentTransferResources};
+pub use transfer::{
+    ManagerInner, ResidentArrays, ResidentHostBuffers, ResidentTransfer, ResidentTransferResources,
+};
 
 mod materialization;
 pub use materialization::host_capacity_upper_bound_for_bindings;

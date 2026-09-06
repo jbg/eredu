@@ -5,6 +5,8 @@
 
 #![warn(missing_docs)]
 
+/// Portable automatic-plan resource sizing and telemetry projections.
+pub mod automatic_support;
 /// Backend execution, parameter, transfer, and collective capabilities.
 pub mod backend;
 /// Backend-neutral mutable-cache ownership, storage, and admission algorithms.
@@ -23,6 +25,7 @@ pub mod dense;
 pub mod draft;
 /// Portable execution-group topology and scheduling state.
 pub mod execution;
+pub mod execution_plan;
 pub mod expert;
 /// Backend-neutral causal-model and token-sampling contracts.
 pub mod generation;
@@ -33,6 +36,8 @@ pub mod inspection;
 pub mod layered;
 /// Normalized portable policy for cold model preparation.
 pub mod load_request;
+/// Exact mechanism capability synthesis from neutral requirements.
+pub mod mechanism_synthesis;
 /// Architecture-declared parallel parameter semantics and local layouts.
 pub mod parallel;
 /// Neutral checkpoint materialization and stable parameter binding.
@@ -52,6 +57,7 @@ pub mod realtime_executor;
 pub mod realtime_ingress;
 /// Neutral delayed-frame interpretation over opaque token mechanisms.
 pub mod realtime_interpreter;
+pub mod realtime_mechanism_synthesis;
 /// Family-blind construction of selected layered realtime models.
 pub mod realtime_model;
 /// Backend-neutral payload retention for delayed realtime coordinates.
@@ -76,6 +82,9 @@ pub mod speculative_selection;
 pub mod state;
 mod weight_residency;
 
+pub use automatic_support::{
+    residency_telemetry, selected_text_bounded_requirement, BoundedResidencySizingError,
+};
 pub use backend::{
     BarrierBackend, BroadcastBackend, CollectiveBackend, CommunicationBackend, EvenGatherBackend,
     FailureAgreementBackend, ParameterBackend, PointToPointBackend, RoleExactBoundaryValue,
@@ -139,6 +148,9 @@ pub use execution::{
     ExecutionGroupSpec, ExecutionScheduleError, ExecutionUnitAddress, ExecutionUnitLayout,
     ExecutionUnitLayoutError, ReadyGroupState,
 };
+pub use execution_plan::{
+    execution_plan_quantization, ExecutionPlanLoadError, ResidencyDiagnostics,
+};
 pub use expert::{
     combine_routed_expert_tensor_parallel, combine_tensor_parallel_expert_outputs,
     plan_addressable_bank_bindings, reduce_routed_expert_tensor_parallel,
@@ -179,6 +191,10 @@ pub use layered::{
 pub use load_request::{
     DraftingLoadRequest, NormalizedLoadRequest, NormalizedLoadRequestError, ParallelLoadRequest,
     ValidatedModelLoadRequest,
+};
+pub use mechanism_synthesis::{
+    synthesize_replicated_text_capabilities, BackendMechanismFacts, ReplicatedTextMechanismSupport,
+    StateLifecycleCapabilities,
 };
 pub use parallel::{
     aligned_partition_units, expand_linear_format_parameter_groups, module_parameter_group,
@@ -239,6 +255,9 @@ pub use realtime_ingress::{
 pub use realtime_interpreter::{
     complete_realtime_frame, prepare_realtime_frame, CompletedRealtimeFrame, PreparedRealtimeFrame,
     RealtimeFrameInterpretationError, RealtimeFrameTensorMechanisms,
+};
+pub use realtime_mechanism_synthesis::{
+    synthesize_realtime_capabilities, RealtimeMechanismFacts, RealtimeMechanismSupport,
 };
 pub use realtime_model::{
     construct_realtime_model, preflight_realtime_materialization_tasks, realtime_task_binding_plan,

@@ -9,6 +9,7 @@ pub(in crate::composition::mlx::replicated_text) struct CompletedReplicatedText<
     S: MlxStateMechanisms,
     A: ReplicatedTextArchitecture<MlxNeuralBackend, S, Error = eredu_nn::Error>,
     A::StaticModules: Clone,
+    A::Unit: 'static,
     D: eredu_runtime::ReplicatedTextExecutionStrategy<
         A,
         MlxNeuralBackend,
@@ -48,42 +49,18 @@ where
         stream: &Stream,
         weights_stream: &Stream,
     ) -> Result<Self, Error> {
-        #[cfg(test)]
-        let selected_residency = prepared.selected().residency();
-        let prompt_cache_identity = prepared.prompt_cache_identity().clone();
-        let capability_estimate = prepared.capability_estimate().clone();
-        let effective_model_type = prepared.effective_model_type().to_owned();
-        let mut modules = prepared.into_modules();
-        let architecture = modules.take_architecture();
-        let source_architecture = modules.take_source_architecture();
-        let contract = modules.take_contract();
         let mechanisms = MlxReplicatedTextMechanisms::new(store, stream, weights_stream);
         #[cfg(test)]
         crate::tests::support::path_instrumentation::constructor();
-        let session = eredu_runtime::construct_replicated_text_session(
-            architecture,
-            source_architecture,
-            contract,
-            mechanisms,
-            stream,
-        )
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        Ok(Self {
-            session,
-            prompt_cache_identity,
-            capability_estimate,
-            effective_model_type,
-            prediction: NoSelectedPrediction,
-            embedded_prediction_observers: MlxEmbeddedPredictionObservers::default(),
-            parameter_bank: None,
-            #[cfg(test)]
-            selected_residency,
-            partition_sampling_group: None,
-            partition_communication_authority: None,
-            partition_sampling_rank: None,
-            partition_public_output: true,
-            stream: stream.clone(),
-        })
+        let (session, facts) =
+            eredu_architectures::prepared_execution::construct_selected_text_session(
+                prepared, mechanisms, stream,
+            )
+            .map_err(Error::ArchitectureModel)?;
+        let (identity, capability, model_type, residency) = facts.into_parts();
+        Ok(Self::from_session(
+            session, identity, capability, model_type, residency, None, None, None, true, stream,
+        ))
     }
 }
 
@@ -92,6 +69,7 @@ where
     S: MlxStateMechanisms,
     A: ReplicatedTextArchitecture<MlxNeuralBackend, S, Error = eredu_nn::Error>,
     A::StaticModules: Clone,
+    A::Unit: 'static,
     D: eredu_runtime::ReplicatedTextExecutionStrategy<
         A,
         MlxNeuralBackend,
@@ -181,6 +159,7 @@ where
     S: MlxStateMechanisms,
     A: ReplicatedTextArchitecture<MlxNeuralBackend, S, Error = eredu_nn::Error>,
     A::StaticModules: Clone,
+    A::Unit: 'static,
     D: eredu_runtime::ReplicatedTextExecutionStrategy<
         A,
         MlxNeuralBackend,
@@ -500,23 +479,37 @@ where
     fn prefill(&mut self, input: input::ModelInput<'_>, stream: &Stream) -> Result<Array, Error> {
         #[cfg(test)]
         crate::tests::support::path_instrumentation::forward();
-        let tokens = input::text_token_ids(input, stream)?;
+        let tokens = input::text_token_ids(input, stream).map_err(Error::before_model_mutation)?;
+        let before = self.session.successful_state_restoration_generation();
         let output = self
             .session
             .prefill(&MlxTensor::from_array(tokens), None, stream)
             .map(MlxTensor::into_array)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+            .map_err(|error| {
+                Error::after_model_call(
+                    error,
+                    before,
+                    self.session.successful_state_restoration_generation(),
+                )
+            })?;
         Ok(self.published(output))
     }
 
     fn decode(&mut self, tokens: &Array, stream: &Stream) -> Result<Array, Error> {
         #[cfg(test)]
         crate::tests::support::path_instrumentation::forward();
+        let before = self.session.successful_state_restoration_generation();
         let output = self
             .session
             .decode(&MlxTensor::from_array(tokens.clone()), stream)
             .map(MlxTensor::into_array)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+            .map_err(|error| {
+                Error::after_model_call(
+                    error,
+                    before,
+                    self.session.successful_state_restoration_generation(),
+                )
+            })?;
         Ok(self.published(output))
     }
 
@@ -533,11 +526,18 @@ where
         let tokens = MlxTensor::from_array(tokens.clone());
         let mask = mask.cloned().map(MlxTensor::from_array);
         let mut observer = crate::composition::NeutralActivationObserver::new(observer);
+        let before = self.session.successful_state_restoration_generation();
         let output = self
             .session
             .forward_with_observer(&tokens, mask.as_ref(), stream, &mut observer)
             .map(MlxTensor::into_array)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+            .map_err(|error| {
+                Error::after_model_call(
+                    error,
+                    before,
+                    self.session.successful_state_restoration_generation(),
+                )
+            })?;
         Ok(self.published(output))
     }
 
@@ -550,15 +550,22 @@ where
     ) -> Result<Array, Error> {
         #[cfg(test)]
         crate::tests::support::path_instrumentation::forward();
-        let tokens = input::text_token_ids(input, stream)?;
+        let tokens = input::text_token_ids(input, stream).map_err(Error::before_model_mutation)?;
         let tokens = MlxTensor::from_array(tokens.clone());
         let mask = mask.cloned().map(MlxTensor::from_array);
         let mut observer = crate::composition::NeutralActivationObserver::new(observer);
+        let before = self.session.successful_state_restoration_generation();
         let output = self
             .session
             .prefill_with_observer(&tokens, mask.as_ref(), stream, &mut observer)
             .map(MlxTensor::into_array)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+            .map_err(|error| {
+                Error::after_model_call(
+                    error,
+                    before,
+                    self.session.successful_state_restoration_generation(),
+                )
+            })?;
         Ok(self.published(output))
     }
 
@@ -572,11 +579,18 @@ where
         crate::tests::support::path_instrumentation::forward();
         let tokens = MlxTensor::from_array(tokens.clone());
         let mut observer = crate::composition::NeutralActivationObserver::new(observer);
+        let before = self.session.successful_state_restoration_generation();
         let output = self
             .session
             .decode_with_observer(&tokens, stream, &mut observer)
             .map(MlxTensor::into_array)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+            .map_err(|error| {
+                Error::after_model_call(
+                    error,
+                    before,
+                    self.session.successful_state_restoration_generation(),
+                )
+            })?;
         Ok(self.published(output))
     }
 }

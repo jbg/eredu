@@ -203,6 +203,7 @@ pub(super) fn mlx_weightless_rms_norm(
     epsilon: f32,
     context: &Stream,
 ) -> Result<Array, ComputeError> {
+    eredu_nn::operation_geometry::NormalizationGeometry::new(input.shape(), epsilon)?;
     let dtype = input.dtype();
     let variance = compute(input.square(context))?;
     let variance = compute(variance.mean_axis(-1, true, context))?;

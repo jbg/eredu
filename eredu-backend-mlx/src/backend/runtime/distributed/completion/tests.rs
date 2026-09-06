@@ -122,7 +122,7 @@ fn completed_quarantine_is_reaped_on_an_unrelated_runtime_entry() {
 }
 
 #[test]
-fn owner_thread_exit_waits_then_releases_quarantined_native_resources() {
+fn owner_thread_exit_releases_quarantined_resources_with_existing_terminal_proof() {
     let completion_observed = Arc::new(AtomicBool::new(false));
     let teardown_observed = Arc::new(AtomicBool::new(false));
     let worker_completion = Arc::clone(&completion_observed);
@@ -156,18 +156,26 @@ fn owner_thread_exit_waits_then_releases_quarantined_native_resources() {
             completion.wait_bounded(policy).unwrap(),
             eredu_core::BoundedCompletionOutcome::DeadlineExceeded { .. }
         ));
-        COMMUNICATION_ORPHANS.with(|orphans| assert_eq!(orphans.borrow().work.len(), 1));
-        // TLS teardown owns the outstanding completion after this return.
+        COMMUNICATION_ORPHANS.with(|orphans| {
+            let orphans = orphans.borrow();
+            assert_eq!(orphans.work.len(), 1);
+            // Explicitly finish this fixture before teardown; production TLS
+            // destruction itself must never wait for an outstanding event.
+            orphans.work[0].event.synchronize().unwrap();
+            while !orphans.work[0].recovery.progress().settled {
+                std::thread::yield_now();
+            }
+        });
     })
     .join()
     .unwrap();
     assert!(
         completion_observed.load(Ordering::Acquire),
-        "owner-thread exit released resources before its exact completion wait returned"
+        "owner-thread exit did not observe the existing terminal evidence"
     );
     assert!(
         teardown_observed.load(Ordering::Acquire),
-        "owner-thread exit leaked the quarantined completion and its retained resources"
+        "owner-thread exit did not release the proven-terminal completion"
     );
 }
 

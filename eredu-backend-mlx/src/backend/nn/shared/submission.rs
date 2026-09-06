@@ -1,26 +1,225 @@
 use super::*;
+use crate::backend::submission_recovery::{Recovery, Retention, Status};
+use std::{cell::Cell, rc::Rc};
+
+struct HostResourceNode {
+    values: Vec<Box<dyn Send>>,
+    next: Option<Box<HostResourceNode>>,
+}
+
+struct HostResources(Option<Box<HostResourceNode>>);
+
+impl HostResources {
+    fn new(values: Vec<Box<dyn Send>>) -> Self {
+        Self(Some(Box::new(HostResourceNode { values, next: None })))
+    }
+
+    fn push(&mut self, value: Box<dyn Send>) {
+        self.0
+            .as_mut()
+            .expect("live host resource owner")
+            .values
+            .push(value);
+    }
+}
+
+#[derive(Default)]
+struct RetiredHostResources(Option<Box<HostResourceNode>>);
+
+impl Drop for RetiredHostResources {
+    fn drop(&mut self) {
+        // Arbitrary user destructors are not safe to invoke during TLS teardown.
+        if let Some(node) = self.0.take() {
+            std::mem::forget(node);
+        }
+    }
+}
+
+thread_local! {
+    static RETIRED_HOST_RESOURCES: RefCell<RetiredHostResources> = RefCell::default();
+    static RECLAIMING_HOST_RESOURCES: Cell<bool> = const { Cell::new(false) };
+}
+
+impl Drop for HostResources {
+    fn drop(&mut self) {
+        let mut node = self.0.take();
+        if node.as_ref().is_some_and(|node| node.values.is_empty()) {
+            return;
+        }
+        let _ = RETIRED_HOST_RESOURCES.try_with(|retired| {
+            if let Ok(mut retired) = retired.try_borrow_mut() {
+                let mut owned = node.take().expect("one preallocated host resource node");
+                owned.next = retired.0.take();
+                retired.0 = Some(owned);
+            }
+        });
+        if let Some(node) = node {
+            std::mem::forget(node);
+        }
+    }
+}
+
+impl MlxNeuralBackend {
+    /// Reclaims this thread's retired application-owned submission resources.
+    ///
+    /// This ordinary host operation may run arbitrary Rust destructors and block.
+    /// Polling, completion Drop, and TLS teardown never invoke those destructors.
+    /// New submissions also call this method. Reentrant calls while inside the
+    /// native runtime, calls while unwinding, and recursive reclamation are deferred.
+    /// If the owner thread exits before reclamation, these resources remain retained.
+    /// If a resource destructor panics, the rest of that detached batch remains
+    /// permanently retained instead of running more destructors during unwinding.
+    pub fn reclaim_retired_resources() {
+        if !safemlx::can_reclaim_submission_resources() {
+            return;
+        }
+        let _ = RECLAIMING_HOST_RESOURCES.try_with(|reclaiming| {
+            if reclaiming.replace(true) {
+                return;
+            }
+            struct Reset<'a>(&'a Cell<bool>);
+            impl Drop for Reset<'_> {
+                fn drop(&mut self) {
+                    self.0.set(false);
+                }
+            }
+            let _reset = Reset(reclaiming);
+            crate::backend::submission_recovery::reap();
+            let pending = RETIRED_HOST_RESOURCES
+                .try_with(|retired| {
+                    retired
+                        .try_borrow_mut()
+                        .ok()
+                        .and_then(|mut retired| retired.0.take())
+                })
+                .ok()
+                .flatten();
+            let mut pending = RetiredHostResources(pending);
+            while let Some(node) = pending.0.as_mut() {
+                if let Some(value) = node.values.pop() {
+                    // If this destructor panics, the snapshot's Drop retains
+                    // every remaining value rather than invoking more user
+                    // destructors during unwinding.
+                    drop(value);
+                } else {
+                    let mut node = pending.0.take().expect("current retired node");
+                    pending.0 = node.next.take();
+                    drop(node);
+                }
+            }
+            crate::backend::ordinary_retirement::reclaim();
+        });
+    }
+}
+
+struct SubmissionResources {
+    event: RefCell<Option<Rc<Event>>>,
+    _arrays: Vec<Array>,
+    additional: RefCell<HostResources>,
+    children: Cell<usize>,
+    failed: Cell<bool>,
+}
+
+impl Retention for SubmissionResources {
+    fn observe(&self, status: Status) {
+        if status.failed || status.blocked {
+            self.failed.set(true);
+        }
+    }
+}
+
+struct ConsumerResources {
+    owner: Rc<SubmissionResources>,
+    _stream: Stream,
+}
+
+impl ConsumerResources {
+    fn new(owner: &Rc<SubmissionResources>, stream: &Stream) -> Self {
+        owner.children.set(
+            owner
+                .children
+                .get()
+                .checked_add(1)
+                .expect("consumer ticket overflow"),
+        );
+        Self {
+            owner: Rc::clone(owner),
+            _stream: stream.clone(),
+        }
+    }
+}
+
+impl Retention for ConsumerResources {
+    fn observe(&self, status: Status) {
+        self.owner.observe(status);
+    }
+}
+
+impl Drop for ConsumerResources {
+    fn drop(&mut self) {
+        self.owner.children.set(self.owner.children.get() - 1);
+    }
+}
+
+struct ConsumerUnwind<'a>(&'a Cell<bool>);
+impl Drop for ConsumerUnwind<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.set(true);
+        }
+    }
+}
 
 /// Exact MLX completion retaining every Rust-side submission resource.
 pub struct MlxSubmissionCompletion {
-    event: Event,
-    retained: RefCell<Vec<Box<dyn Send>>>,
+    event: Rc<Event>,
+    retained: Recovery<Rc<SubmissionResources>>,
 }
 
 impl MlxSubmissionCompletion {
-    fn new(event: Event) -> Self {
-        Self {
-            event,
-            retained: RefCell::new(Vec::new()),
+    fn new(event: Event, retained: Recovery<Rc<SubmissionResources>>) -> Self {
+        let event = Rc::new(event);
+        *retained.retention().event.borrow_mut() = Some(Rc::clone(&event));
+        Self { event, retained }
+    }
+    fn check_native_status(&self) -> Result<bool, safemlx::error::Exception> {
+        crate::backend::submission_recovery::reap();
+        let status = self.retained.progress();
+        if status.failed || status.blocked || self.retained.retention().failed.get() {
+            Err(safemlx::error::Exception::custom(
+                "native submission failed; unresolved resources remain retained",
+            ))
+        } else {
+            Ok(status.settled && self.retained.retention().children.get() == 0)
         }
     }
 
     fn retain<T: Send + 'static>(&self, value: T) {
-        self.retained.borrow_mut().push(Box::new(value));
+        self.retained
+            .retention()
+            .additional
+            .borrow_mut()
+            .push(Box::new(value));
     }
 
     /// Orders a consumer stream after this exact completion without blocking.
     pub fn wait_on(&self, stream: &Stream) -> Result<(), safemlx::error::Exception> {
-        self.event.wait_on(stream)
+        self.check_native_status()?;
+        let owner = self.retained.retention();
+        let mut child = Recovery::begin(ConsumerResources::new(owner, stream))?;
+        let _unwind = ConsumerUnwind(&owner.failed);
+        let result = self.event.wait_on(stream);
+        if result.is_err() {
+            owner.failed.set(true);
+        }
+        child.seal();
+        let status = child.progress();
+        if status.failed || status.blocked {
+            return Err(safemlx::error::Exception::custom(
+                "consumer dependency failed; native resources remain retained",
+            ));
+        }
+        result
     }
 }
 
@@ -28,26 +227,21 @@ impl Completion for MlxSubmissionCompletion {
     type Error = safemlx::error::Exception;
 
     fn is_complete(&self) -> Result<bool, Self::Error> {
-        let complete = self.event.is_complete()?;
-        if complete {
-            self.retained.borrow_mut().clear();
-        }
-        Ok(complete)
+        safemlx::try_with_submission_retirement(|| {
+            if !self.check_native_status()? {
+                return Ok(false);
+            }
+            let complete = self.event.is_complete()?;
+            Ok(complete && self.check_native_status()?)
+        })
+        .unwrap_or(Ok(false))
     }
 
     fn wait(&self) -> Result<(), Self::Error> {
-        self.event.synchronize()?;
-        self.retained.borrow_mut().clear();
-        Ok(())
-    }
-}
-
-impl Drop for MlxSubmissionCompletion {
-    fn drop(&mut self) {
-        if !matches!(self.event.is_complete(), Ok(true)) {
-            let _ = self.event.synchronize();
+        while !self.is_complete()? {
+            std::thread::yield_now();
         }
-        self.retained.get_mut().clear();
+        Ok(())
     }
 }
 
@@ -77,11 +271,23 @@ impl SubmissionBackend for MlxNeuralBackend {
         MlxTensor: 'a,
         I: IntoIterator<Item = &'a MlxTensor>,
     {
-        Ok(MlxSubmissionCompletion::new(
-            safemlx::transforms::async_eval_with_event(
-                values.into_iter().map(MlxTensor::as_array),
-            )?,
-        ))
+        Self::reclaim_retired_resources();
+        let arrays = values
+            .into_iter()
+            .map(|value| value.as_array().clone())
+            .collect();
+        let mut retained = Recovery::begin(Rc::new(SubmissionResources {
+            event: RefCell::new(None),
+            _arrays: arrays,
+            additional: RefCell::new(HostResources::new(Vec::new())),
+            children: Cell::new(0),
+            failed: Cell::new(false),
+        }))?;
+        let event = safemlx::transforms::async_eval_with_event(retained.retention()._arrays.iter());
+        retained.seal();
+        let completion = MlxSubmissionCompletion::new(event?, retained);
+        completion.check_native_status()?;
+        Ok(completion)
     }
 
     fn order_after(
@@ -102,6 +308,152 @@ impl SubmissionBackend for MlxNeuralBackend {
 }
 
 const MLX_COMMUNICATION_MAX_ELEMENTS: usize = i32::MAX as usize;
+
+#[cfg(test)]
+mod consumer_scope_tests {
+    use super::*;
+    use crate::backend::submission_recovery::Probe;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct FakeProbe(Rc<Cell<Status>>);
+    impl Probe for FakeProbe {
+        fn seal(&mut self) {}
+        fn progress(&self) -> Status {
+            self.0.get()
+        }
+    }
+    struct DropWitness(Arc<AtomicUsize>);
+    impl Drop for DropWitness {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn completed_poll_and_drop_defer_arbitrary_destructors_until_unlocked_reclamation() {
+        let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+        let tensor = MlxTensor::from_array(Array::ones::<f32>(&[4], &stream).unwrap());
+        let completion = MlxNeuralBackend::submit(&stream, [&tensor]).unwrap();
+        let drops = Arc::new(AtomicUsize::new(0));
+        completion.retain(DropWitness(Arc::clone(&drops)));
+        completion.wait().unwrap();
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        drop(completion);
+        crate::backend::submission_recovery::reap();
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while safemlx::try_with_submission_retirement(MlxNeuralBackend::reclaim_retired_resources)
+            .is_none()
+        {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        MlxNeuralBackend::reclaim_retired_resources();
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn thread_exit_never_runs_arbitrary_retired_resource_destructors() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let worker_drops = Arc::clone(&drops);
+        std::thread::spawn(move || {
+            drop(HostResources::new(vec![Box::new(DropWitness(
+                worker_drops,
+            ))]));
+        })
+        .join()
+        .unwrap();
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn panicking_resource_destructor_does_not_unwind_through_other_retired_values() {
+        struct Panics;
+        impl Drop for Panics {
+            fn drop(&mut self) {
+                panic!("injected retained-resource destructor panic");
+            }
+        }
+        let drops = Arc::new(AtomicUsize::new(0));
+        drop(HostResources::new(vec![
+            Box::new(DropWitness(Arc::clone(&drops))),
+            Box::new(Panics),
+        ]));
+        let result = std::panic::catch_unwind(MlxNeuralBackend::reclaim_retired_resources);
+        assert!(result.is_err());
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        MlxNeuralBackend::reclaim_retired_resources();
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn pending_consumer_retains_additional_resources_after_primary_owner_drop() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let owner = Rc::new(SubmissionResources {
+            event: RefCell::new(None),
+            _arrays: Vec::new(),
+            additional: RefCell::new(HostResources::new(vec![Box::new(DropWitness(Arc::clone(
+                &drops,
+            )))])),
+            children: Cell::new(0),
+            failed: Cell::new(false),
+        });
+        let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+        let native = Rc::new(Cell::new(Status {
+            settled: false,
+            failed: false,
+            blocked: false,
+        }));
+        let child = Recovery::with_probe(
+            ConsumerResources::new(&owner, &stream),
+            FakeProbe(Rc::clone(&native)),
+        );
+        assert_eq!(owner.children.get(), 1);
+        drop(owner);
+        drop(child);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        native.set(Status {
+            settled: true,
+            failed: false,
+            blocked: false,
+        });
+        crate::backend::submission_recovery::reap();
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        MlxNeuralBackend::reclaim_retired_resources();
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn healthy_parent_observation_does_not_clear_consumer_failure() {
+        let owner = Rc::new(SubmissionResources {
+            event: RefCell::new(None),
+            _arrays: Vec::new(),
+            additional: RefCell::new(HostResources::new(Vec::new())),
+            children: Cell::new(0),
+            failed: Cell::new(false),
+        });
+        let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+        let child = Recovery::with_probe(
+            ConsumerResources::new(&owner, &stream),
+            FakeProbe(Rc::new(Cell::new(Status {
+                settled: true,
+                failed: true,
+                blocked: false,
+            }))),
+        );
+        child.progress();
+        owner.observe(Status {
+            settled: true,
+            failed: false,
+            blocked: false,
+        });
+        assert!(owner.failed.get());
+        drop(child);
+        assert_eq!(owner.children.get(), 0);
+        assert!(owner.failed.get());
+    }
+}
 
 fn communication_dtype(dtype: Dtype) -> TensorDtype {
     match dtype {
@@ -702,11 +1054,21 @@ impl TransferBackend for MlxNeuralBackend {
         executor: &Self::Executor,
         host: &Self::HostBuffer,
     ) -> Result<(Self::MaterializedWeight, Self::Transfer), Self::TransferError> {
-        let submitted = host.copy_to_array(executor)?;
+        Self::reclaim_retired_resources();
+        let mut retained = Recovery::begin(Rc::new(SubmissionResources {
+            event: RefCell::new(None),
+            _arrays: Vec::new(),
+            additional: RefCell::new(HostResources::new(vec![Box::new(Arc::clone(host))])),
+            children: Cell::new(0),
+            failed: Cell::new(false),
+        }))?;
+        let submitted = host.copy_to_array(executor);
+        retained.seal();
+        let submitted = submitted?;
         let (weight, event) = submitted.into_parts();
-        let completion = MlxSubmissionCompletion::new(event);
-        completion.retain(Arc::clone(host));
+        let completion = MlxSubmissionCompletion::new(event, retained);
         completion.retain(weight.clone());
+        completion.check_native_status()?;
         Ok((MlxTensor::from_array(weight), completion))
     }
 
@@ -714,16 +1076,26 @@ impl TransferBackend for MlxNeuralBackend {
         executor: &Self::Executor,
         weight: &Self::MaterializedWeight,
     ) -> Result<(Self::HostBuffer, Self::Transfer), Self::TransferError> {
+        Self::reclaim_retired_resources();
+        let mut retained = Recovery::begin(Rc::new(SubmissionResources {
+            event: RefCell::new(None),
+            _arrays: vec![weight.as_array().clone()],
+            additional: RefCell::new(HostResources::new(Vec::new())),
+            children: Cell::new(0),
+            failed: Cell::new(false),
+        }))?;
         let submitted = HostTransferBuffer::copy_from_array(
             weight.as_array(),
             HostTransferPolicy::Transfer,
             executor,
-        )?;
+        );
+        retained.seal();
+        let submitted = submitted?;
         let (host, event) = submitted.into_parts();
         let host = Arc::new(host.freeze());
-        let completion = MlxSubmissionCompletion::new(event);
-        completion.retain(weight.clone());
+        let completion = MlxSubmissionCompletion::new(event, retained);
         completion.retain(Arc::clone(&host));
+        completion.check_native_status()?;
         Ok((host, completion))
     }
 }

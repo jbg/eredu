@@ -1,19 +1,36 @@
 //! Runtime acquisition for bounded layerwise execution policies.
 
 use super::*;
+use eredu_core::Completion;
+use eredu_runtime::SubmissionBackend;
 
 impl<U, P> LayerwisePolicy<MlxNeuralBackend, U> for MlxLayerwisePolicy<U, P>
 where
-    U: Parameterized<MlxTensor>,
+    U: Parameterized<MlxTensor> + 'static,
     P: MlxUnitPopulator<U>,
 {
     type Lease = MlxUnitLease<U>;
     type Error = Error;
 
     fn begin(&mut self, initial: &MlxTensor, _stream: &Stream) -> Result<(), Self::Error> {
+        crate::backend::submission_recovery::reap();
+        crate::backend::ordinary_retirement::reclaim();
         let Some(dense) = &mut self.dense else {
             return Ok(());
         };
+        if dense.aborted {
+            // Manager/telemetry cleanup can acquire locks. Defer it from the
+            // error path to this explicit ordinary operation; policy teardown
+            // instead stages the entire dense owner for unlocked reclamation.
+            for window in &mut dense.windows {
+                window.take();
+            }
+            for group in &mut dense.groups {
+                group.take();
+            }
+            dense.forward.take();
+            dense.aborted = false;
+        }
         if dense.windows.iter().any(Option::is_some)
             || dense.forward.is_some()
             || dense.groups.iter().any(Option::is_some)
@@ -35,18 +52,11 @@ where
         _stream: &Stream,
     ) {
         drop(active);
-        while let Some((event, lease)) = self.pending.pop_front() {
-            let _ = event.synchronize();
-            drop(lease);
-        }
+        // Each unit's pre-submission owner retires independently. Neither an
+        // error nor unwinding is evidence that its consumer graph has stopped.
+        self.pending.clear();
         if let Some(dense) = &mut self.dense {
-            for window in &mut dense.windows {
-                window.take();
-            }
-            for group in &mut dense.groups {
-                group.take();
-            }
-            dense.forward.take();
+            dense.aborted = true;
         }
     }
 
@@ -60,6 +70,8 @@ where
     where
         BF: FnOnce(&Stream) -> Result<U, E>,
     {
+        crate::backend::submission_recovery::reap();
+        crate::backend::ordinary_retirement::reclaim();
         let mut unloaded = Some(build(stream).map_err(LayerwiseAcquireError::Architecture)?);
         if self.layout.address(index) != Some(address) {
             return Err(LayerwiseAcquireError::Policy(Error::Parallel(format!(
@@ -127,16 +139,19 @@ where
                     transfer.index()
                 ))));
             }
-            let mut unit = MlxModule::new(unloaded.take().expect("unloaded unit is consumed once"));
-            self.populator
-                .populate(&mut unit, transfer.lease())
-                .map_err(LayerwiseAcquireError::Policy)?;
-            return Ok(MlxUnitLease {
+            let unit = MlxModule::new(unloaded.take().expect("unloaded unit is consumed once"));
+            let mut lease = MlxUnitLease::new(
                 unit,
-                _transfer: MlxUnitTransfer::Dense {
+                MlxUnitTransfer::Dense {
                     _transfer: transfer,
                 },
-            });
+            )
+            .map_err(LayerwiseAcquireError::Policy)?;
+            let (unit, transfer) = lease.population_parts();
+            self.populator
+                .populate(unit, transfer)
+                .map_err(LayerwiseAcquireError::Policy)?;
+            return Ok(lease);
         }
         // An ordinary lookahead transfer owns every lease in its window until
         // the preceding unit's exact completion.  Release that completed
@@ -172,23 +187,26 @@ where
             .order_after(stream)
             .map_err(Error::from)
             .map_err(LayerwiseAcquireError::Policy)?;
-        let mut unit = MlxModule::new(unloaded.take().expect("unloaded unit is consumed once"));
-        self.populator
-            .populate(&mut unit, &transfer.leases()[0])
-            .map_err(LayerwiseAcquireError::Policy)?;
-        Ok(MlxUnitLease {
+        let unit = MlxModule::new(unloaded.take().expect("unloaded unit is consumed once"));
+        let mut lease = MlxUnitLease::new(
             unit,
-            _transfer: MlxUnitTransfer::Ordinary {
+            MlxUnitTransfer::Ordinary {
                 _transfer: transfer,
             },
-        })
+        )
+        .map_err(LayerwiseAcquireError::Policy)?;
+        let (unit, transfer) = lease.population_parts();
+        self.populator
+            .populate(unit, transfer)
+            .map_err(LayerwiseAcquireError::Policy)?;
+        Ok(lease)
     }
 
     fn complete<'a, StateValues, ContextValues>(
         &mut self,
         _index: usize,
         _address: ExecutionUnitAddress,
-        lease: Self::Lease,
+        mut lease: Self::Lease,
         output: &'a MlxTensor,
         state_values: StateValues,
         context_values: ContextValues,
@@ -205,12 +223,13 @@ where
                 .chain(context_values)
                 .map(MlxTensor::as_array),
         )?;
-        self.pending.push_back((event, lease));
+        lease.submitted(event)?;
+        self.pending.push_back(lease);
         Ok(())
     }
 
-    fn finish(&mut self, output: &MlxTensor, _stream: &Stream) -> Result<(), Self::Error> {
-        async_eval_with_event([output.as_array()])?.synchronize()?;
+    fn finish(&mut self, output: &MlxTensor, stream: &Stream) -> Result<(), Self::Error> {
+        MlxNeuralBackend::submit(stream, [output])?.wait()?;
         self.drain()?;
         if self.dense.is_none() && (self.sample_mlx_memory || self.sample_process_memory) {
             self.residency
@@ -230,13 +249,5 @@ where
             }
         }
         Ok(())
-    }
-}
-
-impl<U, P> Drop for MlxLayerwisePolicy<U, P> {
-    fn drop(&mut self) {
-        for (event, _) in &self.pending {
-            let _ = event.synchronize();
-        }
     }
 }

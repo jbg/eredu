@@ -256,41 +256,20 @@ where
         stream: &Stream,
         weights_stream: &Stream,
     ) -> Result<Self, Error> {
-        #[cfg(test)]
-        let selected_residency = prepared.selected().residency();
-        let prompt_cache_identity = prepared.prompt_cache_identity().clone();
-        let capability_estimate = prepared.capability_estimate().clone();
-        let effective_model_type = prepared.effective_model_type().to_owned();
-        let (architecture, source_architecture, contract, processor, admission) =
-            prepared.into_parts();
         let mechanisms = MlxReplicatedTextMechanisms::new(store, stream, weights_stream);
         #[cfg(test)]
         crate::tests::support::path_instrumentation::constructor();
-        let session = eredu_runtime::construct_replicated_text_session(
-            architecture,
-            source_architecture,
-            contract,
-            mechanisms,
-            stream,
-        )
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        Ok(Self {
-            session,
-            admission,
-            processor,
-            prompt_cache_identity,
-            capability_estimate,
-            effective_model_type,
-            prediction: NoSelectedPrediction,
-            embedded_prediction_observers: MlxEmbeddedPredictionObservers::default(),
-            #[cfg(test)]
-            selected_residency,
-            partition_sampling_group: None,
-            partition_communication_authority: None,
-            partition_sampling_rank: None,
-            partition_public_output: true,
-            stream: stream.clone(),
-        })
+        let (session, facts) =
+            eredu_architectures::prepared_execution::construct_selected_composite_session(
+                prepared, mechanisms, stream,
+            )
+            .map_err(Error::ArchitectureModel)?;
+        let (text, processor, admission) = facts.into_parts();
+        let (identity, capability, model_type, residency) = text.into_parts();
+        Ok(Self::from_session(
+            session, admission, processor, identity, capability, model_type, residency, None, None,
+            None, true, stream,
+        ))
     }
 }
 
@@ -887,11 +866,13 @@ where
     }
 
     fn prefill(&mut self, input: input::ModelInput<'_>, stream: &Stream) -> Result<Array, Error> {
-        let (prepared, admitted, cache_identity) = self.prepare(input)?;
-        let paired =
-            PreparedCompositeInput::new(&prepared, &admitted).map_err(Error::ArchitectureModel)?;
+        let (prepared, admitted, cache_identity) =
+            self.prepare(input).map_err(Error::before_model_mutation)?;
+        let paired = PreparedCompositeInput::new(&prepared, &admitted)
+            .map_err(Error::before_model_mutation)?;
         #[cfg(test)]
         crate::tests::support::path_instrumentation::forward();
+        let before = self.session.successful_state_restoration_generation();
         let output = match cache_identity {
             Some(identity) => self
                 .session
@@ -899,21 +880,36 @@ where
             None => self.session.prefill_input(paired, stream),
         }
         .map(MlxTensor::into_array)
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        .map_err(|error| {
+            Error::after_model_call(
+                error,
+                before,
+                self.session.successful_state_restoration_generation(),
+            )
+        })?;
         Ok(self.published(output))
     }
 
     fn decode(&mut self, tokens: &Array, stream: &Stream) -> Result<Array, Error> {
         #[cfg(test)]
         crate::tests::support::path_instrumentation::forward();
-        let (prepared, admitted, _) = self.text_input(tokens)?;
-        let paired =
-            PreparedCompositeInput::new(&prepared, &admitted).map_err(Error::ArchitectureModel)?;
+        let (prepared, admitted, _) = self
+            .text_input(tokens)
+            .map_err(Error::before_model_mutation)?;
+        let paired = PreparedCompositeInput::new(&prepared, &admitted)
+            .map_err(Error::before_model_mutation)?;
+        let before = self.session.successful_state_restoration_generation();
         let output = self
             .session
             .decode_input(paired, stream)
             .map(MlxTensor::into_array)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+            .map_err(|error| {
+                Error::after_model_call(
+                    error,
+                    before,
+                    self.session.successful_state_restoration_generation(),
+                )
+            })?;
         Ok(self.published(output))
     }
 
@@ -942,16 +938,18 @@ where
         observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
     ) -> Result<Array, Error> {
         if mask.is_some() {
-            return Err(Error::ArchitectureModel(
-                "explicit composite decoder masks require prepared-input metadata".into(),
+            return Err(Error::before_model_mutation(
+                "explicit composite decoder masks require prepared-input metadata",
             ));
         }
         #[cfg(test)]
         crate::tests::support::path_instrumentation::forward();
-        let (prepared, admitted, cache_identity) = self.prepare(input)?;
-        let paired =
-            PreparedCompositeInput::new(&prepared, &admitted).map_err(Error::ArchitectureModel)?;
+        let (prepared, admitted, cache_identity) =
+            self.prepare(input).map_err(Error::before_model_mutation)?;
+        let paired = PreparedCompositeInput::new(&prepared, &admitted)
+            .map_err(Error::before_model_mutation)?;
         let mut observer = crate::composition::NeutralActivationObserver::new(observer);
+        let before = self.session.successful_state_restoration_generation();
         let output = match cache_identity {
             Some(identity) => self.session.prefill_input_with_observer_and_cache_identity(
                 paired,
@@ -964,7 +962,13 @@ where
                 .prefill_input_with_observer(paired, stream, &mut observer),
         }
         .map(MlxTensor::into_array)
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        .map_err(|error| {
+            Error::after_model_call(
+                error,
+                before,
+                self.session.successful_state_restoration_generation(),
+            )
+        })?;
         Ok(self.published(output))
     }
 
@@ -976,15 +980,24 @@ where
     ) -> Result<Array, Error> {
         #[cfg(test)]
         crate::tests::support::path_instrumentation::forward();
-        let (prepared, admitted, _) = self.text_input(tokens)?;
-        let paired =
-            PreparedCompositeInput::new(&prepared, &admitted).map_err(Error::ArchitectureModel)?;
+        let (prepared, admitted, _) = self
+            .text_input(tokens)
+            .map_err(Error::before_model_mutation)?;
+        let paired = PreparedCompositeInput::new(&prepared, &admitted)
+            .map_err(Error::before_model_mutation)?;
         let mut observer = crate::composition::NeutralActivationObserver::new(observer);
+        let before = self.session.successful_state_restoration_generation();
         let output = self
             .session
             .decode_input_with_observer(paired, stream, &mut observer)
             .map(MlxTensor::into_array)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+            .map_err(|error| {
+                Error::after_model_call(
+                    error,
+                    before,
+                    self.session.successful_state_restoration_generation(),
+                )
+            })?;
         Ok(self.published(output))
     }
 }

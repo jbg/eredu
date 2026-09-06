@@ -96,7 +96,7 @@ fn axis_zero_range_constructs_only_the_selected_safetensors_source() {
         .prepare_materialization(&stream, &stream)
         .unwrap();
 
-    assert_eq!(pending._source.shape(), [1, 4]);
+    assert_eq!(pending.source().shape(), [1, 4]);
     assert_eq!(pending.output().shape(), [1, 4]);
     assert_eq!(
         pending

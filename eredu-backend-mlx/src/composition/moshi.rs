@@ -1,6 +1,11 @@
 //! Production MLX composition for the backend-neutral Moshi-family model.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    cell::{Cell, RefCell},
+    collections::BTreeMap,
+    rc::Rc,
+    sync::Arc,
+};
 
 #[cfg(test)]
 use eredu_architectures::moshi::MoshiConfig;
@@ -21,6 +26,7 @@ use safemlx::Stream;
 use crate::backend::{
     error::Error,
     nn::shared::MlxNeuralBackend,
+    ordinary_retirement::{self, OrdinaryRetirement},
     runtime::{
         cache::state::MlxKeyValueState,
         execution::{
@@ -31,6 +37,7 @@ use crate::backend::{
         },
         generation::MlxSamplingBackend,
     },
+    submission_recovery::{self, Recovery, Retention, Status},
 };
 type SelectedLayerwiseRuntime<A, P> = LayerwiseRuntime<A, MlxNeuralBackend, MlxKeyValueState, P>;
 type SelectedPartitionRuntime<A, P> = eredu_runtime::PartitionedTextRuntime<
@@ -68,6 +75,7 @@ struct DirectRealtimeExecution<A>
 where
     A: LayeredArchitecture<MlxNeuralBackend, MlxKeyValueState>,
     A::Error: std::fmt::Display,
+    A::Unit: 'static,
 {
     selected: SelectedRealtimeRealization,
     execution: ConstructedRealtimeExecution<
@@ -161,7 +169,7 @@ impl<U> RealtimePolicyReports for MlxResidentPolicy<U> {
     }
 }
 
-impl<U> RealtimePolicyReports for MlxLayerwisePolicy<U> {
+impl<U: 'static> RealtimePolicyReports for MlxLayerwisePolicy<U> {
     fn residency_report(&self) -> Result<ResidencyReport, Error> {
         self.residency_report()
     }
@@ -219,7 +227,7 @@ where
 }
 
 /// Generic MLX storage/materialization mechanisms used by the neutral constructor.
-pub struct MlxRealtimeConstructionMechanisms<U> {
+pub struct MlxRealtimeConstructionMechanisms<U: 'static> {
     store: SharedCheckpointSource,
     residency: eredu_runtime::LayerWeightResidency,
     weights_stream: Stream,
@@ -230,7 +238,7 @@ pub struct MlxRealtimeConstructionMechanisms<U> {
     local_layout: Option<Arc<eredu_runtime::LocalModelLayout>>,
 }
 
-impl<U> MlxRealtimeConstructionMechanisms<U> {
+impl<U: 'static> MlxRealtimeConstructionMechanisms<U> {
     fn new(
         store: SharedCheckpointSource,
         residency: eredu_runtime::LayerWeightResidency,
@@ -283,7 +291,7 @@ impl<A, U> RealtimeModelConstructionMechanisms<A, MlxNeuralBackend>
 where
     A: LayeredArchitecture<MlxNeuralBackend, MlxKeyValueState, Unit = U>,
     A::Error: std::fmt::Display,
-    U: Parameterized<crate::MlxTensor>,
+    U: Parameterized<crate::MlxTensor> + 'static,
 {
     type State = MlxKeyValueState;
     type PolicyError = Error;
@@ -479,19 +487,146 @@ where
 pub struct MlxRealtimeExecution {
     artifact_identity: ArtifactIdentity,
     metadata: LayerwiseModelMetadata,
+    payload: Rc<OrdinaryRetirement<RealtimeExecutionPayload>>,
+    poisoned: Rc<Cell<bool>>,
+}
+
+struct RealtimeExecutionPayload {
     execution: Box<dyn ErasedRealtimeExecutionContract>,
     resources: Arc<SelectedRealtimeResources>,
 }
 
+struct RealtimeSubmissionRetention {
+    payload: RefCell<Option<Rc<OrdinaryRetirement<RealtimeExecutionPayload>>>>,
+    poisoned: Rc<Cell<bool>>,
+}
+
+impl Retention for RealtimeSubmissionRetention {
+    fn observe(&self, status: Status) {
+        if status.failed || status.blocked {
+            self.poisoned.set(true);
+        }
+        if status.settled {
+            self.payload.borrow_mut().take();
+        }
+    }
+}
+
+/// Installed before eager input/model/sampling work. Its payload clone is made
+/// only after the mutable execution borrow has ended, including on unwinding.
+struct RealtimeSubmissionGuard<'a> {
+    model: &'a mut MlxRealtimeExecution,
+    recovery: Recovery<Rc<RealtimeSubmissionRetention>>,
+    succeeded: bool,
+}
+
+impl RealtimeSubmissionGuard<'_> {
+    fn finish(&mut self) -> Status {
+        self.recovery.seal();
+        let status = self.recovery.progress();
+        if !self.succeeded || status.failed || status.blocked {
+            self.model.poisoned.set(true);
+        }
+        if !status.settled {
+            *self.recovery.retention().payload.borrow_mut() = Some(Rc::clone(&self.model.payload));
+        }
+        status
+    }
+}
+
+impl Drop for RealtimeSubmissionGuard<'_> {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
 /// Native resources whose lifetime must cover every submitted completion.
 pub(crate) struct SelectedRealtimeResources {
+    inner: OrdinaryRetirement<RealtimeResourcePayload>,
+}
+
+struct RealtimeResourcePayload {
     _store: SharedCheckpointSource,
-    _world: Option<Arc<crate::backend::runtime::distributed::Group>>,
-    _stream: Stream,
+    world: Option<Arc<crate::backend::runtime::distributed::Group>>,
+    stream: Stream,
     _weights_stream: Stream,
+    poisoned: Rc<Cell<bool>>,
+}
+
+impl SelectedRealtimeResources {
+    pub(crate) fn poison(&self) {
+        self.inner.poisoned.set(true);
+    }
+
+    fn validate_stream(&self, stream: &Stream) -> Result<(), Error> {
+        crate::backend::validate_native_execution_target(
+            &self.inner.stream.get_device()?,
+            None,
+            stream,
+            None,
+        )
+    }
+
+    fn validate_context(
+        &self,
+        stream: &Stream,
+        world: Option<&crate::backend::runtime::distributed::Group>,
+    ) -> Result<(), Error> {
+        crate::backend::validate_native_execution_target(
+            &self.inner.stream.get_device()?,
+            self.inner
+                .world
+                .as_deref()
+                .map(|group| group.native_group()),
+            stream,
+            world.map(|group| group.native_group()),
+        )
+    }
 }
 
 impl MlxRealtimeExecution {
+    fn ensure_healthy(&self) -> Result<(), Error> {
+        if self.poisoned.get() {
+            return Err(Error::ArchitectureModel(
+                "MLX realtime execution is poisoned after a failed submission; construct a new execution".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Covers a complete host operation, including work before/after traversal.
+    pub(crate) fn with_submission<T>(
+        &mut self,
+        operation: impl FnOnce(&mut Self) -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        submission_recovery::reap();
+        ordinary_retirement::reclaim();
+        self.ensure_healthy()?;
+        if Rc::strong_count(&self.payload) != 1 {
+            return Err(Error::ArchitectureModel(
+                "MLX realtime execution still has unresolved native work".into(),
+            ));
+        }
+        let recovery = Recovery::begin(Rc::new(RealtimeSubmissionRetention {
+            payload: RefCell::new(None),
+            poisoned: Rc::clone(&self.poisoned),
+        }))?;
+        let mut guard = RealtimeSubmissionGuard {
+            model: self,
+            recovery,
+            succeeded: false,
+        };
+        let result = operation(guard.model);
+        guard.succeeded = result.is_ok();
+        let status = guard.finish();
+        if result.is_ok() && (status.failed || status.blocked) {
+            return Err(Error::ArchitectureModel(
+                "MLX realtime native work failed; unresolved resources remain retained".into(),
+            ));
+        }
+        result
+    }
+
     /// Parameter topology and residency metadata.
     pub fn metadata(&self) -> &LayerwiseModelMetadata {
         &self.metadata
@@ -499,17 +634,20 @@ impl MlxRealtimeExecution {
 
     /// Logical residency and transfer telemetry.
     pub fn residency_report(&self) -> Result<ResidencyReport, Error> {
-        self.execution.residency_report()
+        self.ensure_healthy()?;
+        self.payload.execution.residency_report()
     }
 
     /// Disk-stream telemetry when that policy is active.
     pub fn dense_stream_report(&self) -> Result<Option<DenseDiskStreamReport>, Error> {
-        self.execution.dense_stream_report()
+        self.ensure_healthy()?;
+        self.payload.execution.dense_stream_report()
     }
 
     /// Per-execution-group residency reports.
     pub fn execution_group_reports(&self) -> Result<Vec<ResidentLayerGroupReport>, Error> {
-        self.execution.execution_group_reports()
+        self.ensure_healthy()?;
+        self.payload.execution.execution_group_reports()
     }
 
     /// Identity of the checkpoint payload bound to these mechanisms.
@@ -525,19 +663,43 @@ impl MlxRealtimeExecution {
         driver: &mut SequentialDecisionDriver<MlxSamplingBackend, eredu_runtime::GenerationSampler>,
         stream: &Stream,
     ) -> Result<(crate::MlxTensor, moshi::ForwardContext<crate::MlxTensor>), Error> {
-        self.execution
-            .execute_decisions(state, temporal, driver, stream)
+        self.validate_stream(stream)?;
+        self.with_submission(|model| {
+            Rc::get_mut(&mut model.payload)
+                .ok_or_else(|| {
+                    Error::ArchitectureModel(
+                        "MLX realtime execution has unresolved native owners".into(),
+                    )
+                })?
+                .execution
+                .execute_decisions(state, temporal, driver, stream)
+        })
     }
 
     /// Creates request-local resident key/value state from the neutral layout.
     pub fn new_realtime_state(&self) -> Result<MlxKeyValueState, Error> {
-        MlxKeyValueState::device(self.execution.selected().state().layout().clone())
+        self.ensure_healthy()?;
+        MlxKeyValueState::device(self.payload.execution.selected().state().layout().clone())
             .map_err(Into::into)
     }
 
     /// Clones exact store, stream, and collective ownership into a completion.
     pub(crate) fn completion_resources(&self) -> Arc<SelectedRealtimeResources> {
-        Arc::clone(&self.resources)
+        Arc::clone(&self.payload.resources)
+    }
+
+    pub(crate) fn validate_stream(&self, stream: &Stream) -> Result<(), Error> {
+        self.ensure_healthy()?;
+        self.payload.resources.validate_stream(stream)
+    }
+
+    pub(crate) fn validate_context(
+        &self,
+        stream: &Stream,
+        world: Option<&crate::backend::runtime::distributed::Group>,
+    ) -> Result<(), Error> {
+        self.ensure_healthy()?;
+        self.payload.resources.validate_context(stream, world)
     }
 }
 
@@ -678,8 +840,11 @@ impl moshi::MoshiRealtimeArchitectureVisitor<MlxNeuralBackend, MlxKeyValueState>
         Ok(MlxRealtimeExecution {
             artifact_identity: self.artifact_identity,
             metadata,
-            execution,
-            resources: self.resources,
+            poisoned: Rc::clone(&self.resources.inner.poisoned),
+            payload: Rc::new(OrdinaryRetirement::new(RealtimeExecutionPayload {
+                execution,
+                resources: self.resources,
+            })),
         })
     }
 }
@@ -692,6 +857,7 @@ pub fn materialize_selected(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<moshi::MoshiRealtimeExecution<MlxRealtimeExecution>, Error> {
+    ordinary_retirement::reclaim();
     let execution_descriptor = prepared.selected().execution_descriptor();
     let target_config = prepared.selected().execution_config().clone();
     let selected = prepared.selected().selected().clone();
@@ -721,10 +887,13 @@ pub fn materialize_selected(
         })
         .transpose()?;
     let resources = Arc::new(SelectedRealtimeResources {
-        _store: Arc::clone(&store),
-        _world: world.clone(),
-        _stream: stream.clone(),
-        _weights_stream: weights_stream.clone(),
+        inner: OrdinaryRetirement::new(RealtimeResourcePayload {
+            _store: Arc::clone(&store),
+            world: parallel_manifest.as_ref().and(world.clone()),
+            stream: stream.clone(),
+            _weights_stream: weights_stream.clone(),
+            poisoned: Rc::new(Cell::new(false)),
+        }),
     });
     let execution =
         moshi::visit_selected_moshi_realtime_architecture::<MlxNeuralBackend, MlxKeyValueState, _>(
@@ -745,6 +914,10 @@ pub fn materialize_selected(
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     Ok(execution_descriptor.bind(execution))
 }
+
+#[cfg(test)]
+#[path = "moshi_recovery_tests.rs"]
+mod recovery_tests;
 
 #[cfg(test)]
 mod tests {

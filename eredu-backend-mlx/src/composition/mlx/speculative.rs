@@ -23,7 +23,6 @@ use safemlx::{
     transforms::{async_eval_with_event, eval},
     Array, Event, Stream,
 };
-use std::cell::RefCell;
 
 use crate::{
     backend::error::Error,

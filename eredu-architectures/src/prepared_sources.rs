@@ -112,7 +112,7 @@ impl PreparedModelSources {
     }
 
     /// Consumes the authoritative pairing immediately before typed execution dispatch.
-    pub fn into_parts(
+    pub(crate) fn into_parts(
         self,
     ) -> (
         SelectedPreparation,
@@ -309,7 +309,7 @@ pub fn prepare_model_sources(
                 .into(),
         ));
     }
-    let max_cached_sources = selected.text_realization().residency().max_cached_shards();
+    let max_cached_sources = selected.text_realization().max_cached_shards();
     let media_projector = if selected.allows_media_projector() {
         MediaProjectorSourcePolicy::Allowed
     } else {
@@ -674,6 +674,10 @@ fn metadata_snapshot(
         .map(|key| source.source_metadata(&key).map(|metadata| (key, metadata)))
         .collect()
 }
+
+#[cfg(test)]
+#[path = "prepared_execution/source_contract_tests.rs"]
+mod construction_tests;
 
 #[cfg(test)]
 mod tests {

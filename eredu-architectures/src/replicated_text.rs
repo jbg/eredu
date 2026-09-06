@@ -1,5 +1,11 @@
 //! Architecture-owned admission for replicated text execution.
 
+mod profiles;
+pub use profiles::{
+    IdentityReplicatedTextVisitor, ReplicatedTextStateProfiles, ReplicatedTextVisitorConversion,
+    SharedReplicatedTextVisitor,
+};
+
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     sync::Arc,
@@ -1841,6 +1847,34 @@ where
     fn into_compressed_component_visitor(self) -> Self::CompressedComponentVisitor;
 }
 
+/// Dispatches an ordinary key/value selection without requiring unrelated backend mechanisms.
+pub(crate) fn dispatch_replicated_key_value_text_architecture<B, S, V>(
+    plan: &ArtifactArchitecturePlan,
+    selected: SelectedReplicatedTextRealization,
+    store: eredu_checkpoint::store::SharedCheckpointSource,
+    context: &<B::Tensor as Tensor>::Context,
+    visitor: V,
+) -> Result<V::Output, ReplicatedTextDispatchError<V::Error>>
+where
+    B: NeuralBackend,
+    S: LayerRuntimeState<B>,
+    S::LayerState: AttentionCache<B::Tensor>,
+    V: ReplicatedTextArchitectureVisitor<B, S>,
+{
+    if selected.state().access() != ReplicatedTextStateAccess::KeyValue {
+        return Err(ReplicatedTextDispatchError::Architecture(format!(
+            "selected state profile {:?} is not ordinary key/value attention",
+            selected.state().access()
+        )));
+    }
+    let eligible = eligible_config(plan)?;
+    if matches!(eligible, EligibleConfig::Llama(_) | EligibleConfig::Qwen(_)) {
+        visit_replicated_text_architecture(plan, selected, store, context, visitor)
+    } else {
+        visit_replicated_attention_state_text_architecture(plan, selected, store, context, visitor)
+    }
+}
+
 /// Dispatches one selected replicated-text architecture through its exact typed state profile.
 pub fn dispatch_replicated_text_architecture<B, D>(
     plan: &ArtifactArchitecturePlan,
@@ -2006,7 +2040,8 @@ where
         crate::nemotron_h::prompt_cache_architecture_fingerprint(&args);
     let architecture =
         <MixedState as FixedProfile<B, D::State, NemotronHReplicated>>::new(args, context)
-            .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+            .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?
+            .with_prediction_capture();
     let prepared = prepare_architecture_handoff::<B, D::State, _>(
         architecture,
         source_architecture,
@@ -3592,7 +3627,7 @@ fn replicated_text_requirements_for_structure(
         _ => {
             return Err(ReplicatedTextRequirementsError::InvalidArtifact(
                 "artifact container and admitted architecture plan disagree".into(),
-            ))
+            ));
         }
     };
     let (execution_graph, execution_units, group_transports, state_layout) = match structure {
@@ -4138,7 +4173,7 @@ fn recipe_stored_dtype(
         _ => {
             return Err(ReplicatedTextRequirementsError::InvalidArtifact(
                 "recipe output uses an unsupported scalar representation".into(),
-            ))
+            ));
         }
     })
 }
@@ -4529,7 +4564,7 @@ fn safetensors_parameters(
                 return Err(ReplicatedTextRequirementsError::InvalidArtifact(format!(
                     "required admitted SafeTensors parameter {:?} has no source",
                     constraint.key
-                )))
+                )));
             }
         };
         let role = config.parameter_role(
@@ -6103,7 +6138,7 @@ pub(crate) fn composite_config(
             | GgufMediaProjectorConfig::Qwen35Pending(_) => {
                 return Err(ReplicatedTextRequirementsError::InvalidArtifact(
                     "composite GGUF media token identities are unresolved".into(),
-                ))
+                ));
             }
         }));
     }
@@ -6550,10 +6585,10 @@ pub fn composite_text_requirements(
                 .as_ref()
                 .is_some_and(|mtp| mtp.num_nextn_predict_layers > 0) =>
         {
-            return Err(ReplicatedTextIneligibility::EmbeddedPrediction.into())
+            return Err(ReplicatedTextIneligibility::EmbeddedPrediction.into());
         }
         CompositeConfig::QwenHybrid(args) if args.text.mtp_num_hidden_layers > 0 => {
-            return Err(ReplicatedTextIneligibility::EmbeddedPrediction.into())
+            return Err(ReplicatedTextIneligibility::EmbeddedPrediction.into());
         }
         _ => {}
     }
@@ -6785,192 +6820,284 @@ where
     let target_formats = selected_formats(selected.execution());
     let has_transform = selected_uses_transform(selected.execution());
     visitor.construction_started();
-    macro_rules! visit_constructed {
-        ($architecture:expr, $source:expr, $capability:expr, $model_type:expr, $cache_identity:expr) => {{
-            match selected {
-                SelectedCompositeTextRealization::Direct(selected) => {
-                    let (execution, processor) = selected.into_parts();
-                    let prepared = prepare_composite_architecture_handoff::<B, S, _>(
-                        $architecture,
-                        $source,
-                        requirements,
-                        execution,
-                        processor,
-                        $capability,
-                        $model_type,
-                        $cache_identity,
-                        context,
-                    )
-                    .map_err(ReplicatedTextDispatchError::Architecture)?;
-                    visitor
-                        .visit(prepared, store)
-                        .map_err(ReplicatedTextDispatchError::Backend)
-                }
-                SelectedCompositeTextRealization::Routed {
+    let construction = CompositeTextConstruction::<B, S, V> {
+        requirements,
+        selected,
+        store,
+        context,
+        visitor,
+        source_linear_formats,
+        target_linear_formats,
+        source_formats,
+        target_formats,
+        has_transform,
+        state: std::marker::PhantomData,
+    };
+    match config {
+        CompositeConfig::QwenVl(args) => construction.qwen_vl(args),
+        CompositeConfig::Gemma4(args) => construction.gemma4(args),
+        CompositeConfig::Muse(args) => construction.muse(args),
+        CompositeConfig::Inkling(args) => construction.inkling(args),
+        CompositeConfig::QwenHybrid(args) => construction.qwen_hybrid(args),
+    }
+}
+
+// Keep cold family construction in separate stack frames: one debug dispatch frame
+// containing every family's source/target and direct/routed temporaries can exceed
+// the default thread stack before construction reaches its first layer.
+struct CompositeTextConstruction<'a, B: eredu_nn::NeuralBackend, S, V> {
+    requirements: CompositeTextRequirements,
+    selected: SelectedCompositeTextRealization,
+    store: eredu_checkpoint::store::SharedCheckpointSource,
+    context: &'a <B::Tensor as Tensor>::Context,
+    visitor: V,
+    source_linear_formats: HashMap<String, LinearFormat>,
+    target_linear_formats: HashMap<String, LinearFormat>,
+    source_formats: HashMap<String, WeightQuantization>,
+    target_formats: HashMap<String, WeightQuantization>,
+    has_transform: bool,
+    state: std::marker::PhantomData<fn() -> S>,
+}
+
+impl<B, S, V> CompositeTextConstruction<'_, B, S, V>
+where
+    B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + Clone,
+    S: LayerRuntimeState<B>,
+    S::LayerState: AttentionCache<B::Tensor>
+        + eredu_runtime::RuntimeStateComponents<B>
+        + eredu_nn::AuxiliaryConvolutionState<B::Tensor>,
+    V: CompositeTextArchitectureVisitor<B, S>,
+{
+    #[inline(never)]
+    fn visit<A>(
+        self,
+        architecture: A,
+        source: Option<A>,
+        capability: crate::capability::CapabilityEstimate,
+        model_type: String,
+        cache_identity: String,
+    ) -> Result<V::Output, ReplicatedTextDispatchError<V::Error>>
+    where
+        A: crate::composite_execution::CompositeArchitecture<B, S, Error = eredu_nn::Error>
+            + eredu_runtime::RoutedLayeredArchitecture<B, S>
+            + 'static,
+        A::InputPartPlan: 'static,
+        A::StaticModules: Clone,
+    {
+        match self.selected {
+            SelectedCompositeTextRealization::Direct(selected) => {
+                let (execution, processor) = selected.into_parts();
+                let prepared = prepare_composite_architecture_handoff::<B, S, _>(
+                    architecture,
+                    source,
+                    self.requirements,
                     execution,
                     processor,
-                } => {
-                    let prepared = prepare_routed_composite_architecture_handoff::<B, S, _>(
-                        $architecture,
-                        $source,
-                        requirements,
-                        execution,
-                        processor,
-                        $capability,
-                        $model_type,
-                        $cache_identity,
-                        context,
-                    )
-                    .map_err(ReplicatedTextDispatchError::Architecture)?;
-                    visitor
-                        .visit_routed(prepared, store)
-                        .map_err(ReplicatedTextDispatchError::Backend)
-                }
+                    capability,
+                    model_type,
+                    cache_identity,
+                    self.context,
+                )
+                .map_err(ReplicatedTextDispatchError::Architecture)?;
+                self.visitor
+                    .visit(prepared, self.store)
+                    .map_err(ReplicatedTextDispatchError::Backend)
             }
-        }};
+            SelectedCompositeTextRealization::Routed {
+                execution,
+                processor,
+            } => {
+                let prepared = prepare_routed_composite_architecture_handoff::<B, S, _>(
+                    architecture,
+                    source,
+                    self.requirements,
+                    execution,
+                    processor,
+                    capability,
+                    model_type,
+                    cache_identity,
+                    self.context,
+                )
+                .map_err(ReplicatedTextDispatchError::Architecture)?;
+                self.visitor
+                    .visit_routed(prepared, self.store)
+                    .map_err(ReplicatedTextDispatchError::Backend)
+            }
+        }
     }
-    match config {
-        CompositeConfig::QwenVl(args) => {
-            let capability = crate::capability::qwen_vl(args)
-                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-            let source = has_transform
-                .then(|| qwen_vl_with_formats(args, source_linear_formats.clone()))
-                .transpose()
-                .map_err(ReplicatedTextDispatchError::Architecture)?
-                .map(|args| crate::qwen::vl::LayeredModel::<B>::new(args, context))
-                .transpose()
-                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-            let target = qwen_vl_with_formats(args, target_linear_formats.clone())
-                .map_err(ReplicatedTextDispatchError::Architecture)?;
-            let effective_model_type = target.effective_model_type().to_owned();
-            let cache_identity = crate::qwen::vl::prompt_cache_architecture_fingerprint(&target);
-            let architecture = crate::qwen::vl::LayeredModel::<B>::new(target, context)
-                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-            visit_constructed!(
-                architecture,
-                source,
-                capability,
-                effective_model_type,
-                cache_identity
-            )
-        }
-        CompositeConfig::Gemma4(args) => {
-            let output_projection_bias = requirements
-                .execution()
-                .parameters()
-                .iter()
-                .find(|parameter| parameter.name() == "model.audio_tower.output_proj.bias")
-                .is_some_and(|parameter| {
-                    !matches!(
-                        parameter.presence(),
-                        ReplicatedTextParameterPresence::OptionalAbsent
-                    )
-                });
-            let mut exact_args = args.clone();
-            if let Some(audio) = exact_args.audio.as_mut() {
-                audio.output_projection_bias = output_projection_bias;
-            }
-            let capability = crate::capability::gemma4(&exact_args)
-                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-            let source = has_transform
-                .then(|| {
-                    crate::gemma4::with_checkpoint_formats(&exact_args, source_formats.clone())
-                })
-                .transpose()
-                .map_err(ReplicatedTextDispatchError::Architecture)?
-                .map(|args| crate::gemma4::LayeredModel::<B>::new(args, context))
-                .transpose()
-                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-            let target =
-                crate::gemma4::with_checkpoint_formats(&exact_args, target_formats.clone())
-                    .map_err(ReplicatedTextDispatchError::Architecture)?;
-            let effective_model_type = target.effective_model_type().to_owned();
-            let cache_identity = target.architecture_fingerprint();
-            let architecture = crate::gemma4::LayeredModel::<B>::new(target, context)
-                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-            visit_constructed!(
-                architecture,
-                source,
-                capability,
-                effective_model_type,
-                cache_identity
-            )
-        }
-        CompositeConfig::Muse(args) => {
-            let capability = crate::capability::muse_glimmer(args)
-                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-            let source = has_transform
-                .then(|| crate::muse_glimmer::with_checkpoint_formats(args, source_formats.clone()))
-                .transpose()
-                .map_err(ReplicatedTextDispatchError::Architecture)?
-                .map(|args| crate::muse_glimmer::LayeredModel::<B>::new(args, context))
-                .transpose()
-                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-            let target = crate::muse_glimmer::with_checkpoint_formats(args, target_formats.clone())
-                .map_err(ReplicatedTextDispatchError::Architecture)?;
-            let effective_model_type = target.model_type.clone();
-            let cache_identity = target.architecture_fingerprint();
-            let architecture = crate::muse_glimmer::LayeredModel::<B>::new(target, context)
-                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-            visit_constructed!(
-                architecture,
-                source,
-                capability,
-                effective_model_type,
-                cache_identity
-            )
-        }
-        CompositeConfig::Inkling(args) => {
-            let capability = crate::capability::inkling(args)
-                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-            let source = has_transform
-                .then(|| crate::inkling::with_checkpoint_formats(args, source_formats.clone()))
-                .transpose()
-                .map_err(ReplicatedTextDispatchError::Architecture)?
-                .map(|args| crate::inkling::LayeredModel::<B>::new(args, context))
-                .transpose()
-                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-            let target = crate::inkling::with_checkpoint_formats(args, target_formats.clone())
-                .map_err(ReplicatedTextDispatchError::Architecture)?;
-            let effective_model_type = target.model_type.clone();
-            let cache_identity = target.architecture_fingerprint();
-            let architecture = crate::inkling::LayeredModel::<B>::new(target, context)
-                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-            visit_constructed!(
-                architecture,
-                source,
-                capability,
-                effective_model_type,
-                cache_identity
-            )
-        }
-        CompositeConfig::QwenHybrid(args) => {
-            let capability = crate::capability::qwen_hybrid(args)
-                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-            let source = has_transform
-                .then(|| qwen_hybrid_composite_with_formats(args, source_linear_formats.clone()))
-                .transpose()
-                .map_err(ReplicatedTextDispatchError::Architecture)?
-                .map(|args| crate::qwen::hybrid::ConditionalLayeredModel::<B>::new(args, context))
-                .transpose()
-                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-            let target = qwen_hybrid_composite_with_formats(args, target_linear_formats.clone())
-                .map_err(ReplicatedTextDispatchError::Architecture)?;
-            let effective_model_type = target.text.model_type.clone();
-            let cache_identity =
-                crate::qwen::hybrid::conditional_prompt_cache_architecture_fingerprint(&target);
-            let architecture = crate::qwen::hybrid::ConditionalLayeredModel::<B>::new(
-                target, context,
-            )
+
+    #[inline(never)]
+    fn qwen_vl(
+        self,
+        args: &crate::qwen::vl::ModelArgs,
+    ) -> Result<V::Output, ReplicatedTextDispatchError<V::Error>> {
+        let capability = crate::capability::qwen_vl(args)
             .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-            visit_constructed!(
-                architecture,
-                source,
-                capability,
-                effective_model_type,
-                cache_identity
-            )
+        let source = self
+            .has_transform
+            .then(|| qwen_vl_with_formats(args, self.source_linear_formats.clone()))
+            .transpose()
+            .map_err(ReplicatedTextDispatchError::Architecture)?
+            .map(|args| crate::qwen::vl::LayeredModel::<B>::new(args, self.context))
+            .transpose()
+            .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+        let target = qwen_vl_with_formats(args, self.target_linear_formats.clone())
+            .map_err(ReplicatedTextDispatchError::Architecture)?;
+        let effective_model_type = target.effective_model_type().to_owned();
+        let cache_identity = crate::qwen::vl::prompt_cache_architecture_fingerprint(&target);
+        let architecture = crate::qwen::vl::LayeredModel::<B>::new(target, self.context)
+            .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+        self.visit(
+            architecture,
+            source,
+            capability,
+            effective_model_type,
+            cache_identity,
+        )
+    }
+
+    #[inline(never)]
+    fn gemma4(
+        self,
+        args: &crate::gemma4::FamilyConfig,
+    ) -> Result<V::Output, ReplicatedTextDispatchError<V::Error>> {
+        let output_projection_bias = self
+            .requirements
+            .execution()
+            .parameters()
+            .iter()
+            .find(|parameter| parameter.name() == "model.audio_tower.output_proj.bias")
+            .is_some_and(|parameter| {
+                !matches!(
+                    parameter.presence(),
+                    ReplicatedTextParameterPresence::OptionalAbsent
+                )
+            });
+        let mut exact_args = args.clone();
+        if let Some(audio) = exact_args.audio.as_mut() {
+            audio.output_projection_bias = output_projection_bias;
         }
+        let capability = crate::capability::gemma4(&exact_args)
+            .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+        let source = self
+            .has_transform
+            .then(|| {
+                crate::gemma4::with_checkpoint_formats(&exact_args, self.source_formats.clone())
+            })
+            .transpose()
+            .map_err(ReplicatedTextDispatchError::Architecture)?
+            .map(|args| crate::gemma4::LayeredModel::<B>::new(args, self.context))
+            .transpose()
+            .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+        let target =
+            crate::gemma4::with_checkpoint_formats(&exact_args, self.target_formats.clone())
+                .map_err(ReplicatedTextDispatchError::Architecture)?;
+        let effective_model_type = target.effective_model_type().to_owned();
+        let cache_identity = target.architecture_fingerprint();
+        let architecture = crate::gemma4::LayeredModel::<B>::new(target, self.context)
+            .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+        self.visit(
+            architecture,
+            source,
+            capability,
+            effective_model_type,
+            cache_identity,
+        )
+    }
+
+    #[inline(never)]
+    fn muse(
+        self,
+        args: &crate::muse_glimmer::DecoderConfig,
+    ) -> Result<V::Output, ReplicatedTextDispatchError<V::Error>> {
+        let capability = crate::capability::muse_glimmer(args)
+            .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+        let source = self
+            .has_transform
+            .then(|| {
+                crate::muse_glimmer::with_checkpoint_formats(args, self.source_formats.clone())
+            })
+            .transpose()
+            .map_err(ReplicatedTextDispatchError::Architecture)?
+            .map(|args| crate::muse_glimmer::LayeredModel::<B>::new(args, self.context))
+            .transpose()
+            .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+        let target =
+            crate::muse_glimmer::with_checkpoint_formats(args, self.target_formats.clone())
+                .map_err(ReplicatedTextDispatchError::Architecture)?;
+        let effective_model_type = target.model_type.clone();
+        let cache_identity = target.architecture_fingerprint();
+        let architecture = crate::muse_glimmer::LayeredModel::<B>::new(target, self.context)
+            .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+        self.visit(
+            architecture,
+            source,
+            capability,
+            effective_model_type,
+            cache_identity,
+        )
+    }
+
+    #[inline(never)]
+    fn inkling(
+        self,
+        args: &crate::inkling::ModelArgs,
+    ) -> Result<V::Output, ReplicatedTextDispatchError<V::Error>> {
+        let capability = crate::capability::inkling(args)
+            .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+        let source = self
+            .has_transform
+            .then(|| crate::inkling::with_checkpoint_formats(args, self.source_formats.clone()))
+            .transpose()
+            .map_err(ReplicatedTextDispatchError::Architecture)?
+            .map(|args| crate::inkling::LayeredModel::<B>::new(args, self.context))
+            .transpose()
+            .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+        let target = crate::inkling::with_checkpoint_formats(args, self.target_formats.clone())
+            .map_err(ReplicatedTextDispatchError::Architecture)?;
+        let effective_model_type = target.model_type.clone();
+        let cache_identity = target.architecture_fingerprint();
+        let architecture = crate::inkling::LayeredModel::<B>::new(target, self.context)
+            .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+        self.visit(
+            architecture,
+            source,
+            capability,
+            effective_model_type,
+            cache_identity,
+        )
+    }
+
+    #[inline(never)]
+    fn qwen_hybrid(
+        self,
+        args: &crate::qwen::hybrid::ParsedHybridConfig,
+    ) -> Result<V::Output, ReplicatedTextDispatchError<V::Error>> {
+        let capability = crate::capability::qwen_hybrid(args)
+            .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+        let source = self
+            .has_transform
+            .then(|| qwen_hybrid_composite_with_formats(args, self.source_linear_formats.clone()))
+            .transpose()
+            .map_err(ReplicatedTextDispatchError::Architecture)?
+            .map(|args| crate::qwen::hybrid::ConditionalLayeredModel::<B>::new(args, self.context))
+            .transpose()
+            .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+        let target = qwen_hybrid_composite_with_formats(args, self.target_linear_formats.clone())
+            .map_err(ReplicatedTextDispatchError::Architecture)?;
+        let effective_model_type = target.text.model_type.clone();
+        let cache_identity =
+            crate::qwen::hybrid::conditional_prompt_cache_architecture_fingerprint(&target);
+        let architecture =
+            crate::qwen::hybrid::ConditionalLayeredModel::<B>::new(target, self.context)
+                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+        self.visit(
+            architecture,
+            source,
+            capability,
+            effective_model_type,
+            cache_identity,
+        )
     }
 }
 
@@ -7282,7 +7409,7 @@ pub fn replicated_text_execution_class(
             if reason == ReplicatedTextIneligibility::CompositeInput {
                 match composite_text_requirements(inspection) {
                     Ok(requirements) => {
-                        return Ok(ReplicatedTextExecutionClass::Composite(requirements))
+                        return Ok(ReplicatedTextExecutionClass::Composite(requirements));
                     }
                     Err(
                         error @ ReplicatedTextRequirementsError::Ineligible(
@@ -7295,10 +7422,10 @@ pub fn replicated_text_execution_class(
             if reason == ReplicatedTextIneligibility::Routed {
                 match crate::routed_text_requirements(inspection) {
                     Ok(requirements) => {
-                        return Ok(ReplicatedTextExecutionClass::Routed(requirements))
+                        return Ok(ReplicatedTextExecutionClass::Routed(requirements));
                     }
                     Err(crate::RoutedTextRequirementsError::Invalid(detail)) => {
-                        return Err(ReplicatedTextRequirementsError::InvalidArchitecture(detail))
+                        return Err(ReplicatedTextRequirementsError::InvalidArchitecture(detail));
                     }
                     Err(crate::RoutedTextRequirementsError::Ineligible) => {}
                 }
@@ -7794,17 +7921,16 @@ mod tests {
                 parameter.source_encoding(),
                 Some(SourceTensorEncoding::Safetensors(StoredDtype::F32)) | None
             )));
-            assert!(requirements.parameters().iter().any(|parameter| parameter
-                .logical_shape()
-                .len()
-                == 1
-                && parameter
-                    .transform_target(eredu_core::QuantizationRequest::Affine {
-                        group_size: 16,
-                        bits: 4,
-                    })
-                    .unwrap()
-                    .is_none()));
+            assert!(requirements.parameters().iter().any(|parameter| {
+                parameter.logical_shape().len() == 1
+                    && parameter
+                        .transform_target(eredu_core::QuantizationRequest::Affine {
+                            group_size: 16,
+                            bits: 4,
+                        })
+                        .unwrap()
+                        .is_none()
+            }));
         }
     }
 

@@ -114,6 +114,9 @@ impl ParallelLoadRequest {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum NormalizedLoadRequestError {
+    /// A prepared source must have a positive reader-cache bound.
+    #[error("source reader-cache limit must be positive")]
+    ZeroCachedShards,
     /// Parallel invocation limits must both be positive.
     #[error(
         "partitioned invocation limits must be positive, got batch {maximum_batch_size} and sequence {maximum_sequence_length}"
@@ -155,11 +158,13 @@ pub enum NormalizedLoadRequestError {
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
 pub struct NormalizedLoadRequest {
     quantization: Option<QuantizationRequest>,
+    max_cached_shards: Option<NonZeroUsize>,
     parallel: Option<ParallelLoadRequest>,
     communication_completion: Option<CommunicationCompletionPolicy>,
     weight_residency: WeightResidency,
     state_residency: CacheResidencyPolicy,
     required_session_capabilities: SessionCapabilities,
+    prompt_cache_persistence: bool,
     drafting: DraftingLoadRequest,
 }
 
@@ -183,6 +188,31 @@ impl<'a> ValidatedModelLoadRequest<'a> {
 }
 
 impl NormalizedLoadRequest {
+    /// Requires persisted prompt-prefix import/export independently of state residency.
+    pub const fn with_prompt_cache_persistence(mut self, required: bool) -> Self {
+        self.prompt_cache_persistence = required;
+        self
+    }
+
+    /// Returns explicit persisted prompt-prefix import/export intent.
+    pub const fn prompt_cache_persistence(&self) -> bool {
+        self.prompt_cache_persistence
+    }
+
+    /// Selects the exact reader-cache limit, including fully resident execution.
+    pub const fn with_max_cached_shards(mut self, maximum: NonZeroUsize) -> Self {
+        self.max_cached_shards = Some(maximum);
+        self
+    }
+
+    /// Returns the source reader-cache bound retained by cold selection.
+    pub const fn max_cached_shards(&self) -> usize {
+        match self.max_cached_shards {
+            Some(maximum) => maximum.get(),
+            None => self.weight_residency.max_cached_shards(),
+        }
+    }
+
     /// Creates a request that quantizes eligible dense weights on load.
     pub fn with_quantization(quantization: QuantizationRequest) -> Self {
         Self {
@@ -383,6 +413,9 @@ impl NormalizedLoadRequest {
     pub fn validate_model_preparation(
         &self,
     ) -> Result<ValidatedModelLoadRequest<'_>, NormalizedLoadRequestError> {
+        if self.max_cached_shards() == 0 {
+            return Err(NormalizedLoadRequestError::ZeroCachedShards);
+        }
         self.weight_quantization()?;
         self.communication_completion_policy()?;
         Ok(ValidatedModelLoadRequest {

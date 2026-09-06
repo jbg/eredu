@@ -3114,7 +3114,7 @@ where
     )
 }
 
-fn prepare<B>(
+pub(crate) fn prepare<B>(
     extension: &PredictionExtensionPlan,
     topology: ParallelRankTopology,
     tasks: &[ReplicatedTextMaterializationTask],

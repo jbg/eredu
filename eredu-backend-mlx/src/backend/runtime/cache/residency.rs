@@ -437,7 +437,13 @@ enum HostDemotionRequest {
         device: CacheTransferDevice,
         completion: Arc<HostDemotionCompletion>,
     },
-    Stop,
+    #[cfg(test)]
+    Pause {
+        started: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+        retained: Arc<()>,
+        finished: mpsc::Sender<()>,
+    },
 }
 
 struct HostDemotionWorker {
@@ -476,7 +482,18 @@ impl HostDemotionWorker {
                             });
                             completion.finish(result);
                         }
-                        HostDemotionRequest::Stop => break,
+                        #[cfg(test)]
+                        HostDemotionRequest::Pause {
+                            started,
+                            release,
+                            retained,
+                            finished,
+                        } => {
+                            let _ = started.send(());
+                            let _ = release.recv();
+                            drop(retained);
+                            let _ = finished.send(());
+                        }
                     }
                 }
             })
@@ -520,11 +537,11 @@ impl HostDemotionWorker {
 
 impl Drop for HostDemotionWorker {
     fn drop(&mut self) {
-        let _ = self.sender.send(HostDemotionRequest::Stop);
+        // The receiver owns every queued array/device/completion. Disconnecting
+        // the sender lets it finish those messages without joining under a
+        // native retirement lock; dropping JoinHandle only detaches it.
         if let Ok(handle) = self.handle.get_mut() {
-            if let Some(handle) = handle.take() {
-                let _ = handle.join();
-            }
+            handle.take();
         }
     }
 }

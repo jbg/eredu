@@ -211,8 +211,6 @@ where
             source_layout,
             tasks,
         )?;
-        let locally_materialized =
-            eredu_runtime::locally_materialized_replicated_text_outputs(tasks);
         let selected_static_parameters = static_tasks
             .iter()
             .flat_map(|task| {
@@ -234,18 +232,19 @@ where
             .filter(|name| !selected_static_parameters.contains(name))
             .collect::<std::collections::BTreeSet<_>>();
         excluded_parameters.extend(addressable_parameters.iter().cloned());
-        let mut static_bindings = build_mlx_exact_replicated_text_bindings(
+        let static_bindings = build_mlx_exact_replicated_text_bindings(
             architecture.static_modules(),
             self.store.as_ref(),
             &static_tasks,
             &excluded_parameters,
+            self.parallel_layout.as_ref(),
         )?;
         #[cfg(test)]
         crate::tests::support::path_instrumentation::local_static_materialization(
             static_bindings.len(),
             excluded_parameters.len(),
         );
-        let mut unit_bindings = units
+        let unit_bindings = units
             .iter()
             .zip(&unit_tasks)
             .map(|(unit, tasks)| {
@@ -256,28 +255,10 @@ where
                     self.store.as_ref(),
                     tasks,
                     addressable_parameters,
+                    self.parallel_layout.as_ref(),
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
-        if let Some(layout) = &self.parallel_layout {
-            static_bindings = shard_unmaterialized_bindings(
-                static_bindings,
-                self.store.as_ref(),
-                layout,
-                &locally_materialized,
-            )?;
-            unit_bindings = unit_bindings
-                .into_iter()
-                .map(|bindings| {
-                    shard_unmaterialized_bindings(
-                        bindings,
-                        self.store.as_ref(),
-                        layout,
-                        &locally_materialized,
-                    )
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-        }
         let graph = architecture
             .execution_graph()
             .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
@@ -322,7 +303,10 @@ where
             eredu_runtime::ExecutionUnitLayout,
         ),
         Error,
-    > {
+    >
+    where
+        A::Unit: 'static,
+    {
         let prepared = self.prepared_bindings.take().ok_or_else(|| {
             Error::ArchitectureModel("execution policy requested before materialization".into())
         })?;
@@ -372,6 +356,7 @@ where
     S: MlxStateMechanisms,
     A: eredu_runtime::LayeredArchitecture<MlxNeuralBackend, S, Error = eredu_nn::Error>,
     A::Error: std::fmt::Display,
+    A::Unit: 'static,
 {
     type State = S;
     type PolicyError = Error;
@@ -467,27 +452,18 @@ where
         let unit_tasks = task_plan
             .unit_tasks(tasks)
             .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        let locally_materialized =
-            eredu_runtime::locally_materialized_replicated_text_outputs(tasks);
         let addressable_parameters = addressable_parameters
             .iter()
             .cloned()
             .collect::<std::collections::BTreeSet<_>>();
-        let mut static_bindings = build_mlx_exact_replicated_text_bindings(
+        let static_bindings = build_mlx_exact_replicated_text_bindings(
             architecture.static_modules(),
             self.store.as_ref(),
             &static_tasks,
             &addressable_parameters,
+            self.parallel_layout.as_ref(),
         )?;
-        if let Some(layout) = &self.parallel_layout {
-            static_bindings = shard_unmaterialized_bindings(
-                static_bindings,
-                self.store.as_ref(),
-                layout,
-                &locally_materialized,
-            )?;
-        }
-        let mut unit_bindings = target_units
+        let unit_bindings = target_units
             .iter()
             .zip(&unit_tasks)
             .enumerate()
@@ -499,6 +475,7 @@ where
                     self.store.as_ref(),
                     tasks,
                     &addressable_parameters,
+                    self.parallel_layout.as_ref(),
                 )
                 .map_err(|error| {
                     Error::ArchitectureModel(format!(
@@ -507,19 +484,6 @@ where
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        if let Some(layout) = &self.parallel_layout {
-            unit_bindings = unit_bindings
-                .into_iter()
-                .map(|bindings| {
-                    shard_unmaterialized_bindings(
-                        bindings,
-                        self.store.as_ref(),
-                        layout,
-                        &locally_materialized,
-                    )
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-        }
 
         self.prepared_bindings = Some(PreparedExactBindings {
             layout: target_layout.clone(),
@@ -683,6 +647,7 @@ where
     S: MlxStateMechanisms,
     A: eredu_runtime::LayeredArchitecture<MlxNeuralBackend, S, Error = eredu_nn::Error>,
     A::Error: std::fmt::Display,
+    A::Unit: 'static,
 {
     type PromptCacheSaveTransaction = MlxPromptCacheSaveTransaction;
 

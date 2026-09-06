@@ -4,6 +4,8 @@ use std::cell::Cell;
 pub(crate) struct Counts {
     pub(crate) architecture_constructions: usize,
     pub(crate) state_allocations: usize,
+    // Successful admitted payload-source openings, not payload reads. Tensor
+    // bytes remain lazy until leases/materialization consume them.
     pub(crate) payload_opens: usize,
     pub(crate) constructors: usize,
     pub(crate) unit_constructions: usize,
@@ -23,6 +25,8 @@ thread_local! {
     static BOUNDED_UNIT_ACQUISITIONS: Cell<usize> = const { Cell::new(0) };
     static VARIABLE_ALL_TO_ALL_SUBMISSIONS: Cell<usize> = const { Cell::new(0) };
     static TARGET_NATIVE_RESOURCE_REALIZATION_ATTEMPTS: Cell<usize> = const { Cell::new(0) };
+    static SESSION_RESET_ATTEMPTS: Cell<usize> = const { Cell::new(0) };
+    static SESSION_INPUT_CREATION_ATTEMPTS: Cell<usize> = const { Cell::new(0) };
 }
 
 pub(crate) fn reset() {
@@ -33,6 +37,24 @@ pub(crate) fn reset() {
     BOUNDED_UNIT_ACQUISITIONS.set(0);
     VARIABLE_ALL_TO_ALL_SUBMISSIONS.set(0);
     TARGET_NATIVE_RESOURCE_REALIZATION_ATTEMPTS.set(0);
+    SESSION_RESET_ATTEMPTS.set(0);
+    SESSION_INPUT_CREATION_ATTEMPTS.set(0);
+}
+
+pub(crate) fn session_reset_attempts() -> usize {
+    SESSION_RESET_ATTEMPTS.get()
+}
+
+pub(crate) fn session_reset_attempt() {
+    SESSION_RESET_ATTEMPTS.with(|count| count.set(count.get() + 1));
+}
+
+pub(crate) fn session_input_creation_attempts() -> usize {
+    SESSION_INPUT_CREATION_ATTEMPTS.get()
+}
+
+pub(crate) fn session_input_creation_attempt() {
+    SESSION_INPUT_CREATION_ATTEMPTS.with(|count| count.set(count.get() + 1));
 }
 
 pub(crate) fn snapshot() -> Counts {

@@ -60,7 +60,16 @@ fn validate_safetensors_preparation_for_test(
     config: &Value,
     options: MlxLoadRequest,
 ) -> Result<(), Error> {
-    let policy = options.preparation_policy()?;
+    let policy = options
+        .checked_normalized()?
+        .0
+        .preparation_policy()
+        .map_err(|error| match error {
+            eredu_runtime::NormalizedLoadRequestError::Quantization(message) => {
+                Error::Quantization(message)
+            }
+            error => Error::Parallel(error.to_string()),
+        })?;
     let resolved = eredu_architectures::configuration::resolve_model_config(config)?;
     if resolved.kind != kind {
         return Err(Error::ArchitectureModel(format!(
@@ -88,10 +97,12 @@ mod admission_policy_tests {
     use super::*;
 
     fn parameter_bank_options() -> MlxLoadRequest {
-        MlxLoadRequest::default().with_weight_residency(
-            eredu_runtime::WeightResidency::with_independent_parameter_banks(
-                eredu_runtime::OrdinaryWeightResidency::FullyResident,
-                eredu_runtime::ParameterBankLoadOptions::default(),
+        MlxLoadRequest::from_normalized(
+            eredu_runtime::NormalizedLoadRequest::default().with_weight_residency(
+                eredu_runtime::WeightResidency::with_independent_parameter_banks(
+                    eredu_runtime::OrdinaryWeightResidency::FullyResident,
+                    eredu_runtime::ParameterBankLoadOptions::default(),
+                ),
             ),
         )
     }
@@ -228,10 +239,14 @@ mod admission_policy_tests {
 
     #[test]
     fn nonresident_quantization_admits_kimi_linear_capability_intersection() {
-        let options = MlxLoadRequest::with_quantization(eredu_core::QuantizationRequest::MxFp4)
+        let options = MlxLoadRequest::from_normalized(
+            eredu_runtime::NormalizedLoadRequest::with_quantization(
+                eredu_core::QuantizationRequest::MxFp4,
+            )
             .with_weight_residency(eredu_runtime::WeightResidency::layerwise_host(
                 eredu_runtime::LayerwiseLoadOptions::default(),
-            ));
+            )),
+        );
         validate_safetensors_preparation_for_test(
             ModelKind::KimiLinear,
             &kimi_linear_config(),
@@ -243,18 +258,22 @@ mod admission_policy_tests {
     #[test]
     fn neutral_dense_qwen_tensor_parallel_quantization_is_admitted_during_preflight() {
         let topology = crate::test_parallel_rank(0, 2, 1, 1);
-        let options = MlxLoadRequest::with_quantization(eredu_core::QuantizationRequest::MxFp4)
-            .with_parallel_topology(
-                topology,
-                crate::backend::DeviceAssignment::new(safemlx::DeviceType::Cpu, 0),
-                eredu_runtime::PipelineWireContract::new(
-                    eredu_runtime::PipelineActivationDtype::Float32,
-                ),
-                1,
-                128,
-                MlxLoadRequest::test_communication_completion_policy(),
-            )
-            .unwrap();
+        let options = MlxLoadRequest::from_normalized(
+            eredu_runtime::NormalizedLoadRequest::with_quantization(
+                eredu_core::QuantizationRequest::MxFp4,
+            ),
+        )
+        .with_parallel_topology(
+            topology,
+            crate::backend::DeviceAssignment::new(safemlx::DeviceType::Cpu, 0),
+            eredu_runtime::PipelineWireContract::new(
+                eredu_runtime::PipelineActivationDtype::Float32,
+            ),
+            1,
+            128,
+            MlxLoadRequest::test_communication_completion_policy(),
+        )
+        .unwrap();
 
         validate_safetensors_preparation_for_test(ModelKind::Qwen3, &dense_qwen3_config(), options)
             .unwrap();
@@ -263,18 +282,22 @@ mod admission_policy_tests {
     #[test]
     fn distributed_stage_quantization_is_admitted_during_preflight() {
         let topology = crate::test_parallel_rank(0, 1, 2, 1);
-        let options = MlxLoadRequest::with_quantization(eredu_core::QuantizationRequest::MxFp4)
-            .with_parallel_topology(
-                topology,
-                crate::backend::DeviceAssignment::new(safemlx::DeviceType::Cpu, 0),
-                eredu_runtime::PipelineWireContract::new(
-                    eredu_runtime::PipelineActivationDtype::Float32,
-                ),
-                1,
-                128,
-                MlxLoadRequest::test_communication_completion_policy(),
-            )
-            .unwrap();
+        let options = MlxLoadRequest::from_normalized(
+            eredu_runtime::NormalizedLoadRequest::with_quantization(
+                eredu_core::QuantizationRequest::MxFp4,
+            ),
+        )
+        .with_parallel_topology(
+            topology,
+            crate::backend::DeviceAssignment::new(safemlx::DeviceType::Cpu, 0),
+            eredu_runtime::PipelineWireContract::new(
+                eredu_runtime::PipelineActivationDtype::Float32,
+            ),
+            1,
+            128,
+            MlxLoadRequest::test_communication_completion_policy(),
+        )
+        .unwrap();
 
         validate_safetensors_preparation_for_test(ModelKind::Qwen3, &dense_qwen3_config(), options)
             .unwrap();

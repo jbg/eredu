@@ -16,7 +16,8 @@ use eredu_architectures::{
     replicated_text::{
         dispatch_replicated_text_architecture, CompositeTextArchitectureVisitor,
         PreparedCompositeTextArchitecture, PreparedReplicatedTextArchitecture,
-        ReplicatedTextArchitectureVisitor, ReplicatedTextProfileDispatcher,
+        ReplicatedTextArchitectureVisitor, ReplicatedTextStateProfiles,
+        SharedReplicatedTextVisitor,
     },
     ExpertParameterRecipe, ExpertParameterRole, ExpertRealizationPlan, ExpertResidencyCatalog,
     ExpertResidencyDistribution, ExpertResidencyUnit, ExpertRouteCountPlan,
@@ -59,31 +60,49 @@ use eredu_nn::{
     TopKGroupSelectorSpec, VocabularyParallelRange,
 };
 use eredu_runtime::{
-    construct_replicated_text_session, AddressableExpertRouteProvider,
-    AddressableExpertRouteRequest, AddressableGatedProductBank, AddressableGroupedBank,
-    ArchitectureParameters, ArchitecturePartition, ArchitectureStatePartitionPlan,
-    ArchitectureStatePartitionRule, CollectiveBackend, CommunicationBackend,
-    CommunicationCompletionPolicy, CommunicationGroupDescriptor, CommunicationGroupRequirements,
-    CommunicationManifest, CommunicationOperation, CommunicationOperationRequirement,
-    CommunicationTensorLimits, CommunicationTensorMetadata, CompositeLayeredTraversalHook,
-    DeviceState, EvenGatherBackend, ExecutionGroupId, ExecutionUnitAddress, ExpertPass,
-    ExpertRouteExchange, ExpertRouteTensorMovement, IndexedMovement, LayerRuntimeState,
-    LayerWeightResidency, LayeredArchitecture, LayeredPartitionDriver, LayeredPartitionInput,
-    LayeredPartitionOutput, LayeredTraversalHook, LayerwiseAcquireError, LayerwisePolicy,
-    LayerwiseRuntime, LocalModelLayout, LocalTensorLayout, MemberSharding, NoAuxiliaryBoundary,
-    NoAuxiliaryBoundarySchema, ParallelLayeredArchitecture, ParallelRoutedLayeredArchitecture,
-    ParameterBankAcquisition, ParameterBankKey, ParameterBankLoadOptions, ParameterGroupSpec,
-    ParameterRole, PartitionCommunication, PartitionOwnership, PenaltyConfig, PredictionDirective,
-    RealizedCommunicationGroup, RealizedCommunicationRoute, ReplicatedTextMaterializationTask,
-    ReplicatedTextSessionMechanisms, ResettableRuntimeLayerState, ResidentRuntime,
-    ResidentUnitWindow, RoutedExpertProvider, RoutedExpertRequest,
-    RoutedExpertTensorParallelOutput, RoutedLayeredArchitecture, RuntimeLayerState, RuntimeState,
-    RuntimeStateComponents, Sampler, SamplingBackend, SequentialDecisionDriver,
-    SequentialDecisionPlan, SequentialDecisionSource, SequentialDecisionTraversal, StateError,
-    SubmissionBackend, TensorParallelRoutedExpertProvider, TensorPlacement, TokenDomain,
-    VariableAllToAllBackend,
+    AddressableExpertRouteProvider, AddressableExpertRouteRequest, AddressableGatedProductBank,
+    AddressableGroupedBank, ArchitectureParameters, ArchitecturePartition,
+    ArchitectureStatePartitionPlan, ArchitectureStatePartitionRule, CollectiveBackend,
+    CommunicationBackend, CommunicationCompletionPolicy, CommunicationGroupDescriptor,
+    CommunicationGroupRequirements, CommunicationManifest, CommunicationOperation,
+    CommunicationOperationRequirement, CommunicationTensorLimits, CommunicationTensorMetadata,
+    CompositeLayeredTraversalHook, DeviceState, EvenGatherBackend, ExecutionGroupId,
+    ExecutionUnitAddress, ExpertPass, ExpertRouteExchange, ExpertRouteTensorMovement,
+    IndexedMovement, LayerRuntimeState, LayerWeightResidency, LayeredArchitecture,
+    LayeredPartitionDriver, LayeredPartitionInput, LayeredPartitionOutput, LayeredTraversalHook,
+    LayerwiseAcquireError, LayerwisePolicy, LayerwiseRuntime, LocalModelLayout, LocalTensorLayout,
+    MemberSharding, NoAuxiliaryBoundary, NoAuxiliaryBoundarySchema, ParallelLayeredArchitecture,
+    ParallelRoutedLayeredArchitecture, ParameterBankAcquisition, ParameterBankKey,
+    ParameterBankLoadOptions, ParameterGroupSpec, ParameterRole, PartitionCommunication,
+    PartitionOwnership, PenaltyConfig, PredictionDirective, RealizedCommunicationGroup,
+    RealizedCommunicationRoute, ReplicatedTextMaterializationTask, ReplicatedTextSessionMechanisms,
+    ResettableRuntimeLayerState, ResidentRuntime, ResidentUnitWindow, RoutedExpertProvider,
+    RoutedExpertRequest, RoutedExpertTensorParallelOutput, RoutedLayeredArchitecture,
+    RuntimeLayerState, RuntimeState, RuntimeStateComponents, Sampler, SamplingBackend,
+    SequentialDecisionDriver, SequentialDecisionPlan, SequentialDecisionSource,
+    SequentialDecisionTraversal, StateError, SubmissionBackend, TensorParallelRoutedExpertProvider,
+    TensorPlacement, TokenDomain, VariableAllToAllBackend,
 };
 use safetensors::tensor::Dtype;
+
+#[path = "reference_numeric/neural_geometry_conformance.rs"]
+mod neural_geometry_conformance;
+#[path = "reference_numeric/partitioned_adapter.rs"]
+mod partitioned_adapter;
+#[path = "reference_numeric/prediction_adapter.rs"]
+mod prediction_adapter;
+pub(crate) fn run_reference_conformance_embedded_prediction() {
+    prediction_adapter::assert_real_embedded_prediction();
+}
+#[path = "reference_numeric/payload.rs"]
+mod payload;
+#[path = "reference_numeric/prepared_adapter.rs"]
+mod prepared_adapter;
+#[path = "reference_numeric/profile_conformance.rs"]
+mod profile_conformance;
+#[cfg(test)]
+#[path = "reference_numeric/shadow.rs"]
+mod shadow;
 
 fn dense_linear_format() -> eredu_nn::LinearFormatSpec {
     eredu_nn::LinearFormatSpec::unscaled(eredu_checkpoint::LinearFormat::Dense).unwrap()
@@ -2526,6 +2545,7 @@ impl HyperHeadOperator<NumericTensor> for NumericHyperHead {
 
 #[derive(Default, Clone)]
 struct NumericContext {
+    bind_checkpoint_values: bool,
     sliding_attention_calls: Cell<usize>,
     local_layout: Option<Arc<LocalModelLayout>>,
     mechanisms: Arc<Mutex<Vec<NumericMechanismTrace>>>,
@@ -2535,6 +2555,7 @@ struct NumericContext {
 impl NumericContext {
     fn with_local_layout(layout: LocalModelLayout) -> Self {
         Self {
+            bind_checkpoint_values: false,
             sliding_attention_calls: Cell::new(0),
             local_layout: Some(Arc::new(layout)),
             mechanisms: Arc::default(),
@@ -2548,6 +2569,7 @@ impl NumericContext {
         world: Arc<NumericPartitionWorld>,
     ) -> Self {
         Self {
+            bind_checkpoint_values: false,
             sliding_attention_calls: Cell::new(0),
             local_layout: Some(Arc::new(layout)),
             mechanisms: Arc::default(),
@@ -4386,25 +4408,16 @@ impl NeuralBackend for NumericBackend {
         epsilon: f32,
         _: &NumericContext,
     ) -> Result<Self::Tensor, Error> {
-        let width = usize::try_from(
-            *input
-                .shape
-                .last()
-                .ok_or_else(|| Error::backend("numeric L2 normalization requires rank"))?,
-        )
-        .map_err(Error::backend)?;
+        let geometry =
+            eredu_nn::operation_geometry::NormalizationGeometry::new(&input.shape, epsilon)?;
+        let width = usize::try_from(geometry.width()).map_err(Error::backend)?;
         let mut output = input.clone();
         for (source, target) in input
             .data
             .chunks_exact(width)
             .zip(output.data.chunks_exact_mut(width))
         {
-            let norm = source
-                .iter()
-                .map(|value| value * value)
-                .sum::<f32>()
-                .max(epsilon)
-                .sqrt();
+            let norm = (source.iter().map(|value| value * value).sum::<f32>() + epsilon).sqrt();
             for (target, source) in target.iter_mut().zip(source) {
                 *target = *source / norm;
             }
@@ -4420,17 +4433,17 @@ impl NeuralBackend for NumericBackend {
         epsilon: f32,
         _: &NumericContext,
     ) -> Result<NumericTensor, Error> {
-        if input.shape != gate.shape || weight.shape != [*input.shape.last().unwrap()] {
+        let geometry = eredu_nn::operation_geometry::GroupedNormalizationGeometry::new(
+            &input.shape,
+            &gate.shape,
+            groups,
+            epsilon,
+        )?;
+        if weight.shape != [geometry.width()] {
             return Err(Error::backend("numeric gated RMS geometry mismatch"));
         }
-        let width = *input.shape.last().unwrap() as usize;
-        let groups = usize::try_from(groups).map_err(Error::backend)?;
-        if groups == 0 || !width.is_multiple_of(groups) {
-            return Err(Error::backend(
-                "numeric gated RMS groups do not divide width",
-            ));
-        }
-        let group_width = width / groups;
+        let width = usize::try_from(geometry.width()).map_err(Error::backend)?;
+        let group_width = usize::try_from(geometry.group_width()).map_err(Error::backend)?;
         let gated = input
             .data
             .iter()
@@ -4462,17 +4475,15 @@ impl NeuralBackend for NumericBackend {
         epsilon: f32,
         _: &NumericContext,
     ) -> Result<Self::Tensor, Error> {
-        if input.shape != gate.shape {
-            return Err(Error::backend("numeric SiLU-gated RMS geometry mismatch"));
-        }
-        let width = usize::try_from(*input.shape.last().unwrap()).map_err(Error::backend)?;
+        let geometry = eredu_nn::operation_geometry::GroupedNormalizationGeometry::new(
+            &input.shape,
+            &gate.shape,
+            groups,
+            epsilon,
+        )?;
+        let width = usize::try_from(geometry.width()).map_err(Error::backend)?;
         let groups = usize::try_from(groups).map_err(Error::backend)?;
-        if groups == 0 || !width.is_multiple_of(groups) {
-            return Err(Error::backend(
-                "numeric SiLU-gated RMS groups do not divide width",
-            ));
-        }
-        let group_width = width / groups;
+        let group_width = usize::try_from(geometry.group_width()).map_err(Error::backend)?;
         if weight.shape != [group_width as i32] && weight.shape != [width as i32] {
             return Err(Error::backend(
                 "numeric SiLU-gated RMS weight geometry mismatch",
@@ -4795,7 +4806,9 @@ impl NeuralBackend for NumericBackend {
         epsilon: f32,
         _: &NumericContext,
     ) -> Result<NumericTensor, Error> {
-        let dimensions = input.shape.last().copied().unwrap() as usize;
+        let geometry =
+            eredu_nn::operation_geometry::NormalizationGeometry::new(&input.shape, epsilon)?;
+        let dimensions = usize::try_from(geometry.width()).map_err(Error::backend)?;
         let mut output = input.clone();
         for (source, target) in input
             .data
@@ -4846,14 +4859,16 @@ impl NeuralBackend for NumericBackend {
         window: Option<i32>,
         _: &NumericContext,
     ) -> Result<Self::Tensor, Error> {
-        let keys = position_offset + sequence;
+        let geometry = eredu_nn::operation_geometry::CausalMaskGeometry::new(
+            sequence,
+            position_offset,
+            window,
+        )?;
+        let keys = geometry.keys();
         let mut mask = NumericTensor::zeros(vec![sequence, keys]);
         for query in 0..sequence {
-            let query_position = position_offset + query;
             for key in 0..keys {
-                let too_new = key > query_position;
-                let too_old = window.is_some_and(|window| key <= query_position - window);
-                if too_new || too_old {
+                if !geometry.allows(query, key) {
                     mask.data[(query * keys + key) as usize] = -1.0e9;
                 }
             }
@@ -15747,14 +15762,118 @@ fn assert_state_exact(
 }
 
 #[derive(Default)]
+struct NumericMechanismSupport {
+    persistent_session: bool,
+    addressable: bool,
+}
+
+impl eredu_runtime::ReplicatedTextMechanismSupport for NumericMechanismSupport {
+    fn facts(
+        &self,
+        _: &eredu_runtime::CacheResidencyPolicy,
+    ) -> eredu_runtime::BackendMechanismFacts {
+        let mut facts = eredu_runtime::BackendMechanismFacts::new(
+            NumericBackend::OPERATOR_CAPABILITIES,
+            [eredu_runtime::WeightResidencyMechanism::Resident],
+            eredu_runtime::StateLifecycleCapabilities::new()
+                .with_transactions(true, true)
+                .with_reset(true)
+                .with_prompt_cache(self.persistent_session)
+                .with_observation_retention(self.persistent_session),
+        )
+        .with_grouped_operations([
+            eredu_runtime::GroupedOperationRequirement::GatedProduct,
+            eredu_runtime::GroupedOperationRequirement::GatedProductTensorParallelPartial,
+            eredu_runtime::GroupedOperationRequirement::Relu2,
+            eredu_runtime::GroupedOperationRequirement::Relu2TensorParallelPartial,
+        ]);
+        if self.persistent_session {
+            facts = facts
+                .with_session(eredu_core::SessionCapabilities::new(true, true, true))
+                .with_prompt_cache(true)
+                .with_exact_completion(true);
+        }
+        if self.addressable {
+            facts = facts.with_indexed_movement(true).with_addressable_storage(
+                eredu_runtime::AddressableStorageCapabilities::new(true, true, true, u64::MAX),
+            );
+        }
+        facts
+    }
+
+    fn supports_direct(&self, descriptor: &eredu_runtime::WeightLoweringDescriptor) -> bool {
+        use eredu_checkpoint::{LinearFormat, StoredDtype};
+        match descriptor.executable() {
+            LinearFormat::Dense => matches!(
+                descriptor.source().scalar_dtype(),
+                Some(
+                    StoredDtype::F32
+                        | StoredDtype::F16
+                        | StoredDtype::BF16
+                        | StoredDtype::I32
+                        | StoredDtype::U8
+                        | StoredDtype::F8E8M0
+                )
+            ),
+            LinearFormat::Affine(_) => descriptor.source().scalar_dtype() == Some(StoredDtype::U32),
+            LinearFormat::MxFp4 => matches!(
+                descriptor.source().scalar_dtype(),
+                Some(StoredDtype::U32 | StoredDtype::U8 | StoredDtype::F4)
+            ),
+            _ => false,
+        }
+    }
+
+    fn supports_transform(&self, descriptor: &eredu_runtime::WeightLoweringDescriptor) -> bool {
+        matches!(
+            descriptor.source().scalar_dtype(),
+            Some(eredu_checkpoint::StoredDtype::F32)
+        ) && matches!(
+            descriptor.executable(),
+            eredu_checkpoint::LinearFormat::Affine(_) | eredu_checkpoint::LinearFormat::MxFp4
+        )
+    }
+
+    fn supports_state_component(
+        &self,
+        _: &eredu_core::cache::StateComponentPolicy,
+        placement: eredu_runtime::StateComponentPlacement,
+    ) -> bool {
+        placement == eredu_runtime::StateComponentPlacement::Device
+    }
+}
+
+#[derive(Default)]
 struct NumericReplicatedMechanisms {
     checkpoint: Option<SharedCheckpointSource>,
+    bind_checkpoint_values: bool,
+    bounded_checkpoint_values: bool,
+    bounded_binding: Option<payload::BoundedBinding>,
 }
 
 impl NumericReplicatedMechanisms {
     fn with_checkpoint(checkpoint: SharedCheckpointSource) -> Self {
         Self {
             checkpoint: Some(checkpoint),
+            bind_checkpoint_values: false,
+            ..Self::default()
+        }
+    }
+
+    fn with_bound_checkpoint(checkpoint: SharedCheckpointSource) -> Self {
+        Self {
+            checkpoint: Some(checkpoint),
+            bind_checkpoint_values: true,
+            ..Self::default()
+        }
+    }
+
+    fn with_bounded_checkpoint(checkpoint: SharedCheckpointSource) -> Self {
+        Self {
+            checkpoint: Some(checkpoint),
+            bind_checkpoint_values: true,
+            bounded_checkpoint_values: true,
+            bounded_binding: None,
         }
     }
 }
@@ -16088,6 +16207,7 @@ fn verify_addressable_member_payloads(
 struct NumericReplicatedLease<U> {
     ordinal: usize,
     unit: U,
+    _payload: Option<payload::PayloadLease>,
 }
 
 impl<U> std::ops::Deref for NumericReplicatedLease<U> {
@@ -16106,21 +16226,28 @@ impl<U> std::ops::DerefMut for NumericReplicatedLease<U> {
 
 struct NumericReplicatedPolicy<U> {
     resident: Option<Vec<Option<U>>>,
+    bounded_binding: Option<payload::BoundedBinding>,
 }
 
 impl<U> NumericReplicatedPolicy<U> {
     fn resident(units: Vec<U>) -> Self {
         Self {
             resident: Some(units.into_iter().map(Some).collect()),
+            bounded_binding: None,
         }
     }
 
     fn bounded() -> Self {
-        Self { resident: None }
+        Self {
+            resident: None,
+            bounded_binding: None,
+        }
     }
 }
 
-impl<U> LayerwisePolicy<NumericBackend, U> for NumericReplicatedPolicy<U> {
+impl<U: Parameterized<NumericTensor>> LayerwisePolicy<NumericBackend, U>
+    for NumericReplicatedPolicy<U>
+{
     type Lease = NumericReplicatedLease<U>;
     type Error = Error;
 
@@ -16138,7 +16265,7 @@ impl<U> LayerwisePolicy<NumericBackend, U> for NumericReplicatedPolicy<U> {
     where
         F: FnOnce(&NumericContext) -> Result<U, E>,
     {
-        let unit = match &mut self.resident {
+        let mut unit = match &mut self.resident {
             Some(units) => units
                 .get_mut(ordinal)
                 .and_then(Option::take)
@@ -16146,7 +16273,17 @@ impl<U> LayerwisePolicy<NumericBackend, U> for NumericReplicatedPolicy<U> {
                 .map_err(LayerwiseAcquireError::Policy)?,
             None => build(context).map_err(LayerwiseAcquireError::Architecture)?,
         };
-        Ok(NumericReplicatedLease { ordinal, unit })
+        let payload = self
+            .bounded_binding
+            .as_ref()
+            .map(|binding| binding.acquire(ordinal, &mut unit, context))
+            .transpose()
+            .map_err(LayerwiseAcquireError::Policy)?;
+        Ok(NumericReplicatedLease {
+            ordinal,
+            unit,
+            _payload: payload,
+        })
     }
 
     fn complete<'a, StateValues, ContextValues>(
@@ -16215,13 +16352,13 @@ where
 
     fn prepare_materialization(
         &mut self,
-        _: &mut A,
-        _: &eredu_runtime::ExecutionUnitLayout,
-        _: &mut [A::Unit],
+        architecture: &mut A,
+        layout: &eredu_runtime::ExecutionUnitLayout,
+        units: &mut [A::Unit],
         _: Option<&mut A>,
         _: Option<&mut [A::Unit]>,
         tasks: &[ReplicatedTextMaterializationTask],
-        _: &[String],
+        addressable_parameters: &[String],
         context: &NumericContext,
     ) -> Result<(), Self::Error> {
         if tasks.is_empty() {
@@ -16229,7 +16366,20 @@ where
                 "numeric replicated construction received no materialization tasks",
             ));
         }
-        if let Some(checkpoint) = self.checkpoint.as_deref() {
+        if self.bounded_checkpoint_values {
+            self.bounded_binding = Some(payload::BoundedBinding::prepare(
+                architecture,
+                layout,
+                tasks,
+                addressable_parameters,
+                Arc::clone(
+                    self.checkpoint
+                        .as_ref()
+                        .ok_or_else(|| Error::backend("bounded scalar mechanism has no source"))?,
+                ),
+                context,
+            )?);
+        } else if let Some(checkpoint) = self.checkpoint.as_deref() {
             let mut reads = Vec::new();
             for task in tasks {
                 reads.extend(verify_materialization_task_payloads(task, checkpoint)?);
@@ -16240,6 +16390,16 @@ where
                 ));
             }
             record_reference_payload_reads(reads);
+            if self.bind_checkpoint_values {
+                payload::bind(
+                    architecture,
+                    units,
+                    tasks,
+                    addressable_parameters,
+                    checkpoint,
+                    context,
+                )?;
+            }
         }
         record_reference_lowerings(tasks);
         record_reference_materialization_tasks(tasks.len());
@@ -16285,7 +16445,9 @@ where
         _: &eredu_runtime::SelectedReplicatedTextRealization,
         _: &NumericContext,
     ) -> Result<Self::BoundedPolicy, Self::Error> {
-        Ok(NumericReplicatedPolicy::bounded())
+        let mut policy = NumericReplicatedPolicy::bounded();
+        policy.bounded_binding = self.bounded_binding.take();
+        Ok(policy)
     }
 
     fn index_text_output(
@@ -16725,58 +16887,15 @@ fn numeric_composite_selection(
     requirements: &eredu_architectures::replicated_text::CompositeTextRequirements,
     input: &eredu_runtime::PreparedModelInput<NumericTensor>,
 ) -> eredu_architectures::replicated_text::SelectedCompositeTextRealization {
-    let execution = requirements.execution();
-    let lowerings = execution
-        .parameters()
-        .iter()
-        .filter(|parameter| parameter.has_lowering_source())
-        .map(|parameter| {
-            let kind = if matches!(
-                parameter.presence(),
-                eredu_runtime::ReplicatedTextParameterPresence::Derived { .. }
-            ) {
-                eredu_runtime::WeightLoweringKind::Derived
-            } else {
-                eredu_runtime::WeightLoweringKind::Direct
-            };
-            eredu_runtime::WeightLoweringCapability::new(
-                parameter
-                    .lowering_descriptor(parameter.native_executable())
-                    .unwrap(),
-                kind,
-            )
-        })
-        .collect();
-    let state = eredu_runtime::StateMechanismCapabilities::new(
-        (0..execution.state_layout().len()).flat_map(|layer| {
-            execution
-                .state_layout()
-                .components(layer)
-                .unwrap()
-                .iter()
-                .cloned()
-                .map(move |component| {
-                    eredu_runtime::StateComponentMechanism::new(
-                        layer,
-                        component,
-                        Some(eredu_runtime::StateComponentPlacement::Device),
-                        None,
-                    )
-                })
-        }),
-    )
-    .with_transactions(true, true)
-    .with_reset(true);
-    let capabilities = eredu_runtime::BackendMechanismCapabilities::new(
-        eredu_nn::NeuralOperatorCapabilities::ALL,
-        lowerings,
-        vec![eredu_runtime::WeightResidencyMechanism::Resident],
-        state,
-    )
-    .with_grouped_operations([
-        eredu_runtime::GroupedOperationRequirement::GatedProduct,
-        eredu_runtime::GroupedOperationRequirement::GatedProductTensorParallelPartial,
-    ]);
+    let execution_request = eredu_runtime::ReplicatedTextSelectionRequest::new(
+        LayerWeightResidency::FullyResident,
+        eredu_runtime::CacheResidencyPolicy::Device,
+    );
+    let capabilities = eredu_runtime::synthesize_replicated_text_capabilities(
+        requirements.execution(),
+        &execution_request,
+        &NumericMechanismSupport::default(),
+    );
     let processor_request = eredu_runtime::ProcessorSelectionRequest::new(
         input.parts().iter().map(|part| part.modality()),
     )
@@ -16800,10 +16919,7 @@ fn numeric_composite_selection(
     );
     eredu_architectures::replicated_text::select_composite_text_realization(
         requirements,
-        &eredu_runtime::ReplicatedTextSelectionRequest::new(
-            LayerWeightResidency::FullyResident,
-            eredu_runtime::CacheResidencyPolicy::Device,
-        ),
+        &execution_request,
         eredu_runtime::WeightResidency::fully_resident(),
         &processor_request,
         &capabilities,
@@ -16854,6 +16970,7 @@ impl NumericCompositePartitionExecutable {
 struct NumericCompositePartitionVisitor {
     world: Arc<NumericPartitionWorld>,
     context: NumericContext,
+    checkpoint: SharedCheckpointSource,
 }
 
 impl
@@ -16885,13 +17002,11 @@ impl
         A::Error: std::fmt::Display,
         W: eredu_runtime::ArchitectureBoundary,
     {
-        let plan = prepared.execution_plan().map_err(Error::backend)?;
-        let tensor_group = prepared.prepared().selected().tensor_group();
-        let prompt = prepared
-            .prepared()
-            .selected()
-            .prompt_cache_topology()
+        let facts = prepared
+            .session_facts::<NumericBackend>()
             .map_err(Error::backend)?;
+        let tensor_group = facts.tensor_group();
+        let (_, prompt, plan, _) = facts.into_parts();
         let admission = prepared.prepared().architecture().admission_config();
         let factory_world = Arc::clone(&self.world);
         let binding = prepared
@@ -16957,7 +17072,7 @@ impl
             .record_prompt_cache_identity(rank, prompt_cache_identity);
         let session = eredu_runtime::construct_replicated_text_session_with_runtime(
             binding,
-            NumericReplicatedMechanisms::default(),
+            NumericReplicatedMechanisms::with_checkpoint(self.checkpoint),
             eredu_runtime::PartitionedTextExecution::new(),
         )
         .map_err(|error| Error::backend(error.to_string()))?;
@@ -17743,32 +17858,10 @@ where
     A::StaticModules: Clone,
     G: 'static,
 {
-    let plan = prepared
-        .prepared()
-        .selected()
-        .direct_execution_plan()
-        .map_err(Error::backend)?;
-    let tensor_group = prepared
-        .prepared()
-        .selected()
-        .tensor_group()
-        .ok_or_else(|| Error::backend("numeric direct partition has no tensor group"))?;
-    let prompt = prepared
-        .prepared()
-        .selected()
-        .prompt_cache_topology()
-        .map_err(Error::backend)?;
-    let prompt_cache_identity = prepared
-        .prepared()
-        .selected()
-        .partition()
-        .state()
-        .ok_or_else(|| Error::backend("numeric direct partition has no cache state"))?
-        .prompt_cache_identity::<NumericBackend, A>(
-            prepared.prepared().architecture(),
-            prompt.clone(),
-        )
-        .map_err(|error| Error::backend(error.to_string()))?;
+    let facts = prepared.session_facts().map_err(Error::backend)?;
+    let tensor_group = facts.required_tensor_group().map_err(Error::backend)?;
+    let (text, prompt, plan, _) = facts.into_parts();
+    let (prompt_cache_identity, _, _, _) = text.into_parts();
     let factory_world = Arc::clone(&world);
     let binding = prepared
         .prepare_session_runtime(
@@ -17848,29 +17941,11 @@ where
     A::StaticModules: Clone,
     G: 'static,
 {
-    let plan = prepared
-        .prepared()
-        .selected()
-        .pipeline_execution_plan()
-        .map_err(Error::backend)?;
-    let tensor_group = prepared.prepared().selected().tensor_group();
-    let activation_dtype = prepared.prepared().selected().activation_dtype();
-    let prompt = prepared
-        .prepared()
-        .selected()
-        .prompt_cache_topology()
-        .map_err(Error::backend)?;
-    let prompt_cache_identity = prepared
-        .prepared()
-        .selected()
-        .partition()
-        .state()
-        .ok_or_else(|| Error::backend("numeric pipeline partition has no cache state"))?
-        .prompt_cache_identity::<NumericBackend, A>(
-            prepared.prepared().architecture(),
-            prompt.clone(),
-        )
-        .map_err(|error| Error::backend(error.to_string()))?;
+    let facts = prepared.session_facts().map_err(Error::backend)?;
+    let tensor_group = facts.tensor_group();
+    let activation_dtype = facts.activation_dtype();
+    let (text, prompt, plan, _) = facts.into_parts();
+    let (prompt_cache_identity, _, _, _) = text.into_parts();
     let factory_world = Arc::clone(&world);
     let binding = prepared
         .prepare_session_runtime(
@@ -17968,23 +18043,9 @@ where
     A::StaticModules: Clone,
     G: 'static,
 {
-    let plan = prepared.execution_handoff().execution_plan().clone();
-    let prompt = prepared
-        .prepared()
-        .selected()
-        .prompt_cache_topology()
-        .map_err(Error::backend)?;
-    let prompt_cache_identity = prepared
-        .prepared()
-        .selected()
-        .partition()
-        .state()
-        .ok_or_else(|| Error::backend("numeric routed direct partition has no cache state"))?
-        .prompt_cache_identity::<NumericBackend, A>(
-            prepared.prepared().architecture(),
-            prompt.clone(),
-        )
-        .map_err(|error| Error::backend(error.to_string()))?;
+    let facts = prepared.session_facts().map_err(Error::backend)?;
+    let (text, prompt, plan, _) = facts.into_parts();
+    let (prompt_cache_identity, _, _, _) = text.into_parts();
     let provider = CountingPartitionedRoutedProvider {
         inner: prepared
             .resident_gated_product_provider()
@@ -18121,24 +18182,10 @@ where
     A::StaticModules: Clone,
     G: 'static,
 {
-    let plan = prepared.execution_handoff().execution_plan().clone();
-    let activation_dtype = prepared.execution_handoff().activation_dtype();
-    let prompt = prepared
-        .prepared()
-        .selected()
-        .prompt_cache_topology()
-        .map_err(Error::backend)?;
-    let prompt_cache_identity = prepared
-        .prepared()
-        .selected()
-        .partition()
-        .state()
-        .ok_or_else(|| Error::backend("numeric routed pipeline has no cache state"))?
-        .prompt_cache_identity::<NumericBackend, A>(
-            prepared.prepared().architecture(),
-            prompt.clone(),
-        )
-        .map_err(|error| Error::backend(error.to_string()))?;
+    let facts = prepared.session_facts().map_err(Error::backend)?;
+    let activation_dtype = facts.activation_dtype();
+    let (text, prompt, plan, _) = facts.into_parts();
+    let (prompt_cache_identity, _, _, _) = text.into_parts();
     let provider = CountingPartitionedRoutedProvider {
         inner: prepared
             .resident_gated_product_provider()
@@ -18218,215 +18265,6 @@ where
     ))
 }
 
-struct NumericDirectPartitionAdmission;
-
-struct NumericRoutedPartitionAdmission;
-
-impl eredu_architectures::partitioned_execution::PartitionedAdmissionDispatcher
-    for NumericRoutedPartitionAdmission
-{
-    type Output = eredu_architectures::partitioned_execution::RoutedPartitionedAdmission;
-    type Error = Error;
-
-    fn direct(
-        self,
-        _: eredu_architectures::partitioned_execution::DirectPartitionedAdmission,
-    ) -> Result<Self::Output, Self::Error> {
-        Err(Error::backend(
-            "numeric production proof requires routed execution",
-        ))
-    }
-
-    fn routed(
-        self,
-        admission: eredu_architectures::partitioned_execution::RoutedPartitionedAdmission,
-    ) -> Result<Self::Output, Self::Error> {
-        Ok(admission)
-    }
-
-    fn composite(
-        self,
-        _: eredu_architectures::partitioned_execution::CompositePartitionedAdmission,
-    ) -> Result<Self::Output, Self::Error> {
-        Err(Error::backend(
-            "numeric production proof requires routed execution",
-        ))
-    }
-}
-
-impl eredu_architectures::partitioned_execution::PartitionedAdmissionDispatcher
-    for NumericDirectPartitionAdmission
-{
-    type Output = eredu_architectures::partitioned_execution::DirectPartitionedAdmission;
-    type Error = Error;
-
-    fn direct(
-        self,
-        admission: eredu_architectures::partitioned_execution::DirectPartitionedAdmission,
-    ) -> Result<Self::Output, Self::Error> {
-        Ok(admission)
-    }
-
-    fn routed(
-        self,
-        _: eredu_architectures::partitioned_execution::RoutedPartitionedAdmission,
-    ) -> Result<Self::Output, Self::Error> {
-        Err(Error::backend(
-            "numeric production proof requires direct execution",
-        ))
-    }
-
-    fn composite(
-        self,
-        _: eredu_architectures::partitioned_execution::CompositePartitionedAdmission,
-    ) -> Result<Self::Output, Self::Error> {
-        Err(Error::backend(
-            "numeric production proof requires direct execution",
-        ))
-    }
-}
-
-fn numeric_resident_selection(
-    inspection: &eredu_core::ArtifactInspection<
-        eredu_architectures::processor_plan::ArtifactArchitecturePlan,
-    >,
-) -> eredu_runtime::SelectedReplicatedTextRealization {
-    let requirements =
-        eredu_architectures::replicated_text::replicated_text_requirements(inspection).unwrap();
-    let lowerings = requirements
-        .parameters()
-        .iter()
-        .filter(|parameter| parameter.has_lowering_source())
-        .map(|parameter| {
-            eredu_runtime::WeightLoweringCapability::new(
-                parameter
-                    .lowering_descriptor(parameter.native_executable())
-                    .unwrap(),
-                eredu_runtime::WeightLoweringKind::Direct,
-            )
-        })
-        .collect();
-    let state = eredu_runtime::StateMechanismCapabilities::new(
-        (0..requirements.state_layout().len()).flat_map(|layer| {
-            requirements
-                .state_layout()
-                .components(layer)
-                .unwrap()
-                .iter()
-                .cloned()
-                .map(move |component| {
-                    eredu_runtime::StateComponentMechanism::new(
-                        layer,
-                        component,
-                        Some(eredu_runtime::StateComponentPlacement::Device),
-                        None,
-                    )
-                })
-        }),
-    )
-    .with_transactions(true, true)
-    .with_reset(true)
-    .with_prompt_cache(true)
-    .with_observation_retention(true);
-    let capabilities = eredu_runtime::BackendMechanismCapabilities::new(
-        eredu_nn::NeuralOperatorCapabilities::ALL,
-        lowerings,
-        vec![eredu_runtime::WeightResidencyMechanism::Resident],
-        state,
-    )
-    .with_session(eredu_core::SessionCapabilities::new(true, true, true))
-    .with_prompt_cache(true)
-    .with_exact_completion(true);
-    eredu_runtime::select_replicated_text_realization(
-        &requirements,
-        &eredu_runtime::ReplicatedTextSelectionRequest::new(
-            LayerWeightResidency::FullyResident,
-            eredu_runtime::CacheResidencyPolicy::Device,
-        )
-        .with_session(eredu_core::SessionCapabilities::new(true, true, true))
-        .with_prompt_cache(true)
-        .with_exact_completion(true),
-        &capabilities,
-    )
-    .unwrap()
-}
-
-fn numeric_routed_partition_selection(
-    inspection: &eredu_core::ArtifactInspection<
-        eredu_architectures::processor_plan::ArtifactArchitecturePlan,
-    >,
-) -> eredu_architectures::SelectedRoutedTextRealization {
-    let requirements = eredu_architectures::routed_text_requirements(inspection).unwrap();
-    let lowerings = requirements
-        .text()
-        .parameters()
-        .iter()
-        .filter(|parameter| parameter.has_lowering_source())
-        .map(|parameter| {
-            let kind = if matches!(
-                parameter.presence(),
-                eredu_runtime::ReplicatedTextParameterPresence::Derived { .. }
-            ) {
-                eredu_runtime::WeightLoweringKind::Derived
-            } else {
-                eredu_runtime::WeightLoweringKind::Direct
-            };
-            eredu_runtime::WeightLoweringCapability::new(
-                parameter
-                    .lowering_descriptor(parameter.native_executable())
-                    .unwrap(),
-                kind,
-            )
-        })
-        .collect();
-    let state = eredu_runtime::StateMechanismCapabilities::new(
-        (0..requirements.text().state_layout().len()).flat_map(|layer| {
-            requirements
-                .text()
-                .state_layout()
-                .components(layer)
-                .unwrap()
-                .iter()
-                .cloned()
-                .map(move |component| {
-                    eredu_runtime::StateComponentMechanism::new(
-                        layer,
-                        component,
-                        Some(eredu_runtime::StateComponentPlacement::Device),
-                        None,
-                    )
-                })
-        }),
-    )
-    .with_transactions(true, true)
-    .with_reset(true)
-    .with_prompt_cache(true)
-    .with_observation_retention(true);
-    let capabilities = eredu_runtime::BackendMechanismCapabilities::new(
-        eredu_nn::NeuralOperatorCapabilities::ALL,
-        lowerings,
-        vec![eredu_runtime::WeightResidencyMechanism::Resident],
-        state,
-    )
-    .with_grouped_operations([eredu_runtime::GroupedOperationRequirement::GatedProduct])
-    .with_session(eredu_core::SessionCapabilities::new(true, true, true))
-    .with_prompt_cache(true)
-    .with_exact_completion(true);
-    let request = eredu_architectures::RoutedTextSelectionRequest::new(
-        eredu_runtime::ReplicatedTextSelectionRequest::new(
-            LayerWeightResidency::FullyResident,
-            eredu_runtime::CacheResidencyPolicy::Device,
-        )
-        .with_session(eredu_core::SessionCapabilities::new(true, true, true))
-        .with_prompt_cache(true)
-        .with_exact_completion(true),
-        eredu_runtime::WeightResidency::fully_resident(),
-    )
-    .unwrap();
-    eredu_architectures::select_routed_text_realization(&requirements, &request, &capabilities)
-        .unwrap()
-}
-
 fn numeric_partition_capabilities() -> eredu_runtime::CommunicationCapabilities {
     let limits = CommunicationTensorLimits::new(8, 8, 1 << 20, None).unwrap();
     eredu_runtime::CommunicationCapabilities::new([
@@ -18498,6 +18336,8 @@ fn numeric_partition_capabilities() -> eredu_runtime::CommunicationCapabilities 
 )]
 pub(crate) fn authoritative_partitioned_numeric_sessions_match_tp_pp_and_tp_pp_reference() {
     use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
+
+    partitioned_adapter::assert_narrow_route_and_native_pairing_rejections();
 
     for (architecture_name, model_type) in [
         ("LlamaForCausalLM", "llama"),
@@ -18601,12 +18441,6 @@ pub(crate) fn authoritative_partitioned_numeric_sessions_match_tp_pp_and_tp_pp_r
         let inspection = Arc::new(
             eredu_architectures::configuration::inspect_artifact(artifact.path()).unwrap(),
         );
-        let selected_base = numeric_resident_selection(&inspection);
-        let capabilities = numeric_partition_capabilities();
-        let store: eredu_checkpoint::store::SharedCheckpointSource = Arc::new(
-            eredu_checkpoint::store::SafetensorsWeightStore::open(artifact.path()).unwrap(),
-        );
-
         for topology in [
             ParallelTopology::new(2, 1, 1, 1).unwrap(),
             ParallelTopology::new(1, 2, 1, 1).unwrap(),
@@ -18623,48 +18457,13 @@ pub(crate) fn authoritative_partitioned_numeric_sessions_match_tp_pp_and_tp_pp_r
                 (0..topology.world_size())
                 .map(|rank| {
                     let inspection = Arc::clone(&inspection);
-                    let selected_base = selected_base.clone();
-                    let capabilities = capabilities.clone();
-                    let store = Arc::clone(&store);
                     let description = description.clone();
                     let inputs = inputs.clone();
                     let world = Arc::clone(&world);
                     let barrier = Arc::clone(&barrier);
                     let cache_path = cache_path.clone();
                     scope.spawn(move || {
-                        let admission = eredu_architectures::partitioned_execution::dispatch_partitioned_admission(
-                            &inspection,
-                            eredu_architectures::partitioned_execution::PartitionedSelectionRequest::new(
-                                topology,
-                                rank,
-                                1,
-                                8,
-                                eredu_runtime::PipelineActivationDtype::Float32,
-                            )
-                            .unwrap()
-                            .with_completion_policy(
-                                CommunicationCompletionPolicy::new(
-                                    std::time::Duration::from_secs(2),
-                                    CompletionCancellationMode::QuarantineUntilComplete,
-                                )
-                                .unwrap(),
-                            ),
-                            NumericDirectPartitionAdmission,
-                        )
-                        .unwrap();
-                        let selected = eredu_architectures::partitioned_execution::select_direct_partitioned_admission(
-                            admission,
-                            selected_base,
-                            &capabilities,
-                        )
-                        .unwrap();
-                        assert_eq!(
-                            eredu_architectures::partitioned_execution::dense_decoder_partitioned_production_route(
-                                &inspection,
-                                &selected,
-                            ),
-                            eredu_architectures::partitioned_execution::DenseDecoderPartitionedProductionRoute::NeutralPartitioned,
-                        );
+                        let sources = partitioned_adapter::prepare(&inspection, topology, rank, true).unwrap();
                         let rank_topology = ParallelRankTopology::new(topology, rank).unwrap();
                         let layout = eredu_architectures::partitioned_execution::derive_partitioned_local_layout(
                             &description,
@@ -18676,17 +18475,7 @@ pub(crate) fn authoritative_partitioned_numeric_sessions_match_tp_pp_and_tp_pp_r
                             rank,
                             Arc::clone(&world),
                         );
-                        let mut executable = eredu_architectures::partitioned_execution::visit_resident_partitioned_architecture(
-                            &inspection,
-                            selected,
-                            store,
-                            &context,
-                            NumericResidentPartitionVisitor {
-                                world: Arc::clone(&world),
-                                context: context.clone(),
-                            },
-                        )
-                        .unwrap();
+                        let mut executable = partitioned_adapter::dense(sources, &context).unwrap();
                         let actual = inputs
                             .iter()
                             .enumerate()
@@ -19355,10 +19144,6 @@ fn assert_authoritative_routed_numeric_sessions(
     serialize_to_file(views, None, &artifact.path().join("model.safetensors")).unwrap();
     let inspection =
         Arc::new(eredu_architectures::configuration::inspect_artifact(artifact.path()).unwrap());
-    let selected_base = numeric_routed_partition_selection(&inspection);
-    let capabilities = numeric_partition_capabilities();
-    let store: eredu_checkpoint::store::SharedCheckpointSource =
-        Arc::new(eredu_checkpoint::store::SafetensorsWeightStore::open(artifact.path()).unwrap());
 
     for topology in topologies.iter().copied() {
         let world = Arc::new(NumericPartitionWorld::default());
@@ -19374,9 +19159,6 @@ fn assert_authoritative_routed_numeric_sessions(
             (0..topology.world_size())
                 .map(|rank| {
                     let inspection = Arc::clone(&inspection);
-                    let selected_base = selected_base.clone();
-                    let capabilities = capabilities.clone();
-                    let store = Arc::clone(&store);
                     let description = description.clone();
                     let inputs = inputs.clone();
                     let world = Arc::clone(&world);
@@ -19384,36 +19166,9 @@ fn assert_authoritative_routed_numeric_sessions(
                     let omit_zero_participant = Arc::clone(&omit_zero_participant);
                     let cache_path = cache_path.clone();
                     scope.spawn(move || {
-                        let admission = eredu_architectures::partitioned_execution::dispatch_partitioned_admission(
-                            &inspection,
-                            eredu_architectures::partitioned_execution::PartitionedSelectionRequest::new(
-                                topology,
-                                rank,
-                                1,
-                                8,
-                                eredu_runtime::PipelineActivationDtype::Float32,
-                            )
-                            .unwrap()
-                            .with_completion_policy(
-                                CommunicationCompletionPolicy::new(
-                                    std::time::Duration::from_secs(2),
-                                    CompletionCancellationMode::QuarantineUntilComplete,
-                                )
-                                .unwrap(),
-                            ),
-                            NumericRoutedPartitionAdmission,
-                        )
-                        .unwrap();
-                        let selected = eredu_architectures::partitioned_execution::select_routed_partitioned_admission(
-                            admission,
-                            selected_base,
-                            &capabilities,
-                        )
-                        .unwrap();
+                        let sources = partitioned_adapter::prepare(&inspection, topology, rank, true).unwrap();
                         assert_eq!(
-                            selected
-                                .requirements()
-                                .topology()
+                            sources.selected().execution().parallel_topology().unwrap()
                                 .expert_parallel_size(),
                             topology.expert(),
                         );
@@ -19435,25 +19190,9 @@ fn assert_authoritative_routed_numeric_sessions(
                             Arc::clone(&world),
                         );
                         let provider_calls = Arc::new(AtomicUsize::new(0));
-                        let visitor = NumericRoutedPartitionVisitor {
-                            world: Arc::clone(&world),
-                            context: context.clone(),
-                            provider_calls: Arc::clone(&provider_calls),
-                            omit_inactive,
-                        };
-                        let mut executable = if deepseek_v4 {
-                            eredu_architectures::partitioned_execution::visit_pooling_routed_partitioned_production::<
-                                NumericBackend,
-                                DeviceState<NumericBackend, NumericHybridLayerState>,
-                                _,
-                            >(&inspection, selected, store, &context, visitor)
-                        } else {
-                            eredu_architectures::partitioned_execution::visit_routed_partitioned_production::<
-                                NumericBackend,
-                                DeviceState<NumericBackend, NumericHybridLayerState>,
-                                _,
-                            >(&inspection, selected, store, &context, visitor)
-                        }
+                        let mut executable = partitioned_adapter::routed(
+                            sources, &context, Arc::clone(&provider_calls), omit_inactive,
+                        )
                         .unwrap_or_else(|error| {
                             panic!(
                                 "{label} topology {topology:?} rank {rank} construction: {error}"
@@ -19954,7 +19693,6 @@ struct NumericCompositeVisitor<'a> {
     context: &'a NumericContext,
     input: &'a eredu_runtime::PreparedModelInput<NumericTensor>,
     construction_started: bool,
-    addressable: bool,
     observer: Option<std::rc::Rc<std::cell::RefCell<CompositeObservation>>>,
 }
 
@@ -20029,15 +19767,18 @@ impl<'a>
     {
         assert!(self.construction_started);
         let layout = prepared.requirements().state_layout().clone();
-        let (architecture, source_architecture, contract, _, admission) = prepared.into_parts();
-        let mut session = construct_replicated_text_session::<_, NumericBackend, _>(
-            architecture,
-            source_architecture,
-            contract,
-            NumericReplicatedMechanisms::with_checkpoint(checkpoint),
-            self.context,
-        )
-        .map_err(|error| error.to_string())?;
+        let (mut session, facts) =
+            eredu_architectures::prepared_execution::construct_selected_composite_session::<
+                NumericBackend,
+                _,
+                _,
+                _,
+            >(
+                prepared,
+                NumericReplicatedMechanisms::with_checkpoint(checkpoint),
+                self.context,
+            )?;
+        let (_, _, admission) = facts.into_parts();
         let admitted = A::admit_prepared_input(&admission, self.input, &NumericInputInspector)
             .map_err(|error| error.to_string())?;
         let paired = eredu_architectures::composite_execution::PreparedCompositeInput::new(
@@ -20110,13 +19851,15 @@ impl<'a>
     {
         assert!(self.construction_started);
         let layout = prepared.requirements().state_layout().clone();
-        let (routed, _, admission) = prepared.into_parts();
-        verify_addressable_member_payloads(routed.addressable_members(), checkpoint.as_ref())?;
+        verify_addressable_member_payloads(
+            prepared.routed().addressable_members(),
+            checkpoint.as_ref(),
+        )?;
         macro_rules! run_session {
-            ($session:expr) => {{
+            ($session:expr, $admission:ident) => {{
                 let mut session = $session;
                 let admitted =
-                    A::admit_prepared_input(&admission, self.input, &NumericInputInspector)
+                    A::admit_prepared_input(&$admission, self.input, &NumericInputInspector)
                         .map_err(|error| error.to_string())?;
                 let paired = eredu_architectures::composite_execution::PreparedCompositeInput::new(
                     self.input, &admitted,
@@ -20151,7 +19894,7 @@ impl<'a>
                     })
                     .map_err(|error| error.to_string())?;
                     let admitted =
-                        A::admit_prepared_input(&admission, &input, &NumericInputInspector)
+                        A::admit_prepared_input(&$admission, &input, &NumericInputInspector)
                             .map_err(|error| error.to_string())?;
                     let paired =
                         eredu_architectures::composite_execution::PreparedCompositeInput::new(
@@ -20172,43 +19915,46 @@ impl<'a>
                 (outputs, state, session)
             }};
         }
-        if self.addressable {
-            let bank = numeric_addressable_gated_bank(
-                routed.plan(),
-                routed.catalog(),
-                routed.addressable_members(),
-                routed.routes_per_token(),
-                self.context,
-            )?;
-            let session = routed.construct_addressable_session::<NumericBackend, _, _, _>(
-                NumericReplicatedMechanisms::with_checkpoint(checkpoint),
-                bank,
-                NumericIndexedMovement,
-                self.context,
-            )?;
-            let (outputs, state, session) = run_session!(session);
-            let report = session
-                .execution_strategy()
-                .provider()
-                .bank_report()
-                .map_err(|error| error.to_string())?;
-            Ok(NumericReplicatedRun {
-                outputs,
-                state,
-                bank_report: Some(report),
-            })
-        } else {
-            let session = routed.construct_resident_session::<NumericBackend, _>(
-                NumericReplicatedMechanisms::with_checkpoint(checkpoint),
-                self.context,
-            )?;
-            let (outputs, state, _) = run_session!(session);
-            Ok(NumericReplicatedRun {
-                outputs,
-                state,
-                bank_report: None,
-            })
-        }
+        eredu_architectures::prepared_execution::construct_selected_routed_composite_session(
+            prepared,
+            NumericReplicatedMechanisms::with_checkpoint(checkpoint),
+            self.context,
+            |prepared, _| {
+                let bank = numeric_addressable_gated_bank(
+                    prepared.plan(),
+                    prepared.catalog(),
+                    prepared.addressable_members(),
+                    prepared.routes_per_token(),
+                    self.context,
+                )?;
+                Ok::<_, String>((bank, NumericIndexedMovement))
+            },
+            (),
+            |_, session, facts| {
+                let (_, _, admission) = facts.into_parts();
+                let (outputs, state, _) = run_session!(session, admission);
+                Ok(NumericReplicatedRun {
+                    outputs,
+                    state,
+                    bank_report: None,
+                })
+            },
+            |_, session, facts| {
+                let (_, _, admission) = facts.into_parts();
+                let (outputs, state, session) = run_session!(session, admission);
+                let report = session
+                    .execution_strategy()
+                    .provider()
+                    .bank_report()
+                    .map_err(|error| error.to_string())?;
+                Ok(NumericReplicatedRun {
+                    outputs,
+                    state,
+                    bank_report: Some(report),
+                })
+            },
+        )
+        .map_err(|error| error.to_string())
     }
 }
 
@@ -20221,13 +19967,11 @@ struct NumericReplicatedRun {
 struct NumericRoutedVisitor<'a> {
     context: &'a NumericContext,
     tokens: &'a NumericTensor,
-    addressable: bool,
 }
 
 struct NumericRelu2RoutedVisitor<'a> {
     context: &'a NumericContext,
     tokens: &'a NumericTensor,
-    addressable: bool,
 }
 
 impl<'a>
@@ -20279,38 +20023,42 @@ impl<'a>
         }
 
         verify_addressable_member_payloads(prepared.addressable_members(), checkpoint.as_ref())?;
-        if self.addressable {
-            let bank =
-                numeric_addressable_relu2_bank(prepared.plan(), prepared.catalog(), self.context)?;
-            let session = prepared.construct_addressable_session::<NumericBackend, _, _, _>(
-                NumericReplicatedMechanisms::with_checkpoint(checkpoint),
-                bank,
-                NumericIndexedMovement,
-                self.context,
-            )?;
-            let (outputs, state, session) = run_session!(session);
-            let bank_report = session
-                .execution_strategy()
-                .provider()
-                .bank_report()
-                .map_err(|error| error.to_string())?;
-            Ok(NumericReplicatedRun {
-                outputs,
-                state,
-                bank_report: Some(bank_report),
-            })
-        } else {
-            let session = prepared.construct_resident_session::<NumericBackend, _>(
-                NumericReplicatedMechanisms::with_checkpoint(checkpoint),
-                self.context,
-            )?;
-            let (outputs, state, _) = run_session!(session);
-            Ok(NumericReplicatedRun {
-                outputs,
-                state,
-                bank_report: None,
-            })
-        }
+        eredu_architectures::prepared_execution::construct_selected_relu2_session(
+            prepared,
+            NumericReplicatedMechanisms::with_checkpoint(checkpoint),
+            self.context,
+            |prepared, _| {
+                let bank = numeric_addressable_relu2_bank(
+                    prepared.plan(),
+                    prepared.catalog(),
+                    self.context,
+                )?;
+                Ok::<_, String>((bank, NumericIndexedMovement))
+            },
+            (),
+            |_, session, _| {
+                let (outputs, state, _) = run_session!(session);
+                Ok(NumericReplicatedRun {
+                    outputs,
+                    state,
+                    bank_report: None,
+                })
+            },
+            |_, session, _| {
+                let (outputs, state, session) = run_session!(session);
+                let report = session
+                    .execution_strategy()
+                    .provider()
+                    .bank_report()
+                    .map_err(|error| error.to_string())?;
+                Ok(NumericReplicatedRun {
+                    outputs,
+                    state,
+                    bank_report: Some(report),
+                })
+            },
+        )
+        .map_err(|error| error.to_string())
     }
 }
 
@@ -20363,43 +20111,44 @@ impl<'a>
         }
 
         verify_addressable_member_payloads(prepared.addressable_members(), checkpoint.as_ref())?;
-        if self.addressable {
-            let bank = numeric_addressable_gated_bank(
-                prepared.plan(),
-                prepared.catalog(),
-                prepared.addressable_members(),
-                prepared.routes_per_token(),
-                self.context,
-            )?;
-            let session = prepared.construct_addressable_session::<NumericBackend, _, _, _>(
-                NumericReplicatedMechanisms::with_checkpoint(checkpoint),
-                bank,
-                NumericIndexedMovement,
-                self.context,
-            )?;
-            let (outputs, state, session) = run_session!(session);
-            let bank_report = session
-                .execution_strategy()
-                .provider()
-                .bank_report()
-                .map_err(|error| error.to_string())?;
-            Ok(NumericReplicatedRun {
-                outputs,
-                state,
-                bank_report: Some(bank_report),
-            })
-        } else {
-            let session = prepared.construct_resident_session::<NumericBackend, _>(
-                NumericReplicatedMechanisms::with_checkpoint(checkpoint),
-                self.context,
-            )?;
-            let (outputs, state, _) = run_session!(session);
-            Ok(NumericReplicatedRun {
-                outputs,
-                state,
-                bank_report: None,
-            })
-        }
+        eredu_architectures::prepared_execution::construct_selected_gated_session(
+            prepared,
+            NumericReplicatedMechanisms::with_checkpoint(checkpoint),
+            self.context,
+            |prepared, _| {
+                let bank = numeric_addressable_gated_bank(
+                    prepared.plan(),
+                    prepared.catalog(),
+                    prepared.addressable_members(),
+                    prepared.routes_per_token(),
+                    self.context,
+                )?;
+                Ok::<_, String>((bank, NumericIndexedMovement))
+            },
+            (),
+            |_, session, _| {
+                let (outputs, state, _) = run_session!(session);
+                Ok(NumericReplicatedRun {
+                    outputs,
+                    state,
+                    bank_report: None,
+                })
+            },
+            |_, session, _| {
+                let (outputs, state, session) = run_session!(session);
+                let report = session
+                    .execution_strategy()
+                    .provider()
+                    .bank_report()
+                    .map_err(|error| error.to_string())?;
+                Ok(NumericReplicatedRun {
+                    outputs,
+                    state,
+                    bank_report: Some(report),
+                })
+            },
+        )
+        .map_err(|error| error.to_string())
     }
 }
 
@@ -20532,6 +20281,9 @@ pub(crate) struct ReferenceStageEvidence {
     pub(crate) payload_reads: Vec<ReferencePayloadRead>,
     pub(crate) lowering_kinds: Vec<String>,
     pub(crate) generated_companions: usize,
+    pub(crate) bound_parameters: BTreeMap<String, (Vec<i32>, Vec<u32>)>,
+    pub(crate) bounded_unit_acquisitions: Vec<usize>,
+    pub(crate) peak_bound_units: usize,
 }
 
 thread_local! {
@@ -20633,18 +20385,17 @@ impl<'a>
         );
         record_reference_family(prepared.effective_model_type());
         record_reference_stage("typed_architecture");
-        let mut modules = prepared.into_modules();
-        let architecture = modules.take_architecture();
-        let source_architecture = modules.take_source_architecture();
-        let contract = modules.take_contract();
-        let mut session = construct_replicated_text_session::<_, NumericBackend, _>(
-            architecture,
-            source_architecture,
-            contract,
-            NumericReplicatedMechanisms::with_checkpoint(checkpoint),
-            self.context,
-        )
-        .map_err(|error| error.to_string())?;
+        let mechanisms = if self.context.bind_checkpoint_values {
+            NumericReplicatedMechanisms::with_bound_checkpoint(checkpoint)
+        } else {
+            NumericReplicatedMechanisms::with_checkpoint(checkpoint)
+        };
+        let (mut session, _) =
+            eredu_architectures::prepared_execution::construct_selected_text_session::<
+                NumericBackend,
+                _,
+                _,
+            >(prepared, mechanisms, self.context)?;
         record_reference_stage("session_constructed");
         let prefill = session
             .prefill(self.tokens, None, self.context)
@@ -20674,45 +20425,15 @@ impl<'a>
     }
 }
 
-impl<'a> ReplicatedTextProfileDispatcher<NumericBackend> for NumericReplicatedVisitor<'a> {
-    type Output = NumericReplicatedRun;
-    type Error = String;
+struct NumericReplicatedStateProfiles;
+
+impl ReplicatedTextStateProfiles<NumericBackend> for NumericReplicatedStateProfiles {
     type StatelessState = DeviceState<NumericBackend, NumericHybridLayerState>;
     type AttentionState = DeviceState<NumericBackend, NumericHybridLayerState>;
     type ComponentState = DeviceState<NumericBackend, NumericHybridLayerState>;
     type AttentionComponentState = DeviceState<NumericBackend, NumericHybridLayerState>;
     type CompressedState = DeviceState<NumericBackend, NumericHybridLayerState>;
     type CompressedComponentState = DeviceState<NumericBackend, NumericHybridLayerState>;
-    type StatelessVisitor = Self;
-    type AttentionVisitor = Self;
-    type ComponentVisitor = Self;
-    type AttentionComponentVisitor = Self;
-    type CompressedVisitor = Self;
-    type CompressedComponentVisitor = Self;
-
-    fn into_stateless_visitor(self) -> Self::StatelessVisitor {
-        self
-    }
-
-    fn into_attention_visitor(self) -> Self::AttentionVisitor {
-        self
-    }
-
-    fn into_component_visitor(self) -> Self::ComponentVisitor {
-        self
-    }
-
-    fn into_attention_component_visitor(self) -> Self::AttentionComponentVisitor {
-        self
-    }
-
-    fn into_compressed_visitor(self) -> Self::CompressedVisitor {
-        self
-    }
-
-    fn into_compressed_component_visitor(self) -> Self::CompressedComponentVisitor {
-        self
-    }
 }
 
 fn execute_numeric_replicated_visitor(
@@ -20757,95 +20478,25 @@ fn execute_numeric_replicated_visitor_with_quantization(
         .collect::<Vec<_>>();
     serialize_to_file(views, None, &artifact.path().join("model.safetensors")).unwrap();
     let inspection = eredu_architectures::configuration::inspect_artifact(artifact.path()).unwrap();
-    let store: eredu_checkpoint::store::SharedCheckpointSource = std::sync::Arc::new(
-        eredu_checkpoint::store::SafetensorsWeightStore::open(artifact.path()).unwrap(),
-    );
-    execute_numeric_replicated_inspection(&inspection, store, context, tokens, quantization)
+    execute_numeric_replicated_inspection(&inspection, context, tokens, quantization)
 }
 
 fn execute_numeric_replicated_inspection(
     inspection: &eredu_core::ArtifactInspection<
         eredu_architectures::processor_plan::ArtifactArchitecturePlan,
     >,
-    store: eredu_checkpoint::store::SharedCheckpointSource,
     context: &NumericContext,
     tokens: &NumericTensor,
     quantization: Option<eredu_core::QuantizationRequest>,
 ) -> NumericReplicatedRun {
     reset_reference_stage_evidence(format!("{:?}", inspection.format()));
-    let requirements =
-        eredu_architectures::replicated_text::replicated_text_requirements(inspection).unwrap();
-    let lowerings = requirements
-        .parameters()
-        .iter()
-        .filter(|parameter| parameter.has_lowering_source())
-        .flat_map(|parameter| {
-            let mut values = vec![eredu_runtime::WeightLoweringCapability::new(
-                parameter
-                    .lowering_descriptor(parameter.native_executable())
-                    .unwrap(),
-                eredu_runtime::WeightLoweringKind::Direct,
-            )];
-            if let Some(target) =
-                quantization.and_then(|request| parameter.transform_target(request).unwrap())
-            {
-                values.push(eredu_runtime::WeightLoweringCapability::new(
-                    target.descriptor().clone(),
-                    eredu_runtime::WeightLoweringKind::Transform,
-                ));
-            }
-            values
-        })
-        .collect();
-    let state = eredu_runtime::StateMechanismCapabilities::new(
-        (0..requirements.state_layout().len()).flat_map(|layer| {
-            requirements
-                .state_layout()
-                .components(layer)
-                .unwrap()
-                .iter()
-                .cloned()
-                .map(move |component| {
-                    eredu_runtime::StateComponentMechanism::new(
-                        layer,
-                        component,
-                        Some(eredu_runtime::StateComponentPlacement::Device),
-                        None,
-                    )
-                })
-        }),
-    )
-    .with_transactions(true, true)
-    .with_reset(true);
-    let capabilities = eredu_runtime::BackendMechanismCapabilities::new(
-        eredu_nn::NeuralOperatorCapabilities::ALL,
-        lowerings,
-        vec![eredu_runtime::WeightResidencyMechanism::Resident],
-        state,
-    );
-    let mut request = eredu_runtime::ReplicatedTextSelectionRequest::new(
-        eredu_runtime::LayerWeightResidency::FullyResident,
-        eredu_runtime::CacheResidencyPolicy::Device,
-    );
-    if let Some(quantization) = quantization {
-        request = request.with_quantization(quantization);
-    }
-    let selected =
-        eredu_runtime::select_replicated_text_realization(&requirements, &request, &capabilities)
-            .unwrap();
-    let visitor = NumericReplicatedVisitor {
-        context,
-        tokens,
-        construction_started: false,
-    };
-    let run = dispatch_replicated_text_architecture(
-        inspection.architecture_plan(),
-        selected,
-        store,
-        context,
-        visitor,
+    let sources = prepared_adapter::prepare(
+        inspection,
+        &prepared_adapter::plan(quantization),
+        &prepared_adapter::NumericPreparationProvider { addressable: false },
     )
     .unwrap();
+    let run = prepared_adapter::replicated(sources, context, tokens).unwrap();
     let evidence = last_reference_stage_evidence();
     assert_eq!(
         evidence.stages,
@@ -20941,188 +20592,30 @@ fn execute_numeric_routed_visitor_with_quantization(
 
     let inspection = eredu_architectures::configuration::inspect_artifact(artifact.path()).unwrap();
     let requirements = eredu_architectures::routed_text_requirements(&inspection).unwrap();
-    let lowerings = requirements
-        .text()
-        .parameters()
-        .iter()
-        .filter(|parameter| parameter.source_encoding().is_some())
-        .flat_map(|parameter| {
-            let descriptor = parameter
-                .lowering_descriptor(parameter.native_executable())
-                .unwrap();
-            let kind = if matches!(
-                parameter.presence(),
-                eredu_runtime::ReplicatedTextParameterPresence::Derived { .. }
-            ) {
-                eredu_runtime::WeightLoweringKind::Derived
-            } else {
-                eredu_runtime::WeightLoweringKind::Direct
-            };
-            let mut values = vec![eredu_runtime::WeightLoweringCapability::new(
-                descriptor, kind,
-            )];
-            if let Some(target) =
-                quantization.and_then(|request| parameter.transform_target(request).unwrap())
-            {
-                let kind = if matches!(
-                    parameter.presence(),
-                    eredu_runtime::ReplicatedTextParameterPresence::Derived { .. }
-                ) {
-                    eredu_runtime::WeightLoweringKind::DerivedTransform
-                } else {
-                    eredu_runtime::WeightLoweringKind::Transform
-                };
-                values.push(eredu_runtime::WeightLoweringCapability::new(
-                    target.descriptor().clone(),
-                    kind,
-                ));
-            }
-            values
-        })
-        .collect();
-    let state = eredu_runtime::StateMechanismCapabilities::new(
-        (0..requirements.text().state_layout().len()).flat_map(|layer| {
-            requirements
-                .text()
-                .state_layout()
-                .components(layer)
-                .unwrap()
-                .iter()
-                .cloned()
-                .map(move |component| {
-                    eredu_runtime::StateComponentMechanism::new(
-                        layer,
-                        component,
-                        Some(eredu_runtime::StateComponentPlacement::Device),
-                        None,
-                    )
-                })
-        }),
-    )
-    .with_transactions(true, true)
-    .with_reset(true);
-    let mut capabilities = eredu_runtime::BackendMechanismCapabilities::new(
-        eredu_nn::NeuralOperatorCapabilities::ALL,
-        lowerings,
-        vec![eredu_runtime::WeightResidencyMechanism::Resident],
-        state,
-    )
-    .with_grouped_operations([
-        eredu_runtime::GroupedOperationRequirement::GatedProduct,
-        eredu_runtime::GroupedOperationRequirement::Relu2,
-    ]);
+    let mut plan = prepared_adapter::plan(quantization);
     if addressable {
-        capabilities = capabilities
-            .with_indexed_movement(true)
-            .with_addressable_storage(eredu_runtime::AddressableStorageCapabilities::new(
-                true,
-                true,
-                true,
-                u64::MAX,
-            ));
-    }
-    let mut text_request = eredu_runtime::ReplicatedTextSelectionRequest::new(
-        eredu_runtime::LayerWeightResidency::FullyResident,
-        eredu_runtime::CacheResidencyPolicy::Device,
-    );
-    if let Some(quantization) = quantization {
-        text_request = text_request.with_quantization(quantization);
-    }
-    let weights = if addressable {
         let member_bytes = requirements
             .catalog()
             .units()
             .iter()
             .filter_map(ExpertResidencyUnit::byte_len)
             .max()
-            .expect("routed catalog has exact member geometry");
-        let options = eredu_runtime::ParameterBankLoadOptions::new(
-            eredu_core::residency::OffloadConfig::new(Some(member_bytes), Some(member_bytes), 2)
-                .unwrap(),
+            .expect("routed fixture has exact member geometry");
+        plan = plan.with_expert_cache(Some(eredu_core::ExpertCachePlan::new(
+            Some(member_bytes),
+            Some(member_bytes),
             member_bytes.checked_mul(2).unwrap(),
             member_bytes,
-        )
-        .unwrap();
-        eredu_runtime::WeightResidency::with_independent_parameter_banks(
-            eredu_runtime::OrdinaryWeightResidency::FullyResident,
-            options,
-        )
-    } else {
-        eredu_runtime::WeightResidency::fully_resident()
-    };
-    let request =
-        eredu_architectures::RoutedTextSelectionRequest::new(text_request, weights).unwrap();
-    let selected =
-        eredu_architectures::select_routed_text_realization(&requirements, &request, &capabilities)
-            .unwrap();
-    let store: eredu_checkpoint::store::SharedCheckpointSource = std::sync::Arc::new(
-        eredu_checkpoint::store::SafetensorsWeightStore::open(artifact.path()).unwrap(),
-    );
-    let uses_pooling_attention = selected
-        .text()
-        .state()
-        .components()
-        .iter()
-        .any(|component| {
-            matches!(
-                component.component().role(),
-                eredu_core::cache::StateComponentRole::Fixed(
-                    eredu_core::cache::StateTensorRole::Pooling { .. }
-                )
-            )
-        });
-    if requirements.plan().relu2().is_some() {
-        eredu_architectures::visit_relu2_routed_text_architecture::<
-            NumericBackend,
-            DeviceState<NumericBackend, NumericHybridLayerState>,
-            _,
-        >(
-            &inspection,
-            selected,
-            store,
-            context,
-            NumericRelu2RoutedVisitor {
-                context,
-                tokens,
-                addressable,
-            },
-        )
-        .unwrap()
-    } else if uses_pooling_attention {
-        eredu_architectures::visit_pooling_routed_text_architecture::<
-            NumericBackend,
-            DeviceState<NumericBackend, NumericHybridLayerState>,
-            _,
-        >(
-            &inspection,
-            selected,
-            store,
-            context,
-            NumericRoutedVisitor {
-                context,
-                tokens,
-                addressable,
-            },
-        )
-        .unwrap()
-    } else {
-        eredu_architectures::visit_gated_routed_text_architecture::<
-            NumericBackend,
-            DeviceState<NumericBackend, NumericHybridLayerState>,
-            _,
-        >(
-            &inspection,
-            selected,
-            store,
-            context,
-            NumericRoutedVisitor {
-                context,
-                tokens,
-                addressable,
-            },
-        )
-        .unwrap()
+            eredu_core::residency::CacheEvictionPolicy::LeastRecentlyUsed,
+        )));
     }
+    let sources = prepared_adapter::prepare(
+        &inspection,
+        &plan,
+        &prepared_adapter::NumericPreparationProvider { addressable },
+    )
+    .unwrap();
+    prepared_adapter::routed(sources, context, tokens).unwrap()
 }
 
 fn execute_numeric_composite_visitor(
@@ -21145,106 +20638,11 @@ fn execute_numeric_composite_visitor_with_observer(
     let inspection = eredu_architectures::configuration::inspect_artifact(artifact.path()).unwrap();
     let requirements =
         eredu_architectures::replicated_text::composite_text_requirements(&inspection).unwrap();
-    let lowerings = requirements
-        .execution()
-        .parameters()
-        .iter()
-        .filter(|parameter| parameter.has_lowering_source())
-        .map(|parameter| {
-            let kind = if matches!(
-                parameter.presence(),
-                eredu_runtime::ReplicatedTextParameterPresence::Derived { .. }
-            ) {
-                eredu_runtime::WeightLoweringKind::Derived
-            } else {
-                eredu_runtime::WeightLoweringKind::Direct
-            };
-            eredu_runtime::WeightLoweringCapability::new(
-                parameter
-                    .lowering_descriptor(parameter.native_executable())
-                    .unwrap(),
-                kind,
-            )
-        })
-        .collect();
-    let state = eredu_runtime::StateMechanismCapabilities::new(
-        (0..requirements.state_layout().len()).flat_map(|layer| {
-            requirements
-                .state_layout()
-                .components(layer)
-                .unwrap()
-                .iter()
-                .cloned()
-                .map(move |component| {
-                    eredu_runtime::StateComponentMechanism::new(
-                        layer,
-                        component,
-                        Some(eredu_runtime::StateComponentPlacement::Device),
-                        None,
-                    )
-                })
-        }),
-    )
-    .with_transactions(true, true)
-    .with_reset(true);
-    let mut capabilities = eredu_runtime::BackendMechanismCapabilities::new(
-        eredu_nn::NeuralOperatorCapabilities::ALL,
-        lowerings,
-        vec![eredu_runtime::WeightResidencyMechanism::Resident],
-        state,
-    )
-    .with_grouped_operations([
-        eredu_runtime::GroupedOperationRequirement::GatedProduct,
-        eredu_runtime::GroupedOperationRequirement::GatedProductTensorParallelPartial,
-        eredu_runtime::GroupedOperationRequirement::Relu2,
-        eredu_runtime::GroupedOperationRequirement::Relu2TensorParallelPartial,
-    ]);
+    let mut plan = prepared_adapter::plan(None);
     if addressable {
-        capabilities = capabilities
-            .with_indexed_movement(true)
-            .with_addressable_storage(eredu_runtime::AddressableStorageCapabilities::new(
-                true,
-                true,
-                true,
-                u64::MAX,
-            ));
-    }
-    let execution_request = eredu_runtime::ReplicatedTextSelectionRequest::new(
-        eredu_runtime::LayerWeightResidency::FullyResident,
-        eredu_runtime::CacheResidencyPolicy::Device,
-    );
-    let processor_request = eredu_runtime::ProcessorSelectionRequest::new(
-        input.parts().iter().map(|part| part.modality()),
-    )
-    .with_prepared_tensors(true)
-    .with_projected_modalities(input.parts().iter().filter_map(|part| {
-        matches!(
-            part.payload(),
-            eredu_runtime::PreparedInputPayload::Embeddings(_)
-        )
-        .then_some(part.modality())
-    }));
-    let processor_capabilities = eredu_runtime::MediaPrimitiveCapabilities::new(
-        [],
-        [
-            eredu_core::InputModality::Text,
-            eredu_core::InputModality::Image,
-            eredu_core::InputModality::Video,
-            eredu_core::InputModality::Audio,
-        ],
-        [
-            eredu_core::InputModality::Text,
-            eredu_core::InputModality::Image,
-            eredu_core::InputModality::Video,
-            eredu_core::InputModality::Audio,
-        ],
-        [],
-        i32::MAX as u64,
-    );
-    let weights = if addressable {
         let routed = requirements
             .routed_execution()
-            .expect("addressable composite test requires routed requirements");
+            .expect("addressable composite fixture requires routed requirements");
         let member_bytes = routed
             .catalog()
             .units()
@@ -21252,50 +20650,21 @@ fn execute_numeric_composite_visitor_with_observer(
             .filter_map(ExpertResidencyUnit::byte_len)
             .max()
             .unwrap();
-        let options = eredu_runtime::ParameterBankLoadOptions::new(
-            eredu_core::residency::OffloadConfig::new(Some(member_bytes), Some(member_bytes), 2)
-                .unwrap(),
+        plan = plan.with_expert_cache(Some(eredu_core::ExpertCachePlan::new(
+            Some(member_bytes),
+            Some(member_bytes),
             member_bytes.checked_mul(2).unwrap(),
             member_bytes,
-        )
-        .unwrap();
-        eredu_runtime::WeightResidency::with_independent_parameter_banks(
-            eredu_runtime::OrdinaryWeightResidency::FullyResident,
-            options,
-        )
-    } else {
-        eredu_runtime::WeightResidency::fully_resident()
-    };
-    let selected = eredu_architectures::replicated_text::select_composite_text_realization(
-        &requirements,
-        &execution_request,
-        weights,
-        &processor_request,
-        &capabilities,
-        &processor_capabilities,
+            eredu_core::residency::CacheEvictionPolicy::LeastRecentlyUsed,
+        )));
+    }
+    let sources = prepared_adapter::prepare(
+        &inspection,
+        &plan,
+        &prepared_adapter::NumericPreparationProvider { addressable },
     )
     .unwrap();
-    let store: eredu_checkpoint::store::SharedCheckpointSource = std::sync::Arc::new(
-        eredu_checkpoint::store::SafetensorsWeightStore::open(artifact.path()).unwrap(),
-    );
-    eredu_architectures::replicated_text::visit_composite_text_architecture::<
-        NumericBackend,
-        DeviceState<NumericBackend, NumericHybridLayerState>,
-        _,
-    >(
-        requirements,
-        selected,
-        store,
-        context,
-        NumericCompositeVisitor {
-            context,
-            input,
-            construction_started: false,
-            addressable,
-            observer,
-        },
-    )
-    .unwrap()
+    prepared_adapter::composite(sources, context, input, observer).unwrap()
 }
 
 fn numeric_composite_artifact(config: &serde_json::Value) -> tempfile::TempDir {
@@ -22885,7 +22254,22 @@ fn heterogeneous_replicated_configs() -> Vec<serde_json::Value> {
 
 #[test]
 fn heterogeneous_replicated_visitors_match_established_numeric_family_models() {
-    let cases = heterogeneous_replicated_configs();
+    let mut cases = heterogeneous_replicated_configs();
+    // Together with the mixed schedules, these homogeneous schedules exercise
+    // all six exact state profiles through the shared production adapter.
+    let mut attention = cases[0].clone();
+    attention["layer_types"] = serde_json::json!(["full_attention", "full_attention"]);
+    cases.push(attention);
+    let mut fixed = cases[0].clone();
+    fixed["layer_types"] = serde_json::json!(["conv", "conv"]);
+    cases.push(fixed);
+    let mut compressed = cases[1].clone();
+    compressed["linear_attn_config"]["kda_layers"] = serde_json::json!([]);
+    compressed["linear_attn_config"]["full_attn_layers"] = serde_json::json!([1, 2]);
+    cases.push(compressed);
+    let mut stateless = cases[2].clone();
+    stateless["hybrid_override_pattern"] = "--".into();
+    cases.push(stateless);
     for config in cases {
         let context = NumericContext::default();
         let tokens = NumericTensor::token_ids(&[1, 3, 2]);
@@ -23041,48 +22425,14 @@ pub(crate) fn new_architecture_uses_production_selection_materialization_and_ses
             .unwrap()
             .with_extension_architecture_identity("sink_decoder_fixture")
             .unwrap();
-    let lowerings = requirements
-        .parameters()
-        .iter()
-        .filter(|parameter| parameter.has_lowering_source())
-        .map(|parameter| {
-            eredu_runtime::WeightLoweringCapability::new(
-                parameter
-                    .lowering_descriptor(parameter.native_executable())
-                    .unwrap(),
-                eredu_runtime::WeightLoweringKind::Direct,
-            )
-        })
-        .collect();
-    let state = eredu_runtime::StateMechanismCapabilities::new(
-        (0..requirements.state_layout().len()).flat_map(|layer| {
-            requirements
-                .state_layout()
-                .components(layer)
-                .unwrap()
-                .iter()
-                .cloned()
-                .map(move |component| {
-                    eredu_runtime::StateComponentMechanism::new(
-                        layer,
-                        component,
-                        Some(eredu_runtime::StateComponentPlacement::Device),
-                        None,
-                    )
-                })
-        }),
-    )
-    .with_transactions(true, true)
-    .with_reset(true);
-    let capabilities = eredu_runtime::BackendMechanismCapabilities::new(
-        eredu_nn::NeuralOperatorCapabilities::ALL,
-        lowerings,
-        vec![eredu_runtime::WeightResidencyMechanism::Resident],
-        state,
-    );
     let request = eredu_runtime::ReplicatedTextSelectionRequest::new(
         LayerWeightResidency::FullyResident,
         eredu_runtime::CacheResidencyPolicy::Device,
+    );
+    let capabilities = eredu_runtime::synthesize_replicated_text_capabilities(
+        &requirements,
+        &request,
+        &NumericMechanismSupport::default(),
     );
     let selected =
         eredu_runtime::select_replicated_text_realization(&requirements, &request, &capabilities)
@@ -23275,20 +22625,9 @@ pub(crate) fn run_reference_conformance_gguf_replicated_production() -> Referenc
         .unwrap();
 
     let inspection = eredu_architectures::configuration::inspect_artifact(&path).unwrap();
-    let plan = inspection.architecture_plan().gguf_plan().unwrap();
-    let store = eredu_checkpoint::gguf_store::GgufWeightStore::builder()
-        .add_checkpoint(
-            inspection.gguf_checkpoint().unwrap().clone(),
-            plan.checkpoint(),
-            plan.tensor_mapping(),
-        )
-        .unwrap()
-        .build()
-        .unwrap();
     let context = NumericContext::default();
     let run = execute_numeric_replicated_inspection(
         &inspection,
-        std::sync::Arc::new(store),
         &context,
         &NumericTensor::token_ids(&[1, 3, 2]),
         None,
@@ -26053,53 +25392,17 @@ fn run_numeric_composite_partitions(
     let artifact = numeric_composite_artifact(config);
     let inspection =
         Arc::new(eredu_architectures::configuration::inspect_artifact(artifact.path()).unwrap());
-    let requirements =
-        eredu_architectures::replicated_text::composite_text_requirements(&inspection).unwrap();
-    let selected_base = numeric_composite_selection(&requirements, &inputs[0]);
     let description = numeric_composite_parameter_description(config);
-    let capabilities = numeric_partition_capabilities();
     let world = Arc::new(NumericPartitionWorld::default());
     let results = std::thread::scope(|scope| {
         (0..topology.world_size())
             .map(|rank| {
                 let inspection = Arc::clone(&inspection);
-                let selected_base = selected_base.clone();
-                let capabilities = capabilities.clone();
                 let description = description.clone();
                 let inputs = inputs.to_vec();
                 let world = Arc::clone(&world);
                 scope.spawn(move || {
-                    let admission = eredu_architectures::partitioned_execution::dispatch_partitioned_admission(
-                        &inspection,
-                        eredu_architectures::partitioned_execution::PartitionedSelectionRequest::new(
-                            topology,
-                            rank,
-                            1,
-                            8,
-                            eredu_runtime::PipelineActivationDtype::Float32,
-                        )
-                        .unwrap()
-                        .with_completion_policy(
-                            CommunicationCompletionPolicy::new(
-                                std::time::Duration::from_secs(2),
-                                CompletionCancellationMode::QuarantineUntilComplete,
-                            )
-                            .unwrap(),
-                        ),
-                        NumericCompositePartitionAdmission,
-                    )
-                    .map_err(|error| error.to_string())?;
-                    let selected = eredu_architectures::partitioned_execution::select_composite_partitioned_admission(
-                        admission,
-                        selected_base,
-                        &capabilities,
-                    )
-                    .map_err(|error| error.to_string())?;
-                    if eredu_architectures::composite_partitioned::composite_partitioned_production_decision(&selected)
-                        != eredu_architectures::composite_partitioned::CompositePartitionedProductionDecision::Resident
-                    {
-                        return Err("numeric composite fixture was not selected resident".into());
-                    }
+                    let sources = partitioned_adapter::prepare(&inspection, topology, rank, false)?;
                     let rank_topology = ParallelRankTopology::new(topology, rank).unwrap();
                     let layout = eredu_architectures::partitioned_execution::derive_partitioned_local_layout(
                         &description,
@@ -26107,19 +25410,7 @@ fn run_numeric_composite_partitions(
                     )
                     .map_err(|error| error.to_string())?;
                     let context = NumericContext::with_partition(layout, rank, Arc::clone(&world));
-                    let mut executable = eredu_architectures::composite_partitioned::visit_authoritative_composite_partition::<
-                        NumericBackend,
-                        DeviceState<NumericBackend, NumericHybridLayerState>,
-                        _,
-                    >(
-                        selected,
-                        &context,
-                        NumericCompositePartitionVisitor {
-                            world,
-                            context: context.clone(),
-                        },
-                    )
-                    .map_err(|error| error.to_string())?;
+                    let mut executable = partitioned_adapter::composite(sources, &context)?;
                     inputs
                         .iter()
                         .enumerate()
@@ -26160,50 +25451,19 @@ fn run_numeric_composite_partitions_observed(
     let artifact = numeric_composite_artifact(config);
     let inspection =
         Arc::new(eredu_architectures::configuration::inspect_artifact(artifact.path()).unwrap());
-    let requirements =
-        eredu_architectures::replicated_text::composite_text_requirements(&inspection).unwrap();
-    let selected_base = numeric_composite_selection(&requirements, &inputs[0]);
     let description = numeric_composite_parameter_description(config);
-    let capabilities = numeric_partition_capabilities();
     let world = Arc::new(NumericPartitionWorld::default());
     let results = std::thread::scope(|scope| {
         (0..topology.world_size())
             .map(|rank| {
                 let inspection = Arc::clone(&inspection);
-                let selected_base = selected_base.clone();
-                let capabilities = capabilities.clone();
                 let description = description.clone();
                 let inputs = inputs.to_vec();
                 let world = Arc::clone(&world);
                 let zero_path = zero_path.map(str::to_owned);
                 let fail_path = fail_path.map(str::to_owned);
                 scope.spawn(move || {
-                    let admission = eredu_architectures::partitioned_execution::dispatch_partitioned_admission(
-                        &inspection,
-                        eredu_architectures::partitioned_execution::PartitionedSelectionRequest::new(
-                            topology,
-                            rank,
-                            1,
-                            8,
-                            eredu_runtime::PipelineActivationDtype::Float32,
-                        )
-                        .unwrap()
-                        .with_completion_policy(
-                            CommunicationCompletionPolicy::new(
-                                std::time::Duration::from_secs(2),
-                                CompletionCancellationMode::QuarantineUntilComplete,
-                            )
-                            .unwrap(),
-                        ),
-                        NumericCompositePartitionAdmission,
-                    )
-                    .unwrap();
-                    let selected = eredu_architectures::partitioned_execution::select_composite_partitioned_admission(
-                        admission,
-                        selected_base,
-                        &capabilities,
-                    )
-                    .unwrap();
+                    let sources = partitioned_adapter::prepare(&inspection, topology, rank, false).unwrap();
                     let rank_topology = ParallelRankTopology::new(topology, rank).unwrap();
                     let layout = eredu_architectures::partitioned_execution::derive_partitioned_local_layout(
                         &description,
@@ -26211,19 +25471,7 @@ fn run_numeric_composite_partitions_observed(
                     )
                     .unwrap();
                     let context = NumericContext::with_partition(layout, rank, Arc::clone(&world));
-                    let mut executable = eredu_architectures::composite_partitioned::visit_authoritative_composite_partition::<
-                        NumericBackend,
-                        DeviceState<NumericBackend, NumericHybridLayerState>,
-                        _,
-                    >(
-                        selected,
-                        &context,
-                        NumericCompositePartitionVisitor {
-                            world,
-                            context: context.clone(),
-                        },
-                    )
-                    .unwrap();
+                    let mut executable = partitioned_adapter::composite(sources, &context).unwrap();
                     let mut observer = NumericLifecycleObserver {
                         zero_path,
                         replacement_value,

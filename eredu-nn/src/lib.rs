@@ -16,6 +16,8 @@ pub use eredu_nn_macros::Parameterized;
 
 /// Reusable patch projection and multi-axis position operations.
 pub mod multimodal;
+/// Checked tensor-independent normalization and mask geometry.
+pub mod operation_geometry;
 /// Pure sequence layouts shared by patch-based encoders.
 pub mod sequence_layout;
 
@@ -3653,6 +3655,8 @@ pub trait NeuralBackend: Sized + 'static {
         ))
     }
     /// Applies SiLU gating followed by grouped RMS normalization and scale.
+    /// Input and gate shapes must match; positive groups must divide the final
+    /// feature axis, and epsilon must be finite and strictly positive.
     fn gated_group_rms_norm(
         input: &Self::Tensor,
         gate: &Self::Tensor,
@@ -3666,7 +3670,8 @@ pub trait NeuralBackend: Sized + 'static {
             "gated grouped RMS normalization is not implemented by this backend",
         ))
     }
-    /// Applies L2 normalization over the final axis.
+    /// Applies `input / sqrt(sum(input * input) + epsilon)` over the final axis.
+    /// Epsilon must be finite and strictly positive; it is additive, not a clamp.
     fn l2_normalize(
         input: &Self::Tensor,
         epsilon: f32,
@@ -3679,6 +3684,8 @@ pub trait NeuralBackend: Sized + 'static {
     }
     /// Applies grouped RMS normalization to `input`, multiplies by a learned
     /// scale, and then modulates the result by `silu(gate)`.
+    /// Input and gate shapes must match; positive groups must divide the final
+    /// feature axis, and epsilon must be finite and strictly positive.
     fn silu_gated_group_rms_norm(
         input: &Self::Tensor,
         gate: &Self::Tensor,
@@ -3855,6 +3862,7 @@ pub trait NeuralBackend: Sized + 'static {
         ))
     }
     /// Applies RMS normalization without a learned scale.
+    /// The final feature axis must be nonempty, with finite, positive epsilon.
     fn rms_norm_without_weight(
         input: &Self::Tensor,
         epsilon: f32,
@@ -3866,6 +3874,7 @@ pub trait NeuralBackend: Sized + 'static {
         ))
     }
     /// Applies RMS normalization with a caller-owned learned scale.
+    /// The final feature axis must be nonempty, with finite, positive epsilon.
     ///
     /// The default keeps the operation portable by composing weightless
     /// normalization and multiplication. Backends may override it with a
@@ -3906,6 +3915,8 @@ pub trait NeuralBackend: Sized + 'static {
         context: &<Self::Tensor as Tensor>::Context,
     ) -> Result<Self::Tensor, Error>;
     /// Builds the backend-native boolean causal mask used for a prefill.
+    /// `window` is the inclusive maximum backward distance, not a token count:
+    /// zero admits only the current position and one also admits its predecessor.
     ///
     /// The returned value remains a lazy/backend-owned tensor. Calling this
     /// method must not synchronize or materialize mask contents on the host.

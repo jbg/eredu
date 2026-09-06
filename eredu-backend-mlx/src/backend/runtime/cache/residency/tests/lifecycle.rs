@@ -1,4 +1,86 @@
 #[test]
+fn detached_host_demotion_worker_keeps_active_request_owned() {
+    let worker = super::HostDemotionWorker::new().unwrap();
+    let retained = Arc::new(());
+    let witness = Arc::downgrade(&retained);
+    let (started_tx, started_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let (finished_tx, finished_rx) = mpsc::channel();
+    assert!(worker
+        .sender
+        .send(super::HostDemotionRequest::Pause {
+            started: started_tx,
+            release: release_rx,
+            retained,
+            finished: finished_tx,
+        })
+        .is_ok());
+    started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    let (dropped_tx, dropped_rx) = mpsc::channel();
+    thread::spawn(move || {
+        drop(worker);
+        let _ = dropped_tx.send(());
+    });
+    let dropped_before_release = dropped_rx.recv_timeout(Duration::from_secs(1));
+    let request_still_owned = witness.upgrade().is_some();
+    release_tx.send(()).unwrap();
+    dropped_before_release.unwrap();
+    assert!(request_still_owned);
+    finished_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(witness.upgrade().is_none());
+}
+
+#[test]
+fn manager_drop_does_not_lock_worker_retained_state_and_final_owner_cleans_files() {
+    let directory = tempfile::tempdir().unwrap();
+    let location = missing_location(directory.path(), "ephemeral.safetensors");
+    fs::write(&location.path, b"owned until the final state retires").unwrap();
+    let path = location.path.clone();
+    let manager =
+        CacheResidencyManager::new(PagedCacheOptions::new(1, 64, 64, 1).unwrap()).unwrap();
+    {
+        let mut state = manager.lock().unwrap();
+        insert_test_record(
+            &mut state,
+            CacheBlockRecord {
+                physical: MlxCacheBlockStorage::disk(disk_test_id(0), location),
+                bytes: 0,
+                shapes: [vec![1], vec![1]],
+                dtypes: ["Float32".into(), "Float32".into()],
+                imported: false,
+            },
+            false,
+            0,
+        );
+    }
+    let retained_state = Arc::clone(&manager.inner.state);
+    let (locked_tx, locked_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let (finished_tx, finished_rx) = mpsc::channel();
+    thread::spawn(move || {
+        let state = retained_state.lock().unwrap();
+        let _ = locked_tx.send(());
+        let _ = release_rx.recv();
+        drop(state);
+        drop(retained_state);
+        let _ = finished_tx.send(());
+    });
+    locked_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    let (dropped_tx, dropped_rx) = mpsc::channel();
+    thread::spawn(move || {
+        drop(manager);
+        let _ = dropped_tx.send(());
+    });
+    let dropped_before_release = dropped_rx.recv_timeout(Duration::from_secs(1));
+    let file_still_owned = path.exists();
+    release_tx.send(()).unwrap();
+    dropped_before_release.unwrap();
+    assert!(file_still_owned);
+    finished_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(!path.exists());
+}
+
+#[test]
 fn layer_truncation_clears_only_the_selected_pages_and_mutable_tail() {
     let manager = CacheResidencyManager::new(
         PagedCacheOptions::new(4, 1 << 20, 1 << 20, 1)

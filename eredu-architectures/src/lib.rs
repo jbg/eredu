@@ -28,13 +28,15 @@ pub use configuration::{GgufArchitecture, ModelKind};
 /// Architecture-owned external assistant inspection and preparation.
 pub mod external_assistant;
 pub use external_assistant::{
-    prepare_external_assistant, CompatibleExternalAssistantPreparation,
-    ExternalAssistantArchitecture, ExternalAssistantCheckpoint,
-    ExternalAssistantExecutionMechanisms, ExternalAssistantExecutorVisitor,
-    ExternalAssistantPreparation, ExternalAssistantPreparationVisitor,
-    ExternalAssistantTargetProfile, ExternalAssistantTensorPlacement, ExternalAssistantTransfer,
-    ExternalSpeculativeContract, ExternalSpeculativeContractRequest, MaterializedExternalAssistant,
-    MaterializedExternalAssistantVisitor, PreparedCompatibleExternalAssistant,
+    prepare_execution_plan_assistant, prepare_external_assistant,
+    CompatibleExternalAssistantPreparation, ExternalAssistantArchitecture,
+    ExternalAssistantCheckpoint, ExternalAssistantExecutionMechanisms,
+    ExternalAssistantExecutorVisitor, ExternalAssistantPreparation,
+    ExternalAssistantPreparationVisitor, ExternalAssistantTargetProfile,
+    ExternalAssistantTensorPlacement, ExternalAssistantTransfer, ExternalSpeculativeContract,
+    ExternalSpeculativeContractRequest, MaterializedExternalAssistant,
+    MaterializedExternalAssistantExecution, MaterializedExternalAssistantVisitor,
+    PreparedCompatibleExternalAssistant, PreparedExternalAssistantExecution,
     PreparedExternalAssistantSource, SelectedExternalAssistantPreparation,
 };
 /// Backend-neutral schedules and recipes for independent expert residency.
@@ -66,6 +68,8 @@ pub mod preparation_selection;
 pub use preparation_selection::{
     select_preparation, PreparationMechanismProvider, PreparationSelectionError,
 };
+/// Total prepared-model construction through typed native mechanism visitors.
+pub mod prepared_execution;
 /// Exact backend-neutral checkpoint source graphs prepared after selection.
 pub mod prepared_sources;
 /// Total backend-neutral execution and preparation selections.

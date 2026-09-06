@@ -6,7 +6,7 @@ use std::{
 use eredu_checkpoint::store::{CheckpointSource, SafetensorsWeightStore, TensorSelection};
 use eredu_runtime::{DeviceLayerWindow, ResidentLayerGroup};
 use safemlx::{
-    host_transfer_capacity_upper_bound, Device, DeviceType, HostTransferPolicy,
+    host_transfer_capacity_upper_bound, transforms::eval, Device, DeviceType, HostTransferPolicy,
     HostTransferStorageKind,
 };
 use safetensors::tensor::{serialize_to_file, Dtype, TensorView};

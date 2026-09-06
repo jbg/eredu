@@ -3,7 +3,10 @@
 use std::{
     collections::HashMap,
     panic::{catch_unwind, AssertUnwindSafe},
-    sync::{mpsc, Arc, Condvar, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc, Condvar, Mutex,
+    },
     thread::{self, JoinHandle},
 };
 
@@ -121,6 +124,8 @@ struct CacheIoWorkerShared<Output> {
     in_flight: Mutex<HashMap<CacheIoOperationKey, Arc<CacheIoCompletion<Output>>>>,
     execution: Mutex<CacheIoExecutionState>,
     space_available: Condvar,
+    stopping: AtomicBool,
+    shutdown_polling: AtomicBool,
 }
 
 impl<Output> CacheIoWorkerShared<Output> {
@@ -129,6 +134,8 @@ impl<Output> CacheIoWorkerShared<Output> {
             in_flight: Mutex::new(HashMap::new()),
             execution: Mutex::new(CacheIoExecutionState::new(capacity)?),
             space_available: Condvar::new(),
+            stopping: AtomicBool::new(false),
+            shutdown_polling: AtomicBool::new(false),
         })
     }
 }
@@ -232,6 +239,19 @@ impl<Task, Output: Clone> CacheIoSubmission<Task, Output> {
                 }
             };
             loop {
+                if self.shared.stopping.load(Ordering::Acquire) {
+                    execution.cancel(&self.ticket.key);
+                    drop(execution);
+                    drop(request);
+                    self.ticket
+                        .completion
+                        .finish(Err("cache I/O physical worker stopped".into()));
+                    self.ticket.completion.release_task_resources();
+                    retire_completion(&self.shared, &self.ticket.key, &self.ticket.completion);
+                    return Err(CacheIoWorkerError::OperationFailed(
+                        "cache I/O physical worker stopped".into(),
+                    ));
+                }
                 match execution.admit(&self.ticket.key)? {
                     CacheIoAdmission::Admitted => {
                         if self.sender.send(request).is_err() {
@@ -245,7 +265,20 @@ impl<Task, Output: Clone> CacheIoSubmission<Task, Output> {
                     }
                     CacheIoAdmission::AtCapacity => {
                         backpressure = true;
-                        execution = match self.shared.space_available.wait(execution) {
+                        // Opt-in shutdown cannot lock execution from Drop:
+                        // backend task cleanup may itself need a native lock.
+                        // A bounded check also closes a shutdown notification
+                        // racing between the predicate check and this wait.
+                        let waited = if self.shared.shutdown_polling.load(Ordering::Acquire) {
+                            self.shared
+                                .space_available
+                                .wait_timeout(execution, std::time::Duration::from_millis(25))
+                                .map(|(execution, _)| execution)
+                                .map_err(|_| ())
+                        } else {
+                            self.shared.space_available.wait(execution).map_err(|_| ())
+                        };
+                        execution = match waited {
                             Ok(execution) => execution,
                             Err(_) => {
                                 drop(request);
@@ -295,6 +328,7 @@ pub struct CacheIoWorker<Task, Output> {
     sender: mpsc::Sender<CacheIoWorkerRequest<Task, Output>>,
     handle: Mutex<Option<JoinHandle<()>>>,
     shared: Arc<CacheIoWorkerShared<Output>>,
+    nonblocking_drop: bool,
 }
 
 impl<Task, Output> std::fmt::Debug for CacheIoWorker<Task, Output> {
@@ -331,6 +365,19 @@ where
                             task,
                             completion,
                         } => {
+                            if worker_shared.stopping.load(Ordering::Acquire) {
+                                if let Ok(mut execution) = worker_shared.execution.lock() {
+                                    execution.cancel(&key);
+                                    // Consume the physical queue slot and move
+                                    // cancellation to a retireable state.
+                                    let _ = execution.begin(&key);
+                                }
+                                drop(task);
+                                completion.finish(Err("cache I/O physical worker stopped".into()));
+                                retire_completion(&worker_shared, &key, &completion);
+                                completion.release_task_resources();
+                                continue;
+                            }
                             let start = worker_shared
                                 .execution
                                 .lock()
@@ -390,7 +437,18 @@ where
             sender,
             handle: Mutex::new(Some(handle)),
             shared,
+            nonblocking_drop: false,
         })
+    }
+
+    /// Requests shutdown without joining from this handle's destructor.
+    ///
+    /// The worker owns in-flight tasks until they finish and discards queued
+    /// tasks itself. Prepared submissions reject admission after shutdown.
+    pub fn with_nonblocking_drop(mut self) -> Self {
+        self.nonblocking_drop = true;
+        self.shared.shutdown_polling.store(true, Ordering::Release);
+        self
     }
 
     /// Prepares new work or joins an exact operation already owned by the worker.
@@ -458,10 +516,20 @@ where
 
 impl<Task, Output> Drop for CacheIoWorker<Task, Output> {
     fn drop(&mut self) {
-        let _ = self.sender.send(CacheIoWorkerRequest::Stop);
+        if self.nonblocking_drop {
+            self.shared.stopping.store(true, Ordering::Release);
+            self.shared.space_available.notify_all();
+            // Do not put Stop ahead of a racing prepared sender. Disconnect
+            // after every remaining prepared handle has rejected admission;
+            // the receiver owns and resolves any already-enqueued message.
+        } else {
+            let _ = self.sender.send(CacheIoWorkerRequest::Stop);
+        }
         if let Ok(handle) = self.handle.get_mut() {
             if let Some(handle) = handle.take() {
-                let _ = handle.join();
+                if !self.nonblocking_drop {
+                    let _ = handle.join();
+                }
             }
         }
     }
@@ -622,5 +690,87 @@ mod tests {
         ));
         release_tx.send(()).unwrap();
         assert_eq!(blocker_ticket.wait().unwrap(), 0);
+    }
+
+    #[test]
+    fn nonblocking_drop_retains_active_task_and_retires_queued_work() {
+        let worker = CacheIoWorker::new(1, "cache-worker-detach", execute, discard)
+            .unwrap()
+            .with_nonblocking_drop();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let active = worker
+            .prepare(key(0), Task::Pause(started_tx, release_rx))
+            .unwrap();
+        let active_ticket = active.ticket.clone();
+        active.enqueue().unwrap();
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let queued = worker.prepare(key(1), Task::Value(1)).unwrap();
+        let queued_ticket = queued.ticket.clone();
+        queued.enqueue().unwrap();
+        let prepared = worker.prepare(key(2), Task::Value(2)).unwrap();
+        let prepared_ticket = prepared.ticket.clone();
+
+        let (dropped_tx, dropped_rx) = mpsc::channel();
+        thread::spawn(move || {
+            drop(worker);
+            let _ = dropped_tx.send(());
+        });
+        let dropped_before_release = dropped_rx.recv_timeout(Duration::from_secs(1));
+        let active_retained = !*active_ticket.completion.released.lock().unwrap();
+        let rejected_prepared = prepared.enqueue();
+        let prepared_released = *prepared_ticket.completion.released.lock().unwrap();
+        release_tx.send(()).unwrap();
+        dropped_before_release.unwrap();
+        assert!(active_retained);
+        assert!(matches!(
+            rejected_prepared,
+            Err(CacheIoWorkerError::OperationFailed(_))
+        ));
+        assert!(prepared_released);
+        assert!(matches!(
+            prepared_ticket.wait(),
+            Err(CacheIoWorkerError::OperationFailed(_))
+        ));
+        assert_eq!(active_ticket.wait().unwrap(), 0);
+        assert!(matches!(
+            queued_ticket.wait(),
+            Err(CacheIoWorkerError::OperationFailed(_))
+        ));
+        active_ticket.wait_for_task_resources().unwrap();
+        queued_ticket.wait_for_task_resources().unwrap();
+        assert!(queued_ticket.shared.in_flight.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn nonblocking_shutdown_wakes_backpressured_submission_before_active_task_finishes() {
+        let worker = CacheIoWorker::new(1, "cache-worker-detach-backpressure", execute, discard)
+            .unwrap()
+            .with_nonblocking_drop();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let active = worker
+            .prepare(key(0), Task::Pause(started_tx, release_rx))
+            .unwrap();
+        active.enqueue().unwrap();
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        worker
+            .prepare(key(1), Task::Value(1))
+            .unwrap()
+            .enqueue()
+            .unwrap();
+        let blocked = worker.prepare(key(2), Task::Value(2)).unwrap();
+        let (outcome_tx, outcome_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = outcome_tx.send(blocked.enqueue());
+        });
+        assert!(outcome_rx.recv_timeout(Duration::from_millis(20)).is_err());
+        drop(worker);
+        let outcome_before_release = outcome_rx.recv_timeout(Duration::from_secs(1));
+        release_tx.send(()).unwrap();
+        assert!(matches!(
+            outcome_before_release.unwrap(),
+            Err(CacheIoWorkerError::OperationFailed(_))
+        ));
     }
 }

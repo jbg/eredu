@@ -30,7 +30,7 @@ use std::{
     sync::Arc,
 };
 
-use safemlx::{memory, transforms::async_eval_with_event, Array, Dtype, Event, Stream};
+use safemlx::{memory, Array, Dtype, Stream};
 use safetensors::tensor::Dtype as SafeDtype;
 
 use crate::{
@@ -38,7 +38,7 @@ use crate::{
     backend::runtime::checkpoint::{
         quantization::quantize_tensor,
         recipe::MlxWeightRecipeExt,
-        store::{MlxParameterMaterializationContext, PendingWeightMaterialization},
+        store::{MlxParameterMaterializationContext, WeightMaterialization},
     },
 };
 

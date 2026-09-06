@@ -11,11 +11,13 @@ fn topology(rank: usize, tp: usize, pp: usize, ep: usize) -> ParallelRankTopolog
 
 #[test]
 fn preparation_policy_preserves_quantized_nonresident_request() {
-    let options = MlxLoadRequest::with_quantization(QuantizationRequest::MxFp4)
-        .with_weight_residency(WeightResidency::layerwise_host(
-            LayerwiseLoadOptions::default(),
-        ));
-    let policy = options.preparation_policy().unwrap();
+    let options = MlxLoadRequest::from_normalized(
+        eredu_runtime::NormalizedLoadRequest::with_quantization(QuantizationRequest::MxFp4)
+            .with_weight_residency(WeightResidency::layerwise_host(
+                LayerwiseLoadOptions::default(),
+            )),
+    );
+    let policy = options.normalized().preparation_policy().unwrap();
     assert_eq!(
         policy.quantization(),
         Some(eredu_core::QuantizationRequest::MxFp4)
@@ -28,16 +30,19 @@ fn preparation_policy_preserves_quantized_nonresident_request() {
 
 #[test]
 fn preparation_policy_rejects_invalid_affine_geometry() {
-    let error = MlxLoadRequest::with_quantization(QuantizationRequest::Affine {
-        group_size: 17,
-        bits: 4,
-    })
+    let error = MlxLoadRequest::from_normalized(
+        eredu_runtime::NormalizedLoadRequest::with_quantization(QuantizationRequest::Affine {
+            group_size: 17,
+            bits: 4,
+        }),
+    )
+    .normalized()
     .preparation_policy()
     .unwrap_err();
 
     assert!(matches!(
         error,
-        crate::backend::error::Error::Quantization(message)
+        eredu_runtime::NormalizedLoadRequestError::Quantization(message)
             if message.contains("group_size")
     ));
 }
@@ -55,6 +60,7 @@ fn preparation_policy_preserves_exact_parallel_topology() {
         MlxLoadRequest::test_communication_completion_policy(),
     )
     .unwrap()
+    .normalized()
     .preparation_policy()
     .unwrap();
     assert_eq!(policy.topology(), Some(topology.topology()));
@@ -74,6 +80,7 @@ fn preparation_policies_distinguish_parallel_axes() {
         MlxLoadRequest::test_communication_completion_policy(),
     )
     .unwrap()
+    .normalized()
     .preparation_policy()
     .unwrap();
     let tensor_expert_policy = MlxLoadRequest::with_parallel(
@@ -85,6 +92,7 @@ fn preparation_policies_distinguish_parallel_axes() {
         MlxLoadRequest::test_communication_completion_policy(),
     )
     .unwrap()
+    .normalized()
     .preparation_policy()
     .unwrap();
 
@@ -111,15 +119,19 @@ fn parallel_policy_rejects_nonpositive_invocation_limits() {
 
 #[test]
 fn portable_drafting_plan_is_fixed_before_payload_selection() {
-    let disabled = MlxLoadRequest::default()
+    let disabled = NormalizedLoadRequest::default()
         .with_drafting_plan(&DraftingPlan::Disabled)
         .unwrap();
     assert_eq!(
-        disabled.checked_normalized().unwrap().0.drafting(),
+        MlxLoadRequest::from_normalized(disabled)
+            .checked_normalized()
+            .unwrap()
+            .0
+            .drafting(),
         eredu_runtime::DraftingLoadRequest::Disabled
     );
 
-    let embedded = MlxLoadRequest::default()
+    let embedded = NormalizedLoadRequest::default()
         .with_drafting_plan(&DraftingPlan::Embedded {
             max_draft_tokens: 3,
             lookahead: false,
@@ -127,13 +139,17 @@ fn portable_drafting_plan_is_fixed_before_payload_selection() {
         })
         .unwrap();
     assert_eq!(
-        embedded.checked_normalized().unwrap().0.drafting(),
+        MlxLoadRequest::from_normalized(embedded)
+            .checked_normalized()
+            .unwrap()
+            .0
+            .drafting(),
         eredu_runtime::DraftingLoadRequest::Embedded {
             max_draft_tokens: std::num::NonZeroUsize::new(3).unwrap()
         }
     );
 
-    assert!(MlxLoadRequest::default()
+    assert!(NormalizedLoadRequest::default()
         .with_drafting_plan(&DraftingPlan::Embedded {
             max_draft_tokens: 0,
             lookahead: false,
@@ -146,16 +162,15 @@ fn portable_drafting_plan_is_fixed_before_payload_selection() {
 fn adapter_translation_preserves_the_exact_normalized_request() {
     let capabilities = eredu_core::SessionCapabilities::new(true, false, true);
     let residency = WeightResidency::layerwise_host(LayerwiseLoadOptions::default());
-    let options = MlxLoadRequest::with_quantization(QuantizationRequest::MxFp4)
-        .with_weight_residency(residency)
-        .with_required_session_capabilities(capabilities)
-        .with_drafting_plan(&DraftingPlan::Disabled)
-        .unwrap();
+    let options = MlxLoadRequest::from_normalized(
+        eredu_runtime::NormalizedLoadRequest::with_quantization(QuantizationRequest::MxFp4)
+            .with_weight_residency(residency)
+            .with_required_session_capabilities(capabilities),
+    );
     let expected =
         eredu_runtime::NormalizedLoadRequest::with_quantization(QuantizationRequest::MxFp4)
             .with_weight_residency(residency)
-            .with_required_session_capabilities(capabilities)
-            .with_drafting(eredu_runtime::DraftingLoadRequest::Disabled);
+            .with_required_session_capabilities(capabilities);
 
     let (normalized, rank) = options.checked_normalized().unwrap();
     assert_eq!(normalized, &expected);
@@ -220,3 +235,4 @@ fn checked_translation_rejects_unpaired_parallel_halves() {
     };
     assert!(orphaned_device.checked_normalized().is_err());
 }
+use eredu_runtime::NormalizedLoadRequest;

@@ -26,14 +26,16 @@ fn heterogeneous_logits_and_fixed_state_match_across_weight_and_state_residency(
                 CacheResidencyPolicy::Paged(paged.clone()),
             ),
         ] {
-            let options = crate::MlxLoadRequest::default()
-                .with_weight_residency(residency)
-                .with_state_residency(state);
+            let options = crate::MlxLoadRequest::from_normalized(
+                eredu_runtime::NormalizedLoadRequest::default()
+                    .with_weight_residency(residency)
+                    .with_state_residency(state),
+            );
             let inspection =
                 eredu_architectures::configuration::inspect_artifact(root.path()).unwrap();
             let plan = eredu_core::plan_model_preparation(
                 inspection,
-                options.preparation_policy().unwrap(),
+                options.normalized().preparation_policy().unwrap(),
                 eredu_core::SessionCapabilities::default(),
             )
             .unwrap();
@@ -181,13 +183,15 @@ fn heterogeneous_generic_sessions_preserve_every_state_component_across_controls
 
     for (name, config, residency, state_policy) in cases {
         let root = tiny_heterogeneous_artifact(config);
-        let options = crate::MlxLoadRequest::default()
-            .with_weight_residency(residency)
-            .with_state_residency(state_policy.clone());
+        let options = crate::MlxLoadRequest::from_normalized(
+            eredu_runtime::NormalizedLoadRequest::default()
+                .with_weight_residency(residency)
+                .with_state_residency(state_policy.clone()),
+        );
         let inspection = eredu_architectures::configuration::inspect_artifact(root.path()).unwrap();
         let plan = eredu_core::plan_model_preparation(
             inspection,
-            options.preparation_policy().unwrap(),
+            options.normalized().preparation_policy().unwrap(),
             eredu_core::SessionCapabilities::default(),
         )
         .unwrap();
@@ -412,13 +416,15 @@ fn generic_controls_cover_residency_cache_persistence_and_observation() {
         let paged = PagedCacheOptions::new(4, 1 << 20, 1 << 20, 1)
             .unwrap()
             .with_full_attention(true);
-        let options = crate::MlxLoadRequest::default()
-            .with_weight_residency(residency)
-            .with_state_residency(CacheResidencyPolicy::Paged(paged.clone()));
+        let options = crate::MlxLoadRequest::from_normalized(
+            eredu_runtime::NormalizedLoadRequest::default()
+                .with_weight_residency(residency)
+                .with_state_residency(CacheResidencyPolicy::Paged(paged.clone())),
+        );
         let inspection = eredu_architectures::configuration::inspect_artifact(root.path()).unwrap();
         let plan = eredu_core::plan_model_preparation(
             inspection,
-            options.preparation_policy().unwrap(),
+            options.normalized().preparation_policy().unwrap(),
             eredu_core::SessionCapabilities::default(),
         )
         .unwrap();
@@ -699,11 +705,13 @@ fn heterogeneous_generic_handoff_executes_selected_load_time_transforms() {
         ),
     ] {
         let root = tiny_heterogeneous_artifact(config);
-        let options = crate::MlxLoadRequest::with_quantization(request);
+        let options = crate::MlxLoadRequest::from_normalized(
+            eredu_runtime::NormalizedLoadRequest::with_quantization(request),
+        );
         let inspection = eredu_architectures::configuration::inspect_artifact(root.path()).unwrap();
         let plan = eredu_core::plan_model_preparation(
             inspection,
-            options.preparation_policy().unwrap(),
+            options.normalized().preparation_policy().unwrap(),
             eredu_core::SessionCapabilities::default(),
         )
         .unwrap();
@@ -746,10 +754,12 @@ fn public_handoff_executes_selected_load_time_transform() {
     ] {
         let root = tiny_artifact(model_type, false);
         let inspection = eredu_architectures::configuration::inspect_artifact(root.path()).unwrap();
-        let options = crate::MlxLoadRequest::with_quantization(request);
+        let options = crate::MlxLoadRequest::from_normalized(
+            eredu_runtime::NormalizedLoadRequest::with_quantization(request),
+        );
         let plan = eredu_core::plan_model_preparation(
             inspection,
-            options.preparation_policy().unwrap(),
+            options.normalized().preparation_policy().unwrap(),
             eredu_core::SessionCapabilities::default(),
         )
         .unwrap();

@@ -1834,10 +1834,7 @@ mod tests {
     fn test_floor_complex64() {
         let val = complex64::new(1.0, 2.0);
         let a = Array::from_complex(val);
-        let b = a.floor(Stream::new_with_device(&crate::Device::new(
-            crate::DeviceType::Gpu,
-            0,
-        )));
+        let b = a.floor(crate::test_stream());
         assert!(b.is_err());
     }
 
@@ -1865,10 +1862,7 @@ mod tests {
         let val = complex64::new(1.0, 2.0);
         let a = Array::from_complex(val);
         let b = Array::from_slice(&[4.0, 5.0, 6.0], &[3]);
-        let c = a.floor_divide(
-            &b,
-            Stream::new_with_device(&crate::Device::new(crate::DeviceType::Gpu, 0)),
-        );
+        let c = a.floor_divide(&b, crate::test_stream());
         assert!(c.is_err());
     }
 
@@ -1876,10 +1870,7 @@ mod tests {
     fn test_floor_divide_invalid_broadcast() {
         let a = Array::from_slice(&[1.0, 2.0, 3.0], &[3]);
         let b = Array::from_slice(&[4.0, 5.0], &[2]);
-        let c = a.floor_divide(
-            &b,
-            Stream::new_with_device(&crate::Device::new(crate::DeviceType::Gpu, 0)),
-        );
+        let c = a.floor_divide(&b, crate::test_stream());
         assert!(c.is_err());
     }
 

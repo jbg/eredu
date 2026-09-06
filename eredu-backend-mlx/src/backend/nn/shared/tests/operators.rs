@@ -9,6 +9,70 @@ fn close(actual: &MlxTensor, expected: &[f32], tolerance: f32) {
 }
 
 #[test]
+fn mlx_portable_normalization_geometry_preserves_additive_l2() {
+    let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+    let stream = execution.stream();
+    for (values, epsilon) in [
+        ([1.0_f32, -1.0], 4.0),
+        ([0.0, 0.0], 0.25),
+        ([0.01, -0.02], 0.1),
+    ] {
+        let input = MlxTensor::from_array(Array::from_slice(&values, &[1, 2]));
+        let denominator = (values[0] * values[0] + values[1] * values[1] + epsilon).sqrt();
+        close(
+            &MlxNeuralBackend::l2_normalize(&input, epsilon, stream).unwrap(),
+            &values.map(|value| value / denominator),
+            1e-6,
+        );
+        for epsilon in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            assert!(MlxNeuralBackend::l2_normalize(&input, epsilon, stream).is_err());
+            assert!(MlxNeuralBackend::rms_norm_without_weight(&input, epsilon, stream).is_err());
+        }
+    }
+    let input = MlxTensor::from_array(Array::from_slice(&[1.0_f32; 4], &[1, 4]));
+    let gate = MlxTensor::from_array(Array::from_slice(&[0.5_f32; 4], &[1, 4]));
+    let weight = MlxTensor::from_array(Array::from_slice(&[1.0_f32; 4], &[4]));
+    for (groups, epsilon) in [(0, 1e-5), (-1, 1e-5), (3, 1e-5), (2, f32::NAN)] {
+        assert!(MlxNeuralBackend::gated_group_rms_norm(
+            &input, &gate, &weight, groups, epsilon, stream
+        )
+        .is_err());
+        assert!(MlxNeuralBackend::silu_gated_group_rms_norm(
+            &input, &gate, &weight, groups, epsilon, stream
+        )
+        .is_err());
+    }
+}
+
+#[test]
+fn mlx_portable_causal_geometry_preserves_inclusive_distance() {
+    let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+    let stream = execution.stream();
+    for distance in [None, Some(0), Some(1), Some(2), Some(i32::MAX)] {
+        let mask = MlxNeuralBackend::causal_mask(3, 2, distance, stream).unwrap();
+        assert_eq!(mask.shape(), [3, 5]);
+        let mask = mask.as_array().evaluated().unwrap();
+        let values = mask.as_slice::<bool>();
+        for query in 0..3 {
+            for key in 0..5 {
+                let position = query + 2;
+                let expected =
+                    key <= position && distance.is_none_or(|distance| key >= position - distance);
+                assert_eq!(values[(query * 5 + key) as usize], expected);
+            }
+        }
+    }
+    for (sequence, offset, distance) in [
+        (-1, 0, None),
+        (1, -1, None),
+        (1, 0, Some(-1)),
+        (1, i32::MAX, None),
+    ] {
+        assert!(MlxNeuralBackend::causal_mask(sequence, offset, distance, stream).is_err());
+    }
+}
+
+#[test]
 #[ignore = "explicit MLX dtype regression; run outside the sandbox"]
 fn mlx_weighted_rms_norm_preserves_bfloat16_input_dtype() {
     let execution = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));

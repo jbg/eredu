@@ -170,11 +170,18 @@ impl<P> ExecutionClassSelection<'_, P> {
             self.request.weight_residency().layers(),
             self.request.state_residency().clone(),
         )
+        .with_max_cached_shards(
+            std::num::NonZeroUsize::new(self.request.max_cached_shards())
+                .expect("validated source reader limit is positive"),
+        )
         .with_session(self.admitted_session)
-        .with_prompt_cache(matches!(
-            self.request.state_residency(),
-            CacheResidencyPolicy::Paged(_)
-        ))
+        .with_prompt_cache(
+            self.request.prompt_cache_persistence()
+                || matches!(
+                    self.request.state_residency(),
+                    CacheResidencyPolicy::Paged(_)
+                ),
+        )
         .with_exact_completion(true);
         if !self.partitioned_base {
             if let Some(topology) = self.policy.topology() {
@@ -690,6 +697,68 @@ pub(crate) mod tests {
         }
     }
 
+    impl eredu_runtime::ReplicatedTextMechanismSupport for BoundedIndependentAdapter {
+        fn facts(
+            &self,
+            _: &eredu_runtime::CacheResidencyPolicy,
+        ) -> eredu_runtime::BackendMechanismFacts {
+            eredu_runtime::BackendMechanismFacts::new(
+                eredu_nn::NeuralOperatorCapabilities::ALL,
+                [
+                    eredu_runtime::WeightResidencyMechanism::Resident,
+                    eredu_runtime::WeightResidencyMechanism::Windowed,
+                    eredu_runtime::WeightResidencyMechanism::DiskStreamed,
+                ],
+                eredu_runtime::StateLifecycleCapabilities::new()
+                    .with_transactions(true, true)
+                    .with_reset(true)
+                    .with_prompt_cache(true)
+                    .with_observation_retention(true),
+            )
+            .with_session(SessionCapabilities::new(true, true, true))
+            .with_prompt_cache(true)
+            .with_exact_completion(true)
+            .with_grouped_operations([
+                GroupedOperationRequirement::GatedProduct,
+                GroupedOperationRequirement::GatedProductTensorParallelPartial,
+                GroupedOperationRequirement::Relu2,
+            ])
+            .with_indexed_movement(true)
+        }
+
+        fn supports_direct(&self, descriptor: &eredu_runtime::WeightLoweringDescriptor) -> bool {
+            use eredu_checkpoint::{LinearFormat, SourceTensorEncoding, StoredDtype};
+            descriptor.executable() == LinearFormat::Dense
+                && matches!(
+                    descriptor.source(),
+                    SourceTensorEncoding::Safetensors(
+                        StoredDtype::F32 | StoredDtype::I32 | StoredDtype::U8
+                    ) | SourceTensorEncoding::RecipeOutput(
+                        StoredDtype::F32 | StoredDtype::I32 | StoredDtype::U8
+                    ) | SourceTensorEncoding::Gguf {
+                        ggml_type: eredu_gguf::GgmlType::F32,
+                        ..
+                    }
+                )
+        }
+
+        fn supports_transform(&self, _: &eredu_runtime::WeightLoweringDescriptor) -> bool {
+            false
+        }
+
+        fn supports_state_component(
+            &self,
+            _: &eredu_core::cache::StateComponentPolicy,
+            placement: eredu_runtime::StateComponentPlacement,
+        ) -> bool {
+            matches!(
+                placement,
+                eredu_runtime::StateComponentPlacement::Device
+                    | eredu_runtime::StateComponentPlacement::Paged
+            )
+        }
+    }
+
     impl PreparationMechanismProvider for BoundedIndependentAdapter {
         fn preparation_capabilities(&self) -> PreparationMechanismCapabilities {
             self.counters
@@ -735,74 +804,12 @@ pub(crate) mod tests {
         fn replicated_text_capabilities(
             &self,
             requirements: &ReplicatedTextRequirements,
-            _: &ReplicatedTextSelectionRequest,
+            request: &ReplicatedTextSelectionRequest,
         ) -> BackendMechanismCapabilities {
             self.counters
                 .text_queries
                 .set(self.counters.text_queries.get() + 1);
-            let lowerings = requirements
-                .parameters()
-                .iter()
-                .chain(requirements.auxiliary_parameters())
-                .filter(|parameter| parameter.has_lowering_source())
-                .map(|parameter| {
-                    let kind = if matches!(
-                        parameter.presence(),
-                        eredu_runtime::ReplicatedTextParameterPresence::Derived { .. }
-                    ) {
-                        eredu_runtime::WeightLoweringKind::Derived
-                    } else {
-                        eredu_runtime::WeightLoweringKind::Direct
-                    };
-                    eredu_runtime::WeightLoweringCapability::new(
-                        parameter
-                            .lowering_descriptor(parameter.native_executable())
-                            .unwrap(),
-                        kind,
-                    )
-                })
-                .collect();
-            let state = eredu_runtime::StateMechanismCapabilities::new(
-                (0..requirements.state_layout().len()).flat_map(|layer| {
-                    requirements
-                        .state_layout()
-                        .components(layer)
-                        .unwrap()
-                        .iter()
-                        .cloned()
-                        .map(move |component| {
-                            eredu_runtime::StateComponentMechanism::new(
-                                layer,
-                                component,
-                                Some(eredu_runtime::StateComponentPlacement::Device),
-                                Some(eredu_runtime::StateComponentPlacement::Paged),
-                            )
-                        })
-                }),
-            )
-            .with_transactions(true, true)
-            .with_reset(true)
-            .with_prompt_cache(true)
-            .with_observation_retention(true);
-            BackendMechanismCapabilities::new(
-                eredu_nn::NeuralOperatorCapabilities::ALL,
-                lowerings,
-                vec![
-                    eredu_runtime::WeightResidencyMechanism::Resident,
-                    eredu_runtime::WeightResidencyMechanism::Windowed,
-                    eredu_runtime::WeightResidencyMechanism::DiskStreamed,
-                ],
-                state,
-            )
-            .with_session(SessionCapabilities::new(true, true, true))
-            .with_prompt_cache(true)
-            .with_exact_completion(true)
-            .with_grouped_operations([
-                GroupedOperationRequirement::GatedProduct,
-                GroupedOperationRequirement::GatedProductTensorParallelPartial,
-                GroupedOperationRequirement::Relu2,
-            ])
-            .with_indexed_movement(true)
+            eredu_runtime::synthesize_replicated_text_capabilities(requirements, request, self)
         }
 
         fn processor_capabilities(&self) -> MediaPrimitiveCapabilities {
@@ -959,7 +966,7 @@ pub(crate) mod tests {
         }))
     }
 
-    fn inspected_config(
+    pub(crate) fn inspected_config(
         config: serde_json::Value,
     ) -> (
         tempfile::TempDir,
@@ -1020,7 +1027,7 @@ pub(crate) mod tests {
         (root, inspection)
     }
 
-    fn routed_config() -> serde_json::Value {
+    pub(crate) fn routed_config() -> serde_json::Value {
         serde_json::json!({
             "model_type": "qwen3_moe",
             "architectures": ["Qwen3MoeForCausalLM"],
@@ -1041,7 +1048,7 @@ pub(crate) mod tests {
         })
     }
 
-    fn composite_config() -> serde_json::Value {
+    pub(crate) fn composite_config() -> serde_json::Value {
         serde_json::json!({
             "model_type":"gemma4", "tie_word_embeddings":false,
             "text_config": {
@@ -1057,7 +1064,7 @@ pub(crate) mod tests {
         })
     }
 
-    fn prediction_config() -> serde_json::Value {
+    pub(crate) fn prediction_config() -> serde_json::Value {
         serde_json::json!({
             "architectures":["DeepseekV3ForCausalLM"],"model_type":"deepseek_v3",
             "hidden_size":16,"intermediate_size":32,"moe_intermediate_size":8,
@@ -1139,7 +1146,7 @@ pub(crate) mod tests {
         }
     }
 
-    fn parallel_request() -> NormalizedLoadRequest {
+    pub(crate) fn parallel_request() -> NormalizedLoadRequest {
         let topology = ParallelTopology::new(1, 2, 1, 1).unwrap();
         let rank = ParallelRankTopology::new(topology, 0).unwrap();
         let completion = eredu_runtime::CommunicationCompletionPolicy::new(

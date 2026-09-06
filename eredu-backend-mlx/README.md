@@ -15,6 +15,15 @@ stream, cache, collective, lease-conversion, tensor, and erasure work; it does
 not reopen artifact formats or reconstruct portable selection and inspection
 policy.
 
+`eredu-runtime` converts execution plans and synthesizes exact capabilities from
+MLX's single-candidate mechanism predicates. `eredu-architectures` consumes the
+paired selection and sources through one total typed construction driver. MLX
+supplies materialization, native state profiles, communication resources, and
+final executable assembly. Ordinary and realtime prepared values retain their
+selected native target; materialization accepts no replacement load policy.
+Sessions use `eredu-core` submission authority while native completions retain
+all MLX resources until exact completion or safe teardown.
+
 The crate's `MlxTensor` is a transparent, zero-copy wrapper around the native
 MLX array handle. The wrapper lets this crate implement `eredu_nn::Tensor`
 without placing accelerator code in `eredu-nn` and without violating Rust's

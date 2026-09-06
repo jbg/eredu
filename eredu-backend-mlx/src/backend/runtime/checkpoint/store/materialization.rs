@@ -1,21 +1,90 @@
 use super::*;
+use crate::backend::submission_recovery::{Recovery, Retention, Status};
+use std::{cell::Cell, rc::Rc};
 
-/// Scheduled tensor materialization that still pins its mmap-backed sources.
+struct PendingResources {
+    output: Option<Array>,
+    source: Option<Array>,
+    group: Option<Arc<CachedGgufGroup>>,
+    lease: WeightLease,
+    _source_stream: Stream,
+    _execution_stream: Stream,
+}
+
+impl Retention for PendingResources {
+    fn observe(&self, _: Status) {}
+}
+
+/// Prepared tensor materialization retaining its exact checkpoint source.
 pub struct PendingWeightMaterialization {
-    pub(super) output: Array,
-    pub(super) _source: Array,
-    pub(super) _gguf_group: Option<Arc<CachedGgufGroup>>,
-    pub(super) lease: Option<WeightLease>,
-    pub(super) source_stream: Stream,
-    pub(super) execution_stream: Stream,
-    pub(super) borrowed_source: bool,
-    pub(super) completed: bool,
+    retained: Recovery<PendingResources>,
 }
 
 impl PendingWeightMaterialization {
+    pub(super) fn begin(
+        lease: WeightLease,
+        source_stream: &Stream,
+        execution_stream: &Stream,
+    ) -> Result<Self, CheckpointMaterializationError> {
+        let key = lease.key().to_owned();
+        let retained = Recovery::begin(PendingResources {
+            output: None,
+            source: None,
+            group: None,
+            lease,
+            _source_stream: source_stream.clone(),
+            _execution_stream: execution_stream.clone(),
+        })
+        .map_err(|source| materialization_error(&key, "prepare recovery", source))?;
+        Ok(Self { retained })
+    }
+
+    pub(super) fn set_source(&mut self, source: Array) {
+        self.retained.retention_mut().source = Some(source);
+    }
+
+    pub(super) fn source(&self) -> &Array {
+        self.retained
+            .retention()
+            .source
+            .as_ref()
+            .expect("prepared source")
+    }
+
+    pub(super) fn set_group(&mut self, group: Arc<CachedGgufGroup>) {
+        self.retained.retention_mut().group = Some(group);
+    }
+
+    pub(super) fn prepared(
+        mut self,
+        output: Array,
+    ) -> Result<Self, CheckpointMaterializationError> {
+        self.retained.retention_mut().output = Some(output);
+        self.retained.seal();
+        let status = self.retained.progress();
+        if status.failed || status.blocked {
+            return Err(materialization_error(
+                self.key(),
+                "prepare",
+                safemlx::error::Exception::custom(
+                    "native preparation failed; unresolved resources remain retained",
+                ),
+            ));
+        }
+        Ok(self)
+    }
+
+    fn key(&self) -> &str {
+        self.retained.retention().lease.key()
+    }
+
     /// Returns the lazy materialized output.
     pub fn output(&self) -> &Array {
-        &self.output
+        self.retained
+            .retention()
+            .output
+            .as_ref()
+            .expect("prepared output")
     }
 
     #[cfg(test)]
@@ -23,137 +92,255 @@ impl PendingWeightMaterialization {
         self.submit()?.synchronize()
     }
 
-    pub(super) fn submit(
-        mut self,
-    ) -> Result<WeightMaterialization, CheckpointMaterializationError> {
-        self.prepare_owned_output()?;
-        let output = self.output.clone();
+    pub(super) fn submit(self) -> Result<WeightMaterialization, CheckpointMaterializationError> {
+        let output = self.output().clone();
         WeightMaterialization::submit_retained(output, vec![self])
     }
 
-    fn prepare_owned_output(&mut self) -> Result<(), CheckpointMaterializationError> {
-        if !self.borrowed_source {
-            return Ok(());
+    /// Releases a prepared source after its enclosing submission has completed.
+    ///
+    /// This never waits: an unresolved preparation retains its owner independently.
+    pub fn complete(self) {}
+}
+
+struct MaterializationResources {
+    inputs: Vec<Array>,
+    outputs: Vec<Array>,
+    _sources: Vec<PendingWeightMaterialization>,
+    event: Option<Event>,
+    children: Cell<usize>,
+    failed: Cell<bool>,
+}
+
+impl Retention for MaterializationResources {
+    fn observe(&self, status: Status) {
+        if status.failed || status.blocked {
+            self.failed.set(true);
         }
-        let output = self.output.copy(&self.source_stream).map_err(|source| {
-            self.lease
-                .as_ref()
-                .expect("pending materialization retains its lease")
-                .mlx_error("borrowed source copy", source)
-        })?;
-        self.output = output;
-        self.borrowed_source = false;
-        Ok(())
-    }
-
-    fn complete_in_place(&mut self) {
-        self.completed = true;
-        self.lease.take();
-    }
-
-    /// Marks a batch member complete after a containing output was evaluated.
-    pub fn complete(mut self) {
-        self.completed = true;
-        self.lease.take();
     }
 }
 
-/// Owning completion for one checkpoint tensor materialization.
+struct MaterializationObservation {
+    owner: Rc<MaterializationResources>,
+    _stream: Option<Stream>,
+}
+
+impl MaterializationObservation {
+    fn new(
+        owner: &Rc<MaterializationResources>,
+        stream: Option<Stream>,
+    ) -> Result<Self, safemlx::error::Exception> {
+        let next = owner.children.get().checked_add(1).ok_or_else(|| {
+            safemlx::error::Exception::custom("materialization observation count exhausted")
+        })?;
+        owner.children.set(next);
+        Ok(Self {
+            owner: Rc::clone(owner),
+            _stream: stream,
+        })
+    }
+}
+
+impl Retention for MaterializationObservation {
+    fn observe(&self, status: Status) {
+        self.owner.observe(status);
+    }
+}
+
+impl Drop for MaterializationObservation {
+    fn drop(&mut self) {
+        self.owner.children.set(self.owner.children.get() - 1);
+    }
+}
+
+struct MaterializationUnwind<'a>(&'a Cell<bool>);
+impl Drop for MaterializationUnwind<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.set(true);
+        }
+    }
+}
+
+/// Exact native completion retaining source leases, outputs and consumer tickets.
 ///
-/// This single-shot guard retains checkpoint leases and source arrays until
-/// its exact MLX completion finishes. It may order multiple compatible
-/// consumers. Dropping an unfinished guard blocks only for this event, never
-/// for an entire stream. Asynchronous backend errors are returned by query or
-/// synchronization. The type is intentionally neither `Send` nor `Sync`
-/// because it owns `safemlx`'s thread-affine [`Event`].
-#[must_use = "checkpoint leases remain retained until this completion is consumed or dropped"]
+/// Polling and Drop never wait. Failed or unobservable native work retains its
+/// ownership independently, including when submission fails before publication.
+#[must_use = "checkpoint resources remain retained until exact native completion"]
 pub struct WeightMaterialization {
-    output: Array,
-    sources: Vec<PendingWeightMaterialization>,
-    event: Option<Event>,
+    key: String,
+    retained: Recovery<Rc<MaterializationResources>>,
+}
+
+fn materialization_error(
+    key: &str,
+    operation: &'static str,
+    source: safemlx::error::Exception,
+) -> CheckpointMaterializationError {
+    CheckpointMaterializationError::Mlx {
+        key: key.to_owned(),
+        operation,
+        source,
+    }
 }
 
 impl WeightMaterialization {
+    /// Arms ownership before a potentially eager conversion or native submission.
+    pub(crate) fn prepare_retained(
+        inputs: Vec<Array>,
+        sources: Vec<PendingWeightMaterialization>,
+    ) -> Result<Self, CheckpointMaterializationError> {
+        let key = sources
+            .first()
+            .map(|source| source.key().to_owned())
+            .unwrap_or_else(|| "<derived checkpoint materialization>".into());
+        let retained = Recovery::begin(Rc::new(MaterializationResources {
+            inputs,
+            outputs: Vec::new(),
+            _sources: sources,
+            event: None,
+            children: Cell::new(0),
+            failed: Cell::new(false),
+        }))
+        .map_err(|source| materialization_error(&key, "prepare recovery", source))?;
+        Ok(Self { key, retained })
+    }
+
+    pub(crate) fn inputs(&self) -> &[Array] {
+        &self.retained.retention().inputs
+    }
+
+    pub(crate) fn outputs(&self) -> &[Array] {
+        &self.retained.retention().outputs
+    }
+
+    /// Returns preparation dependencies only after its eager native work is
+    /// provably healthy and terminal. This is an explicit host-side boundary,
+    /// never used by polling or Drop.
+    pub(crate) fn finish_preparation(
+        mut self,
+    ) -> Result<Vec<PendingWeightMaterialization>, CheckpointMaterializationError> {
+        self.retained.seal();
+        while !self.check_native_status()? {
+            std::thread::yield_now();
+        }
+        Ok(std::mem::take(
+            &mut Rc::get_mut(self.retained.retention_mut())
+                .expect("unpublished preparation")
+                ._sources,
+        ))
+    }
+
+    pub(crate) fn submit_outputs(
+        mut self,
+        outputs: Vec<Array>,
+    ) -> Result<Self, CheckpointMaterializationError> {
+        Rc::get_mut(self.retained.retention_mut())
+            .expect("unpublished owner")
+            .outputs = outputs;
+        let result = async_eval_with_event(self.outputs().iter());
+        self.retained.seal();
+        if result.is_err() {
+            self.retained.retention().failed.set(true);
+        }
+        let event = result.map_err(|source| self.mlx_error("evaluation submission", source))?;
+        Rc::get_mut(self.retained.retention_mut())
+            .expect("unpublished owner")
+            .event = Some(event);
+        self.check_native_status()?;
+        Ok(self)
+    }
+
     /// Submits an output and retains its source materializations until completion.
     pub fn submit_retained(
         output: Array,
         sources: Vec<PendingWeightMaterialization>,
     ) -> Result<Self, CheckpointMaterializationError> {
-        let key = sources
-            .first()
-            .and_then(|pending| pending.lease.as_ref())
-            .map(|lease| lease.key().to_owned())
-            .unwrap_or_else(|| "<derived checkpoint materialization>".into());
-        let event = async_eval_with_event([&output]).map_err(|source| {
-            CheckpointMaterializationError::Mlx {
-                key,
-                operation: "evaluation submission",
-                source,
-            }
-        })?;
-        Ok(Self {
-            output,
-            sources,
-            event: Some(event),
-        })
+        Self::prepare_retained(Vec::new(), sources)?.submit_outputs(vec![output])
     }
 
-    /// Returns the materialized output while this guard retains its sources.
+    /// Returns the materialized output while this owner retains its sources.
     pub fn output(&self) -> &Array {
-        &self.output
-    }
-
-    /// Orders subsequently submitted work on `stream` after this completion.
-    ///
-    /// This does not block the host. The stream must be backend/device
-    /// compatible, and the consumer graph must be evaluated after this call.
-    pub fn wait_on(&self, stream: &Stream) -> Result<(), CheckpointMaterializationError> {
-        self.event
-            .as_ref()
-            .expect("unfinished materialization retains its event")
-            .wait_on(stream)
-            .map_err(|source| self.mlx_error("consumer stream wait", source))
-    }
-
-    /// Returns whether the exact materialization has completed without blocking.
-    pub fn is_complete(&self) -> Result<bool, CheckpointMaterializationError> {
-        self.event
-            .as_ref()
-            .expect("unfinished materialization retains its event")
-            .is_complete()
-            .map_err(|source| self.mlx_error("completion query", source))
-    }
-
-    /// Blocks for the exact completion and returns the independently owned output.
-    pub fn synchronize(mut self) -> Result<Array, CheckpointMaterializationError> {
-        let output = self.output().clone();
-        self.finish(true)?;
-        Ok(output)
-    }
-
-    fn finish(&mut self, report_error: bool) -> Result<(), CheckpointMaterializationError> {
-        let Some(event) = self.event.take() else {
-            return Ok(());
-        };
-        let key = self
-            .sources
+        self.outputs()
             .first()
-            .and_then(|pending| pending.lease.as_ref())
-            .map(|lease| lease.key().to_owned())
-            .unwrap_or_else(|| "<completed checkpoint materialization>".into());
-        let result = event.synchronize();
-        for mut pending in self.sources.drain(..) {
-            pending.complete_in_place();
+            .expect("materialization has an output")
+    }
+
+    fn event(&self) -> &Event {
+        self.retained
+            .retention()
+            .event
+            .as_ref()
+            .expect("submitted materialization")
+    }
+
+    fn check_native_status(&self) -> Result<bool, CheckpointMaterializationError> {
+        crate::backend::submission_recovery::reap();
+        let status = self.retained.progress();
+        let resources = self.retained.retention();
+        if status.failed || status.blocked || resources.failed.get() {
+            Err(self.mlx_error(
+                "completion",
+                safemlx::error::Exception::custom(
+                    "native materialization failed; unresolved resources remain retained",
+                ),
+            ))
+        } else {
+            Ok(status.settled && resources.children.get() == 0)
         }
-        match result {
-            Ok(()) => Ok(()),
-            Err(source) if report_error => Err(CheckpointMaterializationError::Mlx {
-                key,
-                operation: "completion",
-                source,
-            }),
-            Err(_) => Ok(()),
+    }
+
+    /// Orders a compatible consumer while retaining its independent completion ticket.
+    pub fn wait_on(&self, stream: &Stream) -> Result<(), CheckpointMaterializationError> {
+        self.check_native_status()?;
+        let owner = self.retained.retention();
+        let observation = MaterializationObservation::new(owner, Some(stream.clone()))
+            .map_err(|source| self.mlx_error("prepare consumer recovery", source))?;
+        let mut child = Recovery::begin(observation)
+            .map_err(|source| self.mlx_error("prepare consumer recovery", source))?;
+        let _unwind = MaterializationUnwind(&owner.failed);
+        let result = self.event().wait_on(stream);
+        if result.is_err() {
+            owner.failed.set(true);
         }
+        child.seal();
+        let status = child.progress();
+        if status.failed || status.blocked {
+            return Err(self.mlx_error(
+                "consumer stream wait",
+                safemlx::error::Exception::custom(
+                    "native consumer dependency failed; resources remain retained",
+                ),
+            ));
+        }
+        result.map_err(|source| self.mlx_error("consumer stream wait", source))
+    }
+
+    /// Polls the whole submission and every consumer without waiting for the runtime.
+    pub fn is_complete(&self) -> Result<bool, CheckpointMaterializationError> {
+        safemlx::try_with_submission_retirement(|| {
+            if !self.check_native_status()? {
+                return Ok(false);
+            }
+            self.event().is_complete().map_err(|source| {
+                self.retained.retention().failed.set(true);
+                self.mlx_error("completion query", source)
+            })
+        })
+        .unwrap_or(Ok(false))
+    }
+
+    pub(crate) fn wait(&self) -> Result<(), CheckpointMaterializationError> {
+        while !self.is_complete()? {
+            std::thread::yield_now();
+        }
+        Ok(())
+    }
+
+    /// Waits explicitly for exact completion and returns the independently owned output.
+    pub fn synchronize(self) -> Result<Array, CheckpointMaterializationError> {
+        self.wait()?;
+        Ok(self.output().clone())
     }
 
     fn mlx_error(
@@ -161,44 +348,7 @@ impl WeightMaterialization {
         operation: &'static str,
         source: safemlx::error::Exception,
     ) -> CheckpointMaterializationError {
-        let key = self
-            .sources
-            .first()
-            .and_then(|pending| pending.lease.as_ref())
-            .map(|lease| lease.key().to_owned())
-            .unwrap_or_else(|| "<completed checkpoint materialization>".into());
-        CheckpointMaterializationError::Mlx {
-            key,
-            operation,
-            source,
-        }
-    }
-}
-
-impl Drop for WeightMaterialization {
-    fn drop(&mut self) {
-        let _ = self.finish(false);
-    }
-}
-
-impl Drop for PendingWeightMaterialization {
-    fn drop(&mut self) {
-        if self.completed {
-            return;
-        }
-        // Submission creates the exact completion event and moves this value's
-        // checkpoint lease into `WeightMaterialization`. If submission itself is
-        // abandoned or fails before that event exists, draining both candidate
-        // streams is the only conservative way to prove that no lazy copy still
-        // references the mmap. This error-cleanup path is intentionally the sole
-        // whole-stream wait in the eredu runtime.
-        let source = self.source_stream.synchronize();
-        let execution = self.execution_stream.synchronize();
-        if source.is_err() || execution.is_err() {
-            if let Some(lease) = &self.lease {
-                lease.retain_mapping_after_sync_failure();
-            }
-        }
+        materialization_error(&self.key, operation, source)
     }
 }
 
@@ -350,5 +500,187 @@ fn mlx_error(
         key: key.to_string(),
         operation,
         source,
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+    use crate::backend::submission_recovery::Probe;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    };
+    use std::time::{Duration, Instant};
+
+    struct Controlled {
+        settled: Arc<AtomicBool>,
+        failed: bool,
+    }
+    impl Probe for Controlled {
+        fn seal(&mut self) {}
+        fn progress(&self) -> Status {
+            Status {
+                settled: self.settled.load(Ordering::Acquire),
+                failed: self.failed,
+                blocked: false,
+            }
+        }
+    }
+
+    fn fixture() -> (tempfile::TempDir, SafetensorsWeightStore, Stream) {
+        let dir = tempfile::tempdir().unwrap();
+        for (key, value) in [("one", 1i32), ("two", 2i32)] {
+            let bytes = value.to_le_bytes();
+            let view =
+                safetensors::tensor::TensorView::new(safetensors::Dtype::I32, vec![1], &bytes)
+                    .unwrap();
+            safetensors::tensor::serialize_to_file(
+                [(key, view)],
+                None,
+                &dir.path().join(format!("{key}.safetensors")),
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            dir.path().join("model.safetensors.index.json"),
+            r#"{"weight_map":{"one":"one.safetensors","two":"two.safetensors"}}"#,
+        )
+        .unwrap();
+        let store = SafetensorsWeightStore::open_with_max_cached_shards(dir.path(), 1).unwrap();
+        let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+        (dir, store, stream)
+    }
+
+    fn assert_capacity_pinned(store: &SafetensorsWeightStore) {
+        assert!(matches!(
+            acquire(store, "two"),
+            Err(CheckpointMaterializationError::Store(
+                StoreError::CapacityExhausted { .. }
+            ))
+        ));
+    }
+
+    fn acquire(
+        store: &SafetensorsWeightStore,
+        key: &str,
+    ) -> Result<WeightLease, CheckpointMaterializationError> {
+        let lease = store.acquire_lease(TensorReadRequest {
+            key: key.to_owned(),
+            selection: TensorSelection::Full,
+            policy: WeightReadPolicy::RequireBounded,
+        })?;
+        WeightLease::from_checkpoint_lease(lease, Arc::new(Mutex::new(BTreeMap::new())))
+    }
+
+    fn reap_until_available(store: &SafetensorsWeightStore) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            crate::backend::submission_recovery::reap();
+            if acquire(store, "two").is_ok() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "terminal source lease was not retired"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn failed_preparation_before_output_publication_retains_exact_checkpoint_lease() {
+        let (_dir, store, stream) = fixture();
+        let settled = Arc::new(AtomicBool::new(false));
+        let prepared = Recovery::with_probe(
+            PendingResources {
+                lease: acquire(&store, "one").unwrap(),
+                output: None,
+                source: None,
+                group: None,
+                _source_stream: stream.clone(),
+                _execution_stream: stream,
+            },
+            Controlled {
+                settled: Arc::clone(&settled),
+                failed: true,
+            },
+        );
+        let started = Instant::now();
+        drop(prepared); // A failed producer has not established a terminal frontier.
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_capacity_pinned(&store);
+        settled.store(true, Ordering::Release);
+        reap_until_available(&store);
+    }
+
+    #[test]
+    fn independent_consumer_ticket_keeps_source_after_parent_drop() {
+        let (_dir, store, stream) = fixture();
+        let source = acquire(&store, "one")
+            .unwrap()
+            .prepare_materialization(&stream, &stream)
+            .unwrap();
+        let resources = Rc::new(MaterializationResources {
+            inputs: Vec::new(),
+            outputs: vec![source.output().clone()],
+            _sources: vec![source],
+            event: None,
+            children: Cell::new(0),
+            failed: Cell::new(false),
+        });
+        let parent = Recovery::with_probe(
+            Rc::clone(&resources),
+            Controlled {
+                settled: Arc::new(AtomicBool::new(true)),
+                failed: false,
+            },
+        );
+        let settled = Arc::new(AtomicBool::new(false));
+        let child = Recovery::with_probe(
+            MaterializationObservation::new(&resources, Some(stream)).unwrap(),
+            Controlled {
+                settled: Arc::clone(&settled),
+                failed: false,
+            },
+        );
+        drop(resources);
+        drop(parent);
+        drop(child);
+        assert_capacity_pinned(&store);
+        settled.store(true, Ordering::Release);
+        reap_until_available(&store);
+    }
+
+    #[test]
+    fn materialization_poll_and_drop_do_not_wait_for_a_contended_runtime() {
+        let (_dir, store, stream) = fixture();
+        let materialized = acquire(&store, "one")
+            .unwrap()
+            .materialize(&stream, &stream)
+            .unwrap();
+        materialized.wait().unwrap();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let holder = std::thread::spawn(move || loop {
+            if safemlx::try_with_submission_retirement(|| {
+                ready_tx.send(()).unwrap();
+                let _ = release_rx.recv_timeout(Duration::from_secs(5));
+            })
+            .is_some()
+            {
+                break;
+            }
+            std::thread::yield_now();
+        });
+        ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let started = Instant::now();
+        assert!(!materialized.is_complete().unwrap());
+        drop(materialized);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_capacity_pinned(&store);
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        reap_until_available(&store);
     }
 }

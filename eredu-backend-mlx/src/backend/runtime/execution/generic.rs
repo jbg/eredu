@@ -21,6 +21,7 @@ use safemlx::{transforms::async_eval_with_event, Event, Stream};
 use crate::backend::{
     error::Error,
     nn::shared::{MlxModule, MlxNeuralBackend},
+    ordinary_retirement::OrdinaryRetirement,
     runtime::{
         checkpoint::binding::{
             binding_bytes, build_module_bindings, populate_module_from_lease,
@@ -43,41 +44,25 @@ use eredu_core::residency::{
 };
 
 /// One populated MLX unit retained with its residency transfer.
-pub struct MlxUnitLease<U> {
-    unit: MlxModule<U>,
-    _transfer: MlxUnitTransfer,
-}
-
 enum MlxUnitTransfer {
     Ordinary { _transfer: ResidentTransfer },
     Dense { _transfer: DensePreparedTransfer },
 }
 
-impl<U> std::ops::Deref for MlxUnitLease<U> {
-    type Target = U;
-
-    fn deref(&self) -> &Self::Target {
-        &self.unit.inner
-    }
-}
-
-impl<U> std::ops::DerefMut for MlxUnitLease<U> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.unit.inner
-    }
-}
+mod submission;
+pub use submission::MlxUnitLease;
 
 /// Exact-completion MLX policy over generic parameterized execution units.
-pub struct MlxLayerwisePolicy<U, P = ()> {
+pub struct MlxLayerwisePolicy<U: 'static, P = ()> {
     residency: ResidencyManager,
     store: SharedCheckpointSource,
     unit_ids: Vec<OffloadUnitId>,
     layout: ExecutionUnitLayout,
     window_depth: usize,
     populator: P,
-    _static_leases: Vec<ResidentUnitLease>,
-    pending: VecDeque<(Event, MlxUnitLease<U>)>,
-    dense: Option<MlxDenseExecution>,
+    _static_leases: OrdinaryRetirement<Vec<ResidentUnitLease>>,
+    pending: VecDeque<MlxUnitLease<U>>,
+    dense: Option<OrdinaryRetirement<MlxDenseExecution>>,
     sample_mlx_memory: bool,
     sample_process_memory: bool,
 }
@@ -88,6 +73,7 @@ struct MlxDenseExecution {
     forward: Option<DenseStreamForwardGuard>,
     groups: Vec<Option<DenseStreamGroupGuard>>,
     prefill: bool,
+    aborted: bool,
 }
 
 mod resident;
@@ -162,7 +148,7 @@ where
         .map_err(|error| Error::ArchitectureModel(error.to_string()))
 }
 
-impl<U, P> MlxLayerwisePolicy<U, P> {
+impl<U: 'static, P> MlxLayerwisePolicy<U, P> {
     /// Creates a bounded policy over validated ordered residency units.
     pub fn new(
         residency: ResidencyManager,
@@ -193,14 +179,17 @@ impl<U, P> MlxLayerwisePolicy<U, P> {
             layout: layout.clone(),
             window_depth,
             populator,
-            _static_leases: static_leases,
+            _static_leases: OrdinaryRetirement::new(static_leases),
             pending: VecDeque::new(),
-            dense: dense.map(|controller| MlxDenseExecution {
-                controller,
-                windows: (0..layout.group_count()).map(|_| None).collect(),
-                forward: None,
-                groups: (0..layout.group_count()).map(|_| None).collect(),
-                prefill: false,
+            dense: dense.map(|controller| {
+                OrdinaryRetirement::new(MlxDenseExecution {
+                    controller,
+                    windows: (0..layout.group_count()).map(|_| None).collect(),
+                    forward: None,
+                    groups: (0..layout.group_count()).map(|_| None).collect(),
+                    prefill: false,
+                    aborted: false,
+                })
             }),
             sample_mlx_memory,
             sample_process_memory,
@@ -209,20 +198,22 @@ impl<U, P> MlxLayerwisePolicy<U, P> {
 
     fn reap_completed(&mut self) -> Result<(), Error> {
         loop {
-            let Some((event, _)) = self.pending.front() else {
+            let Some(lease) = self.pending.front() else {
                 return Ok(());
             };
-            if !event.is_complete()? {
+            if !lease.is_complete()? {
                 return Ok(());
             }
             self.pending.pop_front();
+            crate::backend::ordinary_retirement::reclaim();
         }
     }
 
     fn drain_one(&mut self) -> Result<(), Error> {
-        if let Some((event, lease)) = self.pending.pop_front() {
-            event.synchronize()?;
-            drop(lease);
+        if let Some(lease) = self.pending.front() {
+            lease.wait()?;
+            self.pending.pop_front();
+            crate::backend::ordinary_retirement::reclaim();
         }
         Ok(())
     }

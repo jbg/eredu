@@ -1,5 +1,14 @@
 use safemlx::error::Exception;
 
+/// Backend-produced evidence that a failed model call did not advance state.
+/// The payload has no public constructor; native completion must still be
+/// proven independently before a session can accept another operation.
+#[derive(Debug, thiserror::Error)]
+#[error("architecture model error: {message}")]
+pub struct ModelStatePreservedError {
+    message: String,
+}
+
 fn format_keys(keys: &[String]) -> String {
     const LIMIT: usize = 50;
     if keys.is_empty() {
@@ -63,6 +72,10 @@ pub enum Error {
     /// Invalid composed architecture configuration or state usage.
     #[error("architecture model error: {0}")]
     ArchitectureModel(String),
+
+    /// A typed model adapter proved preflight rejection or successful rollback.
+    #[error(transparent)]
+    ModelStatePreserved(ModelStatePreservedError),
 
     /// Invalid or failed layerwise model execution.
     #[error(transparent)]
@@ -180,6 +193,30 @@ pub enum Error {
     /// Boxed error used for third-party loader failures.
     #[error(transparent)]
     Other(#[from] Box<dyn std::error::Error + Send + Sync>),
+}
+
+impl Error {
+    pub(crate) fn before_model_mutation(error: impl std::fmt::Display) -> Self {
+        Self::ModelStatePreserved(ModelStatePreservedError {
+            message: error.to_string(),
+        })
+    }
+
+    pub(crate) fn after_model_call(
+        error: impl std::fmt::Display,
+        before: Option<u64>,
+        after: Option<u64>,
+    ) -> Self {
+        if matches!((before, after), (Some(before), Some(after)) if after > before) {
+            Self::before_model_mutation(error)
+        } else {
+            Self::ArchitectureModel(error.to_string())
+        }
+    }
+
+    pub(crate) const fn model_state_preserved(&self) -> bool {
+        matches!(self, Self::ModelStatePreserved(_))
+    }
 }
 
 impl From<eredu_checkpoint::validation::StrictLoadFailure> for Error {

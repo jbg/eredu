@@ -298,16 +298,13 @@ mod tests {
         let threads = (0..8)
             .map(|thread_index| {
                 std::thread::spawn(move || {
-                    let stream = crate::Stream::new_with_device(&crate::Device::new(
-                        crate::DeviceType::Gpu,
-                        0,
-                    ));
+                    let stream = crate::test_stream();
                     for iteration in 0..64 {
                         let lhs_len = 3 + thread_index;
                         let rhs_len = lhs_len + 1 + iteration % 3;
                         let lhs = Array::from_slice(&vec![0.0f32; lhs_len], &[lhs_len as i32]);
                         let rhs = Array::from_slice(&vec![0.0f32; rhs_len], &[rhs_len as i32]);
-                        let error = lhs.add(&rhs, &stream).expect_err("add should fail");
+                        let error = lhs.add(&rhs, stream).expect_err("add should fail");
                         let expected = format!("Shapes ({lhs_len}) and ({rhs_len})");
                         assert!(
                             error.what().contains(&expected),

@@ -61,10 +61,8 @@ use eredu_runtime::{
     RealtimePayloadGeneration, RealtimePayloadHistory, RealtimePayloadOwnerIdentity,
     RealtimePayloadState, RealtimeSessionScheduler, ResettableRuntimeLayerState,
     ResidentUnitWindow, RuntimeLayerState, RuntimeState, RuntimeStateComponents, Sampler,
-    SamplingBackend, StateComponentMechanism, StateComponentPlacement, StateError,
-    StateMechanismCapabilities, StaticParameterVisitorMut, SubmissionBackend,
-    SubmittedRealtimeFrame, TokenDomain, WeightBinding, WeightLoweringCapability,
-    WeightLoweringKind,
+    SamplingBackend, StateComponentPlacement, StateError, StaticParameterVisitorMut,
+    SubmissionBackend, SubmittedRealtimeFrame, TokenDomain, WeightBinding, WeightLoweringKind,
 };
 
 include!("support/reference_backend.rs");
@@ -1359,68 +1357,80 @@ fn tensor_parallel_request(residency: LayerWeightResidency) -> MoshiRealtimeRequ
     .unwrap()
 }
 
+struct ReferenceRealtimeSupport;
+
+impl eredu_runtime::RealtimeMechanismSupport for ReferenceRealtimeSupport {
+    fn facts(&self) -> eredu_runtime::RealtimeMechanismFacts {
+        eredu_runtime::RealtimeMechanismFacts::new(
+            ReferenceBackend::OPERATOR_CAPABILITIES,
+            [
+                RealtimeMechanism::TensorOperations,
+                RealtimeMechanism::NeuralOperations,
+                RealtimeMechanism::ParameterMaterialization,
+                RealtimeMechanism::ParameterStorage,
+                RealtimeMechanism::StateStorage,
+                RealtimeMechanism::CoordinateStorage,
+                RealtimeMechanism::Sampling,
+                RealtimeMechanism::Randomness,
+                RealtimeMechanism::HostConversion,
+                RealtimeMechanism::ExactCompletion,
+                RealtimeMechanism::ResourceRetention,
+                RealtimeMechanism::Transfer,
+                RealtimeMechanism::Observation,
+                RealtimeMechanism::Collectives,
+            ],
+            [
+                ExecutionResidency::FullyResident,
+                ExecutionResidency::LayerwiseHost,
+                ExecutionResidency::DenseDiskStream,
+            ],
+            NonZeroUsize::new(2).unwrap(),
+            CommunicationCompletionCapabilities::new([
+                CompletionCancellationMode::QuarantineUntilComplete,
+            ])
+            .unwrap(),
+            SessionCapabilities::new(true, true, true),
+        )
+        .with_state_lifecycle(
+            eredu_runtime::StateLifecycleCapabilities::new()
+                .with_transactions(true, true)
+                .with_reset(true)
+                .with_observation_retention(true),
+        )
+    }
+
+    fn supports_lowering(
+        &self,
+        descriptor: &eredu_runtime::WeightLoweringDescriptor,
+        kind: WeightLoweringKind,
+    ) -> bool {
+        matches!(
+            descriptor.source(),
+            eredu_checkpoint::SourceTensorEncoding::Safetensors(_)
+        ) && matches!(
+            kind,
+            WeightLoweringKind::Direct
+                | WeightLoweringKind::Derived
+                | WeightLoweringKind::Transform
+                | WeightLoweringKind::DerivedTransform
+        )
+    }
+
+    fn state_component_placements(
+        &self,
+        _component: &eredu_core::cache::StateComponentPolicy,
+    ) -> (
+        Option<StateComponentPlacement>,
+        Option<StateComponentPlacement>,
+    ) {
+        (Some(StateComponentPlacement::Device), None)
+    }
+}
+
 fn capabilities(
     requirements: &eredu_runtime::RealtimeArchitectureRequirements,
 ) -> RealtimeMechanismCapabilities {
-    let lowerings = requirements.executions()[0]
-        .weight_lowerings()
-        .iter()
-        .map(|lowering| {
-            WeightLoweringCapability::new(lowering.descriptor().clone(), lowering.kind())
-        })
-        .collect();
-    let layout = requirements.state_layout();
-    let state = StateMechanismCapabilities::new((0..layout.len()).flat_map(|layer| {
-        layout
-            .components(layer)
-            .unwrap()
-            .iter()
-            .cloned()
-            .map(move |component| {
-                StateComponentMechanism::new(
-                    layer,
-                    component,
-                    Some(StateComponentPlacement::Device),
-                    None,
-                )
-            })
-            .collect::<Vec<_>>()
-    }))
-    .with_transactions(true, true)
-    .with_reset(true)
-    .with_observation_retention(true);
-    RealtimeMechanismCapabilities::new(
-        requirements.operators(),
-        [
-            RealtimeMechanism::TensorOperations,
-            RealtimeMechanism::NeuralOperations,
-            RealtimeMechanism::ParameterMaterialization,
-            RealtimeMechanism::ParameterStorage,
-            RealtimeMechanism::StateStorage,
-            RealtimeMechanism::CoordinateStorage,
-            RealtimeMechanism::Sampling,
-            RealtimeMechanism::Randomness,
-            RealtimeMechanism::HostConversion,
-            RealtimeMechanism::ExactCompletion,
-            RealtimeMechanism::ResourceRetention,
-            RealtimeMechanism::Transfer,
-            RealtimeMechanism::Observation,
-            RealtimeMechanism::Collectives,
-        ],
-        [
-            ExecutionResidency::FullyResident,
-            ExecutionResidency::LayerwiseHost,
-            ExecutionResidency::DenseDiskStream,
-        ],
-        lowerings,
-        state,
-        NonZeroUsize::new(2).unwrap(),
-        CommunicationCompletionCapabilities::new([
-            CompletionCancellationMode::QuarantineUntilComplete,
-        ])
-        .unwrap(),
-        SessionCapabilities::new(true, true, true),
-    )
+    eredu_runtime::synthesize_realtime_capabilities(requirements, &ReferenceRealtimeSupport)
 }
 
 fn selected(

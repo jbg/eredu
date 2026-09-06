@@ -1,4 +1,5 @@
 use super::*;
+use std::sync::Arc;
 
 /// MLX communication capability attached to one complete model/session.
 ///
@@ -8,8 +9,10 @@ use super::*;
 /// backend session.
 #[derive(Debug, Clone)]
 pub struct MlxDistributedSession {
+    manifest: Arc<eredu_runtime::CommunicationManifest>,
     communicators: ParallelCommunicators,
     stream: Stream,
+    world: NativeGroup,
     pub(super) authority: eredu_runtime::PartitionCommunicationAuthority,
 }
 
@@ -24,10 +27,30 @@ impl MlxDistributedSession {
         let authority = eredu_runtime::PartitionCommunicationAuthority::from_manifest(manifest)
             .map_err(|error| Error::Parallel(error.to_string()))?;
         Ok(Self {
+            manifest: Arc::new(manifest.clone()),
             communicators,
             stream: stream.clone(),
+            world: world.clone(),
             authority,
         })
+    }
+
+    /// Exact native world from which the retained communication was realized.
+    pub(crate) const fn native_world(&self) -> &NativeGroup {
+        &self.world
+    }
+
+    /// Validates the retained native realization without creating communication resources.
+    pub(crate) fn validate_selected_manifest(
+        &self,
+        manifest: &eredu_runtime::CommunicationManifest,
+    ) -> Result<(), Error> {
+        if self.manifest.as_ref() != manifest {
+            return Err(Error::Parallel(
+                "native communication differs from the selected manifest".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Returns the communicator for an active opaque group identity.
@@ -80,8 +103,10 @@ impl MlxDistributedSession {
                 ))
             })?;
         let Self {
+            manifest: _,
             communicators,
             stream,
+            world: _,
             authority,
         } = self;
         let (groups, routes) = communicators.into_partition_resources(&manifest)?;

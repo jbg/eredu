@@ -87,6 +87,17 @@ impl CacheManagerState {
     }
 }
 
+impl Drop for CacheManagerState {
+    fn drop(&mut self) {
+        // The final state owner has exclusive access without taking its mutex.
+        // Disk commits hold only a weak reference to avoid an ownership cycle.
+        // A late commit removes its own ephemeral output if this state is gone.
+        for record in self.blocks.values() {
+            remove_ephemeral_file(record);
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct CacheResidencyManagerInner {
     pub(super) options: PagedCacheOptions,

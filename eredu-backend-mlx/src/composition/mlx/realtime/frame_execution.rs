@@ -21,6 +21,8 @@ impl RealtimeHostTokenMaterializer for MlxRealtimeFrameTensorMechanisms<'_> {
         values: &[i32],
         shape: [usize; 2],
     ) -> Result<Self::Tensor, Self::Error> {
+        #[cfg(test)]
+        crate::tests::support::path_instrumentation::session_input_creation_attempt();
         let shape = shape
             .into_iter()
             .map(|dimension| {
@@ -181,15 +183,13 @@ where
                     .map(|value| value.as_array().clone()),
             );
         }
-        // `submit_retained` converts a failed event creation into this
-        // pre-submission category only after synchronously draining every
-        // retained root, so no unowned native work crosses this boundary.
+        // Failed event construction can still own accepted work. Its completion
+        // crosses the error boundary with the resources until terminal proof.
         MlxRealtimeCompletion::submit_retained_with_resources(
             retained,
             token_validations.finish(),
             self.execution_resources.take(),
         )
-        .map_err(RealtimeCompletionCreationError::before_submission)
     }
 
     fn retained_resources(&self, completion: &Self::Completion) -> usize {
@@ -232,34 +232,40 @@ pub(super) fn submit_scheduled_realtime_frame(
     frame: &RealtimeInputFrame,
     stream: &Stream,
 ) -> Result<MlxPrepublicationFrame, Error> {
+    model.executor().validate_stream(stream)?;
     let ingress = eredu_architectures::moshi::realtime_ingress_contract(model.execution_config())
         .map_err(Error::ArchitectureModel)?;
+    // Reject invalid host tokens before entering the mutable native operation.
+    // This reuses the neutral contract; invalid user input does not poison a
+    // model whose execution has not begun.
+    ingress
+        .validate(frame)
+        .map_err(|error| Error::Parallel(error.to_string()))?;
     let payload_contract = branch
         .payload_contract(&ingress)
         .map_err(|error| Error::Parallel(error.to_string()))?;
-    let mut host = MlxRealtimeFrameTensorMechanisms::new(stream);
-    let mut tensors = MlxRealtimeFrameTensorMechanisms::new(stream);
-    let mut completion = MlxRealtimeFrameCompletionMechanism::begin_for_execution(
-        model.executor().completion_resources(),
-    )?;
-    let mut executor = MlxSelectedRealtimeFrameExecutor {
-        model: model.executor_mut(),
-    };
-    let submitted = execute_realtime_frame::<MlxSamplingBackend, _, _, _, _, _, _, _, _>(
-        &ingress,
-        &payload_contract,
-        frame,
-        branch.generation_mut(),
-        &eredu_architectures::moshi::realtime_decision_execution(),
-        &mut host,
-        &mut tensors,
-        &mut executor,
-        &mut completion,
-        stream,
-    )
-    .map_err(|error| Error::Parallel(error.to_string()))?;
-    Ok(PrepublicationRealtimeFrame::new(
-        submitted,
-        MlxRealtimeHostObserver::new(stream),
-    ))
+    model.executor_mut().with_submission(|model| {
+        let mut host = MlxRealtimeFrameTensorMechanisms::new(stream);
+        let mut tensors = MlxRealtimeFrameTensorMechanisms::new(stream);
+        let mut completion =
+            MlxRealtimeFrameCompletionMechanism::begin_for_execution(model.completion_resources())?;
+        let mut executor = MlxSelectedRealtimeFrameExecutor { model };
+        let submitted = execute_realtime_frame::<MlxSamplingBackend, _, _, _, _, _, _, _, _>(
+            &ingress,
+            &payload_contract,
+            frame,
+            branch.generation_mut(),
+            &eredu_architectures::moshi::realtime_decision_execution(),
+            &mut host,
+            &mut tensors,
+            &mut executor,
+            &mut completion,
+            stream,
+        )
+        .map_err(|error| Error::Parallel(error.to_string()))?;
+        Ok(PrepublicationRealtimeFrame::new(
+            submitted,
+            MlxRealtimeHostObserver::new(stream),
+        ))
+    })
 }

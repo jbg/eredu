@@ -309,10 +309,12 @@ fn dense_generic_addressable_request_rejects_before_production_paths() {
     crate::tests::support::path_instrumentation::reset();
     let root = tiny_artifact("llama", false);
     let inspection = eredu_architectures::configuration::inspect_artifact(root.path()).unwrap();
-    let options = crate::MlxLoadRequest::default().with_weight_residency(
-        eredu_runtime::WeightResidency::with_independent_parameter_banks(
-            eredu_runtime::OrdinaryWeightResidency::FullyResident,
-            eredu_runtime::ParameterBankLoadOptions::default(),
+    let options = crate::MlxLoadRequest::from_normalized(
+        eredu_runtime::NormalizedLoadRequest::default().with_weight_residency(
+            eredu_runtime::WeightResidency::with_independent_parameter_banks(
+                eredu_runtime::OrdinaryWeightResidency::FullyResident,
+                eredu_runtime::ParameterBankLoadOptions::default(),
+            ),
         ),
     );
     let error = super::super::loading::select_preparation_with_grouped_capabilities(

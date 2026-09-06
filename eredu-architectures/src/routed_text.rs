@@ -4150,6 +4150,12 @@ where
     /// Returns logical parameter targets materialized exclusively by the
     /// selected independent addressable bank.
     pub fn addressable_logical_targets(&self) -> BTreeSet<String> {
+        if !matches!(
+            self.bank_residency(),
+            eredu_runtime::ParameterBankResidency::IndependentCache(_)
+        ) {
+            return BTreeSet::new();
+        }
         self.catalog()
             .logical_targets()
             .into_iter()

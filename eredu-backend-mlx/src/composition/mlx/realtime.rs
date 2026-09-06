@@ -21,14 +21,12 @@ use eredu_runtime::{
     RealtimeCompletionCreationError, RealtimeFrameCompletionMechanism, RealtimeFrameHostObserver,
     RealtimeFrameTensorMechanisms, RealtimeHostTokenMaterializer, RealtimeMechanism,
     RealtimeMechanismCapabilities, RealtimeObservationRequirements, RealtimePayloadBranch,
-    RealtimePayloadHistory, RealtimeSessionBranch, StateComponentMechanism,
-    StateComponentPlacement, StateMechanismCapabilities, WeightLoweringCapability,
-    WeightLoweringKind,
+    RealtimePayloadHistory, RealtimeSessionBranch, StateComponentPlacement, WeightLoweringKind,
 };
 use safemlx::{
     ops::{indexing::TryIndexOp, stack_axis},
     random,
-    transforms::{async_eval_with_event, eval},
+    transforms::async_eval_with_event,
     Array, Dtype, Event, Stream,
 };
 
@@ -55,15 +53,12 @@ mod selection_loading;
 pub use completion::MlxRealtimeCompletion;
 pub use frame_execution::{MlxRealtimeFrameCompletionMechanism, MlxRealtimeFrameTensorMechanisms};
 pub use observation::{MlxFrameSessionBranch, MlxPrepublicationFrame, MlxRealtimeHostObserver};
-pub use selection_loading::MlxRealtimeExecutionContext;
+pub use selection_loading::{MlxPreparedRealtimeExecution, MlxRealtimeExecutionContext};
 
-#[cfg(test)]
-use completion::{submit_or_synchronously_drain, CompletionSubmissionFailure};
 use frame_execution::submit_scheduled_realtime_frame;
 #[cfg(test)]
 use selection_loading::{
     mlx_realtime_mechanisms, mlx_supports_realtime_lowering, realtime_session_capabilities,
-    validate_realtime_session_requirements,
 };
 
 #[cfg(test)]

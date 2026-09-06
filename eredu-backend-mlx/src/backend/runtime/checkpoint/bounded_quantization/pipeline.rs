@@ -532,9 +532,9 @@ fn transform_target(
                     .ok_or_else(|| quantization_error("conversion tile working-set overflow"))?;
                 if tile_peak > tile_budget {
                     return Err(quantization_error(format!(
-                    "bounded quantization planner admitted {} rows for {:?}, but their {}-byte working set exceeds the {}-byte tile slot",
-                    tile_rows, target.weight_name, tile_peak, tile_budget
-                )));
+                        "bounded quantization planner admitted {} rows for {:?}, but their {}-byte working set exceeds the {}-byte tile slot",
+                        tile_rows, target.weight_name, tile_peak, tile_budget
+                    )));
                 }
                 let output_start = matrix
                     .checked_mul(rows)
@@ -606,14 +606,12 @@ fn submit_quantization_tile(
     let tile_stream = tile_context.source_stream();
     let pending = recipe.prepare_borrowed_materialization(source, tile_context)?;
     let (dense, source_leases) = pending.into_parts();
-    let outputs = quantize_tile_outputs(&dense, quantization, target, tile_stream)?;
-    let completion = async_eval_with_event(outputs.iter())?;
+    let prepared = WeightMaterialization::prepare_retained(vec![dense], source_leases)?;
+    let outputs = quantize_tile_outputs(&prepared.inputs()[0], quantization, target, tile_stream)?;
+    let completion = prepared.submit_outputs(outputs)?;
     output_shards[output_shard].tile_submitted();
     pending_tiles.push_back(SubmittedQuantizationTile {
-        outputs,
-        _dense: dense,
-        source_leases,
-        completion: Some(completion),
+        completion,
         output_start,
         rows,
         planned_working_set_bytes,
@@ -662,10 +660,7 @@ fn quantize_tile_outputs(
 }
 
 struct SubmittedQuantizationTile {
-    outputs: Vec<Array>,
-    _dense: Array,
-    source_leases: Vec<PendingWeightMaterialization>,
-    completion: Option<Event>,
+    completion: WeightMaterialization,
     output_start: usize,
     rows: usize,
     planned_working_set_bytes: u64,
@@ -673,29 +668,17 @@ struct SubmittedQuantizationTile {
 }
 
 impl SubmittedQuantizationTile {
-    fn write(mut self, shard: &mut OutputShard) -> Result<(), Error> {
-        self.complete()?;
+    fn write(self, shard: &mut OutputShard) -> Result<(), Error> {
+        self.completion.wait()?;
         for ((layout, output), buffer) in shard
             .layouts
             .iter()
-            .zip(&self.outputs)
+            .zip(self.completion.outputs())
             .zip(&mut shard.buffers)
         {
             write_tile(buffer, layout, self.output_start, self.rows, output)?;
         }
         Ok(())
-    }
-
-    fn complete(&mut self) -> Result<(), Error> {
-        let result = self
-            .completion
-            .take()
-            .expect("submitted tile retains its completion")
-            .synchronize();
-        for mapping in self.source_leases.drain(..) {
-            mapping.complete();
-        }
-        result.map_err(Error::from)
     }
 }
 
@@ -725,14 +708,6 @@ fn queued_working_set_bytes(
             .checked_add(tile.planned_working_set_bytes)
             .ok_or_else(|| quantization_error("double-buffered working-set overflow"))
     })
-}
-
-impl Drop for SubmittedQuantizationTile {
-    fn drop(&mut self) {
-        if self.completion.is_some() {
-            let _ = self.complete();
-        }
-    }
 }
 
 fn write_tile(
@@ -781,7 +756,7 @@ fn write_tile(
             return Err(quantization_error(format!(
                 "quantized output {:?} has unsupported dtype {dtype:?}",
                 layout.name
-            )))
+            )));
         }
     }
     destination.copy_from_slice(&evaluated.to_native_bytes());

@@ -43,6 +43,8 @@ pub mod realtime;
 pub mod residency;
 /// Transactional fair work scheduler.
 pub mod scheduler;
+/// Exact session admission and unresolved-submission ownership.
+pub mod session_authority;
 /// High-level speculative execution contracts and orchestration.
 pub mod speculative;
 /// Parallel topology and placement planning.
@@ -63,17 +65,18 @@ pub use artifact::{
 pub use attention::{AttentionPolicy, LayerSchedule, LayerScheduleError};
 pub use automatic::{
     realize_execution_plan_drafting, realize_execution_plan_target, select_execution_plan_drafting,
-    select_execution_plan_target, AllocatorTelemetry, AutomaticPlanRequest, AutomaticPlanner,
-    AutomaticPlannerPolicy, AutomaticPlanningBackend, AutomaticPlanningError,
-    BoundedResidencyRequirement, CandidateAdmission, DurationSeconds, ExecutionPlanBackendFactory,
-    ExecutionPlanReport, ExecutionPlanTarget, ExecutionPlanTargetLoadError,
-    ExecutionPlanTargetSelection, ExecutionTelemetry, ExpertCacheTelemetry, ExternalDraftArtifact,
-    HardwareBackendProfile, HardwareDeviceProfile, HardwareMemorySemantics, HardwareProfile,
-    ModelResourceProfile, ObservationKind, Observed, PlanExplanation, PlanExplanationEntry,
-    PlanExplanationLevel, PreparedExecutionPlanTarget, RealizedDrafting, ResidencyTelemetry,
-    RetainedAutomaticPlan, SelectedExecutionPlanDrafting, SelectedExecutionPlanTarget,
-    SpeculativeDecodingTelemetry, TimingTelemetry, TokenizerCompatibilityError,
-    TokenizerCompatibilityProof, TransferTelemetry, AUTOMATIC_SCHEMA_VERSION,
+    select_execution_plan_target, speculative_decoding_telemetry, AllocatorTelemetry,
+    AutomaticPlanRequest, AutomaticPlanner, AutomaticPlannerPolicy, AutomaticPlanningBackend,
+    AutomaticPlanningError, BoundedResidencyRequirement, CandidateAdmission, DurationSeconds,
+    ExecutionPlanBackendFactory, ExecutionPlanReport, ExecutionPlanTarget,
+    ExecutionPlanTargetLoadError, ExecutionPlanTargetSelection, ExecutionTelemetry,
+    ExpertCacheTelemetry, ExternalDraftArtifact, HardwareBackendProfile, HardwareDeviceProfile,
+    HardwareMemorySemantics, HardwareProfile, ModelResourceProfile, ObservationKind, Observed,
+    PlanExplanation, PlanExplanationEntry, PlanExplanationLevel, PreparedExecutionPlanTarget,
+    RealizedDrafting, ResidencyTelemetry, RetainedAutomaticPlan, SelectedExecutionPlanDrafting,
+    SelectedExecutionPlanTarget, SpeculativeDecodingTelemetry, TimingTelemetry,
+    TokenizerCompatibilityError, TokenizerCompatibilityProof, TransferTelemetry,
+    AUTOMATIC_SCHEMA_VERSION,
 };
 pub use backend::{
     load_model, prepare_inspected_model, BackendDescriptor, BackendError, BackendProvider,
@@ -144,6 +147,10 @@ pub use realtime::{
 pub use residency::{
     BackgroundPrefetchReport, PrefetchAdmission, PrefetchCompletion, PrefetchDemandObservation,
     PrefetchDemandResolution, PrefetchExecutionState, PrefetchStateError, PrefetchWork,
+};
+pub use session_authority::{
+    SessionAdmission, SessionAdmissionError, SessionAuthority, SessionAuthorityError,
+    SubmissionLease,
 };
 pub use speculative::{
     cancel_pending_verification, decide_speculative_proposal, propose_block,

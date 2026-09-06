@@ -695,3 +695,52 @@ fn neg_log_materializes_negative_rates_and_rejects_nonnegative_values() {
         Err(WeightRecipeError::NonNegativeNegLogInput)
     ));
 }
+
+#[test]
+fn neg_log_eager_preparation_hands_back_exact_source_lease_until_submission_finishes() {
+    use eredu_checkpoint::store::{CheckpointSource, ReadPolicy, StoreError, TensorReadRequest};
+    let dir = tempfile::tempdir().unwrap();
+    for (key, value) in [("negative", -4.0f32), ("nonnegative", 0.0), ("other", 3.0)] {
+        let bytes = value.to_le_bytes();
+        let view = TensorView::new(SafeDtype::F32, vec![1], &bytes).unwrap();
+        serialize_to_file(
+            [(key, view)],
+            None,
+            &dir.path().join(format!("{key}.safetensors")),
+        )
+        .unwrap();
+    }
+    std::fs::write(dir.path().join("model.safetensors.index.json"),
+        r#"{"weight_map":{"negative":"negative.safetensors","nonnegative":"nonnegative.safetensors","other":"other.safetensors"}}"#).unwrap();
+    let store = SafetensorsWeightStore::open_with_max_cached_shards(dir.path(), 1).unwrap();
+    let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+    let context = MlxParameterMaterializationContext::new(&stream, &stream);
+    let request = |key: &str| TensorReadRequest {
+        key: key.to_owned(),
+        selection: TensorSelection::Full,
+        policy: ReadPolicy::RequireBounded,
+    };
+    let recipe = |key: &str| DerivedWeightRecipe::NegLog {
+        input: Box::new(source(key)),
+    };
+    let pending = recipe("negative")
+        .prepare_materialization(&store, &context)
+        .unwrap();
+    assert!(matches!(
+        store.acquire_lease(request("other")),
+        Err(StoreError::CapacityExhausted { .. })
+    ));
+    let (output, sources) = pending.into_parts();
+    let output = WeightMaterialization::submit_retained(output, sources)
+        .unwrap()
+        .synchronize()
+        .unwrap();
+    assert!((output.evaluated().unwrap().as_slice::<f32>()[0] - 4.0f32.ln()).abs() < 1e-6);
+    // A normal semantic rejection follows a completed scalar evaluation and
+    // may release its source; an unresolved native failure may not.
+    assert!(matches!(
+        recipe("nonnegative").prepare_materialization(&store, &context),
+        Err(WeightRecipeError::NonNegativeNegLogInput)
+    ));
+    drop(store.acquire_lease(request("other")).unwrap());
+}

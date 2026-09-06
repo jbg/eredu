@@ -22,11 +22,7 @@ use super::*;
 pub struct DistributedCompletion<T> {
     value: T,
     event: Rc<Event>,
-    _retained: Vec<Array>,
-    _count_buffers: Vec<Vec<usize>>,
-    _groups: Vec<Group>,
-    _routes: Vec<CommunicationRouteRealization>,
-    _streams: Vec<Stream>,
+    recovery: Rc<Recovery<Rc<NativeResources>>>,
     authority: Option<AuthorizedCompletion>,
     quarantined: Cell<bool>,
     #[cfg(test)]
@@ -42,12 +38,8 @@ struct AuthorizedCompletion {
 
 #[derive(Debug)]
 pub(super) struct DistributedCompletionOrphan {
-    pub(super) event: Rc<Event>,
-    _arrays: Vec<Array>,
-    _count_buffers: Vec<Vec<usize>>,
-    _groups: Vec<Group>,
-    _routes: Vec<CommunicationRouteRealization>,
-    _streams: Vec<Stream>,
+    pub(super) _event: Rc<Event>,
+    recovery: Rc<Recovery<Rc<NativeResources>>>,
     #[cfg(test)]
     pub(super) force_pending: Rc<Cell<bool>>,
 }
@@ -64,7 +56,7 @@ impl DistributedCompletionOrphanQuarantine {
             if work.force_pending.get() {
                 return true;
             }
-            matches!(work.event.is_complete(), Ok(false))
+            !work.recovery.progress().settled
         });
     }
 }
@@ -72,9 +64,9 @@ impl DistributedCompletionOrphanQuarantine {
 impl Drop for DistributedCompletionOrphanQuarantine {
     fn drop(&mut self) {
         self.reap();
-        for work in self.work.drain(..) {
-            let _ = work.event.synchronize();
-        }
+        // Dropping the shared recovery handle transfers unresolved resources to
+        // the preallocated nonblocking recovery quarantine, including TLS exit.
+        self.work.clear();
     }
 }
 
@@ -108,15 +100,24 @@ impl<T> DistributedCompletion<T> {
         outputs: impl IntoIterator<Item = &'a Array>,
     ) -> Result<Self, Error> {
         let retained = outputs.into_iter().cloned().collect::<Vec<_>>();
-        let event = Rc::new(async_eval_with_event(retained.iter())?);
+        let mut recovery = Recovery::begin(NativeResources::new(
+            retained,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        ))?;
+        let event = async_eval_with_event(recovery.retention().arrays.iter());
+        recovery.seal();
+        recovery.retention().host_failed.set(event.is_err());
+        recovery.progress();
+        let event = Rc::new(event?);
+        *recovery.retention().event.borrow_mut() = Some(Rc::clone(&event));
+        check_native_status(&recovery)?;
         Ok(Self {
             value,
             event,
-            _retained: retained,
-            _count_buffers: Vec::new(),
-            _groups: Vec::new(),
-            _routes: Vec::new(),
-            _streams: Vec::new(),
+            recovery: Rc::new(recovery),
             authority: None,
             quarantined: Cell::new(false),
             #[cfg(test)]
@@ -137,7 +138,18 @@ impl<T> DistributedCompletion<T> {
         operation: eredu_runtime::CommunicationOperation,
     ) -> Result<Self, Error> {
         let outputs = outputs.into_iter().cloned().collect::<Vec<_>>();
-        let event = Rc::new(async_eval_with_event(outputs.iter()).map_err(|error| {
+        let mut recovery = Recovery::begin(NativeResources::new(
+            retained,
+            count_buffers,
+            groups,
+            routes,
+            streams,
+        ))?;
+        let event = async_eval_with_event(outputs.iter());
+        recovery.seal();
+        recovery.retention().host_failed.set(event.is_err());
+        recovery.progress();
+        let event = Rc::new(event.map_err(|error| {
             Error::Parallel(
                 authority
                     .submission_error(
@@ -149,6 +161,19 @@ impl<T> DistributedCompletion<T> {
                     .to_string(),
             )
         })?);
+        *recovery.retention().event.borrow_mut() = Some(Rc::clone(&event));
+        check_native_status(&recovery).map_err(|error| {
+            Error::Parallel(
+                authority
+                    .submission_error(
+                        error,
+                        operation,
+                        eredu_runtime::DistributedExecutionPhase::Execution,
+                        None,
+                    )
+                    .to_string(),
+            )
+        })?;
         #[cfg(test)]
         let force_pending = Rc::new(Cell::new(
             FORCE_NEXT_COMMUNICATION_PENDING.with(|force| force.replace(false)),
@@ -156,11 +181,7 @@ impl<T> DistributedCompletion<T> {
         Ok(Self {
             value,
             event,
-            _retained: retained,
-            _count_buffers: count_buffers,
-            _groups: groups,
-            _routes: routes,
-            _streams: streams,
+            recovery: Rc::new(recovery),
             authority: Some(AuthorizedCompletion {
                 authority,
                 operation,
@@ -189,12 +210,8 @@ impl<T> DistributedCompletion<T> {
             return;
         }
         let work = DistributedCompletionOrphan {
-            event: self.event.clone(),
-            _arrays: self._retained.clone(),
-            _count_buffers: self._count_buffers.clone(),
-            _groups: self._groups.clone(),
-            _routes: self._routes.clone(),
-            _streams: self._streams.clone(),
+            _event: self.event.clone(),
+            recovery: Rc::clone(&self.recovery),
             #[cfg(test)]
             force_pending: self.force_pending.clone(),
         };
@@ -215,30 +232,41 @@ impl<T> DistributedCompletion<T> {
     /// Because MLX graphs are lazy, the consumer graph must be evaluated after
     /// this call. Constructing it before or after the call does not submit it.
     pub fn wait_on(&self, stream: &Stream) -> Result<(), Error> {
+        check_native_status(&self.recovery).map_err(|error| self.completion_error(error))?;
         if self.quarantined.get() {
             return Err(Error::Parallel(
                 "distributed completion is quarantined after a bounded timeout".into(),
             ));
         }
         self.ensure_authority_active()?;
-        self.event
-            .wait_on(stream)
-            .map_err(|error| self.completion_error(error))?;
+        observe_native_child(
+            self.recovery.retention(),
+            Vec::new(),
+            Some(stream.clone()),
+            || self.event.wait_on(stream),
+        )
+        .map_err(|error| self.completion_error(error))?;
         self.ensure_authority_active()?;
         Ok(())
     }
 
     /// Returns whether the exact distributed operation has completed.
     pub fn is_complete(&self) -> Result<bool, Error> {
-        self.ensure_authority_active()?;
-        let complete = self
-            .event
-            .is_complete()
-            .map_err(|error| self.completion_error(error))?;
-        if complete {
+        safemlx::try_with_submission_retirement(|| {
+            if !check_native_status(&self.recovery).map_err(|error| self.completion_error(error))? {
+                return Ok(false);
+            }
             self.ensure_authority_active()?;
-        }
-        Ok(complete)
+            let complete = self
+                .event
+                .is_complete()
+                .map_err(|error| self.completion_error(error))?;
+            if complete {
+                self.ensure_authority_active()?;
+            }
+            Ok(complete)
+        })
+        .unwrap_or(Ok(false))
     }
 
     /// Returns the backend which owns this exact completion.
@@ -248,28 +276,29 @@ impl<T> DistributedCompletion<T> {
 
     /// Returns the arrays explicitly retained through exact completion.
     pub fn retained_resources(&self) -> usize {
-        self._retained.len()
+        self.recovery.retention().arrays.len()
     }
 
     /// Returns retained count buffers, groups, routes, and streams in that order.
     #[cfg(test)]
     pub(crate) fn retained_native_resources(&self) -> (usize, usize, usize, usize) {
         (
-            self._count_buffers.len(),
-            self._groups.len(),
-            self._routes.len(),
-            self._streams.len(),
+            self.recovery.retention()._count_buffers.len(),
+            self.recovery.retention().groups.len(),
+            self.recovery.retention()._routes.len(),
+            self.recovery.retention()._streams.len(),
         )
     }
 
     /// Blocks the host for this exact completion, not the remainder of a stream.
     pub fn synchronize(&self) -> Result<(), Error> {
+        check_native_status(&self.recovery).map_err(|error| self.completion_error(error))?;
         self.ensure_authority_active()?;
         let Some(context) = &self.authority else {
-            return self
-                .event
-                .synchronize()
-                .map_err(|error| self.completion_error(error));
+            while !self.is_complete()? {
+                std::thread::yield_now();
+            }
+            return Ok(());
         };
         let policy = context.authority.completion_policy().ok_or_else(|| {
             Error::Parallel("authorized distributed completion has no bounded policy".into())
@@ -283,12 +312,17 @@ impl<T> DistributedCompletion<T> {
         loop {
             #[cfg(test)]
             let complete = if self.force_pending.get() {
-                Ok(false)
+                safemlx::try_with_submission_retirement(|| {
+                    check_native_status(&self.recovery)
+                        .map(|_| false)
+                        .map_err(|error| self.completion_error(error))
+                })
+                .unwrap_or(Ok(false))
             } else {
-                self.event.is_complete()
+                self.is_complete()
             };
             #[cfg(not(test))]
-            let complete = self.event.is_complete();
+            let complete = self.is_complete();
             match complete {
                 Ok(true) => {
                     self.ensure_authority_active()?;
@@ -301,7 +335,7 @@ impl<T> DistributedCompletion<T> {
                         "bounded distributed completion deadline exceeded; live work was quarantined",
                     )));
                 }
-                Err(error) => return Err(self.completion_error(error)),
+                Err(error) => return Err(error),
             }
         }
     }

@@ -2,10 +2,10 @@ use super::super::*;
 use super::*;
 
 pub(crate) struct PartitionedDenseDecoderBindingVisitor<'a> {
-    pub(super) distributed: crate::backend::distributed::MlxDistributedSession,
-    pub(super) additional_claimed_sources: std::collections::BTreeSet<String>,
-    pub(super) stream: &'a Stream,
-    pub(super) weights_stream: &'a Stream,
+    pub(in crate::composition::mlx) distributed: crate::backend::distributed::MlxDistributedSession,
+    pub(in crate::composition::mlx) additional_claimed_sources: std::collections::BTreeSet<String>,
+    pub(in crate::composition::mlx) stream: &'a Stream,
+    pub(in crate::composition::mlx) weights_stream: &'a Stream,
 }
 
 pub(crate) struct PartitionedPredictionBindingVisitor<'a> {
@@ -73,16 +73,16 @@ impl
 }
 
 pub(crate) struct PartitionedRoutedDecoderBindingVisitor<'a> {
-    pub(super) distributed: crate::backend::distributed::MlxDistributedSession,
-    pub(super) additional_claimed_sources: std::collections::BTreeSet<String>,
-    pub(super) stream: &'a Stream,
-    pub(super) weights_stream: &'a Stream,
+    pub(in crate::composition::mlx) distributed: crate::backend::distributed::MlxDistributedSession,
+    pub(in crate::composition::mlx) additional_claimed_sources: std::collections::BTreeSet<String>,
+    pub(in crate::composition::mlx) stream: &'a Stream,
+    pub(in crate::composition::mlx) weights_stream: &'a Stream,
 }
 
 pub(crate) struct PartitionedPoolingRoutedDecoderBindingVisitor<'a> {
-    pub(super) distributed: crate::backend::distributed::MlxDistributedSession,
-    pub(super) stream: &'a Stream,
-    pub(super) weights_stream: &'a Stream,
+    pub(in crate::composition::mlx) distributed: crate::backend::distributed::MlxDistributedSession,
+    pub(in crate::composition::mlx) stream: &'a Stream,
+    pub(in crate::composition::mlx) weights_stream: &'a Stream,
 }
 
 impl
@@ -471,45 +471,13 @@ where
     G: 'static,
     F: ReplicatedExecutableFinalizer<A, MlxHybridState>,
 {
-    let capability_estimate = prepared.capability_estimate().clone();
-    let effective_model_type = prepared.effective_model_type().to_owned();
-    let selected_residency = prepared.prepared().selected().base().residency();
-    let tensor_group = prepared
-        .prepared()
-        .selected()
-        .tensor_group()
-        .ok_or_else(|| {
-            Error::ArchitectureModel("direct partition has no selected tensor group".into())
-        })?;
-    let execution_plan = prepared
-        .prepared()
-        .selected()
-        .direct_execution_plan()
+    let facts = prepared.session_facts().map_err(Error::ArchitectureModel)?;
+    let tensor_group = facts
+        .required_tensor_group()
         .map_err(Error::ArchitectureModel)?;
-    let publication_authority = execution_plan
-        .publication_authority(prepared.prepared().selected().communication())
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?
-        .ok_or_else(|| {
-            Error::ArchitectureModel(
-                "direct resident execution has no selected output publication authority".into(),
-            )
-        })?;
-    let prompt_cache_topology = prepared
-        .prepared()
-        .selected()
-        .prompt_cache_topology()
-        .map_err(Error::ArchitectureModel)?;
-    let prompt_cache_identity = prepared
-        .prepared()
-        .selected()
-        .partition()
-        .state()
-        .ok_or_else(|| Error::ArchitectureModel("direct partition has no state".into()))?
-        .prompt_cache_identity::<MlxNeuralBackend, _>(
-            prepared.prepared().architecture(),
-            prompt_cache_topology.clone(),
-        )
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let (text, prompt_cache_topology, execution_plan, publication_authority) = facts.into_parts();
+    let (prompt_cache_identity, capability_estimate, effective_model_type, selected_residency) =
+        text.into_parts();
     let mut mechanisms = MlxReplicatedTextMechanisms::new(store, stream, weights_stream);
     mechanisms.set_ignored_checkpoint_sources(additional_claimed_sources);
     let mut distributed = Some(distributed);

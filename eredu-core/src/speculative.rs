@@ -3630,6 +3630,49 @@ mod tests {
     type TransactionTrace = Rc<RefCell<Vec<&'static str>>>;
 
     #[test]
+    fn speculative_telemetry_preserves_exact_statistics_and_durations() {
+        let stats = SpeculativeStats {
+            execution_topology: SpeculativeExecutionTopology::CrossDeviceSplit,
+            target_tokens: 31,
+            draft_tokens: 8,
+            accepted_tokens: 5,
+            rounds: 2,
+            accept_lens: vec![2, 3],
+            emitted_tokens: 7,
+            optimistic_draft_tokens: 9,
+            reused_optimistic_tokens: 4,
+            discarded_optimistic_tokens: 5,
+            adaptive_lookahead_disabled: true,
+            optimistic_draft_time: Duration::from_millis(125),
+            verification_in_flight_time: Duration::from_millis(375),
+            ..SpeculativeStats::default()
+        };
+        assert_eq!(
+            crate::speculative_decoding_telemetry(&stats),
+            crate::SpeculativeDecodingTelemetry {
+                execution_topology: "cross-device-split".into(),
+                target_tokens: 31,
+                draft_tokens: 8,
+                accepted_tokens: 5,
+                accept_rate: 0.625,
+                rounds: 2,
+                accept_lens: vec![2, 3],
+                emitted_tokens: 7,
+                optimistic_draft_tokens: 9,
+                reused_optimistic_tokens: 4,
+                discarded_optimistic_tokens: 5,
+                adaptive_lookahead_disabled: true,
+                optimistic_draft_seconds: 0.125,
+                verification_in_flight_seconds: 0.375,
+            }
+        );
+        assert_eq!(
+            crate::speculative_decoding_telemetry(&SpeculativeStats::default()).accept_rate,
+            0.0
+        );
+    }
+
+    #[test]
     fn speculative_capability_schema_round_trips_without_backend_identity() {
         let capability = SpeculativeCapability::Unsupported {
             draft_source: SpeculativeDraftSource::Embedded,

@@ -1,17 +1,15 @@
 //! MLX observations and plan realization for neutral automatic planning.
 
-use std::{num::NonZeroUsize, path::Path};
+use std::path::Path;
 
 use eredu_core::{
     AutomaticPlanningBackend, AutomaticPlanningError, BackendId, BoundedResidencyRequirement,
-    CandidateAdmission, DevicePlan, DraftPlacementPlan, DraftingPlan, DurationSeconds,
-    ExecutionPlan, ExecutionPlanBackendFactory, ExecutionPlanTarget, ExecutionPlanTargetSelection,
+    CandidateAdmission, DevicePlan, DraftPlacementPlan, DraftingPlan, ExecutionPlan,
+    ExecutionPlanBackendFactory, ExecutionPlanTarget, ExecutionPlanTargetSelection,
     ExpertCacheTelemetry, ExternalDraftArtifact, HardwareBackendProfile, HardwareDeviceProfile,
     HardwareMemorySemantics, HardwareProfile, ModelResourceProfile, ModelRuntime, Observed,
-    PhysicalMemorySemantics, QuantizationRequest, RealizedDrafting, ResidencyPlan,
-    ResidencyTelemetry, SelectedExecutionPlanTarget, SpeculativeDecodingTelemetry,
-    SpeculativeDraftSource, SpeculativeGenerationBackend, SpeculativeStats, TransferTelemetry,
-    WeightTransformationPlan, AUTOMATIC_SCHEMA_VERSION,
+    RealizedDrafting, ResidencyPlan, SelectedExecutionPlanTarget, SpeculativeDraftSource,
+    SpeculativeGenerationBackend,
 };
 use safemlx::{Device, DeviceType, Stream};
 
@@ -23,11 +21,7 @@ use crate::{
     backend::runtime::residency::parameter_bank::ParameterBankResidencyReport,
     backend::{error::Error, MlxAcceleratorFamily, MlxDeviceIdentity},
 };
-use eredu_core::residency::{MemoryTier, OffloadConfig, TransferDirection};
-use eredu_runtime::{
-    DenseDiskStreamLoadOptions, LayerwiseLoadOptions, OrdinaryWeightResidency,
-    ParameterBankLoadOptions, ResidencyReport, WeightResidency,
-};
+use eredu_runtime::selected_text_bounded_requirement;
 
 /// MLX automatic-planning adapter and whole-session backend factory.
 #[derive(Debug, Clone, Copy, Default)]
@@ -56,8 +50,16 @@ impl MlxBackendFactory {
         &self,
         plan: &ExecutionPlan,
     ) -> Result<MlxLoadRequest, AutomaticPlanningError> {
-        mlx_load_options(self, plan)
-            .map_err(|error| planning_backend_error("select_execution_plan_target", error))
+        eredu_runtime::NormalizedLoadRequest::from_execution_plan(
+            plan,
+            eredu_runtime::ResidencyDiagnostics::new(
+                self.sample_mlx_memory,
+                self.sample_process_memory,
+            ),
+            None,
+        )
+        .map(MlxLoadRequest::from_normalized)
+        .map_err(|error| AutomaticPlanningError::Invalid(error.to_string()))
     }
 }
 
@@ -89,21 +91,17 @@ pub fn create_realtime_execution(
     let stream = Stream::try_new_with_device(&realized.device)?;
     let weights_stream = Stream::try_new_with_device(&Device::new(DeviceType::Cpu, 0))?;
     let context = MlxRealtimeExecutionContext::new(&stream, &weights_stream);
-    let execution = context.materialize_realtime_execution(selected, options)?;
+    let execution = context.materialize_realtime_execution(selected)?;
     Ok((context, execution))
 }
 
 /// Discovers hardware facts visible to the MLX adapter.
 pub fn discover_hardware() -> HardwareProfile {
-    let logical_cpu_count = std::thread::available_parallelism().map_or_else(
-        |error| Observed::unavailable(error.to_string()),
-        |count| Observed::exact(count.get() as u64, "std::thread::available_parallelism"),
-    );
     let (physical_memory_bytes, available_memory_bytes, semantics) = match available_memory() {
         Ok(memory) => (
             memory.physical_memory_bytes,
             memory.available_memory_bytes,
-            memory_semantics(memory.physical_semantics),
+            memory.physical_semantics.into(),
         ),
         Err(error) => (
             Observed::unavailable(error.to_string()),
@@ -175,147 +173,17 @@ pub fn discover_hardware() -> HardwareProfile {
         }
     }
 
-    HardwareProfile {
-        schema_version: AUTOMATIC_SCHEMA_VERSION,
-        operating_system: std::env::consts::OS.into(),
-        architecture: std::env::consts::ARCH.into(),
-        logical_cpu_count,
+    HardwareProfile::observe_host(
         physical_memory_bytes,
         available_memory_bytes,
-        physical_memory_semantics: semantics,
-        backends: vec![HardwareBackendProfile {
+        semantics,
+        vec![HardwareBackendProfile {
             backend: BackendId::new("mlx").expect("MLX is a valid backend identifier"),
             available: true,
             detail: (!details.is_empty()).then(|| details.join("; ")),
             devices,
         }],
-    }
-}
-
-fn mlx_load_options(
-    factory: &MlxBackendFactory,
-    plan: &ExecutionPlan,
-) -> Result<MlxLoadRequest, Error> {
-    if plan.topology().world_size() != 1 {
-        return Err(Error::AutomaticPlanning(
-            "single-device automatic plans require a 1x1x1 parallel topology".into(),
-        ));
-    }
-    let mut load = match plan.weight_transformation() {
-        WeightTransformationPlan::PreserveCheckpoint => MlxLoadRequest::default(),
-        WeightTransformationPlan::Affine { bits, group_size } => {
-            MlxLoadRequest::with_quantization(QuantizationRequest::Affine {
-                group_size: u32::try_from(group_size).map_err(|_| {
-                    Error::Quantization(format!(
-                        "group_size must be non-negative, got {group_size}"
-                    ))
-                })?,
-                bits: u8::try_from(bits)
-                    .map_err(|_| Error::Quantization(format!("bits must fit in u8, got {bits}")))?,
-            })
-        }
-        WeightTransformationPlan::MxFp4 => {
-            MlxLoadRequest::with_quantization(QuantizationRequest::MxFp4)
-        }
-        _ => {
-            return Err(Error::AutomaticPlanning(
-                "unsupported weight transformation".into(),
-            ))
-        }
-    };
-    load = load.with_required_session_capabilities(*plan.required_session_capabilities());
-    let residency = match plan.residency() {
-        ResidencyPlan::FullyResident => OrdinaryWeightResidency::FullyResident,
-        ResidencyPlan::LayerwiseHost {
-            device_layer_window,
-            device_budget_bytes,
-            host_budget_bytes,
-        } => OrdinaryWeightResidency::LayerwiseHost(
-            LayerwiseLoadOptions::new(OffloadConfig::new(
-                *device_budget_bytes,
-                *host_budget_bytes,
-                *device_layer_window,
-            )?)
-            .with_max_cached_shards(plan.max_cached_shards())
-            .with_memory_sampling(factory.sample_mlx_memory, factory.sample_process_memory),
-        ),
-        ResidencyPlan::DenseDiskStream {
-            device_budget_bytes,
-            host_budget_bytes,
-            host_lookahead,
-            background_queue,
-        } => {
-            let mut options = DenseDiskStreamLoadOptions::new(
-                *device_budget_bytes,
-                *host_budget_bytes,
-                *host_lookahead,
-                *background_queue,
-            )?;
-            options = options
-                .with_max_cached_shards(plan.max_cached_shards())
-                .with_memory_sampling(factory.sample_mlx_memory, factory.sample_process_memory);
-            OrdinaryWeightResidency::DenseDiskStream(options)
-        }
-        _ => {
-            return Err(Error::AutomaticPlanning(
-                "unsupported residency plan".into(),
-            ))
-        }
-    };
-    let residency = if let Some(expert) = plan.expert_cache() {
-        WeightResidency::with_independent_parameter_banks(
-            residency,
-            ParameterBankLoadOptions::new(
-                OffloadConfig::new(expert.device_budget_bytes(), expert.host_budget_bytes(), 1)?
-                    .with_eviction_policy(expert.eviction_policy()),
-                expert.scratch_bytes(),
-                expert.prefill_bank_bytes(),
-            )?,
-        )
-    } else {
-        match residency {
-            OrdinaryWeightResidency::FullyResident => WeightResidency::fully_resident(),
-            OrdinaryWeightResidency::LayerwiseHost(options) => {
-                WeightResidency::layerwise_host(options)
-            }
-            OrdinaryWeightResidency::DenseDiskStream(options) => {
-                WeightResidency::dense_disk_stream(options)
-            }
-            _ => {
-                return Err(Error::Parallel(
-                    "automatic MLX planning selected an unsupported ordinary weight residency"
-                        .into(),
-                ));
-            }
-        }
-    };
-    load = load
-        .with_weight_residency(residency)
-        .with_drafting_plan(plan.drafting())?;
-    Ok(load)
-}
-
-fn mlx_drafter_load_options(plan: &ExecutionPlan) -> Result<MlxLoadRequest, Error> {
-    match plan.weight_transformation() {
-        WeightTransformationPlan::PreserveCheckpoint => Ok(MlxLoadRequest::default()),
-        WeightTransformationPlan::Affine { bits, group_size } => Ok(
-            MlxLoadRequest::with_quantization(QuantizationRequest::Affine {
-                group_size: u32::try_from(group_size).map_err(|_| {
-                    Error::Quantization(format!(
-                        "group_size must be non-negative, got {group_size}"
-                    ))
-                })?,
-                bits: u8::try_from(bits)
-                    .map_err(|_| Error::Quantization(format!("bits must fit in u8, got {bits}")))?,
-            }),
-        ),
-        WeightTransformationPlan::MxFp4 => Ok(MlxLoadRequest::with_quantization(
-            QuantizationRequest::MxFp4,
-        )),
-        _ => Err(Error::AutomaticPlanning(
-            "unsupported weight transformation".into(),
-        )),
-    }
+    )
 }
 
 impl AutomaticPlanningBackend for MlxBackendFactory {
@@ -349,8 +217,7 @@ impl AutomaticPlanningBackend for MlxBackendFactory {
         inspection: &Self::Inspection,
         plan: &ExecutionPlan,
     ) -> Result<CandidateAdmission, AutomaticPlanningError> {
-        let load = mlx_load_options(self, plan)
-            .map_err(|error| planning_backend_error("realize_plan", error))?;
+        let load = self.load_request_for_plan(plan)?;
         match super::loading::select_preparation(inspection, load) {
             Ok(_) => Ok(CandidateAdmission {
                 supported: true,
@@ -384,82 +251,10 @@ impl AutomaticPlanningBackend for MlxBackendFactory {
     }
 }
 
-fn selected_text_bounded_requirement(
-    selected: &eredu_runtime::SelectedReplicatedTextRealization,
-    excluded: &std::collections::BTreeSet<String>,
-) -> Result<BoundedResidencyRequirement, String> {
-    let tasks = eredu_runtime::replicated_text_materialization_tasks(selected)
-        .map_err(|error| error.to_string())?;
-    let mut static_bytes = 0u64;
-    let mut groups =
-        std::collections::BTreeMap::<String, std::collections::BTreeMap<usize, u64>>::new();
-    for task in tasks {
-        if excluded.contains(task.name()) {
-            continue;
-        }
-        let bytes = eredu_runtime::selected_materialization_task_bytes(&task)
-            .map_err(|error| error.to_string())?;
-        match task.owner() {
-            eredu_runtime::ReplicatedTextParameterOwner::StaticRole(_) => {
-                static_bytes = static_bytes
-                    .checked_add(bytes)
-                    .ok_or_else(|| "selected static parameter bytes overflowed".to_owned())?;
-            }
-            eredu_runtime::ReplicatedTextParameterOwner::ExecutionUnit { group, unit } => {
-                let total = groups
-                    .entry(group.clone())
-                    .or_default()
-                    .entry(*unit)
-                    .or_default();
-                *total = total
-                    .checked_add(bytes)
-                    .ok_or_else(|| "selected execution-unit bytes overflowed".to_owned())?;
-            }
-            _ => return Err("selected parameter has an unsupported residency owner".into()),
-        }
-    }
-    let unit_count = groups
-        .values()
-        .map(|units| units.keys().next_back().map_or(0, |unit| unit + 1))
-        .sum::<usize>();
-    let depth = selected.residency().device_depth(unit_count);
-    let mut window_bytes = 0u64;
-    for units in groups.values() {
-        let count = units.keys().next_back().map_or(0, |unit| unit + 1);
-        let bytes = (0..count)
-            .map(|unit| units.get(&unit).copied().unwrap_or(0))
-            .collect::<Vec<_>>();
-        for start in 0..bytes.len() {
-            let current = bytes
-                .iter()
-                .skip(start)
-                .take(depth)
-                .try_fold(0u64, |total, bytes| total.checked_add(*bytes))
-                .ok_or_else(|| "selected device-window bytes overflowed".to_owned())?;
-            window_bytes = window_bytes.max(current);
-        }
-    }
-    let required_bytes = static_bytes
-        .checked_add(window_bytes)
-        .ok_or_else(|| "selected bounded-residency bytes overflowed".to_owned())?;
-    Ok(BoundedResidencyRequirement {
-        static_bytes,
-        window_bytes,
-        required_bytes,
-        depth,
-    })
-}
-
-/// Cold-selected external assistant plus MLX reader-cache mechanism policy.
-pub struct SelectedMlxExternalAssistantPreparation {
-    preparation: eredu_architectures::PreparedCompatibleExternalAssistant,
-    speculative: eredu_runtime::SelectedSpeculativeRealization,
-}
-
 impl ExecutionPlanBackendFactory for MlxBackendFactory {
     type Backend = MlxBackend<'static>;
     type DrafterPreparation = eredu_architectures::ExternalAssistantPreparation;
-    type SelectedDrafterPreparation = SelectedMlxExternalAssistantPreparation;
+    type SelectedDrafterPreparation = eredu_architectures::PreparedExternalAssistantExecution;
     type Drafter = MlxDrafter;
 
     fn select_target(
@@ -510,120 +305,22 @@ impl ExecutionPlanBackendFactory for MlxBackendFactory {
         let Some(artifact) = external_artifact else {
             return Ok(None);
         };
-        let options = mlx_drafter_load_options(plan)
-            .map_err(|error| planning_backend_error("select_external_drafter", error))?;
-        if !options.weight_residency().is_fully_resident() {
-            return Err(AutomaticPlanningError::Invalid(
-                "external assistants require fully resident weights".into(),
-            ));
-        }
-        if options
-            .parallel_topology()
-            .is_some_and(|topology| !topology.is_replicated())
-        {
-            return Err(AutomaticPlanningError::Invalid(
-                "external assistants require replicated placement".into(),
-            ));
-        }
-        let max_cached_shards = options.weight_residency().max_cached_shards();
-        let preparation = artifact
-            .preparation
-            .select_materialization(
-                options.quantization(),
-                max_cached_shards,
-                |descriptor, transforms| {
-                    if transforms && super::replicated_text::supports_transform(descriptor) {
-                        Some(eredu_runtime::WeightLoweringKind::Transform)
-                    } else if !transforms && super::replicated_text::supports_direct(descriptor) {
-                        Some(eredu_runtime::WeightLoweringKind::Direct)
-                    } else {
-                        None
-                    }
-                },
-            )
-            .map_err(|message| AutomaticPlanningError::Backend {
-                operation: "select_external_drafter",
-                message,
-            })?;
-        let target_profile = target
-            .inspection()
-            .architecture_plan()
-            .external_assistant_target_profile()
-            .ok_or_else(|| {
-                AutomaticPlanningError::Invalid(
-                    "selected target does not admit an external assistant".into(),
-                )
-            })?;
-        let preparation = preparation
-            .prove_target_compatibility(&target_profile)
-            .map_err(|error| {
-                AutomaticPlanningError::Invalid(format!(
-                    "external assistant is incompatible with the selected target: {error}"
-                ))
-            })?;
-        let placement = match plan.drafting() {
-            DraftingPlan::External { placement, .. } => placement,
-            _ => {
-                return Err(AutomaticPlanningError::Invalid(
-                    "external assistant selection requires an external drafting plan".into(),
-                ))
-            }
-        };
-        let maximum_draft_tokens = match plan.drafting() {
-            DraftingPlan::External {
-                max_draft_tokens, ..
-            } => NonZeroUsize::new(*max_draft_tokens).ok_or_else(|| {
-                AutomaticPlanningError::Invalid("external draft capacity must be positive".into())
-            })?,
-            _ => unreachable!("external drafting plan checked above"),
-        };
-        let placement_request = eredu_runtime::SpeculativePlacementRequest::from_topology(
-            placement.execution_topology(plan.device()),
-        )
-        .map_err(|error| AutomaticPlanningError::Invalid(error.to_string()))?;
-        let rank_topology = eredu_core::ParallelRankTopology::new(*plan.topology(), 0)
-            .map_err(|error| AutomaticPlanningError::Invalid(error.to_string()))?;
-        let processor = eredu_runtime::SpeculativeIdentity::new("prepared-chat/text-token-ids/v1")
-            .map_err(|error| AutomaticPlanningError::Invalid(error.to_string()))?;
-        let contract = preparation
-            .speculative_contract(
-                eredu_architectures::ExternalSpeculativeContractRequest::new(
-                    rank_topology,
-                    processor,
-                    artifact.tokenizer_compatibility,
-                    artifact.tokenizer_compatibility.fingerprint(),
-                    maximum_draft_tokens,
-                ),
-            )
-            .map_err(|error| {
-                AutomaticPlanningError::Invalid(format!(
-                    "external speculative contract is invalid: {error}"
-                ))
-            })?;
-        let speculative = eredu_runtime::select_and_prepare_speculative_realization_observed(
-            contract.requirements(),
-            &contract.selection_request(placement_request),
-            &super::speculative::speculative_mechanism_capabilities(),
-            &|_| Ok(()),
-            |_| Ok::<_, AutomaticPlanningError>(()),
-            |_, &()| Ok::<_, AutomaticPlanningError>(()),
-            |_, &()| Ok::<_, AutomaticPlanningError>(()),
-            |_| Ok::<_, AutomaticPlanningError>(()),
-            |_, &()| Ok::<_, AutomaticPlanningError>(()),
-        )
-        .map_err(|error| AutomaticPlanningError::Invalid(error.to_string()))?
-        .into_parts()
-        .0;
-        let preparation = preparation
-            .prepare_source(max_cached_shards)
-            .map_err(|error| planning_backend_error("prepare_external_drafter_source", error))?;
-        Ok(Some(ExternalDraftArtifact {
-            preparation: SelectedMlxExternalAssistantPreparation {
-                preparation,
-                speculative,
+        eredu_architectures::prepare_execution_plan_assistant(
+            plan,
+            target.inspection(),
+            artifact,
+            |descriptor, transforms| {
+                if transforms && super::replicated_text::supports_transform(descriptor) {
+                    Some(eredu_runtime::WeightLoweringKind::Transform)
+                } else if !transforms && super::replicated_text::supports_direct(descriptor) {
+                    Some(eredu_runtime::WeightLoweringKind::Direct)
+                } else {
+                    None
+                }
             },
-            tokenizer_compatibility: artifact.tokenizer_compatibility,
-        }))
+            &super::speculative::speculative_mechanism_capabilities(),
+        )
+        .map(Some)
     }
 
     fn realize_drafting(
@@ -653,8 +350,6 @@ impl ExecutionPlanBackendFactory for MlxBackendFactory {
                         "external drafting is missing proven tokenizer compatibility".into(),
                     )
                 })?;
-                let preparation = artifact.preparation.preparation;
-                let selected = artifact.preparation.speculative;
                 let draft_stream = match placement {
                     DraftPlacementPlan::Target => target.backend().stream().clone(),
                     DraftPlacementPlan::Device { device } => {
@@ -669,12 +364,10 @@ impl ExecutionPlanBackendFactory for MlxBackendFactory {
                         ))
                     }
                 };
-                let drafter = MlxDrafter::materialize_with_compatibility(
-                    preparation,
-                    artifact.tokenizer_compatibility,
+                let drafter = MlxDrafter::materialize(
+                    artifact.preparation,
                     &draft_stream,
                     target.backend().weights_stream(),
-                    selected,
                 )
                 .map_err(|error| planning_backend_error("realize_external_drafter", error))?;
                 draft_stream.synchronize().map_err(|error| {
@@ -689,36 +382,6 @@ impl ExecutionPlanBackendFactory for MlxBackendFactory {
     }
 }
 
-/// Converts an MLX residency snapshot into neutral telemetry.
-pub fn residency_telemetry(report: &ResidencyReport) -> ResidencyTelemetry {
-    let offload = report.offload();
-    let planned = offload.planned_bytes();
-    let current = offload.resident_bytes();
-    let peak = offload.peak_resident_bytes();
-    let transfers = TransferDirection::ALL
-        .into_iter()
-        .map(|direction| {
-            let metrics = offload.transfer(direction);
-            TransferTelemetry {
-                direction: transfer_direction_name(direction).into(),
-                count: metrics.count(),
-                bytes: metrics.bytes(),
-                seconds: DurationSeconds(metrics.duration().as_secs_f64()),
-            }
-        })
-        .collect();
-    ResidencyTelemetry {
-        planned_disk_bytes: planned.get(MemoryTier::Disk),
-        planned_host_bytes: planned.get(MemoryTier::Host),
-        planned_device_bytes: planned.get(MemoryTier::Device),
-        current_host_bytes: current.get(MemoryTier::Host),
-        current_device_bytes: current.get(MemoryTier::Device),
-        peak_host_bytes: peak.get(MemoryTier::Host),
-        peak_device_bytes: peak.get(MemoryTier::Device),
-        transfers,
-    }
-}
-
 /// Converts an MLX routed-expert cache snapshot into neutral telemetry.
 pub fn parameter_bank_telemetry(report: &ParameterBankResidencyReport) -> ExpertCacheTelemetry {
     ExpertCacheTelemetry {
@@ -730,34 +393,6 @@ pub fn parameter_bank_telemetry(report: &ParameterBankResidencyReport) -> Expert
         device_resident_bytes: report.device_resident_bytes(),
         peak_host_resident_bytes: report.peak_host_resident_bytes(),
         peak_device_resident_bytes: report.peak_device_resident_bytes(),
-    }
-}
-
-/// Converts neutral speculative statistics into the stable telemetry document.
-pub fn speculative_decoding_telemetry(stats: &SpeculativeStats) -> SpeculativeDecodingTelemetry {
-    SpeculativeDecodingTelemetry {
-        execution_topology: stats.execution_topology().to_string(),
-        target_tokens: stats.target_tokens(),
-        draft_tokens: stats.draft_tokens(),
-        accepted_tokens: stats.accepted_tokens(),
-        accept_rate: stats.accept_rate(),
-        rounds: stats.rounds(),
-        accept_lens: stats.accept_lens().to_vec(),
-        emitted_tokens: stats.emitted_tokens(),
-        optimistic_draft_tokens: stats.optimistic_draft_tokens(),
-        reused_optimistic_tokens: stats.reused_optimistic_tokens(),
-        discarded_optimistic_tokens: stats.discarded_optimistic_tokens(),
-        adaptive_lookahead_disabled: stats.adaptive_lookahead_disabled(),
-        optimistic_draft_seconds: stats.optimistic_draft_time().as_secs_f64(),
-        verification_in_flight_seconds: stats.verification_in_flight_time().as_secs_f64(),
-    }
-}
-
-fn memory_semantics(value: PhysicalMemorySemantics) -> HardwareMemorySemantics {
-    match value {
-        PhysicalMemorySemantics::Unified => HardwareMemorySemantics::Unified,
-        PhysicalMemorySemantics::SeparateTiers => HardwareMemorySemantics::SeparateTiers,
-        PhysicalMemorySemantics::Unknown => HardwareMemorySemantics::Unknown,
     }
 }
 
@@ -827,17 +462,6 @@ fn mlx_device(device: &DevicePlan) -> Result<RealizedMlxDevice, AutomaticPlannin
     let identity = MlxDeviceIdentity::from_realized_device(&device, accelerator_family)
         .map_err(|error| planning_backend_error("derive_realized_device_identity", error))?;
     Ok(RealizedMlxDevice { device, identity })
-}
-
-fn transfer_direction_name(direction: TransferDirection) -> &'static str {
-    match direction {
-        TransferDirection::DeviceToHost => "device_to_host",
-        TransferDirection::DeviceToDisk => "device_to_disk",
-        TransferDirection::HostToDevice => "host_to_device",
-        TransferDirection::HostToDisk => "host_to_disk",
-        TransferDirection::DiskToDevice => "disk_to_device",
-        TransferDirection::DiskToHost => "disk_to_host",
-    }
 }
 
 fn planning_backend_error(

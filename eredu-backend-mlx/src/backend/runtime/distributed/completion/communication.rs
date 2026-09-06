@@ -9,12 +9,8 @@ use super::*;
 #[derive(Debug)]
 #[must_use = "communication work has been submitted; retain or wait on its completion"]
 pub struct MlxCommunicationCompletion {
-    pub(super) event: Event,
-    _arrays: Vec<Array>,
-    _count_buffers: Vec<Vec<usize>>,
-    _groups: Vec<Group>,
-    _routes: Vec<CommunicationRouteRealization>,
-    _streams: Vec<Stream>,
+    pub(super) event: Rc<Event>,
+    pub(super) recovery: Recovery<Rc<NativeResources>>,
     agreement: Option<FailureAgreementResolution>,
     flag: Option<FlagResolution>,
     words: Option<WordResolution>,
@@ -128,18 +124,11 @@ impl CommunicationOrphanQuarantine {
     pub(super) fn reap(&mut self) {
         let mut index = 0;
         while index < self.work.len() {
-            let finished = match self.work[index].event.try_is_complete() {
-                Ok(Some(complete)) => complete,
-                Ok(None) => false,
-                // An event query reports an asynchronous failure only after the
-                // backend has resolved that event, so its retained work is releasable.
-                Err(_) => true,
-            };
+            let finished = self.work[index].recovery.progress().settled;
             #[cfg(test)]
             let finished = finished && !self.work[index].force_pending;
             if finished {
-                // Exact completion (or a terminal asynchronous error) was observed,
-                // so explicitly releasing the retained owner is now safe.
+                // Native terminal evidence, not an error return, permits release.
                 drop(self.work.swap_remove(index));
             } else {
                 index += 1;
@@ -151,16 +140,14 @@ impl CommunicationOrphanQuarantine {
 impl Drop for CommunicationOrphanQuarantine {
     fn drop(&mut self) {
         self.reap();
-        // MLX does not expose native event abort and Event is thread-affine. The
-        // originating thread therefore remains the deterministic owner: at thread
-        // exit it waits for each outstanding event to reach completion (or a
-        // terminal asynchronous error) before releasing every retained native
-        // resource. Nothing is transferred to a foreign reaper or leaked.
+        // Never wait at thread exit. Recovery retains unresolved native resources
+        // independently; an inaccessible submitting thread is not terminal proof.
         for work in self.work.drain(..) {
-            let _ = work.event.synchronize();
             #[cfg(test)]
-            if let Some(observed) = &work.owner_exit_completion_observed {
-                observed.store(true, Ordering::Release);
+            if work.recovery.progress().settled {
+                if let Some(observed) = &work.owner_exit_completion_observed {
+                    observed.store(true, Ordering::Release);
+                }
             }
             drop(work);
         }
@@ -183,7 +170,7 @@ pub(crate) fn release_forced_pending_orphans() {
         let mut orphans = orphans.borrow_mut();
         for work in &mut orphans.work {
             work.force_pending.set(false);
-            work.event.synchronize().unwrap();
+            work._event.synchronize().unwrap();
         }
         orphans.reap();
     });
@@ -220,11 +207,32 @@ fn reap_communication_orphans() {
 }
 
 pub(crate) fn ensure_group_available(group: &Group) -> Result<(), Error> {
+    crate::backend::submission_recovery::reap();
+    let unresolved = NATIVE_RESOURCE_OWNERS.with(|owners| {
+        owners
+            .borrow()
+            .iter()
+            .filter_map(std::rc::Weak::upgrade)
+            .any(|resources| {
+                resources.unavailable()
+                    && resources
+                        .groups
+                        .iter()
+                        .any(|retained| retained.shares_native_world(group))
+            })
+    });
+    if unresolved {
+        return Err(Error::Parallel(
+            "native communicator has unresolved failed work".into(),
+        ));
+    }
     COMMUNICATION_ORPHANS.with(|orphans| {
         let mut orphans = orphans.borrow_mut();
         orphans.reap();
         if orphans.work.iter().any(|work| {
-            work._groups
+            work.recovery
+                .retention()
+                .groups
                 .iter()
                 .any(|retained| retained.shares_native_world(group))
         }) {
@@ -250,16 +258,25 @@ impl MlxCommunicationCompletion {
         let outputs = outputs.into_iter().cloned().collect::<Vec<_>>();
         #[cfg(test)]
         let submitted_outputs = outputs.len();
-        let event = async_eval_with_event(outputs.iter())?;
+        let mut recovery = Recovery::begin(NativeResources::new(
+            arrays,
+            count_buffers,
+            groups,
+            routes,
+            streams,
+        ))?;
+        let event = async_eval_with_event(outputs.iter());
+        recovery.seal();
+        recovery.retention().host_failed.set(event.is_err());
+        recovery.progress();
+        let event = Rc::new(event?);
+        *recovery.retention().event.borrow_mut() = Some(Rc::clone(&event));
+        check_native_status(&recovery)?;
         #[cfg(test)]
         let force_pending = FORCE_NEXT_COMMUNICATION_PENDING.with(|force| force.replace(false));
         Ok(Self {
             event,
-            _arrays: arrays,
-            _count_buffers: count_buffers,
-            _groups: groups,
-            _routes: routes,
-            _streams: streams,
+            recovery,
             agreement: None,
             flag: None,
             words: None,
@@ -358,7 +375,7 @@ impl MlxCommunicationCompletion {
                 _ => {
                     return Err(safemlx::error::Exception::custom(
                         "failure-agreement result is not one scalar status count",
-                    ))
+                    ));
                 }
             };
             agreement.resolved.set(Some(agreed));
@@ -375,7 +392,7 @@ impl MlxCommunicationCompletion {
                 _ => {
                     return Err(safemlx::error::Exception::custom(
                         "communication flag result is not one scalar",
-                    ))
+                    ));
                 }
             };
             flag.resolved.set(Some(value));
@@ -405,34 +422,54 @@ impl MlxCommunicationCompletion {
         Ok(())
     }
 
+    fn observe_completion(&self) -> Result<bool, safemlx::error::Exception> {
+        let arrays = self
+            .agreement
+            .iter()
+            .map(|value| value.output.clone())
+            .chain(self.flag.iter().map(|value| value.output.clone()))
+            .chain(self.words.iter().map(|value| value.output.clone()))
+            .chain(
+                self.boundary_headers
+                    .iter()
+                    .map(|value| value.received.clone()),
+            )
+            .collect();
+        let (result, settled) =
+            observe_native_child(self.recovery.retention(), arrays, None, || {
+                self.event.try_with_complete(|| self.resolve_host_results())
+            })?;
+        Ok(result.is_some() && settled)
+    }
+
     /// Number of explicitly retained array handles.
     #[cfg(test)]
     pub(crate) fn retained_arrays(&self) -> usize {
-        self._arrays.len()
+        self.recovery.retention().arrays.len()
     }
 
     /// Number of explicitly retained count buffers.
     #[cfg(test)]
     pub(crate) fn retained_count_buffers(&self) -> usize {
-        self._count_buffers.len()
+        self.recovery.retention()._count_buffers.len()
     }
 
     /// Number of explicitly retained group handles.
     #[cfg(test)]
     pub(crate) fn retained_groups(&self) -> usize {
-        self._groups.len()
+        self.recovery.retention().groups.len()
     }
 
     /// Number of explicitly retained route handles.
     #[cfg(test)]
     pub(crate) fn retained_routes(&self) -> usize {
-        self._routes.len()
+        self.recovery.retention()._routes.len()
     }
 
     /// Number of explicitly retained stream handles.
     #[cfg(test)]
     pub(crate) fn retained_streams(&self) -> usize {
-        self._streams.len()
+        self.recovery.retention()._streams.len()
     }
 
     /// Number of native graph outputs certified by the exact event.
@@ -456,22 +493,18 @@ impl eredu_core::BoundedCompletion for MlxCommunicationCompletion {
         };
         loop {
             #[cfg(test)]
-            let complete = !self.force_pending
-                && match self.event.try_with_complete(|| self.resolve_host_results()) {
-                    Ok(result) => result.is_some(),
-                    Err(error) => {
-                        self.mark_authority_failure(&error);
-                        return Err(error);
-                    }
-                };
-            #[cfg(not(test))]
-            let complete = match self.event.try_with_complete(|| self.resolve_host_results()) {
-                Ok(result) => result.is_some(),
-                Err(error) => {
-                    self.mark_authority_failure(&error);
-                    return Err(error);
-                }
+            let complete = if self.force_pending {
+                safemlx::try_with_submission_retirement(|| {
+                    check_native_status(&self.recovery)
+                        .inspect_err(|error| self.mark_authority_failure(error))
+                        .map(|_| false)
+                })
+                .unwrap_or(Ok(false))?
+            } else {
+                eredu_core::Completion::is_complete(&self)?
             };
+            #[cfg(not(test))]
+            let complete = eredu_core::Completion::is_complete(&self)?;
             if complete {
                 // A completed query is authoritative and reports any retained
                 // asynchronous error without a second lock-taking host wait.
@@ -499,24 +532,28 @@ impl eredu_core::Completion for MlxCommunicationCompletion {
     type Error = safemlx::error::Exception;
 
     fn is_complete(&self) -> Result<bool, Self::Error> {
-        match self.event.try_with_complete(|| self.resolve_host_results()) {
-            Ok(result) => Ok(result.is_some()),
-            Err(error) => {
-                self.mark_authority_failure(&error);
-                Err(error)
+        safemlx::try_with_submission_retirement(|| {
+            if !check_native_status(&self.recovery)
+                .inspect_err(|error| self.mark_authority_failure(error))?
+            {
+                return Ok(false);
             }
-        }
+            match self.observe_completion() {
+                Ok(result) => Ok(result),
+                Err(error) => {
+                    self.mark_authority_failure(&error);
+                    Err(error)
+                }
+            }
+        })
+        .unwrap_or(Ok(false))
     }
 
     fn wait(&self) -> Result<(), Self::Error> {
-        let result = self
-            .event
-            .synchronize()
-            .and_then(|()| self.resolve_host_results());
-        if let Err(error) = &result {
-            self.mark_authority_failure(error);
+        while !self.is_complete()? {
+            std::thread::yield_now();
         }
-        result
+        Ok(())
     }
 }
 
@@ -524,5 +561,14 @@ impl eredu_core::Completion for MlxCommunicationCompletion {
 pub fn synchronize_outputs<'a>(
     outputs: impl IntoIterator<Item = &'a Array>,
 ) -> safemlx::error::Result<()> {
-    async_eval_with_event(outputs)?.synchronize()
+    let outputs = outputs.into_iter().cloned().collect::<Vec<_>>();
+    let completion = MlxCommunicationCompletion::submit(
+        outputs.iter(),
+        outputs.clone(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    )?;
+    eredu_core::Completion::wait(&completion)
 }

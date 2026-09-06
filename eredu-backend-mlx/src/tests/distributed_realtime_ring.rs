@@ -385,7 +385,7 @@ fn moshi_ring_model_parity_worker() {
 
     let replicated_backend = MlxRealtimeExecutionContext::new(&stream, &weights_stream);
     let mut replicated = replicated_backend
-        .materialize_realtime_execution(replicated_selected, replicated_options)
+        .materialize_realtime_execution(replicated_selected)
         .unwrap();
     assert_eq!(
         replicated
@@ -401,7 +401,7 @@ fn moshi_ring_model_parity_worker() {
     let backend = MlxRealtimeExecutionContext::new(&stream, &weights_stream)
         .with_tensor_parallel_group(Arc::clone(&group));
     let mut parallel = backend
-        .materialize_realtime_execution(parallel_selected, parallel_options)
+        .materialize_realtime_execution(parallel_selected)
         .unwrap();
     assert_eq!(
         parallel.execution_config().effective_model_type().as_str(),

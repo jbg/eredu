@@ -104,6 +104,33 @@ pub struct SelectedExecution {
 }
 
 impl SelectedExecution {
+    /// Exact portable rank topology of a selected partition, when present.
+    pub fn parallel_topology(&self) -> Option<eredu_core::ParallelRankTopology> {
+        match self.kind.as_ref() {
+            SelectedExecutionKind::PartitionedDense(selected) => {
+                Some(selected.requirements().topology())
+            }
+            SelectedExecutionKind::PartitionedRouted(selected) => {
+                Some(selected.requirements().topology())
+            }
+            SelectedExecutionKind::PartitionedComposite(selected) => {
+                Some(selected.requirements().topology())
+            }
+            _ => None,
+        }
+    }
+
+    /// Exact selected processor policy for composite execution.
+    pub fn processor(&self) -> Option<&eredu_runtime::SelectedProcessorExecution> {
+        match self.kind.as_ref() {
+            SelectedExecutionKind::Composite(selected) => Some(selected.processor()),
+            SelectedExecutionKind::PartitionedComposite(selected) => {
+                Some(selected.base().processor())
+            }
+            _ => None,
+        }
+    }
+
     pub(crate) fn replicated(selected: SelectedReplicatedTextRealization) -> Self {
         Self {
             kind: Box::new(SelectedExecutionKind::Replicated(selected)),
@@ -401,7 +428,7 @@ impl SelectedPreparation {
     }
 
     /// Consumes the selection into neutral materialization inputs.
-    pub fn into_parts(
+    pub(crate) fn into_parts(
         self,
     ) -> (
         SelectedExecution,

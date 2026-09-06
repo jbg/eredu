@@ -234,7 +234,8 @@ impl DiskWorker {
                 execute_disk_task,
                 discard_disk_result,
             )
-            .map_err(disk_worker_error)?,
+            .map_err(disk_worker_error)?
+            .with_nonblocking_drop(),
         })
     }
 

@@ -92,14 +92,20 @@ impl Drop for TestDirectory {
 
 struct MockBackend;
 struct MockSession {
+    authority: eredu_core::SessionAuthority,
     distributed: MockDistributedSession,
 }
 struct Done;
+struct MockSessionCompletion(eredu_core::SubmissionLease);
 #[derive(Clone)]
 struct MockToken(u32);
 
 #[derive(Debug, thiserror::Error)]
 enum MockError {
+    #[error(transparent)]
+    Authority(#[from] eredu_core::SessionAuthorityError),
+    #[error(transparent)]
+    Admission(#[from] eredu_core::SessionAdmissionError),
     #[error("synthetic token extraction failure for token {0}")]
     Token(u32),
     #[error("synthetic speculative failure: {0}")]
@@ -126,6 +132,20 @@ impl Completion for Done {
     }
 
     fn wait(&self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
+impl Completion for MockSessionCompletion {
+    type Error = MockError;
+
+    fn is_complete(&self) -> Result<bool, Self::Error> {
+        self.0.resolve();
+        Ok(true)
+    }
+
+    fn wait(&self) -> Result<(), Self::Error> {
+        self.0.resolve();
         Ok(())
     }
 }
@@ -171,8 +191,14 @@ impl BackendProvider for MockBackend {
         ))
     }
 
-    fn create_session(&self, _: PreparedModel<Self::Model>) -> Result<Self::Session, Self::Error> {
+    fn create_session(
+        &self,
+        model: PreparedModel<Self::Model>,
+    ) -> Result<Self::Session, Self::Error> {
+        eredu_core::SessionAdmission::new(model.capabilities())
+            .validate(SessionCapabilities::new(true, true, false))?;
         Ok(MockSession {
+            authority: eredu_core::SessionAuthority::new(),
             distributed: MockDistributedSession {
                 descriptor: DistributedSessionDescriptor::new(
                     2,
@@ -192,7 +218,7 @@ impl BackendSession<MockBackend> for MockSession {
     type PrefillInput = Vec<u32>;
     type DecodeInput = u32;
     type Output = u32;
-    type Completion = Done;
+    type Completion = MockSessionCompletion;
 
     fn capabilities(&self) -> SessionCapabilities {
         SessionCapabilities::new(true, true, false)
@@ -203,9 +229,10 @@ impl BackendSession<MockBackend> for MockSession {
         _: &MockBackend,
         input: Self::PrefillInput,
     ) -> Result<Submission<Self::Output, Self::Completion>, MockError> {
+        let lease = self.authority.begin_submission()?;
         Ok(Submission {
             output: input.len() as u32,
-            completion: Done,
+            completion: MockSessionCompletion(lease),
         })
     }
 
@@ -214,9 +241,10 @@ impl BackendSession<MockBackend> for MockSession {
         _: &MockBackend,
         input: Self::DecodeInput,
     ) -> Result<Submission<Self::Output, Self::Completion>, MockError> {
+        let lease = self.authority.begin_submission()?;
         Ok(Submission {
             output: input + 1,
-            completion: Done,
+            completion: MockSessionCompletion(lease),
         })
     }
 
@@ -347,7 +375,7 @@ impl TextGenerationBackend for MockBackend {
     type Prompt = Vec<u32>;
     type Token = MockToken;
     type TextGenerationState = ();
-    type TextCompletion = Done;
+    type TextCompletion = MockSessionCompletion;
 
     fn start_text_generation(
         _: &Self,
@@ -1646,6 +1674,44 @@ fn assert_automatic_planning_conformance() {
         Err(AutomaticPlanningError::Invalid(message))
             if message.contains("different realized target")
     ));
+
+    for through_parts in [false, true] {
+        let selected = eredu_core::select_execution_plan_target(
+            &backend,
+            &external,
+            eredu_architectures::configuration::inspect_artifact(artifact.path()).unwrap(),
+        )
+        .unwrap();
+        let drafting = eredu_core::select_execution_plan_drafting(
+            &backend,
+            &external,
+            &selected,
+            Some(ExternalDraftArtifact {
+                preparation: eredu_architectures::prepare_external_assistant(assistant.path())
+                    .unwrap(),
+                tokenizer_compatibility: eredu_core::TokenizerCompatibilityProof::prove(
+                    [11; 32], [11; 32],
+                )
+                .unwrap(),
+            }),
+        )
+        .unwrap();
+        let mut runtime = eredu_core::realize_execution_plan_target(&backend, &external, selected)
+            .unwrap()
+            .into_runtime()
+            .unwrap();
+        let mut foreign = ModelRuntime::prepare(MockBackend, ()).unwrap();
+        if through_parts {
+            std::mem::swap(runtime.parts_mut().1, foreign.parts_mut().1);
+        } else {
+            std::mem::swap(runtime.session_mut(), foreign.session_mut());
+        }
+        assert!(matches!(
+            eredu_core::realize_execution_plan_drafting(&backend, &external, &runtime, drafting),
+            Err(AutomaticPlanningError::Invalid(message))
+                if message.contains("different realized target")
+        ));
+    }
 
     let mut planned = LoadedModel::load_execution_plan(&backend, artifact.path(), &external)
         .expect("generic plan loading realizes the external assistant");

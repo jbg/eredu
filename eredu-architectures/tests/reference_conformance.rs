@@ -5,12 +5,10 @@
 //! and partitioned execution. The stage evidence below is emitted inside that
 //! harness at the causal boundaries, rather than inferred from a green result.
 //!
-//! Realtime and speculative execution deliberately add the shape-only
-//! `ReferenceBackend` lifecycle mechanisms: realtime requires frame tensor and
-//! host-token materializers, while speculative execution requires extension
-//! materializers and output sinks. They still enter the same production
-//! architecture constructors, but are not represented as NumericBackend
-//! executions because those lifecycle-specific mechanism traits are distinct.
+//! Realtime and broad speculative lifecycle coverage also use `ReferenceBackend`
+//! mechanisms for frame tensors, host tokens and output sinks. A separate numeric
+//! embedded-prediction case binds exact target/extension payloads through the
+//! complete prepared-execution driver and executes real scalar proposals.
 
 use std::collections::BTreeSet;
 
@@ -165,6 +163,7 @@ fn conformance_state_rollback_completion_and_failure_timing() {
 }
 
 fn conformance_speculative_production() {
+    numeric::run_reference_conformance_embedded_prediction();
     speculative::sequential_embedded_runs_the_inspected_materialized_scheduler_path();
     speculative::fused_dspark_runs_the_inspected_materialized_scheduler_path();
     speculative::gemma_runs_the_inspected_materialized_scheduler_path();

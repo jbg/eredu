@@ -53,6 +53,10 @@ impl<'a> MlxBackend<'a> {
         &self.weights_stream
     }
 
+    pub(crate) fn validate_prepared_target(&self, target: &MlxPreparedTarget) -> Result<(), Error> {
+        target.validate(&self.stream, self.world)
+    }
+
     fn realize_selected_communication(
         &self,
         manifest: Option<&eredu_runtime::CommunicationManifest>,
@@ -89,6 +93,10 @@ impl<'a> MlxBackend<'a> {
         rank: Option<crate::backend::MlxRankContext>,
         materialize: impl FnOnce(Option<MlxDistributedSession>) -> Result<MlxModel, Error>,
     ) -> Result<PreparedModel<MlxModel>, Error> {
+        // This is an ordinary host entry, after cold selection and before new
+        // native allocations. Retire a previous executable here rather than
+        // keeping its weights until the replacement session is constructed.
+        crate::backend::nn::shared::MlxNeuralBackend::reclaim_retired_resources();
         let distributed = self.realize_selected_communication(manifest, rank)?;
         materialize(distributed).map(|model| PreparedModel::new(model, capabilities))
     }
@@ -145,6 +153,7 @@ impl<'a> BackendProvider for MlxBackend<'a> {
         &self,
         model: PreparedModel<Self::Model>,
     ) -> Result<Self::Session, Self::Error> {
+        self.validate_prepared_target(model.native_target())?;
         let admitted = model.capabilities();
         MlxModelSession::from_model(model.into_inner(), admitted)
     }

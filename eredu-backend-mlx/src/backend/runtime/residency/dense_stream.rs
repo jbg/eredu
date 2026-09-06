@@ -16,7 +16,7 @@ use eredu_runtime::BackgroundPrefetchWorker;
 type HostPrefetchOperation =
     Arc<dyn Fn(&OffloadUnitId) -> Result<(), String> + Send + Sync + 'static>;
 
-/// One bounded, deterministically joined disk-to-host worker.
+/// One bounded disk-to-host worker with explicit cancellation and nonjoining Drop.
 pub struct BackgroundLayerPrefetch {
     manager: ResidencyManager,
     worker: BackgroundPrefetchWorker,
@@ -43,7 +43,8 @@ impl BackgroundLayerPrefetch {
         let worker =
             BackgroundPrefetchWorker::new(capacity, "eredu-mlx-dense-layer-prefetch", move |id| {
                 operation(id)
-            })?;
+            })?
+            .with_nonblocking_drop();
         Ok(Self { manager, worker })
     }
 
@@ -65,7 +66,7 @@ impl BackgroundLayerPrefetch {
         Ok(self.manager.acquire(id, MemoryTier::Host)?)
     }
 
-    /// Cancels queued work and joins the worker.
+    /// Cancels queued work and fences in-flight work.
     pub fn cancel(&self) -> Result<(), DenseStreamError> {
         Ok(self.worker.cancel()?)
     }

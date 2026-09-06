@@ -4,6 +4,7 @@
 
 #include "mlx/c/error.h"
 #include "mlx/c/private/mlx.h"
+#include "mlx/c/private/prepared_array_output.h"
 
 namespace {
 
@@ -156,10 +157,15 @@ extern "C" int mlx_copy_to_host(
     if (!buffer || !event) {
       throw std::invalid_argument("Host copy output pointers must be non-null.");
     }
+    mlx_output_preparation_<
+        mlx::core::HostTransferBuffer,
+        mlx_host_transfer_buffer>
+        buffer_output(*buffer);
+    mlx_event_preparation_ event_output(*event);
     auto transfer = mlx::core::copy_to_host(
         mlx_array_get_(source), policy_to_cpp(policy), mlx_stream_get_(stream));
-    mlx_host_transfer_buffer_set_(*buffer, std::move(transfer.buffer));
-    mlx_event_set_(*event, std::move(transfer.completion));
+    buffer_output.publish(std::move(transfer.buffer));
+    event_output.publish(std::move(transfer.completion));
     return 0;
   } catch (std::exception& e) {
     mlx_error(e.what());
@@ -176,10 +182,12 @@ extern "C" int mlx_copy_from_host(
     if (!array || !event) {
       throw std::invalid_argument("Device copy output pointers must be non-null.");
     }
+    mlx_array_output_preparation_ array_output(*array);
+    mlx_event_preparation_ event_output(*event);
     auto transfer = mlx::core::copy_from_host(
         mlx_host_transfer_buffer_get_(source), mlx_stream_get_(stream));
-    mlx_array_set_(*array, std::move(transfer.value));
-    mlx_event_set_(*event, std::move(transfer.completion));
+    array_output.publish(std::move(transfer.value));
+    event_output.publish(std::move(transfer.completion));
     return 0;
   } catch (std::exception& e) {
     mlx_error(e.what());

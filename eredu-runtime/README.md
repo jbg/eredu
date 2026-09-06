@@ -8,6 +8,12 @@ realtime execution. `NormalizedLoadRequest` is the singular portable cold-load
 policy: topology, wire, invocation bounds, completion, residency, session, and
 drafting intent are validated before any backend resource is selected.
 
+Execution plans normalize through one shared converter with injected diagnostic
+choices. Capability synthesis enumerates exact parameter and state requirements
+and queries backend support predicates; providers report mechanisms without
+repeating that enumeration. Selected-task residency sizing and report telemetry
+are portable runtime operations.
+
 It owns the canonical declarative parameter-binding and logical placement
 plans, communication-manifest validation, and reusable replicated-session
 construction flow. Backends supply statically dispatched native

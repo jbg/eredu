@@ -11,7 +11,6 @@ use std::{
 use eredu_checkpoint::{store::CheckpointSource, LinearFormat, SourceTensorEncoding, StoredDtype};
 use eredu_core::cache::{
     PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
-    StateResidencyClass,
 };
 use eredu_nn::{NeuralBackend, Parameterized, PoolingAttentionCache};
 use eredu_runtime::{
@@ -20,9 +19,8 @@ use eredu_runtime::{
     ReplicatedTextArchitecture, ReplicatedTextMaterializationTask, ReplicatedTextRequirements,
     ReplicatedTextSelectionRequest, ReplicatedTextSession, ReplicatedTextSessionMechanisms,
     ResidencyReport, RuntimeState, SelectedReplicatedTextRealization, SelectedStateRealization,
-    StateComponentMechanism, StateComponentPlacement, StateMechanismCapabilities,
-    TransactionalPromptCacheMechanisms, WeightBinding, WeightLoweringCapability,
-    WeightLoweringDescriptor, WeightLoweringKind, WeightResidencyMechanism,
+    StateComponentPlacement, TransactionalPromptCacheMechanisms, WeightBinding,
+    WeightLoweringDescriptor, WeightResidencyMechanism,
 };
 use safemlx::{
     error::Exception, ops::indexing::TryIndexOp, transforms::async_eval_with_event, Array, Dtype,
@@ -31,6 +29,8 @@ use safemlx::{
 
 #[cfg(test)]
 use eredu_runtime::PagedCacheOptions;
+#[cfg(test)]
+use eredu_runtime::{StateComponentMechanism, StateMechanismCapabilities, WeightLoweringKind};
 
 use crate::{
     backend::{
@@ -81,7 +81,7 @@ use eredu_architectures::composite_execution::{
 use eredu_architectures::replicated_text::{
     CompositeTextArchitectureVisitor, PreparedCompositeTextArchitecture,
     PreparedReplicatedTextArchitecture, PreparedRoutedCompositeTextArchitecture,
-    ReplicatedTextArchitectureVisitor, ReplicatedTextProfileDispatcher,
+    ReplicatedTextArchitectureVisitor, ReplicatedTextStateProfiles,
 };
 
 mod capability;

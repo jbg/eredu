@@ -405,10 +405,12 @@ fn replicated_inspection_dispatches_gpt_oss_and_nemotron_h_observers() {
             write_gpt_oss_fixture(directory);
             directory.to_path_buf()
         },
-        MlxLoadRequest::default().with_weight_residency(
-            WeightResidency::with_independent_parameter_banks(
-                OrdinaryWeightResidency::FullyResident,
-                ParameterBankLoadOptions::default(),
+        MlxLoadRequest::from_normalized(
+            eredu_runtime::NormalizedLoadRequest::default().with_weight_residency(
+                WeightResidency::with_independent_parameter_banks(
+                    OrdinaryWeightResidency::FullyResident,
+                    ParameterBankLoadOptions::default(),
+                ),
             ),
         ),
         "model.layers.0.output",

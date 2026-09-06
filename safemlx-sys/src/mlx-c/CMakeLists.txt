@@ -63,58 +63,71 @@ else()
   safemlx_declare_vendored(
     metal_cpp metal-cpp-26.zip
     4df3c078b9aadcb516212e9cb03004cbc5ce9a3e9c068fa3144d021db585a3a4)
+  # Patch contents, not only patch paths, identify the extracted native source.
+  # FetchContent otherwise reuses its successful patch stamp after an edit,
+  # silently compiling an older revision. Keep the binary path stable for the
+  # Rust packaging/metallib integration, but never patch an unknown old tree.
+  set(mlx_patch_files
+      mlx-apple-mobile-platforms.patch
+      mlx-cuda-global-encoder-lifetime.patch
+      mlx-affine-group16.patch
+      mlx-completion-events.patch
+      mlx-variable-all-to-all.patch
+      mlx-host-transfer-buffer.patch
+      mlx-host-transfer-umbrella.patch
+      mlx-timing-events.patch
+      mlx-cuda-jit-include-dirs.patch
+      mlx-embedded-metallib.patch
+      mlx-host-transfer-noexcept-move.patch
+      mlx-cpu-submission-progress.patch
+      mlx-gpu-submission-progress.patch
+      mlx-submission-recovery.patch)
+  set(mlx_patch_applier "${CMAKE_CURRENT_LIST_DIR}/patches/apply-idempotent.cmake")
+  file(SHA256 "${mlx_patch_applier}" mlx_patch_identity)
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${mlx_patch_applier}")
+  set(mlx_patch_commands)
+  foreach(mlx_patch IN LISTS mlx_patch_files)
+    set(mlx_patch_path "${CMAKE_CURRENT_LIST_DIR}/patches/${mlx_patch}")
+    file(SHA256 "${mlx_patch_path}" mlx_patch_hash)
+    string(APPEND mlx_patch_identity "\n${mlx_patch}:${mlx_patch_hash}")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${mlx_patch_path}")
+    if(mlx_patch_commands)
+      list(APPEND mlx_patch_commands COMMAND)
+    endif()
+    list(APPEND mlx_patch_commands
+         ${CMAKE_COMMAND} "-DPATCH_FILE=${mlx_patch_path}" -P "${mlx_patch_applier}")
+  endforeach()
+  string(SHA256 mlx_patch_set_hash "${mlx_patch_identity}")
   safemlx_declare_vendored(
     mlx mlx-v0.32.0.tar.gz
     8e74a0eb613861ce50c09402dd99dbc42b65a762e7fdd291caa39f611db978ec
-    PATCH_COMMAND
-      ${CMAKE_COMMAND}
-      -DPATCH_FILE=${CMAKE_CURRENT_LIST_DIR}/patches/mlx-apple-mobile-platforms.patch
-      -P ${CMAKE_CURRENT_LIST_DIR}/patches/apply-idempotent.cmake
-      COMMAND ${CMAKE_COMMAND}
-      -DPATCH_FILE=${CMAKE_CURRENT_LIST_DIR}/patches/mlx-cuda-global-encoder-lifetime.patch
-      -P ${CMAKE_CURRENT_LIST_DIR}/patches/apply-idempotent.cmake
-      COMMAND ${CMAKE_COMMAND}
-      -DPATCH_FILE=${CMAKE_CURRENT_LIST_DIR}/patches/mlx-affine-group16.patch
-      -P ${CMAKE_CURRENT_LIST_DIR}/patches/apply-idempotent.cmake
-      COMMAND ${CMAKE_COMMAND}
-      -DPATCH_FILE=${CMAKE_CURRENT_LIST_DIR}/patches/mlx-completion-events.patch
-      -P ${CMAKE_CURRENT_LIST_DIR}/patches/apply-idempotent.cmake
-      COMMAND ${CMAKE_COMMAND}
-      -DPATCH_FILE=${CMAKE_CURRENT_LIST_DIR}/patches/mlx-variable-all-to-all.patch
-      -P ${CMAKE_CURRENT_LIST_DIR}/patches/apply-idempotent.cmake
-      COMMAND ${CMAKE_COMMAND}
-      -DPATCH_FILE=${CMAKE_CURRENT_LIST_DIR}/patches/mlx-host-transfer-buffer.patch
-      -P ${CMAKE_CURRENT_LIST_DIR}/patches/apply-idempotent.cmake
-      COMMAND ${CMAKE_COMMAND}
-      -DPATCH_FILE=${CMAKE_CURRENT_LIST_DIR}/patches/mlx-host-transfer-umbrella.patch
-      -P ${CMAKE_CURRENT_LIST_DIR}/patches/apply-idempotent.cmake
-      COMMAND ${CMAKE_COMMAND}
-      -DPATCH_FILE=${CMAKE_CURRENT_LIST_DIR}/patches/mlx-timing-events.patch
-      -P ${CMAKE_CURRENT_LIST_DIR}/patches/apply-idempotent.cmake
-      COMMAND ${CMAKE_COMMAND}
-      -DPATCH_FILE=${CMAKE_CURRENT_LIST_DIR}/patches/mlx-cuda-jit-include-dirs.patch
-      -P ${CMAKE_CURRENT_LIST_DIR}/patches/apply-idempotent.cmake
-      COMMAND ${CMAKE_COMMAND}
-      -DPATCH_FILE=${CMAKE_CURRENT_LIST_DIR}/patches/mlx-embedded-metallib.patch
-      -P ${CMAKE_CURRENT_LIST_DIR}/patches/apply-idempotent.cmake)
+    SOURCE_DIR "${FETCHCONTENT_BASE_DIR}/mlx-${mlx_patch_set_hash}-src"
+    SUBBUILD_DIR "${FETCHCONTENT_BASE_DIR}/mlx-${mlx_patch_set_hash}-subbuild"
+    BINARY_DIR "${FETCHCONTENT_BASE_DIR}/mlx-build"
+    PATCH_COMMAND ${mlx_patch_commands})
   FetchContent_MakeAvailable(mlx)
 endif()
 
 if(MLX_C_BUILD_PATCH_TESTS)
   add_executable(
     mlx-patch-test-binary
+    ${CMAKE_CURRENT_LIST_DIR}/tests/event_submission_tests.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/tests/submission_recovery_tests.cpp
     ${mlx_SOURCE_DIR}/tests/tests.cpp
     ${mlx_SOURCE_DIR}/tests/completion_tests.cpp
     ${mlx_SOURCE_DIR}/tests/distributed_all_to_all_v_tests.cpp
     ${mlx_SOURCE_DIR}/tests/host_transfer_tests.cpp)
-  target_link_libraries(mlx-patch-test-binary PRIVATE mlx doctest)
+  target_sources(mlx-patch-test-binary PRIVATE
+                 ${mlx_SOURCE_DIR}/tests/scheduler_recovery_tests.cpp
+                 ${mlx_SOURCE_DIR}/tests/gpu_submission_progress_tests.cpp)
+  target_link_libraries(mlx-patch-test-binary PRIVATE mlxc mlx doctest)
 
   add_custom_target(
     mlx-patch-tests
     COMMAND
       ${CMAKE_COMMAND} -E env DEVICE=cpu
       $<TARGET_FILE:mlx-patch-test-binary>
-      "--test-case=*completion*,*failed CPU event*,*all_to_all_v*,*host transfer*"
+      "--test-case=*completion*,*failed CPU event*,*all_to_all_v*,*host transfer*,*CPU recovery*,*GPU recovery*,*submission recovery*"
     DEPENDS mlx-patch-test-binary
     USES_TERMINAL
     COMMENT "Running tests carried by Eredu's vendored MLX patches")
@@ -157,6 +170,7 @@ set(mlxc-src
     ${CMAKE_CURRENT_LIST_DIR}/mlx/c/ops.cpp
     ${CMAKE_CURRENT_LIST_DIR}/mlx/c/random.cpp
     ${CMAKE_CURRENT_LIST_DIR}/mlx/c/stream.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/mlx/c/submission.cpp
     ${CMAKE_CURRENT_LIST_DIR}/mlx/c/string.cpp
     ${CMAKE_CURRENT_LIST_DIR}/mlx/c/transforms.cpp
     ${CMAKE_CURRENT_LIST_DIR}/mlx/c/transforms_impl.cpp

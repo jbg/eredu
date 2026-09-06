@@ -64,9 +64,10 @@ fn disabled_plan_projects_one_ordinary_target_without_selecting_extension_payloa
     let root = tempfile::tempdir().unwrap();
     crate::tests::distributed_pipeline_ring::write_deepseek_v4_fixture(root.path(), 1);
     let inspection = eredu_architectures::configuration::inspect_artifact(root.path()).unwrap();
-    let options = crate::MlxLoadRequest::default()
-        .with_drafting_plan(&eredu_core::DraftingPlan::Disabled)
-        .unwrap();
+    let options = crate::MlxLoadRequest::from_normalized(
+        eredu_runtime::NormalizedLoadRequest::default()
+            .with_drafting(eredu_runtime::DraftingLoadRequest::Disabled),
+    );
 
     let selected = super::select_preparation(&inspection, options).unwrap();
 
@@ -375,7 +376,10 @@ fn gguf_llama_bounded_residency_selects_neutral_partitioned_execution() {
 
     for residency in [layerwise, dense] {
         let topology = crate::test_parallel_rank(0, 2, 1, 1);
-        let options = crate::MlxLoadRequest::with_parallel(
+        let options = crate::MlxLoadRequest::from_normalized(
+            eredu_runtime::NormalizedLoadRequest::default().with_weight_residency(residency),
+        )
+        .with_parallel_topology(
             topology,
             crate::backend::DeviceAssignment::new(safemlx::DeviceType::Cpu, 0),
             eredu_runtime::PipelineWireContract::new(
@@ -385,8 +389,7 @@ fn gguf_llama_bounded_residency_selects_neutral_partitioned_execution() {
             1,
             crate::MlxLoadRequest::test_communication_completion_policy(),
         )
-        .unwrap()
-        .with_weight_residency(residency);
+        .unwrap();
 
         let selected = super::select_preparation(&inspection, options).unwrap();
         assert!(selected.neutral().communication_manifest().is_some());
@@ -401,22 +404,23 @@ fn gguf_llama_tp_transform_selects_the_immutable_neutral_route() {
     write_minimal_llama_gguf(&model, GgmlType::F16);
     let inspection = eredu_architectures::configuration::inspect_artifact(&model).unwrap();
     let topology = crate::test_parallel_rank(0, 2, 1, 1);
-    let options =
-        crate::MlxLoadRequest::with_quantization(eredu_core::QuantizationRequest::Affine {
-            group_size: 16,
-            bits: 4,
-        })
-        .with_parallel_topology(
-            topology,
-            crate::backend::DeviceAssignment::new(safemlx::DeviceType::Cpu, 0),
-            eredu_runtime::PipelineWireContract::new(
-                eredu_runtime::PipelineActivationDtype::Float32,
-            ),
-            1,
-            1,
-            crate::MlxLoadRequest::test_communication_completion_policy(),
-        )
-        .unwrap();
+    let options = crate::MlxLoadRequest::from_normalized(
+        eredu_runtime::NormalizedLoadRequest::with_quantization(
+            eredu_core::QuantizationRequest::Affine {
+                group_size: 16,
+                bits: 4,
+            },
+        ),
+    )
+    .with_parallel_topology(
+        topology,
+        crate::backend::DeviceAssignment::new(safemlx::DeviceType::Cpu, 0),
+        eredu_runtime::PipelineWireContract::new(eredu_runtime::PipelineActivationDtype::Float32),
+        1,
+        1,
+        crate::MlxLoadRequest::test_communication_completion_policy(),
+    )
+    .unwrap();
     crate::tests::support::path_instrumentation::reset();
 
     let selected = super::select_preparation(&inspection, options).unwrap();

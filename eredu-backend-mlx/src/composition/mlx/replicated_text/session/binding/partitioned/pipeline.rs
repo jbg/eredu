@@ -33,46 +33,17 @@ where
     Provider::Error: std::fmt::Display,
     F: ReplicatedExecutableFinalizer<A, S>,
 {
-    let capability_estimate = prepared.capability_estimate().clone();
-    let effective_model_type = prepared.effective_model_type().to_owned();
-    let selected_residency = prepared.prepared().selected().base().text().residency();
-    let activation_dtype = prepared.execution_handoff().activation_dtype();
-    let execution_plan = prepared.execution_handoff().execution_plan().clone();
-    let publication_authority = execution_plan
-        .publication_authority(prepared.prepared().selected().communication())
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?
-        .ok_or_else(|| {
-            Error::ArchitectureModel("routed pipeline has no publication authority".into())
-        })?;
-    let prompt_cache_topology = prepared
-        .prepared()
-        .selected()
-        .prompt_cache_topology()
-        .map_err(Error::ArchitectureModel)?;
-    let prompt_cache_identity = prepared
-        .prepared()
-        .selected()
-        .partition()
-        .state()
-        .ok_or_else(|| Error::ArchitectureModel("routed pipeline has no local state".into()))?
-        .prompt_cache_identity::<MlxNeuralBackend, _>(
-            prepared.prepared().architecture(),
-            prompt_cache_topology.clone(),
-        )
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let facts = prepared.session_facts().map_err(Error::ArchitectureModel)?;
+    let activation_dtype = facts.activation_dtype();
+    let (text, prompt_cache_topology, execution_plan, publication_authority) = facts.into_parts();
+    let (prompt_cache_identity, capability_estimate, effective_model_type, selected_residency) =
+        text.into_parts();
     let mut ignored_expert_sources = prepared.unowned_expert_checkpoint_sources();
     ignored_expert_sources.extend(additional_claimed_sources);
-    let addressable_parameters = if matches!(
-        prepared.bank_residency(),
-        eredu_runtime::ParameterBankResidency::IndependentCache(_)
-    ) {
-        prepared
-            .addressable_logical_targets()
-            .into_iter()
-            .collect::<Vec<_>>()
-    } else {
-        Vec::new()
-    };
+    let addressable_parameters = prepared
+        .addressable_logical_targets()
+        .into_iter()
+        .collect::<Vec<_>>();
     let mut mechanisms = MlxReplicatedTextMechanisms::new(store, stream, weights_stream);
     mechanisms.set_ignored_checkpoint_sources(ignored_expert_sources);
     let mut distributed = Some(distributed);
@@ -201,47 +172,13 @@ where
     G: 'static,
     F: ReplicatedExecutableFinalizer<A, MlxHybridState>,
 {
-    let capability_estimate = prepared.capability_estimate().clone();
-    let effective_model_type = prepared.effective_model_type().to_owned();
-    let selected_residency = prepared.prepared().selected().base().residency();
-    let activation_dtype = prepared.prepared().selected().activation_dtype();
-    let tensor_group = prepared.prepared().selected().tensor_group();
-    let session_group = prepared
-        .prepared()
-        .selected()
-        .session_group()
-        .ok_or_else(|| {
-            Error::ArchitectureModel("pipeline partition has no selected session group".into())
-        })?;
-    let execution_plan = prepared
-        .prepared()
-        .selected()
-        .pipeline_execution_plan()
-        .map_err(Error::ArchitectureModel)?;
-    let publication_authority = execution_plan
-        .publication_authority(prepared.prepared().selected().communication())
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?
-        .ok_or_else(|| {
-            Error::ArchitectureModel(
-                "pipeline resident execution has no selected output publication authority".into(),
-            )
-        })?;
-    let prompt_cache_topology = prepared
-        .prepared()
-        .selected()
-        .prompt_cache_topology()
-        .map_err(Error::ArchitectureModel)?;
-    let prompt_cache_identity = prepared
-        .prepared()
-        .selected()
-        .partition()
-        .state()
-        .ok_or_else(|| Error::ArchitectureModel("pipeline partition has no state".into()))?
-        .prompt_cache_identity::<MlxNeuralBackend, _>(
-            prepared.prepared().architecture(),
-            prompt_cache_topology.clone(),
-        )
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let facts = prepared.session_facts().map_err(Error::ArchitectureModel)?;
+    let activation_dtype = facts.activation_dtype();
+    let tensor_group = facts.tensor_group();
+    let session_group = facts.session_group();
+    let (text, prompt_cache_topology, execution_plan, publication_authority) = facts.into_parts();
+    let (prompt_cache_identity, capability_estimate, effective_model_type, selected_residency) =
+        text.into_parts();
     let mut mechanisms = MlxReplicatedTextMechanisms::new(store, stream, weights_stream);
     mechanisms.set_ignored_checkpoint_sources(additional_claimed_sources);
     let mut distributed = Some(distributed);

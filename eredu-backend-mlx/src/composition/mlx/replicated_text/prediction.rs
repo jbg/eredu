@@ -341,6 +341,7 @@ where
         store,
         &task_refs,
         &std::collections::BTreeSet::new(),
+        None,
     )?;
     let bindings = match layout {
         Some(layout) => shard_unmaterialized_bindings(
@@ -447,6 +448,7 @@ where
     S: MlxStateMechanisms,
     A: ReplicatedTextArchitecture<MlxNeuralBackend, S, Error = eredu_nn::Error>,
     A::StaticModules: Clone,
+    A::Unit: 'static,
     D: eredu_runtime::ReplicatedTextExecutionStrategy<
         A,
         MlxNeuralBackend,
@@ -468,6 +470,7 @@ where
     S: MlxStateMechanisms,
     A: ReplicatedTextArchitecture<MlxNeuralBackend, S, Error = eredu_nn::Error>,
     A::StaticModules: Clone,
+    A::Unit: 'static,
     D: eredu_runtime::ReplicatedTextExecutionStrategy<
         A,
         MlxNeuralBackend,

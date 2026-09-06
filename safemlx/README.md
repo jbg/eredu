@@ -43,6 +43,18 @@ evaluation, graph transforms, and I/O.
   or same-device stream ordering without a whole-stream drain.
 - Typed host-transfer buffers provide explicit CPU, Metal shared, CUDA pinned,
   or CUDA managed storage policies.
+- Native event and transfer publication reserves output handles before work is
+  submitted, so successful publication needs no new output-wrapper allocation.
+- Thread-affine `SubmissionScope` records native work independently of returned
+  errors. Its nonblocking status distinguishes no work, pending, terminal, and
+  unobservable work. Unresolved failed or unobservable work remains retained; dropping a
+  scope neither retries evaluation nor terminates the process. Backend callers
+  separately retain their own application resources until terminal evidence.
+  Terminal evidence is separate from reclamation: ordinary owner-thread native
+  calls retire completed records; scope progress does not destroy arbitrary
+  primitive owners. `try_with_submission_retirement` lets backend callers
+  retire terminal handles without waiting for the runtime lock or reentering
+  housekeeping.
 - The `distributed` module wraps MLX groups, collectives, point-to-point
   operations, and their native execution semantics.
 

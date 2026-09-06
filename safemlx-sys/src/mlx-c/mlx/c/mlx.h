@@ -28,6 +28,7 @@
 #include "mlx/c/optional.h"
 #include "mlx/c/random.h"
 #include "mlx/c/stream.h"
+#include "mlx/c/submission.h"
 #include "mlx/c/string.h"
 #include "mlx/c/transforms.h"
 #include "mlx/c/transforms_impl.h"

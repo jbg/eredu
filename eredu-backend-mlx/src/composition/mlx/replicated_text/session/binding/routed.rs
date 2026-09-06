@@ -1,75 +1,38 @@
 use super::*;
-pub(in crate::composition::mlx) fn bind_routed_text(
-    inspection: &eredu_core::ArtifactInspection<
-        eredu_architectures::processor_plan::ArtifactArchitecturePlan,
-    >,
-    selected: eredu_architectures::SelectedRoutedTextRealization,
-    store: Arc<dyn CheckpointSource>,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<Box<dyn ErasedReplicatedTextExecutable>, Error> {
-    if selected.plan().relu2().is_some() {
-        return eredu_architectures::visit_relu2_routed_text_architecture::<
-            MlxNeuralBackend,
-            MlxHybridState,
-            _,
-        >(
-            inspection,
-            selected,
-            store,
-            stream,
-            Relu2RoutedBindingVisitor {
-                stream,
-                weights_stream,
-            },
-        )
-        .map_err(|error| Error::ArchitectureModel(error.to_string()));
+
+pub(super) fn construction_error(
+    error: eredu_architectures::prepared_execution::PreparedExecutionError<Error>,
+) -> Error {
+    match error {
+        eredu_architectures::prepared_execution::PreparedExecutionError::Backend(error) => error,
+        error => Error::ArchitectureModel(error.to_string()),
     }
-    let uses_pooling_attention = selected
-        .text()
-        .state()
-        .components()
-        .iter()
-        .any(|component| {
-            matches!(
-                component.component().role(),
-                eredu_core::cache::StateComponentRole::Fixed(
-                    eredu_core::cache::StateTensorRole::Pooling { .. }
-                )
-            )
-        });
-    if uses_pooling_attention {
-        return eredu_architectures::visit_pooling_routed_text_architecture::<
+}
+
+fn finish_routed_session<A, S, D, F>(
+    (stream, finalizer): (&Stream, F),
+    session: ReplicatedTextSession<A, MlxNeuralBackend, MlxReplicatedTextMechanisms<A, S>, D>,
+    facts: eredu_architectures::prepared_execution::PreparedTextSessionFacts,
+) -> Result<Box<dyn ErasedReplicatedTextExecutable>, Error>
+where
+    S: MlxStateMechanisms + 'static,
+    A: ReplicatedTextArchitecture<MlxNeuralBackend, S, Error = eredu_nn::Error> + 'static,
+    A::StaticModules: Clone,
+    A::Error: std::fmt::Display,
+    D: eredu_runtime::ReplicatedTextExecutionStrategy<
+            A,
             MlxNeuralBackend,
-            MlxPoolingAttentionState,
-            _,
-        >(
-            inspection,
-            selected,
-            store,
-            stream,
-            PoolingRoutedBindingVisitor {
-                stream,
-                weights_stream,
-            },
-        )
-        .map_err(|error| Error::ArchitectureModel(error.to_string()));
-    }
-    eredu_architectures::visit_gated_routed_text_architecture::<
-        MlxNeuralBackend,
-        MlxHybridState,
-        _,
-    >(
-        inspection,
-        selected,
-        store,
-        stream,
-        RoutedBindingVisitor {
-            stream,
-            weights_stream,
-        },
-    )
-    .map_err(|error| Error::ArchitectureModel(error.to_string()))
+            S,
+            MlxArchitectureLayerwisePolicy<A, S>,
+            MlxArchitectureLayerwisePolicy<A, S>,
+        > + MlxParameterBankTelemetry
+        + 'static,
+    F: ReplicatedExecutableFinalizer<A, S>,
+{
+    let (identity, capability, model_type, residency) = facts.into_parts();
+    finalizer.finish(CompletedReplicatedText::from_session(
+        session, identity, capability, model_type, residency, None, None, None, true, stream,
+    ))
 }
 
 pub(super) fn selected_addressable_bank(
@@ -182,9 +145,9 @@ pub(super) fn selected_addressable_partition_bank(
 }
 
 #[derive(Clone, Copy)]
-pub(super) struct Relu2RoutedBindingVisitor<'a> {
-    stream: &'a Stream,
-    weights_stream: &'a Stream,
+pub(in crate::composition::mlx) struct Relu2RoutedBindingVisitor<'a> {
+    pub(in crate::composition::mlx) stream: &'a Stream,
+    pub(in crate::composition::mlx) weights_stream: &'a Stream,
 }
 
 impl eredu_architectures::Relu2RoutedTextArchitectureVisitor<MlxNeuralBackend, MlxHybridState>
@@ -210,34 +173,15 @@ impl eredu_architectures::Relu2RoutedTextArchitectureVisitor<MlxNeuralBackend, M
         A::StaticModules: Clone,
         A::Error: std::fmt::Display,
     {
-        let prompt_cache_identity = prepared.text().prompt_cache_identity().clone();
-        let capability_estimate = prepared.text().capability_estimate().clone();
-        let effective_model_type = prepared.text().effective_model_type().to_owned();
-        let selected_residency = prepared.text().selected().residency();
-        let bank_residency = prepared.bank_residency();
         let mechanisms: MlxReplicatedTextMechanisms<A, MlxHybridState> =
             MlxReplicatedTextMechanisms::new(Arc::clone(&store), self.stream, self.weights_stream);
         #[cfg(test)]
         crate::tests::support::path_instrumentation::constructor();
-        match bank_residency {
-            eredu_runtime::ParameterBankResidency::WithLayer => {
-                let session = prepared
-                    .construct_resident_session::<MlxNeuralBackend, _>(mechanisms, self.stream)
-                    .map_err(Error::ArchitectureModel)?;
-                Ok(Box::new(CompletedReplicatedText::from_session(
-                    session,
-                    prompt_cache_identity,
-                    capability_estimate,
-                    effective_model_type,
-                    selected_residency,
-                    None,
-                    None,
-                    None,
-                    true,
-                    self.stream,
-                )))
-            }
-            eredu_runtime::ParameterBankResidency::IndependentCache(options) => {
+        eredu_architectures::prepared_execution::construct_selected_relu2_session(
+            prepared,
+            mechanisms,
+            self.stream,
+            |prepared, options| {
                 let bank = selected_addressable_bank(
                     prepared.addressable_members(),
                     store,
@@ -245,44 +189,29 @@ impl eredu_architectures::Relu2RoutedTextArchitectureVisitor<MlxNeuralBackend, M
                     self.weights_stream,
                     self.stream,
                 )?;
-                let session = prepared
-                    .construct_addressable_session::<MlxNeuralBackend, _, _, _>(
-                        mechanisms,
-                        bank,
-                        crate::backend::runtime::residency::parameter_bank::MlxIndexedMovement,
-                        self.stream,
-                    )
-                    .map_err(Error::ArchitectureModel)?;
-                Ok(Box::new(CompletedReplicatedText::from_session(
-                    session,
-                    prompt_cache_identity,
-                    capability_estimate,
-                    effective_model_type,
-                    selected_residency,
-                    None,
-                    None,
-                    None,
-                    true,
-                    self.stream,
-                )))
-            }
-            _ => Err(Error::ArchitectureModel(
-                "unsupported selected addressable bank residency".into(),
-            )),
-        }
+                Ok((
+                    bank,
+                    crate::backend::runtime::residency::parameter_bank::MlxIndexedMovement,
+                ))
+            },
+            (self.stream, OrdinaryReplicatedFinalizer),
+            finish_routed_session,
+            finish_routed_session,
+        )
+        .map_err(construction_error)
     }
 }
 
 #[derive(Clone, Copy)]
-pub(super) struct RoutedBindingVisitor<'a> {
-    stream: &'a Stream,
-    weights_stream: &'a Stream,
+pub(in crate::composition::mlx) struct RoutedBindingVisitor<'a> {
+    pub(in crate::composition::mlx) stream: &'a Stream,
+    pub(in crate::composition::mlx) weights_stream: &'a Stream,
 }
 
 #[derive(Clone, Copy)]
-pub(super) struct PoolingRoutedBindingVisitor<'a> {
-    stream: &'a Stream,
-    weights_stream: &'a Stream,
+pub(in crate::composition::mlx) struct PoolingRoutedBindingVisitor<'a> {
+    pub(in crate::composition::mlx) stream: &'a Stream,
+    pub(in crate::composition::mlx) weights_stream: &'a Stream,
 }
 
 pub(super) fn bind_prepared_routed<A, S>(
@@ -299,34 +228,15 @@ where
     A::StaticModules: Clone,
     A::Error: std::fmt::Display,
 {
-    let prompt_cache_identity = prepared.text().prompt_cache_identity().clone();
-    let capability_estimate = prepared.text().capability_estimate().clone();
-    let effective_model_type = prepared.text().effective_model_type().to_owned();
-    let selected_residency = prepared.text().selected().residency();
-    let bank_residency = prepared.bank_residency();
     let mechanisms: MlxReplicatedTextMechanisms<A, S> =
         MlxReplicatedTextMechanisms::new(Arc::clone(&store), stream, weights_stream);
     #[cfg(test)]
     crate::tests::support::path_instrumentation::constructor();
-    match bank_residency {
-        eredu_runtime::ParameterBankResidency::WithLayer => {
-            let session = prepared
-                .construct_resident_session::<MlxNeuralBackend, _>(mechanisms, stream)
-                .map_err(Error::ArchitectureModel)?;
-            Ok(Box::new(CompletedReplicatedText::from_session(
-                session,
-                prompt_cache_identity,
-                capability_estimate,
-                effective_model_type,
-                selected_residency,
-                None,
-                None,
-                None,
-                true,
-                stream,
-            )))
-        }
-        eredu_runtime::ParameterBankResidency::IndependentCache(options) => {
+    eredu_architectures::prepared_execution::construct_selected_gated_session(
+        prepared,
+        mechanisms,
+        stream,
+        |prepared, options| {
             let bank = selected_addressable_bank(
                 prepared.addressable_members(),
                 store,
@@ -334,31 +244,16 @@ where
                 weights_stream,
                 stream,
             )?;
-            let session = prepared
-                .construct_addressable_session::<MlxNeuralBackend, _, _, _>(
-                    mechanisms,
-                    bank,
-                    crate::backend::runtime::residency::parameter_bank::MlxIndexedMovement,
-                    stream,
-                )
-                .map_err(Error::ArchitectureModel)?;
-            Ok(Box::new(CompletedReplicatedText::from_session(
-                session,
-                prompt_cache_identity,
-                capability_estimate,
-                effective_model_type,
-                selected_residency,
-                None,
-                None,
-                None,
-                true,
-                stream,
-            )))
-        }
-        _ => Err(Error::ArchitectureModel(
-            "unsupported selected addressable bank residency".into(),
-        )),
-    }
+            Ok((
+                bank,
+                crate::backend::runtime::residency::parameter_bank::MlxIndexedMovement,
+            ))
+        },
+        (stream, OrdinaryReplicatedFinalizer),
+        finish_routed_session,
+        finish_routed_session,
+    )
+    .map_err(construction_error)
 }
 
 pub(super) fn bind_prepared_routed_prediction<A, S, P>(
@@ -383,10 +278,6 @@ where
             MlxEmbeddedPredictionMaterializer,
         > + 'static,
 {
-    let prompt_cache_identity = prepared.text().prompt_cache_identity().clone();
-    let effective_model_type = prepared.text().effective_model_type().to_owned();
-    let selected_residency = prepared.text().selected().residency();
-    let bank_residency = prepared.bank_residency();
     let mechanisms =
         MlxReplicatedTextMechanisms::<A, S>::new(Arc::clone(&store), stream, weights_stream);
     let prediction = SelectedPrediction {
@@ -395,27 +286,11 @@ where
     };
     #[cfg(test)]
     crate::tests::support::path_instrumentation::constructor();
-    match bank_residency {
-        eredu_runtime::ParameterBankResidency::WithLayer => {
-            let session = prepared
-                .construct_resident_session::<MlxNeuralBackend, _>(mechanisms, stream)
-                .map_err(Error::ArchitectureModel)?;
-            CompletedReplicatedText::from_session(
-                session,
-                prompt_cache_identity,
-                capability.clone(),
-                effective_model_type,
-                selected_residency,
-                None,
-                None,
-                None,
-                true,
-                stream,
-            )
-            .with_prediction(prediction, capability)
-            .map(|model| Box::new(model) as Box<dyn ErasedReplicatedTextExecutable>)
-        }
-        eredu_runtime::ParameterBankResidency::IndependentCache(options) => {
+    eredu_architectures::prepared_execution::construct_selected_gated_session(
+        prepared,
+        mechanisms,
+        stream,
+        |prepared, options| {
             let bank = selected_addressable_bank(
                 prepared.addressable_members(),
                 store,
@@ -423,33 +298,22 @@ where
                 weights_stream,
                 stream,
             )?;
-            let session = prepared
-                .construct_addressable_session::<MlxNeuralBackend, _, _, _>(
-                    mechanisms,
-                    bank,
-                    crate::backend::runtime::residency::parameter_bank::MlxIndexedMovement,
-                    stream,
-                )
-                .map_err(Error::ArchitectureModel)?;
-            CompletedReplicatedText::from_session(
-                session,
-                prompt_cache_identity,
-                capability.clone(),
-                effective_model_type,
-                selected_residency,
-                None,
-                None,
-                None,
-                true,
-                stream,
-            )
-            .with_prediction(prediction, capability)
-            .map(|model| Box::new(model) as Box<dyn ErasedReplicatedTextExecutable>)
-        }
-        _ => Err(Error::ArchitectureModel(
-            "unsupported selected addressable bank residency".into(),
-        )),
-    }
+            Ok((
+                bank,
+                crate::backend::runtime::residency::parameter_bank::MlxIndexedMovement,
+            ))
+        },
+        (
+            stream,
+            PredictionReplicatedFinalizer {
+                prediction,
+                capability,
+            },
+        ),
+        finish_routed_session,
+        finish_routed_session,
+    )
+    .map_err(construction_error)
 }
 
 impl<S>

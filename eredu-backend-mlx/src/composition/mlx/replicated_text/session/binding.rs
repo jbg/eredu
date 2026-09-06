@@ -6,12 +6,14 @@ mod routed;
 
 pub(crate) use composite::CompositeBindingVisitor;
 pub(crate) use partitioned::{
-    bind_partitioned_composite, bind_partitioned_dense_decoder, bind_partitioned_routed_decoder,
-    bind_partitioned_routed_prediction_decoder, PartitionedCompositePredictionBindingVisitor,
-    PartitionedPredictionBindingVisitor,
+    PartitionedCompositeBindingVisitor, PartitionedCompositePredictionBindingVisitor,
+    PartitionedDenseDecoderBindingVisitor, PartitionedPoolingRoutedDecoderBindingVisitor,
+    PartitionedPredictionBindingVisitor, PartitionedRoutedDecoderBindingVisitor,
 };
-pub(in crate::composition::mlx) use routed::bind_routed_text;
 use routed::{selected_addressable_bank, selected_addressable_partition_bank};
+pub(in crate::composition::mlx) use routed::{
+    PoolingRoutedBindingVisitor, Relu2RoutedBindingVisitor, RoutedBindingVisitor,
+};
 
 /// Family-agnostic MLX visitor that binds neutral parameter topology.
 #[derive(Clone, Copy)]
@@ -239,43 +241,13 @@ impl ReplicatedTextArchitectureVisitor<MlxNeuralBackend, MlxHybridState> for Bin
     }
 }
 
-impl ReplicatedTextProfileDispatcher<MlxNeuralBackend> for BindingVisitor<'_> {
-    type Output = Box<dyn ErasedReplicatedTextExecutable>;
-    type Error = Error;
+pub(crate) struct MlxReplicatedStateProfiles;
+
+impl ReplicatedTextStateProfiles<MlxNeuralBackend> for MlxReplicatedStateProfiles {
     type StatelessState = MlxHybridState;
     type AttentionState = MlxKeyValueState;
     type ComponentState = MlxHybridState;
     type AttentionComponentState = MlxHybridState;
     type CompressedState = MlxHybridState;
     type CompressedComponentState = MlxHybridState;
-    type StatelessVisitor = Self;
-    type AttentionVisitor = Self;
-    type ComponentVisitor = Self;
-    type AttentionComponentVisitor = Self;
-    type CompressedVisitor = Self;
-    type CompressedComponentVisitor = Self;
-
-    fn into_stateless_visitor(self) -> Self::StatelessVisitor {
-        self
-    }
-
-    fn into_attention_visitor(self) -> Self::AttentionVisitor {
-        self
-    }
-
-    fn into_component_visitor(self) -> Self::ComponentVisitor {
-        self
-    }
-
-    fn into_attention_component_visitor(self) -> Self::AttentionComponentVisitor {
-        self
-    }
-
-    fn into_compressed_visitor(self) -> Self::CompressedVisitor {
-        self
-    }
-
-    fn into_compressed_component_visitor(self) -> Self::CompressedComponentVisitor {
-        self
-    }
 }

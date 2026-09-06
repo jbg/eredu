@@ -4,26 +4,18 @@
 #define MLX_EVENT_PRIVATE_H
 
 #include "mlx/c/event.h"
+#include "mlx/c/private/prepared_output.h"
 #include "mlx/mlx.h"
 
 inline mlx_event mlx_event_new_() {
   return mlx_event({new mlx::core::Completion()});
 }
 
-inline mlx_event mlx_event_new_(mlx::core::Completion&& event) {
-  return mlx_event({new mlx::core::Completion(std::move(event))});
-}
-
-inline mlx_event& mlx_event_set_(
-    mlx_event& destination,
-    mlx::core::Completion&& event) {
-  if (destination.ctx) {
-    *static_cast<mlx::core::Completion*>(destination.ctx) = std::move(event);
-  } else {
-    destination.ctx = new mlx::core::Completion(std::move(event));
-  }
-  return destination;
-}
+// Prepare publication storage before a producer can enqueue native work.
+// Publishing its successful result must not introduce a later allocation or
+// exception that would discard the only completion handle.
+using mlx_event_preparation_ =
+    mlx_output_preparation_<mlx::core::Completion, mlx_event>;
 
 inline mlx::core::Completion& mlx_event_get_(mlx_event event) {
   if (!event.ctx) {

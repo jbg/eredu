@@ -326,6 +326,13 @@ pub struct ExecutionPlan {
     pub(crate) required_device_capabilities: DeviceCapabilities,
     /// Capabilities which the exact prepared session must provide.
     pub(crate) required_session_capabilities: SessionCapabilities,
+    /// Explicitly requires persisted prompt-prefix import/export independently of cache residency.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(crate) prompt_cache_persistence: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl ExecutionPlan {
@@ -342,6 +349,7 @@ impl ExecutionPlan {
             drafting: DraftingPlan::Disabled,
             required_device_capabilities: DeviceCapabilities::new(true, false, false),
             required_session_capabilities: SessionCapabilities::default(),
+            prompt_cache_persistence: false,
         }
     }
 
@@ -368,6 +376,13 @@ impl ExecutionPlan {
     /// Maximum simultaneously retained checkpoint readers.
     pub const fn max_cached_shards(&self) -> usize {
         self.max_cached_shards
+    }
+
+    /// Whether persisted prompt-prefix import/export is explicitly required.
+    ///
+    /// This is distinct from maintaining decode cache state between submissions.
+    pub const fn prompt_cache_persistence(&self) -> bool {
+        self.prompt_cache_persistence
     }
     /// Optional independent routed-parameter cache.
     pub const fn expert_cache(&self) -> Option<&ExpertCachePlan> {
@@ -409,6 +424,12 @@ impl ExecutionPlan {
     /// Replaces the checkpoint reader bound.
     pub fn with_max_cached_shards(mut self, maximum: usize) -> Self {
         self.max_cached_shards = maximum;
+        self
+    }
+
+    /// Requires persisted prompt-prefix import/export without changing cache residency.
+    pub fn with_prompt_cache_persistence(mut self, required: bool) -> Self {
+        self.prompt_cache_persistence = required;
         self
     }
     /// Replaces the independent routed-parameter cache plan.
@@ -547,6 +568,24 @@ pub enum ExecutionPlanError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prompt_cache_persistence_serde_preserves_legacy_default_and_explicit_intent() {
+        let plan = ExecutionPlan::fully_resident(DevicePlan::new("foreign", "cpu:0").unwrap());
+        let legacy = serde_json::to_value(&plan).unwrap();
+        assert!(legacy.get("prompt_cache_persistence").is_none());
+        assert_eq!(
+            serde_json::from_value::<ExecutionPlan>(legacy).unwrap(),
+            plan
+        );
+        let explicit = plan.with_prompt_cache_persistence(true);
+        let encoded = serde_json::to_value(&explicit).unwrap();
+        assert_eq!(encoded["prompt_cache_persistence"], true);
+        assert_eq!(
+            serde_json::from_value::<ExecutionPlan>(encoded).unwrap(),
+            explicit
+        );
+    }
 
     #[test]
     fn plan_round_trips_with_extensible_backend_identity() {

@@ -208,30 +208,9 @@ fn pipeline_ring_worker() {
                     bits: 4,
                 }
             };
-            MlxLoadRequest::with_quantization(request)
-                .with_parallel_topology(
-                    topology,
-                    device,
-                    eredu_runtime::PipelineWireContract::new(
-                        eredu_runtime::PipelineActivationDtype::Float32,
-                    ),
-                    4,
-                    4096,
-                    ring_completion_policy(),
-                )
-                .unwrap()
+            eredu_runtime::NormalizedLoadRequest::with_quantization(request)
         } else {
-            MlxLoadRequest::with_parallel(
-                topology,
-                device,
-                eredu_runtime::PipelineWireContract::new(
-                    eredu_runtime::PipelineActivationDtype::Float32,
-                ),
-                4,
-                4096,
-                ring_completion_policy(),
-            )
-            .unwrap()
+            eredu_runtime::NormalizedLoadRequest::default()
         };
         let load_options = if std::env::var_os(EXPERT_CACHE).is_some() {
             let ordinary = if dense_stream {
@@ -270,6 +249,18 @@ fn pipeline_ring_worker() {
             load_options
         }
         .with_state_residency(CacheResidencyPolicy::Paged(selected_paged));
+        let load_options = MlxLoadRequest::from_normalized(load_options)
+            .with_parallel_topology(
+                topology,
+                device,
+                eredu_runtime::PipelineWireContract::new(
+                    eredu_runtime::PipelineActivationDtype::Float32,
+                ),
+                4,
+                4096,
+                ring_completion_policy(),
+            )
+            .unwrap();
         if std::env::var_os(OPAQUE_DEEPSEEK_MTP_TARGET).is_some()
             && family == FixtureFamily::DeepSeekV4
         {

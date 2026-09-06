@@ -10,12 +10,11 @@ use eredu_checkpoint::store::{CheckpointSource, ReadPolicy, TensorReadRequest, T
 
 use safemlx::{
     ops::{concatenate_axis, contiguous, stack_axis},
-    transforms::async_eval_with_event,
     Array, Dtype, Stream,
 };
 
 use crate::backend::runtime::checkpoint::store::{
-    MlxParameterMaterializationContext, PendingWeightMaterialization,
+    MlxParameterMaterializationContext, PendingWeightMaterialization, WeightMaterialization,
 };
 
 /// Converts an MLX scalar type into the backend-neutral recipe representation.
@@ -452,14 +451,20 @@ impl MlxWeightRecipeExt for DerivedWeightRecipe {
             Self::NegLog { input } => {
                 let array =
                     input.materialize_inner(store, stream, sources, borrow_sources, context)?;
-                let all_negative = array
+                let prepared =
+                    WeightMaterialization::prepare_retained(vec![array], std::mem::take(sources))?;
+                let all_negative = prepared.inputs()[0]
                     .lt(Array::from_f32(0.0), stream)?
                     .all(false, stream)?
-                    .item::<bool>(stream);
+                    .try_item::<bool>(stream)?;
                 if !all_negative {
                     return Err(WeightRecipeError::NonNegativeNegLogInput);
                 }
-                Ok(array.multiply(Array::from_f32(-1.0), stream)?.log(stream)?)
+                let output = prepared.inputs()[0]
+                    .multiply(Array::from_f32(-1.0), stream)?
+                    .log(stream)?;
+                sources.extend(prepared.finish_preparation()?);
+                Ok(output)
             }
             Self::SubtractOne { input } => {
                 let array =
@@ -484,11 +489,7 @@ impl PendingWeightRecipe {
 
     #[cfg(test)]
     fn finish(self) -> Result<Array, WeightRecipeError> {
-        async_eval_with_event([&self.output])?.synchronize()?;
-        for source in self.sources {
-            source.complete();
-        }
-        Ok(self.output)
+        Ok(WeightMaterialization::submit_retained(self.output, self.sources)?.synchronize()?)
     }
 }
 
@@ -515,10 +516,11 @@ fn materialize_inputs(
             ) {
                 Ok(array) => {
                     if detach_remaining && !input_sources.is_empty() {
-                        async_eval_with_event([&array])?.synchronize()?;
-                        for source in input_sources.drain(..) {
-                            source.complete();
-                        }
+                        WeightMaterialization::submit_retained(
+                            array.clone(),
+                            std::mem::take(&mut input_sources),
+                        )?
+                        .synchronize()?;
                     }
                     pending.push((array, input_sources));
                     break;
@@ -542,10 +544,11 @@ fn materialize_inputs(
                         if child_sources.is_empty() {
                             continue;
                         }
-                        async_eval_with_event([&*array])?.synchronize()?;
-                        for source in child_sources.drain(..) {
-                            source.complete();
-                        }
+                        WeightMaterialization::submit_retained(
+                            array.clone(),
+                            std::mem::take(child_sources),
+                        )?
+                        .synchronize()?;
                     }
                     detach_remaining = true;
                 }

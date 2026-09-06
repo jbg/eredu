@@ -2,7 +2,10 @@
 
 use std::{
     panic::{catch_unwind, AssertUnwindSafe},
-    sync::{mpsc, Arc, Condvar, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc, Condvar, Mutex,
+    },
     thread::{self, JoinHandle},
     time::Instant,
 };
@@ -19,11 +22,13 @@ enum WorkerMessage {
 
 type PrefetchOperation = Arc<dyn Fn(&OffloadUnitId) -> Result<(), String> + Send + Sync + 'static>;
 
-/// One bounded background prefetch worker with exact cancellation and deterministic shutdown.
+/// One bounded background prefetch worker with exact cancellation and configurable shutdown.
 pub struct BackgroundPrefetchWorker {
     sender: mpsc::Sender<WorkerMessage>,
     shared: Arc<(Mutex<PrefetchExecutionState<String>>, Condvar)>,
     worker: Option<JoinHandle<()>>,
+    nonblocking_drop: bool,
+    stopping: Arc<AtomicBool>,
 }
 
 impl BackgroundPrefetchWorker {
@@ -43,14 +48,28 @@ impl BackgroundPrefetchWorker {
             Condvar::new(),
         ));
         let worker_shared = Arc::clone(&shared);
+        let stopping = Arc::new(AtomicBool::new(false));
+        let worker_stopping = Arc::clone(&stopping);
         let worker = thread::Builder::new()
             .name(thread_name.into())
-            .spawn(move || worker_loop(operation, receiver, worker_shared))?;
+            .spawn(move || worker_loop(operation, receiver, worker_shared, worker_stopping))?;
         Ok(Self {
             sender,
             shared,
             worker: Some(worker),
+            nonblocking_drop: false,
+            stopping,
         })
+    }
+
+    /// Requests shutdown without joining when this handle is dropped.
+    ///
+    /// The worker retains its operation and lifecycle state until in-flight
+    /// work returns. Queued work is cancelled by that worker; callers needing
+    /// a synchronous fence can still explicitly call [`Self::cancel`].
+    pub fn with_nonblocking_drop(mut self) -> Self {
+        self.nonblocking_drop = true;
+        self
     }
 
     /// Admits or coalesces one operation after the backend reports current residency.
@@ -178,10 +197,16 @@ impl BackgroundPrefetchWorker {
 
 impl Drop for BackgroundPrefetchWorker {
     fn drop(&mut self) {
-        let _ = self.cancel();
-        let _ = self.sender.send(WorkerMessage::Shutdown);
+        if self.nonblocking_drop {
+            self.stopping.store(true, Ordering::Release);
+        } else {
+            let _ = self.cancel();
+            let _ = self.sender.send(WorkerMessage::Shutdown);
+        }
         if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
+            if !self.nonblocking_drop {
+                let _ = worker.join();
+            }
         }
     }
 }
@@ -190,8 +215,12 @@ fn worker_loop(
     operation: PrefetchOperation,
     receiver: mpsc::Receiver<WorkerMessage>,
     shared: Arc<(Mutex<PrefetchExecutionState<String>>, Condvar)>,
+    stopping: Arc<AtomicBool>,
 ) {
     while let Ok(message) = receiver.recv() {
+        if stopping.load(Ordering::Acquire) {
+            break;
+        }
         let WorkerMessage::WorkAvailable = message else {
             break;
         };
@@ -222,6 +251,13 @@ fn worker_loop(
             .complete(work, result)
             .expect("worker completion matches runtime-owned admitted work");
         shared.1.notify_all();
+    }
+    if stopping.load(Ordering::Acquire) {
+        if let Ok(mut state) = shared.0.lock() {
+            let _ = state.cancel_all();
+            let _ = state.finish_cancellation();
+            shared.1.notify_all();
+        }
     }
 }
 
@@ -314,6 +350,53 @@ mod tests {
         *gate.0.lock().unwrap() = true;
         gate.1.notify_all();
         finished_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    }
+
+    #[test]
+    fn nonblocking_drop_retains_active_operation_and_cancels_queued_work() {
+        struct OperationOwner(mpsc::Sender<()>);
+        impl Drop for OperationOwner {
+            fn drop(&mut self) {
+                let _ = self.0.send(());
+            }
+        }
+
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let operation_gate = Arc::clone(&gate);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (released_tx, released_rx) = mpsc::channel();
+        let owner = OperationOwner(released_tx);
+        let worker = BackgroundPrefetchWorker::new(1, "runtime-prefetch-detach", move |_| {
+            let _retained = &owner;
+            let _ = started_tx.send(());
+            let mut released = operation_gate.0.lock().unwrap();
+            while !*released {
+                released = operation_gate.1.wait(released).unwrap();
+            }
+            Ok(())
+        })
+        .unwrap()
+        .with_nonblocking_drop();
+        worker.submit(&id("active"), false).unwrap();
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        worker.submit(&id("queued"), false).unwrap();
+        let shared = Arc::clone(&worker.shared);
+        let (dropped_tx, dropped_rx) = mpsc::channel();
+        thread::spawn(move || {
+            drop(worker);
+            let _ = dropped_tx.send(());
+        });
+        let dropped_before_release = dropped_rx.recv_timeout(Duration::from_secs(1));
+        let owner_still_retained = released_rx.try_recv().is_err();
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+        dropped_before_release.unwrap();
+        assert!(owner_still_retained);
+        released_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let report = shared.0.lock().unwrap().report();
+        assert_eq!(report.started(), 1);
+        assert_eq!(report.cancelled(), 1);
+        assert!(started_rx.try_recv().is_err());
     }
 
     #[test]

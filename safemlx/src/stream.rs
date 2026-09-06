@@ -140,12 +140,16 @@ mod tests {
 
     #[test]
     fn test_stream_clone() {
-        let stream = Stream::new_with_device(&crate::Device::new(crate::DeviceType::Gpu, 0));
+        let stream = crate::test_stream().clone();
         let cloned_stream = stream.clone();
         assert_eq!(stream, cloned_stream);
     }
 
     #[test]
+    #[cfg_attr(
+        not(any(feature = "metal", feature = "cuda")),
+        ignore = "requires a GPU backend"
+    )]
     fn test_cpu_gpu_stream_not_equal() {
         let cpu_stream = Stream::new_with_device(&crate::Device::new(crate::DeviceType::Cpu, 0));
         let gpu_stream = Stream::new_with_device(&crate::Device::new(crate::DeviceType::Gpu, 0));

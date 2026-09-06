@@ -11,6 +11,18 @@ directory. Source provenance is recorded in
 [`vendor/SOURCES.md`](vendor/SOURCES.md). The native surface includes the
 completion events, typed host-transfer storage, variable-count all-to-all, and
 packed-quantization support required by Eredu's MLX backend.
+Event, timed-evaluation, and host-transfer C producers allocate output wrappers
+before native submission. Successful publication uses nonthrowing moves;
+producer errors restore initially empty or previously populated output handles.
+Submission scopes and exact CPU/GPU progress records retain native resources
+when scheduling fails before an event can be published. Cleanup uses terminal
+evidence rather than retrying evaluation; unresolved work remains owned without
+process termination or a blocking destructor.
+Scope progress publishes terminal evidence separately from primitive-owner
+destruction. Ordinary native calls reclaim terminal records on their original
+owner thread; unresolved records and records whose owner has exited remain
+retained. Patch-content identities select fresh extracted source trees, so
+changing a native patch cannot silently reuse an older successful patch stamp.
 
 ## Backends
 

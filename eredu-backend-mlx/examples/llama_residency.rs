@@ -106,7 +106,9 @@ fn main() -> anyhow::Result<()> {
     let model = load_model(
         &backend,
         &args.model_dir,
-        MlxLoadRequest::default().with_weight_residency(weight_residency),
+        MlxLoadRequest::from_normalized(
+            eredu_runtime::NormalizedLoadRequest::default().with_weight_residency(weight_residency),
+        ),
     )?;
     let mut session = backend.create_session(model)?;
 

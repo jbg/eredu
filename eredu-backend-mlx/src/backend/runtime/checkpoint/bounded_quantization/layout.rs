@@ -20,6 +20,10 @@ pub(super) struct OutputShard {
 pub(super) struct BoundedAllocatorCache {
     working_set_limit_bytes: u64,
     retained_limit_bytes: u64,
+    cleanup: crate::backend::ordinary_retirement::OrdinaryRetirement<AllocatorCacheCleanup>,
+}
+
+struct AllocatorCacheCleanup {
     finished: bool,
 }
 
@@ -29,7 +33,9 @@ impl BoundedAllocatorCache {
             working_set_limit_bytes,
             retained_limit_bytes: (working_set_limit_bytes / 4)
                 .min(BOUNDED_QUANTIZATION_MAX_CACHE_BYTES),
-            finished: false,
+            cleanup: crate::backend::ordinary_retirement::OrdinaryRetirement::new(
+                AllocatorCacheCleanup { finished: false },
+            ),
         }
     }
 
@@ -84,7 +90,7 @@ impl BoundedAllocatorCache {
 
     pub(super) fn finish(&mut self) -> Result<(), Error> {
         memory::clear_cache()?;
-        self.finished = true;
+        self.cleanup.finished = true;
         Ok(())
     }
 }
@@ -97,7 +103,7 @@ pub(super) const fn allocator_cache_requires_clear(
     cached_bytes > retained_limit_bytes || cached_bytes > available_cache_bytes
 }
 
-impl Drop for BoundedAllocatorCache {
+impl Drop for AllocatorCacheCleanup {
     fn drop(&mut self) {
         if !self.finished {
             let _ = memory::clear_cache();
@@ -161,7 +167,7 @@ pub(super) fn output_layouts(
             return Err(quantization_error(format!(
                 "bounded affine companion output has invalid dtype {:?}",
                 target.affine_companion_dtype
-            )))
+            )));
         }
     };
     layouts.push(layout(

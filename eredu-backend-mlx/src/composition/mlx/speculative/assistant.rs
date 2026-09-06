@@ -1,4 +1,10 @@
 use super::*;
+use crate::backend::ordinary_retirement::{self, OrdinaryRetirement};
+use crate::backend::submission_recovery::{Recovery, Retention, Status};
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+};
 
 /// Reports only generic mechanisms available to neutral speculative selection.
 ///
@@ -125,6 +131,7 @@ fn materialize_external_assistant<A: eredu_architectures::ExternalAssistantArchi
         store.as_ref(),
         &task_refs,
         &std::collections::BTreeSet::new(),
+        None,
     )?;
     let arrays = materialize_module_bindings(store.as_ref(), &bindings, weights_stream, stream)?;
     populate_module_from_arrays_excluding(&mut module, &arrays, |_| false)?;
@@ -137,103 +144,197 @@ fn materialize_external_assistant<A: eredu_architectures::ExternalAssistantArchi
 
 /// Architecture-dispatched MLX draft model with its fixed execution placement.
 pub struct MlxDrafter {
-    assistant: eredu_architectures::MaterializedExternalAssistant<MlxAssistantPreparationVisitor>,
-    tokenizer_compatibility: TokenizerCompatibilityProof,
+    payload: Rc<OrdinaryRetirement<DrafterPayload>>,
+    poisoned: Rc<Cell<bool>>,
+}
+
+struct DrafterPayload {
+    execution:
+        eredu_architectures::MaterializedExternalAssistantExecution<MlxAssistantPreparationVisitor>,
     stream: Stream,
-    selected: SelectedSpeculativeRealization,
-    capture: eredu_architectures::composite_execution::ExternalPredictionCaptureRequest,
+}
+
+struct DrafterRetention {
+    _payload: Rc<RefCell<Option<Rc<OrdinaryRetirement<DrafterPayload>>>>>,
+    poisoned: Rc<Cell<bool>>,
+}
+
+impl Retention for DrafterRetention {
+    fn observe(&self, status: Status) {
+        if status.failed || status.blocked {
+            self.poisoned.set(true);
+        }
+    }
+}
+
+struct DrafterOperation<'a> {
+    drafter: &'a mut MlxDrafter,
+    retained: Rc<RefCell<Option<Rc<OrdinaryRetirement<DrafterPayload>>>>>,
+    recovery: Recovery<DrafterRetention>,
+    completed: bool,
+}
+
+impl DrafterOperation<'_> {
+    fn payload(&mut self) -> &mut DrafterPayload {
+        Rc::get_mut(&mut self.drafter.payload).expect("healthy drafter owns its native payload")
+    }
+
+    fn finish<T>(mut self, result: Result<T, Error>) -> Result<T, Error> {
+        self.retained
+            .replace(Some(Rc::clone(&self.drafter.payload)));
+        self.recovery.seal();
+        let status = self.recovery.progress();
+        if !status.settled || status.failed || status.blocked {
+            self.drafter.poisoned.set(true);
+            return Err(Error::Speculative(
+                "native drafter work failed or remains unresolved".into(),
+            ));
+        }
+        let value = result?;
+        self.completed = true;
+        Ok(value)
+    }
+}
+
+impl Drop for DrafterOperation<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.drafter.poisoned.set(true);
+        }
+        self.retained
+            .replace(Some(Rc::clone(&self.drafter.payload)));
+        self.recovery.seal();
+        let status = self.recovery.progress();
+        if !status.settled || status.failed || status.blocked || std::thread::panicking() {
+            self.drafter.poisoned.set(true);
+        }
+    }
 }
 
 impl MlxDrafter {
+    fn begin_operation(&mut self) -> Result<DrafterOperation<'_>, Error> {
+        crate::backend::submission_recovery::reap();
+        ordinary_retirement::reclaim();
+        if self.poisoned.get() {
+            return Err(Error::Speculative(
+                "native drafter is poisoned by failed or unresolved work".into(),
+            ));
+        }
+        // A healthy terminal scope can still retain its payload while another
+        // thread owns the native runtime. Terminal evidence is not exclusive
+        // mutation authority: reject until retirement releases that owner.
+        if Rc::get_mut(&mut self.payload).is_none() {
+            return Err(Error::Speculative(
+                "native drafter payload is still retained by prior work".into(),
+            ));
+        }
+        let retained = Rc::new(RefCell::new(None));
+        let recovery = Recovery::begin(DrafterRetention {
+            _payload: Rc::clone(&retained),
+            poisoned: Rc::clone(&self.poisoned),
+        })?;
+        Ok(DrafterOperation {
+            drafter: self,
+            retained,
+            recovery,
+            completed: false,
+        })
+    }
+
     /// Installs typed production observers for external-assistant tensors and logits.
     pub fn install_external_observers<TensorObserver, LogitsObserver>(
         &mut self,
         tensors: TensorObserver,
         logits: LogitsObserver,
-    ) where
+    ) -> Result<(), Error>
+    where
         TensorObserver: eredu_runtime::ActivationObserver<MlxTensor, Exception> + 'static,
         LogitsObserver: eredu_runtime::ActivationObserver<Array, Exception> + 'static,
     {
-        self.assistant.visit(InstallExternalObservers {
-            observers: Some(
-                eredu_architectures::external_assistant::ExternalAssistantObservers::new(
-                    tensors, logits,
+        let mut operation = self.begin_operation()?;
+        operation
+            .payload()
+            .execution
+            .visit(InstallExternalObservers {
+                observers: Some(
+                    eredu_architectures::external_assistant::ExternalAssistantObservers::new(
+                        tensors, logits,
+                    ),
                 ),
-            ),
-        });
+            });
+        operation.finish(Ok(()))
     }
 
     /// Materializes an architecture-inspected drafter with proven tokenizer compatibility.
-    pub(crate) fn materialize_with_compatibility(
-        preparation: eredu_architectures::PreparedCompatibleExternalAssistant,
-        tokenizer_compatibility: TokenizerCompatibilityProof,
+    pub(crate) fn materialize(
+        preparation: eredu_architectures::PreparedExternalAssistantExecution,
         stream: &Stream,
         weights_stream: &Stream,
-        selected: SelectedSpeculativeRealization,
     ) -> Result<Self, Error> {
-        if !matches!(
-            selected.requirements().strategy().class(),
-            eredu_runtime::SpeculativeStrategyClass::External
-        ) || selected.requirements().strategy().tokenizer_fingerprint()
-            != Some(tokenizer_compatibility.fingerprint())
-        {
-            return Err(Error::ArchitectureModel(
-                "external assistant materialization received a different neutral realization"
-                    .into(),
-            ));
-        }
-        let capture = preparation.capture().clone();
-        let assistant = preparation.visit(MlxAssistantPreparationVisitor {
+        ordinary_retirement::reclaim();
+        let poisoned = Rc::new(Cell::new(false));
+        let retained = Rc::new(RefCell::new(None));
+        let mut recovery = Recovery::begin(DrafterRetention {
+            _payload: Rc::clone(&retained),
+            poisoned: Rc::clone(&poisoned),
+        })?;
+        let execution = preparation.materialize(MlxAssistantPreparationVisitor {
             stream: stream.clone(),
             weights_stream: weights_stream.clone(),
         })?;
-        Ok(Self {
-            assistant,
-            tokenizer_compatibility,
+        let payload = Rc::new(OrdinaryRetirement::new(DrafterPayload {
+            execution,
             stream: stream.clone(),
-            selected,
-            capture,
-        })
+        }));
+        retained.replace(Some(Rc::clone(&payload)));
+        recovery.seal();
+        let status = recovery.progress();
+        if !status.settled || status.failed || status.blocked {
+            return Err(Error::Speculative(
+                "native drafter materialization failed or remains unresolved".into(),
+            ));
+        }
+        drop(recovery);
+        retained.borrow_mut().take();
+        Ok(Self { payload, poisoned })
     }
 
-    pub(crate) fn visit<W>(
-        &mut self,
-        visitor: W,
-    ) -> <W as eredu_architectures::MaterializedExternalAssistantVisitor<
-        MlxAssistantPreparationVisitor,
-    >>::Output
+    pub(crate) fn visit<W, T>(&mut self, visitor: W) -> Result<T, Error>
     where
         W: eredu_architectures::MaterializedExternalAssistantVisitor<
             MlxAssistantPreparationVisitor,
+            Output = Result<T, Error>,
         >,
     {
-        self.assistant.visit(visitor)
+        let mut operation = self.begin_operation()?;
+        let result = operation.payload().execution.visit(visitor);
+        operation.finish(result)
     }
 
     /// Returns the portable proof established before this assistant was materialized.
-    pub const fn tokenizer_compatibility(&self) -> TokenizerCompatibilityProof {
-        self.tokenizer_compatibility
+    pub fn tokenizer_compatibility(&self) -> TokenizerCompatibilityProof {
+        self.payload.execution.tokenizer_compatibility()
     }
 
     /// Execution stream selected when this drafter was loaded.
-    pub const fn stream(&self) -> &Stream {
-        &self.stream
+    pub fn stream(&self) -> &Stream {
+        &self.payload.stream
     }
 
     /// Returns topology selected by the portable execution plan before queue construction.
-    pub const fn topology(&self) -> SpeculativeExecutionTopology {
-        self.selected.placement().topology()
+    pub fn topology(&self) -> SpeculativeExecutionTopology {
+        self.payload.execution.selected().placement().topology()
     }
 
     /// Returns the one neutral realization retained from preconstruction selection.
-    pub const fn selected(&self) -> &SelectedSpeculativeRealization {
-        &self.selected
+    pub fn selected(&self) -> &SelectedSpeculativeRealization {
+        self.payload.execution.selected()
     }
 
-    pub(crate) const fn capture(
+    pub(crate) fn capture(
         &self,
     ) -> &eredu_architectures::composite_execution::ExternalPredictionCaptureRequest {
-        &self.capture
+        self.payload.execution.capture()
     }
 }
 
@@ -262,3 +363,7 @@ impl eredu_architectures::MaterializedExternalAssistantVisitor<MlxAssistantPrepa
             .expect("external observers are installed exactly once");
     }
 }
+
+#[cfg(test)]
+#[path = "assistant_recovery_tests.rs"]
+mod recovery_tests;

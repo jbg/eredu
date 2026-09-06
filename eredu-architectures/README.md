@@ -6,6 +6,13 @@ parameter topology, state geometry, parallel semantic plans, and model
 execution equations. It also owns the total cold selector, architecture-aware
 inspection state, and exact prepared-source roles consumed by backends.
 
+`construct_prepared_execution` consumes the retained selection and source bundle
+through sealed typed routes. It owns prediction/source agreement, communication
+consistency, processor preparation and common executable facts. Backends supply
+native contexts, materializers, visitors and final adapters. Explicit state-profile
+sets share visitor dispatch while retaining each profile's static trait bounds;
+a minimal key/value route does not require optional neural mechanisms.
+
 Architecture implementations are generic over the traits from `eredu-nn`.
 Concrete backends retain control of tensors, storage, graph construction,
 kernel fusion, streams, caches, and collectives. This keeps every model family

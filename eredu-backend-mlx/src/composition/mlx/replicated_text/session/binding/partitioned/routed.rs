@@ -25,69 +25,46 @@ where
     G: 'static,
     F: ReplicatedExecutableFinalizer<A, S>,
 {
-    match prepared.bank_residency() {
-        eredu_runtime::ParameterBankResidency::WithLayer => {
-            let provider = prepared
-                .resident_gated_product_provider()
-                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-            bind_partitioned_routed_with_provider(
-                prepared,
-                store,
-                distributed,
-                provider,
-                None,
-                additional_claimed_sources,
-                stream,
-                weights_stream,
-                finalizer,
-            )
-        }
-        eredu_runtime::ParameterBankResidency::IndependentCache(options) => {
-            if prepared.addressable_members().is_empty() {
-                return bind_partitioned_routed_with_provider(
-                    prepared,
-                    store,
-                    distributed,
-                    eredu_architectures::EmptyPartitionRoutedExpertProvider,
-                    None,
-                    additional_claimed_sources,
-                    stream,
-                    weights_stream,
-                    finalizer,
-                );
-            }
-            let (selected_member_bytes, bank) = selected_addressable_partition_bank(
+    let bank_store = Arc::clone(&store);
+    eredu_architectures::prepared_execution::construct_selected_gated_partition_provider(
+        prepared,
+        |prepared, options| {
+            let (bytes, bank) = selected_addressable_partition_bank(
                 prepared.addressable_members(),
-                Arc::clone(&store),
+                bank_store,
                 options,
                 prepared.layout(),
                 weights_stream,
                 stream,
             )?;
-            let provider = prepared
-                .addressable_gated_product_provider(
-                    selected_member_bytes,
+            Ok(
+                eredu_architectures::prepared_execution::PartitionBankMechanisms::new(
+                    bytes,
                     bank.clone(),
                     crate::backend::runtime::residency::parameter_bank::MlxIndexedMovement,
-                    options,
-                )
-                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-            bind_partitioned_routed_with_provider(
-                prepared,
-                store,
-                distributed,
-                provider,
-                Some(bank),
-                additional_claimed_sources,
-                stream,
-                weights_stream,
-                finalizer,
+                    bank,
+                ),
             )
-        }
-        _ => Err(Error::ArchitectureModel(
-            "neutral routed partition selected an unsupported expert-bank residency".into(),
-        )),
-    }
+        },
+        (
+            store,
+            distributed,
+            additional_claimed_sources,
+            stream,
+            weights_stream,
+            finalizer,
+        ),
+        |native, prepared, provider| {
+            bind_selected_partition_provider(native, prepared, provider, None)
+        },
+        |native, prepared, provider, bank| {
+            bind_selected_partition_provider(native, prepared, provider, Some(bank))
+        },
+        |native, prepared, provider| {
+            bind_selected_partition_provider(native, prepared, provider, None)
+        },
+    )
+    .map_err(super::super::routed::construction_error)
 }
 
 pub(crate) fn bind_partitioned_relu2_resident<A, G, F>(
@@ -119,70 +96,94 @@ where
     G: 'static,
     F: ReplicatedExecutableFinalizer<A, MlxHybridState>,
 {
-    match prepared.bank_residency() {
-        eredu_runtime::ParameterBankResidency::WithLayer => {
-            let provider = prepared
-                .resident_relu2_provider()
-                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-            bind_partitioned_routed_with_provider(
-                prepared,
-                store,
-                distributed,
-                provider,
-                None,
-                additional_claimed_sources,
-                stream,
-                weights_stream,
-                finalizer,
-            )
-        }
-        eredu_runtime::ParameterBankResidency::IndependentCache(options) => {
-            if prepared.addressable_members().is_empty() {
-                let provider = eredu_architectures::EmptyPartitionRoutedExpertProvider;
-                return bind_partitioned_routed_with_provider(
-                    prepared,
-                    store,
-                    distributed,
-                    provider,
-                    None,
-                    additional_claimed_sources,
-                    stream,
-                    weights_stream,
-                    finalizer,
-                );
-            }
-            let (selected_member_bytes, bank) = selected_addressable_partition_bank(
+    let bank_store = Arc::clone(&store);
+    eredu_architectures::prepared_execution::construct_selected_relu2_partition_provider(
+        prepared,
+        |prepared, options| {
+            let (bytes, bank) = selected_addressable_partition_bank(
                 prepared.addressable_members(),
-                Arc::clone(&store),
+                bank_store,
                 options,
                 prepared.layout(),
                 weights_stream,
                 stream,
             )?;
-            let provider = prepared
-                .addressable_relu2_provider(
-                    selected_member_bytes,
+            Ok(
+                eredu_architectures::prepared_execution::PartitionBankMechanisms::new(
+                    bytes,
                     bank.clone(),
                     crate::backend::runtime::residency::parameter_bank::MlxIndexedMovement,
-                    options,
-                )
-                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-            bind_partitioned_routed_with_provider(
-                prepared,
-                store,
-                distributed,
-                provider,
-                Some(bank),
-                additional_claimed_sources,
-                stream,
-                weights_stream,
-                finalizer,
+                    bank,
+                ),
             )
-        }
-        _ => Err(Error::ArchitectureModel(
-            "neutral ReLU-squared partition selected an unsupported expert-bank residency".into(),
-        )),
-    }
+        },
+        (
+            store,
+            distributed,
+            additional_claimed_sources,
+            stream,
+            weights_stream,
+            finalizer,
+        ),
+        |native, prepared, provider| {
+            bind_selected_partition_provider(native, prepared, provider, None)
+        },
+        |native, prepared, provider, bank| {
+            bind_selected_partition_provider(native, prepared, provider, Some(bank))
+        },
+        |native, prepared, provider| {
+            bind_selected_partition_provider(native, prepared, provider, None)
+        },
+    )
+    .map_err(super::super::routed::construction_error)
+}
+
+#[allow(clippy::type_complexity)]
+fn bind_selected_partition_provider<A, S, G, E, Provider, F>(
+    (store, distributed, additional, stream, weights_stream, finalizer): (
+        Arc<dyn CheckpointSource>,
+        crate::backend::distributed::MlxDistributedSession,
+        std::collections::BTreeSet<String>,
+        &Stream,
+        &Stream,
+        F,
+    ),
+    prepared: eredu_architectures::partitioned_execution::PreparedRoutedPartitionedArchitecture<
+        MlxNeuralBackend,
+        A,
+        G,
+        <A as eredu_runtime::PartitionedLayeredArchitecture<MlxNeuralBackend, S>>::Boundary,
+        E,
+    >,
+    provider: Provider,
+    bank: Option<MlxSharedAddressableBank>,
+) -> Result<Box<dyn ErasedReplicatedTextExecutable>, Error>
+where
+    S: MlxStateMechanisms + 'static,
+    A: eredu_architectures::partitioned_execution::TextPartitionArchitecture<MlxNeuralBackend, S>
+        + ReplicatedTextArchitecture<MlxNeuralBackend, S, Error = eredu_nn::Error>
+        + eredu_runtime::ParallelRoutedLayeredArchitecture<MlxNeuralBackend, S>
+        + 'static,
+    A::StaticModules: Clone,
+    G: 'static,
+    E: eredu_architectures::partitioned_execution::RoutedCollectiveSpec
+        + eredu_architectures::routed_text::RoutedGroupedSpec
+        + 'static,
+    Provider: eredu_runtime::TensorParallelRoutedExpertProvider<MlxNeuralBackend> + 'static,
+    Provider::Error: std::fmt::Display,
+    F: ReplicatedExecutableFinalizer<A, S>,
+{
+    bind_partitioned_routed_with_provider(
+        prepared,
+        store,
+        distributed,
+        provider,
+        bank,
+        additional,
+        stream,
+        weights_stream,
+        finalizer,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -289,45 +290,16 @@ where
     Provider::Error: std::fmt::Display,
     F: ReplicatedExecutableFinalizer<A, S>,
 {
-    let capability_estimate = prepared.capability_estimate().clone();
-    let effective_model_type = prepared.effective_model_type().to_owned();
-    let selected_residency = prepared.prepared().selected().base().text().residency();
-    let execution_plan = prepared.execution_handoff().execution_plan().clone();
-    let publication_authority = execution_plan
-        .publication_authority(prepared.prepared().selected().communication())
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?
-        .ok_or_else(|| {
-            Error::ArchitectureModel("routed partition has no publication authority".into())
-        })?;
-    let prompt_cache_topology = prepared
-        .prepared()
-        .selected()
-        .prompt_cache_topology()
-        .map_err(Error::ArchitectureModel)?;
-    let prompt_cache_identity = prepared
-        .prepared()
-        .selected()
-        .partition()
-        .state()
-        .ok_or_else(|| Error::ArchitectureModel("routed partition has no state".into()))?
-        .prompt_cache_identity::<MlxNeuralBackend, _>(
-            prepared.prepared().architecture(),
-            prompt_cache_topology.clone(),
-        )
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let facts = prepared.session_facts().map_err(Error::ArchitectureModel)?;
+    let (text, prompt_cache_topology, execution_plan, publication_authority) = facts.into_parts();
+    let (prompt_cache_identity, capability_estimate, effective_model_type, selected_residency) =
+        text.into_parts();
     let mut ignored_expert_sources = prepared.unowned_expert_checkpoint_sources();
     ignored_expert_sources.extend(additional_claimed_sources);
-    let addressable_parameters = if matches!(
-        prepared.bank_residency(),
-        eredu_runtime::ParameterBankResidency::IndependentCache(_)
-    ) {
-        prepared
-            .addressable_logical_targets()
-            .into_iter()
-            .collect::<Vec<_>>()
-    } else {
-        Vec::new()
-    };
+    let addressable_parameters = prepared
+        .addressable_logical_targets()
+        .into_iter()
+        .collect::<Vec<_>>();
     let mut mechanisms = MlxReplicatedTextMechanisms::new(store, stream, weights_stream);
     mechanisms.set_ignored_checkpoint_sources(ignored_expert_sources);
     let mut distributed = Some(distributed);

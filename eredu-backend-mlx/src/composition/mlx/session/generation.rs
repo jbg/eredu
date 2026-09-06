@@ -56,47 +56,52 @@ pub(super) fn sample_text_submission(
     state: &mut MlxTextGenerationState,
     stream: Stream,
 ) -> Result<Submission<MlxTextToken, MlxTextCompletion>, Error> {
-    let MlxTextGenerationState {
-        temperature,
-        prng,
-        sampler,
-    } = state;
-    let mut sampler = FilteredTextSampler { sampler, filter };
-    let token = if session.synchronizes_sampling() {
-        session
-            .sample_and_synchronize(
-                submission.output.logits(),
-                1,
+    let operation = super::model_session::ResourceOperation::begin(submission.completion.owner())?;
+    let sampled = (|| {
+        let MlxTextGenerationState {
+            temperature,
+            prng,
+            sampler,
+        } = state;
+        let mut sampler = FilteredTextSampler { sampler, filter };
+        let token = if session.synchronizes_sampling() {
+            session
+                .sample_under_submission(
+                    submission.output.logits(),
+                    1,
+                    &mut sampler,
+                    *temperature,
+                    prng.as_mut(),
+                    false,
+                )?
+                .token
+                .try_index_device((.., 0), &stream)?
+        } else {
+            let logits = submission.output.logits().ok_or_else(|| {
+                Error::Parallel("local text generation requires model logits".into())
+            })?;
+            Sampler::<MlxSamplingBackend>::sample(
                 &mut sampler,
+                logits,
                 *temperature,
                 prng.as_mut(),
-                false,
+                &stream,
             )?
-            .token
-            .try_index_device((.., 0), &stream)?
-    } else {
-        let logits = submission
-            .output
-            .logits()
-            .ok_or_else(|| Error::Parallel("local text generation requires model logits".into()))?;
-        Sampler::<MlxSamplingBackend>::sample(
-            &mut sampler,
-            logits,
-            *temperature,
-            prng.as_mut(),
-            &stream,
-        )?
-        .into_array()
-    };
-    let sampled = MlxCompletion::submission(token)?;
+            .into_array()
+        };
+        MlxCompletion::submission(token)
+    })();
+    let (sampled, recovery) = operation.finish(sampled)?;
     Ok(Submission {
         output: MlxTextToken {
             value: sampled.output,
             stream,
+            owner: std::rc::Rc::clone(submission.completion.owner()),
         },
         completion: MlxTextCompletion {
             model: submission.completion,
             token: sampled.completion,
+            recovery: std::cell::RefCell::new(Some(recovery)),
         },
     })
 }

@@ -507,7 +507,7 @@ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 
 [[package]]
 name = "eredu"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "anyhow",
  "eredu-architectures",
@@ -527,7 +527,7 @@ dependencies = [
 
 [[package]]
 name = "eredu-architectures"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "eredu-checkpoint",
  "eredu-core",
@@ -535,6 +535,7 @@ dependencies = [
  "eredu-media",
  "eredu-nn",
  "eredu-runtime",
+ "half",
  "safetensors",
  "serde",
  "serde_json",
@@ -545,7 +546,7 @@ dependencies = [
 
 [[package]]
 name = "eredu-backend-mlx"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -597,7 +598,7 @@ dependencies = [
 
 [[package]]
 name = "eredu-cli"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -613,7 +614,7 @@ dependencies = [
 
 [[package]]
 name = "eredu-codec"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "eredu-checkpoint",
  "eredu-nn",
@@ -625,7 +626,7 @@ dependencies = [
 
 [[package]]
 name = "eredu-core"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "eredu-checkpoint",
  "eredu-gguf",
@@ -638,7 +639,7 @@ dependencies = [
 
 [[package]]
 name = "eredu-evaluation"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "clap",
  "eredu-architectures",
@@ -673,7 +674,7 @@ dependencies = [
 
 [[package]]
 name = "eredu-media"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "eredu-core",
  "image",
@@ -683,7 +684,7 @@ dependencies = [
 
 [[package]]
 name = "eredu-nn"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "eredu-checkpoint",
  "eredu-nn-macros",
@@ -701,10 +702,11 @@ dependencies = [
 
 [[package]]
 name = "eredu-runtime"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "eredu-checkpoint",
  "eredu-core",
+ "eredu-gguf",
  "eredu-nn",
  "safetensors",
  "serde",
@@ -1517,7 +1519,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "safemlx"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "bytemuck",
  "float_eq",
@@ -1551,7 +1553,7 @@ dependencies = [
 
 [[package]]
 name = "safemlx-sys"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "bindgen",
  "cmake",

@@ -42,7 +42,7 @@ fn load_selected_test_model(
         MlxRealtimeExecutionContext::select_realtime_execution(preparation, &options, false)
             .expect("select realtime model");
     let model = backend
-        .materialize_realtime_execution(selected, options)
+        .materialize_realtime_execution(selected)
         .expect("load selected realtime model");
     SelectedTestModel { backend, model }
 }
@@ -106,22 +106,188 @@ fn drive_selected_frame(
 }
 
 #[test]
+fn prepared_realtime_target_rejects_another_device_before_frame_or_state_work() {
+    use eredu_core::scheduler::SemanticStateTransaction as _;
+
+    let directory = tempfile::tempdir().unwrap();
+    write_tiny_native_artifact(directory.path(), None);
+    let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+    let second = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+    let other = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 1));
+    let compatible = MlxRealtimeExecutionContext::new(&second, &second);
+    let replacement = MlxRealtimeExecutionContext::new(&other, &other);
+    let mut model = load_selected_test_model(
+        MlxRealtimeExecutionContext::new(&stream, &stream),
+        prepare(directory.path()),
+        MlxLoadRequest::default(),
+    );
+    // A fresh stream on the retained native device is a valid context.
+    compatible.new_realtime_model_state(&model.model).unwrap();
+    let request = RequestId::new(618);
+    let scheduler = selected_scheduler(&model, request, RealtimeSampling::greedy());
+    let mut branch = scheduler.request_state(request).unwrap().branch().unwrap();
+    let decisions = branch.generation_mut().samplers().len();
+    let mut driver = branch
+        .generation_mut()
+        .decision_driver::<MlxSamplingBackend>(
+            eredu_runtime::SequentialDecisionPlan::new(
+                std::iter::repeat_with(|| eredu_runtime::PredictionDirective::Sample)
+                    .take(decisions),
+                false,
+                false,
+            )
+            .unwrap(),
+            vec![0.0; decisions],
+        )
+        .unwrap();
+    let frontier = branch.generation_mut().schedule_state().frontier();
+    let retained = branch
+        .generation_mut()
+        .model_state()
+        .model_state()
+        .retained_arrays()
+        .len();
+    let frame = RealtimeInputFrame::new(1, vec![1]);
+    crate::tests::support::path_instrumentation::reset();
+    let reject = |error: Error| assert!(error.to_string().contains("different native devices"));
+    reject(
+        replacement
+            .new_realtime_model_state(&model.model)
+            .err()
+            .unwrap(),
+    );
+    reject(
+        replacement
+            .submit_realtime_frame(&mut model.model, &frame, &mut branch)
+            .err()
+            .unwrap(),
+    );
+    // The lower native frame entry point also guards before host tensors, even
+    // when a caller bypasses the public context adapter.
+    reject(
+        submit_scheduled_realtime_frame(&mut model.model, &mut branch, &frame, &other)
+            .err()
+            .unwrap(),
+    );
+    reject(
+        model
+            .model
+            .executor_mut()
+            .execute_selected_realtime(
+                branch.generation_mut().model_state_mut().model_state_mut(),
+                &[],
+                &mut driver,
+                &other,
+            )
+            .err()
+            .unwrap(),
+    );
+    assert_eq!(
+        branch.generation_mut().schedule_state().frontier(),
+        frontier
+    );
+    assert_eq!(
+        branch
+            .generation_mut()
+            .model_state()
+            .model_state()
+            .retained_arrays()
+            .len(),
+        retained
+    );
+    assert!(!branch.generation_mut().has_submission_completion());
+    assert_eq!(
+        crate::tests::support::path_instrumentation::session_input_creation_attempts(),
+        0
+    );
+    assert_eq!(
+        crate::tests::support::path_instrumentation::snapshot(),
+        Default::default()
+    );
+}
+
+#[test]
 fn realtime_session_capabilities_fail_closed_for_activation_inspection() {
     let available = realtime_session_capabilities();
     assert!(available.persistent_cache());
     assert!(available.output_observation());
     assert!(!available.activation_inspection());
 
-    let options = MlxLoadRequest::default().with_required_session_capabilities(
-        eredu_core::SessionCapabilities::default().with_activation_inspection(true),
+    let options = MlxLoadRequest::from_normalized(
+        eredu_runtime::NormalizedLoadRequest::default().with_required_session_capabilities(
+            eredu_core::SessionCapabilities::default().with_activation_inspection(true),
+        ),
     );
-    let error = validate_realtime_session_requirements(&options).unwrap_err();
-    match error {
-        Error::SessionCapability(error) => {
-            assert_eq!(error.capability(), "activation_inspection")
-        }
-        error => panic!("expected session capability error, got {error:?}"),
-    }
+    let directory = tempfile::tempdir().unwrap();
+    write_tiny_native_artifact(directory.path(), None);
+    crate::tests::support::path_instrumentation::reset();
+    let error = MlxRealtimeExecutionContext::select_realtime_execution(
+        prepare(directory.path()),
+        &options,
+        false,
+    )
+    .err()
+    .expect("missing inspection support must reject cold selection");
+    assert!(error.to_string().contains("activation inspection"));
+    assert_eq!(
+        crate::tests::support::path_instrumentation::snapshot().payload_opens,
+        0
+    );
+}
+
+#[test]
+fn realtime_selected_native_target_cannot_be_replaced_by_later_load_options() {
+    let directory = tempfile::tempdir().unwrap();
+    write_tiny_native_artifact(directory.path(), None);
+    let topology = eredu_core::ParallelRankTopology::new(
+        eredu_core::ParallelTopology::new(2, 1, 1, 1).unwrap(),
+        0,
+    )
+    .unwrap();
+    let request_for = |device_type| {
+        MlxLoadRequest::with_parallel(
+            topology,
+            crate::backend::DeviceAssignment::new(device_type, 0),
+            eredu_runtime::PipelineWireContract::new(
+                eredu_runtime::PipelineActivationDtype::Float32,
+            ),
+            1,
+            4096,
+            MlxLoadRequest::test_communication_completion_policy(),
+        )
+        .unwrap()
+    };
+    let mut options = request_for(safemlx::DeviceType::Gpu);
+    crate::tests::support::path_instrumentation::reset();
+    let selected = MlxRealtimeExecutionContext::select_realtime_execution(
+        prepare(directory.path()),
+        &options,
+        true,
+    )
+    .unwrap();
+    let original_policy = options.normalized().clone();
+    options = request_for(safemlx::DeviceType::Cpu);
+    assert_eq!(options.normalized(), &original_policy);
+
+    // Replacing the caller's options cannot alter the target retained by the
+    // opaque selected value. No GPU or collective group is created here.
+    let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+    let backend = MlxRealtimeExecutionContext::new(&stream, &stream);
+    let error = match backend.materialize_realtime_execution(selected) {
+        Ok(_) => panic!("replacement CPU options must not replace the selected GPU target"),
+        Err(error) => error,
+    };
+    assert!(error
+        .to_string()
+        .contains("this rank is assigned Gpu device 0"));
+    assert_eq!(
+        crate::tests::support::path_instrumentation::snapshot(),
+        crate::tests::support::path_instrumentation::Counts::default(),
+    );
+    assert_eq!(
+        crate::tests::support::path_instrumentation::communication_realization_attempts(),
+        0
+    );
 }
 
 #[test]
@@ -411,7 +577,9 @@ fn verify_tiny_native_hardware_matrix() {
         let mut model = load_selected_test_model(
             backend,
             prepare(directory.path()),
-            MlxLoadRequest::default().with_weight_residency(residency),
+            MlxLoadRequest::from_normalized(
+                eredu_runtime::NormalizedLoadRequest::default().with_weight_residency(residency),
+            ),
         );
         assert_eq!(model.model.executor().metadata().residency(), execution);
         assert_eq!(run_tiny_realtime_frames(&mut model), expected);
@@ -451,7 +619,9 @@ fn verify_tiny_native_hardware_matrix() {
         let mut model = load_selected_test_model(
             backend,
             prepare(directory.path()),
-            MlxLoadRequest::with_quantization(request),
+            MlxLoadRequest::from_normalized(
+                eredu_runtime::NormalizedLoadRequest::with_quantization(request),
+            ),
         );
         let metadata = model.model.executor().metadata();
         assert_eq!(metadata.quantization(), Some(quantization));
@@ -871,7 +1041,9 @@ fn moshi_personaplex_prompt_realtime_and_residency_parity() {
         let mut model = load_selected_test_model(
             backend,
             prepare(Path::new(&model_path)),
-            MlxLoadRequest::default().with_weight_residency(residency),
+            MlxLoadRequest::from_normalized(
+                eredu_runtime::NormalizedLoadRequest::default().with_weight_residency(residency),
+            ),
         );
         assert_eq!(
             model.model.execution_config().effective_model_type(),

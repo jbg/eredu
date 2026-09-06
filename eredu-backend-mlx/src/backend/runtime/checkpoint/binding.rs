@@ -155,6 +155,7 @@ pub fn build_mlx_exact_replicated_text_bindings<M>(
     store: &dyn eredu_checkpoint::store::CheckpointSource,
     tasks: &[&ReplicatedTextMaterializationTask],
     addressable_parameters: &BTreeSet<String>,
+    local_layout: Option<&eredu_runtime::LocalModelLayout>,
 ) -> Result<Vec<WeightBinding>, ModuleBindingError>
 where
     M: Parameterized<crate::MlxTensor>,
@@ -164,6 +165,7 @@ where
         store,
         tasks,
         addressable_parameters,
+        local_layout,
         mlx_parameter_binding_target,
         |_task, recipe, source| {
             crate::backend::runtime::checkpoint::recipe::lower_mxfp4_recipe(recipe, source)
@@ -231,14 +233,15 @@ fn submit_module_binding(
     if let Some(recipe) = binding.recipe() {
         let pending = recipe.prepare_materialization(store, context)?;
         let (source, sources) = pending.into_parts();
+        let prepared = WeightMaterialization::prepare_retained(vec![source], sources)?;
         let output = if source_stream == execution_stream {
-            source
+            prepared.inputs()[0].clone()
         } else {
-            source
+            prepared.inputs()[0]
                 .copy(execution_stream)
                 .map_err(WeightRecipeError::from)?
         };
-        Ok(WeightMaterialization::submit_retained(output, sources)?)
+        Ok(prepared.submit_outputs(vec![output])?)
     } else {
         let lease = store.acquire_lease(TensorReadRequest {
             key: binding.checkpoint_key().to_owned(),

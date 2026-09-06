@@ -1,0 +1,1267 @@
+diff --git a/mlx/CMakeLists.txt b/mlx/CMakeLists.txt
+index 6112222c..3874977e 100644
+--- a/mlx/CMakeLists.txt
++++ b/mlx/CMakeLists.txt
+@@ -16,6 +16,7 @@ target_sources(
+           ${CMAKE_CURRENT_SOURCE_DIR}/random.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/scheduler.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/stream.cpp
++          ${CMAKE_CURRENT_SOURCE_DIR}/submission.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/timing.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/transforms.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/utils.cpp
+diff --git a/mlx/array.cpp b/mlx/array.cpp
+index 07d3acd6..37c005cb 100644
+--- a/mlx/array.cpp
++++ b/mlx/array.cpp
+@@ -5,6 +5,7 @@
+ #include "mlx/array.h"
+ #include "mlx/ops.h"
+ #include "mlx/primitives.h"
++#include "mlx/submission.h"
+ #include "mlx/transforms.h"
+ #include "mlx/transforms_impl.h"
+ 
+@@ -168,6 +169,7 @@ bool array::is_tracer() const {
+ 
+ void array::set_data(allocator::Buffer buffer, Deleter d) {
+   array_desc_->data = std::make_shared<Data>(buffer, d);
++  submission::capture_data(array_desc_->data);
+   array_desc_->offset = 0;
+   array_desc_->data_size = size();
+   array_desc_->flags.contiguous = true;
+@@ -184,6 +186,7 @@ void array::set_data(
+     int64_t offset,
+     Deleter d) {
+   array_desc_->data = std::make_shared<Data>(buffer, d);
++  submission::capture_data(array_desc_->data);
+   array_desc_->offset = offset;
+   array_desc_->data_size = data_size;
+   array_desc_->strides = std::move(strides);
+diff --git a/mlx/array.h b/mlx/array.h
+index 8e14ca47..8b137a4a 100644
+--- a/mlx/array.h
++++ b/mlx/array.h
+@@ -2,6 +2,7 @@
+ #pragma once
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <cstdint>
+ #include <functional>
+ #include <memory>
+@@ -231,6 +232,12 @@ class MLX_API array {
+   struct Data {
+     allocator::Buffer buffer;
+     Deleter d;
++    // Physical-only submission pins never expose a logical array value. They
++    // preserve allocation lifetime without preventing ordered buffer donation.
++    std::atomic<size_t> recovery_pins{0};
++    std::atomic_flag recovery_pin_lock = ATOMIC_FLAG_INIT;
+     Data(allocator::Buffer buffer, Deleter d = allocator::free)
+         : buffer(buffer), d(d) {}
+     // Not copyable
+@@ -292,7 +299,23 @@ class MLX_API array {
+ 
+   /** True indicates the arrays buffer is safe to reuse */
+   bool is_donatable() const {
+-    return array_desc_.use_count() == 1 && (array_desc_->data.use_count() == 1);
++    if (array_desc_.use_count() != 1 || !array_desc_->data) {
++      return false;
++    }
++    auto* data = array_desc_->data.get();
++    // The ordinary unique-owner case needs no recovery bookkeeping. New
++    // physical pins cannot introduce another logical reader of this value.
++    if (array_desc_->data.use_count() == 1) {
++      return true;
++    }
++    // Sampling shared_ptr's relaxed count separately from a changing pin
++    // count is not a coherent snapshot. Never wait in the donation predicate;
++    // serialize with pin mutation or conservatively decline donation.
++    if (data->recovery_pin_lock.test_and_set(std::memory_order_acquire)) {
++      return false;
++    }
++    const auto owners = array_desc_->data.use_count();
++    const auto pins = data->recovery_pins.load(std::memory_order_relaxed);
++    data->recovery_pin_lock.clear(std::memory_order_release);
++    return owners > 0 && static_cast<size_t>(owners - 1) == pins;
+   }
+ 
+   /** The array's siblings. */
+diff --git a/mlx/backend/common/buffer_cache.h b/mlx/backend/common/buffer_cache.h
+index 27648b2f..215e7f5c 100644
+--- a/mlx/backend/common/buffer_cache.h
++++ b/mlx/backend/common/buffer_cache.h
+@@ -47,12 +47,21 @@ class BufferCache {
+ 
+   void recycle_to_cache(T* buf) {
+     assert(buf);
+-    // Add to cache.
+-    BufferHolder* bh = new BufferHolder(buf);
+-    add_at_head(bh);
+     size_t size = get_size_(buf);
++    // Recycling occurs in buffer destructors. A cache is optional: allocation
++    // failure must free the buffer, not throw during recovery unwinding or
++    // leave a linked holder without its map entry.
++    BufferHolder* bh = nullptr;
++    try {
++      bh = new BufferHolder(buf);
++      buffer_pool_.emplace(size, bh);
++    } catch (...) {
++      delete bh;
++      free_(buf);
++      return;
++    }
++    add_at_head(bh);
+     pool_size_ += size;
+-    buffer_pool_.emplace(size, bh);
+   }
+ 
+   int release_cached_buffers(size_t min_bytes_to_free) {
+diff --git a/mlx/backend/no_gpu/event.cpp b/mlx/backend/no_gpu/event.cpp
+index c6df8ad6..e01932fd 100644
+--- a/mlx/backend/no_gpu/event.cpp
++++ b/mlx/backend/no_gpu/event.cpp
+@@ -2,7 +2,10 @@
+ 
+ #include "mlx/event.h"
+ #include "mlx/scheduler.h"
++#include "mlx/submission.h"
+ 
++#include <algorithm>
++#include <chrono>
+ #include <condition_variable>
+ #include <mutex>
+ 
+@@ -10,6 +13,7 @@ namespace mlx::core {
+ 
+ struct EventCounter {
+   uint64_t value{0};
++  bool recovery_failed{false};
+   std::shared_ptr<std::string> error;
+   std::mutex mtx;
+   std::condition_variable cv;
+@@ -21,10 +25,22 @@ Event::Event(Stream stream) : stream_(stream) {
+ }
+ 
+ void Event::wait() const {
++  submission::wait_for_event(*this);
++}
++
++void Event::wait_dependency() const {
+   auto ec = static_cast<EventCounter*>(event_.get());
+   std::unique_lock<std::mutex> lk(ec->mtx);
+-  if (ec->value < value()) {
+-    ec->cv.wait(lk, [value = value(), ec] { return ec->value >= value; });
++  while (ec->value < value()) {
++    ec->cv.wait_for(lk, std::chrono::milliseconds(1));
++    if (ec->value < value()) {
++      lk.unlock();
++      submission::progress_records(false);
++      lk.lock();
++    }
++  }
++  if (ec->recovery_failed) {
++    throw std::runtime_error("Native submission failed before event publication.");
+   }
+   if (ec->error) {
+     throw std::runtime_error(*ec->error);
+@@ -32,7 +48,7 @@ void Event::wait() const {
+ }
+ 
+ void Event::wait(Stream stream) const {
+-  scheduler::enqueue(stream, [*this]() mutable { wait(); });
++  scheduler::enqueue(stream, [*this]() mutable { wait_dependency(); });
+ }
+ 
+ void Event::signal(Stream stream) {
+@@ -52,10 +68,43 @@ bool Event::is_signaled() const {
+   {
+     std::lock_guard<std::mutex> lk(ec->mtx);
+     auto signaled = ec->value >= value();
++    if (signaled && ec->recovery_failed) {
++      throw std::runtime_error("Native submission failed before event publication.");
++    }
+     if (signaled && ec->error) {
+       throw std::runtime_error(*ec->error);
+     }
+     return signaled;
+   }
+ }
++
++bool Event::recover_terminal_failure() noexcept {
++  if (!valid()) {
++    return true;
++  }
++  auto* ec = static_cast<EventCounter*>(event_.get());
++  try {
++    std::unique_lock<std::mutex> lock(ec->mtx, std::try_to_lock);
++    if (!lock.owns_lock()) {
++      return false;
++    }
++    ec->recovery_failed = true;
++    ec->value = std::max(ec->value, value());
++    lock.unlock();
++    ec->cv.notify_all();
++    return true;
++  } catch (...) {
++    return false;
++  }
++}
++
++bool Event::side_effects_terminal() const noexcept {
++  return true;
++}
++
++bool Event::side_effects_failed() const noexcept {
++  return false;
++}
++
++void Event::progress_side_effects() noexcept {}
+ } // namespace mlx::core
+diff --git a/mlx/backend/no_gpu/fence.cpp b/mlx/backend/no_gpu/fence.cpp
+index cd66d23c..118d4085 100644
+--- a/mlx/backend/no_gpu/fence.cpp
++++ b/mlx/backend/no_gpu/fence.cpp
+@@ -51,4 +51,14 @@ void Fence::update(Stream stream, const array&, bool) {
+   }
+ }
+ 
++bool Fence::side_effects_terminal() const noexcept {
++  return true;
++}
++
++bool Fence::side_effects_failed() const noexcept {
++  return false;
++}
++
++void Fence::progress_side_effects() noexcept {}
++
+ } // namespace mlx::core
+diff --git a/mlx/event.h b/mlx/event.h
+index 7cfa08a7..4f4a1dab 100644
+--- a/mlx/event.h
++++ b/mlx/event.h
+@@ -17,6 +17,10 @@ class MLX_API Event {
+   // Wait for the event to be signaled at its current value
+   void wait() const;
+ 
++  // Backend dependency wait: unlike a host wait, a failure may not release a
++  // consumer until the producer's exact native frontier is terminal.
++  void wait_dependency() const;
++
+   // Wait in the given stream for the event to be signaled at its current value
+   void wait(Stream stream) const;
+ 
+@@ -26,6 +30,14 @@ class MLX_API Event {
+   // Check if the event has been signaled at its current value
+   bool is_signaled() const;
+ 
++  // Recovery only: the producer's exact native frontier is already terminal.
++  // Publish failure to dependent waiters without enqueueing additional work.
++  // False means no terminal signal could be established; retain the owner.
++  bool recover_terminal_failure() noexcept;
++  bool side_effects_terminal() const noexcept;
++  bool side_effects_failed() const noexcept;
++  void progress_side_effects() noexcept;
++
+   // Check if the event is valid
+   bool valid() const {
+     return event_ != nullptr;
+diff --git a/mlx/fence.h b/mlx/fence.h
+index 0ececdb6..c06aa804 100644
+--- a/mlx/fence.h
++++ b/mlx/fence.h
+@@ -31,6 +31,9 @@ class Fence {
+ 
+   void update(Stream stream, const array& x, bool cross_device);
+   void wait(Stream stream, const array& x);
++  bool side_effects_terminal() const noexcept;
++  bool side_effects_failed() const noexcept;
++  void progress_side_effects() noexcept;
+ 
+  private:
+   std::shared_ptr<void> fence_{nullptr};
+diff --git a/mlx/scheduler.h b/mlx/scheduler.h
+index 853b89d5..351246ac 100644
+--- a/mlx/scheduler.h
++++ b/mlx/scheduler.h
+@@ -3,6 +3,7 @@
+ #pragma once
+ 
+ #include <atomic>
++#include <chrono>
+ #include <cstdint>
+ #include <deque>
+ #include <exception>
+@@ -210,6 +211,14 @@ class MLX_API Scheduler {
+     }
+   }
+ 
++  bool wait_for_one_for(std::chrono::milliseconds interval) {
++    std::unique_lock<std::mutex> lock(mtx);
++    const auto before = n_active_tasks();
++    return before == 0 || completion_cv.wait_for(lock, interval, [this, before] {
++      return n_active_tasks() < before;
++    });
++  }
++
+  private:
+   friend Stream mlx::core::new_stream(Device d);
+ 
+diff --git a/target/mlx-recovery-edit/new/mlx/submission.cpp b/mlx/submission.cpp
+new file mode 100644
+index 00000000..13a2fb67
+--- /dev/null
++++ b/mlx/submission.cpp
+@@ -0,0 +1,523 @@
++#include "mlx/submission.h"
++
++#include <algorithm>
++#include <limits>
++#include <mutex>
++
++namespace mlx::core::submission {
++namespace {
++thread_local Scope* active_scope = nullptr;
++thread_local Record* active_capture = nullptr;
++thread_local const void* owner_identity = nullptr;
++
++const void* prepare_owner_identity() {
++  if (!owner_identity) {
++    // std::thread::id and TLS addresses may be reused after thread exit.
++    // A never-recycled tag cannot authorize another thread to touch an encoder.
++    owner_identity = new unsigned char;
++  }
++  return owner_identity;
++}
++struct Registry {
++  std::mutex mutex;
++  Record* head{nullptr};
++  Record* tail{nullptr};
++  size_t size{0};
++};
++// No static teardown: unresolved native callbacks and their owners may outlive
++// the submitting thread, all C handles, and ordinary static destruction.
++Registry& registry() {
++  static auto* value = new Registry;
++  return *value;
++}
++
++struct PinMutation {
++  array::Data& data;
++  explicit PinMutation(array::Data& value) noexcept : data(value) {
++    // Pins are created/released only by ordinary host evaluation/retirement,
++    // never scope progress/free or native worker observation. The holder does
++    // only pin-count arithmetic: no allocation, callbacks or backend work.
++    while (data.recovery_pin_lock.test_and_set(std::memory_order_acquire)) {
++      std::this_thread::yield();
++    }
++  }
++  ~PinMutation() {
++    data.recovery_pin_lock.clear(std::memory_order_release);
++  }
++  PinMutation(const PinMutation&) = delete;
++  PinMutation& operator=(const PinMutation&) = delete;
++};
++} // namespace
++
++Scope::Scope() : owner_(prepare_owner_identity()), parent_(active_scope) {
++  // Prepare global ownership before the first possible submission.
++  (void)registry();
++  if (parent_) {
++    parent_->retain();
++    parent_->record_started();
++    parent_->next_ = this;
++  }
++  previous_ = active_scope;
++  active_scope = this;
++}
++
++Scope::~Scope() {
++  if (parent_) {
++    parent_->release();
++  }
++}
++
++bool Scope::on_owner_thread() const noexcept {
++  return owner_ == owner_identity;
++}
++
++void Scope::retain() noexcept {
++  references_.fetch_add(1, std::memory_order_relaxed);
++}
++
++void Scope::release() noexcept {
++  if (references_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
++    delete this;
++  }
++}
++
++void Scope::seal() noexcept {
++  if (!active_) {
++    return;
++  }
++  // The active chain is independent of the durable ancestry. Removing an
++  // outer scope leaves its active children and their lifetime ancestry valid.
++  if (previous_) {
++    previous_->next_ = next_;
++  }
++  if (next_) {
++    next_->previous_ = previous_;
++  } else {
++    active_scope = previous_;
++  }
++  previous_ = next_ = nullptr;
++  active_ = false;
++  if (parent_) {
++    parent_->record_finished(false, false, false);
++  }
++}
++
++Status Scope::query() const noexcept {
++  const auto pending = pending_.load(std::memory_order_acquire);
++  return {
++      pending ? Activity::pending
++              : (activity_.load(std::memory_order_acquire) ? Activity::terminal
++                                                         : Activity::none),
++      failed_.load(std::memory_order_acquire),
++      blocked_.load(std::memory_order_acquire)};
++}
++
++void Scope::progress() noexcept {
++  progress_records();
++}
++
++void Scope::record_started() noexcept {
++  for (auto* scope = this; scope; scope = scope->parent_) {
++    scope->pending_.fetch_add(1, std::memory_order_relaxed);
++  }
++}
++
++void Scope::record_failed(bool blocked) noexcept {
++  for (auto* scope = this; scope; scope = scope->parent_) {
++    scope->failed_.store(true, std::memory_order_release);
++    if (blocked) {
++      scope->blocked_.store(true, std::memory_order_release);
++    }
++  }
++}
++
++void Scope::record_finished(bool activity, bool failed, bool blocked) noexcept {
++  for (auto* scope = this; scope; scope = scope->parent_) {
++    if (activity) {
++      scope->activity_.store(true, std::memory_order_release);
++    }
++    if (failed) {
++      scope->failed_.store(true, std::memory_order_release);
++    }
++    if (blocked) {
++      scope->blocked_.store(true, std::memory_order_release);
++    }
++    scope->pending_.fetch_sub(1, std::memory_order_release);
++  }
++}
++
++Record::Record() : owner_(prepare_owner_identity()) {
++  captures_.reserve(8);
++  (void)registry();
++}
++
++void Record::enter() {
++  auto& owners = registry();
++  std::lock_guard<std::mutex> lock(owners.mutex);
++  scope_ = active_scope;
++  if (scope_) {
++    scope_->retain();
++    scope_->record_started();
++  }
++  if (owners.tail) {
++    owners.tail->next_ = this;
++  } else {
++    owners.head = this;
++  }
++  owners.tail = this;
++  ++owners.size;
++}
++
++Record::~Record() {
++  if (scope_) {
++    scope_->release();
++  }
++}
++
++void Record::prepare_stream(Stream stream) {
++  if (std::any_of(streams_.begin(), streams_.end(), [&](const auto& receipt) {
++        return receipt.stream == stream;
++      })) {
++    return;
++  }
++  StreamReceipt receipt{stream, {}, {}};
++  if (stream.device == Device::cpu) {
++    receipt.cpu = scheduler::prepare_cpu_stream(stream);
++    receipt.begin = scheduler::cpu_stream_progress(receipt.cpu).accepted;
++  } else {
++    receipt.gpu = gpu::prepare_submission_stream(stream);
++    receipt.begin = gpu::submission_progress(receipt.gpu).accepted;
++  }
++  receipt.end = receipt.begin;
++  streams_.push_back(std::move(receipt));
++}
++
++Record::PhysicalPin::PhysicalPin(const std::shared_ptr<array::Data>& owner)
++    : data(owner) {
++  if (data) {
++    bool exhausted;
++    {
++      PinMutation mutation(*data);
++      exhausted = data->recovery_pins.load(std::memory_order_relaxed) ==
++          std::numeric_limits<size_t>::max();
++      // The shared owner exists before its exclusion becomes visible.
++      if (!exhausted) {
++        data->recovery_pins.fetch_add(1, std::memory_order_relaxed);
++      }
++    }
++    // Exception construction may allocate, so it must run outside the guard.
++    if (exhausted) {
++      throw std::overflow_error("Native recovery pin count exhausted.");
++    }
++  }
++}
++
++Record::PhysicalPin::~PhysicalPin() {
++  if (data) {
++    PinMutation mutation(*data);
++    // Only this move-only owner changes its one count; a move transfers the
++    // shared pointer and leaves the source null without changing the count.
++    auto count = data->recovery_pins.load(std::memory_order_relaxed);
++    if (count) {
++      data->recovery_pins.fetch_sub(1, std::memory_order_relaxed);
++    }
++    // The guard releases before the shared_ptr member releases its owner.
++  }
++}
++
++void Record::reserve_outputs(size_t count) {
++  outputs_.reserve(count);
++}
++
++void Record::retain_output(const std::shared_ptr<array::Data>& data) {
++  if (data) {
++    outputs_.emplace_back(data);
++  }
++}
++
++void Record::release_success_outputs() noexcept {
++  // Called only after every primitive and all event/finalize publication
++  // succeeded. Unconsumed values remain graph-owned; consumed values are
++  // retained by the successful backend dispatch (or its donated output).
++  // Failed submission paths keep every pin until terminal retirement.
++  outputs_.clear();
++}
++
++void Record::begin_primitive() noexcept {
++  previous_capture_ = active_capture;
++  active_capture = this;
++  capture_active_ = true;
++}
++
++void Record::end_primitive() noexcept {
++  active_capture = previous_capture_;
++  previous_capture_ = nullptr;
++  capture_active_ = false;
++  captures_.clear();
++}
++
++void Record::capture(const std::shared_ptr<array::Data>& data) {
++  captures_.push_back(data);
++}
++
++void capture_data(const std::shared_ptr<array::Data>& data) {
++  if (active_capture) {
++    active_capture->capture(data);
++  }
++}
++
++void Record::mark_failure() noexcept {
++  failed_ = true;
++  for (auto& receipt : streams_) {
++    if (receipt.stream.device == Device::cpu) {
++      receipt.end = scheduler::cpu_stream_progress(receipt.cpu).accepted;
++      if (receipt.end > receipt.begin) {
++        scheduler::block_cpu_stream(receipt.cpu);
++        receipt.end = scheduler::cpu_stream_progress(receipt.cpu).accepted;
++      }
++    } else {
++      receipt.end = gpu::submission_progress(receipt.gpu).accepted;
++      if (receipt.end > receipt.begin) {
++        gpu::block_submission_stream(receipt.gpu);
++        receipt.end = gpu::submission_progress(receipt.gpu).accepted;
++      }
++    }
++    activity_ |= receipt.end > receipt.begin;
++  }
++  blocked_ |= activity_;
++  if (scope_) {
++    scope_->record_failed(blocked_);
++  }
++}
++
++void Record::finish(bool failed) noexcept {
++  if (capture_active_) {
++    active_capture = previous_capture_;
++    capture_active_ = false;
++  }
++  if (failed) {
++    mark_failure();
++  } else {
++    for (auto& receipt : streams_) {
++      receipt.end = receipt.stream.device == Device::cpu
++          ? scheduler::cpu_stream_progress(receipt.cpu).accepted
++          : gpu::submission_progress(receipt.gpu).accepted;
++      activity_ |= receipt.end > receipt.begin;
++    }
++  }
++  frozen_.store(true, std::memory_order_release);
++}
++
++bool Record::progress(bool allow_backend_progress) noexcept {
++  if (settled_) {
++    return true;
++  }
++  if (!frozen_.load(std::memory_order_acquire)) {
++    return false;
++  }
++  // Finalize every exact GPU encoder before observing any frontier. Never
++  // wait on one stream while another producer still has an open buffer.
++  for (auto& receipt : streams_) {
++    if (allow_backend_progress && owner_ == owner_identity &&
++        receipt.stream.device == Device::gpu &&
++        gpu::submission_progress(receipt.gpu).completed < receipt.end) {
++      gpu::progress_submission_stream(receipt.gpu);
++      if (failed_) {
++        receipt.end = std::max(
++            receipt.end, gpu::submission_progress(receipt.gpu).accepted);
++      }
++    }
++  }
++  if (allow_backend_progress && owner_ == owner_identity) {
++    progress_side_effects();
++  }
++  if (side_effects_failed() && !failed_) {
++    mark_failure();
++  }
++  bool terminal = side_effects_terminal();
++  for (auto& receipt : streams_) {
++    uint64_t completed;
++    bool failed;
++    if (receipt.stream.device == Device::cpu) {
++      auto state = scheduler::cpu_stream_progress(receipt.cpu);
++      completed = state.completed;
++      failed = state.failed;
++    } else {
++      auto state = gpu::submission_progress(receipt.gpu);
++      completed = state.completed;
++      failed = state.failed;
++    }
++    if (failed && !failed_) {
++      mark_failure();
++    }
++    if (completed < receipt.end) {
++      terminal = false;
++      continue;
++    }
++    if (failed_ && !receipt.event_recovered) {
++      receipt.event_recovered = side_effects_terminal(receipt.stream) &&
++          recover_event(receipt.stream);
++      terminal &= receipt.event_recovered;
++    }
++  }
++  if (terminal) {
++    settled_ = true;
++    if (scope_) {
++      scope_->record_finished(activity_, failed_, blocked_);
++    }
++  }
++  return terminal;
++}
++
++void progress_records(bool allow_backend_progress) noexcept {
++  try {
++    auto& owners = registry();
++    std::unique_lock<std::mutex> lock(owners.mutex, std::try_to_lock);
++    if (!lock.owns_lock()) {
++      return;
++    }
++    // Rotate pending owners for fairness. At most 64 records are examined per
++    // call, regardless of registry size, and no native host wait is performed.
++    auto count = std::min<size_t>(owners.size, 64);
++    while (count--) {
++      auto* record = owners.head;
++      owners.head = record->next_;
++      if (!owners.head) {
++        owners.tail = nullptr;
++      }
++      record->next_ = nullptr;
++      record->progress(allow_backend_progress);
++      if (owners.tail) {
++        owners.tail->next_ = record;
++      } else {
++        owners.head = record;
++      }
++      owners.tail = record;
++    }
++  } catch (...) {
++    // Observation is best effort. Failure never destroys unresolved owners.
++  }
++}
++
++void retire_records() {
++  Record* retired = nullptr;
++  {
++    auto& owners = registry();
++    std::unique_lock<std::mutex> lock(owners.mutex, std::try_to_lock);
++    if (!lock.owns_lock()) {
++      return;
++    }
++    auto count = std::min<size_t>(owners.size, 64);
++    while (count--) {
++      auto* record = owners.head;
++      owners.head = record->next_;
++      if (!owners.head) {
++        owners.tail = nullptr;
++      }
++      if (record->settled_ && record->owner_ == owner_identity) {
++        --owners.size;
++        record->next_ = retired;
++        retired = record;
++      } else {
++        record->next_ = nullptr;
++        if (owners.tail) {
++          owners.tail->next_ = record;
++        } else {
++          owners.head = record;
++        }
++        owners.tail = record;
++      }
++    }
++  }
++  while (retired) {
++    auto* record = retired;
++    retired = record->next_;
++    delete record;
++  }
++}
++
++bool stream_failed(Stream stream) noexcept {
++  if (stream.device == Device::cpu) {
++    if (auto progress = scheduler::cpu_stream_progress(stream);
++        progress && progress->failed) {
++      return true;
++    }
++  }
++  try {
++    auto& owners = registry();
++    std::unique_lock<std::mutex> lock(owners.mutex, std::try_to_lock);
++    if (!lock.owns_lock()) {
++      return false;
++    }
++    for (auto* record = owners.head; record; record = record->next_) {
++      if (!record->frozen_.load(std::memory_order_acquire)) {
++        continue;
++      }
++      for (const auto& receipt : record->streams_) {
++        if (receipt.stream == stream &&
++            (record->failed_ ||
++             (stream.device == Device::gpu &&
++              gpu::submission_progress(receipt.gpu).failed))) {
++          return true;
++        }
++      }
++    }
++  } catch (...) {
++  }
++  return false;
++}
++
++bool failed_work_pending() noexcept {
++  try {
++    auto& owners = registry();
++    std::unique_lock<std::mutex> lock(owners.mutex, std::try_to_lock);
++    if (!lock.owns_lock()) {
++      return false;
++    }
++    for (auto* record = owners.head; record; record = record->next_) {
++      if (record->frozen_.load(std::memory_order_acquire) &&
++          record->failed_ && !record->settled_) {
++        return true;
++      }
++    }
++  } catch (...) {
++  }
++  return false;
++}
++
++void Record::wait_for_progress() {
++  for (;;) {
++    progress_records();
++    bool failed = failed_work_pending();
++    for (const auto& receipt : streams_) {
++      failed |= receipt.stream.device == Device::cpu
++          ? scheduler::cpu_stream_progress(receipt.cpu).failed
++          : gpu::submission_progress(receipt.gpu).failed;
++    }
++    if (failed) {
++      throw std::runtime_error(
++          "Native scheduler progress is blocked by an unresolved failed submission.");
++    }
++    if (scheduler::scheduler().wait_for_one_for(std::chrono::milliseconds(1))) {
++      return;
++    }
++    // A healthy slow task has no deadline. Only known failed/owned work
++    // changes the outcome from ordinary waiting to a recoverable error.
++  }
++}
++
++void wait_for_event(const Event& event) {
++  auto fail = [&]() -> void {
++    if (event.stream().device == Device::cpu) {
++      if (auto message = scheduler::stream_error(event.stream())) {
++        throw std::runtime_error(*message);
++      }
++    }
++    throw std::runtime_error("Native submission failed while waiting for completion.");
++  };
++  for (;;) {
++    // Failure is not terminality. Return promptly and let the independent
++    // registry/scope keep accepted work and its owners until proven stopped.
++    if (stream_failed(event.stream())) {
++      fail();
++    }
++    progress_records();
++    if (stream_failed(event.stream())) {
++      fail();
++    }
++    if (event.is_signaled()) {
++      return;
++    }
++    std::this_thread::yield();
++  }
++}
++
++} // namespace mlx::core::submission
+diff --git a/target/mlx-recovery-edit/new/mlx/submission.h b/mlx/submission.h
+new file mode 100644
+index 00000000..e1fc28c9
+--- /dev/null
++++ b/mlx/submission.h
+@@ -0,0 +1,134 @@
++#pragma once
++
++#include <atomic>
++#include <cstdint>
++#include <memory>
++#include <thread>
++#include <vector>
++
++#include "mlx/array.h"
++#include "mlx/backend/gpu/eval.h"
++#include "mlx/scheduler.h"
++
++namespace mlx::core::submission {
++
++enum class Activity : uint8_t { none, pending, terminal };
++struct Status {
++  Activity activity;
++  bool failed;
++  bool blocked;
++};
++
++// The handle owns an observation, not the lifetime of accepted work. Records
++// retain it independently until every exact native frontier is terminal.
++class MLX_API Scope {
++ public:
++  Scope();
++  Scope(const Scope&) = delete;
++  Scope& operator=(const Scope&) = delete;
++  bool on_owner_thread() const noexcept;
++  void seal() noexcept;
++  Status query() const noexcept;
++  void progress() noexcept;
++  void release() noexcept;
++
++ private:
++  friend class Record;
++  ~Scope();
++  void retain() noexcept;
++  void record_started() noexcept;
++  void record_finished(bool activity, bool failed, bool blocked) noexcept;
++  void record_failed(bool blocked) noexcept;
++  std::atomic<size_t> references_{1};
++  std::atomic<size_t> pending_{0};
++  std::atomic<bool> activity_{false};
++  std::atomic<bool> failed_{false};
++  std::atomic<bool> blocked_{false};
++  const void* owner_;
++  Scope* parent_{nullptr};
++  Scope* previous_{nullptr};
++  Scope* next_{nullptr};
++  bool active_{true};
++};
++
++// Construct and prepare before native work. Keep the current array, remaining
++// tape, primitive owners, fences and events in a derived record. finish and
++// progress never free resources; ordinary retirement reclaims only terminal
++// records on their exact original owner thread.
++class MLX_API Record {
++ public:
++  Record();
++  virtual ~Record();
++  Record(const Record&) = delete;
++  Record& operator=(const Record&) = delete;
++  void enter();
++  void prepare_stream(Stream);
++  void reserve_outputs(size_t);
++  void retain_output(const std::shared_ptr<array::Data>&);
++  void release_success_outputs() noexcept;
++  void wait_for_progress();
++  void finish(bool failed) noexcept;
++  void begin_primitive() noexcept;
++  void end_primitive() noexcept;
++  void capture(const std::shared_ptr<array::Data>&);
++
++ protected:
++  virtual bool recover_event(Stream) noexcept { return true; }
++  virtual bool side_effects_terminal() const noexcept { return true; }
++  virtual bool side_effects_failed() const noexcept { return false; }
++  virtual bool side_effects_terminal(Stream) const noexcept {
++    return side_effects_terminal();
++  }
++  virtual void progress_side_effects() noexcept {}
++
++ private:
++  friend void progress_records(bool) noexcept;
++  friend void retire_records();
++  friend bool stream_failed(Stream) noexcept;
++  friend bool failed_work_pending() noexcept;
++  struct PhysicalPin {
++    std::shared_ptr<array::Data> data;
++    explicit PhysicalPin(const std::shared_ptr<array::Data>&);
++    PhysicalPin(PhysicalPin&&) noexcept = default;
++    PhysicalPin& operator=(PhysicalPin&&) = delete;
++    PhysicalPin(const PhysicalPin&) = delete;
++    PhysicalPin& operator=(const PhysicalPin&) = delete;
++    ~PhysicalPin();
++  };
++  struct StreamReceipt {
++    Stream stream;
++    scheduler::CpuStreamToken cpu;
++    gpu::SubmissionToken gpu;
++    uint64_t begin{0};
++    uint64_t end{0};
++    bool event_recovered{false};
++  };
++  bool progress(bool) noexcept;
++  void mark_failure() noexcept;
++  Scope* scope_{nullptr};
++  Record* next_{nullptr};
++  std::atomic<bool> frozen_{false};
++  std::vector<StreamReceipt> streams_;
++  std::vector<std::shared_ptr<array::Data>> captures_;
++  std::vector<PhysicalPin> outputs_;
++  Record* previous_capture_{nullptr};
++  bool capture_active_{false};
++  bool failed_{false};
++  bool activity_{false};
++  bool blocked_{false};
++  bool settled_{false};
++  const void* owner_;
++};
++
++// Only active inside one primitive until its ordinary backend retention has
++// been published. This closes partial-primitive temporary lifetime holes while
++// restoring normal donation before the next primitive.
++MLX_API void capture_data(const std::shared_ptr<array::Data>&);
++MLX_API void progress_records(bool allow_backend_progress = true) noexcept;
++// Ordinary host operations may explicitly reclaim terminal records. Arbitrary
++// primitive/resource destructors run outside the registry lock, never in
++// scope progress/free, worker observation or thread-local teardown.
++MLX_API void retire_records();
++MLX_API bool stream_failed(Stream) noexcept;
++MLX_API void wait_for_event(const Event&);
++
++} // namespace mlx::core::submission
+diff --git a/mlx/transforms.cpp b/mlx/transforms.cpp
+index 9583dda2..6227f9ac 100644
+--- a/mlx/transforms.cpp
++++ b/mlx/transforms.cpp
+@@ -17,6 +17,7 @@
+ #include "mlx/ops.h"
+ #include "mlx/primitives.h"
+ #include "mlx/scheduler.h"
++#include "mlx/submission.h"
+ #include "mlx/transforms.h"
+ #include "mlx/transforms_impl.h"
+ #include "mlx/utils.h"
+@@ -78,11 +79,96 @@ int& detail::InExportTracing::counter() {
+ }
+ thread_local int detail::RetainGraph::tracing_counter{0};
+ 
++namespace {
++struct EvalSubmissionRecord : submission::Record {
++  std::deque<array> tape;
++  std::optional<array> synchronizer;
++  std::optional<array> current;
++  std::vector<std::shared_ptr<Primitive>> primitive_owners;
++  std::unordered_map<uint32_t, Fence> fences;
++  std::unordered_map<uint32_t, Event> events;
++  bool failed_record{false};
++
++  ~EvalSubmissionRecord() override {
++    if (!failed_record) {
++      return;
++    }
++    // Every unscheduled node is still held by the tape/current array. Detach
++    // while these independent handles exist, so terminal recovery does not
++    // invoke the allocating recursive graph-destructor walk under pressure.
++    for (auto& arr : tape) {
++      arr.detach();
++    }
++    if (current) {
++      current->detach();
++    }
++    if (synchronizer) {
++      synchronizer->detach();
++    }
++  }
++
++  bool recover_event(Stream stream) noexcept override {
++    auto event = events.find(stream.index);
++    return event == events.end() || event->second.recover_terminal_failure();
++  }
++
++  bool side_effects_terminal() const noexcept override {
++    for (const auto& [_, event] : events) {
++      if (!event.side_effects_terminal()) {
++        return false;
++      }
++    }
++    for (const auto& [_, fence] : fences) {
++      if (!fence.side_effects_terminal()) {
++        return false;
++      }
++    }
++    return true;
++  }
++
++  bool side_effects_terminal(Stream stream) const noexcept override {
++    auto event = events.find(stream.index);
++    auto fence = fences.find(stream.index);
++    return (event == events.end() || event->second.side_effects_terminal()) &&
++        (fence == fences.end() || fence->second.side_effects_terminal());
++  }
++
++  bool side_effects_failed() const noexcept override {
++    for (const auto& [_, event] : events) {
++      if (event.side_effects_failed()) {
++        return true;
++      }
++    }
++    for (const auto& [_, fence] : fences) {
++      if (fence.side_effects_failed()) {
++        return true;
++      }
++    }
++    return false;
++  }
++
++  void progress_side_effects() noexcept override {
++    for (auto& [_, event] : events) {
++      event.progress_side_effects();
++    }
++    for (auto& [_, fence] : fences) {
++      fence.progress_side_effects();
++    }
++  }
++};
++} // namespace
++
+ array eval_impl(
+     std::vector<array> outputs,
+     bool async,
+     DeviceTimer* timer = nullptr) {
+-  std::deque<array> tape;
++  submission::progress_records();
++  submission::retire_records();
++  auto prepared_recovery = std::make_unique<EvalSubmissionRecord>();
++  prepared_recovery->enter();
++  auto* recovery = prepared_recovery.release();
++  try {
++  auto& tape = recovery->tape;
+ 
+   // Make an effort to choose a good output stream
+   Stream stream = default_stream(default_device());
+@@ -99,14 +185,15 @@ array eval_impl(
+   // Map of array id that needs fence and stream it's computed on
+   std::unordered_map<uintptr_t, std::pair<uint32_t, bool>> needs_fence;
+ 
+-  auto synchronizer = array(
+-      {}, bool_, std::make_shared<Synchronizer>(stream), std::move(outputs));
++  recovery->synchronizer.emplace(
++      Shape{}, bool_, std::make_shared<Synchronizer>(stream), std::move(outputs));
++  auto& synchronizer = *recovery->synchronizer;
+ 
+   // Stream fences for inter-stream synchronization
+-  std::unordered_map<uint32_t, Fence> fences;
++  auto& fences = recovery->fences;
+ 
+   // Stream events for synchronization after eval
+-  std::unordered_map<uint32_t, Event> events;
++  auto& events = recovery->events;
+   {
+     auto e = Event{stream};
+     e.set_value(1);
+@@ -231,14 +318,27 @@ array eval_impl(
+     }
+   }
+ 
+-  if (timer) {
+-    timer->start();
++  // Reserve all receipts and primitive owners before the first native task.
++  // Array copies alone would not retain primitive resources after detach().
++  recovery->primitive_owners.reserve(tape.size());
++  size_t output_count = 0;
++  for (const auto& arr : tape) {
++    recovery->prepare_stream(arr.primitive().stream());
++    recovery->primitive_owners.push_back(arr.primitive_ptr());
++    output_count += 1 + arr.siblings().size();
+   }
++  recovery->reserve_outputs(output_count);
+ 
+   std::set<Stream> open_streams;
++  if (timer) {
++    recovery->prepare_stream(timer->stream());
++    open_streams.insert(timer->stream());
++    timer->start();
++  }
+   while (!tape.empty()) {
+-    auto arr = std::move(tape.back());
++    recovery->current.emplace(std::move(tape.back()));
+     tape.pop_back();
++    auto& arr = *recovery->current;
+ 
+     auto stream = arr.primitive().stream();
+     open_streams.insert(stream);
+@@ -272,11 +372,17 @@ array eval_impl(
+       }
+     }
+ 
++    recovery->begin_primitive();
+     if (arr.primitive().device() == Device::gpu) {
+       gpu::eval(arr);
+     } else {
+       cpu::eval(arr);
+     }
++    recovery->retain_output(arr.data_shared_ptr());
++    for (const auto& sibling : arr.siblings()) {
++      recovery->retain_output(sibling.data_shared_ptr());
++    }
++    recovery->end_primitive();
+ 
+     if (scheduler::n_active_tasks() > MAX_ACTIVE_TASKS ||
+         (get_active_memory() > get_memory_limit() &&
+@@ -287,10 +393,10 @@ array eval_impl(
+           gpu::finalize(s);
+         }
+       }
+-      scheduler::wait_for_one();
++      recovery->wait_for_progress();
+       while (get_active_memory() > get_memory_limit() &&
+              scheduler::n_active_tasks() > 0) {
+-        scheduler::wait_for_one();
++        recovery->wait_for_progress();
+       }
+     }
+ 
+@@ -333,7 +439,15 @@ array eval_impl(
+     }
+   }
+ 
++  recovery->release_success_outputs();
++  recovery->finish(false);
+   return synchronizer;
++  } catch (...) {
++    // The current popped array and temporary data remain owned here; no
++    // retry-evaluation, waiting, allocation or resource destruction on error.
++    recovery->failed_record = true;
++    recovery->finish(true);
++    throw;
++  }
+ }
+ 
+ void async_eval(std::vector<array> outputs) {
+@@ -413,6 +527,8 @@ void Completion::wait() const {
+   if (event_) {
+     event_->wait();
+   }
++  submission::progress_records();
++  submission::retire_records();
+ }
+ 
+ void Completion::wait(Stream stream) const {
+@@ -427,11 +543,38 @@ void Completion::wait(Stream stream) const {
+             << ".";
+     throw std::invalid_argument(message.str());
+   }
+-  event_->wait(stream);
++  struct WaitRecord : submission::Record {
++    explicit WaitRecord(const Event& value) : owner(value) {}
++    Event owner;
++    bool side_effects_terminal() const noexcept override {
++      return owner.side_effects_terminal();
++    }
++    bool side_effects_failed() const noexcept override {
++      return owner.side_effects_failed();
++    }
++    void progress_side_effects() noexcept override {
++      owner.progress_side_effects();
++    }
++  };
++  auto prepared = std::make_unique<WaitRecord>(*event_);
++  prepared->enter();
++  auto* recovery = prepared.release();
++  try {
++    recovery->prepare_stream(stream);
++    recovery->owner.wait(stream);
++    recovery->finish(false);
++  } catch (...) {
++    recovery->finish(true);
++    throw;
++  }
+ }
+ 
+ bool Completion::is_complete() const {
+-  return !event_ || event_->is_signaled();
++  auto complete = !event_ || event_->is_signaled();
++  if (complete) {
++    submission::progress_records();
++  }
++  return complete;
+ }
+ 
+ double Completion::elapsed_seconds() const {
+@@ -491,10 +634,14 @@ void eval(std::vector<array> outputs) {
+     for (auto& x : outputs) {
+       x.wait();
+     }
++    submission::progress_records();
++    submission::retire_records();
+     return;
+   }
+ 
+   eval_impl(std::move(outputs), false).wait();
++  submission::progress_records();
++  submission::retire_records();
+ }
+ 
+ std::pair<std::vector<array>, std::vector<array>> vjp(

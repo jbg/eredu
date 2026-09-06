@@ -346,7 +346,15 @@ construction; later code does not repeat those checks from family
 configuration or caller options.
 
 The runtime-owned `NormalizedLoadRequest` is the single portable cold-load
-policy. Its checked parallel subrequest atomically binds rank topology, wire,
+policy. `NormalizedLoadRequest::from_execution_plan` derives transformation,
+ordinary and independent-bank residency, exact reader-cache limits, session
+requirements, and drafting intent from one portable `ExecutionPlan`. Invalid
+plan structure and policy produce structured portable errors before backend
+capability selection or native work. Distributed plans supply one complete
+parallel request whose topology must equal the plan. Diagnostics choices
+request backend/process memory observations without invoking those mechanisms
+during normalization. Reader-cache limits remain exact even for resident loads.
+Its checked parallel subrequest atomically binds rank topology, wire,
 positive invocation limits, and bounded completion; drafting capacity is also
 positive by construction. A concrete adapter may pair that request with a
 native resource token, but cannot add a second policy representation. The MLX
@@ -382,11 +390,89 @@ Backend adapters add only their name, static hardware context, and native
 diagnostics; inspection itself opens no payload and creates no native resource.
 
 Moshi realtime selection likewise derives shared policy from
-`NormalizedLoadRequest`. Its neutral prepared-source handoff contains the exact
+`NormalizedLoadRequest`. Runtime's `synthesize_realtime_capabilities` enumerates
+every execution alternative, stably deduplicates exact lowering capabilities,
+and shares state-component traversal with replicated-text synthesis. MLX and the
+independent realtime backend report only collection-independent facility facts
+and per-descriptor lowering and placement support; neither capability provider
+walks architecture requirement collections. Its neutral prepared-source handoff contains the exact
 source, content identity under the architecture-selected domain, retained
 resolution and metadata validation, selected topology and architecture, and a
 consistent lowering summary. MLX receives that completed handoff and adds only
 groups, streams, caches, arrays, random state, completion, and final erasure.
+`MlxPreparedRealtimeExecution` privately pairs that handoff with the exact
+native rank/device token validated during cold selection. Realtime
+materialization consumes this pair without accepting replacement load options;
+it validates the retained device against the execution stream before payload
+binding or construction. `MlxLoadRequest` holds one `NormalizedLoadRequest`
+and optional native device assignment, not an independently mutable portable
+mirror. Backend-author callers build portable policy directly on the normalized
+request and wrap it once; the MLX adapter exposes only native pairing operations.
+Prepared MLX models retain their actual native device and, for distributed
+execution, the selected world handle. Session publication and every
+backend-taking session operation validate this retained target before input
+conversion, mutation, or submission. Device labels and equal rank/size values
+are not identity proofs; another stream on the same device remains valid.
+Realtime state creation and frame submission apply the same retained-context
+check, and direct execution rejects a stream on a different device. Realtime
+selection rejects explicitly requested prompt-cache persistence or drafting
+when the realtime architecture cannot honor them; explicit observation
+capabilities require matching state-retention support even without named
+observation requests.
+Core retains exact capability admission throughout a `ModelRuntime` lifetime
+and rechecks it before generic submission, observation, or inspection. Exposing
+an unrestricted mutable backend session invalidates its execution-plan target
+proof, since callers can replace that session. Drafting selected for the old
+target cannot attach after such access. Native MLX C event and transfer producers
+reserve output wrappers before submission, so publishing a successful producer
+result needs no new wrapper allocation. Native submission recovery separately
+records accepted CPU tasks and GPU command-buffer work before publication can
+fail. A preallocated owner retains graph, primitive, temporary-buffer, stream,
+and callback state until every accepted frontier is terminal. An error is not
+terminal evidence, and evaluation is never retried as a cleanup operation.
+Backend submission scopes retain application resources and session authority
+across returned errors, discarded errors, and unwinding. Recovery neither
+terminates the process nor waits for native work in destructors. Unobservable
+work stays owned and its affected execution resources remain unavailable.
+Terminal proof and reclamation are distinct: bounded native scope progress
+publishes completion without destroying arbitrary primitive or group owners.
+Ordinary owner-thread native operations reclaim terminal records outside the
+registry lock; a departed owner thread cannot be replaced by a recycled thread
+identifier. Rust recovery tries the runtime lock without waiting and retains
+the node if it is busy. Events belong to the retained bundle, and terminal
+handle destruction runs with housekeeping suppressed. Independent consumer
+waits and host observations each have their own ticket; readiness requires all
+such tickets to settle, not merely the original producer's completion.
+Checkpoint materialization, quantization tiles, residency transfers, and bounded
+execution units retain their own submission owners. Aborting a layerwise forward
+does not drain events or whole streams. Terminal module, session, checkpoint,
+and manager-lease owners are staged for ordinary unlocked reclamation, since
+their destructors may acquire host locks or execute application code. Dense
+forward cleanup is deferred from abort to an ordinary entry or owner reclamation.
+Selected model materialization also reclaims an already-retired snapshot before
+allocating the next model, so completed previous-session weights need not remain
+alive until replacement session publication. Newly staged recursive owners wait
+for a later ordinary entry; this is not a drain of unresolved native work.
+Each completion poll keeps one nonblocking runtime guard across its native
+observations. Arbitrary application resources retained by neural submissions
+are staged separately after every native/consumer owner releases them: their
+destructors do not run from polling, recovery Drop, or TLS teardown. The next
+unlocked ordinary neural submission reclaims them, or callers explicitly use
+`MlxNeuralBackend::reclaim_retired_resources`. This step may block in a caller's
+destructor and is skipped under the runtime lock, during unwinding, and during
+recursive reclamation. If no eligible reclamation occurs before owner-thread
+exit, those resources remain retained.
+If an application destructor panics during explicit reclamation, the remaining
+detached resources are retained instead of invoking more destructors while
+unwinding.
+MLX prefetch, cache-I/O, and host-demotion worker handles request shutdown
+without joining from recovery or teardown. Each worker owns its active inputs
+until that operation returns. Prefetch and cache-I/O workers cancel queued work
+and release its admission slots; the host-demotion worker drains queued inputs
+after its sender disconnects. Portable worker APIs retain deterministic joining by default and
+expose nonjoining shutdown as an explicit option. Final cache-state reclamation
+removes its ephemeral files. Disk commits hold a weak state reference to avoid
+ownership cycles and remove late ephemeral outputs when that state is gone.
 Replicated routed text has its own architecture-owned requirements
 and selected realization layered over the shared replicated-text contract.
 Replicated composite text adds selected processor and ingress requirements to
@@ -415,6 +501,9 @@ output, recipe and companions, source encoding, executable format, and selected
 lowering. These tasks are the only source, recipe, format, and lowering choices
 consumed by module construction and materialization; no backend collapses them
 into a model-wide transform or rediscovers policy from parameter names.
+The exact-task binder applies retained logical placement before validating
+rank-local destination geometry. Task-declared locally transformed outputs
+are already placed and are not sharded again.
 Packed lowering supports only the final logical matrix axis; any
 other declared packed axis is rejected during selection. Companion bindings
 are format-exact: affine formats retain scale and affine bias, while MXFP4
@@ -1111,8 +1200,9 @@ that deadline expires instead of polling forever. A backend completion must
 then either finish native cancellation or transfer the completion and every
 live retained resource to a quarantine owner; only exact completion permits
 observation, cache commit, or publication. MLX uses a thread-affine quarantine
-because its events do not expose native cancellation, and drains outstanding
-owners safely at exact completion or thread-runtime teardown.
+because its events do not expose native cancellation. Terminal native evidence
+permits reclamation; thread-runtime teardown does not wait and permanently
+retains any owner for which that evidence is still unavailable.
 
 An admitted artifact with embedded prediction is split before partitioned
 construction into an ordinary target projection and a typed prediction
@@ -1525,10 +1615,13 @@ The MLX completion mechanism retains native input, output, diagnostics, history,
 state, checkpoint stores, streams, and collective ownership. Runtime
 prepublication waits for that exact completion and validates native token
 scopes before host observation; only then may the scheduler publish the branch
-and its portable output. Failed event creation synchronously drains retained
-roots before returning, while delayed or failed completion remains quarantined
-and cannot expose host output. These completion rules are mechanism-specific;
-the commit and visibility rules remain backend-neutral.
+and its portable output. Delayed or failed returned completions remain
+quarantined and cannot expose host output. A scheduling failure before event
+publication carries a recovery completion when work is unresolved. An outer
+scope covers input materialization, traversal, sampling, and frame assembly;
+it retains the entire native execution payload if any accepted work remains.
+An unresolved or failed execution cannot be reused. These ownership rules are
+mechanism-specific; commit and visibility rules remain backend-neutral.
 
 Distributed realtime turns use the same neutral scheduler transaction. Before
 submission, bounded consensus compares the topology-wide selected model
@@ -1587,6 +1680,14 @@ failing on the first affected forward pass. Concrete backends must keep that
 declaration aligned with both their `NeuralBackend` and `Tensor`
 implementations.
 
+`eredu-nn` owns tensor-independent normalization and causal-mask geometry
+validation. Backends validate final-axis dimensions, epsilon, grouped gates and
+divisibility, and checked sequence/offset/lookback ranges before tensor work.
+Causal masks interpret lookback as an inclusive maximum past distance;
+sliding-window attention uses its separately specified token-count window.
+MLX and scalar reference mechanisms consume the shared geometry while retaining
+their own dtype, layout, reduction, and kernel implementations.
+
 A backend owns runtime-specific resources and computation:
 
 - tensors, neural operators, queues or streams, random state, and sampling math;
@@ -1629,10 +1730,35 @@ Artifact loading has four stages:
    quantization, residency, state, and session policy. Materialization options
    must reproduce the selected values rather than supplying a merely
    equivalent class of request.
-4. The selected backend adapter realizes native mechanisms from the plan. For
-   replicated text it passes those mechanisms to the neutral session
-   constructor and erases the completed typed session at the outer boundary;
-   other execution classes retain their dedicated neutral contracts.
+4. The selected backend adapter realizes native mechanisms from the plan and
+   passes its exact prepared-source bundle to `construct_prepared_execution`.
+   Architecture-owned sealed routes invoke the appropriate typed construction
+   contract. The backend erases the completed typed session at the outer boundary.
+
+`ReplicatedTextMechanismSupport` reports backend facts and answers support for
+one exact lowering candidate or state component. Runtime capability synthesis
+enumerates primary and auxiliary requirements, validates portable geometry,
+deduplicates lowering candidates and selects exact state placements. Both
+native and independent scalar adapters use this same synthesizer; no provider
+needs to reconstruct requirement enumeration or policy from family identity.
+
+The total construction driver consumes `PreparedModelSources` and owns ordinary
+versus partitioned communication consistency, target/extension agreement,
+prediction preparation, the floating-state source, and processor preparation.
+Native communication is checked against the exact retained manifest before
+typed construction. `PreparedExecutionRoutes` contains only supplied native
+visitors and contexts; optional routes impose no bounds on absent capabilities.
+`KeyValueRoute` supports ordinary attention using the base neural and cache
+traits, without requiring blockwise, grouped, distributed or prediction traits.
+Complete profile dispatch uses an explicit `ReplicatedTextStateProfiles` set
+and `SharedReplicatedTextVisitor`, retaining profile-specific static bounds and
+the original visitor's construction-start notification.
+
+`PreparedExecutableAssembler` receives an executable only after typed
+construction succeeds, together with the exact selected state policy,
+capabilities, physical floating-state width, prepared processor, and retained
+native communication. MLX wraps these values; it does not repeat processor
+selection, extension pairing, or the six-class dispatch.
 
 Concrete backend preflight reports mechanisms rather than family support or a
 parallel execution-class table. Architecture dispatch is authoritative for
@@ -1747,6 +1873,11 @@ normalizes embedded depth to zero and capability reporting does not expose it.
 Automatic bounded-residency sizing is likewise a cold operation. It performs
 the same exact neutral selection used by loading and computes executable bytes
 and the largest unit window solely from the selected materialization tasks. It
+uses `eredu-runtime::selected_text_bounded_requirement`, including checked
+byte/count arithmetic and sparse group-local window accounting. Neutral
+residency telemetry is projected in runtime; speculative statistics and common
+host observations are projected in core. Accelerator and allocator observations
+remain backend mechanisms. The sizing path
 does not realize a device or stream, open payload data, construct an
 architecture, or provoke a failed native load to discover the requirement.
 Automatic planning retains that single admitted artifact inspection through
@@ -1780,6 +1911,23 @@ completion-only failure. The public session admits no newer state-changing
 submission while its prior completion remains unresolved; generation-tagged
 completion ownership prevents an older resolved handle from releasing a newer
 submission's gate.
+
+`SessionAuthority` and its move-only `SubmissionLease` own this exclusion in
+`eredu-core`. Every state mutation checks idle authority before native work.
+Native completions retain the lease and their exact resources; ready resolution,
+terminal failure, or safe teardown releases only that ticket. Pending or
+unresolved observation errors cannot release newer work. Atomic ticket matching
+makes repeated and stale releases harmless, and ticket exhaustion is a typed
+error. MLX retains one shared executable owner and an independent ticket for
+each native scope; one completed child cannot release another unresolved child.
+Failure remains a session poison even after its resources become reclaimable.
+The neutral runtime supplies fresh successful state-restoration evidence for
+recoverable errors. Only that evidence combined with an independently settled,
+healthy native scope permits retry; unknown host errors and unwinds do not.
+`SessionAdmission` compares complete admitted and realized capability
+reports before publication, rather than accepting a subset or assuming universal
+backend facilities. Sampled-token completion and model validation both finish
+before a text submission releases its authority.
 
 The backend is selected for the entire model/session. Per-operation backend
 selection would make cache ownership ambiguous and introduce implicit data
@@ -2375,11 +2523,13 @@ blocking runtime lock, retains arrays, count storage, groups, routes, and
 streams, and defers the host boolean read until that event completes. Because
 upstream MLX exposes no event abort, timed-out work is retained in a
 thread-affine quarantine and its native communicator cannot be realized again
-until a later safe reap observes completion. If the originating thread exits
-first, that thread waits for exact completion (or a terminal asynchronous
-error) and deterministically releases the retained arrays, count storage,
-groups, routes, streams, and event; quarantine ownership is never leaked or
-transferred across threads. Complete all-rank manifest consensus also precedes
+until a later safe reap observes terminal native evidence. Failed submissions
+also retain these resources when no public event was returned. If the
+originating thread exits first, teardown does not block: unresolved arrays,
+count storage, groups, routes, streams, and native execution owners remain
+retained permanently. This bounded-teardown policy can retain memory after an
+unrecoverable device failure; it never converts a missing completion proof
+into process termination or unsafe destruction. Complete all-rank manifest consensus also precedes
 every rank-local MLX capability, quarantine, and world-identity check, so a
 corrupt projection produces the same shared setup failure before subgroup or
 payload realization. Because the serialized completion policy is itself part
@@ -2434,10 +2584,10 @@ timeout disposition: orphaned MLX work retains every native dependency and
 fences the same native world. Quarantine registers an idempotent thread-local
 runtime housekeeping callback, so any later same-thread MLX entry observes and
 releases exactly completed work even when no communication operation performs
-an explicit reap. If the owning thread exits first, it synchronizes each live
-event itself and releases the retained resources only after completion (or a
-terminal asynchronous error); thread-affine work is neither leaked nor
-transferred to a reaper thread.
+an explicit reap. Owner-thread teardown makes only a nonblocking retirement
+attempt. If terminal evidence or runtime access is unavailable, its retained
+resources remain owned permanently; thread-affine work is not transferred to a
+reaper thread. An asynchronous error alone never authorizes reclamation.
 
 `DistributedSession` is an optional capability of the selected model session.
 It exposes high-level sum, gather, variable-count exchange, point-to-point, and

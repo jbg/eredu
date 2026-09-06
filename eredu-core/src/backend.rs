@@ -1095,13 +1095,15 @@ pub type SessionSubmission<B> = Submission<
 /// A prepared model, its selected backend, and its backend-owned session.
 ///
 /// This is the canonical client-side execution owner. Keeping the backend and
-/// session together makes backend selection a whole-model decision and makes
-/// it impossible to submit a session through a different backend instance.
+/// session together makes backend selection a whole-model decision: generic
+/// operations always supply this retained backend. Backend session hooks still
+/// validate native identity when unrestricted session mutation is exposed.
 /// Backend-owned executable, cache, tensor, and completion types remain
 /// associated types and never enter the portable API.
 pub struct ModelRuntime<B: BackendProvider> {
     backend: B,
     session: B::Session,
+    admission: crate::SessionAdmission,
     execution_plan_target_id: Option<u64>,
 }
 
@@ -1137,12 +1139,16 @@ impl<B: BackendProvider> ModelRuntime<B> {
         let admitted = model.capabilities();
         let session = backend.create_session(model)?;
         let realized = session.capabilities();
-        if admitted != realized {
+        if crate::SessionAdmission::new(admitted)
+            .validate(realized)
+            .is_err()
+        {
             return Err(backend.session_capability_mismatch(admitted, realized));
         }
         Ok(Self {
             backend,
             session,
+            admission: crate::SessionAdmission::new(admitted),
             execution_plan_target_id,
         })
     }
@@ -1162,13 +1168,31 @@ impl<B: BackendProvider> ModelRuntime<B> {
     }
 
     /// Returns the backend-owned session for optional backend capabilities.
+    ///
+    /// Unrestricted mutation can replace the session, so this invalidates any
+    /// retained execution-plan target proof. Previously selected drafting can
+    /// no longer attach to this runtime. Generic operations still enforce the
+    /// original exact capability admission after mutation.
     pub fn session_mut(&mut self) -> &mut B::Session {
+        self.execution_plan_target_id = None;
         &mut self.session
     }
 
     /// Borrows the selected backend and its mutable session together.
+    ///
+    /// Like [`Self::session_mut`], this invalidates retained drafting target proof.
     pub fn parts_mut(&mut self) -> (&B, &mut B::Session) {
+        self.execution_plan_target_id = None;
         (&self.backend, &mut self.session)
+    }
+
+    fn validate_session_admission(&self) -> Result<(), B::Error> {
+        self.admission
+            .validate(self.session.capabilities())
+            .map_err(|error| {
+                self.backend
+                    .session_capability_mismatch(error.admitted(), error.realized())
+            })
     }
 
     /// Reports capabilities of the exact prepared model session.
@@ -1181,6 +1205,7 @@ impl<B: BackendProvider> ModelRuntime<B> {
         &mut self,
         input: <B::Session as BackendSession<B>>::PrefillInput,
     ) -> Result<SessionSubmission<B>, B::Error> {
+        self.validate_session_admission()?;
         self.session.prefill(&self.backend, input)
     }
 
@@ -1189,6 +1214,7 @@ impl<B: BackendProvider> ModelRuntime<B> {
         &mut self,
         input: <B::Session as BackendSession<B>>::DecodeInput,
     ) -> Result<SessionSubmission<B>, B::Error> {
+        self.validate_session_admission()?;
         self.session.decode(&self.backend, input)
     }
 
@@ -1197,6 +1223,7 @@ impl<B: BackendProvider> ModelRuntime<B> {
         &self,
         output: &<B::Session as BackendSession<B>>::Output,
     ) -> Result<ObservationSet, B::Error> {
+        self.validate_session_admission()?;
         self.session.observe_output(&self.backend, output)
     }
 }
@@ -1212,6 +1239,7 @@ where
         input: <B::Session as BackendSession<B>>::PrefillInput,
         request: &ObservationRequest,
     ) -> Result<InspectedOutput<<B::Session as BackendSession<B>>::Output>, B::Error> {
+        self.validate_session_admission()?;
         self.session.inspect_prefill(&self.backend, input, request)
     }
 
@@ -1221,6 +1249,7 @@ where
         input: <B::Session as BackendSession<B>>::DecodeInput,
         request: &ObservationRequest,
     ) -> Result<InspectedOutput<<B::Session as BackendSession<B>>::Output>, B::Error> {
+        self.validate_session_admission()?;
         self.session.inspect_decode(&self.backend, input, request)
     }
 }

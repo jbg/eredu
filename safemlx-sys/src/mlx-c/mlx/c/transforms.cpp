@@ -21,10 +21,9 @@ extern "C" int mlx_async_eval_with_event(
     mlx_event* event,
     const mlx_vector_array outputs) {
   try {
-    mlx_event_set_(
-        *event,
-        mlx::core::async_eval_with_completion(
-            mlx_vector_array_get_(outputs)));
+    mlx_event_preparation_ destination(*event);
+    destination.publish(mlx::core::async_eval_with_completion(
+        mlx_vector_array_get_(outputs)));
   } catch (std::exception& e) {
     mlx_error(e.what());
     return 1;
@@ -36,10 +35,9 @@ extern "C" int mlx_async_eval_timed(
     const mlx_vector_array outputs,
     const mlx_stream stream) {
   try {
-    mlx_event_set_(
-        *event,
-        mlx::core::async_eval_with_timing(
-            mlx_vector_array_get_(outputs), mlx_stream_get_(stream)));
+    mlx_event_preparation_ destination(*event);
+    destination.publish(mlx::core::async_eval_with_timing(
+        mlx_vector_array_get_(outputs), mlx_stream_get_(stream)));
   } catch (std::exception& e) {
     mlx_error(e.what());
     return 1;

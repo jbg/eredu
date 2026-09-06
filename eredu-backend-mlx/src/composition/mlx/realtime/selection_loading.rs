@@ -1,5 +1,21 @@
 use super::*;
 
+/// Exact cold realtime preparation inseparably paired with its native target.
+///
+/// Only cold selection constructs this value. Materialization accepts no new
+/// load request, so a caller cannot replace the admitted rank/device binding.
+///
+/// ```compile_fail
+/// use eredu_backend_mlx::native::MlxPreparedRealtimeExecution;
+/// fn discard_selected_target(mut prepared: MlxPreparedRealtimeExecution) {
+///     prepared.rank_context = None;
+/// }
+/// ```
+pub struct MlxPreparedRealtimeExecution {
+    source: PreparedMoshiRealtimeSource,
+    rank_context: Option<crate::backend::MlxRankContext>,
+}
+
 /// MLX stream and collective mechanisms for neutral realtime execution.
 pub struct MlxRealtimeExecutionContext {
     stream: Stream,
@@ -46,20 +62,17 @@ impl MlxRealtimeExecutionContext {
         preparation: RealtimePreparationPlan,
         options: &MlxLoadRequest,
         collectives_supported: bool,
-    ) -> Result<PreparedMoshiRealtimeSource, Error> {
+    ) -> Result<MlxPreparedRealtimeExecution, Error> {
         select_realtime_model(preparation, options, collectives_supported)
     }
 
     /// Materializes an already selected architecture through MLX mechanisms.
     pub fn materialize_realtime_execution(
         &self,
-        selected: PreparedMoshiRealtimeSource,
-        options: MlxLoadRequest,
+        selected: MlxPreparedRealtimeExecution,
     ) -> Result<MoshiRealtimeExecution<MlxRealtimeExecution>, Error> {
-        validate_realtime_session_requirements(&options)?;
         materialize_realtime_model(
             selected,
-            options,
             self.world_group.clone(),
             &self.stream,
             &self.weights_stream,
@@ -71,6 +84,9 @@ impl MlxRealtimeExecutionContext {
         &self,
         model: &MoshiRealtimeExecution<MlxRealtimeExecution>,
     ) -> Result<MlxKeyValueState, Error> {
+        model
+            .executor()
+            .validate_context(&self.stream, self.world_group.as_deref())?;
         model.executor().new_realtime_state()
     }
 
@@ -91,6 +107,9 @@ impl MlxRealtimeExecutionContext {
         frame: &RealtimeInputFrame,
         branch: &mut MlxFrameSessionBranch,
     ) -> Result<MlxPrepublicationFrame, Error> {
+        model
+            .executor()
+            .validate_context(&self.stream, self.world_group.as_deref())?;
         submit_scheduled_realtime_frame(model, branch, frame, &self.stream)
     }
 }
@@ -99,41 +118,30 @@ pub(super) const fn realtime_session_capabilities() -> eredu_core::SessionCapabi
     eredu_core::SessionCapabilities::new(true, true, false)
 }
 
-pub(super) fn validate_realtime_session_requirements(
-    options: &MlxLoadRequest,
-) -> Result<(), Error> {
-    options
-        .required_session_capabilities()
-        .validate(&realtime_session_capabilities())?;
-    Ok(())
-}
-
 fn materialize_realtime_model(
-    selected: PreparedMoshiRealtimeSource,
-    options: MlxLoadRequest,
+    selected: MlxPreparedRealtimeExecution,
     world: Option<Arc<Group>>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<MoshiRealtimeExecution<MlxRealtimeExecution>, Error> {
-    if !selected.selected().selected().topology().is_replicated() {
-        options
-            .parallel_rank_context()?
-            .ok_or_else(|| {
-                Error::Parallel("parallel realtime execution has no MLX rank/device context".into())
-            })?
-            .validate_execution_stream(stream)?;
+    let MlxPreparedRealtimeExecution {
+        source,
+        rank_context,
+    } = selected;
+    if let Some(rank) = rank_context {
+        rank.validate_execution_stream(stream)?;
     }
-    neutral_moshi::materialize_selected(selected, world, stream, weights_stream)
+    neutral_moshi::materialize_selected(source, world, stream, weights_stream)
 }
 
 fn select_realtime_model(
     preparation: RealtimePreparationPlan,
     options: &MlxLoadRequest,
     collectives_supported: bool,
-) -> Result<PreparedMoshiRealtimeSource, Error> {
-    validate_realtime_session_requirements(options)?;
+) -> Result<MlxPreparedRealtimeExecution, Error> {
+    let (normalized, rank_context) = options.checked_normalized()?;
     let request = moshi_realtime_request_from_normalized(
-        options.checked_normalized()?.0,
+        normalized,
         RealtimeObservationRequirements::new(true, []),
     )
     .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
@@ -142,63 +150,76 @@ fn select_realtime_model(
     let capabilities = mlx_realtime_capabilities(inspected.requirements(), collectives_supported);
     let selected = select_inspected_moshi_realtime(inspected, &capabilities)
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    prepare_selected_moshi_realtime_source(selected)
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))
+    let source = prepare_selected_moshi_realtime_source(selected)
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    Ok(MlxPreparedRealtimeExecution {
+        source,
+        rank_context,
+    })
 }
 
 fn mlx_realtime_capabilities(
     requirements: &RealtimeArchitectureRequirements,
     collectives_supported: bool,
 ) -> RealtimeMechanismCapabilities {
-    let state =
-        StateMechanismCapabilities::new((0..requirements.state_layout().len()).flat_map(|layer| {
-            requirements
-                .state_layout()
-                .components(layer)
-                .expect("validated state layout exposes every layer")
-                .iter()
-                .filter(mlx_supports_realtime_state_component)
-                .cloned()
-                .map(move |component| {
-                    StateComponentMechanism::new(
-                        layer,
-                        component,
-                        Some(StateComponentPlacement::Device),
-                        None,
-                    )
-                })
-                .collect::<Vec<_>>()
-        }))
-        .with_transactions(true, true)
-        .with_reset(true)
-        .with_observation_retention(true);
-    let lowerings = requirements
-        .executions()
-        .iter()
-        .flat_map(|execution| execution.weight_lowerings())
-        .filter(|lowering| mlx_supports_realtime_lowering(lowering.descriptor(), lowering.kind()))
-        .map(|lowering| {
-            WeightLoweringCapability::new(lowering.descriptor().clone(), lowering.kind())
-        })
-        .collect();
-    let mechanisms = mlx_realtime_mechanisms(collectives_supported);
-    RealtimeMechanismCapabilities::new(
-        eredu_nn::NeuralOperatorCapabilities::NONE,
-        mechanisms,
-        [
-            ExecutionResidency::FullyResident,
-            ExecutionResidency::LayerwiseHost,
-            ExecutionResidency::DenseDiskStream,
-        ],
-        lowerings,
-        state,
-        NonZeroUsize::new(usize::MAX).expect("usize maximum is positive"),
-        CommunicationCompletionCapabilities::new([
-            CompletionCancellationMode::QuarantineUntilComplete,
-        ])
-        .expect("MLX quarantine completion capability is valid"),
-        SessionCapabilities::new(true, true, false),
+    eredu_runtime::synthesize_realtime_capabilities(
+        requirements,
+        &MlxRealtimeSupport {
+            collectives_supported,
+        },
     )
+}
+
+struct MlxRealtimeSupport {
+    collectives_supported: bool,
+}
+
+impl eredu_runtime::RealtimeMechanismSupport for MlxRealtimeSupport {
+    fn facts(&self) -> eredu_runtime::RealtimeMechanismFacts {
+        eredu_runtime::RealtimeMechanismFacts::new(
+            eredu_nn::NeuralOperatorCapabilities::NONE,
+            mlx_realtime_mechanisms(self.collectives_supported),
+            [
+                ExecutionResidency::FullyResident,
+                ExecutionResidency::LayerwiseHost,
+                ExecutionResidency::DenseDiskStream,
+            ],
+            NonZeroUsize::new(usize::MAX).expect("usize maximum is positive"),
+            CommunicationCompletionCapabilities::new([
+                CompletionCancellationMode::QuarantineUntilComplete,
+            ])
+            .expect("MLX quarantine completion capability is valid"),
+            SessionCapabilities::new(true, true, false),
+        )
+        .with_state_lifecycle(
+            eredu_runtime::StateLifecycleCapabilities::new()
+                .with_transactions(true, true)
+                .with_reset(true)
+                .with_observation_retention(true),
+        )
+    }
+
+    fn supports_lowering(
+        &self,
+        descriptor: &eredu_runtime::WeightLoweringDescriptor,
+        kind: WeightLoweringKind,
+    ) -> bool {
+        mlx_supports_realtime_lowering(descriptor, kind)
+    }
+
+    fn state_component_placements(
+        &self,
+        component: &StateComponentPolicy,
+    ) -> (
+        Option<StateComponentPlacement>,
+        Option<StateComponentPlacement>,
+    ) {
+        (
+            mlx_supports_realtime_state_component(component)
+                .then_some(StateComponentPlacement::Device),
+            None,
+        )
+    }
 }
 
 pub(super) fn mlx_realtime_mechanisms(collectives_supported: bool) -> Vec<RealtimeMechanism> {
@@ -222,7 +243,7 @@ pub(super) fn mlx_realtime_mechanisms(collectives_supported: bool) -> Vec<Realti
     mechanisms
 }
 
-fn mlx_supports_realtime_state_component(component: &&StateComponentPolicy) -> bool {
+fn mlx_supports_realtime_state_component(component: &StateComponentPolicy) -> bool {
     matches!(
         component.role(),
         StateComponentRole::AttentionKeys

@@ -18,6 +18,7 @@ where
     A: LayeredArchitecture<MlxNeuralBackend, S>,
     S: RuntimeState<MlxNeuralBackend>,
     A::StaticModules: Clone,
+    A::Unit: 'static,
     A::Error: std::fmt::Display,
     P: MlxUnitPopulator<A::Unit>,
     I: Fn(&str) -> bool,
@@ -63,6 +64,7 @@ pub fn prepare_layerwise_policy_with_bindings<A, S, P, I, SB, UB>(
 ) -> Result<(MlxLayerwisePolicy<A::Unit, P>, LayerwiseModelMetadata), Error>
 where
     A: LayeredArchitecture<MlxNeuralBackend, S>,
+    A::Unit: 'static,
     S: RuntimeState<MlxNeuralBackend>,
     A::Error: std::fmt::Display,
     P: MlxUnitPopulator<A::Unit>,
@@ -279,6 +281,7 @@ pub fn prepare_layerwise_policy_from_bindings<A, S, P, I>(
 ) -> Result<(MlxLayerwisePolicy<A::Unit, P>, LayerwiseModelMetadata), Error>
 where
     A: LayeredArchitecture<MlxNeuralBackend, S>,
+    A::Unit: 'static,
     S: RuntimeState<MlxNeuralBackend>,
     A::Error: std::fmt::Display,
     P: MlxUnitPopulator<A::Unit>,

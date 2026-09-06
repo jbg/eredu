@@ -10,8 +10,10 @@ fn complete_qwen3_vl_variants_accept_paged_cache() {
         let paged = PagedCacheOptions::new(1, 32768, 32768, 1)
             .unwrap()
             .with_full_attention(true);
-        let request =
-            MlxLoadRequest::default().with_state_residency(CacheResidencyPolicy::Paged(paged));
+        let request = MlxLoadRequest::from_normalized(
+            eredu_runtime::NormalizedLoadRequest::default()
+                .with_state_residency(CacheResidencyPolicy::Paged(paged)),
+        );
         let model = load_model(&backend, checkpoint.path(), request).unwrap();
         assert_eq!(model.effective_model_type(), expected_effective_model_type);
         let runtime = ModelRuntime::from_prepared(backend, model).unwrap();
@@ -668,7 +670,7 @@ fn public_gemma_external_observers_are_causal_exact_and_transactional() {
                         trace: installed,
                         intervention: proposal_intervention,
                     },
-                );
+                ).unwrap();
             },
         );
         (result, publications, trace)

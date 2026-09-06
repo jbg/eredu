@@ -26,14 +26,26 @@ eredu-core / eredu-checkpoint / eredu-nn / eredu-media
 - `eredu-architectures` owns model-family configuration, checkpoint schemas,
   parameter topology, module construction, state geometry, parallel semantic
   plans, processor request policy, cold execution-class selection, prepared
-  source roles, architecture-aware inspection, and embedding/layer/output
-  execution. It may use neutral backend traits, but must not import `safemlx`,
+  source roles, total prepared-execution construction, typed state-profile
+  dispatch, architecture-aware inspection, and embedding/layer/output
+  execution. Backends supply native contexts, typed binding visitors and final
+  executable adapters to that construction driver, not semantic branch logic.
+  It may use neutral backend traits, but must not import `safemlx`,
   `eredu::backend`, or another concrete backend.
-- `eredu-runtime` owns normalized portable load policy and model-independent
-  mechanism selection. `eredu-checkpoint` owns exact prepared source stores,
+- `eredu-runtime` owns execution-plan normalization, portable load policy,
+  selected-task residency sizing, neutral residency telemetry, and
+  model-independent mechanism selection. It synthesizes capabilities from
+  exact single-candidate support predicates and backend mechanism facts.
+  Backends inject diagnostics choices and native observations; they do not
+  repeat portable plan conversion or requirement enumeration.
+  `eredu-checkpoint` owns exact prepared source stores,
   restricted views, cache policy, leases, provenance, and resolution guards.
   Cold selection and inspection consume backend capability facts but never a
   native device, stream, tensor, group, or completion object.
+- `eredu-core` owns exact session-admission comparison and move-only submission
+  authority. Backends retain the neutral lease alongside native completion
+  resources and establish safe completion, terminal failure, or teardown before
+  releasing it. A polling error alone is not a universal completion signal.
 - `eredu-backend-mlx` owns reusable MLX tensors, operators,
   streams, completion objects, materialization, cache storage, transfers, and
   collectives. It also owns MLX family composition, which may bind

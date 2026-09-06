@@ -1,0 +1,686 @@
+diff --git a/mlx/scheduler.h b/mlx/scheduler.h
+index fe82b252..5bf3a79c 100644
+--- a/mlx/scheduler.h
++++ b/mlx/scheduler.h
+@@ -3,8 +3,11 @@
+ #pragma once
+ 
+ #include <atomic>
++#include <cstdint>
++#include <deque>
++#include <exception>
+ #include <future>
+-#include <queue>
++#include <optional>
+ #include <shared_mutex>
+ #include <string>
+ #include <thread>
+@@ -17,14 +20,63 @@
+ 
+ namespace mlx::core::scheduler {
+ 
++struct StreamProgress {
++  uint64_t accepted{0};
++  uint64_t completed{0};
++  bool failed{false};
++};
++
++// Prepared before submission. Scheduler-owned stream state has process lifetime.
++struct CpuStreamToken {
++  const void* state{nullptr};
++};
++
+ struct StreamThread {
++  static_assert(std::atomic<uint64_t>::is_always_lock_free);
++  static constexpr uint64_t blocked_bit = uint64_t{1} << 63;
++  static constexpr uint64_t sequence_mask = blocked_bit - 1;
++
++  struct Task {
++    std::function<void()> body;
++  };
++
+   std::mutex mtx;
+-  std::queue<std::function<void()>> q;
++  std::deque<Task> q;
+   std::condition_variable cond;
+   bool stop;
++  std::atomic<uint64_t> admission{0};
++  std::atomic<uint64_t> completed{0};
++  std::atomic<bool> failed{false};
++  std::atomic<bool> uncaptured_error{false};
++  std::mutex error_mtx;
++  std::exception_ptr first_error;
++  std::shared_ptr<std::string> error_message;
++  std::shared_ptr<std::string> fallback_error;
++  bool error_pending{false};
+   std::thread thread;
+ 
+-  StreamThread() : stop(false), thread(&StreamThread::thread_fn, this) {}
++  StreamThread()
++      : stop(false),
++        fallback_error(std::make_shared<std::string>(
++            "Asynchronous CPU stream work failed; diagnostic unavailable.")),
++        thread(&StreamThread::thread_fn, this) {}
++
++  void record_error(std::exception_ptr error) noexcept {
++    try {
++      std::lock_guard lock(error_mtx);
++      if (!error_pending) {
++        first_error = std::move(error);
++        error_pending = true;
++      }
++    } catch (...) {
++      // The monotonic failure flag remains available even if locking fails.
++      uncaptured_error.store(true, std::memory_order_release);
++    }
++    // Publish failure only after its first diagnostic (or fallback) is ready.
++    failed.store(true, std::memory_order_release);
++  }
++
++  std::shared_ptr<std::string> error(bool consume);
+ 
+   ~StreamThread() {
+     {
+@@ -44,25 +96,63 @@ struct StreamThread {
+         if (q.empty() && stop) {
+           return;
+         }
+-        task = std::move(q.front());
+-        q.pop();
++        task = std::move(q.front().body);
++        q.pop_front();
+       }
+ 
+-      task();
++      try {
++        task();
++      } catch (...) {
++        record_error(std::current_exception());
++      }
++      // Release task captures before publishing its terminal sequence number.
++      task = {};
++      completed.fetch_add(1, std::memory_order_release);
+     }
+   }
+ 
+-  void enqueue(std::function<void()> f) {
++  void enqueue(
++      std::function<void()> f,
++      std::atomic<int>* counted_tasks = nullptr) {
+     {
+       std::lock_guard<std::mutex> lk(mtx);
+-      if (stop) {
++      auto previous = admission.load(std::memory_order_acquire);
++      if (stop || (previous & blocked_bit)) {
+         throw std::runtime_error(
+-            "Cannot enqueue work after stream is stopped.");
++            "Cannot enqueue work after CPU stream is stopped or blocked.");
++      }
++      if ((previous & sequence_mask) == sequence_mask) {
++        throw std::overflow_error("CPU stream submission sequence exhausted.");
++      }
++      q.push_back(Task{std::move(f)});
++      // Blocking and acceptance share one atomic linearization point. A
++      // concurrent block either includes this task in its frontier or rejects
++      // it before the worker can observe it.
++      if (!admission.compare_exchange_strong(
++              previous,
++              previous + 1,
++              std::memory_order_acq_rel,
++              std::memory_order_acquire)) {
++        q.pop_back();
++        throw std::runtime_error("CPU stream blocked during submission.");
++      }
++      if (counted_tasks) {
++        counted_tasks->fetch_add(1, std::memory_order_relaxed);
+       }
+-      q.emplace(std::move(f));
+     }
+     cond.notify_one();
+   }
++
++  StreamProgress progress() const noexcept {
++    return {
++        admission.load(std::memory_order_acquire) & sequence_mask,
++        completed.load(std::memory_order_acquire),
++        failed.load(std::memory_order_acquire)};
++  }
++
++  void block() noexcept {
++    admission.fetch_or(blocked_bit, std::memory_order_acq_rel);
++  }
+ };
+ 
+ class MLX_API Scheduler {
+@@ -76,7 +166,13 @@ class MLX_API Scheduler {
+   Scheduler& operator=(const Scheduler&) = delete;
+   Scheduler& operator=(Scheduler&&) = delete;
+ 
+-  void enqueue(Stream s, std::function<void()> task);
++  void enqueue(
++      Stream s,
++      std::function<void()> task,
++      bool counted = false);
++
++  CpuStreamToken prepare_cpu_stream(Stream s);
++  std::optional<StreamProgress> cpu_stream_progress(Stream s) const noexcept;
+ 
+   std::shared_ptr<std::string> stream_error(const Stream& stream) const;
+ 
+@@ -90,16 +186,19 @@ class MLX_API Scheduler {
+     completion_cv.notify_all();
+   }
+ 
+-  void notify_task_completion(const Stream& stream) {
+-    {
++  void notify_task_completion(const Stream& stream) noexcept {
++    try {
+       std::lock_guard<std::mutex> lk(mtx);
+       n_active_tasks_--;
++    } catch (...) {
++      // Preserve accounting even if acquiring the notification mutex fails.
++      n_active_tasks_--;
+     }
+     completion_cv.notify_all();
+   }
+ 
+   int n_active_tasks() const {
+-    return n_active_tasks_;
++    return n_active_tasks_.load(std::memory_order_relaxed);
+   }
+ 
+   void wait_for_one() {
+@@ -115,21 +214,32 @@ class MLX_API Scheduler {
+  private:
+   friend Stream mlx::core::new_stream(Device d);
+ 
+-  int n_active_tasks_{0};
++  StreamThread* prepare_stream(Stream s);
++
++  std::atomic<int> n_active_tasks_{0};
+   std::unordered_map<int, std::unique_ptr<StreamThread>> threads_;
+-  std::shared_mutex threads_mtx_;
++  mutable std::shared_mutex threads_mtx_;
+   std::condition_variable completion_cv;
+   mutable std::mutex mtx;
+-  std::unordered_map<int, std::shared_ptr<std::string>> stream_errors_;
+ };
+ 
+ MLX_API Scheduler& scheduler();
+ 
++MLX_API CpuStreamToken prepare_cpu_stream(Stream s);
++MLX_API StreamProgress cpu_stream_progress(CpuStreamToken token) noexcept;
++MLX_API void block_cpu_stream(CpuStreamToken token) noexcept;
++MLX_API std::optional<StreamProgress> cpu_stream_progress(Stream s) noexcept;
++
+ template <typename F>
+ void enqueue(const Stream& stream, F&& f) {
+   scheduler().enqueue(stream, std::forward<F>(f));
+ }
+ 
++template <typename F>
++void enqueue_counted(const Stream& stream, F&& f) {
++  scheduler().enqueue(stream, std::forward<F>(f), true);
++}
++
+ inline int n_active_tasks() {
+   return scheduler().n_active_tasks();
+ }
+diff --git a/mlx/scheduler.cpp b/mlx/scheduler.cpp
+index c6de4d38..2fc7993a 100644
+--- a/mlx/scheduler.cpp
++++ b/mlx/scheduler.cpp
+@@ -36,6 +36,10 @@ void clear_streams() {
+ 
+ namespace scheduler {
+ 
++namespace {
++std::atomic<Scheduler*> published_scheduler{nullptr};
++}
++
+ Scheduler::Scheduler() {
+   is_main_thread();
+   gpu::init();
+@@ -43,7 +47,7 @@ Scheduler::Scheduler() {
+ 
+ Scheduler::~Scheduler() = default;
+ 
+-void Scheduler::enqueue(Stream s, std::function<void()> task) {
++StreamThread* Scheduler::prepare_stream(Stream s) {
+   StreamThread* st = nullptr;
+   {
+     std::shared_lock lock(threads_mtx_);
+@@ -60,35 +64,131 @@ void Scheduler::enqueue(Stream s, std::function<void()> task) {
+     }
+     st = it->second.get();
+   }
+-  st->enqueue([this, s, task = std::move(task)]() mutable {
++  return st;
++}
++
++void Scheduler::enqueue(
++    Stream s,
++    std::function<void()> task,
++    bool counted) {
++  auto* st = prepare_stream(s);
++  st->enqueue([this, st, s, counted, task = std::move(task)]() mutable {
+     try {
+       task();
++    } catch (...) {
++      st->record_error(std::current_exception());
++    }
++    if (counted) {
++      notify_task_completion(s);
++    }
++  }, counted ? &n_active_tasks_ : nullptr);
++}
++
++CpuStreamToken Scheduler::prepare_cpu_stream(Stream s) {
++  if (s.device != Device::cpu) {
++    throw std::invalid_argument("CPU stream progress requires a CPU stream.");
++  }
++  auto* thread = prepare_stream(s);
++  if (thread->failed.load(std::memory_order_acquire)) {
++    if (auto error = thread->error(false)) {
++      throw std::runtime_error(*error);
++    }
++    throw std::runtime_error("CPU stream has a prior asynchronous failure.");
++  }
++  if (thread->admission.load(std::memory_order_acquire) &
++      StreamThread::blocked_bit) {
++    throw std::runtime_error("CPU stream is blocked after submission failure.");
++  }
++  return {thread};
++}
++
++std::optional<StreamProgress> Scheduler::cpu_stream_progress(
++    Stream s) const noexcept {
++  if (s.device != Device::cpu) {
++    return std::nullopt;
++  }
++  try {
++    std::shared_lock lock(threads_mtx_, std::try_to_lock);
++    if (!lock.owns_lock()) {
++      return std::nullopt;
++    }
++    auto it = threads_.find(s.index);
++    if (it == threads_.end()) {
++      return std::nullopt;
++    }
++    return it->second->progress();
++  } catch (...) {
++    return std::nullopt;
++  }
++}
++
++std::shared_ptr<std::string> StreamThread::error(bool consume) {
++  std::lock_guard lock(error_mtx);
++  if (!error_pending && !uncaptured_error.load(std::memory_order_acquire)) {
++    return nullptr;
++  }
++  if (!error_message) {
++    try {
++      if (first_error) {
++        std::rethrow_exception(first_error);
++      }
+     } catch (const std::exception& e) {
+-      std::lock_guard lk(mtx);
+-      stream_errors_.try_emplace(
+-          s.index, std::make_shared<std::string>(e.what()));
++      try {
++        error_message = std::make_shared<std::string>(e.what());
++      } catch (...) {
++        error_message = fallback_error;
++      }
+     } catch (...) {
+-      std::lock_guard lk(mtx);
+-      stream_errors_.try_emplace(
+-          s.index,
+-          std::make_shared<std::string>(
+-              "Unknown exception in asynchronous CPU stream work."));
++      error_message = fallback_error;
++    }
++    if (!error_message) {
++      error_message = fallback_error;
+     }
+-  });
++  }
++  auto result = error_message;
++  if (consume) {
++    first_error = {};
++    error_message.reset();
++    error_pending = false;
++    uncaptured_error.store(false, std::memory_order_release);
++  }
++  return result;
+ }
+ 
+ std::shared_ptr<std::string> Scheduler::stream_error(
+     const Stream& stream) const {
+-  std::lock_guard lk(mtx);
+-  auto it = stream_errors_.find(stream.index);
+-  return it == stream_errors_.end() ? nullptr : it->second;
++  std::shared_lock lock(threads_mtx_);
++  auto it = threads_.find(stream.index);
++  return it == threads_.end() ? nullptr : it->second->error(false);
+ }
+ 
+ std::shared_ptr<std::string> Scheduler::take_stream_error(
+     const Stream& stream) {
+-  std::lock_guard lk(mtx);
+-  auto node = stream_errors_.extract(stream.index);
+-  return node.empty() ? nullptr : std::move(node.mapped());
++  std::shared_lock lock(threads_mtx_);
++  auto it = threads_.find(stream.index);
++  return it == threads_.end() ? nullptr : it->second->error(true);
++}
++
++CpuStreamToken prepare_cpu_stream(Stream s) {
++  return scheduler().prepare_cpu_stream(s);
++}
++
++StreamProgress cpu_stream_progress(CpuStreamToken token) noexcept {
++  return token.state
++      ? static_cast<const StreamThread*>(token.state)->progress()
++      : StreamProgress{};
++}
++
++void block_cpu_stream(CpuStreamToken token) noexcept {
++  if (token.state) {
++    const_cast<StreamThread*>(
++        static_cast<const StreamThread*>(token.state))->block();
++  }
++}
++
++std::optional<StreamProgress> cpu_stream_progress(Stream s) noexcept {
++  auto* existing = published_scheduler.load(std::memory_order_acquire);
++  return existing ? existing->cpu_stream_progress(s) : std::nullopt;
+ }
+ 
+ // Leak the scheduler singleton on all platforms. During static destruction,
+@@ -97,7 +197,11 @@ std::shared_ptr<std::string> Scheduler::take_stream_error(
+ // CRT).
+ // The OS reclaims all resources at process exit anyway.
+ Scheduler& scheduler() {
+-  static Scheduler* scheduler = new Scheduler;
++  static Scheduler* scheduler = []() {
++    auto* value = new Scheduler;
++    published_scheduler.store(value, std::memory_order_release);
++    return value;
++  }();
+   return *scheduler;
+ }
+ 
+diff --git a/mlx/backend/cpu/encoder.h b/mlx/backend/cpu/encoder.h
+index ec088997..66b44679 100644
+--- a/mlx/backend/cpu/encoder.h
++++ b/mlx/backend/cpu/encoder.h
+@@ -42,23 +42,14 @@ struct MLX_API CommandEncoder {
+ 
+   template <class F, class... Args>
+   void dispatch(F&& f, Args&&... args) {
+-    num_ops_ = (num_ops_ + 1) % DISPATCHES_PER_TASK;
++    auto next_num_ops = (num_ops_ + 1) % DISPATCHES_PER_TASK;
+     auto task = std::bind(std::forward<F>(f), std::forward<Args>(args)...);
+-    if (num_ops_ == 0) {
+-      scheduler::notify_new_task(stream_);
+-      auto task_wrap = [s = stream_, task = std::move(task)]() mutable {
+-        try {
+-          task();
+-        } catch (...) {
+-          scheduler::notify_task_completion(s);
+-          throw;
+-        }
+-        scheduler::notify_task_completion(s);
+-      };
+-      scheduler::enqueue(stream_, std::move(task_wrap));
++    if (next_num_ops == 0) {
++      scheduler::enqueue_counted(stream_, std::move(task));
+     } else {
+       scheduler::enqueue(stream_, std::move(task));
+     }
++    num_ops_ = next_num_ops;
+   }
+ 
+  private:
+diff --git a/tests/scheduler_recovery_tests.cpp b/tests/scheduler_recovery_tests.cpp
+new file mode 100644
+index 00000000..21fdaeaf
+--- /dev/null
++++ b/tests/scheduler_recovery_tests.cpp
+@@ -0,0 +1,193 @@
++#include "doctest/doctest.h"
++#include "mlx/backend/cpu/encoder.h"
++#include "mlx/scheduler.h"
++
++#include <chrono>
++#include <future>
++#include <new>
++#include <thread>
++
++using namespace mlx::core;
++
++namespace {
++
++bool reached(
++    scheduler::CpuStreamToken token,
++    uint64_t frontier,
++    std::chrono::seconds timeout = std::chrono::seconds(5)) {
++  auto deadline = std::chrono::steady_clock::now() + timeout;
++  do {
++    if (scheduler::cpu_stream_progress(token).completed >= frontier) {
++      return true;
++    }
++    std::this_thread::yield();
++  } while (std::chrono::steady_clock::now() < deadline);
++  return false;
++}
++
++struct Gate {
++  std::promise<void> release;
++  std::shared_future<void> ready{release.get_future().share()};
++  bool released{false};
++
++  void open() {
++    if (!released) {
++      release.set_value();
++      released = true;
++    }
++  }
++
++  ~Gate() {
++    open();
++  }
++};
++
++struct FailsMovingIntoTask {
++  FailsMovingIntoTask() = default;
++  FailsMovingIntoTask(const FailsMovingIntoTask&) = default;
++  FailsMovingIntoTask(FailsMovingIntoTask&&) {
++    throw std::bad_alloc();
++  }
++  void operator()() const {}
++};
++
++} // namespace
++
++TEST_CASE("test CPU recovery progress counts pending and throwing tasks") {
++  auto stream = new_thread_unsafe_stream(Device::cpu);
++  auto token = scheduler::prepare_cpu_stream(stream);
++  auto initial = scheduler::cpu_stream_progress(token);
++  CHECK(initial.accepted == 0);
++  CHECK(initial.completed == 0);
++  CHECK_FALSE(initial.failed);
++
++  Gate gate;
++  scheduler::enqueue(stream, [ready = gate.ready]() { ready.wait(); });
++  scheduler::enqueue(stream, []() { throw std::runtime_error("queued failure"); });
++  scheduler::enqueue(stream, []() {});
++  auto pending = scheduler::cpu_stream_progress(token);
++  CHECK(pending.accepted == 3);
++  CHECK(pending.completed == 0);
++  CHECK_FALSE(pending.failed);
++  gate.open();
++  REQUIRE(reached(token, 3));
++
++  auto terminal = scheduler::cpu_stream_progress(token);
++  CHECK(terminal.accepted == 3);
++  CHECK(terminal.completed == 3);
++  CHECK(terminal.failed);
++  CHECK_THROWS_AS(scheduler::prepare_cpu_stream(stream), std::runtime_error);
++  auto error = scheduler::stream_error(stream);
++  REQUIRE(error);
++  CHECK(*error == "queued failure");
++  CHECK(scheduler::take_stream_error(stream) == error);
++  CHECK_FALSE(scheduler::stream_error(stream));
++  // Error consumption does not erase the terminal recovery failure witness.
++  CHECK(scheduler::cpu_stream_progress(token).failed);
++  CHECK_THROWS_AS(scheduler::prepare_cpu_stream(stream), std::runtime_error);
++}
++
++TEST_CASE("test CPU recovery accounts bad alloc and unknown task exceptions") {
++  auto stream = new_thread_unsafe_stream(Device::cpu);
++  auto token = scheduler::prepare_cpu_stream(stream);
++  scheduler::enqueue(stream, []() { throw std::bad_alloc(); });
++  scheduler::enqueue(stream, []() { throw 7; });
++  REQUIRE(reached(token, 2));
++  CHECK(scheduler::cpu_stream_progress(token).failed);
++  CHECK(scheduler::cpu_stream_progress(token).completed == 2);
++  CHECK(scheduler::take_stream_error(stream) != nullptr);
++
++  scheduler::enqueue(stream, []() { throw 9; });
++  REQUIRE(reached(token, 3));
++  auto unknown = scheduler::take_stream_error(stream);
++  REQUIRE(unknown);
++  CHECK(*unknown ==
++        "Asynchronous CPU stream work failed; diagnostic unavailable.");
++}
++
++TEST_CASE("test CPU recovery blocks acceptance without phantom tasks") {
++  auto stream = new_thread_unsafe_stream(Device::cpu);
++  auto token = scheduler::prepare_cpu_stream(stream);
++  auto baseline = scheduler::n_active_tasks();
++  scheduler::block_cpu_stream(token);
++  CHECK_THROWS_AS(scheduler::prepare_cpu_stream(stream), std::runtime_error);
++  CHECK_THROWS_AS(scheduler::enqueue(stream, []() {}), std::runtime_error);
++  CHECK_THROWS_AS(
++      scheduler::enqueue_counted(stream, []() {}), std::runtime_error);
++  auto progress = scheduler::cpu_stream_progress(token);
++  CHECK(progress.accepted == 0);
++  CHECK(progress.completed == 0);
++  CHECK(scheduler::n_active_tasks() == baseline);
++  auto lookup = scheduler::cpu_stream_progress(stream);
++  REQUIRE(lookup.has_value());
++  CHECK(lookup->accepted == progress.accepted);
++  CHECK(lookup->completed == progress.completed);
++}
++
++TEST_CASE("test CPU recovery counted dispatch is exception safe") {
++  auto stream = new_thread_unsafe_stream(Device::cpu);
++  auto token = scheduler::prepare_cpu_stream(stream);
++  auto& encoder = cpu::get_command_encoder(stream);
++  auto baseline = scheduler::n_active_tasks();
++  for (int i = 0; i < cpu::DISPATCHES_PER_TASK - 1; ++i) {
++    encoder.dispatch([]() {});
++  }
++  REQUIRE(reached(token, cpu::DISPATCHES_PER_TASK - 1));
++  FailsMovingIntoTask failure;
++  CHECK_THROWS_AS(encoder.dispatch(failure), std::bad_alloc);
++  CHECK(scheduler::cpu_stream_progress(token).accepted ==
++        cpu::DISPATCHES_PER_TASK - 1);
++  CHECK(scheduler::n_active_tasks() == baseline);
++
++  Gate gate;
++  encoder.dispatch([ready = gate.ready]() {
++    ready.wait();
++    throw std::runtime_error("counted task failed");
++  });
++  CHECK(scheduler::n_active_tasks() == baseline + 1);
++  CHECK(scheduler::cpu_stream_progress(token).accepted == cpu::DISPATCHES_PER_TASK);
++  gate.open();
++  REQUIRE(reached(token, cpu::DISPATCHES_PER_TASK));
++  CHECK(scheduler::n_active_tasks() == baseline);
++  CHECK(scheduler::cpu_stream_progress(token).failed);
++}
++
++TEST_CASE("test CPU recovery block linearizes with concurrent acceptance") {
++  auto stream = new_thread_unsafe_stream(Device::cpu);
++  auto token = scheduler::prepare_cpu_stream(stream);
++  Gate start;
++  std::thread producer([stream, ready = start.ready]() {
++    ready.wait();
++    for (int i = 0; i < 1000; ++i) {
++      try {
++        scheduler::enqueue(stream, []() {});
++      } catch (const std::runtime_error&) {
++        break;
++      }
++    }
++  });
++  start.open();
++  scheduler::block_cpu_stream(token);
++  auto frontier = scheduler::cpu_stream_progress(token).accepted;
++  producer.join();
++  CHECK(scheduler::cpu_stream_progress(token).accepted == frontier);
++  CHECK_THROWS_AS(scheduler::enqueue(stream, []() {}), std::runtime_error);
++  REQUIRE(reached(token, frontier));
++  CHECK(scheduler::cpu_stream_progress(token).completed == frontier);
++}
++
++TEST_CASE("test CPU recovery sequence exhaustion rejects before acceptance") {
++  auto stream = new_thread_unsafe_stream(Device::cpu);
++  auto token = scheduler::prepare_cpu_stream(stream);
++  auto* state = const_cast<scheduler::StreamThread*>(
++      static_cast<const scheduler::StreamThread*>(token.state));
++  auto baseline = scheduler::n_active_tasks();
++  state->admission.store(scheduler::StreamThread::sequence_mask);
++  CHECK_THROWS_AS(
++      scheduler::enqueue_counted(stream, []() {}), std::overflow_error);
++  CHECK(scheduler::cpu_stream_progress(token).accepted ==
++        scheduler::StreamThread::sequence_mask);
++  CHECK(scheduler::cpu_stream_progress(token).completed == 0);
++  CHECK(scheduler::n_active_tasks() == baseline);
++  scheduler::block_cpu_stream(token);
++}
+diff --git a/tests/completion_tests.cpp b/tests/completion_tests.cpp
+index 9403a617..c52d4b1c 100644
+--- a/tests/completion_tests.cpp
++++ b/tests/completion_tests.cpp
+@@ -1,6 +1,7 @@
+ // Copyright © 2026 Apple Inc.
+ 
+ #include "doctest/doctest.h"
++#include <optional>
+ 
+ #include "mlx/event.h"
+ #include "mlx/mlx.h"
+@@ -90,17 +91,25 @@ TEST_CASE("test timed completion retains asynchronous CPU failures") {
+   });
+ 
+   auto output = add(array(1.0f), array(2.0f), stream);
+-  auto completion = async_eval_with_timing({output}, stream);
++  // The worker may fail before cold stream admission, or after submission.
++  // Both outcomes must retain the same failure; no successful result is valid.
++  std::optional<Completion> completion;
++  try {
++    completion.emplace(async_eval_with_timing({output}, stream));
++  } catch (const std::runtime_error& error) {
++    CHECK(std::string(error.what()) == "timed asynchronous producer failure");
++    return;
++  }
+   CHECK_THROWS_WITH_AS(
+-      completion.elapsed_seconds(),
++      completion->elapsed_seconds(),
+       "timed asynchronous producer failure",
+       std::runtime_error);
+   CHECK_THROWS_WITH_AS(
+-      completion.elapsed_seconds(),
++      completion->elapsed_seconds(),
+       "timed asynchronous producer failure",
+       std::runtime_error);
+   CHECK_THROWS_WITH_AS(
+-      completion.try_elapsed_seconds(),
++      completion->try_elapsed_seconds(),
+       "timed asynchronous producer failure",
+       std::runtime_error);
+ }

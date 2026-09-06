@@ -46,10 +46,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut model = realtime_support::load(
             &backend,
             eredu_architectures::moshi::prepare_realtime_model(&model_dir)?,
-            MlxLoadRequest::with_quantization(QuantizationRequest::Affine {
-                group_size: 64,
-                bits: 4,
-            }),
+            MlxLoadRequest::from_normalized(
+                eredu_runtime::NormalizedLoadRequest::with_quantization(
+                    QuantizationRequest::Affine {
+                        group_size: 64,
+                        bits: 4,
+                    },
+                ),
+            ),
         )?;
         stream.synchronize()?;
         println!("load_s={:.3}", load_start.elapsed().as_secs_f64());

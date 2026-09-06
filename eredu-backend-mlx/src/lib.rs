@@ -65,8 +65,9 @@ pub mod native {
     pub use crate::backend::topology::DeviceAssignment;
     pub use crate::backend::{random::RandomState, ExecutionContext};
     pub use crate::composition::mlx::realtime::{
-        MlxRealtimeCompletion, MlxRealtimeExecutionContext, MlxRealtimeFrameCompletionMechanism,
-        MlxRealtimeFrameTensorMechanisms, MlxRealtimeHostObserver,
+        MlxPreparedRealtimeExecution, MlxRealtimeCompletion, MlxRealtimeExecutionContext,
+        MlxRealtimeFrameCompletionMechanism, MlxRealtimeFrameTensorMechanisms,
+        MlxRealtimeHostObserver,
     };
     pub use crate::composition::mlx::speculative::MlxDrafter;
     pub use crate::composition::mlx::{

@@ -200,17 +200,22 @@ pub fn create_causal_mask(
     lengths: Option<Array>,
     stream: &Stream,
 ) -> Result<Array, Exception> {
-    let offset = offset.unwrap_or(0);
+    let geometry =
+        eredu_nn::operation_geometry::CausalMaskGeometry::new(N, offset.unwrap_or(0), window_size)
+            .map_err(|error| Exception::custom(error.to_string()))?;
+    let offset = geometry.offset();
 
-    let rinds = arange!(stop = offset + N, stream = stream)?;
-    let linds = arange!(start = offset, stop = offset + N, stream = stream)?;
+    let rinds = arange!(stop = geometry.keys(), stream = stream)?;
+    let linds = arange!(start = offset, stop = geometry.keys(), stream = stream)?;
     let linds = linds.try_index_device((.., NewAxis), stream)?;
     let rinds = rinds.try_index_device(NewAxis, stream)?;
 
     let mut mask = linds.ge(&rinds, stream)?;
     if let Some(window_size) = window_size {
-        let rinds_window = rinds.add(Array::from_int(window_size), stream)?;
-        mask = mask.logical_and(&linds.le(&rinds_window, stream)?, stream)?;
+        // Subtract from nonnegative query positions instead of adding to keys:
+        // a valid maximum I32 lookback must not overflow its comparison operand.
+        let earliest_key = linds.subtract(Array::from_int(window_size), stream)?;
+        mask = mask.logical_and(&rinds.ge(&earliest_key, stream)?, stream)?;
     }
 
     if let Some(lengths) = lengths {

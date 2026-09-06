@@ -8,7 +8,7 @@ use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
 
 use super::{MlxAssistantPreparationVisitor, MlxExternalAssistant};
 
-const ASSISTANT_CONFIG: &str = r#"{
+pub(super) const ASSISTANT_CONFIG: &str = r#"{
   "model_type":"gemma4_assistant","backbone_hidden_size":32,
   "use_ordered_embeddings":false,"tie_word_embeddings":false,"block_size":4,
   "text_config":{"model_type":"gemma4_text","hidden_size":32,
@@ -18,7 +18,7 @@ const ASSISTANT_CONFIG: &str = r#"{
     "attention_k_eq_v":false,"layer_types":["full_attention"]}
 }"#;
 
-fn assistant_artifact() -> tempfile::TempDir {
+pub(super) fn assistant_artifact() -> tempfile::TempDir {
     let directory = tempfile::tempdir().unwrap();
     std::fs::write(directory.path().join("config.json"), ASSISTANT_CONFIG).unwrap();
     let config = gemma4::AssistantConfig::from_json(ASSISTANT_CONFIG.as_bytes()).unwrap();

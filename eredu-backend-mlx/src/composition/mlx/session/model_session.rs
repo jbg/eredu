@@ -1,4 +1,310 @@
 use super::*;
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+};
+
+use super::recovery::{Probe, Recovery, Retention, Status};
+use crate::backend::ordinary_retirement::{self, OrdinaryRetirement};
+
+pub(super) struct SessionPayload {
+    model: Executable,
+    target: crate::backend::MlxPreparedTarget,
+    distributed: Option<MlxDistributedSession>,
+    #[cfg(any(feature = "image", feature = "audio"))]
+    processor: Option<ModelProcessor>,
+    #[cfg(test)]
+    _retirement_probe: Option<Box<dyn std::any::Any>>,
+}
+
+/// One submission owns both the entire executable and its neutral authority.
+/// Scope tickets keep this owner alive even if the public session is dropped.
+pub(super) struct SubmissionResources {
+    payload: RefCell<Option<Rc<OrdinaryRetirement<SessionPayload>>>>,
+    lease: RefCell<Option<SubmissionLease>>,
+    poison: Rc<Cell<bool>>,
+    scopes: Cell<usize>,
+    release_requested: Cell<bool>,
+}
+
+impl SubmissionResources {
+    pub(super) fn new(lease: SubmissionLease, poison: Rc<Cell<bool>>) -> Rc<Self> {
+        Rc::new(Self {
+            payload: RefCell::new(None),
+            lease: RefCell::new(Some(lease)),
+            poison,
+            scopes: Cell::new(0),
+            release_requested: Cell::new(false),
+        })
+    }
+
+    pub(super) fn recovery(self: &Rc<Self>) -> Result<Recovery<ScopeRetention>, Error> {
+        Recovery::begin(self.ticket()).map_err(Into::into)
+    }
+
+    pub(super) fn observation_recovery(
+        self: &Rc<Self>,
+        roots: Vec<Array>,
+    ) -> Result<Recovery<ObservationRetention>, Error> {
+        Recovery::begin(ObservationRetention {
+            _roots: roots,
+            ticket: self.ticket(),
+        })
+        .map_err(Into::into)
+    }
+
+    pub(super) fn poison_on_unwind(&self) -> ObservationUnwind<'_> {
+        ObservationUnwind(self)
+    }
+
+    pub(super) fn ticket(self: &Rc<Self>) -> ScopeRetention {
+        self.scopes.set(self.scopes.get() + 1);
+        ScopeRetention(Rc::clone(self))
+    }
+
+    pub(super) fn request_release(&self) {
+        self.release_requested.set(true);
+        self.release_if_settled();
+    }
+
+    fn release_if_settled(&self) {
+        if self.release_requested.get() && self.scopes.get() == 0 {
+            // A live old completion must not keep Rc::get_mut unavailable after
+            // its authority is released for a newer submission.
+            self.payload.borrow_mut().take();
+            self.lease.borrow_mut().take();
+        }
+    }
+
+    pub(super) fn reject_unresolved(&self) {
+        self.poison.set(true);
+    }
+
+    pub(super) fn ensure_healthy(&self) -> Result<(), Error> {
+        if self.poison.get() {
+            Err(Error::ArchitectureModel(
+                "native session is poisoned by unresolved or failed work".into(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+struct ReleaseSubmission(Rc<SubmissionResources>);
+impl Drop for ReleaseSubmission {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.reject_unresolved();
+        }
+        self.0.request_release();
+    }
+}
+
+pub(super) struct ScopeRetention(Rc<SubmissionResources>);
+
+pub(super) struct ObservationRetention {
+    _roots: Vec<Array>,
+    ticket: ScopeRetention,
+}
+
+impl Retention for ObservationRetention {
+    fn observe(&self, status: Status) {
+        self.ticket.observe(status);
+    }
+}
+
+pub(super) struct ObservationUnwind<'a>(&'a SubmissionResources);
+impl Drop for ObservationUnwind<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.reject_unresolved();
+        }
+    }
+}
+
+impl Retention for ScopeRetention {
+    fn observe(&self, status: Status) {
+        if status.failed || status.blocked {
+            self.0.poison.set(true);
+        }
+    }
+}
+
+impl Drop for ScopeRetention {
+    fn drop(&mut self) {
+        self.0.scopes.set(self.0.scopes.get() - 1);
+        self.0.release_if_settled();
+    }
+}
+
+pub(super) struct ResourceOperation<P: Probe = safemlx::SubmissionScope> {
+    owner: Rc<SubmissionResources>,
+    recovery: Option<Recovery<ScopeRetention, P>>,
+}
+
+impl ResourceOperation {
+    pub(super) fn begin(owner: &Rc<SubmissionResources>) -> Result<Self, Error> {
+        owner.ensure_healthy()?;
+        Ok(Self {
+            owner: Rc::clone(owner),
+            recovery: Some(owner.recovery()?),
+        })
+    }
+}
+
+impl<P: Probe> ResourceOperation<P> {
+    #[cfg(test)]
+    pub(super) fn with_probe(owner: &Rc<SubmissionResources>, probe: P) -> Self {
+        Self {
+            owner: Rc::clone(owner),
+            recovery: Some(Recovery::with_probe(owner.ticket(), probe)),
+        }
+    }
+
+    pub(super) fn finish<T>(
+        mut self,
+        result: Result<T, Error>,
+    ) -> Result<(T, Recovery<ScopeRetention, P>), Error> {
+        let recovery = self.recovery.as_mut().expect("live resource operation");
+        recovery.seal();
+        let status = recovery.progress();
+        if status.failed || status.blocked {
+            return Err(Error::ArchitectureModel(
+                "native resource operation failed or is unobservable".into(),
+            ));
+        }
+        Ok((result?, self.recovery.take().unwrap()))
+    }
+}
+
+impl<P: Probe> Drop for ResourceOperation<P> {
+    fn drop(&mut self) {
+        if let Some(recovery) = self.recovery.as_mut() {
+            // No rollback proof accompanies an abandoned operation, even if
+            // all native children happened to finish successfully.
+            self.owner.reject_unresolved();
+            recovery.seal();
+            let status = recovery.progress();
+            if !status.settled || status.failed || status.blocked || std::thread::panicking() {
+                self.owner.reject_unresolved();
+            }
+        }
+    }
+}
+
+struct SessionOperation<'a> {
+    session: &'a mut MlxModelSession,
+    owner: Rc<SubmissionResources>,
+    recovery: Option<Recovery<ScopeRetention>>,
+    handed_off: bool,
+}
+
+pub(super) fn restored_error_permits_retry(status: Status, error: &Error) -> bool {
+    status.settled && !status.failed && !status.blocked && error.model_state_preserved()
+}
+
+pub(super) fn complete_model_operation<T, P: Probe>(
+    value: T,
+    owner: Rc<SubmissionResources>,
+    recovery: Recovery<ScopeRetention, P>,
+) -> Result<T, Error> {
+    let status = recovery.progress();
+    owner.request_release();
+    if !status.settled || status.failed || status.blocked {
+        owner.reject_unresolved();
+        return Err(Error::ArchitectureModel(
+            "native operation failed or returned without proven completion; session is poisoned"
+                .into(),
+        ));
+    }
+    drop(recovery);
+    Ok(value)
+}
+
+impl SessionOperation<'_> {
+    fn model(&mut self) -> &mut Executable {
+        &mut Rc::get_mut(&mut self.session.payload)
+            .expect("idle session has exclusive native payload ownership")
+            .model
+    }
+
+    fn finish<T>(
+        self,
+        result: Result<T, Error>,
+    ) -> Result<(T, Rc<SubmissionResources>, Recovery<ScopeRetention>), Error> {
+        self.finish_with_preservation(result, false)
+    }
+
+    fn finish_execution<T>(
+        self,
+        result: Result<T, Error>,
+    ) -> Result<(T, Rc<SubmissionResources>, Recovery<ScopeRetention>), Error> {
+        self.finish_with_preservation(result, true)
+    }
+
+    fn finish_with_preservation<T>(
+        mut self,
+        result: Result<T, Error>,
+        allow_preservation: bool,
+    ) -> Result<(T, Rc<SubmissionResources>, Recovery<ScopeRetention>), Error> {
+        self.owner
+            .payload
+            .replace(Some(Rc::clone(&self.session.payload)));
+        let recovery = self.recovery.as_mut().expect("live operation scope");
+        recovery.seal();
+        let status = recovery.progress();
+        if status.failed || status.blocked {
+            if let Err(error) = &result {
+                self.session.record_failure(error);
+            }
+            return Err(Error::ArchitectureModel(
+                "native session execution failed or became unobservable; session is poisoned"
+                    .into(),
+            ));
+        }
+        let value = match result {
+            Err(error) if allow_preservation && restored_error_permits_retry(status, &error) => {
+                // Only a direct model call can supply this evidence. A larger
+                // speculative/cache operation may have other mutated state.
+                self.handed_off = true;
+                self.owner.request_release();
+                self.recovery.take();
+                return Err(error);
+            }
+            Err(error) => {
+                self.session.record_failure(&error);
+                return Err(error);
+            }
+            Ok(value) => value,
+        };
+        self.handed_off = true;
+        Ok((value, Rc::clone(&self.owner), self.recovery.take().unwrap()))
+    }
+}
+
+impl Drop for SessionOperation<'_> {
+    fn drop(&mut self) {
+        if self.handed_off {
+            return;
+        }
+        self.owner.reject_unresolved();
+        self.owner
+            .payload
+            .replace(Some(Rc::clone(&self.session.payload)));
+        if let Some(recovery) = self.recovery.as_mut() {
+            recovery.seal();
+            let status = recovery.progress();
+            if !status.settled || status.failed || status.blocked || std::thread::panicking() {
+                self.owner.reject_unresolved();
+            }
+        }
+        self.owner.request_release();
+        // The preallocated node either releases the scope ticket or retains it
+        // together with the executable and lease in nonblocking quarantine.
+        self.recovery.take();
+    }
+}
 
 /// MLX-owned prefill input.
 ///
@@ -66,49 +372,66 @@ impl MlxModelInput {
 /// session so callers cannot accidentally execute a sharded model with an
 /// unrelated communicator.
 pub struct MlxModelSession {
-    model: Executable,
-    submission_in_flight: Rc<Cell<Option<u64>>>,
-    next_submission_ticket: Cell<u64>,
+    payload: Rc<OrdinaryRetirement<SessionPayload>>,
+    poison: Rc<Cell<bool>>,
+    failure: RefCell<Option<String>>,
+    authority: RefCell<SessionAuthority>,
     floating_state_dtype_bytes: std::num::NonZeroU8,
-    distributed: Option<MlxDistributedSession>,
     capabilities: eredu_core::SessionCapabilities,
     state_residency: CacheResidencyPolicy,
-    #[cfg(any(feature = "image", feature = "audio"))]
-    processor: Option<ModelProcessor>,
 }
 
 impl MlxModelSession {
-    /// Creates a session and validates that its communicator matches the model topology.
+    #[cfg(test)]
+    pub(super) fn test_payload_weak(&self) -> std::rc::Weak<OrdinaryRetirement<SessionPayload>> {
+        Rc::downgrade(&self.payload)
+    }
+    #[cfg(test)]
+    pub(super) fn set_retirement_probe(&mut self, probe: Box<dyn std::any::Any>) {
+        Rc::get_mut(&mut self.payload).unwrap()._retirement_probe = Some(probe);
+    }
+    /// Creates a session retaining the model's exact native target.
+    /// The backend provider checks that target before this method resets state.
     pub(crate) fn from_model(
         mut model: MlxModel,
         admitted_capabilities: eredu_core::SessionCapabilities,
     ) -> Result<Self, Error> {
+        ordinary_retirement::reclaim();
+        let realized_capabilities = eredu_core::SessionCapabilities::new(true, true, true);
+        SessionAdmission::new(admitted_capabilities)
+            .validate(realized_capabilities)
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         let floating_state_dtype_bytes = model.floating_state_dtype_bytes();
         let state_residency = model.state_residency().clone();
         #[cfg(any(feature = "image", feature = "audio"))]
         let processor = model.take_processor();
         let distributed = model.take_distributed();
-        let mut executable = model.into_executable();
-        executable
-            .reset_cache_with_options(state_residency.clone())
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        let realized_capabilities = eredu_core::SessionCapabilities::new(true, true, true);
-        if admitted_capabilities != realized_capabilities {
-            return Err(Error::ArchitectureModel(format!(
-                "realized MLX session capabilities {realized_capabilities:?} do not match pre-materialization admission {admitted_capabilities:?}"
-            )));
-        }
-        Ok(Self {
-            model: executable,
-            submission_in_flight: Rc::new(Cell::new(None)),
-            next_submission_ticket: Cell::new(1),
+        let (executable, target) = model.into_execution_parts();
+        #[cfg(test)]
+        crate::tests::support::path_instrumentation::session_reset_attempt();
+        let mut session = Self {
+            // The final Rc may be released by a native recovery reaper while
+            // it holds the runtime lock. Stage the complete semantic owner;
+            // resident-manager leases and observers drop only at an ordinary
+            // unlocked host boundary.
+            payload: Rc::new(OrdinaryRetirement::new(SessionPayload {
+                model: executable,
+                target,
+                distributed,
+                #[cfg(any(feature = "image", feature = "audio"))]
+                processor,
+                #[cfg(test)]
+                _retirement_probe: None,
+            })),
+            poison: Rc::new(Cell::new(false)),
+            failure: RefCell::new(None),
+            authority: RefCell::new(SessionAuthority::new()),
             floating_state_dtype_bytes,
-            distributed,
             capabilities: realized_capabilities,
             state_residency,
-            #[cfg(any(feature = "image", feature = "audio"))]
-            processor,
-        })
+        };
+        session.reset()?;
+        Ok(session)
     }
 
     pub(in crate::composition::mlx) const fn floating_state_dtype_bytes(
@@ -117,47 +440,118 @@ impl MlxModelSession {
         self.floating_state_dtype_bytes
     }
 
-    fn begin_submission(&self) -> Result<SessionSubmissionLease, Error> {
-        if self.submission_in_flight.get().is_some() {
-            return Err(Error::ArchitectureModel(
-                "model session already owns an unresolved submission completion".into(),
-            ));
-        }
-        let ticket = self.next_submission_ticket.get();
-        let next = ticket.checked_add(1).ok_or_else(|| {
-            Error::ArchitectureModel("model session submission ticket space exhausted".into())
-        })?;
-        self.next_submission_ticket.set(next);
-        self.submission_in_flight.set(Some(ticket));
-        Ok(SessionSubmissionLease {
-            owner: self.submission_in_flight.clone(),
-            ticket,
+    fn begin_submission(
+        &mut self,
+        backend: &MlxBackend<'_>,
+    ) -> Result<SessionOperation<'_>, Error> {
+        self.validate_backend(backend)?;
+        self.begin_operation()
+    }
+
+    fn begin_operation(&mut self) -> Result<SessionOperation<'_>, Error> {
+        self.ensure_no_submission_in_flight()?;
+        let lease = self
+            .authority
+            .borrow_mut()
+            .begin_submission()
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        let owner = SubmissionResources::new(lease, Rc::clone(&self.poison));
+        let recovery = owner.recovery()?;
+        Ok(SessionOperation {
+            session: self,
+            owner,
+            recovery: Some(recovery),
+            handed_off: false,
         })
     }
 
-    fn ensure_no_submission_in_flight(&self) -> Result<(), Error> {
-        if self.submission_in_flight.get().is_some() {
-            Err(Error::ArchitectureModel(
-                "model session state cannot be changed while a submission completion is unresolved"
-                    .into(),
-            ))
-        } else {
-            Ok(())
+    pub(in crate::composition::mlx) fn with_model_operation<T>(
+        &mut self,
+        operation: impl FnOnce(&mut Executable) -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        let mut guard = self.begin_operation()?;
+        let result = operation(guard.model());
+        let (value, owner, recovery) = guard.finish(result)?;
+        complete_model_operation(value, owner, recovery)
+    }
+
+    fn with_shared_operation<T>(
+        &self,
+        operation: impl FnOnce() -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        self.ensure_no_submission_in_flight()?;
+        let lease = self
+            .authority
+            .borrow_mut()
+            .begin_submission()
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        let owner = SubmissionResources::new(lease, Rc::clone(&self.poison));
+        owner.payload.replace(Some(Rc::clone(&self.payload)));
+        let mut recovery = owner.recovery()?;
+        let _release = ReleaseSubmission(Rc::clone(&owner));
+        let result = operation();
+        if let Err(error) = &result {
+            self.record_failure(error);
+        }
+        recovery.seal();
+        let status = recovery.progress();
+        if !status.settled || status.failed || status.blocked {
+            owner.reject_unresolved();
+            return Err(Error::ArchitectureModel(
+                "native observation or sampling failed or remains unresolved".into(),
+            ));
+        }
+        if result.is_err() {
+            owner.reject_unresolved();
+        }
+        result
+    }
+
+    pub(crate) fn validate_backend(&self, backend: &MlxBackend<'_>) -> Result<(), Error> {
+        self.ensure_healthy()?;
+        backend.validate_prepared_target(&self.payload.target)
+    }
+
+    pub(in crate::composition::mlx) fn ensure_no_submission_in_flight(&self) -> Result<(), Error> {
+        super::recovery::reap();
+        ordinary_retirement::reclaim();
+        self.ensure_healthy()?;
+        self.authority
+            .borrow()
+            .require_idle()
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))
+    }
+
+    fn ensure_healthy(&self) -> Result<(), Error> {
+        if self.poison.get() {
+            let message = self.failure.borrow().as_ref().map_or_else(
+                || "native session is fenced by unresolved or failed work".to_owned(),
+                |cause| format!("native session is fenced after prior operation failure: {cause}"),
+            );
+            return Err(Error::ArchitectureModel(message));
+        }
+        Ok(())
+    }
+
+    fn record_failure(&self, error: &Error) {
+        let mut failure = self.failure.borrow_mut();
+        if failure.is_none() {
+            *failure = Some(error.to_string());
         }
     }
 
     #[cfg(any(feature = "image", feature = "audio"))]
     pub(crate) fn processor(&self) -> Option<&ModelProcessor> {
-        self.processor.as_ref()
+        self.payload.processor.as_ref()
     }
 
     pub(crate) fn effective_model_type(&self) -> &str {
-        self.model.effective_model_type()
+        self.payload.model.effective_model_type()
     }
 
     /// Reports how the session-owned model exposes speculative weights.
     pub fn speculative_capability(&self) -> SpeculativeCapability {
-        self.model.speculative_capability()
+        self.payload.model.speculative_capability()
     }
 
     /// Installs causal observers on this session's selected embedded-prediction executor.
@@ -171,29 +565,36 @@ impl MlxModelSession {
         LogitsObserver: RuntimeActivationObserver<Array, Exception> + 'static,
     {
         self.ensure_no_submission_in_flight()?;
+        if !self.payload.model.erased().has_embedded_prediction() {
+            return Err(Error::ArchitectureModel(
+                "session has no selected embedded-prediction executor".into(),
+            ));
+        }
         let observers =
             eredu_architectures::speculative_execution::EmbeddedPredictionObservers::new(
                 tensors, logits,
             );
-        if self.model.install_embedded_prediction_observers(observers) {
-            Ok(())
-        } else {
-            Err(Error::ArchitectureModel(
-                "session has no selected embedded-prediction executor".into(),
-            ))
-        }
+        self.with_model_operation(|model| {
+            if model.install_embedded_prediction_observers(observers) {
+                Ok(())
+            } else {
+                Err(Error::ArchitectureModel(
+                    "session has no selected embedded-prediction executor".into(),
+                ))
+            }
+        })
     }
 
     /// Returns bounded parameter-residency telemetry when available.
     pub fn residency_report(&self) -> Result<Option<eredu_runtime::ResidencyReport>, Error> {
-        self.model.residency_report()
+        self.payload.model.residency_report()
     }
 
     /// Returns dense checkpoint-streaming telemetry when enabled.
     pub fn dense_stream_report(
         &self,
     ) -> Result<Option<eredu_runtime::DenseDiskStreamReport>, Error> {
-        self.model.dense_stream_report()
+        self.payload.model.dense_stream_report()
     }
 
     /// Returns sparse routed-expert cache telemetry when enabled.
@@ -203,21 +604,24 @@ impl MlxModelSession {
         Option<crate::backend::runtime::residency::parameter_bank::ParameterBankResidencyReport>,
         Error,
     > {
-        self.model.parameter_bank_report()
+        self.payload.model.parameter_bank_report()
     }
 
     /// Returns the complete model-derived identity for a reusable prompt cache.
     pub fn prompt_cache_model_identity(
         &self,
     ) -> Result<eredu_core::cache::PromptCacheModelIdentity, Error> {
-        self.model.prompt_cache_model_identity().map_err(Into::into)
+        self.payload
+            .model
+            .prompt_cache_model_identity()
+            .map_err(Into::into)
     }
 
     pub(in crate::composition::mlx) fn capability_estimate(
         &self,
     ) -> Result<eredu_architectures::capability::CapabilityEstimate, eredu_core::CapabilityError>
     {
-        self.model.architecture_capability_estimate()
+        self.payload.model.architecture_capability_estimate()
     }
 
     pub(in crate::composition::mlx) fn prepared_input_part_plan(
@@ -225,29 +629,38 @@ impl MlxModelSession {
         input: &crate::backend::runtime::media::input::InputPart,
     ) -> Result<eredu_architectures::media_plan::PreparedInputPartPlan, eredu_core::CapabilityError>
     {
-        self.model.prepared_input_part_plan(input)
+        self.payload.model.prepared_input_part_plan(input)
     }
 
-    pub(in crate::composition::mlx) fn speculative_model_mut(&mut self) -> &mut Executable {
-        &mut self.model
+    #[cfg(test)]
+    pub(in crate::composition::mlx) fn speculative_model_mut(
+        &mut self,
+    ) -> Result<&mut Executable, Error> {
+        self.ensure_no_submission_in_flight()?;
+        Ok(&mut Rc::get_mut(&mut self.payload).expect("idle payload").model)
     }
 
     #[cfg(test)]
     pub(crate) fn neutral_prediction_target_mut(
         &mut self,
     ) -> Result<&mut dyn super::super::replicated_text::ErasedReplicatedTextExecutable, Error> {
-        Ok(self.model.erased_mut())
+        self.ensure_no_submission_in_flight()?;
+        Ok(Rc::get_mut(&mut self.payload)
+            .expect("idle payload")
+            .model
+            .erased_mut())
     }
 
     /// Clears all MLX cache state under the authoritative selected policy.
     pub fn reset(&mut self) -> Result<(), Error> {
-        self.ensure_no_submission_in_flight()?;
-        if self.model.has_neutral_partitioned_control() {
-            return self.model.reset_cache_distributed().map_err(Into::into);
-        }
-        self.model
-            .reset_cache_with_options(self.state_residency.clone())
-            .map_err(Into::into)
+        let policy = self.state_residency.clone();
+        self.with_model_operation(|model| {
+            if model.has_neutral_partitioned_control() {
+                model.reset_cache_distributed().map_err(Into::into)
+            } else {
+                model.reset_cache_with_options(policy).map_err(Into::into)
+            }
+        })
     }
 
     /// Submits one cached decode position from a portable token id.
@@ -256,17 +669,43 @@ impl MlxModelSession {
         backend: &MlxBackend<'_>,
         token_id: u32,
     ) -> Result<Submission<MlxModelOutput, MlxSessionCompletion>, Error> {
-        let token_ids = [token_id];
-        let input =
-            Array::from(token_ids.as_slice()).try_index_device(NewAxis, backend.stream())?;
-        self.decode(backend, input)
+        self.submit_decode_input(backend, || {
+            #[cfg(test)]
+            crate::tests::support::path_instrumentation::session_input_creation_attempt();
+            let token_ids = [token_id];
+            Array::from(token_ids.as_slice())
+                .try_index_device(NewAxis, backend.stream())
+                .map_err(Into::into)
+        })
+    }
+
+    fn submit_decode_input(
+        &mut self,
+        backend: &MlxBackend<'_>,
+        input: impl FnOnce() -> Result<Array, Error>,
+    ) -> Result<Submission<MlxModelOutput, MlxSessionCompletion>, Error> {
+        let mut operation = self.begin_submission(backend)?;
+        let token_validation_scope = TokenValidationScope::begin()?;
+        let output = input()
+            .map_err(Error::before_model_mutation)
+            .and_then(|input| decode_model(operation.model(), &input, backend.stream()));
+        let public_output = operation.model().erased().partition_public_output();
+        let (output, owner, recovery) = operation.finish_execution(output)?;
+        Ok(owned_model_submission(
+            output,
+            token_validation_scope.finish(),
+            public_output,
+            owner,
+            recovery,
+        ))
     }
 
     /// Returns aggregate cache-residency telemetry for this session.
     pub fn cache_residency_report(
         &self,
     ) -> Result<Option<eredu_runtime::CacheResidencyReport>, Error> {
-        self.model
+        self.payload
+            .model
             .cache_residency_report()
             .map_err(|error| Error::Parallel(error.to_string()))
     }
@@ -280,27 +719,30 @@ impl MlxModelSession {
         prefix_token_ids: &[u32],
         options: &PromptCacheOptions,
     ) -> Result<PromptCacheManifest, Error> {
+        self.validate_backend(backend)?;
         self.ensure_no_submission_in_flight()?;
         let root = root.as_ref();
-        if self.model.has_neutral_partitioned_control() {
-            self.model
-                .save_prompt_cache_distributed(root, descriptor, prefix_token_ids, options)?
-                .ok_or_else(|| {
-                    Error::ArchitectureModel(
-                        "this partition rank owns no prompt-cache state".into(),
+        self.with_model_operation(|model| {
+            if model.has_neutral_partitioned_control() {
+                model
+                    .save_prompt_cache_distributed(root, descriptor, prefix_token_ids, options)?
+                    .ok_or_else(|| {
+                        Error::ArchitectureModel(
+                            "this partition rank owns no prompt-cache state".into(),
+                        )
+                    })
+            } else {
+                model
+                    .save_prompt_cache(
+                        root,
+                        descriptor,
+                        prefix_token_ids,
+                        options,
+                        backend.stream(),
                     )
-                })
-        } else {
-            self.model
-                .save_prompt_cache(
-                    root,
-                    descriptor,
-                    prefix_token_ids,
-                    options,
-                    backend.stream(),
-                )
-                .map_err(Into::into)
-        }
+                    .map_err(Into::into)
+            }
+        })
     }
 
     /// Opens a compatible persisted prefix and replaces this session's cache.
@@ -311,6 +753,7 @@ impl MlxModelSession {
         expected: &PromptCacheDescriptor,
         prefix_token_ids: &[u32],
     ) -> Result<PromptCacheManifest, Error> {
+        self.validate_backend(backend)?;
         self.ensure_no_submission_in_flight()?;
         let root = root.as_ref();
         let CacheResidencyPolicy::Paged(options) = &self.state_residency else {
@@ -319,24 +762,26 @@ impl MlxModelSession {
             ));
         };
         let options = options.clone();
-        let manifest = if self.model.has_neutral_partitioned_control() {
-            self.model
-                .load_prompt_cache_distributed(root, expected, prefix_token_ids)?
-                .ok_or_else(|| {
-                    Error::ArchitectureModel(
-                        "this partition rank owns no prompt-cache state".into(),
-                    )
-                })?
-        } else {
-            self.model.load_prompt_cache(
-                root,
-                expected,
-                prefix_token_ids,
-                options,
-                backend.stream(),
-            )?
-        };
-        Ok(manifest)
+        self.with_model_operation(|model| {
+            let manifest = if model.has_neutral_partitioned_control() {
+                model
+                    .load_prompt_cache_distributed(root, expected, prefix_token_ids)?
+                    .ok_or_else(|| {
+                        Error::ArchitectureModel(
+                            "this partition rank owns no prompt-cache state".into(),
+                        )
+                    })?
+            } else {
+                model.load_prompt_cache(
+                    root,
+                    expected,
+                    prefix_token_ids,
+                    options,
+                    backend.stream(),
+                )?
+            };
+            Ok(manifest)
+        })
     }
 
     /// Opens a persisted prefix only when it matches an exact prepared input.
@@ -348,6 +793,7 @@ impl MlxModelSession {
         prefix_token_ids: &[u32],
         input: &MlxModelInput,
     ) -> Result<PromptCacheManifest, Error> {
+        self.validate_backend(backend)?;
         self.ensure_no_submission_in_flight()?;
         let identity = input.cache_identity.clone().ok_or_else(|| {
             Error::ArchitectureModel(
@@ -360,40 +806,47 @@ impl MlxModelSession {
             ));
         };
         let root = root.as_ref();
-        if self.model.has_neutral_partitioned_control() {
-            self.model
-                .load_prompt_cache_for_input_distributed(
-                    root,
-                    expected,
-                    prefix_token_ids,
-                    identity,
-                )?
-                .ok_or_else(|| {
-                    Error::ArchitectureModel(
-                        "this partition rank owns no prompt-cache state".into(),
+        let options = options.clone();
+        self.with_model_operation(|model| {
+            if model.has_neutral_partitioned_control() {
+                model
+                    .load_prompt_cache_for_input_distributed(
+                        root,
+                        expected,
+                        prefix_token_ids,
+                        identity,
+                    )?
+                    .ok_or_else(|| {
+                        Error::ArchitectureModel(
+                            "this partition rank owns no prompt-cache state".into(),
+                        )
+                    })
+            } else {
+                model
+                    .load_prompt_cache_for_input(
+                        root,
+                        expected,
+                        prefix_token_ids,
+                        identity,
+                        options.clone(),
+                        backend.stream(),
                     )
-                })
-        } else {
-            self.model
-                .load_prompt_cache_for_input(
-                    root,
-                    expected,
-                    prefix_token_ids,
-                    identity,
-                    options.clone(),
-                    backend.stream(),
-                )
-                .map_err(Into::into)
-        }
+                    .map_err(Into::into)
+            }
+        })
     }
 
     /// Returns communication when this is a distributed session.
-    pub const fn distributed(&self) -> Option<&MlxDistributedSession> {
-        self.distributed.as_ref()
+    pub fn distributed(&self) -> Option<&MlxDistributedSession> {
+        self.payload.distributed.as_ref()
     }
 
     pub(super) fn synchronizes_sampling(&self) -> bool {
-        self.model.erased().partition_sampling_context().is_some()
+        self.payload
+            .model
+            .erased()
+            .partition_sampling_context()
+            .is_some()
     }
 
     /// Samples on the canonical rank and synchronizes the result for this
@@ -408,7 +861,30 @@ impl MlxModelSession {
         prng_state: Option<&mut RandomState>,
         finished: bool,
     ) -> Result<crate::backend::runtime::distributed::parallel::SynchronizedToken, Error> {
-        let executable = self.model.erased();
+        self.with_shared_operation(|| {
+            self.sample_under_submission(
+                logits,
+                batch_size,
+                sampler,
+                temperature,
+                prng_state,
+                finished,
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn sample_under_submission<S: Sampler<MlxSamplingBackend>>(
+        &self,
+        logits: Option<&MlxTensor>,
+        batch_size: i32,
+        sampler: &mut S,
+        temperature: f32,
+        prng_state: Option<&mut RandomState>,
+        finished: bool,
+    ) -> Result<crate::backend::runtime::distributed::parallel::SynchronizedToken, Error> {
+        self.ensure_healthy()?;
+        let executable = self.payload.model.erased();
         let (group, authority, stream, sampling_rank) =
             executable.partition_sampling_context().ok_or_else(|| {
                 Error::Parallel(
@@ -436,27 +912,23 @@ impl MlxModelSession {
         input: MlxModelInput,
         observer: &mut impl RuntimeActivationObserver<MlxTensor, Exception>,
     ) -> Result<Submission<Array, MlxSessionCompletion>, Error> {
-        let submission_lease = self.begin_submission()?;
-        let result = (|| {
-            let token_validation_scope = TokenValidationScope::begin()?;
-            let output = input.with_borrowed(|input| {
-                self.model.erased_mut().prefill_with_observer(
-                    input,
-                    None,
-                    backend.stream(),
-                    &mut ArrayObserverAdapter { inner: observer },
-                )
-            })?;
-            Ok(model_array_submission(
-                output,
-                token_validation_scope.finish(),
-                submission_lease.clone(),
-            ))
-        })();
-        if result.is_err() {
-            submission_lease.release();
-        }
-        result
+        let mut operation = self.begin_submission(backend)?;
+        let token_validation_scope = TokenValidationScope::begin()?;
+        let output = input.with_borrowed(|input| {
+            operation.model().erased_mut().prefill_with_observer(
+                input,
+                None,
+                backend.stream(),
+                &mut ArrayObserverAdapter { inner: observer },
+            )
+        });
+        let (output, owner, recovery) = operation.finish_execution(output)?;
+        Ok(model_array_submission(
+            output,
+            token_validation_scope.finish(),
+            owner,
+            recovery,
+        ))
     }
 
     fn submit_decode_with_observer(
@@ -465,24 +937,20 @@ impl MlxModelSession {
         input: Array,
         observer: &mut impl RuntimeActivationObserver<MlxTensor, Exception>,
     ) -> Result<Submission<Array, MlxSessionCompletion>, Error> {
-        let submission_lease = self.begin_submission()?;
-        let result = (|| {
-            let token_validation_scope = TokenValidationScope::begin()?;
-            let output = self.model.erased_mut().decode_with_observer(
-                &input,
-                backend.stream(),
-                &mut ArrayObserverAdapter { inner: observer },
-            )?;
-            Ok(model_array_submission(
-                output,
-                token_validation_scope.finish(),
-                submission_lease.clone(),
-            ))
-        })();
-        if result.is_err() {
-            submission_lease.release();
-        }
-        result
+        let mut operation = self.begin_submission(backend)?;
+        let token_validation_scope = TokenValidationScope::begin()?;
+        let output = operation.model().erased_mut().decode_with_observer(
+            &input,
+            backend.stream(),
+            &mut ArrayObserverAdapter { inner: observer },
+        );
+        let (output, owner, recovery) = operation.finish_execution(output)?;
+        Ok(model_array_submission(
+            output,
+            token_validation_scope.finish(),
+            owner,
+            recovery,
+        ))
     }
 }
 
@@ -501,23 +969,19 @@ impl<'a> BackendSession<MlxBackend<'a>> for MlxModelSession {
         backend: &MlxBackend<'a>,
         input: Self::PrefillInput,
     ) -> Result<Submission<Self::Output, Self::Completion>, Error> {
-        let submission_lease = self.begin_submission()?;
-        let result = (|| {
-            let token_validation_scope = TokenValidationScope::begin()?;
-            let output = input
-                .with_borrowed(|input| prefill_model(&mut self.model, input, backend.stream()))?;
-            let public_output = self.model.erased().partition_public_output();
-            Ok(model_submission(
-                output,
-                token_validation_scope.finish(),
-                public_output,
-                submission_lease.clone(),
-            ))
-        })();
-        if result.is_err() {
-            submission_lease.release();
-        }
-        result
+        let mut operation = self.begin_submission(backend)?;
+        let token_validation_scope = TokenValidationScope::begin()?;
+        let output =
+            input.with_borrowed(|input| prefill_model(operation.model(), input, backend.stream()));
+        let public_output = operation.model().erased().partition_public_output();
+        let (output, owner, recovery) = operation.finish_execution(output)?;
+        Ok(owned_model_submission(
+            output,
+            token_validation_scope.finish(),
+            public_output,
+            owner,
+            recovery,
+        ))
     }
 
     fn decode(
@@ -525,22 +989,7 @@ impl<'a> BackendSession<MlxBackend<'a>> for MlxModelSession {
         backend: &MlxBackend<'a>,
         input: Self::DecodeInput,
     ) -> Result<Submission<Self::Output, Self::Completion>, Error> {
-        let submission_lease = self.begin_submission()?;
-        let result = (|| {
-            let token_validation_scope = TokenValidationScope::begin()?;
-            let output = decode_model(&mut self.model, &input, backend.stream())?;
-            let public_output = self.model.erased().partition_public_output();
-            Ok(model_submission(
-                output,
-                token_validation_scope.finish(),
-                public_output,
-                submission_lease.clone(),
-            ))
-        })();
-        if result.is_err() {
-            submission_lease.release();
-        }
-        result
+        self.submit_decode_input(backend, || Ok(input))
     }
 
     fn observe_output(
@@ -548,16 +997,19 @@ impl<'a> BackendSession<MlxBackend<'a>> for MlxModelSession {
         backend: &MlxBackend<'a>,
         output: &Self::Output,
     ) -> Result<ObservationSet, Error> {
-        let mut observations = ObservationSet::new();
-        if let Some(logits) = output.logits() {
-            observations
-                .insert(
-                    eredu_core::MODEL_LOGITS_OBSERVATION_PATH,
-                    ObservationValue::Tensor(observe_tensor(logits, backend.stream())?),
-                )
-                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        }
-        Ok(observations)
+        self.validate_backend(backend)?;
+        self.with_shared_operation(|| {
+            let mut observations = ObservationSet::new();
+            if let Some(logits) = output.logits() {
+                observations
+                    .insert(
+                        eredu_core::MODEL_LOGITS_OBSERVATION_PATH,
+                        ObservationValue::Tensor(observe_tensor(logits, backend.stream())?),
+                    )
+                    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+            }
+            Ok(observations)
+        })
     }
 }
 
@@ -571,12 +1023,13 @@ impl<'a> InspectableBackendSession<MlxBackend<'a>> for MlxModelSession {
         let mut collector = InspectionCollector::new(request);
         let submission = self.submit_prefill_with_observer(backend, input, &mut collector)?;
         let logits = submission.wait()?;
-        let output = if self.model.erased().partition_public_output() {
+        let output = if self.payload.model.erased().partition_public_output() {
             MlxModelOutput::new(Some(MlxTensor::from_array(logits)))
         } else {
             MlxModelOutput::new(None)
         };
-        let observations = collector.materialize(backend.stream())?;
+        let observations =
+            self.with_shared_operation(|| collector.materialize(backend.stream()))?;
         Ok(InspectedOutput {
             output,
             observations,
@@ -592,12 +1045,13 @@ impl<'a> InspectableBackendSession<MlxBackend<'a>> for MlxModelSession {
         let mut collector = InspectionCollector::new(request);
         let submission = self.submit_decode_with_observer(backend, input, &mut collector)?;
         let logits = submission.wait()?;
-        let output = if self.model.erased().partition_public_output() {
+        let output = if self.payload.model.erased().partition_public_output() {
             MlxModelOutput::new(Some(MlxTensor::from_array(logits)))
         } else {
             MlxModelOutput::new(None)
         };
-        let observations = collector.materialize(backend.stream())?;
+        let observations =
+            self.with_shared_operation(|| collector.materialize(backend.stream()))?;
         Ok(InspectedOutput {
             output,
             observations,
@@ -615,36 +1069,38 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
         _: &Self,
         config: TextGenerationConfig,
     ) -> Result<Self::TextGenerationState, Error> {
-        let sampling = config.sampling();
-        let prng = if sampling.temperature == 0.0 {
-            None
-        } else {
-            Some(RandomState::from_key(safemlx::random::key(config.seed())?))
-        };
-        let sampler = match config.strategy() {
-            TextSamplingStrategy::Standard => {
-                MlxTextSampler::Standard(GenerationSampler::from_resolved(sampling))
-            }
-            TextSamplingStrategy::MirostatV2 { tau, eta } => {
-                let sampler = MirostatV2Sampler::new(tau, eta)
-                    .map_err(|error| eredu_core::BackendError::Execution {
-                        session: "text-generation".into(),
-                        operation: "configure Mirostat V2".into(),
-                        message: error.to_string(),
-                    })?
-                    .penalties(
-                        sampling.repetition_penalty,
-                        sampling.repeat_last_n,
-                        sampling.frequency_penalty,
-                        sampling.presence_penalty,
-                    );
-                MlxTextSampler::MirostatV2(sampler)
-            }
-        };
-        Ok(MlxTextGenerationState {
-            temperature: sampling.temperature,
-            prng,
-            sampler,
+        super::recovery::detached(Vec::new(), || {
+            let sampling = config.sampling();
+            let prng = if sampling.temperature == 0.0 {
+                None
+            } else {
+                Some(RandomState::from_key(safemlx::random::key(config.seed())?))
+            };
+            let sampler = match config.strategy() {
+                TextSamplingStrategy::Standard => {
+                    MlxTextSampler::Standard(GenerationSampler::from_resolved(sampling))
+                }
+                TextSamplingStrategy::MirostatV2 { tau, eta } => {
+                    let sampler = MirostatV2Sampler::new(tau, eta)
+                        .map_err(|error| eredu_core::BackendError::Execution {
+                            session: "text-generation".into(),
+                            operation: "configure Mirostat V2".into(),
+                            message: error.to_string(),
+                        })?
+                        .penalties(
+                            sampling.repetition_penalty,
+                            sampling.repeat_last_n,
+                            sampling.frequency_penalty,
+                            sampling.presence_penalty,
+                        );
+                    MlxTextSampler::MirostatV2(sampler)
+                }
+            };
+            Ok(MlxTextGenerationState {
+                temperature: sampling.temperature,
+                prng,
+                sampler,
+            })
         })
     }
 
@@ -657,17 +1113,19 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
                 "text generation requires at least one prompt token".into(),
             ));
         }
-        let tokens =
-            Array::from(prompt_token_ids.as_slice()).try_index_device(NewAxis, backend.stream())?;
-        let parts = [input::input_part(
-            InputModality::Text,
-            input::InputPayload::TokenIds(tokens),
-            [],
-            [],
-        )?];
-        MlxModelInput::from(input::ModelInput::new(&parts)).with_semantic_content_fingerprint(
-            eredu_core::cache::prompt_cache_token_fingerprint(&prompt_token_ids),
-        )
+        super::recovery::detached(Vec::new(), || {
+            let tokens = Array::from(prompt_token_ids.as_slice())
+                .try_index_device(NewAxis, backend.stream())?;
+            let parts = [input::input_part(
+                InputModality::Text,
+                input::InputPayload::TokenIds(tokens),
+                [],
+                [],
+            )?];
+            MlxModelInput::from(input::ModelInput::new(&parts)).with_semantic_content_fingerprint(
+                eredu_core::cache::prompt_cache_token_fingerprint(&prompt_token_ids),
+            )
+        })
     }
 
     fn submit_text_prefill(
@@ -688,8 +1146,15 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
         state: &mut Self::TextGenerationState,
     ) -> Result<Submission<Self::Token, Self::TextCompletion>, Error> {
         let stream = runtime.backend().stream().clone();
-        let input = token.value.try_index_device((.., NewAxis), &stream)?;
-        let submission = runtime.decode(input)?;
+        let (backend, session) = runtime.parts_mut();
+        let submission = session.submit_decode_input(backend, || {
+            #[cfg(test)]
+            crate::tests::support::path_instrumentation::session_input_creation_attempt();
+            token
+                .value
+                .try_index_device((.., NewAxis), &stream)
+                .map_err(Into::into)
+        })?;
         sample_text_submission(runtime.session(), submission, filter, state, stream)
     }
 }
@@ -697,7 +1162,8 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
 fn model_array_submission(
     output: Array,
     token_validations: TokenValidationBatch,
-    submission_lease: SessionSubmissionLease,
+    owner: Rc<SubmissionResources>,
+    recovery: Recovery<ScopeRetention>,
 ) -> Submission<Array, MlxSessionCompletion> {
     let mut retained = Vec::with_capacity(1 + token_validations.arrays().count());
     retained.push(output.clone());
@@ -708,23 +1174,39 @@ fn model_array_submission(
             inner: MlxSessionCompletionKind::Model {
                 token_validations,
                 _retained: retained,
-                submission_lease,
+                owner,
+                recovery: RefCell::new(Some(recovery)),
+                observation_error: RefCell::new(None),
             },
         },
     }
 }
 
-pub(super) fn model_submission(
+fn owned_model_submission(
     output: Array,
     token_validations: TokenValidationBatch,
     public_output: bool,
-    submission_lease: SessionSubmissionLease,
+    owner: Rc<SubmissionResources>,
+    recovery: Recovery<ScopeRetention>,
 ) -> Submission<MlxModelOutput, MlxSessionCompletion> {
-    let submission = model_array_submission(output, token_validations, submission_lease);
+    let submission = model_array_submission(output, token_validations, owner, recovery);
     Submission {
         output: MlxModelOutput::new(
             public_output.then(|| MlxTensor::from_array(submission.output)),
         ),
         completion: submission.completion,
     }
+}
+
+#[cfg(test)]
+pub(super) fn model_submission(
+    output: Array,
+    token_validations: TokenValidationBatch,
+    public_output: bool,
+    submission_lease: SubmissionLease,
+) -> Submission<MlxModelOutput, MlxSessionCompletion> {
+    let owner = SubmissionResources::new(submission_lease, Rc::new(Cell::new(false)));
+    let mut recovery = owner.recovery().unwrap();
+    recovery.seal();
+    owned_model_submission(output, token_validations, public_output, owner, recovery)
 }

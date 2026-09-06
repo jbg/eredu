@@ -833,6 +833,8 @@ impl RealtimeObservationRequirements {
 /// Exact source, execution, placement, and observation selection request.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct RealtimeSelectionRequest {
+    max_cached_shards: usize,
+    required_session_capabilities: SessionCapabilities,
     source: RealtimeIdentity,
     execution: RealtimeIdentity,
     residency: LayerWeightResidency,
@@ -843,6 +845,19 @@ pub struct RealtimeSelectionRequest {
 }
 
 impl RealtimeSelectionRequest {
+    /// Requires exact portable session facilities independently of requested observations.
+    pub const fn with_required_session_capabilities(
+        mut self,
+        required: SessionCapabilities,
+    ) -> Self {
+        self.required_session_capabilities = required;
+        self
+    }
+    /// Sets the source reader-cache limit independently of executable residency.
+    pub const fn with_max_cached_shards(mut self, maximum: std::num::NonZeroUsize) -> Self {
+        self.max_cached_shards = maximum.get();
+        self
+    }
     /// Creates one complete fail-closed selection request.
     pub fn new(
         source: RealtimeIdentity,
@@ -856,6 +871,8 @@ impl RealtimeSelectionRequest {
         Self {
             source,
             execution,
+            max_cached_shards: residency.max_cached_shards(),
+            required_session_capabilities: SessionCapabilities::default(),
             residency,
             state,
             architecture_proof,
@@ -941,6 +958,7 @@ impl SelectedRealtimeStateRealization {
 /// One immutable realtime realization selected before native construction.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct SelectedRealtimeRealization {
+    max_cached_shards: usize,
     requirements: RealtimeArchitectureRequirements,
     source: RealtimeIdentity,
     execution: RealtimeExecutionRequirements,
@@ -953,6 +971,10 @@ pub struct SelectedRealtimeRealization {
 }
 
 impl SelectedRealtimeRealization {
+    /// Returns the exact source reader-cache bound retained during selection.
+    pub const fn max_cached_shards(&self) -> usize {
+        self.max_cached_shards
+    }
     /// Returns the complete architecture requirements selected once.
     pub const fn requirements(&self) -> &RealtimeArchitectureRequirements {
         &self.requirements
@@ -1286,7 +1308,12 @@ pub fn select_realtime_realization(
     if !capabilities.state.reset() {
         issues.push(RealtimeSelectionIssue::MissingStateReset);
     }
-    if (request.observations.output() || request.observations.requires_activations())
+    if (request.observations.output()
+        || request.observations.requires_activations()
+        || request.required_session_capabilities.output_observation()
+        || request
+            .required_session_capabilities
+            .activation_inspection())
         && !capabilities.state.observation_retention()
     {
         issues.push(RealtimeSelectionIssue::MissingStateObservationRetention);
@@ -1306,10 +1333,16 @@ pub fn select_realtime_realization(
     if !capabilities.session.persistent_cache() {
         issues.push(RealtimeSelectionIssue::MissingPersistentState);
     }
-    if request.observations.output() && !capabilities.session.output_observation() {
+    if (request.observations.output() || request.required_session_capabilities.output_observation())
+        && !capabilities.session.output_observation()
+    {
         issues.push(RealtimeSelectionIssue::MissingOutputObservation);
     }
-    if request.observations.requires_activations() && !capabilities.session.activation_inspection()
+    if (request.observations.requires_activations()
+        || request
+            .required_session_capabilities
+            .activation_inspection())
+        && !capabilities.session.activation_inspection()
     {
         issues.push(RealtimeSelectionIssue::MissingActivationInspection);
     }
@@ -1334,6 +1367,7 @@ pub fn select_realtime_realization(
         observation_retention: capabilities.state.observation_retention(),
     };
     Ok(SelectedRealtimeRealization {
+        max_cached_shards: request.max_cached_shards,
         requirements: requirements.clone(),
         source: request.source.clone(),
         execution: execution
@@ -1837,6 +1871,178 @@ mod tests {
             SessionCapabilities::new(true, true, true),
         )
         .with_observation_identities([identity("temporal.layer.0"), identity("depth.slice.0")])
+    }
+
+    struct SyntheticRealtimeSupport {
+        supported: bool,
+        lowering_queries: std::cell::Cell<usize>,
+        state_queries: std::cell::Cell<usize>,
+    }
+
+    impl crate::RealtimeMechanismSupport for SyntheticRealtimeSupport {
+        fn facts(&self) -> crate::RealtimeMechanismFacts {
+            let state = if self.supported {
+                crate::StateLifecycleCapabilities::new()
+                    .with_transactions(true, true)
+                    .with_reset(true)
+                    .with_observation_retention(true)
+            } else {
+                crate::StateLifecycleCapabilities::new()
+            };
+            crate::RealtimeMechanismFacts::new(
+                required_operators(),
+                required_mechanisms(),
+                [
+                    ExecutionResidency::FullyResident,
+                    ExecutionResidency::LayerwiseHost,
+                ],
+                NonZeroUsize::new(2).unwrap(),
+                completion_capabilities(),
+                SessionCapabilities::new(true, true, true),
+            )
+            .with_state_lifecycle(state)
+            .with_observation_identities([identity("temporal.layer.0"), identity("depth.slice.0")])
+        }
+
+        fn supports_lowering(
+            &self,
+            _descriptor: &WeightLoweringDescriptor,
+            _kind: WeightLoweringKind,
+        ) -> bool {
+            self.lowering_queries.set(self.lowering_queries.get() + 1);
+            self.supported
+        }
+
+        fn state_component_placements(
+            &self,
+            _component: &eredu_core::cache::StateComponentPolicy,
+        ) -> (
+            Option<StateComponentPlacement>,
+            Option<StateComponentPlacement>,
+        ) {
+            self.state_queries.set(self.state_queries.get() + 1);
+            (
+                self.supported.then_some(StateComponentPlacement::Device),
+                None,
+            )
+        }
+    }
+
+    #[test]
+    fn realtime_synthesis_matches_independent_oracle_and_deduplicates_all_executions() {
+        let requirements = requirements();
+        let support = SyntheticRealtimeSupport {
+            supported: true,
+            lowering_queries: std::cell::Cell::new(0),
+            state_queries: std::cell::Cell::new(0),
+        };
+        let synthesized = crate::synthesize_realtime_capabilities(&requirements, &support);
+        assert_eq!(synthesized, capabilities());
+        assert_eq!(support.lowering_queries.get(), 2);
+        assert_eq!(synthesized.weight_lowerings().len(), 1);
+        assert_eq!(
+            support.state_queries.get(),
+            synthesized.state().components().len()
+        );
+        assert_eq!(
+            select_realtime_realization(&requirements, &request(&requirements), &synthesized),
+            select_realtime_realization(&requirements, &request(&requirements), &capabilities()),
+        );
+    }
+
+    #[test]
+    fn realtime_synthesis_preserves_kind_and_fails_closed_for_missing_mechanisms() {
+        let mut requirements = requirements();
+        requirements.executions[1].weight_lowerings = vec![lowering_requirement(
+            "target.weight",
+            LinearFormat::Dense,
+            WeightLoweringKind::Derived,
+        )];
+        let mut support = SyntheticRealtimeSupport {
+            supported: true,
+            lowering_queries: std::cell::Cell::new(0),
+            state_queries: std::cell::Cell::new(0),
+        };
+        let synthesized = crate::synthesize_realtime_capabilities(&requirements, &support);
+        assert_eq!(synthesized.weight_lowerings().len(), 2);
+        assert_eq!(
+            synthesized.weight_lowerings()[0].kind(),
+            WeightLoweringKind::Direct
+        );
+        assert_eq!(
+            synthesized.weight_lowerings()[1].kind(),
+            WeightLoweringKind::Derived
+        );
+        support.supported = false;
+        let absent = crate::synthesize_realtime_capabilities(&requirements, &support);
+        assert!(absent.weight_lowerings().is_empty());
+        assert!(absent.state().components().is_empty());
+        assert!(!absent.state().checkpoint());
+        assert!(!absent.state().rollback());
+        assert!(!absent.state().reset());
+        assert!(!absent.state().observation_retention());
+        assert!(
+            select_realtime_realization(&requirements, &request(&requirements), &absent).is_err()
+        );
+    }
+
+    #[test]
+    fn realtime_synthesis_rejects_portably_invalid_geometry_before_native_predicates() {
+        let mut requirements = requirements();
+        for execution in &mut requirements.executions {
+            execution.weight_lowerings[0].descriptor = WeightLoweringDescriptor::new(
+                SourceTensorEncoding::Safetensors(StoredDtype::F32),
+                LinearFormat::Dense,
+                vec![2, 3],
+                vec![2, 4],
+                None,
+            )
+            .unwrap();
+        }
+        let support = SyntheticRealtimeSupport {
+            supported: true,
+            lowering_queries: std::cell::Cell::new(0),
+            state_queries: std::cell::Cell::new(0),
+        };
+        let capabilities = crate::synthesize_realtime_capabilities(&requirements, &support);
+        assert!(capabilities.weight_lowerings().is_empty());
+        assert_eq!(support.lowering_queries.get(), 0);
+        assert!(
+            select_realtime_realization(&requirements, &request(&requirements), &capabilities)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn realtime_session_requirements_do_not_depend_on_observation_requests() {
+        let requirements = requirements();
+        for required in [
+            SessionCapabilities::new(false, true, false),
+            SessionCapabilities::new(false, false, true),
+        ] {
+            let mut request = request(&requirements).with_required_session_capabilities(required);
+            request.observations = RealtimeObservationRequirements::new(false, []);
+            let mut capabilities = capabilities();
+            capabilities.session = SessionCapabilities::new(true, false, false);
+            let error =
+                select_realtime_realization(&requirements, &request, &capabilities).unwrap_err();
+            assert_eq!(
+                error.issues(),
+                if required.output_observation() {
+                    &[RealtimeSelectionIssue::MissingOutputObservation][..]
+                } else {
+                    &[RealtimeSelectionIssue::MissingActivationInspection][..]
+                }
+            );
+            capabilities.session = SessionCapabilities::new(true, true, true);
+            capabilities.state = capabilities.state.with_observation_retention(false);
+            let error =
+                select_realtime_realization(&requirements, &request, &capabilities).unwrap_err();
+            assert_eq!(
+                error.issues(),
+                &[RealtimeSelectionIssue::MissingStateObservationRetention]
+            );
+        }
     }
 
     #[test]

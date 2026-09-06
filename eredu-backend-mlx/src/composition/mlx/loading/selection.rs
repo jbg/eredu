@@ -30,7 +30,9 @@ pub(crate) fn prepare_selected_sources(
     let sources = prepare_model_sources(plan, selected)
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     #[cfg(test)]
-    if sources.format() == eredu_core::ArtifactFormat::Gguf {
+    {
+        // Every admitted primary source is prepared once, independent of its
+        // container format; target/extension views share that same source.
         crate::tests::support::path_instrumentation::payload_open();
         for _ in sources.companions() {
             crate::tests::support::path_instrumentation::payload_open();

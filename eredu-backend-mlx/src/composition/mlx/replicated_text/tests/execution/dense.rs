@@ -6,11 +6,14 @@ fn both_text_architectures_retain_exact_sharded_admission_with_one_cached_payloa
         let inspection = eredu_architectures::configuration::inspect_artifact(root.path()).unwrap();
         let streaming =
             eredu_runtime::DenseDiskStreamLoadOptions::default().with_max_cached_shards(1);
-        let options = crate::MlxLoadRequest::default()
-            .with_weight_residency(eredu_runtime::WeightResidency::dense_disk_stream(streaming));
+        let options = crate::MlxLoadRequest::from_normalized(
+            eredu_runtime::NormalizedLoadRequest::default().with_weight_residency(
+                eredu_runtime::WeightResidency::dense_disk_stream(streaming),
+            ),
+        );
         let plan = eredu_core::plan_model_preparation(
             inspection,
-            options.preparation_policy().unwrap(),
+            options.normalized().preparation_policy().unwrap(),
             eredu_core::SessionCapabilities::default(),
         )
         .unwrap();
@@ -366,16 +369,18 @@ fn gpt_oss_gguf_uses_generic_routed_execution_for_both_residencies() {
         let inspection = eredu_architectures::configuration::inspect_artifact(&path).unwrap();
         let mut options = crate::MlxLoadRequest::default();
         if addressable {
-            options = options.with_weight_residency(
-                eredu_runtime::WeightResidency::with_independent_parameter_banks(
-                    eredu_runtime::OrdinaryWeightResidency::FullyResident,
-                    eredu_runtime::ParameterBankLoadOptions::default(),
+            options = crate::MlxLoadRequest::from_normalized(
+                options.normalized().clone().with_weight_residency(
+                    eredu_runtime::WeightResidency::with_independent_parameter_banks(
+                        eredu_runtime::OrdinaryWeightResidency::FullyResident,
+                        eredu_runtime::ParameterBankLoadOptions::default(),
+                    ),
                 ),
             );
         }
         let plan = eredu_core::plan_model_preparation(
             inspection,
-            options.preparation_policy().unwrap(),
+            options.normalized().preparation_policy().unwrap(),
             eredu_core::SessionCapabilities::default(),
         )
         .unwrap();
@@ -750,7 +755,7 @@ fn generic_handoff_executes_every_replicated_state_profile() {
         crate::tests::support::path_instrumentation::Counts {
             architecture_constructions: 5,
             state_allocations: 5,
-            payload_opens: 0,
+            payload_opens: 5,
             constructors: 5,
             unit_constructions: 12,
             materializations: 0,

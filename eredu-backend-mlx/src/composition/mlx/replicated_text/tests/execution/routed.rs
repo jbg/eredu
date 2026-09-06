@@ -5,18 +5,20 @@ fn routed_deepseek_v4_pooling_state_uses_shared_checkpoint_and_prompt_cache_cont
     let paged = PagedCacheOptions::new(4, 1 << 20, 1 << 20, 1)
         .unwrap()
         .with_full_attention(true);
-    let options = crate::MlxLoadRequest::default()
-        .with_weight_residency(
-            eredu_runtime::WeightResidency::with_independent_parameter_banks(
-                eredu_runtime::OrdinaryWeightResidency::FullyResident,
-                eredu_runtime::ParameterBankLoadOptions::default(),
-            ),
-        )
-        .with_state_residency(CacheResidencyPolicy::Paged(paged));
+    let options = crate::MlxLoadRequest::from_normalized(
+        eredu_runtime::NormalizedLoadRequest::default()
+            .with_weight_residency(
+                eredu_runtime::WeightResidency::with_independent_parameter_banks(
+                    eredu_runtime::OrdinaryWeightResidency::FullyResident,
+                    eredu_runtime::ParameterBankLoadOptions::default(),
+                ),
+            )
+            .with_state_residency(CacheResidencyPolicy::Paged(paged)),
+    );
     let inspection = eredu_architectures::configuration::inspect_artifact(root.path()).unwrap();
     let plan = eredu_core::plan_model_preparation(
         inspection,
-        options.preparation_policy().unwrap(),
+        options.normalized().preparation_policy().unwrap(),
         eredu_core::SessionCapabilities::default(),
     )
     .unwrap();
@@ -92,16 +94,18 @@ fn routed_deepseek_v4_executes_resident_and_addressable_with_pooling_state() {
         let inspection = eredu_architectures::configuration::inspect_artifact(root.path()).unwrap();
         let mut options = crate::MlxLoadRequest::default();
         if addressable {
-            options = options.with_weight_residency(
-                eredu_runtime::WeightResidency::with_independent_parameter_banks(
-                    eredu_runtime::OrdinaryWeightResidency::FullyResident,
-                    eredu_runtime::ParameterBankLoadOptions::default(),
+            options = crate::MlxLoadRequest::from_normalized(
+                options.normalized().clone().with_weight_residency(
+                    eredu_runtime::WeightResidency::with_independent_parameter_banks(
+                        eredu_runtime::OrdinaryWeightResidency::FullyResident,
+                        eredu_runtime::ParameterBankLoadOptions::default(),
+                    ),
                 ),
             );
         }
         let plan = eredu_core::plan_model_preparation(
             inspection,
-            options.preparation_policy().unwrap(),
+            options.normalized().preparation_policy().unwrap(),
             eredu_core::SessionCapabilities::default(),
         )
         .unwrap();
@@ -166,15 +170,17 @@ fn routed_only_default_observation_intervenes_on_provider_output() {
     let (stream, weights_stream) = execution_streams();
     let root = tiny_artifact("qwen3_moe", false);
     let inspection = eredu_architectures::configuration::inspect_artifact(root.path()).unwrap();
-    let options = crate::MlxLoadRequest::default().with_weight_residency(
-        eredu_runtime::WeightResidency::with_independent_parameter_banks(
-            eredu_runtime::OrdinaryWeightResidency::FullyResident,
-            eredu_runtime::ParameterBankLoadOptions::default(),
+    let options = crate::MlxLoadRequest::from_normalized(
+        eredu_runtime::NormalizedLoadRequest::default().with_weight_residency(
+            eredu_runtime::WeightResidency::with_independent_parameter_banks(
+                eredu_runtime::OrdinaryWeightResidency::FullyResident,
+                eredu_runtime::ParameterBankLoadOptions::default(),
+            ),
         ),
     );
     let plan = eredu_core::plan_model_preparation(
         inspection,
-        options.preparation_policy().unwrap(),
+        options.normalized().preparation_policy().unwrap(),
         eredu_core::SessionCapabilities::default(),
     )
     .unwrap();
@@ -252,16 +258,18 @@ fn routed_session_observation_reports_shared_combination_and_intervenes_causally
         let inspection = eredu_architectures::configuration::inspect_artifact(root.path()).unwrap();
         let mut options = crate::MlxLoadRequest::default();
         if addressable {
-            options = options.with_weight_residency(
-                eredu_runtime::WeightResidency::with_independent_parameter_banks(
-                    eredu_runtime::OrdinaryWeightResidency::FullyResident,
-                    eredu_runtime::ParameterBankLoadOptions::default(),
+            options = crate::MlxLoadRequest::from_normalized(
+                options.normalized().clone().with_weight_residency(
+                    eredu_runtime::WeightResidency::with_independent_parameter_banks(
+                        eredu_runtime::OrdinaryWeightResidency::FullyResident,
+                        eredu_runtime::ParameterBankLoadOptions::default(),
+                    ),
                 ),
             );
         }
         let plan = eredu_core::plan_model_preparation(
             inspection,
-            options.preparation_policy().unwrap(),
+            options.normalized().preparation_policy().unwrap(),
             eredu_core::SessionCapabilities::default(),
         )
         .unwrap();
@@ -312,16 +320,18 @@ fn routed_gated_families_execute_resident_and_addressable_with_heterogeneous_sta
                 eredu_architectures::configuration::inspect_artifact(root.path()).unwrap();
             let mut options = crate::MlxLoadRequest::default();
             if addressable {
-                options = options.with_weight_residency(
-                    eredu_runtime::WeightResidency::with_independent_parameter_banks(
-                        eredu_runtime::OrdinaryWeightResidency::FullyResident,
-                        eredu_runtime::ParameterBankLoadOptions::default(),
+                options = crate::MlxLoadRequest::from_normalized(
+                    options.normalized().clone().with_weight_residency(
+                        eredu_runtime::WeightResidency::with_independent_parameter_banks(
+                            eredu_runtime::OrdinaryWeightResidency::FullyResident,
+                            eredu_runtime::ParameterBankLoadOptions::default(),
+                        ),
                     ),
                 );
             }
             let plan = eredu_core::plan_model_preparation(
                 inspection,
-                options.preparation_policy().unwrap(),
+                options.normalized().preparation_policy().unwrap(),
                 eredu_core::SessionCapabilities::default(),
             )
             .unwrap();
@@ -355,16 +365,18 @@ fn routed_nemotron_relu2_executes_resident_and_addressable_with_mixed_state() {
         let inspection = eredu_architectures::configuration::inspect_artifact(root.path()).unwrap();
         let mut options = crate::MlxLoadRequest::default();
         if addressable {
-            options = options.with_weight_residency(
-                eredu_runtime::WeightResidency::with_independent_parameter_banks(
-                    eredu_runtime::OrdinaryWeightResidency::FullyResident,
-                    eredu_runtime::ParameterBankLoadOptions::default(),
+            options = crate::MlxLoadRequest::from_normalized(
+                options.normalized().clone().with_weight_residency(
+                    eredu_runtime::WeightResidency::with_independent_parameter_banks(
+                        eredu_runtime::OrdinaryWeightResidency::FullyResident,
+                        eredu_runtime::ParameterBankLoadOptions::default(),
+                    ),
                 ),
             );
         }
         let plan = eredu_core::plan_model_preparation(
             inspection,
-            options.preparation_policy().unwrap(),
+            options.normalized().preparation_policy().unwrap(),
             eredu_core::SessionCapabilities::default(),
         )
         .unwrap();
@@ -444,15 +456,18 @@ fn gpt_oss_load_time_transform_preserves_native_experts_in_both_residencies() {
                 && parameter.lowering() == eredu_runtime::WeightLoweringKind::Transform
         }));
 
-        let options =
-            crate::MlxLoadRequest::with_quantization(eredu_core::QuantizationRequest::Affine {
-                group_size: 32,
-                bits: 4,
-            })
-            .with_weight_residency(weights);
+        let options = crate::MlxLoadRequest::from_normalized(
+            eredu_runtime::NormalizedLoadRequest::with_quantization(
+                eredu_core::QuantizationRequest::Affine {
+                    group_size: 32,
+                    bits: 4,
+                },
+            )
+            .with_weight_residency(weights),
+        );
         let plan = eredu_core::plan_model_preparation(
             inspection,
-            options.preparation_policy().unwrap(),
+            options.normalized().preparation_policy().unwrap(),
             eredu_core::SessionCapabilities::default(),
         )
         .unwrap();
@@ -495,15 +510,18 @@ fn routed_addressable_load_time_transform_uses_selected_bank_geometry() {
             eredu_runtime::OrdinaryWeightResidency::FullyResident,
             eredu_runtime::ParameterBankLoadOptions::default(),
         );
-        let options =
-            crate::MlxLoadRequest::with_quantization(eredu_core::QuantizationRequest::Affine {
-                group_size: 32,
-                bits: 4,
-            })
-            .with_weight_residency(residency);
+        let options = crate::MlxLoadRequest::from_normalized(
+            eredu_runtime::NormalizedLoadRequest::with_quantization(
+                eredu_core::QuantizationRequest::Affine {
+                    group_size: 32,
+                    bits: 4,
+                },
+            )
+            .with_weight_residency(residency),
+        );
         let plan = eredu_core::plan_model_preparation(
             inspection,
-            options.preparation_policy().unwrap(),
+            options.normalized().preparation_policy().unwrap(),
             eredu_core::SessionCapabilities::default(),
         )
         .unwrap();
@@ -551,10 +569,12 @@ fn routed_addressable_storage_executes_qwen_and_gpt_oss_repeated_decode() {
             eredu_runtime::OrdinaryWeightResidency::FullyResident,
             eredu_runtime::ParameterBankLoadOptions::default(),
         );
-        let options = crate::MlxLoadRequest::default().with_weight_residency(residency);
+        let options = crate::MlxLoadRequest::from_normalized(
+            eredu_runtime::NormalizedLoadRequest::default().with_weight_residency(residency),
+        );
         let plan = eredu_core::plan_model_preparation(
             inspection,
-            options.preparation_policy().unwrap(),
+            options.normalized().preparation_policy().unwrap(),
             eredu_core::SessionCapabilities::default(),
         )
         .unwrap();
@@ -607,16 +627,18 @@ fn routed_qwen_gguf_executes_resident_and_addressable_through_generic_compositio
             eredu_architectures::configuration::inspect_artifact(artifact.path()).unwrap();
         let mut options = crate::MlxLoadRequest::default();
         if addressable {
-            options = options.with_weight_residency(
-                eredu_runtime::WeightResidency::with_independent_parameter_banks(
-                    eredu_runtime::OrdinaryWeightResidency::FullyResident,
-                    eredu_runtime::ParameterBankLoadOptions::default(),
+            options = crate::MlxLoadRequest::from_normalized(
+                options.normalized().clone().with_weight_residency(
+                    eredu_runtime::WeightResidency::with_independent_parameter_banks(
+                        eredu_runtime::OrdinaryWeightResidency::FullyResident,
+                        eredu_runtime::ParameterBankLoadOptions::default(),
+                    ),
                 ),
             );
         }
         let plan = eredu_core::plan_model_preparation(
             inspection,
-            options.preparation_policy().unwrap(),
+            options.normalized().preparation_policy().unwrap(),
             eredu_core::SessionCapabilities::default(),
         )
         .unwrap();

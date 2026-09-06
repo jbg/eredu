@@ -26,21 +26,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let device = DeviceAssignment::new(DeviceType::Gpu, local_index);
     let stream = Stream::new_with_device(&device.device()?);
     let weights_stream = Stream::new_with_device(&device.device()?);
-    let options = eredu_backend_mlx::native::parallel_load_options(
-        topology,
-        device,
-        eredu_runtime::PipelineWireContract::new(eredu_runtime::PipelineActivationDtype::Float32),
-        1,
-        4096,
-        eredu_runtime::CommunicationCompletionPolicy::new(
-            std::time::Duration::from_secs(30),
-            eredu_core::CompletionCancellationMode::QuarantineUntilComplete,
-        )?,
-    )?
-    .with_weight_residency(WeightResidency::with_independent_parameter_banks(
-        OrdinaryWeightResidency::LayerwiseHost(Default::default()),
-        ParameterBankLoadOptions::default(),
-    ));
+    let normalized = eredu_runtime::NormalizedLoadRequest::default().with_weight_residency(
+        WeightResidency::with_independent_parameter_banks(
+            OrdinaryWeightResidency::LayerwiseHost(Default::default()),
+            ParameterBankLoadOptions::default(),
+        ),
+    );
+    let options = eredu_backend_mlx::MlxLoadRequest::from_normalized(normalized)
+        .with_parallel_topology(
+            topology,
+            device,
+            eredu_runtime::PipelineWireContract::new(
+                eredu_runtime::PipelineActivationDtype::Float32,
+            ),
+            1,
+            4096,
+            eredu_runtime::CommunicationCompletionPolicy::new(
+                std::time::Duration::from_secs(30),
+                eredu_core::CompletionCancellationMode::QuarantineUntilComplete,
+            )?,
+        )?;
     let backend = eredu_backend_mlx::native::distributed_backend(&stream, &weights_stream, &group);
     let model = load_model(&backend, &model_dir, options)?;
     if group.rank() == 0 {

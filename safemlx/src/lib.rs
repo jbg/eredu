@@ -36,6 +36,7 @@ pub mod ops;
 pub mod random;
 mod runtime_deadline;
 mod stream;
+mod submission;
 pub mod system;
 pub mod transforms;
 pub mod utils;
@@ -47,6 +48,7 @@ pub use event::*;
 pub use host_transfer::*;
 pub use runtime_deadline::*;
 pub use stream::*;
+pub use submission::*;
 
 /// Registers one idempotent same-thread housekeeping callback.
 ///

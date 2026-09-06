@@ -709,7 +709,7 @@ impl LocalModel {
             .session()
             .residency_report()
             .map_err(|error| LocalBackendError::new("residency telemetry", error))
-            .map(|report| report.as_ref().map(eredu_backend_mlx::residency_telemetry))
+            .map(|report| report.as_ref().map(eredu_runtime::residency_telemetry))
     }
 }
 
@@ -1352,13 +1352,6 @@ pub fn reset_local_allocator_peak() -> Result<(), LocalBackendError> {
     eredu_backend_mlx::reset_allocator_peak()
         .map_err(|error| LocalBackendError::new("allocator peak reset", error))?;
     Ok(())
-}
-
-/// Converts neutral speculative statistics into portable execution telemetry.
-pub fn local_speculative_decoding_telemetry(
-    stats: &eredu_core::speculative::SpeculativeStats,
-) -> crate::SpeculativeDecodingTelemetry {
-    eredu_backend_mlx::speculative_decoding_telemetry(stats)
 }
 
 fn allocator_telemetry() -> Result<crate::AllocatorTelemetry, LocalBackendError> {

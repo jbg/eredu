@@ -1,11 +1,8 @@
 //! MLX adapter over the normalized portable preparation request.
 
-use eredu_core::QuantizationRequest;
-
 use crate::backend::error::Error;
 use eredu_runtime::{
     NormalizedLoadRequest, NormalizedLoadRequestError, ParallelLoadRequest, PipelineWireContract,
-    WeightResidency,
 };
 
 /// Caller request translated into an authoritative realization before materialization.
@@ -41,16 +38,8 @@ impl MlxLoadRequest {
         .expect("test completion policy is positive")
     }
 
-    /// Creates load options that quantize eligible dense weights on load.
-    pub fn with_quantization(quantization: QuantizationRequest) -> Self {
-        Self {
-            normalized: NormalizedLoadRequest::with_quantization(quantization),
-            parallel_device: None,
-        }
-    }
-
     /// Adds a validated MLX parallel topology and its activation wire contract.
-    pub(crate) fn with_parallel_topology(
+    pub fn with_parallel_topology(
         mut self,
         topology: eredu_core::ParallelRankTopology,
         device: crate::backend::DeviceAssignment,
@@ -95,62 +84,6 @@ impl MlxLoadRequest {
         )
     }
 
-    /// Selects the bounded completion policy for every native communication
-    /// operation in the distributed session.
-    pub const fn with_communication_completion_policy(
-        mut self,
-        policy: eredu_runtime::CommunicationCompletionPolicy,
-    ) -> Self {
-        self.normalized.set_communication_completion_policy(policy);
-        self
-    }
-
-    /// Selects fully resident or bounded layer execution for checkpoint weights.
-    pub fn with_weight_residency(mut self, residency: WeightResidency) -> Self {
-        self.normalized = self.normalized.with_weight_residency(residency);
-        self
-    }
-
-    /// Selects the exact mutable-state residency and paging controls.
-    pub fn with_state_residency(mut self, residency: eredu_runtime::CacheResidencyPolicy) -> Self {
-        self.normalized = self.normalized.with_state_residency(residency);
-        self
-    }
-
-    /// Requires capabilities from the exact inspected and realized session.
-    pub fn with_required_session_capabilities(
-        mut self,
-        capabilities: eredu_core::SessionCapabilities,
-    ) -> Self {
-        self.normalized = self
-            .normalized
-            .with_required_session_capabilities(capabilities);
-        self
-    }
-
-    /// Applies the execution plan's drafting mode before target payload selection.
-    pub(crate) fn with_drafting_plan(
-        mut self,
-        plan: &eredu_core::DraftingPlan,
-    ) -> Result<Self, Error> {
-        self.normalized = self
-            .normalized
-            .with_drafting_plan(plan)
-            .map_err(normalized_request_error)?;
-        Ok(self)
-    }
-
-    /// Returns the selected distributed topology, if any.
-    pub(crate) const fn parallel_topology(&self) -> Option<eredu_core::ParallelRankTopology> {
-        self.normalized.parallel_topology()
-    }
-
-    pub(crate) fn parallel_rank_context(
-        &self,
-    ) -> Result<Option<crate::backend::MlxRankContext>, Error> {
-        self.checked_normalized().map(|(_, rank)| rank)
-    }
-
     /// Returns the normalized request atomically paired with its validated MLX rank token.
     pub(crate) fn checked_normalized(
         &self,
@@ -176,45 +109,6 @@ impl MlxLoadRequest {
                 "MLX device assignment requires a parallel topology".into(),
             )),
         }
-    }
-
-    /// Returns the activation wire contract paired with the distributed
-    /// topology, if any.
-    pub const fn pipeline_wire_contract(&self) -> Option<PipelineWireContract> {
-        self.normalized.pipeline_wire_contract()
-    }
-
-    /// Reports whether composition attached a native parallel execution plan.
-    pub const fn has_parallel_execution(&self) -> bool {
-        self.normalized.has_parallel_execution()
-    }
-
-    /// Returns the requested dense-weight transformation, if any.
-    pub const fn quantization(&self) -> Option<QuantizationRequest> {
-        self.normalized.quantization()
-    }
-
-    /// Returns the selected immutable-weight residency policy.
-    pub const fn weight_residency(&self) -> WeightResidency {
-        self.normalized.weight_residency()
-    }
-
-    /// Returns the selected mutable-state residency policy.
-    pub const fn state_residency(&self) -> &eredu_runtime::CacheResidencyPolicy {
-        self.normalized.state_residency()
-    }
-
-    /// Returns the capabilities required from the realized session.
-    pub const fn required_session_capabilities(&self) -> eredu_core::SessionCapabilities {
-        self.normalized.required_session_capabilities()
-    }
-
-    /// Converts these MLX load options into the portable preparation policy.
-    pub fn preparation_policy(&self) -> Result<eredu_core::PreparationPolicy, Error> {
-        self.checked_normalized()?
-            .0
-            .preparation_policy()
-            .map_err(normalized_request_error)
     }
 }
 

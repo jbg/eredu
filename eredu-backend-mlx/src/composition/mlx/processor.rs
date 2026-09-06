@@ -136,26 +136,17 @@ fn mlx_shape(shape: &[usize]) -> Result<Vec<i32>, Error> {
 
 #[cfg(any(feature = "image", feature = "audio"))]
 impl ModelProcessor {
+    /// Wraps a processor already prepared by the architecture construction driver.
+    pub(crate) fn from_prepared(processor: PreparedProcessor) -> Self {
+        Self { processor }
+    }
+
     /// Lowers the authoritative architecture-owned processor plan to MLX execution.
+    #[cfg(test)]
     pub fn from_plan(
         plan: &eredu_architectures::processor_plan::ArtifactArchitecturePlan,
     ) -> Option<Self> {
         PreparedProcessor::from_artifact(plan).map(|processor| Self { processor })
-    }
-
-    /// Instantiates raw preparation only when it belongs to the selected realization.
-    pub fn from_selected(
-        plan: &eredu_architectures::processor_plan::ArtifactArchitecturePlan,
-        selected: &eredu_runtime::SelectedProcessorExecution,
-    ) -> Result<Option<Self>, Error> {
-        if !selected.raw_media() {
-            return Ok(None);
-        }
-        Self::from_plan(plan).map(Some).ok_or_else(|| {
-            Error::Processor(
-                "selected raw-media execution has no retained architecture processor".into(),
-            )
-        })
     }
 
     /// Converts a portable ordered request into owned MLX model input.

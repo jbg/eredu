@@ -121,7 +121,7 @@ pub(super) type MlxPipelinePartitionStrategy<A, S> = eredu_runtime::PartitionedT
     eredu_runtime::OpaqueFailureAgreement,
 >;
 
-pub(super) enum MlxSelectedLayerwisePolicyInner<U, P> {
+pub(super) enum MlxSelectedLayerwisePolicyInner<U: 'static, P> {
     Resident(MlxResidentPolicy<U>),
     Bounded {
         policy: MlxLayerwisePolicy<U, P>,
@@ -129,7 +129,7 @@ pub(super) enum MlxSelectedLayerwisePolicyInner<U, P> {
     },
 }
 
-pub(super) struct MlxSelectedLayerwisePolicy<U, P> {
+pub(super) struct MlxSelectedLayerwisePolicy<U: 'static, P> {
     inner: Arc<Mutex<MlxSelectedLayerwisePolicyInner<U, P>>>,
 }
 
@@ -138,7 +138,7 @@ pub(super) type MlxArchitectureLayerwisePolicy<A, S> = MlxSelectedLayerwisePolic
     MlxSelectiveUnitPopulator,
 >;
 
-impl<U, P> Clone for MlxSelectedLayerwisePolicy<U, P> {
+impl<U: 'static, P> Clone for MlxSelectedLayerwisePolicy<U, P> {
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
@@ -146,7 +146,7 @@ impl<U, P> Clone for MlxSelectedLayerwisePolicy<U, P> {
     }
 }
 
-impl<U, P> MlxSelectedLayerwisePolicy<U, P> {
+impl<U: 'static, P> MlxSelectedLayerwisePolicy<U, P> {
     pub(super) fn resident(policy: MlxResidentPolicy<U>) -> Self {
         Self {
             inner: Arc::new(Mutex::new(MlxSelectedLayerwisePolicyInner::Resident(
@@ -195,12 +195,12 @@ impl<U, P> MlxSelectedLayerwisePolicy<U, P> {
     }
 }
 
-pub(super) enum MlxSelectedUnitLease<U> {
+pub(super) enum MlxSelectedUnitLease<U: 'static> {
     Resident(MlxResidentUnit<U>),
     Bounded(MlxUnitLease<U>),
 }
 
-impl<U> Deref for MlxSelectedUnitLease<U> {
+impl<U: 'static> Deref for MlxSelectedUnitLease<U> {
     type Target = U;
 
     fn deref(&self) -> &Self::Target {
@@ -211,7 +211,7 @@ impl<U> Deref for MlxSelectedUnitLease<U> {
     }
 }
 
-impl<U> DerefMut for MlxSelectedUnitLease<U> {
+impl<U: 'static> DerefMut for MlxSelectedUnitLease<U> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         match self {
             Self::Resident(lease) => lease,
@@ -222,7 +222,7 @@ impl<U> DerefMut for MlxSelectedUnitLease<U> {
 
 impl<U, P> eredu_runtime::LayerwisePolicy<MlxNeuralBackend, U> for MlxSelectedLayerwisePolicy<U, P>
 where
-    U: eredu_nn::Parameterized<MlxTensor>,
+    U: eredu_nn::Parameterized<MlxTensor> + 'static,
     P: MlxUnitPopulator<U>,
 {
     type Lease = MlxSelectedUnitLease<U>;

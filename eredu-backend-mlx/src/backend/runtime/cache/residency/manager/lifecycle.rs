@@ -479,19 +479,6 @@ impl CacheResidencyManager {
     }
 }
 
-impl Drop for CacheResidencyManager {
-    fn drop(&mut self) {
-        if Arc::strong_count(&self.inner) != 1 {
-            return;
-        }
-        if let Ok(state) = self.inner.state.lock() {
-            for record in state.blocks.values() {
-                remove_ephemeral_file(record);
-            }
-        }
-    }
-}
-
 fn validate_block_arrays(
     arrays: &CacheBlockArrays,
     token_count: i64,

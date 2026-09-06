@@ -627,6 +627,7 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
         C: SpeculativeTokenFilterController,
         V: SpeculativeGenerationVisitor,
     {
+        self.runtime.session().ensure_no_submission_in_flight()?;
         let proposal_capacity = drafter
             .selected()
             .requirements()
@@ -635,21 +636,25 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
             .get();
         let target_stream = self.runtime.backend().stream().clone();
         let draft_stream = drafter.stream().clone();
-        let streams =
-            SpeculativeExecutionStreams::bind(&target_stream, &draft_stream, drafter.topology())?;
-        let prepared_lanes = Self::prepare_speculative_batch_lanes(lanes, proposal_capacity)?;
         let capture = drafter.capture().clone();
         let selected = drafter.selected().clone();
-        let model = self.runtime.session_mut().speculative_model_mut();
-        drafter.visit(MlxExternalBatchVisitor {
-            runner: MlxExternalBatchRunner {
-                target: model.erased_mut(),
-                lanes: prepared_lanes,
-                streams,
-                visitor,
-                capture,
-                selected,
-            },
+        self.runtime.session_mut().with_model_operation(|model| {
+            let streams = SpeculativeExecutionStreams::bind(
+                &target_stream,
+                &draft_stream,
+                drafter.topology(),
+            )?;
+            let prepared_lanes = Self::prepare_speculative_batch_lanes(lanes, proposal_capacity)?;
+            drafter.visit(MlxExternalBatchVisitor {
+                runner: MlxExternalBatchRunner {
+                    target: model.erased_mut(),
+                    lanes: prepared_lanes,
+                    streams,
+                    visitor,
+                    capture,
+                    selected,
+                },
+            })
         })
     }
 
@@ -662,22 +667,24 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
         C: SpeculativeTokenFilterController,
         V: SpeculativeGenerationVisitor,
     {
+        self.runtime.session().ensure_no_submission_in_flight()?;
         let stream = self.runtime.backend().stream().clone();
         let streams = SpeculativeExecutionStreams::single(&stream);
-        let model = self.runtime.session_mut().speculative_model_mut();
-        let target = model.erased_mut();
         let mut continuation = MlxEmbeddedBatchContinuation {
             lanes,
             streams,
             visitor: Some(visitor),
         };
-        target
-            .with_embedded_prediction(&mut continuation)
-            .ok_or_else(|| {
-                Error::Speculative(
-                    "neutral target has no installed prediction-extension contract".into(),
-                )
-            })?
+        self.runtime.session_mut().with_model_operation(|model| {
+            model
+                .erased_mut()
+                .with_embedded_prediction(&mut continuation)
+                .ok_or_else(|| {
+                    Error::Speculative(
+                        "neutral target has no installed prediction-extension contract".into(),
+                    )
+                })?
+        })
     }
 }
 

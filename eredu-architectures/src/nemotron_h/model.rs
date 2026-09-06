@@ -1274,6 +1274,10 @@ where
         Ok(hidden.clone())
     }
 
+    fn prediction_target_capture(forward: &Self::ForwardContext) -> Option<&B::Tensor> {
+        forward.target_capture.as_ref()
+    }
+
     fn finish_forward(
         &mut self,
         hidden: &B::Tensor,

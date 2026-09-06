@@ -38,5 +38,5 @@ use eredu_core::{
     AllocatorTelemetry, AutomaticPlanRequest, AutomaticPlanner, AutomaticPlanningError, DevicePlan,
     ExecutionPlan, ExecutionPlanReport, ExpertCacheTelemetry, ModelInspectionReport,
     QuantizationRequest, RealtimeInputFrame, RealtimeOutputFrame, RealtimeSampling,
-    RealtimeSpeechConfig, ResidencyTelemetry, SessionCapabilities, SpeculativeDecodingTelemetry,
+    RealtimeSpeechConfig, ResidencyTelemetry, SessionCapabilities,
 };

@@ -1,5 +1,42 @@
 use super::*;
 
+fn finish_routed_composite_session<A, D, F>(
+    (stream, finalizer): (&Stream, F),
+    session: ReplicatedTextSession<
+        PreparedCompositeArchitecture<A>,
+        MlxNeuralBackend,
+        MlxReplicatedTextMechanisms<PreparedCompositeArchitecture<A>, MlxHybridState>,
+        D,
+    >,
+    facts: eredu_architectures::prepared_execution::PreparedCompositeSessionFacts<
+        A::AdmissionConfig,
+    >,
+) -> Result<Box<dyn ErasedReplicatedTextExecutable>, Error>
+where
+    A: CompositeArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error> + 'static,
+    A::InputPartPlan: 'static,
+    A::AdmissionConfig: 'static,
+    A::Error: std::fmt::Display,
+    D: eredu_runtime::ReplicatedTextExecutionStrategy<
+            PreparedCompositeArchitecture<A>,
+            MlxNeuralBackend,
+            MlxHybridState,
+            MlxArchitectureLayerwisePolicy<PreparedCompositeArchitecture<A>, MlxHybridState>,
+            MlxArchitectureLayerwisePolicy<PreparedCompositeArchitecture<A>, MlxHybridState>,
+        > + MlxParameterBankTelemetry
+        + 'static,
+    F: super::partitioned::CompositeExecutableFinalizer<A>,
+{
+    let (text, processor, admission) = facts.into_parts();
+    let (identity, capability, model_type, residency) = text.into_parts();
+    finalizer.finish(
+        CompletedComposite::<A, _, NoSelectedPrediction>::from_session(
+            session, admission, processor, identity, capability, model_type, residency, None, None,
+            None, true, stream,
+        ),
+    )
+}
+
 /// Family-agnostic MLX binder for architecture-owned composite ingress.
 #[derive(Clone, Copy)]
 pub(crate) struct CompositeBindingVisitor<'a> {
@@ -131,11 +168,6 @@ impl
                 MlxNeuralBackend,
             >,
     {
-        let prompt_cache_identity = prepared.routed().text().prompt_cache_identity().clone();
-        let effective_model_type = prepared.effective_model_type().to_owned();
-        let selected_residency = prepared.routed().text().selected().residency();
-        let bank_residency = prepared.routed().bank_residency();
-        let (routed, processor, admission) = prepared.into_parts();
         let mechanisms = MlxReplicatedTextMechanisms::<
             PreparedCompositeArchitecture<A>,
             MlxHybridState,
@@ -146,65 +178,34 @@ impl
         };
         #[cfg(test)]
         crate::tests::support::path_instrumentation::constructor();
-        match bank_residency {
-            eredu_runtime::ParameterBankResidency::WithLayer => {
-                let session = routed
-                    .construct_resident_session::<MlxNeuralBackend, _>(mechanisms, self.stream)
-                    .map_err(Error::ArchitectureModel)?;
-                CompletedComposite::<A, _, NoSelectedPrediction>::from_session(
-                    session,
-                    admission,
-                    processor,
-                    prompt_cache_identity,
-                    self.capability.clone(),
-                    effective_model_type,
-                    selected_residency,
-                    None,
-                    None,
-                    None,
-                    true,
-                    self.stream,
-                )
-                .with_prediction(prediction, self.capability)
-                .map(|model| Box::new(model) as Box<dyn ErasedReplicatedTextExecutable>)
-            }
-            eredu_runtime::ParameterBankResidency::IndependentCache(options) => {
+        eredu_architectures::prepared_execution::construct_selected_routed_composite_session(
+            prepared,
+            mechanisms,
+            self.stream,
+            |prepared, options| {
                 let bank = selected_addressable_bank(
-                    routed.addressable_members(),
+                    prepared.addressable_members(),
                     store,
                     options,
                     self.weights_stream,
                     self.stream,
                 )?;
-                let session = routed
-                    .construct_addressable_session::<MlxNeuralBackend, _, _, _>(
-                        mechanisms,
-                        bank,
-                        crate::backend::runtime::residency::parameter_bank::MlxIndexedMovement,
-                        self.stream,
-                    )
-                    .map_err(Error::ArchitectureModel)?;
-                CompletedComposite::<A, _, NoSelectedPrediction>::from_session(
-                    session,
-                    admission,
-                    processor,
-                    prompt_cache_identity,
-                    self.capability.clone(),
-                    effective_model_type,
-                    selected_residency,
-                    None,
-                    None,
-                    None,
-                    true,
-                    self.stream,
-                )
-                .with_prediction(prediction, self.capability)
-                .map(|model| Box::new(model) as Box<dyn ErasedReplicatedTextExecutable>)
-            }
-            _ => Err(Error::ArchitectureModel(
-                "unsupported selected composite bank residency".into(),
-            )),
-        }
+                Ok((
+                    bank,
+                    crate::backend::runtime::residency::parameter_bank::MlxIndexedMovement,
+                ))
+            },
+            (
+                self.stream,
+                PredictionReplicatedFinalizer {
+                    prediction,
+                    capability: self.capability,
+                },
+            ),
+            finish_routed_composite_session,
+            finish_routed_composite_session,
+        )
+        .map_err(super::routed::construction_error)
     }
 }
 
@@ -248,76 +249,33 @@ impl CompositeTextArchitectureVisitor<MlxNeuralBackend, MlxHybridState>
         A::StaticModules: Clone,
         A::Error: std::fmt::Display,
     {
-        let prompt_cache_identity = prepared.routed().text().prompt_cache_identity().clone();
-        let capability_estimate = prepared.capability_estimate().clone();
-        let effective_model_type = prepared.effective_model_type().to_owned();
-        let selected_residency = prepared.routed().text().selected().residency();
-        let bank_residency = prepared.routed().bank_residency();
-        let (routed, processor, admission) = prepared.into_parts();
         let mechanisms: MlxReplicatedTextMechanisms<
             PreparedCompositeArchitecture<A>,
             MlxHybridState,
         > = MlxReplicatedTextMechanisms::new(Arc::clone(&store), self.stream, self.weights_stream);
         #[cfg(test)]
         crate::tests::support::path_instrumentation::constructor();
-        match bank_residency {
-            eredu_runtime::ParameterBankResidency::WithLayer => {
-                let session = routed
-                    .construct_resident_session::<MlxNeuralBackend, _>(mechanisms, self.stream)
-                    .map_err(Error::ArchitectureModel)?;
-                Ok(Box::new(
-                    CompletedComposite::<A, _, NoSelectedPrediction>::from_session(
-                        session,
-                        admission,
-                        processor,
-                        prompt_cache_identity,
-                        capability_estimate,
-                        effective_model_type,
-                        selected_residency,
-                        None,
-                        None,
-                        None,
-                        true,
-                        self.stream,
-                    ),
-                ))
-            }
-            eredu_runtime::ParameterBankResidency::IndependentCache(options) => {
+        eredu_architectures::prepared_execution::construct_selected_routed_composite_session(
+            prepared,
+            mechanisms,
+            self.stream,
+            |prepared, options| {
                 let bank = selected_addressable_bank(
-                    routed.addressable_members(),
+                    prepared.addressable_members(),
                     store,
                     options,
                     self.weights_stream,
                     self.stream,
                 )?;
-                let session = routed
-                    .construct_addressable_session::<MlxNeuralBackend, _, _, _>(
-                        mechanisms,
-                        bank,
-                        crate::backend::runtime::residency::parameter_bank::MlxIndexedMovement,
-                        self.stream,
-                    )
-                    .map_err(Error::ArchitectureModel)?;
-                Ok(Box::new(
-                    CompletedComposite::<A, _, NoSelectedPrediction>::from_session(
-                        session,
-                        admission,
-                        processor,
-                        prompt_cache_identity,
-                        capability_estimate,
-                        effective_model_type,
-                        selected_residency,
-                        None,
-                        None,
-                        None,
-                        true,
-                        self.stream,
-                    ),
+                Ok((
+                    bank,
+                    crate::backend::runtime::residency::parameter_bank::MlxIndexedMovement,
                 ))
-            }
-            _ => Err(Error::ArchitectureModel(
-                "unsupported selected composite bank residency".into(),
-            )),
-        }
+            },
+            (self.stream, OrdinaryReplicatedFinalizer),
+            finish_routed_composite_session,
+            finish_routed_composite_session,
+        )
+        .map_err(super::routed::construction_error)
     }
 }

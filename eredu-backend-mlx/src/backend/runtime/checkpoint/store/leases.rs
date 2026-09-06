@@ -167,8 +167,9 @@ impl WeightLease {
 
     /// Submits the selected tensor for materialization onto `execution_stream`.
     ///
-    /// The returned guard owns this lease, every mmap-derived source, and the
-    /// exact completion event. Call [`WeightMaterialization::wait_on`] before
+    /// The returned guard retains this checkpoint lease, independently owned
+    /// native source bytes, and exact completion ownership. Call
+    /// [`WeightMaterialization::wait_on`] before
     /// evaluating a dependent graph on another compatible stream, or call
     /// [`WeightMaterialization::synchronize`] to block for and take the output.
     /// MLX graph construction alone does not consume the materialization.
@@ -182,10 +183,10 @@ impl WeightLease {
             .submit()
     }
 
-    /// Schedules materialization while retaining every mmap-backed dependency.
+    /// Prepares materialization while retaining its exact checkpoint dependency.
     ///
-    /// The returned value must be explicitly completed after its output is
-    /// evaluated. Dropping it early conservatively synchronizes both streams.
+    /// The returned value must remain owned by the output's evaluation scope.
+    /// Early Drop never waits; unresolved preparation is retained independently.
     pub fn prepare_materialization(
         self,
         source_stream: &Stream,
@@ -260,22 +261,17 @@ impl WeightLease {
                 message: error.to_string(),
             }
         })?;
+        let mut pending =
+            PendingWeightMaterialization::begin(self.clone(), source_stream, source_stream)?;
         let source_value = Array::try_from(view).map_err(|conversion| {
             CheckpointMaterializationError::MlxConversion {
                 key: self.key.clone(),
                 source: conversion,
             }
         })?;
-        Ok(PendingWeightMaterialization {
-            output: source_value.clone(),
-            _source: source_value,
-            _gguf_group: None,
-            lease: Some(self),
-            source_stream: source_stream.clone(),
-            execution_stream: source_stream.clone(),
-            borrowed_source: false,
-            completed: false,
-        })
+        pending.set_source(source_value);
+        let output = pending.source().clone();
+        pending.prepared(output)
     }
 
     fn prepare_safetensors(
@@ -314,25 +310,20 @@ impl WeightLease {
                 message: error.to_string(),
             }
         })?;
+        let mut pending =
+            PendingWeightMaterialization::begin(self.clone(), source_stream, execution_stream)?;
         let source_value = Array::try_from(view).map_err(|conversion| {
             CheckpointMaterializationError::MlxConversion {
                 key: self.key.clone(),
                 source: conversion,
             }
         })?;
-        let materialized = source_value
+        pending.set_source(source_value);
+        let materialized = pending
+            .source()
             .copy(execution_stream)
             .map_err(|error| self.mlx_error("copy", error))?;
-        Ok(PendingWeightMaterialization {
-            output: materialized,
-            _source: source_value,
-            _gguf_group: None,
-            lease: Some(self),
-            source_stream: source_stream.clone(),
-            execution_stream: execution_stream.clone(),
-            borrowed_source: false,
-            completed: false,
-        })
+        pending.prepared(materialized)
     }
     fn prepare_gguf(
         self,
@@ -347,6 +338,8 @@ impl WeightLease {
         let cache_key = lease.identity().clone();
         let selection_is_materialized = lease.selection_is_materialized();
         let logical_output_name = lease.logical_output_name().to_owned();
+        let mut pending =
+            PendingWeightMaterialization::begin(self.clone(), source_stream, execution_stream)?;
         let mut groups = converted_groups
             .lock()
             .map_err(|_| CheckpointMaterializationError::StatePoisoned)?;
@@ -371,6 +364,7 @@ impl WeightLease {
             cached
         };
         drop(groups);
+        pending.set_group(Arc::clone(&group));
         let source_value = group
             .arrays
             .iter()
@@ -381,17 +375,19 @@ impl WeightLease {
                     "portable GGUF group did not produce logical output {logical_output_name:?}"
                 ),
             })?;
+        pending.set_source(source_value);
         let materialized = if selection_is_materialized && source_stream == execution_stream {
-            source_value.clone()
+            pending.source().clone()
         } else if selection_is_materialized {
-            source_value
+            pending
+                .source()
                 .copy(execution_stream)
                 .map_err(|source| self.mlx_error("copy", source))?
         } else {
             match &self.selection {
                 TensorSelection::Range { axis, start, end } => materialize_range(
                     &self.key,
-                    source_value.clone(),
+                    pending.source().clone(),
                     &self.metadata.logical_shape,
                     *axis,
                     *start,
@@ -401,7 +397,7 @@ impl WeightLease {
                 )?,
                 TensorSelection::Indices { axis, indices } => materialize_indices(
                     &self.key,
-                    &source_value,
+                    pending.source(),
                     *axis,
                     indices,
                     source_stream,
@@ -413,7 +409,7 @@ impl WeightLease {
                     shape,
                 } => materialize_contiguous(
                     &self.key,
-                    &source_value,
+                    pending.source(),
                     *offset_elements,
                     shape,
                     source_stream,
@@ -421,16 +417,7 @@ impl WeightLease {
                 )?,
             }
         };
-        Ok(PendingWeightMaterialization {
-            output: materialized,
-            _source: source_value,
-            _gguf_group: Some(group),
-            lease: Some(self),
-            source_stream: source_stream.clone(),
-            execution_stream: execution_stream.clone(),
-            borrowed_source: false,
-            completed: false,
-        })
+        pending.prepared(materialized)
     }
 
     pub(super) fn mlx_error(
@@ -442,15 +429,6 @@ impl WeightLease {
             key: self.key.clone(),
             operation,
             source,
-        }
-    }
-
-    pub(super) fn retain_mapping_after_sync_failure(&self) {
-        // A failed synchronization leaves the runtime's dependency state
-        // unknowable. Permanently retaining one Arc is conservative and avoids
-        // releasing bytes that submitted MLX work may still reference.
-        if let WeightLeaseSource::Safetensors(shard) = &self.source {
-            std::mem::forget(shard.clone());
         }
     }
 }

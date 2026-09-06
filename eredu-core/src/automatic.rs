@@ -236,6 +236,35 @@ pub struct HardwareProfile {
     pub backends: Vec<HardwareBackendProfile>,
 }
 
+impl HardwareProfile {
+    /// Adds portable host observations to explicitly supplied memory and backend facts.
+    ///
+    /// Only operating-system, architecture, and logical CPU observations are
+    /// discovered here. Accelerator discovery and memory measurements remain
+    /// the responsibility of the mechanism providing these inputs.
+    pub fn observe_host(
+        physical_memory_bytes: Observed<u64>,
+        available_memory_bytes: Observed<u64>,
+        physical_memory_semantics: HardwareMemorySemantics,
+        backends: Vec<HardwareBackendProfile>,
+    ) -> Self {
+        let logical_cpu_count = std::thread::available_parallelism().map_or_else(
+            |error| Observed::unavailable(error.to_string()),
+            |count| Observed::exact(count.get() as u64, "std::thread::available_parallelism"),
+        );
+        Self {
+            schema_version: AUTOMATIC_SCHEMA_VERSION,
+            operating_system: std::env::consts::OS.into(),
+            architecture: std::env::consts::ARCH.into(),
+            logical_cpu_count,
+            physical_memory_bytes,
+            available_memory_bytes,
+            physical_memory_semantics,
+            backends,
+        }
+    }
+}
+
 /// Serializable form of physical host/device memory semantics.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -246,6 +275,16 @@ pub enum HardwareMemorySemantics {
     SeparateTiers,
     /// The relationship cannot be established.
     Unknown,
+}
+
+impl From<crate::capability::PhysicalMemorySemantics> for HardwareMemorySemantics {
+    fn from(value: crate::capability::PhysicalMemorySemantics) -> Self {
+        match value {
+            crate::capability::PhysicalMemorySemantics::Unified => Self::Unified,
+            crate::capability::PhysicalMemorySemantics::SeparateTiers => Self::SeparateTiers,
+            crate::capability::PhysicalMemorySemantics::Unknown => Self::Unknown,
+        }
+    }
 }
 
 /// Severity of one planner explanation entry.
@@ -493,6 +532,28 @@ pub struct SpeculativeDecodingTelemetry {
     pub optimistic_draft_seconds: f64,
     /// Target verification in-flight wall time.
     pub verification_in_flight_seconds: f64,
+}
+
+/// Projects neutral speculative statistics into the stable telemetry document.
+pub fn speculative_decoding_telemetry(
+    stats: &crate::speculative::SpeculativeStats,
+) -> SpeculativeDecodingTelemetry {
+    SpeculativeDecodingTelemetry {
+        execution_topology: stats.execution_topology().to_string(),
+        target_tokens: stats.target_tokens(),
+        draft_tokens: stats.draft_tokens(),
+        accepted_tokens: stats.accepted_tokens(),
+        accept_rate: stats.accept_rate(),
+        rounds: stats.rounds(),
+        accept_lens: stats.accept_lens().to_vec(),
+        emitted_tokens: stats.emitted_tokens(),
+        optimistic_draft_tokens: stats.optimistic_draft_tokens(),
+        reused_optimistic_tokens: stats.reused_optimistic_tokens(),
+        discarded_optimistic_tokens: stats.discarded_optimistic_tokens(),
+        adaptive_lookahead_disabled: stats.adaptive_lookahead_disabled(),
+        optimistic_draft_seconds: stats.optimistic_draft_time().as_secs_f64(),
+        verification_in_flight_seconds: stats.verification_in_flight_time().as_secs_f64(),
+    }
 }
 
 /// Stable JSON telemetry for one completed model execution.
@@ -1602,6 +1663,54 @@ fn select_feedback_plan<B: AutomaticPlanningBackend>(
 mod tests {
     use super::*;
     use crate::execution::BackendId;
+
+    #[test]
+    fn host_observation_preserves_injected_memory_and_backend_facts() {
+        let physical = Observed::exact(4096, "foreign memory provider");
+        let available = Observed::unavailable("not measured");
+        let backend = HardwareBackendProfile {
+            backend: BackendId::new("independent").unwrap(),
+            available: false,
+            detail: Some("no native context created".into()),
+            devices: vec![],
+        };
+        let profile = HardwareProfile::observe_host(
+            physical.clone(),
+            available.clone(),
+            HardwareMemorySemantics::SeparateTiers,
+            vec![backend.clone()],
+        );
+        assert_eq!(profile.physical_memory_bytes, physical);
+        assert_eq!(profile.available_memory_bytes, available);
+        assert_eq!(profile.backends, vec![backend]);
+        assert_eq!(
+            profile.physical_memory_semantics,
+            HardwareMemorySemantics::SeparateTiers
+        );
+        assert!(!profile.operating_system.is_empty());
+        assert!(!profile.architecture.is_empty());
+    }
+
+    #[test]
+    fn physical_memory_semantics_preserve_unknown_and_separate_capacity() {
+        use crate::capability::PhysicalMemorySemantics;
+        for (physical, hardware) in [
+            (
+                PhysicalMemorySemantics::Unified,
+                HardwareMemorySemantics::Unified,
+            ),
+            (
+                PhysicalMemorySemantics::SeparateTiers,
+                HardwareMemorySemantics::SeparateTiers,
+            ),
+            (
+                PhysicalMemorySemantics::Unknown,
+                HardwareMemorySemantics::Unknown,
+            ),
+        ] {
+            assert_eq!(HardwareMemorySemantics::from(physical), hardware);
+        }
+    }
 
     struct MockPlanningBackend {
         model_bytes: u64,

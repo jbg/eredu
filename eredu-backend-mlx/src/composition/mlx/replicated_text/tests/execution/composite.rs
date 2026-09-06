@@ -38,6 +38,66 @@ fn invalid_token_completion_rolls_back_session_state_before_publication() {
     assert!(overlap
         .to_string()
         .contains("unresolved submission completion"));
+    let counts = crate::tests::support::path_instrumentation::snapshot();
+    assert!(session.reset().is_err());
+    assert!(session.speculative_model_mut().is_err());
+    assert!(session.neutral_prediction_target_mut().is_err());
+    assert!(session.submit_token_decode(&backend, 3).is_err());
+    let empty_prompt = crate::composition::mlx::MlxModelInput::from(
+        crate::backend::runtime::media::input::ModelInput::new(&[]),
+    );
+    assert!(
+        eredu_core::BackendSession::prefill(&mut session, &backend, empty_prompt.clone()).is_err()
+    );
+    assert!(eredu_core::InspectableBackendSession::inspect_decode(
+        &mut session,
+        &backend,
+        Array::from_slice(&[3_u32], &[1, 1]),
+        &eredu_core::ObservationRequest::all(),
+    )
+    .is_err());
+    assert!(session
+        .submit_prefill_with_observer(
+            &backend,
+            empty_prompt.clone(),
+            &mut eredu_runtime::NoopObserver,
+        )
+        .is_err());
+    assert!(session
+        .install_embedded_prediction_observers(
+            eredu_runtime::NoopObserver,
+            eredu_runtime::NoopObserver
+        )
+        .is_err());
+    let descriptor = eredu_core::cache::PromptCacheDescriptor::from_model_identity(
+        session.prompt_cache_model_identity().unwrap(),
+        "fixture-checkpoint",
+        "tokens:1",
+        1,
+    )
+    .unwrap();
+    let cache_root = tempfile::tempdir().unwrap();
+    let destination = cache_root.path().join("must-not-be-created");
+    assert!(session
+        .save_prompt_cache(
+            &backend,
+            &destination,
+            descriptor.clone(),
+            &[1],
+            &eredu_core::cache::PromptCacheOptions::default(),
+        )
+        .is_err());
+    assert!(session
+        .load_prompt_cache(&backend, &destination, &descriptor, &[1])
+        .is_err());
+    assert!(session
+        .load_prompt_cache_for_input(&backend, &destination, &descriptor, &[1], &empty_prompt,)
+        .is_err());
+    assert!(!destination.exists());
+    assert_eq!(
+        crate::tests::support::path_instrumentation::snapshot(),
+        counts
+    );
     eredu_core::Completion::wait(&first.completion).unwrap();
     let before = session
         .neutral_prediction_target_mut()
@@ -125,7 +185,7 @@ fn public_handoff_executes_ordinary_and_routed_qwen_with_repeated_decode() {
         crate::tests::support::path_instrumentation::Counts {
             architecture_constructions: 6,
             state_allocations: 6,
-            payload_opens: 0,
+            payload_opens: 6,
             constructors: 6,
             unit_constructions: 6,
             materializations: 0,

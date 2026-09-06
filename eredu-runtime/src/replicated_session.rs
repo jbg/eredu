@@ -794,6 +794,44 @@ where
 {
 }
 
+fn record_successful_restoration<E>(
+    generation: &mut Option<u64>,
+    restored: Result<(), E>,
+) -> Result<(), E> {
+    restored?;
+    *generation = generation.and_then(|value| value.checked_add(1));
+    Ok(())
+}
+
+#[cfg(test)]
+mod restoration_witness_tests {
+    use super::record_successful_restoration;
+
+    #[test]
+    fn failed_restore_and_stale_snapshot_do_not_prove_new_restoration() {
+        let mut generation = Some(0);
+        let before = generation;
+        assert!(record_successful_restoration(&mut generation, Err("restore failed")).is_err());
+        assert_eq!(generation, before);
+        record_successful_restoration(&mut generation, Ok::<_, ()>(())).unwrap();
+        assert_eq!(generation, Some(1));
+        let prior_restore = generation;
+        assert!(
+            record_successful_restoration(&mut generation, Err("later restore failed")).is_err()
+        );
+        assert_eq!(generation, prior_restore);
+    }
+
+    #[test]
+    fn restoration_counter_overflow_permanently_disables_the_witness() {
+        let mut generation = Some(u64::MAX);
+        record_successful_restoration(&mut generation, Ok::<_, ()>(())).unwrap();
+        assert_eq!(generation, None);
+        record_successful_restoration(&mut generation, Ok::<_, ()>(())).unwrap();
+        assert_eq!(generation, None);
+    }
+}
+
 /// Complete backend-neutral replicated-text session.
 pub struct ReplicatedTextSession<A, B, M, D = DirectReplicatedTextExecution>
 where
@@ -816,6 +854,7 @@ where
     next_commit_epoch: DistributedCommitEpoch,
     active_commit_epoch: Option<DistributedCommitEpoch>,
     last_commit_outcome: Option<DistributedCommitOutcome>,
+    successful_state_restorations: Option<u64>,
     control_fence: Option<crate::DistributedExecutionPhase>,
     output_selection: ReplicatedTextOutputSelection,
     backend: PhantomData<fn() -> B>,
@@ -1796,6 +1835,7 @@ where
         next_commit_epoch: DistributedCommitEpoch::FIRST,
         active_commit_epoch: None,
         last_commit_outcome: None,
+        successful_state_restorations: Some(0),
         control_fence: None,
         output_selection,
         backend: PhantomData,
@@ -1889,6 +1929,7 @@ where
         next_commit_epoch: DistributedCommitEpoch::FIRST,
         active_commit_epoch: None,
         last_commit_outcome: None,
+        successful_state_restorations: Some(0),
         control_fence: None,
         output_selection,
         backend: PhantomData,
@@ -2438,6 +2479,15 @@ where
             }
         };
         self.publish(output, checkpoint, forward_context, context)
+    }
+
+    /// Snapshots successful state-restoration evidence for one execution call.
+    ///
+    /// Snapshots of this counter prove only a successful neutral state restore,
+    /// never completion of backend work. Overflow permanently disables the
+    /// witness; checkpoint restoration never rewinds it.
+    pub const fn successful_state_restoration_generation(&self) -> Option<u64> {
+        self.successful_state_restorations
     }
 
     /// Captures all mutable state for a later transactional rollback.
@@ -3355,9 +3405,11 @@ where
             DistributedCommitOutcome::Aborted(aborted) if aborted == epoch => {
                 self.last_commit_outcome = Some(DistributedCommitOutcome::Aborted(epoch));
                 self.active_commit_epoch = None;
-                self.mechanisms
+                let restored = self
+                    .mechanisms
                     .restore_state(&mut self.state, checkpoint, context)
-                    .map_err(ReplicatedTextSessionError::Mechanism)?;
+                    .map_err(ReplicatedTextSessionError::Mechanism);
+                record_successful_restoration(&mut self.successful_state_restorations, restored)?;
                 return Err(ReplicatedTextSessionError::CommitAborted { epoch });
             }
             DistributedCommitOutcome::Indeterminate {
@@ -3397,7 +3449,7 @@ where
         if let Some(epoch) = self.active_commit_epoch.take() {
             self.last_commit_outcome = Some(DistributedCommitOutcome::Aborted(epoch));
         }
-        restored?;
+        record_successful_restoration(&mut self.successful_state_restorations, restored)?;
         Err(error)
     }
 

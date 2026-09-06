@@ -23,6 +23,7 @@ use crate::{
 
 pub(crate) struct ReplicatedForwardContext<T> {
     pub(crate) mask: Option<T>,
+    prediction_capture: Option<T>,
 }
 
 pub(crate) trait FixedReplicatedFamily<B: NeuralBackend>: 'static {
@@ -372,6 +373,7 @@ pub(crate) struct FixedReplicatedModel<
 > {
     config: F::Config,
     decoder: HybridDecoder<B>,
+    prediction_capture: bool,
     family: PhantomData<(F, P)>,
 }
 
@@ -392,8 +394,14 @@ impl<B: NeuralBackend, F: FixedReplicatedFamily<B>, P> FixedReplicatedModel<B, F
         Ok(Self {
             decoder: HybridDecoder::new(F::static_spec(&config), "model.layers", layers, context)?,
             config,
+            prediction_capture: false,
             family: PhantomData,
         })
+    }
+
+    pub(crate) fn with_prediction_capture(mut self) -> Self {
+        self.prediction_capture = true;
+        self
     }
 }
 
@@ -688,7 +696,7 @@ macro_rules! common_layered_methods {
             _group: usize,
             _index: usize,
         ) -> Self::RetainedContextValues<'a> {
-            forward.mask.iter()
+            forward.mask.iter().chain(forward.prediction_capture.iter())
         }
     };
 }
@@ -708,13 +716,31 @@ where
     type Unit = F::Unit;
     type ForwardContext = ReplicatedForwardContext<B::Tensor>;
     type RetainedContextValues<'a>
-        = std::option::Iter<'a, B::Tensor>
+        = std::iter::Chain<std::option::Iter<'a, B::Tensor>, std::option::Iter<'a, B::Tensor>>
     where
         Self: 'a,
         B::Tensor: 'a;
     type Error = Error;
 
     common_layered_methods!();
+
+    fn complete_execution_group(
+        &mut self,
+        _group: usize,
+        hidden: &B::Tensor,
+        _state: &mut S,
+        forward: &mut Self::ForwardContext,
+        _context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        if self.prediction_capture {
+            forward.prediction_capture = Some(hidden.clone());
+        }
+        Ok(hidden.clone())
+    }
+
+    fn prediction_target_capture(forward: &Self::ForwardContext) -> Option<&B::Tensor> {
+        forward.prediction_capture.as_ref()
+    }
 
     fn build_unit(
         &self,
@@ -754,7 +780,10 @@ where
         let mask = causal_mask::<B>(hidden.dim(1), input.mask, position, context)?;
         Ok(LayeredForwardState {
             hidden,
-            context: ReplicatedForwardContext { mask },
+            context: ReplicatedForwardContext {
+                mask,
+                prediction_capture: None,
+            },
         })
     }
 
@@ -806,7 +835,7 @@ where
     type Unit = F::Unit;
     type ForwardContext = ReplicatedForwardContext<B::Tensor>;
     type RetainedContextValues<'a>
-        = std::option::Iter<'a, B::Tensor>
+        = std::iter::Chain<std::option::Iter<'a, B::Tensor>, std::option::Iter<'a, B::Tensor>>
     where
         Self: 'a,
         B::Tensor: 'a;
@@ -852,7 +881,10 @@ where
         let mask = causal_mask::<B>(hidden.dim(1), input.mask, position, context)?;
         Ok(LayeredForwardState {
             hidden,
-            context: ReplicatedForwardContext { mask },
+            context: ReplicatedForwardContext {
+                mask,
+                prediction_capture: None,
+            },
         })
     }
 
@@ -902,7 +934,7 @@ where
     type Unit = F::Unit;
     type ForwardContext = ReplicatedForwardContext<B::Tensor>;
     type RetainedContextValues<'a>
-        = std::option::Iter<'a, B::Tensor>
+        = std::iter::Chain<std::option::Iter<'a, B::Tensor>, std::option::Iter<'a, B::Tensor>>
     where
         Self: 'a,
         B::Tensor: 'a;
@@ -940,7 +972,10 @@ where
         let mask = causal_mask::<B>(hidden.dim(1), input.mask, None, context)?;
         Ok(LayeredForwardState {
             hidden,
-            context: ReplicatedForwardContext { mask },
+            context: ReplicatedForwardContext {
+                mask,
+                prediction_capture: None,
+            },
         })
     }
 
@@ -989,7 +1024,7 @@ where
     type Unit = F::Unit;
     type ForwardContext = ReplicatedForwardContext<B::Tensor>;
     type RetainedContextValues<'a>
-        = std::option::Iter<'a, B::Tensor>
+        = std::iter::Chain<std::option::Iter<'a, B::Tensor>, std::option::Iter<'a, B::Tensor>>
     where
         Self: 'a,
         B::Tensor: 'a;
@@ -1031,7 +1066,10 @@ where
         let mask = causal_mask::<B>(hidden.dim(1), input.mask, None, context)?;
         Ok(LayeredForwardState {
             hidden,
-            context: ReplicatedForwardContext { mask },
+            context: ReplicatedForwardContext {
+                mask,
+                prediction_capture: None,
+            },
         })
     }
 
@@ -1080,7 +1118,7 @@ where
     type Unit = F::Unit;
     type ForwardContext = ReplicatedForwardContext<B::Tensor>;
     type RetainedContextValues<'a>
-        = std::option::Iter<'a, B::Tensor>
+        = std::iter::Chain<std::option::Iter<'a, B::Tensor>, std::option::Iter<'a, B::Tensor>>
     where
         Self: 'a,
         B::Tensor: 'a;
@@ -1126,7 +1164,10 @@ where
         let mask = causal_mask::<B>(hidden.dim(1), input.mask, position, context)?;
         Ok(LayeredForwardState {
             hidden,
-            context: ReplicatedForwardContext { mask },
+            context: ReplicatedForwardContext {
+                mask,
+                prediction_capture: None,
+            },
         })
     }
 
@@ -1179,7 +1220,7 @@ where
     type Unit = F::Unit;
     type ForwardContext = ReplicatedForwardContext<B::Tensor>;
     type RetainedContextValues<'a>
-        = std::option::Iter<'a, B::Tensor>
+        = std::iter::Chain<std::option::Iter<'a, B::Tensor>, std::option::Iter<'a, B::Tensor>>
     where
         Self: 'a,
         B::Tensor: 'a;
@@ -1224,7 +1265,10 @@ where
         let mask = causal_mask::<B>(hidden.dim(1), input.mask, position, context)?;
         Ok(LayeredForwardState {
             hidden,
-            context: ReplicatedForwardContext { mask },
+            context: ReplicatedForwardContext {
+                mask,
+                prediction_capture: None,
+            },
         })
     }
     fn forward_unit(

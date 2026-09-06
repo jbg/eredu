@@ -1,13 +1,21 @@
 //! Checkpoint materialization, host transfer, and capacity accounting.
 
 use super::*;
+use crate::backend::submission_recovery::{Recovery, Retention, Status};
+
+struct HostMaterialization {
+    array: Array,
+    _sources: Vec<PendingWeightMaterialization>,
+    buffer: Option<HostTransferBuffer>,
+    event: Option<Event>,
+}
+
+impl Retention for HostMaterialization {
+    fn observe(&self, _: Status) {}
+}
 
 pub(super) struct PreparedResidentArrays {
     pub(super) arrays: BTreeMap<String, Array>,
-    pub(super) pending_sources: Vec<PendingWeightMaterialization>,
-    pub(super) retained_arrays: Vec<Array>,
-    pub(super) retained_host: Option<Arc<ResidentHostBuffers>>,
-    pub(super) retained_events: Vec<Event>,
     pub(super) direction: TransferDirection,
 }
 
@@ -113,25 +121,53 @@ pub(super) fn materialize_host_buffers(
                 (pending.output().clone(), vec![pending])
             }
         };
-        let buffer = HostTransferBuffer::copy_from_array(
-            &array,
-            HostTransferPolicy::Transfer,
-            source_stream,
-        )
+        let mut retained = Recovery::begin(HostMaterialization {
+            array,
+            _sources: sources,
+            buffer: None,
+            event: None,
+        })
         .map_err(|source| ResidencyError::Mlx {
             id: id.clone(),
-            operation: "weight array-to-host-buffer submission",
-            source,
-        })?
-        .synchronize()
-        .map_err(|source| ResidencyError::Mlx {
-            id: id.clone(),
-            operation: "weight array-to-host-buffer completion",
+            operation: "prepare host materialization recovery",
             source,
         })?;
-        for source in sources {
-            source.complete();
+        let result = HostTransferBuffer::copy_from_array(
+            &retained.retention().array,
+            HostTransferPolicy::Transfer,
+            source_stream,
+        );
+        retained.seal();
+        let (buffer, event) = result
+            .map_err(|source| ResidencyError::Mlx {
+                id: id.clone(),
+                operation: "weight array-to-host-buffer submission",
+                source,
+            })?
+            .into_parts();
+        retained.retention_mut().buffer = Some(buffer);
+        retained.retention_mut().event = Some(event);
+        loop {
+            let status = retained.progress();
+            if status.failed || status.blocked {
+                return Err(ResidencyError::Mlx {
+                    id: id.clone(),
+                    operation: "weight array-to-host-buffer completion",
+                    source: safemlx::error::Exception::custom(
+                        "native host transfer failed; unresolved resources remain retained",
+                    ),
+                });
+            }
+            if status.settled {
+                break;
+            }
+            std::thread::yield_now();
         }
+        let buffer = retained
+            .retention_mut()
+            .buffer
+            .take()
+            .expect("completed host buffer");
         let actual = u64::try_from(buffer.nbytes().map_err(|source| ResidencyError::Mlx {
             id: id.clone(),
             operation: "host-buffer byte inspection",
@@ -161,10 +197,10 @@ pub(super) fn prepare_from_disk(
     context: &MlxParameterMaterializationContext,
     direction: TransferDirection,
     shared: &BTreeMap<String, Array>,
+    retained: &mut ResidentTransferResources,
 ) -> Result<PreparedResidentArrays, ResidencyError> {
     let mut arrays = shared.clone();
-    let mut pending_sources = Vec::new();
-    let mut retained_arrays = Vec::new();
+    retained.retained_arrays.extend(shared.values().cloned());
     for binding in bindings {
         if arrays.contains_key(binding.name()) {
             continue;
@@ -181,8 +217,10 @@ pub(super) fn prepare_from_disk(
                                 source,
                             })?;
                     let (host, sources) = pending.into_parts();
+                    retained.sources.extend(sources);
+                    retained.retained_arrays.push(host.clone());
                     if execution_stream == source_stream {
-                        Ok((host, sources, None))
+                        Ok(host)
                     } else {
                         let output = host.copy(execution_stream).map_err(|source| {
                             ResidencyError::Recipe {
@@ -190,7 +228,7 @@ pub(super) fn prepare_from_disk(
                                 source: WeightRecipeError::Mlx(source),
                             }
                         })?;
-                        Ok((output, sources, Some(host)))
+                        Ok(output)
                     }
                 }
                 None => {
@@ -203,44 +241,34 @@ pub(super) fn prepare_from_disk(
                     let lease = context.weight_lease(lease)?;
                     let pending = lease.prepare_materialization(source_stream, execution_stream)?;
                     let output = pending.output().clone();
-                    Ok((output, vec![pending], None))
+                    retained.sources.push(pending);
+                    Ok(output)
                 }
             })();
             match prepared {
-                Ok((output, sources, retained)) => {
-                    pending_sources.extend(sources);
-                    retained_arrays.extend(retained);
+                Ok(output) => {
+                    retained.retained_arrays.push(output.clone());
                     arrays.insert(binding.name().to_owned(), output);
                     break;
                 }
                 Err(error)
                     if !retried_after_capacity
-                        && !pending_sources.is_empty()
+                        && !retained.sources.is_empty()
                         && is_shard_cache_capacity_error(&error) =>
                 {
-                    eval(arrays.values()).map_err(|source| ResidencyError::Mlx {
-                        id: internal_id(),
-                        operation: "shard-cache-capacity residency evaluation",
-                        source,
-                    })?;
-                    for source in pending_sources.drain(..) {
-                        source.complete();
-                    }
-                    retained_arrays.clear();
+                    WeightMaterialization::prepare_retained(
+                        Vec::new(),
+                        std::mem::take(&mut retained.sources),
+                    )?
+                    .submit_outputs(retained.retained_arrays.clone())?
+                    .wait()?;
                     retried_after_capacity = true;
                 }
                 Err(error) => return Err(error),
             }
         }
     }
-    Ok(PreparedResidentArrays {
-        arrays,
-        pending_sources,
-        retained_arrays,
-        retained_host: None,
-        retained_events: Vec::new(),
-        direction,
-    })
+    Ok(PreparedResidentArrays { arrays, direction })
 }
 
 pub(super) fn is_shard_cache_capacity_error(error: &ResidencyError) -> bool {
@@ -261,9 +289,10 @@ pub(super) fn prepare_copy_to_device(
     id: &OffloadUnitId,
     host: Arc<ResidentHostBuffers>,
     device_stream: &Stream,
+    retained: &mut ResidentTransferResources,
 ) -> Result<PreparedResidentArrays, ResidencyError> {
     let mut arrays = BTreeMap::new();
-    let mut retained_events = Vec::new();
+    retained.retained_host.push(Arc::clone(&host));
     for (name, buffer) in &host.buffers {
         let submitted =
             buffer
@@ -274,15 +303,12 @@ pub(super) fn prepare_copy_to_device(
                     source,
                 })?;
         let (array, completion) = submitted.into_parts();
+        retained.retained_arrays.push(array.clone());
         arrays.insert(name.clone(), array);
-        retained_events.push(completion);
+        retained.retained_events.push(completion);
     }
     Ok(PreparedResidentArrays {
         arrays,
-        pending_sources: Vec::new(),
-        retained_arrays: Vec::new(),
-        retained_host: Some(host),
-        retained_events,
         direction: TransferDirection::HostToDevice,
     })
 }

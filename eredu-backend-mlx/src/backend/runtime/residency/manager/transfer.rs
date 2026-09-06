@@ -1,12 +1,25 @@
 //! Residency transfer ownership, storage lifecycle, and acquisition.
 
 use super::*;
+use crate::backend::{
+    ordinary_retirement::OrdinaryRetirement,
+    submission_recovery::{Recovery, Retention, Status},
+};
+use std::{
+    cell::{Cell, OnceCell, RefCell},
+    rc::Rc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Weak,
+    },
+};
 
 /// Shared lease and transfer owner for a residency manager.
 pub struct ManagerInner {
     pub(super) store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
     pub(super) state: Mutex<ManagerState>,
     pub(super) changed: Condvar,
+    pub(super) failed_transfer: Arc<AtomicBool>,
 }
 
 impl ResidencyLeaseOwner for ManagerInner {
@@ -17,67 +30,14 @@ impl ResidencyLeaseOwner for ManagerInner {
     }
 }
 
-impl ResidencyTransferOwner<Event, ResidentTransferResources> for ManagerInner {
-    type Executor = Stream;
-    type Error = ResidencyError;
-
-    fn order_after(
-        completion: &Event,
-        executor: &Stream,
-        id: &OffloadUnitId,
-    ) -> Result<(), Self::Error> {
-        completion
-            .wait_on(executor)
-            .map_err(|source| ResidencyError::Mlx {
-                id: id.clone(),
-                operation: "resident transfer stream wait",
-                source,
-            })
-    }
-
-    fn is_complete(completion: &Event, id: &OffloadUnitId) -> Result<bool, Self::Error> {
-        completion
-            .is_complete()
-            .map_err(|source| ResidencyError::Mlx {
-                id: id.clone(),
-                operation: "resident transfer query",
-                source,
-            })
-    }
-
-    fn wait(completion: &Event, id: &OffloadUnitId) -> Result<(), Self::Error> {
-        completion
-            .synchronize()
-            .map_err(|source| ResidencyError::Mlx {
-                id: id.clone(),
-                operation: "resident transfer completion",
-                source,
-            })
-    }
-
-    fn finish_resources(resources: ResidentTransferResources, succeeded: bool) {
-        if succeeded {
-            for source in resources.sources {
-                source.complete();
-            }
-            drop(resources.retained_arrays);
-            drop(resources.retained_host);
-            drop(resources.retained_events);
-        } else {
-            // Preserve PendingWeightMaterialization's conservative failure
-            // cleanup: it synchronizes the involved streams and retains a
-            // source lease permanently if backend state is unknowable.
-            drop(resources);
-        }
-    }
-
+impl ManagerInner {
     fn resolve_transfer(
         &self,
         ids: &[OffloadUnitId],
         tier: MemoryTier,
         generation: u64,
         succeeded: bool,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), ResidencyError> {
         let mut state = self
             .state
             .lock()
@@ -92,6 +52,7 @@ impl ResidencyTransferOwner<Event, ResidentTransferResources> for ManagerInner {
 }
 
 pub(super) struct ManagerState {
+    pub(super) failed_transfer: Arc<AtomicBool>,
     pub(super) control: ResidencyController,
     pub(super) storage: BTreeMap<OffloadUnitId, UnitStorage>,
     pub(super) alias_owner_pins: BTreeSet<(OffloadUnitId, MemoryTier)>,
@@ -148,13 +109,279 @@ pub struct ResidentTransferResources {
     pub(super) retained_arrays: Vec<Array>,
     pub(super) retained_host: Vec<Arc<ResidentHostBuffers>>,
     pub(super) retained_events: Vec<Event>,
+    event: Option<Event>,
+    application: Rc<OrdinaryRetirement<TransferApplication>>,
 }
 
 pub(super) struct SubmittedResidentTransfer {
-    pub(super) event: Event,
-    pub(super) retained: ResidentTransferResources,
-    pub(super) ids: Vec<OffloadUnitId>,
-    pub(super) generation: u64,
+    retained: Recovery<Rc<ResidentTransferResources>>,
+}
+
+#[derive(Default)]
+struct TransferStatus {
+    settled: Cell<bool>,
+    failed: Cell<bool>,
+    children: Cell<usize>,
+}
+
+struct TransferApplication {
+    leases: OnceCell<Vec<ResidentUnitLease>>,
+    owner: RefCell<Weak<ManagerInner>>,
+    ids: Vec<OffloadUnitId>,
+    tier: MemoryTier,
+    generation: Cell<u64>,
+    status: TransferStatus,
+    failed_transfer: Arc<AtomicBool>,
+}
+
+impl TransferApplication {
+    fn new(ids: Vec<OffloadUnitId>, tier: MemoryTier, failed_transfer: Arc<AtomicBool>) -> Self {
+        Self {
+            leases: OnceCell::new(),
+            owner: RefCell::new(Weak::new()),
+            ids,
+            tier,
+            generation: Cell::new(0),
+            status: TransferStatus::default(),
+            failed_transfer,
+        }
+    }
+
+    fn mark_failed(&self) {
+        self.status.failed.set(true);
+        self.failed_transfer.store(true, Ordering::Release);
+    }
+
+    fn resolve(&self) -> Result<(), ResidencyError> {
+        let generation = self.generation.get();
+        if generation == 0 {
+            return Ok(());
+        }
+        let Some(owner) = self.owner.borrow().upgrade() else {
+            return Ok(());
+        };
+        owner.resolve_transfer(
+            &self.ids,
+            self.tier,
+            generation,
+            self.status.settled.get()
+                && !self.status.failed.get()
+                && self.status.children.get() == 0,
+        )?;
+        self.generation.set(0);
+        Ok(())
+    }
+}
+
+impl Drop for TransferApplication {
+    fn drop(&mut self) {
+        // Only ordinary, unlocked reclamation reaches this manager-lock owner.
+        let _ = self.resolve();
+    }
+}
+
+impl Retention for ResidentTransferResources {
+    fn observe(&self, status: Status) {
+        self.application.status.settled.set(status.settled);
+        if status.failed || status.blocked {
+            self.application.mark_failed();
+        }
+    }
+}
+
+struct TransferObservation {
+    owner: Rc<ResidentTransferResources>,
+    _stream: Stream,
+}
+
+impl Retention for TransferObservation {
+    fn observe(&self, status: Status) {
+        if status.failed || status.blocked {
+            self.owner.application.mark_failed();
+        }
+    }
+}
+
+impl Drop for TransferObservation {
+    fn drop(&mut self) {
+        let children = &self.owner.application.status.children;
+        children.set(children.get() - 1);
+    }
+}
+
+impl SubmittedResidentTransfer {
+    pub(super) fn attach_owner(&self, owner: Weak<ManagerInner>) {
+        *self.retained.retention().application.owner.borrow_mut() = owner;
+    }
+
+    pub(super) fn retain_partial_leases(&self, leases: Vec<ResidentUnitLease>) {
+        let _ = self.retained.retention().application.leases.set(leases);
+    }
+}
+
+struct TransferUnwind<'a>(&'a TransferApplication);
+impl Drop for TransferUnwind<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.mark_failed();
+        }
+    }
+}
+
+/// Native transfer owner with nonblocking polling and teardown.
+///
+/// Pending native work keeps source and application leases independently of this
+/// handle. Manager publication and unpinning run only at ordinary unlocked entry.
+pub struct ResidentTransfer {
+    retained: Option<Recovery<Rc<ResidentTransferResources>>>,
+    application: Rc<OrdinaryRetirement<TransferApplication>>,
+}
+
+fn transfer_error(operation: &'static str, source: safemlx::error::Exception) -> ResidencyError {
+    ResidencyError::Mlx {
+        id: internal_id(),
+        operation,
+        source,
+    }
+}
+
+impl ResidentTransfer {
+    #[cfg(test)]
+    pub(super) fn mark_failed_for_test(&self) {
+        self.application.mark_failed();
+    }
+
+    /// Creates a transfer for copies already resident in the requested tier.
+    pub fn immediate(leases: Vec<ResidentUnitLease>, tier: MemoryTier) -> Self {
+        let app = TransferApplication::new(Vec::new(), tier, Arc::new(AtomicBool::new(false)));
+        let _ = app.leases.set(leases);
+        app.status.settled.set(true);
+        Self {
+            retained: None,
+            application: Rc::new(OrdinaryRetirement::new(app)),
+        }
+    }
+
+    pub(super) fn submitted(
+        leases: Vec<ResidentUnitLease>,
+        submitted: SubmittedResidentTransfer,
+    ) -> Self {
+        let application = Rc::clone(&submitted.retained.retention().application);
+        let _ = application.leases.set(leases);
+        Self {
+            retained: Some(submitted.retained),
+            application,
+        }
+    }
+
+    /// The exact resident unit leases carried by this transfer.
+    pub fn leases(&self) -> &[ResidentUnitLease] {
+        self.application.leases.get().map_or(&[], Vec::as_slice)
+    }
+
+    /// Whether this transfer carries no resident unit leases.
+    pub fn is_empty(&self) -> bool {
+        self.leases().is_empty()
+    }
+
+    fn check_native_status(&self) -> Result<bool, ResidencyError> {
+        crate::backend::submission_recovery::reap();
+        if let Some(retained) = &self.retained {
+            let status = retained.progress();
+            if status.failed || status.blocked {
+                self.application.mark_failed();
+            }
+        }
+        let status = &self.application.status;
+        if status.failed.get() {
+            Err(transfer_error(
+                "resident transfer completion",
+                safemlx::error::Exception::custom(
+                    "native transfer failed; unresolved resources remain retained",
+                ),
+            ))
+        } else {
+            Ok(status.settled.get() && status.children.get() == 0)
+        }
+    }
+
+    /// Orders an independently retained consumer-stream dependency.
+    pub fn order_after(&self, stream: &Stream) -> Result<(), ResidencyError> {
+        self.check_native_status()?;
+        let Some(retained) = &self.retained else {
+            return Ok(());
+        };
+        let owner = retained.retention();
+        let _unwind = TransferUnwind(&owner.application);
+        let count = &owner.application.status.children;
+        let next = count.get().checked_add(1).ok_or_else(|| {
+            transfer_error(
+                "prepare transfer consumer",
+                safemlx::error::Exception::custom("transfer observation count exhausted"),
+            )
+        })?;
+        count.set(next);
+        let mut observation = Recovery::begin(TransferObservation {
+            owner: Rc::clone(owner),
+            _stream: stream.clone(),
+        })
+        .map_err(|error| transfer_error("prepare transfer consumer", error))?;
+        let result = owner
+            .event
+            .as_ref()
+            .expect("submitted transfer")
+            .wait_on(stream);
+        if result.is_err() {
+            self.application.mark_failed();
+        }
+        observation.seal();
+        let status = observation.progress();
+        if status.failed || status.blocked {
+            return Err(transfer_error(
+                "transfer consumer",
+                safemlx::error::Exception::custom(
+                    "native transfer consumer failed; unresolved resources remain retained",
+                ),
+            ));
+        }
+        result.map_err(|error| transfer_error("resident transfer stream wait", error))
+    }
+
+    /// Nonblocking exact completion query; runtime contention returns pending.
+    pub fn is_complete(&self) -> Result<bool, ResidencyError> {
+        // Already-resident transfers have no native work or event to observe.
+        if self.retained.is_none() {
+            return Ok(true);
+        }
+        safemlx::try_with_submission_retirement(|| {
+            if !self.check_native_status()? {
+                return Ok(false);
+            }
+            match &self.retained {
+                Some(retained) => retained
+                    .retention()
+                    .event
+                    .as_ref()
+                    .expect("submitted transfer")
+                    .is_complete()
+                    .map_err(|error| {
+                        self.application.mark_failed();
+                        transfer_error("resident transfer query", error)
+                    }),
+                None => Ok(true),
+            }
+        })
+        .unwrap_or(Ok(false))
+    }
+
+    /// Explicitly waits for completion and publishes the exact transfer generation.
+    pub fn synchronize(&mut self) -> Result<(), ResidencyError> {
+        while !self.is_complete()? {
+            std::thread::yield_now();
+        }
+        self.application.resolve()?;
+        Ok(())
+    }
 }
 
 pub(super) fn validate_target(
@@ -332,6 +559,24 @@ pub(super) fn ensure_many_resident(
             return Ok((created.clone(), None));
         }
 
+        let application = Rc::new(OrdinaryRetirement::new(TransferApplication::new(
+            ids.iter()
+                .zip(&created)
+                .filter(|(_, missing)| **missing)
+                .map(|(id, _)| id.clone())
+                .collect(),
+            tier,
+            Arc::clone(&state.failed_transfer),
+        )));
+        let mut retained = Recovery::begin(Rc::new(ResidentTransferResources {
+            sources: Vec::new(),
+            retained_arrays: Vec::new(),
+            retained_host: Vec::new(),
+            retained_events: Vec::new(),
+            event: None,
+            application,
+        }))
+        .map_err(|error| transfer_error("prepare resident transfer recovery", error))?;
         let mut prepared = Vec::new();
         for (id, is_missing) in ids.iter().zip(&created) {
             if !is_missing {
@@ -348,7 +593,13 @@ pub(super) fn ensure_many_resident(
                 let item = match tier {
                     MemoryTier::Device => {
                         if let Some(host) = state.storage[id].host.as_ref().map(Arc::clone) {
-                            prepare_copy_to_device(id, host, &state.device_stream)
+                            prepare_copy_to_device(
+                                id,
+                                host,
+                                &state.device_stream,
+                                Rc::get_mut(retained.retention_mut())
+                                    .expect("unpublished transfer"),
+                            )
                         } else {
                             prepare_from_disk(
                                 store,
@@ -358,6 +609,8 @@ pub(super) fn ensure_many_resident(
                                 &state.materialization,
                                 TransferDirection::DiskToDevice,
                                 &shared,
+                                Rc::get_mut(retained.retention_mut())
+                                    .expect("unpublished transfer"),
                             )
                         }
                     }
@@ -367,31 +620,21 @@ pub(super) fn ensure_many_resident(
                     Ok(item) => break item,
                     Err(error)
                         if is_shard_cache_capacity_error(&error)
-                            && prepared.iter().any(
-                                |(_, item): &(OffloadUnitId, PreparedResidentArrays)| {
-                                    !item.pending_sources.is_empty()
-                                },
-                            ) =>
+                            && !retained.retention().sources.is_empty() =>
                     {
                         // Earlier units in this batch can pin the only cached
                         // shard while a later cross-shard entry is prepared.
                         // Their output arrays are complete evaluation roots, so
                         // detach those leases and retry the current unit.
-                        eval(prepared.iter().flat_map(|(_, item)| item.arrays.values())).map_err(
-                            |source| ResidencyError::Mlx {
-                                id: internal_id(),
-                                operation: "shard-cache-capacity batch evaluation",
-                                source,
-                            },
-                        )?;
-                        for (_, item) in &mut prepared {
-                            for source in item.pending_sources.drain(..) {
-                                source.complete();
-                            }
-                            item.retained_arrays.clear();
-                            item.retained_host = None;
-                            item.retained_events.clear();
-                        }
+                        let resources =
+                            Rc::get_mut(retained.retention_mut()).expect("unpublished transfer");
+                        let prior = WeightMaterialization::prepare_retained(
+                            Vec::new(),
+                            std::mem::take(&mut resources.sources),
+                        )?
+                        .submit_outputs(resources.retained_arrays.clone())?;
+                        prior.wait()?;
+                        drop(prior);
                     }
                     Err(error) => return Err(error),
                 }
@@ -416,53 +659,49 @@ pub(super) fn ensure_many_resident(
             }
         }
 
+        let submitted =
+            async_eval_with_event(prepared.iter().flat_map(|(_, item)| item.arrays.values()));
+        retained.seal();
+        if submitted.is_err() {
+            retained.retention().application.mark_failed();
+        }
         let event =
-            async_eval_with_event(prepared.iter().flat_map(|(_, item)| item.arrays.values()))
-                .map_err(|source| ResidencyError::Mlx {
-                    id: internal_id(),
-                    operation: "batched residency submission",
-                    source,
-                })?;
+            submitted.map_err(|error| transfer_error("batched residency submission", error))?;
+        Rc::get_mut(retained.retention_mut())
+            .expect("unpublished transfer")
+            .event = Some(event);
+        let progress = retained.progress();
+        if progress.failed || progress.blocked {
+            return Err(transfer_error(
+                "batched residency submission",
+                safemlx::error::Exception::custom(
+                    "native transfer failed; unresolved resources remain retained",
+                ),
+            ));
+        }
         let generation = if return_transfer {
             state.control.ledger_mut().next_transfer_generation()?
         } else {
-            let completion = event.synchronize();
-            for (_, item) in &mut prepared {
-                for source in item.pending_sources.drain(..) {
-                    source.complete();
+            loop {
+                let status = retained.progress();
+                if status.failed || status.blocked {
+                    return Err(transfer_error(
+                        "batched residency completion",
+                        safemlx::error::Exception::custom(
+                            "native transfer failed; unresolved resources remain retained",
+                        ),
+                    ));
                 }
-                item.retained_arrays.clear();
-                item.retained_host = None;
-                item.retained_events.clear();
+                if status.settled {
+                    break;
+                }
+                std::thread::yield_now();
             }
-            completion.map_err(|source| ResidencyError::Mlx {
-                id: internal_id(),
-                operation: "batched residency completion",
-                source,
-            })?;
             0
         };
+        retained.retention().application.generation.set(generation);
 
-        let submitted_ids = prepared
-            .iter()
-            .map(|(id, _)| id.clone())
-            .collect::<Vec<_>>();
-        let mut retained = ResidentTransferResources {
-            sources: Vec::new(),
-            retained_arrays: Vec::new(),
-            retained_host: Vec::new(),
-            retained_events: Vec::new(),
-        };
-
-        for (id, mut item) in prepared {
-            if return_transfer {
-                retained.sources.append(&mut item.pending_sources);
-                retained.retained_arrays.append(&mut item.retained_arrays);
-                if let Some(host) = item.retained_host.take() {
-                    retained.retained_host.push(host);
-                }
-                retained.retained_events.append(&mut item.retained_events);
-            }
+        for (id, item) in prepared {
             let bindings = state
                 .control
                 .unit(&id)
@@ -492,12 +731,7 @@ pub(super) fn ensure_many_resident(
             }
         }
         state.control.touch_acquisition_hits(&acquisition, tier)?;
-        let submitted = return_transfer.then_some(SubmittedResidentTransfer {
-            event,
-            retained,
-            ids: submitted_ids,
-            generation,
-        });
+        let submitted = return_transfer.then_some(SubmittedResidentTransfer { retained });
         Ok((created.clone(), submitted))
     })();
 

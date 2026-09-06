@@ -1,0 +1,19 @@
+diff --git a/mlx/host_transfer.h b/mlx/host_transfer.h
+--- a/mlx/host_transfer.h
++++ b/mlx/host_transfer.h
+@@ -54,6 +54,15 @@ class MLX_API HostTransferBuffer {
+       Dtype dtype,
+       HostTransferPolicy policy = HostTransferPolicy::transfer);
+ 
++  HostTransferBuffer(const HostTransferBuffer&) = default;
++  HostTransferBuffer& operator=(const HostTransferBuffer&) = default;
++  // Shape stores trivial integers: its move only steals heap storage or
++  // moves inline elements, never allocating. The other fields are shared_ptr
++  // and Dtype. Expose that existing nonthrowing behavior so C producers can
++  // publish a completed submission without a later failure point.
++  HostTransferBuffer(HostTransferBuffer&&) noexcept = default;
++  HostTransferBuffer& operator=(HostTransferBuffer&&) noexcept = default;
++
+   /** Host pointer. Do not access it until the producing completion finishes. */
+   void* data();
+   const void* data() const;

@@ -57,7 +57,7 @@ pub fn load(
         MlxRealtimeExecutionContext::select_realtime_execution(preparation, &options, false)
             .map_err(driver_error)?;
     backend
-        .materialize_realtime_execution(selected, options)
+        .materialize_realtime_execution(selected)
         .map_err(driver_error)
 }
 

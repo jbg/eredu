@@ -1590,6 +1590,40 @@ pub struct mlx_event_ {
 }
 #[doc = " An owning opaque completion event."]
 pub type mlx_event = mlx_event_;
+#[doc = " Owning thread-affine submission recovery scope."]
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct mlx_submission_scope_ {
+    pub ctx: *mut ::std::os::raw::c_void,
+}
+pub type mlx_submission_scope = mlx_submission_scope_;
+pub const mlx_submission_activity__MLX_SUBMISSION_ACTIVITY_NONE: mlx_submission_activity_ = 0;
+pub const mlx_submission_activity__MLX_SUBMISSION_ACTIVITY_PENDING: mlx_submission_activity_ = 1;
+pub const mlx_submission_activity__MLX_SUBMISSION_ACTIVITY_TERMINAL: mlx_submission_activity_ = 2;
+pub type mlx_submission_activity_ = ::std::os::raw::c_uint;
+pub use self::mlx_submission_activity_ as mlx_submission_activity;
+#[doc = " Native lifetime evidence independent of textual errors."]
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct mlx_submission_status_ {
+    pub activity: mlx_submission_activity,
+    pub failed: bool,
+    pub blocked: bool,
+}
+pub type mlx_submission_status = mlx_submission_status_;
+extern "C" {
+    pub fn mlx_submission_scope_new(scope: *mut mlx_submission_scope) -> ::std::os::raw::c_int;
+    pub fn mlx_submission_scope_seal(scope: mlx_submission_scope) -> ::std::os::raw::c_int;
+    pub fn mlx_submission_scope_query(
+        status: *mut mlx_submission_status,
+        scope: mlx_submission_scope,
+    ) -> ::std::os::raw::c_int;
+    pub fn mlx_submission_scope_progress(
+        status: *mut mlx_submission_status,
+        scope: mlx_submission_scope,
+    ) -> ::std::os::raw::c_int;
+    pub fn mlx_submission_scope_free(scope: mlx_submission_scope) -> ::std::os::raw::c_int;
+}
 pub const mlx_event_backend__MLX_EVENT_BACKEND_NONE: mlx_event_backend_ = 0;
 pub const mlx_event_backend__MLX_EVENT_BACKEND_CPU: mlx_event_backend_ = 1;
 pub const mlx_event_backend__MLX_EVENT_BACKEND_METAL: mlx_event_backend_ = 2;

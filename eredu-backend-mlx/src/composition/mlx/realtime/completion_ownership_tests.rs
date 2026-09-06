@@ -1,107 +1,104 @@
-use super::{submit_or_synchronously_drain, CompletionSubmissionFailure, MlxRealtimeCompletion};
-use crate::backend::nn::tensor::{validate_token_domain, TokenValidationScope};
+use super::{completion::submission_failure, MlxRealtimeCompletion};
+use crate::backend::{
+    nn::tensor::{validate_token_domain, TokenValidationScope},
+    submission_recovery::{self, Probe, Recovery, Retention, Status},
+};
 use eredu_core::backend::Completion;
+use eredu_runtime::RealtimeCompletionCreationError;
 use safemlx::{Array, Device, DeviceType, Stream};
-use std::{cell::RefCell, rc::Rc};
+use std::{cell::Cell, rc::Rc};
 
-#[derive(Debug)]
-struct RetainedRoot {
-    calls: Rc<RefCell<Vec<&'static str>>>,
-}
-
+struct RetainedRoot(Rc<Cell<usize>>);
 impl Drop for RetainedRoot {
     fn drop(&mut self) {
-        self.calls.borrow_mut().push("drop");
+        self.0.set(self.0.get() + 1);
+    }
+}
+impl Retention for RetainedRoot {
+    fn observe(&self, _: Status) {}
+}
+struct FakeProbe(Rc<Cell<Status>>);
+impl Probe for FakeProbe {
+    fn seal(&mut self) {}
+    fn progress(&self) -> Status {
+        self.0.get()
     }
 }
 
 #[test]
-fn successful_exact_submission_does_not_run_the_synchronous_drain() {
-    let calls = Rc::new(RefCell::new(Vec::new()));
-    let retained = vec![RetainedRoot {
-        calls: Rc::clone(&calls),
-    }];
-
-    let (completion, retained) = submit_or_synchronously_drain(
-        retained,
-        |roots| {
-            assert_eq!(roots.len(), 1);
-            calls.borrow_mut().push("submit");
-            Ok::<_, &'static str>("event")
-        },
-        |_| {
-            calls.borrow_mut().push("drain");
-            Ok(())
-        },
-    )
-    .unwrap();
-
-    assert_eq!(completion, "event");
-    assert_eq!(&*calls.borrow(), &["submit"]);
-    drop(retained);
-    assert_eq!(&*calls.borrow(), &["submit", "drop"]);
+fn failed_submission_keeps_completion_and_roots_without_retrying_evaluation() {
+    let drops = Rc::new(Cell::new(0));
+    let state = Rc::new(Cell::new(Status {
+        settled: false,
+        failed: true,
+        blocked: true,
+    }));
+    let completion = Recovery::with_probe(
+        RetainedRoot(Rc::clone(&drops)),
+        FakeProbe(Rc::clone(&state)),
+    );
+    let failure = submission_failure(completion, "event creation failed", false);
+    assert!(matches!(
+        failure,
+        RealtimeCompletionCreationError::AfterSubmission { .. }
+    ));
+    assert_eq!(drops.get(), 0);
+    drop(failure);
+    submission_recovery::reap();
+    assert_eq!(
+        drops.get(),
+        0,
+        "dropping an error cannot free unresolved work"
+    );
+    state.set(Status {
+        settled: true,
+        failed: true,
+        blocked: false,
+    });
+    submission_recovery::reap();
+    assert_eq!(drops.get(), 1, "terminal failure is safe to release");
 }
 
 #[test]
-fn failed_event_creation_retains_roots_through_the_synchronous_drain() {
-    let calls = Rc::new(RefCell::new(Vec::new()));
-    let retained = vec![RetainedRoot {
-        calls: Rc::clone(&calls),
-    }];
-
-    let error = submit_or_synchronously_drain(
-        retained,
-        |_| {
-            calls.borrow_mut().push("submit");
-            Err::<(), _>("submission")
-        },
-        |roots| {
-            assert_eq!(roots.len(), 1);
-            assert_eq!(&*calls.borrow(), &["submit"]);
-            calls.borrow_mut().push("drain");
-            Ok(())
-        },
-    )
-    .unwrap_err();
-
-    assert_eq!(
-        error,
-        CompletionSubmissionFailure::Drained {
-            submission: "submission"
-        }
-    );
-    assert_eq!(&*calls.borrow(), &["submit", "drain", "drop"]);
+fn only_terminal_proof_allows_an_error_without_an_owned_completion() {
+    let drops = Rc::new(Cell::new(0));
+    let state = Rc::new(Cell::new(Status {
+        settled: true,
+        failed: true,
+        blocked: false,
+    }));
+    let completion = Recovery::with_probe(RetainedRoot(Rc::clone(&drops)), FakeProbe(state));
+    let failure = submission_failure(completion, "event creation failed", true);
+    assert!(matches!(
+        failure,
+        RealtimeCompletionCreationError::BeforeSubmission(_)
+    ));
+    assert_eq!(drops.get(), 1);
 }
 
 #[test]
-fn synchronous_drain_failure_is_reported_only_after_retained_roots_are_held() {
-    let calls = Rc::new(RefCell::new(Vec::new()));
-    let retained = vec![RetainedRoot {
-        calls: Rc::clone(&calls),
-    }];
-
-    let error = submit_or_synchronously_drain(
-        retained,
-        |_| {
-            calls.borrow_mut().push("submit");
-            Err::<(), _>("submission")
-        },
-        |roots| {
-            assert_eq!(roots.len(), 1);
-            calls.borrow_mut().push("drain");
-            Err("asynchronous execution failure")
-        },
-    )
-    .unwrap_err();
-
-    assert_eq!(
-        error,
-        CompletionSubmissionFailure::DrainReported {
-            submission: "submission",
-            drain: "asynchronous execution failure"
-        }
+fn pending_without_a_failure_is_not_a_release_proof() {
+    let drops = Rc::new(Cell::new(0));
+    let state = Rc::new(Cell::new(Status {
+        settled: false,
+        failed: false,
+        blocked: false,
+    }));
+    let completion = Recovery::with_probe(
+        RetainedRoot(Rc::clone(&drops)),
+        FakeProbe(Rc::clone(&state)),
     );
-    assert_eq!(&*calls.borrow(), &["submit", "drain", "drop"]);
+    let failure = submission_failure(completion, "host operation failed", false);
+    drop(failure);
+    submission_recovery::reap();
+    assert_eq!(drops.get(), 0);
+    state.set(Status {
+        settled: true,
+        failed: false,
+        blocked: false,
+    });
+    submission_recovery::reap();
+    assert_eq!(drops.get(), 1);
 }
 
 #[test]

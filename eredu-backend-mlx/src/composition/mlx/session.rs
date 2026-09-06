@@ -2,9 +2,9 @@
 
 use eredu_core::{
     BackendSession, Completion, InputModality, InspectableBackendSession, InspectedOutput,
-    ModelRuntime, ObservationRequest, ObservationSet, ObservationValue, Submission,
-    TensorObservation, TensorObservationData, TextGenerationBackend, TextGenerationConfig,
-    TextSamplingStrategy, TokenFilter, TokenOutput,
+    ModelRuntime, ObservationRequest, ObservationSet, ObservationValue, SessionAdmission,
+    SessionAuthority, Submission, SubmissionLease, TensorObservation, TensorObservationData,
+    TextGenerationBackend, TextGenerationConfig, TextSamplingStrategy, TokenFilter, TokenOutput,
 };
 use eredu_nn::Tensor as _;
 use eredu_runtime::{
@@ -17,7 +17,7 @@ use safemlx::{
     ops::indexing::{NewAxis, TryIndexOp},
     Array, Dtype, Stream,
 };
-use std::{cell::Cell, path::Path, rc::Rc};
+use std::path::Path;
 
 use crate::{
     backend::error::Error,
@@ -42,6 +42,7 @@ mod generation;
 mod model_session;
 mod observation;
 mod output_completion;
+pub(super) use crate::backend::submission_recovery as recovery;
 
 pub use generation::MlxTextGenerationState;
 pub use model_session::{MlxModelInput, MlxModelSession};
@@ -53,7 +54,9 @@ use generation::{sample_text_submission, MlxTextSampler};
 #[cfg(test)]
 use model_session::model_submission;
 use observation::{observe_tensor, ArrayObserverAdapter, InspectionCollector};
-use output_completion::{MlxSessionCompletionKind, SessionSubmissionLease};
+use output_completion::MlxSessionCompletionKind;
 
+#[cfg(test)]
+mod recovery_tests;
 #[cfg(test)]
 mod tests;

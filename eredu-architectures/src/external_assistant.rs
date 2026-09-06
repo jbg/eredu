@@ -1,5 +1,11 @@
 //! Architecture-owned inspection and preparation of external draft assistants.
 
+mod execution_plan;
+pub use execution_plan::{
+    prepare_execution_plan_assistant, MaterializedExternalAssistantExecution,
+    PreparedExternalAssistantExecution,
+};
+
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     marker::PhantomData,
@@ -2276,6 +2282,8 @@ impl ModelConfigurationResolver for AssistantConfigurations {
 
 #[cfg(test)]
 mod tests {
+    mod execution_plan;
+
     use super::*;
     use eredu_checkpoint::{schema::StoredDtypeConstraint, SourceTensorEncoding, StoredDtype};
     use eredu_core::{ParallelTopology, TokenizerCompatibilityProof};

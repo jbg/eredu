@@ -14,9 +14,8 @@ use clap::{parser::ValueSource, ArgMatches, CommandFactory, FromArgMatches, Pars
 use eredu::{
     api::{
         benchmark_local_expert_cache, configure_local_runtime, discover_local_hardware,
-        inspect_local_model, local_device_plan, local_speculative_decoding_telemetry,
-        reset_local_allocator_peak, LocalBackendFactory, LocalDevice,
-        LocalExpertCacheBenchmarkSample, LocalInspectionOptions, LocalModel,
+        inspect_local_model, local_device_plan, reset_local_allocator_peak, LocalBackendFactory,
+        LocalDevice, LocalExpertCacheBenchmarkSample, LocalInspectionOptions, LocalModel,
         LocalPreparedChatGenerationRequest, LocalPreparedChatInput,
         LocalPreparedChatSpeculativeGenerationRequest, LocalRuntimeConfiguration,
         LocalSpeculativeComponentTimingGuard, PreparedChatGenerationSettings,
@@ -27,10 +26,10 @@ use eredu::{
     },
 };
 use eredu_core::{
-    residency::CacheEvictionPolicy, speculative::SpeculativeStats, AutomaticPlanRequest,
-    AutomaticPlanner, DeviceCapabilities, DevicePlan, DraftPlacementPlan, DraftingPlan,
-    ExecutionPlan, ExecutionPlanReport, ExecutionTelemetry, ExpertCachePlan, FinishReason,
-    GenerationCancellationToken, GenerationConfigOverrides, HardwareMemorySemantics,
+    residency::CacheEvictionPolicy, speculative::SpeculativeStats, speculative_decoding_telemetry,
+    AutomaticPlanRequest, AutomaticPlanner, DeviceCapabilities, DevicePlan, DraftPlacementPlan,
+    DraftingPlan, ExecutionPlan, ExecutionPlanReport, ExecutionTelemetry, ExpertCachePlan,
+    FinishReason, GenerationCancellationToken, GenerationConfigOverrides, HardwareMemorySemantics,
     HardwareProfile, InspectionSeverity, ModelResourceProfile, Observed, PlanExplanation,
     PlanExplanationEntry, PlanExplanationLevel, QuantizationRequest, ResidencyPlan, SemanticEvent,
     SessionCapabilities, SpeculativeSchedulerOptions, TextGenerationConfig, TimingTelemetry,
@@ -2634,7 +2633,7 @@ fn main() -> Result<()> {
             expert_cache,
             speculative: speculative_stats
                 .as_ref()
-                .map(local_speculative_decoding_telemetry),
+                .map(speculative_decoding_telemetry),
         };
         let json = serde_json::to_vec_pretty(&telemetry)
             .context("failed to serialize execution telemetry")?;

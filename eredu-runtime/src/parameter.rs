@@ -426,12 +426,15 @@ where
 /// admitted aliases), physical provenance, recipes, companions, and coverage are
 /// validated here before any backend payload or native operation. `lower_mxfp4`
 /// is the sole backend hook and may only replace an admitted derived F4 recipe for
-/// an MXFP4 executable.
+/// an MXFP4 executable. When `local_layout` is present, its exact placements are
+/// applied before destination-shape validation. Selected transform outputs are
+/// already rank-local and are never placed a second time.
 pub fn build_exact_replicated_text_bindings<P, M, D, L, E>(
     module: &M,
     source: &dyn CheckpointSource,
     tasks: &[&ReplicatedTextMaterializationTask],
     addressable_parameters: &std::collections::BTreeSet<String>,
+    local_layout: Option<&crate::LocalModelLayout>,
     describe: D,
     mut lower_mxfp4: L,
 ) -> Result<Vec<WeightBinding>, ModuleBindingPlanError>
@@ -499,6 +502,7 @@ where
     let mut covered = std::collections::BTreeSet::new();
     let mut declarations = Vec::new();
     let mut conversions = BTreeMap::new();
+    let mut locally_materialized = std::collections::BTreeSet::new();
     let shared_source_keys = tasks
         .iter()
         .flat_map(|task| task.shared_source_keys().iter().cloned())
@@ -525,6 +529,13 @@ where
             });
         }
         validate_exact_task_provenance(task, source)?;
+        let is_local_transform = matches!(
+            task.lowering(),
+            WeightLoweringKind::Transform | WeightLoweringKind::DerivedTransform
+        );
+        if is_local_transform {
+            locally_materialized.insert(target.clone());
+        }
         let recipe = exact_task_recipe(task, source, &mut lower_mxfp4)?;
         push_exact_declaration(
             &collector.parameters,
@@ -537,6 +548,9 @@ where
 
         for companion in task.output_companions() {
             let target = companion.name().to_owned();
+            if is_local_transform {
+                locally_materialized.insert(target.clone());
+            }
             if !parameter_names.contains(&target) {
                 return Err(ModuleBindingPlanError::ExactTask {
                     details: format!(
@@ -617,6 +631,38 @@ where
         return Err(ModuleBindingPlanError::ExactTask {
             details: format!("module parameters have no exact materialization task: {missing:?}"),
         });
+    }
+
+    // The module already has rank-local slots. Place the admitted source recipe
+    // before validating its output against those slots, never after validation.
+    // Transform tasks have already produced their selected rank-local overlays.
+    if let Some(layout) = local_layout {
+        let bindings = declarations
+            .iter()
+            .filter(|declaration| !locally_materialized.contains(&declaration.target_name))
+            .map(|declaration| {
+                Ok(WeightBinding::from_recipe(
+                    &declaration.target_name,
+                    declaration.recipe.clone(),
+                    declaration.recipe.infer(source)?.byte_len(),
+                )?
+                .with_logical_target(&declaration.target_name)?)
+            })
+            .collect::<Result<Vec<_>, ModuleBindingPlanError>>()?;
+        let placed = crate::place_weight_bindings(bindings, source, layout).map_err(|error| {
+            ModuleBindingPlanError::ExactTask {
+                details: error.to_string(),
+            }
+        })?;
+        // Placement preserves input order and produces exactly one output per
+        // binding; logical identities remain the declarations' exact targets.
+        for (declaration, binding) in declarations
+            .iter_mut()
+            .filter(|declaration| !locally_materialized.contains(&declaration.target_name))
+            .zip(placed)
+        {
+            declaration.recipe = binding.source_recipe();
+        }
     }
 
     BindingPlan::with_explicit_exceptions(declarations, shared_source_keys, conversions)?

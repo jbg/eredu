@@ -639,6 +639,25 @@ pub fn moshi_realtime_request_from_normalized(
     request: &NormalizedLoadRequest,
     observations: RealtimeObservationRequirements,
 ) -> Result<MoshiRealtimeRequest, MoshiRealtimeSelectionError> {
+    if request.max_cached_shards() == 0 {
+        return Err(MoshiRealtimeSelectionError::InvalidRequest(
+            "source reader-cache limit must be positive".into(),
+        ));
+    }
+    if request.prompt_cache_persistence() {
+        return Err(MoshiRealtimeSelectionError::UnsupportedRequest(
+            "persisted prompt caches",
+        ));
+    }
+    if !matches!(
+        request.drafting(),
+        eredu_runtime::DraftingLoadRequest::ArchitectureDefault
+            | eredu_runtime::DraftingLoadRequest::Disabled
+    ) {
+        return Err(MoshiRealtimeSelectionError::UnsupportedRequest(
+            "speculative drafting",
+        ));
+    }
     request
         .weight_quantization()
         .map_err(|error| MoshiRealtimeSelectionError::InvalidRequest(error.to_string()))?;
@@ -1050,6 +1069,9 @@ impl PreparedMoshiRealtime {
 /// Failure before a Moshi realtime realization becomes constructible.
 #[derive(Debug, thiserror::Error)]
 pub enum MoshiRealtimeSelectionError {
+    /// Valid portable intent has no implementation in this architecture execution class.
+    #[error("Moshi realtime does not support {0}")]
+    UnsupportedRequest(&'static str),
     /// A requested transform or normalized configuration is invalid.
     #[error("invalid Moshi realtime request: {0}")]
     InvalidRequest(String),
@@ -1139,7 +1161,7 @@ pub fn prepare_selected_moshi_realtime_source(
         selected.source_metadata().clone(),
         selected.checkpoint_plan(),
         selected.resolved_checkpoint_plan().clone(),
-        selected.selected().residency().max_cached_shards(),
+        selected.selected().max_cached_shards(),
     )?;
     validate_store_metadata(&selected, source.as_ref())
         .map_err(MoshiRealtimeSourceError::Source)?;
@@ -1557,6 +1579,9 @@ fn build_candidate(
         topology,
         rank.global_rank(),
     );
+    let max_cached_shards = std::num::NonZeroUsize::new(request.normalized().max_cached_shards())
+        .expect("realtime request validates a positive reader limit");
+    let required_session_capabilities = request.normalized().required_session_capabilities();
     let selection_request = RealtimeSelectionRequest::new(
         source_identity,
         execution_identity,
@@ -1565,7 +1590,9 @@ fn build_candidate(
         Some(proof),
         request.completion(),
         request.observations,
-    );
+    )
+    .with_max_cached_shards(max_cached_shards)
+    .with_required_session_capabilities(required_session_capabilities);
     Ok(Candidate {
         preparation,
         execution_config,
@@ -2252,6 +2279,13 @@ mod tests {
     }
 
     fn capabilities(candidate: &Candidate) -> RealtimeMechanismCapabilities {
+        capabilities_with_session(candidate, SessionCapabilities::new(true, true, true))
+    }
+
+    fn capabilities_with_session(
+        candidate: &Candidate,
+        session: SessionCapabilities,
+    ) -> RealtimeMechanismCapabilities {
         let requirements = &candidate.requirements;
         let state = StateMechanismCapabilities::new(
             (0..requirements.state_layout().len()).flat_map(|layer| {
@@ -2292,7 +2326,7 @@ mod tests {
                 CompletionCancellationMode::QuarantineUntilComplete,
             ])
             .unwrap(),
-            SessionCapabilities::new(true, true, true),
+            session,
         )
         .with_observation_identities(
             observation_points(&candidate.execution_config)
@@ -2347,7 +2381,21 @@ mod tests {
         )
         .unwrap();
 
-        let request = request(None, std::iter::empty());
+        let plan = eredu_core::ExecutionPlan::fully_resident(
+            eredu_core::DevicePlan::new("independent", "client:7").unwrap(),
+        )
+        .with_max_cached_shards(7);
+        let normalized = NormalizedLoadRequest::from_execution_plan(
+            &plan,
+            eredu_runtime::ResidencyDiagnostics::default(),
+            None,
+        )
+        .unwrap();
+        let request = moshi_realtime_request_from_normalized(
+            &normalized,
+            RealtimeObservationRequirements::new(true, std::iter::empty()),
+        )
+        .unwrap();
         let capability_candidate = build_candidate(preparation(config), request.clone()).unwrap();
         let mechanisms = capabilities(&capability_candidate);
         let preparation = prepare_realtime_model(root.path()).unwrap();
@@ -2356,6 +2404,7 @@ mod tests {
             .weight_lowerings()
             .is_empty());
         let selected = select_inspected_moshi_realtime(inspected, &mechanisms).unwrap();
+        assert_eq!(selected.selected().max_cached_shards(), 7);
         let prepared = prepare_selected_moshi_realtime_source(selected).unwrap();
 
         assert_eq!(prepared.lowering().transform(), None);
@@ -2403,6 +2452,62 @@ mod tests {
             .observations()
             .activations()
             .contains(&observation));
+    }
+
+    #[test]
+    fn explicit_realtime_intent_is_preserved_or_rejected_before_construction() {
+        let base = request(None, []).normalized().clone();
+        for normalized in [
+            base.clone().with_prompt_cache_persistence(true),
+            base.clone()
+                .with_drafting(eredu_runtime::DraftingLoadRequest::embedded(2).unwrap()),
+            base.clone()
+                .with_drafting(eredu_runtime::DraftingLoadRequest::ExternalTarget),
+        ] {
+            assert!(matches!(
+                moshi_realtime_request_from_normalized(
+                    &normalized,
+                    RealtimeObservationRequirements::new(false, [])
+                ),
+                Err(MoshiRealtimeSelectionError::UnsupportedRequest(_))
+            ));
+        }
+        for drafting in [
+            eredu_runtime::DraftingLoadRequest::ArchitectureDefault,
+            eredu_runtime::DraftingLoadRequest::Disabled,
+        ] {
+            assert!(moshi_realtime_request_from_normalized(
+                &base.clone().with_drafting(drafting),
+                RealtimeObservationRequirements::new(false, [])
+            )
+            .is_ok());
+        }
+        for required in [
+            SessionCapabilities::new(false, true, false),
+            SessionCapabilities::new(false, false, true),
+        ] {
+            let normalized = base.clone().with_required_session_capabilities(required);
+            let request = moshi_realtime_request_from_normalized(
+                &normalized,
+                RealtimeObservationRequirements::new(false, []),
+            )
+            .unwrap();
+            let candidate = build_candidate(preparation(native_config(4)), request).unwrap();
+            let absent =
+                capabilities_with_session(&candidate, SessionCapabilities::new(true, false, false));
+            assert!(select_realtime_realization(
+                &candidate.requirements,
+                &candidate.selection_request,
+                &absent
+            )
+            .is_err());
+            assert!(select_realtime_realization(
+                &candidate.requirements,
+                &candidate.selection_request,
+                &capabilities(&candidate)
+            )
+            .is_ok());
+        }
     }
 
     #[test]

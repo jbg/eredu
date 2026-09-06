@@ -36,6 +36,14 @@ work through the same interface for every implementation. Exact completion
 objects keep outputs and transactional resources alive until the submitted work
 is safe to observe or release.
 
+`SessionAuthority` issues move-only leases for unresolved submissions. Backends
+retain them until exact completion or safe teardown; idle guards protect every
+state mutation. `SessionAdmission` validates the complete realized capability
+report against the report admitted before materialization.
+`ModelRuntime` retains that admission and revalidates generic operations after
+backend-specific mutable access. Unrestricted session mutation invalidates any
+retained execution-plan target proof, preventing stale drafting attachment.
+
 Capabilities fail closed. Optional facilities such as multimodal preparation,
 speculative decoding, realtime execution, transfers, and collectives are
 separate contracts attached to the selected backend or session.

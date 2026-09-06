@@ -51,16 +51,17 @@ impl ParameterBackend for MlxNeuralBackend {
 
         let pending = recipe.prepare_materialization(source, context)?;
         let (output, sources) = pending.into_parts();
+        let prepared =
+            crate::backend::runtime::checkpoint::store::WeightMaterialization::prepare_retained(
+                vec![output],
+                sources,
+            )?;
         let output = if context.source_stream() == context.execution_stream() {
-            output
+            prepared.inputs()[0].clone()
         } else {
-            output.copy(context.execution_stream())?
+            prepared.inputs()[0].copy(context.execution_stream())?
         };
-        Ok(
-            crate::backend::runtime::checkpoint::store::WeightMaterialization::submit_retained(
-                output, sources,
-            )?,
-        )
+        Ok(prepared.submit_outputs(vec![output])?)
     }
 
     fn materialized_weight(materialization: &Self::Materialization) -> &Self::MaterializedWeight {
@@ -219,11 +220,14 @@ impl NeuralBackend for MlxNeuralBackend {
         let weight = weight.as_array();
         let dtype = input.dtype();
         let shape = input.shape().to_vec();
-        let width = *shape
-            .last()
-            .ok_or_else(|| ComputeError::backend("gated RMS input has no feature axis"))?;
-        if groups <= 0 || width % groups != 0 || gate.shape() != shape || weight.shape() != [width]
-        {
+        let geometry = eredu_nn::operation_geometry::GroupedNormalizationGeometry::new(
+            &shape,
+            gate.shape(),
+            groups,
+            epsilon,
+        )?;
+        let width = geometry.width();
+        if weight.shape() != [width] {
             return Err(ComputeError::backend(
                 "invalid gated grouped RMS normalization geometry",
             ));
@@ -256,9 +260,7 @@ impl NeuralBackend for MlxNeuralBackend {
         context: &Stream,
     ) -> Result<MlxTensor, ComputeError> {
         let input = input.as_array();
-        if input.shape().last().is_none() || !epsilon.is_finite() || epsilon <= 0.0 {
-            return Err(ComputeError::backend("invalid L2 normalization geometry"));
-        }
+        eredu_nn::operation_geometry::NormalizationGeometry::new(input.shape(), epsilon)?;
         let squared = compute(input.square(context))?;
         let sum = compute(safemlx::ops::sum_axis(&squared, -1, true, context))?;
         let denominator = compute(sum.add(Array::from_f32(epsilon), context))?;
@@ -278,16 +280,14 @@ impl NeuralBackend for MlxNeuralBackend {
         let weight = weight.as_array();
         let dtype = input.dtype();
         let shape = input.shape().to_vec();
-        let width = *shape
-            .last()
-            .ok_or_else(|| ComputeError::backend("gated RMS input has no feature axis"))?;
-        if groups <= 0
-            || width % groups != 0
-            || gate.shape() != shape
-            || weight.shape() != [width]
-            || !epsilon.is_finite()
-            || epsilon <= 0.0
-        {
+        let geometry = eredu_nn::operation_geometry::GroupedNormalizationGeometry::new(
+            &shape,
+            gate.shape(),
+            groups,
+            epsilon,
+        )?;
+        let width = geometry.width();
+        if weight.shape() != [width] {
             return Err(ComputeError::backend(
                 "invalid SiLU-gated grouped RMS normalization geometry",
             ));
@@ -882,6 +882,7 @@ impl NeuralBackend for MlxNeuralBackend {
         epsilon: f32,
         context: &Stream,
     ) -> Result<MlxTensor, ComputeError> {
+        eredu_nn::operation_geometry::NormalizationGeometry::new(input.shape(), epsilon)?;
         let output = compute(safemlx::fast::rms_norm(
             input.as_array(),
             weight.as_array(),

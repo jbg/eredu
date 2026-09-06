@@ -569,6 +569,9 @@ impl ReplicatedTextParameterRequirement {
         transform: ParameterTransformConstraint,
     ) -> Result<Self, ReplicatedTextContractError> {
         let name = name.into();
+        native_executable
+            .validate()
+            .map_err(|error| ReplicatedTextContractError::invalid(error.to_string()))?;
         if name.trim().is_empty() {
             return Err(ReplicatedTextContractError::invalid(
                 "logical parameter identity is empty",
@@ -641,7 +644,7 @@ impl ReplicatedTextParameterRequirement {
                 )));
             }
         }
-        Ok(Self {
+        let requirement = Self {
             name,
             sources,
             physical_sources,
@@ -657,7 +660,8 @@ impl ReplicatedTextParameterRequirement {
             linear_companion: None,
             transform_companions: None,
             permitted_native_source_dtypes: Vec::new(),
-        })
+        };
+        Ok(requirement)
     }
 
     /// Explicitly permits exact source dtypes for this architecture parameter.
@@ -867,7 +871,8 @@ impl ReplicatedTextParameterRequirement {
             .or_else(|| {
                 (self.role == ReplicatedTextParameterRole::Embedding
                     && executable != LinearFormat::Dense)
-                    .then(|| self.logical_shape.len() - 1)
+                    .then(|| self.logical_shape.len().checked_sub(1))
+                    .flatten()
             })
             .or_else(|| {
                 (matches!(
@@ -877,10 +882,9 @@ impl ReplicatedTextParameterRequirement {
                     .then(|| {
                         self.physical_shape
                             .as_ref()
-                            .expect("derived lowering source has shape")
-                            .len()
-                            - 1
+                            .and_then(|shape| shape.len().checked_sub(1))
                     })
+                    .flatten()
             });
         let alias_backed_packed_output = matches!(
             self.source_encoding,
@@ -1548,6 +1552,7 @@ impl BackendMechanismCapabilities {
 /// Caller choices resolved while selecting one replicated text realization.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ReplicatedTextSelectionRequest {
+    max_cached_shards: usize,
     /// Requested execution topology.
     topology: Option<ParallelTopology>,
     /// Requested ordinary parameter residency.
@@ -1568,6 +1573,7 @@ impl ReplicatedTextSelectionRequest {
     /// Creates a replicated request with fail-closed optional facilities.
     pub fn new(residency: LayerWeightResidency, state: CacheResidencyPolicy) -> Self {
         Self {
+            max_cached_shards: residency.max_cached_shards(),
             topology: None,
             residency,
             state,
@@ -1576,6 +1582,15 @@ impl ReplicatedTextSelectionRequest {
             prompt_cache: false,
             exact_completion: false,
         }
+    }
+    /// Sets the exact source reader-cache limit independently of weight placement.
+    pub const fn with_max_cached_shards(mut self, maximum: std::num::NonZeroUsize) -> Self {
+        self.max_cached_shards = maximum.get();
+        self
+    }
+    /// Returns the exact selected source reader-cache limit.
+    pub const fn max_cached_shards(&self) -> usize {
+        self.max_cached_shards
     }
     /// Sets the requested topology.
     pub const fn with_topology(mut self, topology: ParallelTopology) -> Self {
@@ -3064,6 +3079,7 @@ impl SelectedStateRealization {
 /// Authoritative realization selected before architecture or payload construction.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct SelectedReplicatedTextRealization {
+    max_cached_shards: usize,
     requirements: ReplicatedTextRequirements,
     /// Exact selected execution topology.
     topology: ParallelTopology,
@@ -3089,6 +3105,10 @@ pub struct SelectedReplicatedTextRealization {
 }
 
 impl SelectedReplicatedTextRealization {
+    /// Returns the source reader-cache limit retained through selection.
+    pub const fn max_cached_shards(&self) -> usize {
+        self.max_cached_shards
+    }
     /// Returns the exact architecture/artifact requirements selected together.
     pub const fn requirements(&self) -> &ReplicatedTextRequirements {
         &self.requirements
@@ -3304,33 +3324,30 @@ pub fn select_replicated_text_realization(
         if !parameter.has_lowering_source() {
             continue;
         }
-        let candidate = match request.quantization {
-            Some(request) => match parameter.transform_target(request) {
-                Ok(Some(target)) => Some((target.executable(), target.descriptor().clone())),
-                Ok(None) => Some((
-                    parameter.native_executable,
-                    parameter
-                        .lowering_descriptor(parameter.native_executable)
-                        .expect("validated parameter forms native descriptor"),
-                )),
-                Err(error) => {
-                    issues.push(error.to_string());
-                    None
-                }
-            },
-            None => Some((
-                parameter.native_executable,
-                parameter
-                    .lowering_descriptor(parameter.native_executable)
-                    .expect("validated parameter forms native descriptor"),
-            )),
+        let native_candidate = || {
+            parameter
+                .lowering_descriptor(parameter.native_executable)
+                .map(|descriptor| (parameter.native_executable, descriptor))
         };
-        let Some((executable, descriptor)) = candidate else {
-            issues.push(format!(
-                "architecture transform {:?} for {:?}",
-                request.quantization, parameter.name
-            ));
-            continue;
+        let candidate = match request.quantization {
+            Some(request) => parameter
+                .transform_target(request)
+                .and_then(|target| match target {
+                    Some(target) => Ok((target.executable(), target.descriptor().clone())),
+                    None => native_candidate(),
+                }),
+            None => native_candidate(),
+        };
+        let (executable, descriptor) = match candidate {
+            Ok(candidate) => candidate,
+            Err(error) => {
+                issues.push(error.to_string());
+                issues.push(format!(
+                    "architecture transform {:?} for {:?}",
+                    request.quantization, parameter.name
+                ));
+                continue;
+            }
         };
         let Some(lowering) = capabilities
             .weight_lowerings
@@ -3371,6 +3388,7 @@ pub fn select_replicated_text_realization(
         return Err(ReplicatedTextSelectionError { issues });
     }
     let mut selected = SelectedReplicatedTextRealization {
+        max_cached_shards: request.max_cached_shards,
         requirements: requirements.clone(),
         topology: request
             .topology

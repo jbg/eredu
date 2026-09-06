@@ -1,0 +1,1835 @@
+diff --git a/mlx/backend/gpu/eval.h b/mlx/backend/gpu/eval.h
+index d75b30ab..e482b9a5 100644
+--- a/mlx/backend/gpu/eval.h
++++ b/mlx/backend/gpu/eval.h
+@@ -10,6 +10,20 @@
+ 
+ namespace mlx::core::gpu {
+ 
++// Tokens retain the exact native encoder even after its stream registry is cleared.
++// Mutation/progress must use the same external serialization as encoder mutation;
++// querying and blocking use only atomics and never enter the native runtime.
++struct SubmissionToken { std::shared_ptr<void> state; };
++struct SubmissionProgress {
++  uint64_t accepted{0};
++  uint64_t completed{0};
++  bool failed{false};
++};
++SubmissionToken prepare_submission_stream(Stream);
++SubmissionProgress submission_progress(const SubmissionToken&) noexcept;
++void block_submission_stream(const SubmissionToken&) noexcept;
++void progress_submission_stream(const SubmissionToken&) noexcept;
++
+ void init();
+ void new_stream(Stream s);
+ void new_thread_unsafe_stream(Stream s);
+diff --git a/mlx/backend/gpu/submission_progress.h b/mlx/backend/gpu/submission_progress.h
+new file mode 100644
+index 00000000..1ec03d3e
+--- /dev/null
++++ b/mlx/backend/gpu/submission_progress.h
+@@ -0,0 +1,57 @@
++// Exact-stream accounting shared by native GPU encoders.
++#pragma once
++#include <atomic>
++#include <cstdint>
++#include <limits>
++#include <stdexcept>
++#include "mlx/backend/gpu/eval.h"
++
++namespace mlx::core::gpu {
++class SubmissionState {
++ public:
++  void check_admission() const {
++    if (blocked_.load(std::memory_order_acquire)) {
++      throw std::runtime_error("GPU stream is blocked after submission failure.");
++    }
++    if (accepted_.load(std::memory_order_relaxed) == UINT64_MAX) {
++      throw std::overflow_error("GPU submission sequence exhausted.");
++    }
++  }
++  void open() noexcept { pending_.fetch_add(1, std::memory_order_acq_rel); }
++  void accept() noexcept { accepted_.fetch_add(1, std::memory_order_release); }
++  void finish() noexcept {
++    if (pending_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
++      // A producer opens its receipt before publishing accepted work. Reading
++      // that work with acquire also observes its open; the following zero
++      // check therefore cannot certify a still-live newly accepted receipt.
++      auto frontier = accepted_.load(std::memory_order_acquire);
++      if (pending_.load(std::memory_order_acquire) != 0) { return; }
++      auto old = completed_.load(std::memory_order_relaxed);
++      while (old < frontier && !completed_.compare_exchange_weak(
++                 old, frontier, std::memory_order_release,
++                 std::memory_order_relaxed)) {}
++    }
++  }
++  void fail() noexcept {
++    failed_.store(true, std::memory_order_release);
++    block();
++  }
++  void block() noexcept { blocked_.store(true, std::memory_order_release); }
++  bool blocked() const noexcept {
++    return blocked_.load(std::memory_order_acquire);
++  }
++  SubmissionProgress query() const noexcept {
++    // Read completed first so a concurrent new acceptance cannot be hidden.
++    auto completed = completed_.load(std::memory_order_acquire);
++    auto accepted = accepted_.load(std::memory_order_acquire);
++    return {accepted, completed, failed_.load(std::memory_order_acquire)};
++  }
++  bool idle() const noexcept {
++    return pending_.load(std::memory_order_acquire) == 0;
++  }
++ private:
++  static_assert(std::atomic<uint64_t>::is_always_lock_free);
++  std::atomic<uint64_t> accepted_{0}, completed_{0}, pending_{0};
++  std::atomic<bool> blocked_{false}, failed_{false};
++};
++} // namespace mlx::core::gpu
+diff --git a/mlx/backend/no_gpu/eval.cpp b/mlx/backend/no_gpu/eval.cpp
+index 39667546..17ff28b1 100644
+--- a/mlx/backend/no_gpu/eval.cpp
++++ b/mlx/backend/no_gpu/eval.cpp
+@@ -7,6 +7,15 @@
+ 
+ namespace mlx::core::gpu {
+ 
++SubmissionToken prepare_submission_stream(Stream) {
++  throw std::runtime_error("GPU backend is not available.");
++}
++SubmissionProgress submission_progress(const SubmissionToken&) noexcept {
++  return {};
++}
++void block_submission_stream(const SubmissionToken&) noexcept {}
++void progress_submission_stream(const SubmissionToken&) noexcept {}
++
+ void init() {}
+ 
+ void new_stream(Stream) {
+diff --git a/mlx/backend/metal/device.h b/mlx/backend/metal/device.h
+index ea5bd370..74837ddf 100644
+--- a/mlx/backend/metal/device.h
++++ b/mlx/backend/metal/device.h
+@@ -11,6 +11,7 @@
+ #include <unordered_set>
+ 
+ #include "mlx/array.h"
++#include "mlx/backend/gpu/submission_progress.h"
+ #include "mlx/backend/common/metal_kernel.h"
+ #include "mlx/backend/metal/resident.h"
+ #include "mlx/device.h"
+@@ -38,9 +39,13 @@ class MLX_API CommandEncoder {
+     }
+     ~ConcurrentContext() {
+       enc.concurrent_ = false;
+-      enc.prev_outputs_.insert(
+-          enc.concurrent_outputs_.begin(), enc.concurrent_outputs_.end());
+-      enc.concurrent_outputs_.clear();
++      try {
++        enc.prev_outputs_.insert(
++            enc.concurrent_outputs_.begin(), enc.concurrent_outputs_.end());
++        enc.concurrent_outputs_.clear();
++      } catch (...) {
++        enc.submission_state_->fail();
++      }
+     }
+ 
+    private:
+@@ -98,6 +103,15 @@ class MLX_API CommandEncoder {
+   bool needs_commit() const;
+   void commit(std::function<void()> completion = nullptr);
+   void synchronize();
++  void record_submission();
++  void check_submission_admission() const { submission_state_->check_admission(); }
++  void add_completed_handler(std::function<void(MTL::CommandBuffer*)> task);
++  gpu::SubmissionProgress submission_progress() const noexcept {
++    return submission_state_->query();
++  }
++  void block_submission() noexcept { submission_state_->block(); }
++  void progress_submission() noexcept;
++  bool submission_idle() const noexcept { return submission_state_->idle(); }
+ 
+   MTL::CommandBuffer* get_command_buffer() const {
+     return buffer_.get();
+@@ -109,6 +123,17 @@ class MLX_API CommandEncoder {
+  private:
+   MTL::ComputeCommandEncoder* get_command_encoder();
+ 
++  struct Receipt {
++    bool active{false};
++    std::vector<std::function<void(MTL::CommandBuffer*)>> handlers;
++  };
++  std::shared_ptr<gpu::SubmissionState> submission_state_{
++      std::make_shared<gpu::SubmissionState>()};
++  std::shared_ptr<Receipt> receipt_{std::make_shared<Receipt>()};
++  bool commit_attempted_{false};
++  bool recovery_attempted_{false};
++  bool encoding_cleanup_failed_{false};
++
+   Device& device_;
+   bool exiting_{false};
+ 
+@@ -145,6 +170,7 @@ class MLX_API CommandEncoder {
+   // A map of prior command encoder outputs to their corresponding fence.
+   std::unordered_map<const void*, NS::SharedPtr<MTL::Fence>> prev_ce_outputs_;
+   std::mutex outputs_mtx_;
++  std::unordered_map<MTL::Fence*, NS::SharedPtr<MTL::Fence>> waiting_fences_;
+ };
+ 
+ class MLX_API Device {
+@@ -253,9 +279,11 @@ class MLX_API Device {
+ 
+ MLX_API Device& device(mlx::core::Device);
+ MLX_API CommandEncoder& get_command_encoder(Stream s);
++std::shared_ptr<CommandEncoder> get_command_encoder_owner(Stream s);
++std::shared_ptr<CommandEncoder> make_command_encoder(Device&, int, ResidencySet&);
+ 
+-std::unordered_map<int, CommandEncoder>& get_command_encoders();
+-std::unordered_map<int, CommandEncoder>& get_global_command_encoders();
++std::unordered_map<int, std::shared_ptr<CommandEncoder>>& get_command_encoders();
++std::unordered_map<int, std::shared_ptr<CommandEncoder>>& get_global_command_encoders();
+ NS::SharedPtr<NS::AutoreleasePool> new_scoped_memory_pool();
+ 
+ bool is_nax_available();
+diff --git a/mlx/backend/metal/device.cpp b/mlx/backend/metal/device.cpp
+index 79133219..2e297ef8 100644
+--- a/mlx/backend/metal/device.cpp
++++ b/mlx/backend/metal/device.cpp
+@@ -371,11 +371,13 @@ CommandEncoder::CommandEncoder(
+   }
+   debug_set_stream_queue_label(queue_.get(), index);
+   buffer_ = NS::RetainPtr(queue_->commandBufferWithUnretainedReferences());
++  if (!buffer_) { throw std::runtime_error("Failed to make Metal command buffer."); }
+ }
+ 
+ CommandEncoder::~CommandEncoder() {
++  // The shared-owner deleter calls this only after all receipts are terminal.
++  // Teardown must never submit more work or wait on a failed stream.
+   exiting_ = true;
+-  synchronize();
+   auto pool = new_scoped_memory_pool();
+   buffer_.reset();
+   queue_.reset();
+@@ -492,6 +494,7 @@ void CommandEncoder::barrier() {
+ }
+ 
+ void CommandEncoder::end_encoding() {
++  try {
+   // Each command encoder has a unique fence. We also store a map of
+   // all previous outputs of command encoders to their corresponding fence.
+   // - The command encoder records its inputs and outputs.
+@@ -516,15 +519,15 @@ void CommandEncoder::end_encoding() {
+ 
+   // Keep references to the fences we waited on and put them in the completion
+   // handler so they are not prematurely released.
+-  std::unordered_set<NS::SharedPtr<MTL::Fence>> waiting_on;
++  auto& waiting_on = waiting_fences_;
+   {
+     std::lock_guard lk(outputs_mtx_);
+     for (auto& in : all_inputs_) {
+       if (auto it = prev_ce_outputs_.find(in); it != prev_ce_outputs_.end()) {
+         // If we've already waited on a fence, don't wait on it again.
+-        if (waiting_on.find(it->second) == waiting_on.end()) {
++        if (waiting_on.find(it->second.get()) == waiting_on.end()) {
++          waiting_on.emplace(it->second.get(), it->second);
+           encoder_->waitForFence(it->second.get());
+-          waiting_on.insert(it->second);
+         }
+       }
+     }
+@@ -534,11 +537,11 @@ void CommandEncoder::end_encoding() {
+   }
+ 
+   encoder_->updateFence(fence_.get());
+-  buffer_->addCompletedHandler([this,
+-                                fence = std::move(fence_),
+-                                temporaries = std::move(temporaries_),
+-                                all_outputs = std::move(all_outputs_),
+-                                waiting_on = std::move(waiting_on)](
++  add_completed_handler([this,
++                                fence = fence_,
++                                temporaries = temporaries_,
++                                all_outputs = all_outputs_,
++                                waiting_on = waiting_on](
+                                    MTL::CommandBuffer*) mutable {
+     std::lock_guard lk(outputs_mtx_);
+     for (auto& o : all_outputs) {
+@@ -550,6 +553,10 @@ void CommandEncoder::end_encoding() {
+     }
+   });
+ 
++  waiting_fences_.clear();
++  fence_.reset();
++  temporaries_.clear();
++  all_outputs_.clear();
+   encoder_->endEncoding();
+   encoder_.reset();
+   needs_barrier_ = false;
+@@ -560,22 +567,27 @@ void CommandEncoder::end_encoding() {
+   next_outputs_.clear();
+   concurrent_outputs_.clear();
+   all_inputs_.clear();
++  } catch (...) {
++    encoding_cleanup_failed_ = true;
++    submission_state_->fail();
++    throw;
++  }
+ }
+ 
+ void CommandEncoder::signal_event(
+     std::shared_ptr<EventImpl> event,
+     uint64_t value) {
+   end_encoding();
++  signal_events_.push_back({event, value});
+   buffer_->encodeSignalEvent(event->mtl_event(), value);
+-  signal_events_.push_back({std::move(event), value});
+ }
+ 
+ void CommandEncoder::wait_event(
+     std::shared_ptr<EventImpl> event,
+     uint64_t value) {
+   end_encoding();
++  wait_events_.push_back(event);
+   buffer_->encodeWait(event->mtl_event(), value);
+-  wait_events_.push_back(std::move(event));
+ }
+ 
+ bool CommandEncoder::needs_commit() const {
+@@ -583,56 +595,113 @@ bool CommandEncoder::needs_commit() const {
+   return (buffer_ops_ > max_ops) || ((buffer_sizes_ >> 20) > max_mb);
+ }
+ 
++void CommandEncoder::record_submission() {
++  submission_state_->check_admission();
++  if (!receipt_->active) {
++    submission_state_->open();
++    receipt_->active = true;
++  }
++  submission_state_->accept();
++}
++
++void CommandEncoder::add_completed_handler(
++    std::function<void(MTL::CommandBuffer*)> task) {
++  receipt_->handlers.push_back(std::move(task));
++}
++
+ void CommandEncoder::commit(std::function<void()> completion) {
+-  if (timer_) {
+-    timer_->submitted();
++  if (commit_attempted_) {
++    throw std::runtime_error("Metal command buffer has an unresolved commit.");
++  }
++  // Prepare the next buffer and all callback storage before native submission.
++  auto next_buffer =
++      NS::RetainPtr(queue_->commandBufferWithUnretainedReferences());
++  if (!next_buffer) {
++    throw std::runtime_error("Failed to make Metal command buffer.");
+   }
++  auto next_receipt = std::make_shared<Receipt>();
++  auto waits = wait_events_;
++  auto signals = signal_events_;
++  auto timer = timer_;
++  if (!receipt_->active) {
++    submission_state_->check_admission();
++    submission_state_->open();
++    receipt_->active = true;
++    submission_state_->accept();
++  }
++  auto receipt = receipt_;
++  auto state = submission_state_;
++  // No retry from this point: callback registration/native commit may have
++  // accepted work even if the caller sees an exception.
++  commit_attempted_ = true;
+   buffer_->addCompletedHandler(
+-      [&error_ = error_,
+-       timer = timer_,
+-       wait_events = std::move(wait_events_),
+-       signal_events = std::move(signal_events_),
+-       completion = std::move(completion)](MTL::CommandBuffer* cbuf) {
+-        if (timer) {
+-          timer->record(cbuf);
+-        }
+-        if (completion) {
+-          completion();
+-        }
+-        // If any of the waited event has error in it, poison the encoder.
+-        for (auto& event : wait_events) {
+-          if (event->error()) {
+-            error_ = event->error();
+-            break;
++      [this, receipt, state, timer, waits = std::move(waits),
++       signals = std::move(signals), completion = std::move(completion)]
++      (MTL::CommandBuffer* cbuf) mutable noexcept {
++        bool failed = cbuf->status() == MTL::CommandBufferStatusError;
++        try {
++          if (timer) { timer->record(cbuf); }
++          for (auto& event : waits) {
++            if (event->failed()) { failed = true; }
++            if (auto error = event->error()) {
++              std::atomic_store(&error_, std::move(error));
++              failed = true;
++            }
+           }
+-        }
+-        // Set error only when no error happended before, to preserve the
+-        // earliest error.
+-        if (!error_ && cbuf->status() == MTL::CommandBufferStatusError) {
+-          error_ = std::make_shared<std::string>(fmt::format(
+-              "[METAL] Command buffer execution failed: {}.",
+-              cbuf->error()->localizedDescription()->utf8String()));
+-        }
+-        // Poison all the signaled events when error happened.
+-        if (error_) {
+-          for (auto& [event, value] : signal_events) {
+-            event->set_error(error_);
++          if (failed && !std::atomic_load(&error_)) {
++            std::atomic_store(&error_, std::make_shared<std::string>(
++                "[METAL] Command buffer execution failed."));
+           }
++        } catch (...) { failed = true; }
++        if (failed) { state->fail(); }
++        for (auto& handler : receipt->handlers) {
++          try { handler(cbuf); } catch (...) { state->fail(); failed = true; }
++          handler = nullptr;
+         }
+-        // Metal won't signal the events for us on error, manually signal them
+-        // to avoid infinite waiting.
+-        if (cbuf->status() == MTL::CommandBufferStatusError) {
+-          for (auto& [event, value] : signal_events) {
+-            event->signal(value);
++        receipt->handlers.clear();
++        if (completion) {
++          try { completion(); } catch (...) { state->fail(); failed = true; }
++          completion = nullptr;
++        }
++        for (auto& [event, value] : signals) {
++          if (failed) { event->mark_failed(); }
++          if (cbuf->status() == MTL::CommandBufferStatusError) {
++            try { event->signal(value); } catch (...) { state->fail(); }
+           }
+         }
++        // Release every callback-owned native resource before publishing the
++        // frontier. No ordering between independently registered handlers is
++        // assumed: all handlers above belong to this one owned receipt.
++        waits.clear();
++        signals.clear();
++        timer.reset();
++        state->finish();
+       });
++  if (timer_) { timer_->submitted(); }
+   buffer_->commit();
+-  buffer_ = NS::RetainPtr(queue_->commandBufferWithUnretainedReferences());
++  buffer_ = std::move(next_buffer);
++  receipt_ = std::move(next_receipt);
++  wait_events_.clear();
++  signal_events_.clear();
++  commit_attempted_ = false;
+   buffer_ops_ = 0;
+   buffer_sizes_ = 0;
+ }
+ 
++void CommandEncoder::progress_submission() noexcept {
++  if (submission_idle() || recovery_attempted_ || commit_attempted_ ||
++      encoding_cleanup_failed_) { return; }
++  recovery_attempted_ = true;
++  try {
++    auto pool = new_scoped_memory_pool();
++    end_encoding();
++    commit();
++  } catch (...) {
++    submission_state_->fail();
++    // Retain the exact encoder and receipt. Never replay an ambiguous commit.
++  }
++}
++
+ void CommandEncoder::synchronize() {
+   auto pool = new_scoped_memory_pool();
+   auto cbuf = buffer_; // retained
+@@ -640,8 +709,7 @@ void CommandEncoder::synchronize() {
+   commit();
+   cbuf->waitUntilCompleted();
+ 
+-  if (error_ && !exiting_) {
+-    auto error = std::move(error_);
++  if (auto error = std::atomic_load(&error_); error && !exiting_) {
+     throw std::runtime_error(*error);
+   }
+ }
+@@ -653,7 +721,7 @@ MTL::ComputeCommandEncoder* CommandEncoder::get_command_encoder() {
+     fence_ = NS::TransferPtr(device_.mtl_device()->newFence());
+     // Reset error when user starts to encode new commands, they are supposed to
+     // have handled the error in synchronize() or Event::wait().
+-    error_.reset();
++    // Failure is sticky: a failed stream cannot be reused.
+   }
+   return encoder_.get();
+ }
+@@ -987,7 +1055,7 @@ Device& device(mlx::core::Device) {
+   return *metal_device;
+ }
+ 
+-CommandEncoder& get_command_encoder(Stream s) {
++std::shared_ptr<CommandEncoder> get_command_encoder_owner(Stream s) {
+   auto& encoders = get_command_encoders();
+   auto it = encoders.find(s.index);
+   if (it == encoders.end()) {
+@@ -1002,16 +1070,33 @@ CommandEncoder& get_command_encoder(Stream s) {
+   return it->second;
+ }
+ 
+-std::unordered_map<int, CommandEncoder>& get_command_encoders() {
+-  static thread_local std::unordered_map<int, CommandEncoder> encoders;
++std::unordered_map<int, std::shared_ptr<CommandEncoder>>& get_command_encoders() {
++  static thread_local std::unordered_map<int, std::shared_ptr<CommandEncoder>> encoders;
+   return encoders;
+ }
+ 
+-std::unordered_map<int, CommandEncoder>& get_global_command_encoders() {
+-  static std::unordered_map<int, CommandEncoder> encoders;
++std::unordered_map<int, std::shared_ptr<CommandEncoder>>& get_global_command_encoders() {
++  static std::unordered_map<int, std::shared_ptr<CommandEncoder>> encoders;
+   return encoders;
+ }
+ 
++CommandEncoder& get_command_encoder(Stream s) {
++  auto encoder = get_command_encoder_owner(s);
++  encoder->record_submission();
++  return *encoder;
++}
++
++std::shared_ptr<CommandEncoder> make_command_encoder(
++    Device& d, int index, ResidencySet& residency) {
++  return {new CommandEncoder(d, index, residency), [](CommandEncoder* encoder) noexcept {
++    if (encoder->submission_idle()) {
++      delete encoder;
++    }
++    // Unknown completion: retain the raw owner permanently. This is the
++    // preallocated nonblocking quarantine; callbacks may still refer to it.
++  }};
++}
++
+ NS::SharedPtr<NS::AutoreleasePool> new_scoped_memory_pool() {
+   return NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
+ }
+diff --git a/mlx/backend/metal/eval.cpp b/mlx/backend/metal/eval.cpp
+index e6826253..ea849fdf 100644
+--- a/mlx/backend/metal/eval.cpp
++++ b/mlx/backend/metal/eval.cpp
+@@ -10,20 +10,48 @@
+ 
+ namespace mlx::core::gpu {
+ 
++SubmissionToken prepare_submission_stream(Stream s) {
++  auto owner = metal::get_command_encoder_owner(s);
++  // Validate admission without accepting any work.
++  if (owner->submission_progress().failed) {
++    throw std::runtime_error("Metal stream is blocked after submission failure.");
++  }
++  owner->check_submission_admission();
++  return {std::move(owner)};
++}
++SubmissionProgress submission_progress(const SubmissionToken& token) noexcept {
++  auto* encoder = static_cast<metal::CommandEncoder*>(token.state.get());
++  return encoder ? encoder->submission_progress() : SubmissionProgress{};
++}
++void block_submission_stream(const SubmissionToken& token) noexcept {
++  if (auto* encoder = static_cast<metal::CommandEncoder*>(token.state.get())) {
++    encoder->block_submission();
++  }
++}
++void progress_submission_stream(const SubmissionToken& token) noexcept {
++  if (auto* encoder = static_cast<metal::CommandEncoder*>(token.state.get())) {
++    encoder->progress_submission();
++  }
++}
++
+ void init() {}
+ 
+ void new_stream(Stream s) {
+   assert(s.device == Device::gpu);
+   auto& encoders = metal::get_command_encoders();
+   auto& d = metal::device(s.device);
+-  encoders.try_emplace(s.index, d, s.index, d.residency_set());
++  if (!encoders.contains(s.index)) {
++    encoders.emplace(s.index, metal::make_command_encoder(d, s.index, d.residency_set()));
++  }
+ }
+ 
+ void new_thread_unsafe_stream(Stream s) {
+   assert(s.device == Device::gpu);
+   auto& encoders = metal::get_global_command_encoders();
+   auto& d = metal::device(s.device);
+-  encoders.try_emplace(s.index, d, s.index, d.residency_set());
++  if (!encoders.contains(s.index)) {
++    encoders.emplace(s.index, metal::make_command_encoder(d, s.index, d.residency_set()));
++  }
+ }
+ 
+ void eval(array& arr) {
+@@ -44,6 +72,7 @@ void eval(array& arr) {
+     debug_set_primitive_buffer_label(command_buffer, arr.primitive());
+     arr.primitive().eval_gpu(arr.inputs(), outputs);
+   }
++  encoder.check_submission_admission();
+   std::unordered_set<std::shared_ptr<array::Data>> buffers;
+   for (auto& in : arr.inputs()) {
+     buffers.insert(in.data_shared_ptr());
+@@ -58,12 +87,20 @@ void eval(array& arr) {
+ 
+   if (encoder.needs_commit()) {
+     encoder.end_encoding();
++    auto counted = std::make_shared<std::atomic<bool>>(false);
++    encoder.add_completed_handler(
++        [s, counted, buffers = std::move(buffers)](MTL::CommandBuffer*) {
++          if (counted->exchange(false)) { scheduler::notify_task_completion(s); }
++        });
+     scheduler::notify_new_task(s);
+-    encoder.commit([s, buffers = std::move(buffers)]() {
+-      scheduler::notify_task_completion(s);
+-    });
++    counted->store(true);
++    try { encoder.commit(); }
++    catch (...) {
++      if (counted->exchange(false)) { scheduler::notify_task_completion(s); }
++      throw;
++    }
+   } else {
+-    command_buffer->addCompletedHandler(
++    encoder.add_completed_handler(
+         [buffers = std::move(buffers)](MTL::CommandBuffer* cbuf) {});
+   }
+ }
+diff --git a/mlx/backend/metal/event.h b/mlx/backend/metal/event.h
+index c5c82a7c..e4a2bcda 100644
+--- a/mlx/backend/metal/event.h
++++ b/mlx/backend/metal/event.h
+@@ -15,9 +15,9 @@ class EventImpl {
+   void set_error(std::shared_ptr<std::string> error);
+   void check_error();
+ 
+-  const auto& error() const {
+-    return error_;
+-  }
++  auto error() const { return std::atomic_load(&error_); }
++  bool failed() const noexcept { return failed_.load(std::memory_order_acquire); }
++  void mark_failed() noexcept { failed_.store(true, std::memory_order_release); }
+ 
+   auto* mtl_event() {
+     return mtl_event_.get();
+@@ -26,6 +26,7 @@ class EventImpl {
+  private:
+   // TODO: Use std::atomic<std::shared_ptr> when it gets supported in Xcode.
+   std::shared_ptr<std::string> error_;
++  std::atomic<bool> failed_{false};
+ 
+   NS::SharedPtr<MTL::SharedEvent> mtl_event_;
+ };
+diff --git a/mlx/backend/metal/event.cpp b/mlx/backend/metal/event.cpp
+index 483d1a5d..c0bc0723 100644
+--- a/mlx/backend/metal/event.cpp
++++ b/mlx/backend/metal/event.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include "mlx/backend/metal/event.h"
+ #include "mlx/scheduler.h"
++#include "mlx/submission.h"
+ 
+ namespace mlx::core {
+ 
+@@ -40,6 +41,7 @@ void EventImpl::set_error(std::shared_ptr<std::string> error) {
+ }
+ 
+ void EventImpl::check_error() {
++  if (failed()) { throw std::runtime_error("Metal event belongs to a failed submission."); }
+   auto error = std::atomic_load(&error_);
+   if (error) {
+     throw std::runtime_error(*error);
+@@ -57,6 +59,10 @@ Event::Event(Stream stream) : stream_(stream) {
+ }
+ 
+ void Event::wait() const {
++  submission::wait_for_event(*this);
++}
++
++void Event::wait_dependency() const {
+   static_cast<metal::EventImpl*>(event_.get())->wait(value());
+ }
+ 
+@@ -87,6 +93,17 @@ void Event::signal(Stream stream) {
+   }
+ }
+ 
++bool Event::recover_terminal_failure() noexcept {
++  // Caller has already proved the producer's exact native frontier terminal.
++  auto* impl = static_cast<metal::EventImpl*>(event_.get());
++  if (!impl) { return false; }
++  impl->mark_failed();
++  try {
++    if (impl->mtl_event()->signaledValue() < value()) { impl->signal(value()); }
++    return true;
++  } catch (...) { return false; }
++}
++
+ bool Event::is_signaled() const {
+   auto* impl = static_cast<metal::EventImpl*>(event_.get());
+   impl->check_error();
+@@ -97,4 +114,8 @@ bool Event::is_signaled() const {
+   return signaled;
+ }
+ 
++bool Event::side_effects_terminal() const noexcept { return true; }
++bool Event::side_effects_failed() const noexcept { return false; }
++void Event::progress_side_effects() noexcept {}
++
+ } // namespace mlx::core
+diff --git a/mlx/backend/metal/fence.cpp b/mlx/backend/metal/fence.cpp
+index 6fdd57a5..b6fcbf48 100644
+--- a/mlx/backend/metal/fence.cpp
++++ b/mlx/backend/metal/fence.cpp
+@@ -78,7 +78,7 @@ void Fence::wait(Stream stream, const array& x) {
+   compute_encoder.set_bytes(f.count, 1);
+   compute_encoder.dispatch_threads(kernel_dims, kernel_dims);
+ 
+-  compute_encoder.get_command_buffer()->addCompletedHandler(
++  compute_encoder.add_completed_handler(
+       [fence_ = fence_](MTL::CommandBuffer* cbuf) {});
+ }
+ 
+@@ -129,8 +129,12 @@ void Fence::update(Stream stream, const array& x, bool cross_device) {
+   compute_encoder.set_bytes(f.count, 1);
+   compute_encoder.dispatch_threads(kernel_dims, kernel_dims);
+ 
+-  compute_encoder.get_command_buffer()->addCompletedHandler(
++  compute_encoder.add_completed_handler(
+       [fence_ = fence_](MTL::CommandBuffer* cbuf) {});
+ }
+ 
++bool Fence::side_effects_terminal() const noexcept { return true; }
++bool Fence::side_effects_failed() const noexcept { return false; }
++void Fence::progress_side_effects() noexcept {}
++
+ } // namespace mlx::core
+diff --git a/mlx/backend/cuda/device.h b/mlx/backend/cuda/device.h
+index 2929794f..b0bc7154 100644
+--- a/mlx/backend/cuda/device.h
++++ b/mlx/backend/cuda/device.h
+@@ -3,6 +3,7 @@
+ #pragma once
+ 
+ #include "mlx/array.h"
++#include "mlx/backend/gpu/submission_progress.h"
+ #include "mlx/backend/cuda/allocator.h"
+ #include "mlx/backend/cuda/lru_cache.h"
+ #include "mlx/backend/cuda/utils.h"
+@@ -124,11 +125,18 @@ class CommandEncoder {
+   }
+ 
+   CudaStream& stream() {
++    record_submission();
+     return stream_;
+   }
+ 
+   // Wait until kernels and completion handlers are finished
+   void synchronize();
++  void record_submission();
++  void check_submission_admission() const { submission_state_->check_admission(); }
++  gpu::SubmissionProgress submission_progress() const noexcept;
++  void block_submission() noexcept { submission_state_->block(); }
++  void progress_submission() noexcept;
++  bool submission_idle() const noexcept { return submission_state_->idle(); }
+ 
+  private:
+   cudaGraphNode_t add_kernel_node_raw(const cudaKernelNodeParams& params);
+@@ -147,6 +155,14 @@ class CommandEncoder {
+   void insert_graph_dependencies(GraphNode node);
+   void insert_graph_dependencies(std::vector<GraphNode> nodes);
+ 
++  std::shared_ptr<gpu::SubmissionState> submission_state_{
++      std::make_shared<gpu::SubmissionState>()};
++  bool receipt_open_{false};
++  bool launch_attempted_{false};
++  bool worker_commit_attempted_{false};
++  bool recovery_attempted_{false};
++  bool recovering_{false};
++
+   Device& device_;
+   CudaStream stream_;
+   CudaGraph graph_;
+@@ -217,8 +233,10 @@ class Device {
+ MLX_API Device& device(int cuda_device);
+ MLX_API Device& device(mlx::core::Device d);
+ MLX_API CommandEncoder& get_command_encoder(Stream s);
++std::shared_ptr<CommandEncoder> get_command_encoder_owner(Stream s);
++std::shared_ptr<CommandEncoder> make_command_encoder(Device&);
+ 
+-std::unordered_map<int, CommandEncoder>& get_command_encoders();
+-std::unordered_map<int, CommandEncoder>& get_global_command_encoders();
++std::unordered_map<int, std::shared_ptr<CommandEncoder>>& get_command_encoders();
++std::unordered_map<int, std::shared_ptr<CommandEncoder>>& get_global_command_encoders();
+ 
+ } // namespace mlx::core::cu
+diff --git a/mlx/backend/cuda/device.cpp b/mlx/backend/cuda/device.cpp
+index ffa63e32..353bd7ea 100644
+--- a/mlx/backend/cuda/device.cpp
++++ b/mlx/backend/cuda/device.cpp
+@@ -78,6 +78,7 @@ CommandEncoder::CaptureContext::CaptureContext(CommandEncoder& enc) : enc(enc) {
+ }
+ 
+ CommandEncoder::CaptureContext::~CaptureContext() {
++  try {
+   if (!use_cuda_graphs()) {
+     enc.node_count_++;
+     return;
+@@ -88,6 +89,11 @@ CommandEncoder::CaptureContext::~CaptureContext() {
+     return;
+   }
+   enc.add_graph_node(graph);
++  } catch (...) {
++    enc.submission_state_->fail();
++    // A failed native capture/dependency cleanup has no replay-safe state.
++    enc.recovery_attempted_ = true;
++  }
+ }
+ 
+ CommandEncoder::ConcurrentContext::ConcurrentContext(CommandEncoder& enc)
+@@ -96,6 +102,7 @@ CommandEncoder::ConcurrentContext::ConcurrentContext(CommandEncoder& enc)
+ }
+ 
+ CommandEncoder::ConcurrentContext::~ConcurrentContext() {
++  try {
+   enc.in_concurrent_ = false;
+   if (!use_cuda_graphs()) {
+     return;
+@@ -124,6 +131,11 @@ CommandEncoder::ConcurrentContext::~ConcurrentContext() {
+   for (auto o : outputs) {
+     enc.node_map_.emplace(o, empty).first->second = empty;
+   }
++  } catch (...) {
++    enc.submission_state_->fail();
++    // A failed native capture/dependency cleanup has no replay-safe state.
++    enc.recovery_attempted_ = true;
++  }
+ }
+ 
+ void CommandEncoder::insert_graph_dependencies(GraphNode node) {
+@@ -213,7 +225,7 @@ CommandEncoder::CommandEncoder(Device& d)
+ }
+ 
+ CommandEncoder::~CommandEncoder() {
+-  synchronize();
++  // Shared-owner deletion is permitted only after the exact receipt is terminal.
+   worker_->stop();
+ }
+ 
+@@ -480,8 +492,14 @@ bool CommandEncoder::needs_commit() {
+ 
+ void CommandEncoder::commit() {
+   nvtx3::scoped_range r("CommandEncoder::commit");
++  if (launch_attempted_ || worker_commit_attempted_) {
++    throw std::runtime_error("CUDA encoder has an unresolved native commit.");
++  }
++  if (!receipt_open_) { record_submission(); }
+   if (!temporaries_.empty()) {
+-    add_completed_handler([temporaries = std::move(temporaries_)]() {});
++    // Keep the originals until fallible callback allocation/enqueue succeeds.
++    add_completed_handler([temporaries = temporaries_]() {});
++    temporaries_.clear();
+   }
+   if (use_cuda_graphs() && node_count_ > 0) {
+     if (!from_nodes_.empty()) {
+@@ -503,6 +521,7 @@ void CommandEncoder::commit() {
+     if (!is_graph_updatable_) {
+       CudaGraphExec graph_exec;
+       graph_exec.instantiate(graph_);
++      launch_attempted_ = true;
+       CHECK_CUDA_ERROR(cudaGraphLaunch(graph_exec, stream_));
+     } else {
+       auto graph_key = graph_nodes_key_ + ":" + graph_deps_key_;
+@@ -527,6 +546,7 @@ void CommandEncoder::commit() {
+         graph_exec.instantiate(graph_);
+       }
+ 
++      launch_attempted_ = true;
+       CHECK_CUDA_ERROR(cudaGraphLaunch(graph_exec, stream_));
+     }
+ 
+@@ -548,11 +568,53 @@ void CommandEncoder::commit() {
+   }
+ 
+   // Put completion handlers in a batch.
+-  worker_->commit(stream_);
++  worker_commit_attempted_ = true;
++  worker_->commit(stream_, [state = submission_state_]() noexcept {
++    state->finish();
++  });
++  receipt_open_ = false;
++  launch_attempted_ = false;
++  worker_commit_attempted_ = false;
+   node_count_ = 0;
+   bytes_in_graph_ = 0;
+ }
+ 
++void CommandEncoder::record_submission() {
++  if (!recovering_) { submission_state_->check_admission(); }
++  if (!receipt_open_) {
++    submission_state_->open();
++    receipt_open_ = true;
++  }
++  submission_state_->accept();
++}
++
++gpu::SubmissionProgress CommandEncoder::submission_progress() const noexcept {
++  auto progress = submission_state_->query();
++  progress.failed = progress.failed || worker_->failed();
++  return progress;
++}
++
++void CommandEncoder::progress_submission() noexcept {
++  // Query never establishes terminality by itself: queued worker callbacks
++  // also own resources. It can only add an allocation-free failure fact.
++  auto status = cudaStreamQuery(stream_);
++  if (status != cudaSuccess && status != cudaErrorNotReady) {
++    submission_state_->fail();
++  }
++  if (submission_idle() || recovery_attempted_ ||
++      launch_attempted_ || worker_commit_attempted_) { return; }
++  recovery_attempted_ = true;
++  recovering_ = true;
++  try {
++    device_.make_current();
++    commit();
++  } catch (...) {
++    submission_state_->fail();
++    // In particular, never replay a graph after a fallible post-launch reset.
++  }
++  recovering_ = false;
++}
++
+ void CommandEncoder::synchronize() {
+   CHECK_CUDA_ERROR(cudaStreamSynchronize(stream_));
+   auto p = std::make_shared<std::promise<void>>();
+@@ -580,7 +642,7 @@ Device& device(mlx::core::Device d) {
+   return device(d.index);
+ }
+ 
+-CommandEncoder& get_command_encoder(Stream s) {
++std::shared_ptr<CommandEncoder> get_command_encoder_owner(Stream s) {
+   auto& encoders = get_command_encoders();
+   auto it = encoders.find(s.index);
+   if (it == encoders.end()) {
+@@ -595,18 +657,32 @@ CommandEncoder& get_command_encoder(Stream s) {
+   return it->second;
+ }
+ 
+-std::unordered_map<int, CommandEncoder>& get_command_encoders() {
+-  static thread_local std::unordered_map<int, CommandEncoder> encoders;
++std::unordered_map<int, std::shared_ptr<CommandEncoder>>& get_command_encoders() {
++  static thread_local std::unordered_map<int, std::shared_ptr<CommandEncoder>> encoders;
+   return encoders;
+ }
+ 
+-std::unordered_map<int, CommandEncoder>& get_global_command_encoders() {
++std::unordered_map<int, std::shared_ptr<CommandEncoder>>& get_global_command_encoders() {
+   // Keep process-global encoders alive until the OS reclaims them. With a
+   // statically linked CUDA backend their destructor can otherwise run after
+   // the CUDA runtime has started unloading. This follows the intentionally
+   // leaked lifetime used by the CUDA Device and Scheduler singletons.
+-  static auto* encoders = new std::unordered_map<int, CommandEncoder>;
++  static auto* encoders = new std::unordered_map<int, std::shared_ptr<CommandEncoder>>;
+   return *encoders;
+ }
+ 
++CommandEncoder& get_command_encoder(Stream s) {
++  auto encoder = get_command_encoder_owner(s);
++  encoder->record_submission();
++  return *encoder;
++}
++
++std::shared_ptr<CommandEncoder> make_command_encoder(Device& d) {
++  return {new CommandEncoder(d), [](CommandEncoder* encoder) noexcept {
++    if (encoder->submission_idle()) { delete encoder; }
++    // Unresolved receipts retain the exact native stream, worker and graph.
++    // No wait, allocation, runtime call or process termination in this path.
++  }};
++}
++
+ } // namespace mlx::core::cu
+diff --git a/mlx/backend/cuda/eval.cpp b/mlx/backend/cuda/eval.cpp
+index f8a71d71..1f690f51 100644
+--- a/mlx/backend/cuda/eval.cpp
++++ b/mlx/backend/cuda/eval.cpp
+@@ -13,6 +13,29 @@
+ 
+ namespace mlx::core::gpu {
+ 
++SubmissionToken prepare_submission_stream(Stream s) {
++  auto owner = cu::get_command_encoder_owner(s);
++  owner->check_submission_admission();
++  if (owner->submission_progress().failed) {
++    throw std::runtime_error("CUDA stream is blocked after submission failure.");
++  }
++  return {std::move(owner)};
++}
++SubmissionProgress submission_progress(const SubmissionToken& token) noexcept {
++  auto* encoder = static_cast<cu::CommandEncoder*>(token.state.get());
++  return encoder ? encoder->submission_progress() : SubmissionProgress{};
++}
++void block_submission_stream(const SubmissionToken& token) noexcept {
++  if (auto* encoder = static_cast<cu::CommandEncoder*>(token.state.get())) {
++    encoder->block_submission();
++  }
++}
++void progress_submission_stream(const SubmissionToken& token) noexcept {
++  if (auto* encoder = static_cast<cu::CommandEncoder*>(token.state.get())) {
++    encoder->progress_submission();
++  }
++}
++
+ void init() {
+   // Force initialization of CUDA, so CUDA runtime get destroyed last.
+   cudaFree(nullptr);
+@@ -28,14 +51,18 @@ void new_stream(Stream s) {
+   assert(s.device == Device::gpu);
+   auto& encoders = cu::get_command_encoders();
+   auto& d = cu::device(s.device);
+-  encoders.try_emplace(s.index, d);
++  if (!encoders.contains(s.index)) {
++    encoders.emplace(s.index, cu::make_command_encoder(d));
++  }
+ }
+ 
+ void new_thread_unsafe_stream(Stream s) {
+   assert(s.device == Device::gpu);
+   auto& encoders = cu::get_global_command_encoders();
+   auto& d = cu::device(s.device);
+-  encoders.try_emplace(s.index, d);
++  if (!encoders.contains(s.index)) {
++    encoders.emplace(s.index, cu::make_command_encoder(d));
++  }
+ }
+ 
+ void eval(array& arr) {
+@@ -44,6 +71,8 @@ void eval(array& arr) {
+   // from threads that have not yet established a CUDA context (e.g. thread
+   // pools, language runtimes that migrate work across OS threads).
+   cu::device(arr.primitive().stream().device).make_current();
++  // Accept the primitive before it can enqueue native work or mutate outputs.
++  cu::get_command_encoder(arr.primitive().stream());
+   auto outputs = arr.outputs();
+   {
+     // If the array is a tracer hold a reference
+@@ -57,6 +86,7 @@ void eval(array& arr) {
+ 
+   auto& stream = arr.primitive().stream();
+   auto& encoder = cu::get_command_encoder(stream);
++  encoder.check_submission_admission();
+   // Keep used buffers alive until kernel finishes running.
+   for (auto& in : arr.inputs()) {
+     // Except for the donated one.
+@@ -69,10 +99,17 @@ void eval(array& arr) {
+   }
+ 
+   if (encoder.needs_commit()) {
++    auto counted = std::make_shared<std::atomic<bool>>(false);
++    encoder.add_completed_handler([stream, counted]() {
++      if (counted->exchange(false)) { scheduler::notify_task_completion(stream); }
++    });
+     scheduler::notify_new_task(stream);
+-    encoder.add_completed_handler(
+-        [stream]() { scheduler::notify_task_completion(stream); });
+-    encoder.commit();
++    counted->store(true);
++    try { encoder.commit(); }
++    catch (...) {
++      if (counted->exchange(false)) { scheduler::notify_task_completion(stream); }
++      throw;
++    }
+   }
+ }
+ 
+diff --git a/mlx/backend/cuda/worker.h b/mlx/backend/cuda/worker.h
+index 54a4456a..799b14ba 100644
+--- a/mlx/backend/cuda/worker.h
++++ b/mlx/backend/cuda/worker.h
+@@ -3,7 +3,9 @@
+ #pragma once
+ 
+ #include "mlx/backend/cuda/event.h"
++#include "mlx/backend/cuda/submission_marker.h"
+ 
++#include <atomic>
+ #include <condition_variable>
+ #include <functional>
+ #include <map>
+@@ -30,29 +32,37 @@ class Worker : public std::enable_shared_from_this<Worker> {
+ 
+   // Inform worker thread to run current batches after kernels in |stream|
+   // finish running.
+-  void commit(cudaStream_t stream);
++  void commit(cudaStream_t stream, std::function<void()> completion = {});
++  bool failed() const noexcept { return failed_.load(std::memory_order_acquire); }
+ 
+  private:
+-  static void signal(void*);
++  static void signal(void*) noexcept;
+ 
+   void thread_fn();
+   std::mutex mtx_;
+   std::condition_variable cond_;
+ 
+   uint64_t committed_batch_{0};
+-  uint64_t signaled_batch_{0};
++  std::atomic<uint64_t> signaled_batch_{0};
++  std::atomic<bool> failed_{false};
+ 
+   // Cuda stream and event for signaling kernel completion.
++  Device& device_;
+   CudaStream signal_stream_;
+   CudaEvent signal_event_;
+ 
+-  bool stop_{false};
++  std::atomic<bool> stop_{false};
+ 
+   // Tasks are put in |pending_tasks_| first, and then moved to
+   // |worker_tasks_| when end_batch() is called.
+   using Tasks = std::vector<std::function<void()>>;
+   Tasks pending_tasks_;
+-  std::map<uint64_t, Tasks> worker_tasks_;
++  struct Batch {
++    std::shared_ptr<SubmissionMarker> callback_terminal;
++    Tasks tasks;
++    std::function<void()> completion;
++  };
++  std::map<uint64_t, Batch> worker_tasks_;
+   std::thread worker_;
+ };
+ 
+diff --git a/mlx/backend/cuda/worker.cpp b/mlx/backend/cuda/worker.cpp
+index de38a06e..a6213edd 100644
+--- a/mlx/backend/cuda/worker.cpp
++++ b/mlx/backend/cuda/worker.cpp
+@@ -2,11 +2,12 @@
+ 
+ #include "mlx/backend/cuda/worker.h"
+ #include "mlx/backend/cuda/device.h"
++#include <chrono>
+ 
+ namespace mlx::core::cu {
+ 
+ Worker::Worker(Device& d)
+-    : signal_stream_(d),
++    : device_(d), signal_stream_(d),
+       signal_event_(d, cudaEventDisableTiming | cudaEventBlockingSync) {}
+ 
+ Worker::~Worker() = default;
+@@ -21,9 +22,12 @@ void Worker::start() {
+ }
+ 
+ void Worker::stop() {
+-  {
++  try {
+     std::lock_guard lock(mtx_);
+-    stop_ = true;
++    stop_.store(true, std::memory_order_release);
++  } catch (...) {
++    stop_.store(true, std::memory_order_release);
++    failed_.store(true, std::memory_order_release);
+   }
+   cond_.notify_one();
+ }
+@@ -32,56 +36,104 @@ void Worker::add_task(std::function<void()> task) {
+   pending_tasks_.push_back(std::move(task));
+ }
+ 
+-void Worker::signal(void* data) {
++void Worker::signal(void* data) noexcept {
+   auto w = static_cast<Worker*>(data);
+-  {
++  try {
++    // Pair notification with the condition-variable mutex: a bare atomic
++    // increment could notify between the worker's predicate and its wait.
+     std::lock_guard lock(w->mtx_);
+-    w->signaled_batch_++;
++    w->signaled_batch_.fetch_add(1, std::memory_order_release);
++  } catch (...) {
++    w->failed_.store(true, std::memory_order_release);
+   }
+   w->cond_.notify_one();
+ }
+ 
+-void Worker::commit(cudaStream_t stream) {
+-  // Move pending tasks into tasks
+-  if (pending_tasks_.empty()) {
+-    return;
+-  }
++void Worker::commit(cudaStream_t stream, std::function<void()> completion) {
++  if (pending_tasks_.empty() && !completion) { return; }
++  device_.make_current();
++  auto callback_terminal = std::make_shared<SubmissionMarker>();
+   {
+     std::lock_guard lock(mtx_);
+-    // Move pending tasks into ready tasks
+-    worker_tasks_[++committed_batch_] = std::move(pending_tasks_);
++    if (committed_batch_ == UINT64_MAX) {
++      throw std::overflow_error("CUDA worker batch sequence exhausted.");
++    }
++    // Allocate the queue node before moving any resource-owning callbacks.
++    auto [it, inserted] = worker_tasks_.try_emplace(committed_batch_ + 1);
++    it->second.callback_terminal = callback_terminal;
++    it->second.tasks = std::move(pending_tasks_);
++    it->second.completion = std::move(completion);
++    ++committed_batch_;
++  }
++  // An exception from any native call leaves the owned batch queued. Its
++  // encoder cannot be reclaimed because the receipt remains outstanding.
++  try {
++    signal_event_.record(stream);
++    signal_event_.wait(signal_stream_);
++    CHECK_CUDA_ERROR(cudaLaunchHostFunc(signal_stream_, signal, this));
++    // This marker is ordered after the host callback RETURNS, not merely
++    // after its signaled_batch/condition-variable publication.
++    callback_terminal->record(signal_stream_);
++  } catch (...) {
++    callback_terminal->fail();
++    failed_.store(true, std::memory_order_release);
++    cond_.notify_one();
++    throw;
+   }
+-  signal_event_.record(stream);
+-  signal_event_.wait(signal_stream_);
+-  CHECK_CUDA_ERROR(cudaLaunchHostFunc(signal_stream_, signal, this));
++  cond_.notify_one();
+ }
+ 
+ void Worker::thread_fn() {
+-  while (!stop_) {
+-    uint64_t current_batch = 0;
+-    Tasks tasks;
+-    {
+-      std::unique_lock<std::mutex> lk(mtx_);
+-      cond_.wait(lk, [this, &current_batch] {
+-        return this->signaled_batch_ > current_batch || this->stop_;
+-      });
+-      current_batch = signaled_batch_;
+-      auto end = worker_tasks_.upper_bound(current_batch);
+-      for (auto it = worker_tasks_.begin(); it != end; ++it) {
+-        if (tasks.empty()) {
+-          tasks = std::move(it->second);
+-        } else {
+-          std::move(
+-              it->second.begin(), it->second.end(), std::back_inserter(tasks));
++  try {
++    for (;;) {
++      Batch batch;
++      {
++        std::unique_lock lk(mtx_);
++        cond_.wait(lk, [this] {
++          return stop_.load(std::memory_order_acquire) ||
++              (!worker_tasks_.empty() &&
++               worker_tasks_.begin()->first <=
++                   signaled_batch_.load(std::memory_order_acquire));
++        });
++        if (worker_tasks_.empty() ||
++            worker_tasks_.begin()->first >
++                signaled_batch_.load(std::memory_order_acquire)) {
++          if (stop_.load(std::memory_order_acquire)) { return; }
++          continue;
+         }
++        auto it = worker_tasks_.begin();
++        auto& marker = it->second.callback_terminal;
++        marker->progress();
++        if (marker->failed()) {
++          failed_.store(true, std::memory_order_release);
++          return; // Leave the batch owned; no terminal proof.
++        }
++        if (!marker->terminal()) {
++          // The callback may still be returning, or marker publication may
++          // not have reached us. This worker poll never blocks a caller.
++          cond_.wait_for(lk, std::chrono::microseconds(100));
++          continue;
++        }
++        batch = std::move(it->second);
++        worker_tasks_.erase(it);
++      }
++      // No allocation while collecting batches, and no callback exception may
++      // unwind out of the worker thread. Release every task before completion.
++      for (auto& task : batch.tasks) {
++        try { task(); }
++        catch (...) { failed_.store(true, std::memory_order_release); }
++        task = nullptr;
++      }
++      batch.tasks.clear();
++      if (batch.completion) {
++        try { batch.completion(); }
++        catch (...) { failed_.store(true, std::memory_order_release); }
++        batch.completion = nullptr;
+       }
+-      worker_tasks_.erase(worker_tasks_.begin(), end);
+-    }
+-    // Make sure tasks are cleared before the next wait
+-    for (int i = 0; i < tasks.size(); ++i) {
+-      auto task = std::move(tasks[i]);
+-      task();
+     }
++  } catch (...) {
++    failed_.store(true, std::memory_order_release);
++    // Queued ownership remains in this worker. Unknown completion is retained.
+   }
+ }
+ 
+diff --git a/mlx/backend/cuda/event.h b/mlx/backend/cuda/event.h
+index 494b133f..4059a41f 100644
+--- a/mlx/backend/cuda/event.h
++++ b/mlx/backend/cuda/event.h
+@@ -7,6 +7,8 @@
+ #include "mlx/stream.h"
+ 
+ #include <memory>
++#include <atomic>
++#include <functional>
+ 
+ #include <cuda_runtime.h>
+ #include <cuda/atomic>
+@@ -14,6 +16,7 @@
+ namespace mlx::core::cu {
+ 
+ class Device;
++struct HostSignalState;
+ 
+ // RAII-managed move-only wrapper of cudaEvent_t.
+ struct CudaEventHandle : public CudaHandle<cudaEvent_t, cudaEventDestroy> {
+@@ -65,14 +68,20 @@ class AtomicEvent {
+   void signal(Stream s, uint32_t value);
+   bool is_signaled(uint32_t value) const;
+   uint32_t value() const;
++  std::function<void()> prepare_host_signal(uint32_t value, bool force_gpu);
++  bool side_effects_terminal() const noexcept;
++  bool side_effects_failed() const noexcept;
++  void progress_side_effects() noexcept;
+ 
+  private:
+-  const CudaStream& signal_stream();
+ 
+   uint32_t* ptr() const {
+     return static_cast<uint32_t*>(buf_.get());
+   }
+ 
++  std::shared_ptr<std::atomic<uint32_t>> known_value_{
++      std::make_shared<std::atomic<uint32_t>>(0)};
++  std::shared_ptr<HostSignalState> host_signals_;
+   bool coherent_;
+   std::shared_ptr<void> buf_;
+ };
+diff --git a/mlx/backend/cuda/event.cu b/mlx/backend/cuda/event.cu
+index 6409a29f..3516dc61 100644
+--- a/mlx/backend/cuda/event.cu
++++ b/mlx/backend/cuda/event.cu
+@@ -3,9 +3,11 @@
+ #include "mlx/backend/cuda/allocator.h"
+ #include "mlx/backend/cuda/device.h"
+ #include "mlx/backend/cuda/event.h"
++#include "mlx/backend/cuda/submission_marker.h"
+ #include "mlx/backend/gpu/device_info.h"
+ #include "mlx/event.h"
+ #include "mlx/scheduler.h"
++#include "mlx/submission.h"
+ 
+ #include <map>
+ #include <vector>
+@@ -226,6 +228,102 @@ auto check_gpu_coherency() {
+   return coherency;
+ }
+ 
++namespace {
++void publish_signal_value(
++    const std::shared_ptr<std::atomic<uint32_t>>& known, uint32_t value) noexcept {
++  auto old = known->load(std::memory_order_relaxed);
++  while (old < value && !known->compare_exchange_weak(
++             old, value, std::memory_order_release, std::memory_order_relaxed)) {}
++}
++struct HostSignalNode {
++  SubmissionMarker marker;
++  std::atomic<bool> started{false};
++  std::atomic<bool> counted{false};
++  uint32_t value;
++  std::shared_ptr<HostSignalNode> next;
++  explicit HostSignalNode(uint32_t value) : value(value) {}
++};
++} // namespace
++
++// Allocated before a CPU task can submit its hidden GPU signal kernel.
++struct HostSignalState {
++  Device& device;
++  std::shared_ptr<void> buffer;
++  std::shared_ptr<std::atomic<uint32_t>> known;
++  cudaStream_t stream{nullptr};
++  std::shared_ptr<HostSignalNode> head;
++  std::atomic<HostSignalNode*> published_head{nullptr};
++  std::atomic<uint64_t> outstanding{0};
++  std::atomic<bool> failed{false};
++
++  HostSignalState(Device& d, std::shared_ptr<void> b,
++                  std::shared_ptr<std::atomic<uint32_t>> k)
++      : device(d), buffer(std::move(b)), known(std::move(k)) {}
++  ~HostSignalState() noexcept {
++    while (head) {
++      auto next = std::move(head->next);
++      head.reset();
++      head = std::move(next);
++    }
++    if (stream) { (void)cudaStreamDestroy(stream); }
++  }
++  void prepare_stream() {
++    device.make_current();
++    if (!stream) {
++      CHECK_CUDA_ERROR(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
++    }
++  }
++  void progress() noexcept {
++    // Nodes are immutable after publication and retained until owner teardown,
++    // permitting a CPU dependency waiter to poll without a runtime lock.
++    for (auto* node = published_head.load(std::memory_order_acquire);
++         node; node = node->next.get()) {
++      node->marker.progress();
++      if (node->marker.failed()) { failed.store(true, std::memory_order_release); }
++      if (node->marker.terminal() &&
++          node->counted.exchange(false, std::memory_order_acq_rel)) {
++        if (node->started.load(std::memory_order_acquire)) {
++          publish_signal_value(known, node->value);
++        }
++        outstanding.fetch_sub(1, std::memory_order_release);
++      }
++    }
++  }
++};
++
++namespace {
++struct PreparedHostSignal {
++  std::shared_ptr<HostSignalState> owner;
++  std::shared_ptr<HostSignalNode> node;
++
++  ~PreparedHostSignal() noexcept {
++    // Building/enqueueing the CPU task failed before hidden GPU submission.
++    if (node && !node->started.load(std::memory_order_acquire)) {
++      node->marker.cancel_unsubmitted();
++      if (node->counted.exchange(false, std::memory_order_acq_rel)) {
++        owner->outstanding.fetch_sub(1, std::memory_order_release);
++      }
++    }
++  }
++  void operator()() {
++    if (node->started.exchange(true, std::memory_order_acq_rel)) {
++      throw std::runtime_error("CUDA host signal operation was already submitted.");
++    }
++    try {
++      owner->device.make_current();
++      event_signal_kernel<<<1, 1, 0, owner->stream>>>(
++          static_cast<uint32_t*>(owner->buffer.get()), node->value);
++      CHECK_CUDA_ERROR(cudaGetLastError());
++      node->marker.record(owner->stream);
++    } catch (...) {
++      node->marker.fail();
++      owner->failed.store(true, std::memory_order_release);
++      throw;
++    }
++  }
++};
++} // namespace
++
+ AtomicEvent::AtomicEvent(Device& d) {
+   void* buf;
+   cudaError_t (*cuda_free)(void*);
+@@ -252,20 +350,66 @@ AtomicEvent::AtomicEvent(Device& d) {
+     coherent_ = false;
+   }
+   buf_ = std::shared_ptr<void>(
+-      buf, [cuda_free](void* buf) { CHECK_CUDA_ERROR(cuda_free(buf)); });
++      buf, [cuda_free](void* buf) noexcept { (void)cuda_free(buf); });
+   if (coherent_) {
+     *ptr() = 0;
+   } else {
+     CHECK_CUDA_ERROR(cudaMemset(buf, 0, sizeof(uint32_t)));
+   }
++  host_signals_ = {new HostSignalState(d, buf_, known_value_),
++      [](HostSignalState* state) noexcept {
++        if (state->outstanding.load(std::memory_order_acquire) == 0) { delete state; }
++        // Otherwise retain: a queued kernel may still access the owned buffer.
++      }};
+ }
+ 
++std::function<void()> AtomicEvent::prepare_host_signal(
++    uint32_t value, bool force_gpu) {
++  if (coherent_ && !force_gpu) {
++    return [buffer = buf_, known = known_value_, value]() {
++      event_signal(static_cast<uint32_t*>(buffer.get()), value);
++      publish_signal_value(known, value);
++    };
++  }
++  if (host_signals_->failed.load(std::memory_order_acquire)) {
++    throw std::runtime_error("CUDA hidden signal stream is poisoned.");
++  }
++  if (host_signals_->outstanding.load(std::memory_order_acquire) == UINT64_MAX) {
++    throw std::overflow_error("CUDA hidden signal sequence exhausted.");
++  }
++  host_signals_->prepare_stream();
++  auto node = std::make_shared<HostSignalNode>(value);
++  auto operation = std::make_shared<PreparedHostSignal>();
++  operation->owner = host_signals_;
++  operation->node = node;
++  std::function<void()> task = [operation]() { (*operation)(); };
++  // No fallible work after arming the receipt until the task owns it.
++  node->next = host_signals_->head;
++  host_signals_->head = node;
++  host_signals_->outstanding.fetch_add(1, std::memory_order_release);
++  node->counted.store(true, std::memory_order_release);
++  host_signals_->published_head.store(node.get(), std::memory_order_release);
++  return task;
++}
++
++bool AtomicEvent::side_effects_terminal() const noexcept {
++  return host_signals_->outstanding.load(std::memory_order_acquire) == 0;
++}
++bool AtomicEvent::side_effects_failed() const noexcept {
++  return host_signals_->failed.load(std::memory_order_acquire);
++}
++void AtomicEvent::progress_side_effects() noexcept { host_signals_->progress(); }
++
+ void AtomicEvent::wait(uint32_t value) {
+   nvtx3::scoped_range r("cu::AtomicEvent::wait");
+   if (coherent_) {
+     event_wait(ptr(), value);
+   } else {
+     while (!is_signaled(value)) {
++      host_signals_->progress();
++      if (side_effects_failed()) {
++        throw std::runtime_error("CUDA hidden signal submission failed.");
++      }
+       std::this_thread::yield();
+     }
+   }
+@@ -282,18 +426,16 @@ void AtomicEvent::wait(Stream s, uint32_t value) {
+   } else {
+     auto& encoder = get_command_encoder(s);
+     encoder.commit();
++    encoder.add_completed_handler(
++        [buf = buf_, signals = host_signals_, known = known_value_]() {});
+     wait(encoder.stream(), value);
+-    encoder.add_completed_handler([buf = buf_]() {});
+   }
+ }
+ 
+ void AtomicEvent::signal(uint32_t value) {
+   nvtx3::scoped_range r("cu::AtomicEvent::signal");
+-  if (coherent_) {
+-    event_signal(ptr(), value);
+-  } else {
+-    signal(signal_stream(), value);
+-  }
++  auto operation = prepare_host_signal(value, false);
++  operation();
+ }
+ 
+ void AtomicEvent::signal(cudaStream_t stream, uint32_t value) {
+@@ -305,13 +447,16 @@ void AtomicEvent::signal(Stream s, uint32_t value) {
+   if (s.device == mlx::core::Device::cpu) {
+     // Signal through a GPU stream so the atomic is updated in GPU - updating
+     // the atomic in CPU sometimes does not get GPU notified.
+-    scheduler::enqueue(
+-        s, [*this, value]() mutable { signal(signal_stream(), value); });
++    scheduler::enqueue(s, prepare_host_signal(value, true));
+   } else {
+     auto& encoder = get_command_encoder(s);
+     encoder.commit();
++    // Retain and prepare host observation before the native launch.
++    encoder.add_completed_handler(
++        [buf = buf_, signals = host_signals_, known = known_value_, value]() noexcept {
++          publish_signal_value(known, value);
++        });
+     signal(encoder.stream(), value);
+-    encoder.add_completed_handler([buf = buf_]() {});
+   }
+ }
+ 
+@@ -320,21 +465,8 @@ bool AtomicEvent::is_signaled(uint32_t val) const {
+ }
+ 
+ uint32_t AtomicEvent::value() const {
+-  nvtx3::scoped_range r("cu::AtomicEvent::value");
+-  if (coherent_) {
+-    cuda::atomic_ref<uint32_t> ac(*ptr());
+-    return ac.load();
+-  } else {
+-    uint32_t val;
+-    CHECK_CUDA_ERROR(
+-        cudaMemcpy(&val, ptr(), sizeof(uint32_t), cudaMemcpyDeviceToHost));
+-    return val;
+-  }
+-}
+-
+-const CudaStream& AtomicEvent::signal_stream() {
+-  static CudaStream stream(device(0));
+-  return stream;
++  // No synchronous cudaMemcpy in a nonblocking Event::is_signaled observation.
++  return known_value_->load(std::memory_order_acquire);
+ }
+ 
+ } // namespace cu
+@@ -353,6 +485,7 @@ struct EventImpl {
+   std::unique_ptr<cu::CopyableCudaEvent> cuda;
+   std::unique_ptr<cu::AtomicEvent> atomic;
+   std::shared_ptr<std::string> error;
++  std::atomic<bool> failed{false};
+ 
+   bool is_created() const {
+     return cuda || atomic;
+@@ -380,8 +513,15 @@ Event::Event(Stream s) : stream_(s) {
+ }
+ 
+ void Event::wait() const {
++  submission::wait_for_event(*this);
++}
++
++void Event::wait_dependency() const {
+   auto event = std::static_pointer_cast<EventImpl>(event_);
+   assert(event->is_created());
++  if (event->failed.load(std::memory_order_acquire)) {
++    throw std::runtime_error("CUDA event belongs to a failed submission.");
++  }
+   if (auto error = std::atomic_load(&event->error)) {
+     throw std::runtime_error(*error);
+   }
+@@ -399,7 +539,7 @@ void Event::wait() const {
+ 
+ void Event::wait(Stream s) const {
+   if (s.device == mlx::core::Device::cpu) {
+-    scheduler::enqueue(s, [event = *this]() { event.wait(); });
++    scheduler::enqueue(s, [event = *this]() { event.wait_dependency(); });
+     return;
+   }
+   auto event = std::static_pointer_cast<EventImpl>(event_);
+@@ -419,11 +559,13 @@ void Event::signal(Stream s) {
+   auto event = std::static_pointer_cast<EventImpl>(event_);
+   event->ensure_created(s, value());
+   if (s.device == mlx::core::Device::cpu) {
+-    scheduler::enqueue(s, [event = std::move(event), s, value = value()]() {
++    auto signal = event->atomic->prepare_host_signal(value(), false);
++    scheduler::enqueue(s, [event = std::move(event), s,
++                           signal = std::move(signal)]() mutable {
+       if (auto error = scheduler::stream_error(s)) {
+         std::atomic_store(&event->error, std::move(error));
+       }
+-      event->atomic->signal(value);
++      signal();
+     });
+   } else if (event->cuda) {
+     assert(value() == 1);
+@@ -433,8 +575,33 @@ void Event::signal(Stream s) {
+   }
+ }
+ 
++bool Event::side_effects_terminal() const noexcept {
++  auto* event = static_cast<EventImpl*>(event_.get());
++  return !event || !event->atomic || event->atomic->side_effects_terminal();
++}
++bool Event::side_effects_failed() const noexcept {
++  auto* event = static_cast<EventImpl*>(event_.get());
++  return event && event->atomic && event->atomic->side_effects_failed();
++}
++void Event::progress_side_effects() noexcept {
++  auto* event = static_cast<EventImpl*>(event_.get());
++  if (event && event->atomic) { event->atomic->progress_side_effects(); }
++}
++
++bool Event::recover_terminal_failure() noexcept {
++  auto* event = static_cast<EventImpl*>(event_.get());
++  if (event) { event->failed.store(true, std::memory_order_release); }
++  // CUDA's atomic fallback may require a signal kernel, and native CUDA events
++  // have no host signal operation. No bounded allocation-free terminal signal
++  // is available for every supported device; preserve ownership and poison.
++  return false;
++}
++
+ bool Event::is_signaled() const {
+   auto* event = static_cast<EventImpl*>(event_.get());
++  if (side_effects_failed()) {
++    throw std::runtime_error("CUDA hidden signal submission failed.");
++  }
+   if (!event->is_created()) {
+     return false;
+   }
+diff --git a/mlx/backend/cuda/fence.cpp b/mlx/backend/cuda/fence.cpp
+index c6a41f0e..1558a92c 100644
+--- a/mlx/backend/cuda/fence.cpp
++++ b/mlx/backend/cuda/fence.cpp
+@@ -20,7 +20,7 @@ Fence::Fence(Stream s) {
+ 
+ void Fence::wait(Stream s, const array&) {
+   auto* fence = static_cast<FenceImpl*>(fence_.get());
+-  fence->event.wait(fence->count);
++  fence->event.wait(s, fence->count);
+ }
+ 
+ void Fence::update(Stream s, const array& a, bool cross_device) {
+@@ -39,4 +39,17 @@ void Fence::update(Stream s, const array& a, bool cross_device) {
+   fence->event.signal(s, fence->count);
+ }
+ 
++bool Fence::side_effects_terminal() const noexcept {
++  auto* fence = static_cast<FenceImpl*>(fence_.get());
++  return !fence || fence->event.side_effects_terminal();
++}
++bool Fence::side_effects_failed() const noexcept {
++  auto* fence = static_cast<FenceImpl*>(fence_.get());
++  return fence && fence->event.side_effects_failed();
++}
++void Fence::progress_side_effects() noexcept {
++  auto* fence = static_cast<FenceImpl*>(fence_.get());
++  if (fence) { fence->event.progress_side_effects(); }
++}
++
+ } // namespace mlx::core
+diff --git a/mlx/backend/cuda/submission_marker.h b/mlx/backend/cuda/submission_marker.h
+new file mode 100644
+index 00000000..7be0d29f
+--- /dev/null
++++ b/mlx/backend/cuda/submission_marker.h
+@@ -0,0 +1,56 @@
++// A one-shot, pre-work CUDA marker. Query errors never imply terminality.
++#pragma once
++#include <atomic>
++#include <cuda_runtime.h>
++#include "mlx/backend/cuda/utils.h"
++
++namespace mlx::core::cu {
++class SubmissionMarker {
++ public:
++  SubmissionMarker() {
++    CHECK_CUDA_ERROR(cudaEventCreateWithFlags(&event_, cudaEventDisableTiming));
++  }
++  ~SubmissionMarker() noexcept {
++    if (event_) { (void)cudaEventDestroy(event_); }
++  }
++  SubmissionMarker(const SubmissionMarker&) = delete;
++  SubmissionMarker& operator=(const SubmissionMarker&) = delete;
++  void record(cudaStream_t stream) {
++    // A failing record may have partially submitted work. Never retry it.
++    state_.store(State::attempted, std::memory_order_release);
++    auto status = cudaEventRecord(event_, stream);
++    if (status != cudaSuccess) {
++      state_.store(State::failed, std::memory_order_release);
++      CHECK_CUDA_ERROR(status);
++    }
++    state_.store(State::recorded, std::memory_order_release);
++  }
++  void progress() noexcept {
++    if (state_.load(std::memory_order_acquire) != State::recorded) { return; }
++    auto status = cudaEventQuery(event_);
++    auto expected = State::recorded;
++    if (status == cudaSuccess) {
++      state_.compare_exchange_strong(expected, State::terminal,
++          std::memory_order_release, std::memory_order_relaxed);
++    } else if (status != cudaErrorNotReady) {
++      state_.compare_exchange_strong(expected, State::failed,
++          std::memory_order_release, std::memory_order_relaxed);
++    }
++  }
++  bool terminal() const noexcept {
++    return state_.load(std::memory_order_acquire) == State::terminal;
++  }
++  bool failed() const noexcept {
++    return state_.load(std::memory_order_acquire) == State::failed;
++  }
++  void fail() noexcept { state_.store(State::failed, std::memory_order_release); }
++  // Only legal before any native launch/record attempt.
++  void cancel_unsubmitted() noexcept {
++    state_.store(State::terminal, std::memory_order_release);
++  }
++ private:
++  enum class State { prepared, attempted, recorded, terminal, failed };
++  cudaEvent_t event_{nullptr};
++  std::atomic<State> state_{State::prepared};
++};
++} // namespace mlx::core::cu
+diff --git a/tests/gpu_submission_progress_tests.cpp b/tests/gpu_submission_progress_tests.cpp
+new file mode 100644
+index 00000000..1199584a
+--- /dev/null
++++ b/tests/gpu_submission_progress_tests.cpp
+@@ -0,0 +1,77 @@
++// CPU-only tests for native GPU receipt accounting; no GPU is initialized.
++#include "doctest/doctest.h"
++#include "mlx/backend/gpu/submission_progress.h"
++
++using mlx::core::gpu::SubmissionState;
++
++TEST_CASE("test GPU recovery receipt includes uncommitted encoded work") {
++  SubmissionState state;
++  state.check_admission();
++  state.open();
++  state.accept();
++  state.accept();
++  CHECK(state.query().accepted == 2);
++  CHECK(state.query().completed == 0);
++  CHECK_FALSE(state.idle());
++  state.finish();
++  CHECK(state.query().completed == 2);
++  CHECK(state.idle());
++}
++
++TEST_CASE("test GPU recovery frontier waits for every receipt handler") {
++  SubmissionState state;
++  state.open();
++  state.accept();
++  state.open();
++  state.accept();
++  // The later receipt may finish first; a count of completed buffers would
++  // incorrectly claim that the earlier accepted frontier is now terminal.
++  state.finish();
++  CHECK(state.query().completed == 0);
++  CHECK_FALSE(state.idle());
++  state.finish();
++  CHECK(state.query().completed == 2);
++  CHECK(state.idle());
++}
++
++TEST_CASE("test GPU recovery blocked stream rejects prework") {
++  SubmissionState state;
++  state.open();
++  state.accept();
++  state.block();
++  CHECK_THROWS_AS(state.check_admission(), std::runtime_error);
++  CHECK(state.query().accepted == 1);
++  CHECK_FALSE(state.query().failed);
++  state.finish();
++  CHECK(state.query().completed == 1);
++  CHECK_THROWS_AS(state.check_admission(), std::runtime_error);
++}
++
++TEST_CASE("test GPU recovery failure stays poisoned after terminal work") {
++  SubmissionState state;
++  state.open();
++  state.accept();
++  state.fail();
++  CHECK(state.query().failed);
++  CHECK_THROWS_AS(state.check_admission(), std::runtime_error);
++  state.finish();
++  CHECK(state.idle());
++  CHECK(state.query().completed == state.query().accepted);
++  CHECK(state.query().failed);
++  CHECK_THROWS_AS(state.check_admission(), std::runtime_error);
++}
++
++TEST_CASE("test GPU recovery later epoch cannot reuse an earlier terminal proof") {
++  SubmissionState state;
++  state.open();
++  state.accept();
++  state.finish();
++  CHECK(state.query().completed == 1);
++  state.open();
++  state.accept();
++  CHECK(state.query().accepted == 2);
++  CHECK(state.query().completed == 1);
++  state.finish();
++  CHECK(state.query().completed == 2);
++}
++

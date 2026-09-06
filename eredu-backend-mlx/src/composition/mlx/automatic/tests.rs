@@ -2,6 +2,75 @@ use super::*;
 use eredu_core::BackendProvider as _;
 
 #[test]
+fn plan_normalization_is_identical_through_native_and_foreign_adapters() {
+    let plan = ExecutionPlan::fully_resident(DevicePlan::new("mlx", "cpu:0").unwrap())
+        .with_max_cached_shards(7)
+        .with_weight_transformation(eredu_core::WeightTransformationPlan::Affine {
+            bits: 4,
+            group_size: 64,
+        })
+        .with_residency(ResidencyPlan::LayerwiseHost {
+            device_layer_window: 2,
+            device_budget_bytes: Some(4096),
+            host_budget_bytes: Some(8192),
+        });
+    let mlx = MlxBackendFactory::default()
+        .with_residency_diagnostics(true, false)
+        .load_request_for_plan(&plan)
+        .unwrap();
+    let foreign = eredu_runtime::NormalizedLoadRequest::from_execution_plan(
+        &plan.with_device(DevicePlan::new("independent", "client:7").unwrap()),
+        eredu_runtime::ResidencyDiagnostics::new(true, false),
+        None,
+    )
+    .unwrap();
+    assert_eq!(mlx.normalized(), &foreign);
+}
+
+#[test]
+fn resident_plan_retains_reader_limit_through_cold_selection() {
+    crate::tests::support::path_instrumentation::reset();
+    let directory = super::super::replicated_text::tests::tiny_artifact("llama", false);
+    let inspection =
+        eredu_architectures::configuration::inspect_artifact(directory.path()).unwrap();
+    let plan = ExecutionPlan::fully_resident(DevicePlan::new("mlx", "cpu:0").unwrap())
+        .with_max_cached_shards(7);
+    let options = MlxBackendFactory::default()
+        .load_request_for_plan(&plan)
+        .unwrap();
+    assert_eq!(options.normalized().max_cached_shards(), 7);
+    let selected = super::super::loading::select_preparation(&inspection, options).unwrap();
+    assert_eq!(selected.neutral().text_realization().max_cached_shards(), 7);
+    let counts = crate::tests::support::path_instrumentation::snapshot();
+    assert_eq!(counts.payload_opens, 0);
+    assert_eq!(counts.architecture_constructions, 0);
+    assert_eq!(counts.materializations, 0);
+}
+
+#[test]
+fn malformed_plan_reports_portable_invalidity_before_native_work() {
+    crate::tests::support::path_instrumentation::reset();
+    let plan = ExecutionPlan::fully_resident(DevicePlan::new("mlx", "cpu:0").unwrap())
+        .with_max_cached_shards(0);
+    let error = MlxBackendFactory::default()
+        .load_request_for_plan(&plan)
+        .unwrap_err();
+    let foreign = eredu_runtime::NormalizedLoadRequest::from_execution_plan(
+        &plan,
+        eredu_runtime::ResidencyDiagnostics::default(),
+        None,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, AutomaticPlanningError::Invalid(ref message) if message == &foreign.to_string())
+    );
+    assert_eq!(
+        crate::tests::support::path_instrumentation::target_native_resource_realization_attempts(),
+        0
+    );
+}
+
+#[test]
 fn realtime_capability_rejection_precedes_device_and_stream_realization() {
     crate::tests::support::path_instrumentation::reset();
     let directory = tempfile::tempdir().expect("tiny realtime artifact directory");
@@ -9,15 +78,17 @@ fn realtime_capability_rejection_precedes_device_and_stream_realization() {
     let preparation = eredu_architectures::moshi::prepare_realtime_model(directory.path())
         .expect("tiny realtime artifact is valid");
     let device = DevicePlan::new("mlx", "gpu:0").expect("portable device name is valid");
-    let options = MlxLoadRequest::default().with_required_session_capabilities(
-        eredu_core::SessionCapabilities::default().with_activation_inspection(true),
+    let options = MlxLoadRequest::from_normalized(
+        eredu_runtime::NormalizedLoadRequest::default().with_required_session_capabilities(
+            eredu_core::SessionCapabilities::default().with_activation_inspection(true),
+        ),
     );
 
     let error = match create_realtime_execution(preparation, &device, options) {
         Ok(_) => panic!("unsupported activation observation must reject selection"),
         Err(error) => error,
     };
-    assert!(error.to_string().contains("activation_inspection"));
+    assert!(error.to_string().contains("activation inspection"));
     assert_eq!(
         crate::tests::support::path_instrumentation::target_native_resource_realization_attempts(),
         0
@@ -38,7 +109,9 @@ fn mlx_discovery_always_reports_cpu() {
 fn plan_realization_rejects_distributed_topology() {
     let plan = ExecutionPlan::fully_resident(DevicePlan::new("mlx", "cpu:0").unwrap())
         .with_topology(eredu_core::ParallelTopology::new(2, 1, 1, 1).unwrap());
-    assert!(mlx_load_options(&MlxBackendFactory::default(), &plan).is_err());
+    assert!(MlxBackendFactory::default()
+        .load_request_for_plan(&plan)
+        .is_err());
 }
 
 #[test]

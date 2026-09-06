@@ -637,19 +637,11 @@ mod tests {
     #[test]
     fn test_full_try() {
         let stream = crate::test_stream();
-        let source = Array::zeros::<f32>(
-            &[1, 3],
-            Stream::new_with_device(&crate::Device::new(crate::DeviceType::Gpu, 0)),
-        )
-        .unwrap();
+        let source = Array::zeros::<f32>(&[1, 3], stream).unwrap();
         let array = Array::full::<f32>(&[2, 3], source, stream);
         assert!(array.is_ok());
 
-        let source = Array::zeros::<f32>(
-            &[1, 3],
-            Stream::new_with_device(&crate::Device::new(crate::DeviceType::Gpu, 0)),
-        )
-        .unwrap();
+        let source = Array::zeros::<f32>(&[1, 3], stream).unwrap();
         let array = Array::full::<f32>(&[-1, 3], source, stream);
         assert!(array.is_err());
     }

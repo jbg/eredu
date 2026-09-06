@@ -11,6 +11,10 @@ layer normalization, rotary encoding, and scaled dot-product attention remain
 backend fusion points. A backend therefore retains control of storage, device
 placement, graph construction, laziness, synchronization, and kernel fusion.
 
+Shared tensor-independent geometry validates normalization, grouped gates and
+causal-mask positions before backend work. Native and scalar implementations
+use these contracts without sharing layout, dtype or kernel policy.
+
 `eredu-nn` has no concrete-backend features or accelerator dependencies. Each
 backend implements `NeuralBackend` for a local backend type and `Tensor` for a
 local tensor newtype, which keeps the neutral contracts independent while
