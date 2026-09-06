@@ -364,9 +364,22 @@ fn mlx_parameter_binding_target(parameter: &crate::MlxTensor) -> Option<Paramete
     Some(ParameterBindingTarget {
         shape,
         dtype: recipe_dtype_from_mlx(parameter.as_array().dtype()),
-        permitted_source_dtypes: Vec::new(),
+        // Floating parameters are unloaded handles whose storage is replaced by
+        // the materialized source. Their initial dtype does not request a cast.
+        // Packed and integer parameters retain exact representation matching.
+        permitted_source_dtypes: match parameter.as_array().dtype() {
+            safemlx::Dtype::Float16 | safemlx::Dtype::Bfloat16 | safemlx::Dtype::Float32 => vec![
+                eredu_checkpoint::recipe::RecipeDtype::F16,
+                eredu_checkpoint::recipe::RecipeDtype::BF16,
+                eredu_checkpoint::recipe::RecipeDtype::F32,
+            ],
+            _ => Vec::new(),
+        },
     })
 }
+
+#[cfg(test)]
+mod dtype_tests;
 
 /// Assigns every module parameter from a protected resident unit.
 ///

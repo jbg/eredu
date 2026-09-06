@@ -70,7 +70,10 @@ impl BindingPlan {
         Self::with_explicit_exceptions(bindings, shared_source_keys, BTreeMap::new())
     }
 
-    /// Builds a plan with explicit shared-source and native dtype-conversion declarations.
+    /// Builds a plan with explicit shared-source and native source-dtype declarations.
+    ///
+    /// Admitted source dtypes retain their recipe metadata and byte accounting.
+    /// This declaration does not insert a dtype conversion.
     pub fn with_explicit_exceptions(
         mut bindings: Vec<PlannedBinding>,
         shared_source_keys: std::collections::BTreeSet<String>,
@@ -281,7 +284,10 @@ pub struct ParameterBindingTarget {
     pub shape: Vec<usize>,
     /// Logical dtype expected by the destination.
     pub dtype: RecipeDtype,
-    /// Source dtypes the backend explicitly converts while materializing this slot.
+    /// Source dtypes the backend can bind to this slot in addition to `dtype`.
+    ///
+    /// Admission preserves the recipe's dtype and byte accounting; it does not
+    /// request conversion to the unloaded slot's initial dtype.
     pub permitted_source_dtypes: Vec<RecipeDtype>,
 }
 

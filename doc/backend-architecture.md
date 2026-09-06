@@ -1052,6 +1052,13 @@ single consumed value returned by `ArchitectureParameters::state_identity`;
 the execution lifecycle does not publish a second, ambiguous identity getter.
 Concrete backend adapters use one shared visitor rather than family binding
 tables.
+MLX's unloaded floating parameter handles admit F16, BF16, and F32 source
+storage through the neutral binding target's explicit source-dtype allowance.
+Materialization preserves the selected recipe's dtype, bytes, and values;
+the placeholder's initial F32 dtype does not request a conversion. Packed and
+integer parameter handles retain exact dtype matching. The neutral binder
+continues to validate exact shapes, selected sources, and declared dtype
+allowances without inferring native storage flexibility.
 Partitioned materializers use that same visitor for both ordinary decoder
 families and multimodal families, leaving tensor-parallel binding selection generic and
 the role-to-module mapping entirely within the architecture. Distinct pinned
