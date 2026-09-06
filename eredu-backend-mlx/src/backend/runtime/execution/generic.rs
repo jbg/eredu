@@ -394,11 +394,16 @@ impl<U: 'static, P> MlxLayerwisePolicy<U, P> {
     }
 }
 
-fn populate_parameterized<M: Parameterized<MlxTensor>>(
+fn populate_selected_parameterized<M: Parameterized<MlxTensor>>(
     module: &mut M,
     lease: &ResidentUnitLease,
+    selected: &BTreeSet<String>,
 ) -> Result<(), Error> {
-    populate_module_from_lease(module, lease).map_err(Error::from)
+    // A pipeline rank can retain unloaded handles for another rank's static
+    // roles. Bind exactly the planned destinations, keeping every selected
+    // destination mandatory even if its materialized value is missing.
+    populate_module_from_lease_excluding(module, lease, |name| !selected.contains(name))
+        .map_err(Error::from)
 }
 
 fn largest_window_bytes(layer_bytes: &[u64], depth: usize) -> Result<u64, Error> {

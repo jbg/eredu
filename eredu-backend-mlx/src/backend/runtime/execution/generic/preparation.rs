@@ -100,6 +100,10 @@ where
     let static_id = OffloadUnitId::new("model.static")?;
     let static_bindings = static_bindings(architecture.static_modules(), store.as_ref())?;
     let static_bytes = binding_bytes(&static_bindings)?;
+    let static_parameters = static_bindings
+        .iter()
+        .map(|binding| binding.name().to_owned())
+        .collect();
     consumed.extend(
         static_bindings
             .iter()
@@ -212,7 +216,11 @@ where
     )?;
     residency.initialize()?;
     let static_lease = residency.acquire(&static_id, MemoryTier::Device)?;
-    populate_parameterized(architecture.static_modules_mut(), &static_lease)?;
+    populate_selected_parameterized(
+        architecture.static_modules_mut(),
+        &static_lease,
+        &static_parameters,
+    )?;
     let metadata = LayerwiseModelMetadata::new(
         "generic",
         None,
@@ -304,6 +312,10 @@ where
 
     let static_id = OffloadUnitId::new("model.static")?;
     let static_bytes = binding_bytes(&static_bindings)?;
+    let static_parameters = static_bindings
+        .iter()
+        .map(|binding| binding.name().to_owned())
+        .collect();
     consumed.extend(
         static_bindings
             .iter()
@@ -409,7 +421,11 @@ where
     )?;
     residency.initialize()?;
     let static_lease = residency.acquire(&static_id, MemoryTier::Device)?;
-    populate_parameterized(architecture.static_modules_mut(), &static_lease)?;
+    populate_selected_parameterized(
+        architecture.static_modules_mut(),
+        &static_lease,
+        &static_parameters,
+    )?;
     let metadata = LayerwiseModelMetadata::new(
         "generic",
         None,
