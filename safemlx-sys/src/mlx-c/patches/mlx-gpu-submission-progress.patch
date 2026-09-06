@@ -295,7 +295,7 @@ index 79133219..2e297ef8 100644
  }
  
  bool CommandEncoder::needs_commit() const {
-@@ -583,56 +595,113 @@ bool CommandEncoder::needs_commit() const {
+@@ -583,56 +595,116 @@ bool CommandEncoder::needs_commit() const {
    return (buffer_ops_ > max_ops) || ((buffer_sizes_ >> 20) > max_mb);
  }
  
@@ -424,12 +424,15 @@ index 79133219..2e297ef8 100644
 +  wait_events_.clear();
 +  signal_events_.clear();
 +  commit_attempted_ = false;
++  // A later receipt gets its own attempt after this commit succeeds.
++  recovery_attempted_ = false;
    buffer_ops_ = 0;
    buffer_sizes_ = 0;
  }
  
 +void CommandEncoder::progress_submission() noexcept {
-+  if (submission_idle() || recovery_attempted_ || commit_attempted_ ||
++  // Only the current open receipt needs a commit.
++  if (!receipt_->active || recovery_attempted_ || commit_attempted_ ||
 +      encoding_cleanup_failed_) { return; }
 +  recovery_attempted_ = true;
 +  try {
@@ -445,7 +448,7 @@ index 79133219..2e297ef8 100644
  void CommandEncoder::synchronize() {
    auto pool = new_scoped_memory_pool();
    auto cbuf = buffer_; // retained
-@@ -640,8 +709,7 @@ void CommandEncoder::synchronize() {
+@@ -640,8 +712,7 @@ void CommandEncoder::synchronize() {
    commit();
    cbuf->waitUntilCompleted();
  
@@ -455,7 +458,7 @@ index 79133219..2e297ef8 100644
      throw std::runtime_error(*error);
    }
  }
-@@ -653,7 +721,7 @@ MTL::ComputeCommandEncoder* CommandEncoder::get_command_encoder() {
+@@ -653,7 +724,7 @@ MTL::ComputeCommandEncoder* CommandEncoder::get_command_encoder() {
      fence_ = NS::TransferPtr(device_.mtl_device()->newFence());
      // Reset error when user starts to encode new commands, they are supposed to
      // have handled the error in synchronize() or Event::wait().
@@ -464,7 +467,7 @@ index 79133219..2e297ef8 100644
    }
    return encoder_.get();
  }
-@@ -987,7 +1055,7 @@ Device& device(mlx::core::Device) {
+@@ -987,7 +1058,7 @@ Device& device(mlx::core::Device) {
    return *metal_device;
  }
  
@@ -473,7 +476,7 @@ index 79133219..2e297ef8 100644
    auto& encoders = get_command_encoders();
    auto it = encoders.find(s.index);
    if (it == encoders.end()) {
-@@ -1002,16 +1070,33 @@ CommandEncoder& get_command_encoder(Stream s) {
+@@ -1002,16 +1073,33 @@ CommandEncoder& get_command_encoder(Stream s) {
    return it->second;
  }
  
@@ -853,7 +856,7 @@ index ffa63e32..353bd7ea 100644
        CHECK_CUDA_ERROR(cudaGraphLaunch(graph_exec, stream_));
      }
  
-@@ -548,11 +568,53 @@ void CommandEncoder::commit() {
+@@ -548,11 +568,56 @@ void CommandEncoder::commit() {
    }
  
    // Put completion handlers in a batch.
@@ -865,6 +868,8 @@ index ffa63e32..353bd7ea 100644
 +  receipt_open_ = false;
 +  launch_attempted_ = false;
 +  worker_commit_attempted_ = false;
++  // A later receipt gets its own attempt after this commit succeeds.
++  recovery_attempted_ = false;
    node_count_ = 0;
    bytes_in_graph_ = 0;
  }
@@ -891,7 +896,8 @@ index ffa63e32..353bd7ea 100644
 +  if (status != cudaSuccess && status != cudaErrorNotReady) {
 +    submission_state_->fail();
 +  }
-+  if (submission_idle() || recovery_attempted_ ||
++  // Only the current open receipt needs a commit.
++  if (!receipt_open_ || recovery_attempted_ ||
 +      launch_attempted_ || worker_commit_attempted_) { return; }
 +  recovery_attempted_ = true;
 +  recovering_ = true;
@@ -908,7 +914,7 @@ index ffa63e32..353bd7ea 100644
  void CommandEncoder::synchronize() {
    CHECK_CUDA_ERROR(cudaStreamSynchronize(stream_));
    auto p = std::make_shared<std::promise<void>>();
-@@ -580,7 +642,7 @@ Device& device(mlx::core::Device d) {
+@@ -580,7 +645,7 @@ Device& device(mlx::core::Device d) {
    return device(d.index);
  }
  
@@ -917,7 +923,7 @@ index ffa63e32..353bd7ea 100644
    auto& encoders = get_command_encoders();
    auto it = encoders.find(s.index);
    if (it == encoders.end()) {
-@@ -595,18 +657,32 @@ CommandEncoder& get_command_encoder(Stream s) {
+@@ -595,18 +660,32 @@ CommandEncoder& get_command_encoder(Stream s) {
    return it->second;
  }
  

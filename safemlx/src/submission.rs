@@ -266,6 +266,26 @@ mod tests {
         assert_eq!(output.evaluated().unwrap().as_slice::<f32>(), &[1.0; 1024]);
     }
 
+    #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
+    #[test]
+    fn successive_gpu_stream_waits_each_reach_terminal_completion() {
+        let device = Device::new(DeviceType::Gpu, 0);
+        let producer = Stream::new_with_device(&device);
+        let consumer = Stream::new_with_device(&device);
+        for _ in 0..3 {
+            let mut scope = SubmissionScope::begin().unwrap();
+            let value = Array::ones::<f32>(&[8], &producer).unwrap();
+            let completion = async_eval_with_event([&value]).unwrap();
+            completion.synchronize().unwrap();
+            completion.wait_on(&consumer).unwrap();
+            scope.seal();
+            let status = settle(&scope);
+            assert_eq!(status.activity(), SubmissionActivity::Terminal);
+            assert!(!status.failed());
+            assert!(!status.blocked());
+        }
+    }
+
     #[test]
     fn sealed_outer_scope_waits_for_its_active_child_before_releasing_ownership() {
         let mut outer = SubmissionScope::begin().unwrap();
