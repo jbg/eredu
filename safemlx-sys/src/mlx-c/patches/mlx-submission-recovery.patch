@@ -852,10 +852,10 @@ index 00000000..13a2fb67
 +} // namespace mlx::core::submission
 diff --git a/target/mlx-recovery-edit/new/mlx/submission.h b/mlx/submission.h
 new file mode 100644
-index 00000000..e1fc28c9
+index 00000000..c32fdb89
 --- /dev/null
 +++ b/mlx/submission.h
-@@ -0,0 +1,134 @@
+@@ -0,0 +1,138 @@
 +#pragma once
 +
 +#include <atomic>
@@ -908,6 +908,15 @@ index 00000000..e1fc28c9
 +  Scope* next_{nullptr};
 +  bool active_{true};
 +};
++
++// Establish DLL linkage before the friend declarations in Record. MSVC
++// rejects adding dllexport/dllimport after an undecorated friend declaration.
++MLX_API void progress_records(bool allow_backend_progress = true) noexcept;
++// Ordinary host operations may explicitly reclaim terminal records. Arbitrary
++// primitive/resource destructors run outside the registry lock, never in
++// scope progress/free, worker observation or thread-local teardown.
++MLX_API void retire_records();
++MLX_API bool stream_failed(Stream) noexcept;
 +
 +// Construct and prepare before native work. Keep the current array, remaining
 +// tape, primitive owners, fences and events in a derived record. finish and
@@ -982,12 +991,6 @@ index 00000000..e1fc28c9
 +// been published. This closes partial-primitive temporary lifetime holes while
 +// restoring normal donation before the next primitive.
 +MLX_API void capture_data(const std::shared_ptr<array::Data>&);
-+MLX_API void progress_records(bool allow_backend_progress = true) noexcept;
-+// Ordinary host operations may explicitly reclaim terminal records. Arbitrary
-+// primitive/resource destructors run outside the registry lock, never in
-+// scope progress/free, worker observation or thread-local teardown.
-+MLX_API void retire_records();
-+MLX_API bool stream_failed(Stream) noexcept;
 +MLX_API void wait_for_event(const Event&);
 +
 +} // namespace mlx::core::submission
