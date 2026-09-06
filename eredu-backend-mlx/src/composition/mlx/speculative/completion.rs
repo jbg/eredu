@@ -95,6 +95,14 @@ impl MlxSpeculativeCompletion {
 impl Completion for MlxSpeculativeCompletion {
     type Error = Exception;
 
+    fn resources_releasable(&self) -> bool {
+        safemlx::try_with_submission_retirement(|| {
+            crate::backend::submission_recovery::reap();
+            self.recovery.progress().settled && self.observations.active.get() == 0
+        })
+        .unwrap_or(false)
+    }
+
     fn is_complete(&self) -> Result<bool, Self::Error> {
         safemlx::try_with_submission_retirement(|| {
             crate::backend::submission_recovery::reap();

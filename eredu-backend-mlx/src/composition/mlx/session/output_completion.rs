@@ -81,6 +81,23 @@ pub struct MlxTextCompletion {
 impl Completion for MlxTextCompletion {
     type Error = Error;
 
+    fn resources_releasable(&self) -> bool {
+        safemlx::try_with_submission_retirement(|| {
+            let settled = self
+                .recovery
+                .borrow()
+                .as_ref()
+                .is_none_or(|scope| scope.progress().settled);
+            if settled {
+                self.recovery.borrow_mut().take();
+            }
+            let token = self.token.resources_releasable();
+            let model = self.model.resources_releasable();
+            settled && token && model
+        })
+        .unwrap_or(false)
+    }
+
     fn is_complete(&self) -> Result<bool, Self::Error> {
         safemlx::try_with_submission_retirement(|| {
             self.observe(|| token_then_model_is_complete(&self.token, &self.model))
@@ -140,27 +157,8 @@ impl MlxTextCompletion {
 // Keep native token-event observation ahead of model authority resolution.
 // The generic completion parameter permits deterministic pending/error tests
 // without timing-dependent accelerator events; production remains monomorphized.
-pub(super) enum TokenWaitOutcome {
-    Terminal(Result<(), Error>),
-    #[cfg(test)]
-    Unresolved(Error),
-}
-
-pub(super) trait TokenCompletion: Completion<Error = Error> {
-    fn wait_outcome(&self) -> TokenWaitOutcome;
-}
-
-impl TokenCompletion for MlxCompletion {
-    fn wait_outcome(&self) -> TokenWaitOutcome {
-        // This result is not a native terminality proof. The enclosing text
-        // completion retains its scope ticket through all model resolution;
-        // an unresolved native wait therefore cannot release the lease.
-        TokenWaitOutcome::Terminal(self.wait())
-    }
-}
-
 pub(super) fn token_then_model_is_complete(
-    token: &impl TokenCompletion,
+    token: &impl Completion<Error = Error>,
     model: &MlxSessionCompletion,
 ) -> Result<bool, Error> {
     match token.is_complete() {
@@ -171,19 +169,19 @@ pub(super) fn token_then_model_is_complete(
 }
 
 pub(super) fn token_then_model_wait(
-    token: &impl TokenCompletion,
+    token: &impl Completion<Error = Error>,
     model: &MlxSessionCompletion,
 ) -> Result<(), Error> {
-    match token.wait_outcome() {
-        TokenWaitOutcome::Terminal(Ok(())) => model.wait(),
-        TokenWaitOutcome::Terminal(Err(error)) => {
-            // A failed token wait must not trigger an unbounded cleanup wait
-            // for other children. Scope tickets retain any unresolved work.
-            let _ = model.is_complete();
+    match token.wait() {
+        Ok(()) => model.wait(),
+        Err(error) => {
+            // A failure permits model resolution only with independent native
+            // resource evidence. Never start an unbounded cleanup wait here.
+            if token.resources_releasable() {
+                let _ = model.is_complete();
+            }
             Err(error)
         }
-        #[cfg(test)]
-        TokenWaitOutcome::Unresolved(error) => Err(error),
     }
 }
 
@@ -261,6 +259,24 @@ impl MlxSessionCompletion {
 
 impl Completion for MlxSessionCompletion {
     type Error = Error;
+
+    fn resources_releasable(&self) -> bool {
+        safemlx::try_with_submission_retirement(|| {
+            crate::backend::submission_recovery::reap();
+            let MlxSessionCompletionKind::Model {
+                recovery, owner, ..
+            } = &self.inner;
+            let settled = recovery
+                .borrow()
+                .as_ref()
+                .is_none_or(|scope| scope.progress().settled);
+            if settled {
+                recovery.borrow_mut().take();
+            }
+            settled && owner.resources_releasable()
+        })
+        .unwrap_or(false)
+    }
 
     fn is_complete(&self) -> Result<bool, Self::Error> {
         safemlx::try_with_submission_retirement(|| {

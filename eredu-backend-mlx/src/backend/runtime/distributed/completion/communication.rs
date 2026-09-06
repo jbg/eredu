@@ -531,6 +531,14 @@ impl eredu_core::BoundedCompletion for MlxCommunicationCompletion {
 impl eredu_core::Completion for MlxCommunicationCompletion {
     type Error = safemlx::error::Exception;
 
+    fn resources_releasable(&self) -> bool {
+        #[cfg(test)]
+        if self.force_pending {
+            return false;
+        }
+        native_resources_releasable(&self.recovery)
+    }
+
     fn is_complete(&self) -> Result<bool, Self::Error> {
         safemlx::try_with_submission_retirement(|| {
             if !check_native_status(&self.recovery)

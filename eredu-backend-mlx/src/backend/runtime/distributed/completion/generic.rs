@@ -350,6 +350,14 @@ impl<T> DistributedCompletion<T> {
 impl<T> eredu_core::Completion for DistributedCompletion<T> {
     type Error = Error;
 
+    fn resources_releasable(&self) -> bool {
+        #[cfg(test)]
+        if self.force_pending.get() {
+            return false;
+        }
+        native_resources_releasable(&self.recovery)
+    }
+
     fn is_complete(&self) -> Result<bool, Self::Error> {
         self.is_complete()
     }

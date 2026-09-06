@@ -226,6 +226,14 @@ impl MlxSubmissionCompletion {
 impl Completion for MlxSubmissionCompletion {
     type Error = safemlx::error::Exception;
 
+    fn resources_releasable(&self) -> bool {
+        safemlx::try_with_submission_retirement(|| {
+            crate::backend::submission_recovery::reap();
+            self.retained.progress().settled && self.retained.retention().children.get() == 0
+        })
+        .unwrap_or(false)
+    }
+
     fn is_complete(&self) -> Result<bool, Self::Error> {
         safemlx::try_with_submission_retirement(|| {
             if !self.check_native_status()? {

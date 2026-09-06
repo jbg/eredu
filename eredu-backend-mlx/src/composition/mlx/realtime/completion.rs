@@ -180,6 +180,14 @@ impl MlxRealtimeCompletion {
 impl Completion for MlxRealtimeCompletion {
     type Error = Error;
 
+    fn resources_releasable(&self) -> bool {
+        safemlx::try_with_submission_retirement(|| {
+            crate::backend::submission_recovery::reap();
+            self.inner.recovery.progress().settled && self.inner.observations.get() == 0
+        })
+        .unwrap_or(false)
+    }
+
     fn is_complete(&self) -> Result<bool, Self::Error> {
         safemlx::try_with_submission_retirement(|| {
             if !self.ready()? {
@@ -265,6 +273,29 @@ mod observation_tests {
             blocked: false,
         });
         assert!(completion.is_complete().unwrap());
+    }
+
+    #[test]
+    fn failed_observation_becomes_releasable_only_after_its_native_scope_settles() {
+        let completion = completion();
+        let state = Rc::new(Cell::new(Status {
+            settled: false,
+            failed: true,
+            blocked: true,
+        }));
+        drop(Recovery::with_probe(
+            ObservationTicket::new(&completion.inner).unwrap(),
+            FakeProbe(Rc::clone(&state)),
+        ));
+        assert!(completion.is_complete().is_err());
+        assert!(!completion.resources_releasable());
+        state.set(Status {
+            settled: true,
+            failed: true,
+            blocked: false,
+        });
+        assert!(completion.resources_releasable());
+        assert!(completion.is_complete().is_err());
     }
 
     #[test]

@@ -62,6 +62,10 @@ impl SubmissionResources {
         ScopeRetention(Rc::clone(self))
     }
 
+    pub(super) fn resources_releasable(&self) -> bool {
+        self.scopes.get() == 0
+    }
+
     pub(super) fn request_release(&self) {
         self.release_requested.set(true);
         self.release_if_settled();

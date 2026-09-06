@@ -1905,6 +1905,21 @@ They do not expose model/cache parts or architecture-specific constructors to
 callers. Operations unavailable for a valid session topology return typed
 errors rather than relying on unreachable or panicking accessors.
 
+`Completion::resources_releasable` exposes native resource safety separately from
+`is_complete` and `wait`, which report execution/output success or failure. A failed
+submission can eventually become releasable without losing its error. Pending work,
+unavailable evidence, and runtime contention report false. Cancellation requests,
+timeouts, and observation errors never establish this proof. The default query
+recognizes successful exact completion only; native backends provide independent
+scope or fence evidence for failed submissions. This query does not make failed
+model state reusable, publish output, or transfer ownership of retained resources.
+
+MLX implements the query from its native submission scopes and outstanding consumer
+and observation tickets, including sampled text, realtime, speculative, and
+communication work. A settled producer cannot hide a pending child. Polling remains
+nonblocking and does not execute arbitrary application destructors. Text completion
+uses the neutral query before resolving model authority after a token failure.
+
 Every submission returns an exact completion object. A completion observes
 only the submitted work; it must not drain unrelated backend work. Schedulers
 retain outputs, branches, cache transactions, and other resources until that

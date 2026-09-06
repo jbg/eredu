@@ -17,6 +17,10 @@ pub struct MlxCompletion {
 
 impl Completion for MlxCompletion {
     type Error = Error;
+    fn resources_releasable(&self) -> bool {
+        self.retained.progress().settled
+    }
+
     fn is_complete(&self) -> Result<bool, Self::Error> {
         // Retain one try-lock across both the recovery query and event access;
         // otherwise another host can acquire the runtime between those steps.
@@ -122,6 +126,7 @@ mod retirement_tests {
         ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
         let started = Instant::now();
         let polled = submission.completion.is_complete();
+        assert!(!submission.completion.resources_releasable());
         let elapsed = started.elapsed();
         let _ = release_tx.send(());
         holder.join().unwrap();
@@ -135,6 +140,7 @@ mod retirement_tests {
         let completed = submission.completion.wait();
         safemlx::unregister_thread_runtime_housekeeping(record_poll_housekeeping);
         completed.unwrap();
+        assert!(submission.completion.resources_releasable());
         assert_eq!(POLL_HOUSEKEEPING_CALLS.with(std::cell::Cell::get), 0);
     }
 

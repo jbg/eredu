@@ -153,6 +153,14 @@ fn observe_native_child<T>(
     Ok((result?, status.settled))
 }
 
+fn native_resources_releasable<P: Probe>(recovery: &Recovery<Rc<NativeResources>, P>) -> bool {
+    safemlx::try_with_submission_retirement(|| {
+        crate::backend::submission_recovery::reap();
+        recovery.progress().settled && recovery.retention().children.get() == 0
+    })
+    .unwrap_or(false)
+}
+
 fn check_native_status<P: Probe>(
     recovery: &Recovery<Rc<NativeResources>, P>,
 ) -> safemlx::error::Result<bool> {
@@ -264,9 +272,11 @@ mod child_scope_tests {
         drop(child(&owner, Rc::clone(&failed)));
         assert!(check_native_status(&parent).is_err());
         assert!(owner.unavailable());
+        assert!(!native_resources_releasable(&parent));
         failed.set(state(true, true));
         crate::backend::submission_recovery::reap();
         assert_eq!(owner.children.get(), 0);
+        assert!(native_resources_releasable(&parent));
         assert!(check_native_status(&parent).is_err());
     }
 

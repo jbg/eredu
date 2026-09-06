@@ -532,7 +532,25 @@ pub trait Completion {
     fn is_complete(&self) -> Result<bool, Self::Error>;
 
     /// Blocks on this exact completion only.
+    /// An error reports the outcome, not whether native resource use has stopped.
     fn wait(&self) -> Result<(), Self::Error>;
+
+    /// Nonblocking proof that submitted work and its consumers no longer borrow
+    /// retained resources. This is independent of successful output publication:
+    /// a failed submission may become releasable while its error remains sticky.
+    ///
+    /// `false` includes pending work, unavailable evidence, and runtime contention.
+    /// An observation error, timeout, or cancellation request is never proof of
+    /// release. Implementations must include outstanding child/observation work
+    /// and must not wait, retry failed execution, or run application destructors.
+    /// Readiness does not make a failed session reusable or validate its outputs.
+    /// Backends still own retention when the public completion is dropped.
+    ///
+    /// The default recognizes successful exact completion only. Backends that
+    /// can establish safe release after failure should override this method.
+    fn resources_releasable(&self) -> bool {
+        matches!(self.is_complete(), Ok(true))
+    }
 }
 
 /// Mechanism selected for work which has not completed by a bounded deadline.

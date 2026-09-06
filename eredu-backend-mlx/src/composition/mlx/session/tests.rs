@@ -121,6 +121,9 @@ fn text_completion_keeps_authority_through_pending_and_failed_native_observation
     }
     impl Completion for NativeToken<'_> {
         type Error = Error;
+        fn resources_releasable(&self) -> bool {
+            self.state.get() == 1 || (self.state.get() == 2 && self.failure_is_terminal)
+        }
         fn is_complete(&self) -> Result<bool, Error> {
             assert!(self.authority.require_idle().is_err());
             match self.state.get() {
@@ -137,17 +140,6 @@ fn text_completion_keeps_authority_through_pending_and_failed_native_observation
             } else {
                 self.state.set(1);
                 Ok(())
-            }
-        }
-    }
-
-    impl output_completion::TokenCompletion for NativeToken<'_> {
-        fn wait_outcome(&self) -> output_completion::TokenWaitOutcome {
-            match self.wait() {
-                Err(error) if !self.failure_is_terminal => {
-                    output_completion::TokenWaitOutcome::Unresolved(error)
-                }
-                result => output_completion::TokenWaitOutcome::Terminal(result),
             }
         }
     }

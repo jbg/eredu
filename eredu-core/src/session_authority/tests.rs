@@ -3,7 +3,7 @@ use crate::{BackendProvider, BackendSession, Completion, ModelRuntime, PreparedM
 use std::sync::atomic::{AtomicBool, AtomicU8};
 
 struct ForeignNativeCompletion {
-    // 0: pending, 1: ready, 2: terminal failure.
+    // 0: pending, 1: ready, 2: terminal failure, 3: unresolved failure.
     state: Arc<AtomicU8>,
     active: Arc<AtomicU64>,
     drained: Arc<AtomicBool>,
@@ -12,7 +12,7 @@ struct ForeignNativeCompletion {
 impl Drop for ForeignNativeCompletion {
     fn drop(&mut self) {
         // A still-pending backend resource must be torn down with authority held.
-        if self.state.load(Ordering::Acquire) == 0 {
+        if matches!(self.state.load(Ordering::Acquire), 0 | 3) {
             assert_ne!(self.active.load(Ordering::Acquire), 0);
         }
         self.drained.store(true, Ordering::Release);
@@ -27,6 +27,10 @@ struct ForeignCompletion {
 impl Completion for ForeignCompletion {
     type Error = std::io::Error;
 
+    fn resources_releasable(&self) -> bool {
+        matches!(self.native.state.load(Ordering::Acquire), 1 | 2)
+    }
+
     fn is_complete(&self) -> Result<bool, Self::Error> {
         match self.native.state.load(Ordering::Acquire) {
             0 => Ok(false),
@@ -34,6 +38,9 @@ impl Completion for ForeignCompletion {
                 self.lease.resolve();
                 Ok(true)
             }
+            3 => Err(std::io::Error::other(
+                "native failure without terminal proof",
+            )),
             _ => {
                 self.lease.resolve();
                 Err(std::io::Error::other("terminal native failure"))
@@ -308,4 +315,37 @@ fn failed_generic_session_publication_drains_native_resources_and_releases_activ
             .load(Ordering::Acquire),
         0
     );
+}
+
+#[test]
+fn failed_completion_requires_independent_resource_proof_before_releasing_authority() {
+    let mut authority = SessionAuthority::new();
+    let completion = pending(&mut authority);
+    assert!(!completion.resources_releasable());
+    completion.native.state.store(3, Ordering::Release);
+    assert!(completion.wait().is_err());
+    assert!(!completion.resources_releasable());
+    assert_eq!(authority.require_idle(), Err(SessionAuthorityError::Busy));
+    completion.native.state.store(2, Ordering::Release);
+    assert!(completion.resources_releasable());
+    // Resource readiness alone neither publishes successful output nor mutates authority.
+    assert_eq!(authority.require_idle(), Err(SessionAuthorityError::Busy));
+    assert!(completion.wait().is_err());
+    authority.require_idle().unwrap();
+    assert!(completion.is_complete().is_err());
+}
+
+#[test]
+fn default_resource_query_never_treats_an_error_as_release_proof() {
+    struct UnknownFailure;
+    impl Completion for UnknownFailure {
+        type Error = std::io::Error;
+        fn is_complete(&self) -> Result<bool, Self::Error> {
+            Err(std::io::Error::other("cannot observe native work"))
+        }
+        fn wait(&self) -> Result<(), Self::Error> {
+            self.is_complete().map(|_| ())
+        }
+    }
+    assert!(!UnknownFailure.resources_releasable());
 }
