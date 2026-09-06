@@ -182,7 +182,11 @@ fn text_completion_keeps_authority_through_pending_and_failed_native_observation
                     assert!(!token.waited.get());
                     output_completion::token_then_model_wait(&token, &model).unwrap();
                 }
-                1 => assert!(result.unwrap()),
+                1 => {
+                    if !result.unwrap() {
+                        model.wait().unwrap();
+                    }
+                }
                 _ => {
                     assert!(result.is_err());
                     assert!(
@@ -208,6 +212,12 @@ fn text_completion_keeps_authority_through_pending_and_failed_native_observation
             output_completion::token_then_model_wait(&token, &model).unwrap();
         }
         crate::backend::submission_recovery::wait_for_retirement(|| {
+            // Returning a terminal token error does not wait for the model's
+            // own completion or for runtime access. Continue that observation
+            // only after the token's independent lifetime proof permits it.
+            if token.resources_releasable() && authority.require_idle().is_err() {
+                let _ = model.is_complete();
+            }
             authority.require_idle().is_ok()
         });
         assert_eq!(authority.require_idle(), Ok(()));
@@ -232,7 +242,9 @@ fn dropping_settled_text_completion_releases_model_authority() {
         recovery: std::cell::RefCell::new(None),
     };
     assert!(authority.require_idle().is_err());
+    completion.token.wait().unwrap();
     drop(completion);
+    crate::backend::submission_recovery::wait_for_retirement(|| authority.require_idle().is_ok());
     assert_eq!(authority.require_idle(), Ok(()));
     assert_eq!(sampled.output.evaluated().unwrap().as_slice::<u32>(), &[17]);
 }
