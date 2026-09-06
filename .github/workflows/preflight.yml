@@ -20,6 +20,7 @@ jobs:
         id: cache
         with:
           variant: macos-metal
+          rust: 'true'
       - name: Build the native library
         run: cargo build --locked -p safemlx-sys --no-default-features --features metal,accelerate
       - uses: ./.github/actions/save-native-cache

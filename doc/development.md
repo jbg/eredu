@@ -66,8 +66,11 @@ image, Xcode and Metal or the CUDA toolkit, and Linux CUDA/cuDNN/NCCL package ve
 native key also includes the native sources and build scripts, but excludes
 Rust crate manifests and Cargo.lock. The toolkit variant includes Windows
 CUDA/cuDNN versions and target architecture. Rust artifacts use a separate
-key with the Rust toolchain and Cargo dependency versions. Native files must
-be available before restoring Rust artifacts that may refer to them.
+key with the Rust toolchain and Cargo dependency versions. Only the shared
+macOS preflight build caches Rust artifacts: caching full Rust test trees for
+every matrix entry would quickly exhaust the repository's 10 GB budget and
+evict the expensive native builds. Native files must be available before
+restoring Rust artifacts that may refer to them.
 
 Successful native builds are saved before downstream tests and Rust builds,
 so a later failure does not throw away the expensive native compilation.

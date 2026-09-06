@@ -26,6 +26,7 @@ jobs:
         id: cache
         with:
           variant: macos-metal
+          rust: 'true'
       - name: Require native MLX execution
         run: |
           cargo test -p eredu-backend-mlx --features metal,accelerate --lib \

@@ -4,6 +4,9 @@ inputs:
   variant:
     description: Native platform/toolkit configuration (include CUDA and cuDNN versions).
     required: true
+  rust:
+    description: Also cache Rust artifacts; enable only for the shared macOS preflight build to stay within the repository cache budget.
+    default: 'false'
 outputs:
   native-key:
     description: Key for saving a successful native build.
@@ -35,6 +38,7 @@ runs:
       # A cached build-script result can refer to native files outside target.
       # Only restore it when a native tree is available too.
       uses: actions/cache@v4
+      if: inputs.rust == 'true'
       with:
         path: target
         key: rust-v2-${{ runner.os }}-${{ runner.arch }}-${{ inputs.variant }}-${{ steps.tools.outputs.native }}-${{ steps.tools.outputs.rust }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml') }}-${{ github.sha }}
