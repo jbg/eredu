@@ -294,6 +294,7 @@ fn map_prepared_chat_error(
     error: super::PreparedChatError<eredu_backend_mlx::backend::error::Error>,
 ) -> super::PreparedChatError<LocalBackendError> {
     match error {
+        super::PreparedChatError::Capture(error) => super::PreparedChatError::Capture(error),
         super::PreparedChatError::Backend(error) => super::PreparedChatError::Backend(
             LocalBackendError::new("prepared-chat generation", error),
         ),
@@ -540,6 +541,43 @@ impl LocalModel {
             .generate_tokens(prompt_token_ids, config)
             .map(|inner| LocalTextGeneration { inner })
             .map_err(|error| LocalBackendError::new("text generation", error))
+    }
+
+    /// Returns the loaded session's retained observation and capture support.
+    pub fn capture_discovery(
+        &self,
+    ) -> Result<eredu_core::capture::CaptureDiscovery, eredu_core::capture::CaptureError> {
+        self.inner.capture_discovery()
+    }
+
+    /// Prepares prompt alignment, ordinary generation settings, and bounded capture.
+    pub fn prepare_observed_chat(
+        &self,
+        chat: &super::PreparedChat,
+        settings: super::PreparedChatGenerationSettings,
+        plan: eredu_core::capture::CapturePlan,
+        limits: super::TraceLimits,
+    ) -> Result<super::PreparedObservedGeneration, super::PreparedChatError<LocalBackendError>>
+    {
+        self.inner
+            .prepare_observed_chat(chat, settings, plan, limits)
+            .map_err(map_prepared_chat_error)
+    }
+
+    /// Streams ordinary generation and bounded captures through the local facade.
+    pub fn generate_observed_chat<F>(
+        &mut self,
+        prepared: super::PreparedObservedGeneration,
+        caller_stop_sequences: &[String],
+        cancellation: eredu_core::generation::GenerationCancellationToken,
+        on_record: F,
+    ) -> Result<super::PreparedChatGenerationOutput, super::PreparedChatError<LocalBackendError>>
+    where
+        F: FnMut(super::ObservedGenerationRecord) -> std::ops::ControlFlow<()>,
+    {
+        self.inner
+            .generate_observed_chat(prepared, caller_stop_sequences, cancellation, on_record)
+            .map_err(map_prepared_chat_error)
     }
 
     /// Returns whether a chat template is attached.

@@ -1,5 +1,32 @@
 # Language-model backend architecture
 
+Architecture and capture discovery follows the same ownership boundaries.
+`eredu-core::discovery` owns the versioned logical graph, symbolic axes, declared
+observation catalog, and separate execution-support reports.
+`ArtifactArchitecturePlan::architecture_descriptor` in `eredu-architectures`
+projects admitted family configurations and existing component/parameter
+declarations. Runtime traversal and routing collectors share typed path
+declarations with discovery. `eredu-runtime` combines phase/conditional
+requirements with selected session and collector facts; a backend reports only
+native collection/conversion mechanisms. The facade exposes cold discovery and
+enriches ordinary inspection reports. No discovery step requires native
+resources. See [the consumer guide](architecture-discovery.md) for coverage,
+limitations, and executable examples.
+
+Bounded observation follows the same dependency direction. `eredu-core::capture`
+owns immutable admitted plans, exact catalog selectors, symbolic request geometry,
+budget comparison, native transform contracts, and versioned host records.
+`eredu-runtime::capture` reserves before calling native transforms and owns the
+one-step delivery ledger. Architecture preparation projects and retains catalog
+semantics with the exact prepared source identity; backends consume that projection.
+MLX implements eager slicing, previews and chunked reductions under its existing
+submission/recovery owner. It queues no native capture handles. The facade composes
+capture with `ControlledTextGeneration` and the ordinary committed-token semantic
+driver: tokenizer, settings, EOS, decoding, cancellation and transport stay above
+the backend. Physical allocator/private-workspace bounds remain explicitly
+unsupported; logical capture storage is not a bound on total inference memory.
+See [bounded capture](bounded-capture.md) for the accounting and delivery contract.
+
 This guide defines the boundary between the portable language-model runtime
 and an execution backend. It is intended for backend authors and maintainers of
 `eredu`.

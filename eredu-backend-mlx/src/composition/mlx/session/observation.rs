@@ -47,26 +47,7 @@ impl RuntimeActivationObserver<MlxTensor, Exception> for InspectionCollector<'_>
         &mut self,
         routing: eredu_runtime::RoutingObservation<'_, MlxTensor>,
     ) -> Result<(), Exception> {
-        let root = format!("{}.routing", routing.path);
-        self.capture(
-            &format!("{root}.selected_experts"),
-            routing.selected_experts,
-        );
-        self.capture(&format!("{root}.selected_scores"), routing.selected_scores);
-        self.capture(&format!("{root}.coefficients"), routing.coefficients);
-        self.capture(&format!("{root}.routed_output"), routing.routed_output);
-        if let Some(value) = routing.local_routed_output {
-            self.capture(&format!("{root}.local_routed_output"), value);
-        }
-        if let Some(value) = routing.reduced_routed_output {
-            self.capture(&format!("{root}.reduced_routed_output"), value);
-        }
-        if let Some(value) = routing.shared_output {
-            self.capture(&format!("{root}.shared_output"), value);
-        }
-        if let Some(value) = routing.combined_output {
-            self.capture(&format!("{root}.combined_output"), value);
-        }
+        routing.for_each_tensor(|path, value| self.capture(&path, value));
         Ok(())
     }
 }
@@ -75,6 +56,8 @@ pub(super) fn observe_tensor(
     value: &MlxTensor,
     stream: &Stream,
 ) -> Result<TensorObservation, Error> {
+    #[cfg(test)]
+    super::bounded_capture::record_host_read(value.as_array().size());
     let shape = value
         .shape()
         .iter()
@@ -86,6 +69,27 @@ pub(super) fn observe_tensor(
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
+    if shape.contains(&0) {
+        let data = match value.as_array().dtype() {
+            Dtype::Bool => TensorObservationData::Bool(Vec::new()),
+            Dtype::Uint8 | Dtype::Uint16 | Dtype::Uint32 | Dtype::Uint64 => {
+                TensorObservationData::U64(Vec::new())
+            }
+            Dtype::Int8 | Dtype::Int16 | Dtype::Int32 | Dtype::Int64 => {
+                TensorObservationData::I64(Vec::new())
+            }
+            Dtype::Float16 | Dtype::Float32 | Dtype::Float64 | Dtype::Bfloat16 => {
+                TensorObservationData::F32(Vec::new())
+            }
+            Dtype::Complex64 => {
+                return Err(Error::ArchitectureModel(
+                    "complex activation observation is unsupported".into(),
+                ))
+            }
+        };
+        return TensorObservation::new(shape, data)
+            .map_err(|error| Error::ArchitectureModel(error.to_string()));
+    }
     let data = match value.as_array().dtype() {
         Dtype::Bool => {
             TensorObservationData::Bool(value.as_array().evaluated()?.as_slice::<bool>().to_vec())

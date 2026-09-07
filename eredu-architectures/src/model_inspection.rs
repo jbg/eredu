@@ -163,6 +163,7 @@ pub fn inspect_selected_model<P>(
 where
     P: PreparationMechanismProvider,
 {
+    let descriptor = inspection.architecture_plan().architecture_descriptor();
     let capabilities = match architecture_capabilities(&inspection) {
         Ok(capabilities) => capabilities,
         Err(error) => {
@@ -171,6 +172,7 @@ where
             report.record_artifact_inspection(&inspection);
             invalidate_architecture(&mut report, error.to_string());
             record_media(&mut report, &inspection, media);
+            record_discovery(&mut report, descriptor, None, mechanisms);
             return ModelInspectionOutcome {
                 report,
                 selected: None,
@@ -188,6 +190,7 @@ where
                 safetensors_processor(&inspection, media),
             );
             record_gguf_media(&mut report, &inspection, media);
+            record_discovery(&mut report, descriptor, Some(&preparation), mechanisms);
             ModelInspectionOutcome {
                 report,
                 selected: Some(SelectedModelInspection {
@@ -206,11 +209,34 @@ where
             );
             reject_selection(&mut report, error);
             record_media(&mut report, &inspection, media);
+            record_discovery(&mut report, descriptor, None, mechanisms);
             ModelInspectionOutcome {
                 report,
                 selected: None,
             }
         }
+    }
+}
+
+fn record_discovery(
+    report: &mut ModelInspectionReport,
+    descriptor: eredu_core::ArchitectureDescriptor,
+    selected: Option<&SelectedPreparation>,
+    mechanisms: &impl PreparationMechanismProvider,
+) {
+    report.observation_support = Some(eredu_runtime::inspection::observation_support(
+        &descriptor.observations,
+        eredu_runtime::inspection::ObservationExecutionContext {
+            selected: selected.is_some(),
+            activation_inspection: selected
+                .is_some_and(|s| s.session_capabilities().activation_inspection()),
+            partitioned: selected.is_some_and(|s| s.execution().parallel_topology().is_some()),
+            mechanisms: mechanisms.observation_mechanisms(),
+        },
+    ));
+    report.architecture_descriptor = Some(descriptor);
+    if let Some(support) = &mut report.observation_support {
+        support.capture = mechanisms.capture_capabilities();
     }
 }
 

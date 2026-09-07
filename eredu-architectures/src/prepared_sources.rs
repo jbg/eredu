@@ -111,6 +111,34 @@ impl PreparedModelSources {
         &self.selected
     }
 
+    /// Projects catalog semantics from the retained architecture and combines them
+    /// with side-effect-free backend capture facts for this exact selection.
+    pub fn capture_discovery(
+        &self,
+        mechanisms: eredu_core::ObservationMechanisms,
+        capture: eredu_core::capture::CaptureCapabilities,
+    ) -> eredu_core::capture::CaptureDiscovery {
+        let catalog = self.architecture().architecture_descriptor().observations;
+        let mut support = eredu_runtime::inspection::observation_support(
+            &catalog,
+            eredu_runtime::inspection::ObservationExecutionContext {
+                activation_inspection: self
+                    .selected()
+                    .session_capabilities()
+                    .activation_inspection(),
+                partitioned: self.selected().execution().parallel_topology().is_some(),
+                selected: true,
+                mechanisms,
+            },
+        );
+        support.capture = capture;
+        eredu_core::capture::CaptureDiscovery {
+            artifact_identity: self.source_identity().to_string(),
+            catalog,
+            support,
+        }
+    }
+
     /// Consumes the authoritative pairing immediately before typed execution dispatch.
     pub(crate) fn into_parts(
         self,

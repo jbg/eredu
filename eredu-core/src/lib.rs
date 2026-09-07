@@ -19,12 +19,17 @@ pub mod automatic;
 pub mod backend;
 /// Aggregate ownership and admission for backend-managed live caches.
 pub mod cache;
+/// Bounded, admitted execution capture and portable transport records.
+pub mod capture;
 /// Portable model capabilities, runtime-state accounting, and admission policy.
 pub mod capability;
 /// Neutral checkpoint tensor descriptions and validation.
 pub mod checkpoint;
 /// Backend-neutral distributed scheduler consensus.
 pub mod consensus;
+/// Logical architecture and capture discovery contracts.
+pub mod discovery;
+pub use discovery::*;
 /// Portable execution plans, capabilities, and telemetry.
 pub mod execution;
 /// Backend-independent generation lifecycle and output events.

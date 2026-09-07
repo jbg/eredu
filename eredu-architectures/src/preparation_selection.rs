@@ -58,6 +58,16 @@ use crate::{
 /// execution branch, or inspect model-family identity. Architecture code supplies
 /// exact neutral requirements and retains every selection decision.
 pub trait PreparationMechanismProvider {
+    /// Host observation collector facts, independent of model family and devices.
+    fn observation_mechanisms(&self) -> eredu_core::ObservationMechanisms {
+        eredu_core::ObservationMechanisms::default()
+    }
+
+    /// Bounded native transformations, without allocating or selecting a device.
+    fn capture_capabilities(&self) -> eredu_core::capture::CaptureCapabilities {
+        Default::default()
+    }
+
     /// Portable artifact, residency, topology, modality, completion, and session mechanisms.
     fn preparation_capabilities(&self) -> PreparationMechanismCapabilities;
 

@@ -381,6 +381,7 @@ pub struct MlxModelSession {
     authority: RefCell<SessionAuthority>,
     floating_state_dtype_bytes: std::num::NonZeroU8,
     capabilities: eredu_core::SessionCapabilities,
+    capture_discovery: Option<eredu_core::capture::CaptureDiscovery>,
     state_residency: CacheResidencyPolicy,
 }
 
@@ -388,6 +389,11 @@ impl MlxModelSession {
     #[cfg(test)]
     pub(super) fn test_payload_weak(&self) -> std::rc::Weak<OrdinaryRetirement<SessionPayload>> {
         Rc::downgrade(&self.payload)
+    }
+    #[cfg(test)]
+    pub(crate) fn test_payload_retirement_probe(&self) -> impl Fn() -> bool + 'static {
+        let payload = Rc::downgrade(&self.payload);
+        move || payload.upgrade().is_none()
     }
     #[cfg(test)]
     pub(super) fn set_retirement_probe(&mut self, probe: Box<dyn std::any::Any>) {
@@ -409,6 +415,7 @@ impl MlxModelSession {
         #[cfg(any(feature = "image", feature = "audio"))]
         let processor = model.take_processor();
         let distributed = model.take_distributed();
+        let capture_discovery = model.take_capture_discovery();
         let (executable, target) = model.into_execution_parts();
         #[cfg(test)]
         crate::tests::support::path_instrumentation::session_reset_attempt();
@@ -431,6 +438,7 @@ impl MlxModelSession {
             authority: RefCell::new(SessionAuthority::new()),
             floating_state_dtype_bytes,
             capabilities: realized_capabilities,
+            capture_discovery,
             state_residency,
         };
         session.reset()?;
@@ -1074,6 +1082,67 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
     type TextGenerationState = MlxTextGenerationState;
     type TextCompletion = MlxTextCompletion;
 
+    fn capture_discovery(
+        runtime: &ModelRuntime<Self>,
+    ) -> Result<eredu_core::capture::CaptureDiscovery, eredu_core::capture::CaptureError> {
+        runtime.session().capture_discovery.clone().ok_or_else(|| {
+            eredu_core::capture::CaptureError::Unsupported(
+                "session has no retained capture catalog".into(),
+            )
+        })
+    }
+
+    fn configure_text_capture(
+        runtime: &ModelRuntime<Self>,
+        state: &mut Self::TextGenerationState,
+        plan: eredu_core::capture::AdmittedCapturePlan,
+    ) -> Result<(), eredu_core::capture::CaptureError> {
+        Self::validate_text_capture(runtime, &plan)?;
+        if !plan.is_empty() {
+            state.capture = Some(eredu_runtime::capture::CaptureSession::new(plan));
+        }
+        Ok(())
+    }
+
+    fn validate_text_capture(
+        runtime: &ModelRuntime<Self>,
+        plan: &eredu_core::capture::AdmittedCapturePlan,
+    ) -> Result<(), eredu_core::capture::CaptureError> {
+        use eredu_core::capture::*;
+        if plan.is_empty() {
+            return Ok(());
+        }
+        if runtime.session().payload.distributed.is_some() || plan.request().batch != 1 {
+            return Err(CaptureError::Unsupported(
+                "bounded capture requires ordinary single-rank, single-sequence text generation"
+                    .into(),
+            ));
+        }
+        let discovery = Self::capture_discovery(runtime)?;
+        let checked = plan.plan().clone().admit(
+            &discovery.catalog,
+            &discovery.support,
+            &discovery.support.capture,
+            plan.request(),
+        )?;
+        if checked.identity() != plan.identity() {
+            return Err(CaptureError::Invalid(
+                "capture admission does not match this session's catalog".into(),
+            ));
+        }
+        super::bounded_capture::preflight(&checked)?;
+        Ok(())
+    }
+
+    fn take_text_capture(
+        state: &mut Self::TextGenerationState,
+    ) -> Option<eredu_core::capture::CapturedStep> {
+        state
+            .capture
+            .as_mut()
+            .and_then(eredu_runtime::capture::CaptureSession::take_step)
+    }
+
     fn start_text_generation(
         _: &Self,
         config: TextGenerationConfig,
@@ -1109,6 +1178,8 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
                 temperature: sampling.temperature,
                 prng,
                 sampler,
+                capture: None,
+                prediction_index: 0,
             })
         })
     }
@@ -1144,6 +1215,25 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
         state: &mut Self::TextGenerationState,
     ) -> Result<Submission<Self::Token, Self::TextCompletion>, Error> {
         let stream = runtime.backend().stream().clone();
+        if let Some(capture) = &mut state.capture {
+            capture
+                .begin_step(eredu_core::capture::CapturePhase::Prefill, 0)
+                .map_err(|e| Error::ArchitectureModel(e.to_string()))?;
+            let (backend, session) = runtime.parts_mut();
+            let submission = session.submit_prefill_with_observer(
+                backend,
+                prompt,
+                &mut super::bounded_capture::BoundedObserver {
+                    capture,
+                    stream: &stream,
+                },
+            )?;
+            let submission = Submission {
+                output: MlxModelOutput::new(Some(MlxTensor::from_array(submission.output))),
+                completion: submission.completion,
+            };
+            return sample_text_submission(runtime.session(), submission, filter, state, stream);
+        }
         let submission = runtime.prefill(prompt)?;
         sample_text_submission(runtime.session(), submission, filter, state, stream)
     }
@@ -1155,6 +1245,39 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
         state: &mut Self::TextGenerationState,
     ) -> Result<Submission<Self::Token, Self::TextCompletion>, Error> {
         let stream = runtime.backend().stream().clone();
+        if let Some(capture) = &mut state.capture {
+            state.prediction_index = state
+                .prediction_index
+                .checked_add(1)
+                .ok_or_else(|| Error::ArchitectureModel("capture prediction overflow".into()))?;
+            capture
+                .begin_step(
+                    eredu_core::capture::CapturePhase::Decode,
+                    state.prediction_index,
+                )
+                .map_err(|e| Error::ArchitectureModel(e.to_string()))?;
+            let (backend, session) = runtime.parts_mut();
+            // Input framing belongs to the existing session recovery boundary.
+            let input = session.with_shared_operation(|| {
+                token
+                    .value
+                    .try_index_device((.., NewAxis), &stream)
+                    .map_err(Into::into)
+            })?;
+            let submission = session.submit_decode_with_observer(
+                backend,
+                input,
+                &mut super::bounded_capture::BoundedObserver {
+                    capture,
+                    stream: &stream,
+                },
+            )?;
+            let submission = Submission {
+                output: MlxModelOutput::new(Some(MlxTensor::from_array(submission.output))),
+                completion: submission.completion,
+            };
+            return sample_text_submission(runtime.session(), submission, filter, state, stream);
+        }
         let (backend, session) = runtime.parts_mut();
         let submission = session.submit_decode_input(backend, || {
             #[cfg(test)]

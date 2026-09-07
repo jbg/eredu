@@ -5,6 +5,8 @@ pub struct MlxTextGenerationState {
     pub(super) temperature: f32,
     pub(super) prng: Option<RandomState>,
     pub(super) sampler: MlxTextSampler,
+    pub(super) capture: Option<eredu_runtime::capture::CaptureSession>,
+    pub(super) prediction_index: u64,
 }
 
 pub(super) enum MlxTextSampler {
@@ -62,6 +64,7 @@ pub(super) fn sample_text_submission(
             temperature,
             prng,
             sampler,
+            ..
         } = state;
         let mut sampler = FilteredTextSampler { sampler, filter };
         let token = if session.synchronizes_sampling() {

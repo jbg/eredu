@@ -94,6 +94,8 @@ mod prediction_adapter;
 pub(crate) fn run_reference_conformance_embedded_prediction() {
     prediction_adapter::assert_real_embedded_prediction();
 }
+#[path = "reference_numeric/discovery.rs"]
+mod discovery;
 #[path = "reference_numeric/payload.rs"]
 mod payload;
 #[path = "reference_numeric/prepared_adapter.rs"]

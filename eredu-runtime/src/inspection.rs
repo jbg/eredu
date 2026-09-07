@@ -2,6 +2,76 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+/// Selected, model-independent conditions used to report capture support.
+#[derive(Debug, Clone, Copy)]
+pub struct ObservationExecutionContext {
+    /// Exact admitted session enables the instrumented execution route.
+    pub activation_inspection: bool,
+    /// Rank ownership and provider-specific routing need more precise discovery.
+    pub partitioned: bool,
+    /// An execution configuration was successfully selected.
+    pub selected: bool,
+    /// Side-effect-free native collector facts.
+    pub mechanisms: eredu_core::ObservationMechanisms,
+}
+
+/// Resolves support without modifying the logical graph or inventing observations.
+pub fn observation_support(
+    catalog: &eredu_core::ObservationCatalog,
+    context: ObservationExecutionContext,
+) -> eredu_core::ObservationSupportReport {
+    eredu_core::ObservationSupportReport {
+        schema_version: eredu_core::DISCOVERY_SCHEMA_VERSION,
+        capture: Default::default(),
+        points: catalog
+            .points
+            .iter()
+            .map(|point| eredu_core::ObservationSupport {
+                path: point.path.clone(),
+                prefill: point_support(point, point.prefill, context),
+                decode: point_support(point, point.decode, context),
+                floating_to_f32: context.mechanisms.floating_to_f32,
+            })
+            .collect(),
+    }
+}
+
+fn point_support(
+    point: &eredu_core::ObservationPoint,
+    phase_available: bool,
+    context: ObservationExecutionContext,
+) -> eredu_core::ObservationSupportStatus {
+    use eredu_core::{ObservationRequirement as R, ObservationSupportStatus as S};
+    if !phase_available {
+        return S::Unsupported("The architecture does not emit this point in this phase".into());
+    }
+    if !context.selected {
+        return S::Unverified("No admitted execution configuration".into());
+    }
+    if !context.activation_inspection {
+        return S::Unsupported("Selected session does not enable activation inspection".into());
+    }
+    if !context.mechanisms.activation_tensors {
+        return S::Unsupported("Backend has not declared tensor capture support".into());
+    }
+    if point.requirements.contains(&R::RoutingEvents) && !context.mechanisms.routing_tensors {
+        return S::Unsupported("Backend does not collect normalized routing events".into());
+    }
+    if context.partitioned {
+        return S::Unverified(
+            "Partition-local ownership and routing observation coverage are not yet described"
+                .into(),
+        );
+    }
+    if point.requirements.contains(&R::MediaInput) {
+        return S::Conditional("Requires the corresponding media input during prefill".into());
+    }
+    if point.requirements.contains(&R::PredictionExecution) {
+        return S::Conditional("Requires the corresponding prediction execution group".into());
+    }
+    S::Supported
+}
+
 /// One ordinary block output selected for a target/draft consumer.
 pub struct TargetStateTap<'a, T> {
     /// Architecture block ordinal.
@@ -111,6 +181,27 @@ pub struct RoutingObservation<'a, T> {
     pub combined_output: Option<&'a T>,
     /// Total number of routed experts.
     pub expert_count: i32,
+}
+
+impl<T> RoutingObservation<'_, T> {
+    /// Enumerates only present event fields using the same typed paths as discovery.
+    pub fn for_each_tensor(&self, mut visit: impl FnMut(String, &T)) {
+        use eredu_core::RoutingObservationField as Field;
+        for (field, value) in [
+            (Field::SelectedExperts, Some(self.selected_experts)),
+            (Field::SelectedScores, Some(self.selected_scores)),
+            (Field::Coefficients, Some(self.coefficients)),
+            (Field::RoutedOutput, Some(self.routed_output)),
+            (Field::LocalRoutedOutput, self.local_routed_output),
+            (Field::ReducedRoutedOutput, self.reduced_routed_output),
+            (Field::SharedOutput, self.shared_output),
+            (Field::CombinedOutput, self.combined_output),
+        ] {
+            if let Some(value) = value {
+                visit(field.path(self.path), value);
+            }
+        }
+    }
 }
 
 /// Statically dispatched activation observation and intervention contract.

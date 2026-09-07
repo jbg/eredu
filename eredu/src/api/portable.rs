@@ -87,6 +87,7 @@ pub struct LoadedTextModelConfig {
 /// The type contains no backend tensor, device, stream, or completion type.
 /// Backend-specific state remains owned by [`ModelRuntime`].
 pub struct LoadedModel<B: TextGenerationBackend> {
+    pub(crate) session_identity: String,
     pub(crate) runtime: ModelRuntime<B>,
     pub(crate) tokenizer: ChatTokenizer,
     pub(crate) tokenizer_fingerprint: [u8; 32],
@@ -196,6 +197,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
     ) -> Self {
         let tokenizer_fingerprint = eredu_text::tokenizer::vocabulary_fingerprint(&tokenizer);
         Self {
+            session_identity: super::observed::new_identity("session"),
             runtime,
             tokenizer,
             tokenizer_fingerprint,

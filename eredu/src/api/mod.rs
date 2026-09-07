@@ -39,9 +39,13 @@ pub use tokenizer::{chat_template_kwargs, load_tokenizer, TextMetadataError};
 mod capability;
 mod inspection;
 mod loaded;
-pub use inspection::{inspect_text_model, TextInspectionOptions};
+mod observed;
+pub use inspection::{inspect_architecture, inspect_text_model, TextInspectionOptions};
 pub use loaded::{LoadedModelLoadError, PlannedModelLoadError};
 pub use media::MultimodalPreparationError;
+pub use observed::{
+    ObservedGenerationEvent, ObservedGenerationRecord, PreparedObservedGeneration, TraceLimits,
+};
 
 pub use portable::{
     LoadedModel, LoadedTextModelConfig, PlannedModel, TextDecoder, TextDecoderError, TextModelError,

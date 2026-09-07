@@ -92,6 +92,16 @@ pub fn finalize_realized_model_inspection(
         } else {
             InspectionReadiness::Unsupported
         };
+    if !outcomes.session.activation_inspection() {
+        if let Some(support) = &mut report.observation_support {
+            for point in &mut support.points {
+                point.prefill = crate::ObservationSupportStatus::Unsupported(
+                    "Realized session does not support activation inspection".into(),
+                );
+                point.decode = point.prefill.clone();
+            }
+        }
+    }
     report
 }
 
@@ -353,6 +363,12 @@ pub struct InspectionRequirement {
 /// Structured pre-preparation compatibility report for a local artifact.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ModelInspectionReport {
+    /// Logical architecture and declared captures, generated without backend resources.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub architecture_descriptor: Option<crate::ArchitectureDescriptor>,
+    /// Capture support under the selected backend execution configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation_support: Option<crate::ObservationSupportReport>,
     /// Submitted local artifact path.
     pub path: PathBuf,
     /// Detected artifact container.
@@ -413,6 +429,8 @@ impl ModelInspectionReport {
     /// Creates an initially unverified report for backend-specific enrichment.
     pub fn unverified(path: &Path, artifact_format: ArtifactFormat) -> Self {
         Self {
+            architecture_descriptor: None,
+            observation_support: None,
             path: path.to_path_buf(),
             artifact_format,
             model_family: None,

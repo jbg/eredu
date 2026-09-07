@@ -118,6 +118,9 @@ pub struct PreparedChatGenerationOutput {
 /// failures have distinct variants and never masquerade as backend errors.
 #[derive(Debug, thiserror::Error)]
 pub enum PreparedChatError<E: std::error::Error + Send + Sync + 'static> {
+    /// Capture admission, accounting, or transport bounds rejected the request.
+    #[error(transparent)]
+    Capture(#[from] eredu_core::capture::CaptureError),
     /// The selected backend failed submission, completion, or token extraction.
     #[error("selected backend failed prepared-chat generation: {0}")]
     Backend(#[source] E),
@@ -459,6 +462,9 @@ where
     B: eredu_core::TextGenerationBackend,
 {
     pub(super) generator: eredu_core::ControlledTextGeneration<'a, B, ConstraintController>,
+    pub(super) on_token:
+        Option<&'a mut dyn FnMut(Option<u32>, Option<eredu_core::capture::CapturedStep>, f64)>,
+    pub(super) capture_enabled: bool,
 }
 
 impl<B> CommittedTokenSource for BackendGenerationTokenSource<'_, B>
@@ -468,10 +474,44 @@ where
     type Error = eredu_core::ControlledTextGenerationError<B::Error, ConstraintError>;
 
     fn next_token(&mut self) -> Result<Option<u32>, Self::Error> {
-        self.generator
+        let started = self.on_token.as_ref().map(|_| std::time::Instant::now());
+        let result = self
+            .generator
             .next()
             .transpose()
-            .map(|token| token.map(|token| token.token_id()))
+            .map(|token| token.map(|token| token.token_id()));
+        let token = match result {
+            Ok(token) => token,
+            Err(error) => {
+                if self.capture_enabled {
+                    if let (Some(callback), Ok(Some(capture))) =
+                        (&mut self.on_token, self.generator.take_captured_step())
+                    {
+                        callback(
+                            None,
+                            Some(capture),
+                            started.unwrap().elapsed().as_secs_f64(),
+                        );
+                    }
+                }
+                return Err(error);
+            }
+        };
+        if let (Some(token), Some(callback)) = (token, &mut self.on_token) {
+            let capture = if self.capture_enabled {
+                self.generator
+                    .take_captured_step()
+                    .map_err(eredu_core::ControlledTextGenerationError::Backend)?
+            } else {
+                None
+            };
+            callback(
+                Some(token),
+                capture,
+                started.unwrap().elapsed().as_secs_f64(),
+            );
+        }
+        Ok(token)
     }
 
     fn grammar_is_complete(&mut self) -> Result<bool, Self::Error> {

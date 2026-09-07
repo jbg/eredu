@@ -57,6 +57,10 @@ fn write_qwen_hybrid_fixture(directory: &Path, model_type: &str) {
 
 fn write_qwen_hybrid_moe_fixture(directory: &Path, model_type: &str) {
     let config = qwen_hybrid_moe_config(model_type);
+    write_qwen_hybrid_config_fixture(directory, config);
+}
+
+fn write_qwen_hybrid_config_fixture(directory: &Path, config: serde_json::Value) {
     let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = execution.stream();
     let parsed = qwen_hybrid::model_args_from_config_value(&config).unwrap();
@@ -69,6 +73,185 @@ fn write_qwen_hybrid_moe_fixture(directory: &Path, model_type: &str) {
     );
     initialize_fixture(&mut model, stream);
     save_parameter_fixture(directory, &config, &model);
+}
+
+#[test]
+fn discovery_hybrid_supported_catalog_agrees_with_native_captures() {
+    use eredu_core::{ObservationSelector, ObservationSupportStatus};
+    let checkpoint = tempfile::tempdir().unwrap();
+    let mut config = qwen_hybrid_moe_config("qwen3_next");
+    config["mtp_num_hidden_layers"] = 0.into();
+    write_qwen_hybrid_config_fixture(checkpoint.path(), config);
+    let report = crate::native::inspect_model(
+        checkpoint.path(),
+        crate::native::MlxInspectionOptions::default(),
+    )
+    .unwrap();
+    let catalog = &report
+        .architecture_descriptor
+        .as_ref()
+        .unwrap()
+        .observations;
+    let supported = report
+        .observation_support
+        .as_ref()
+        .unwrap()
+        .points
+        .iter()
+        .filter(|p| {
+            p.prefill == ObservationSupportStatus::Supported
+                && p.decode == ObservationSupportStatus::Supported
+        })
+        .map(|p| p.path.clone())
+        .collect::<Vec<_>>();
+    assert!(supported
+        .iter()
+        .any(|p| p.ends_with("routing.shared_output")));
+    let request =
+        ObservationRequest::selected(supported.iter().cloned().map(ObservationSelector::Exact));
+    let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+    let stream = execution.stream();
+    let backend = crate::native::backend(stream, stream);
+    let prepared = load_model(&backend, checkpoint.path(), MlxLoadRequest::default()).unwrap();
+    let mut runtime = ModelRuntime::from_prepared(backend, prepared).unwrap();
+    let tokens = Array::from_slice(&[1_u32, 2], &[1, 2]);
+    let parts = [text_input_part(&tokens)];
+    let first = runtime
+        .inspect_prefill(
+            crate::backend::runtime::media::input::ModelInput::new(&parts).into(),
+            &request,
+        )
+        .unwrap();
+    let next = runtime
+        .inspect_decode(Array::from_slice(&[3_u32], &[1, 1]), &request)
+        .unwrap();
+    for output in [first, next] {
+        for path in &supported {
+            assert!(catalog.get(path).is_some());
+            assert!(
+                output.observations.get(path).is_some(),
+                "advertised native path missing: {path}"
+            );
+        }
+    }
+    verify_bounded_hybrid_capture(&mut runtime);
+}
+
+fn verify_bounded_hybrid_capture(runtime: &mut ModelRuntime<crate::backend::MlxBackend<'_>>) {
+    use eredu_core::{capture::*, TextGenerationBackend, TextGenerationConfig, TokenOutput};
+    struct Allow;
+    impl eredu_core::TokenFilterController for Allow {
+        type Error = std::convert::Infallible;
+        fn current_filter(&mut self) -> Result<eredu_core::TokenFilter, Self::Error> {
+            Ok(eredu_core::TokenFilter::All)
+        }
+        fn commit_token(&mut self, _: u32) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        fn is_complete(&mut self) -> Result<bool, Self::Error> {
+            Ok(false)
+        }
+    }
+    let sampling = eredu_core::resolve_generation_config(
+        None,
+        eredu_core::GenerationConfigOverrides {
+            temperature: Some(0.0),
+            max_new_tokens: Some(2),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    runtime.parts_mut().1.reset().unwrap();
+    let ordinary =
+        eredu_core::TextGeneration::new(runtime, vec![1, 2], TextGenerationConfig::new(sampling))
+            .unwrap()
+            .map(|token| token.unwrap().token_id().unwrap())
+            .collect::<Vec<_>>();
+    runtime.parts_mut().1.reset().unwrap();
+    let discovery =
+        <crate::backend::MlxBackend as TextGenerationBackend>::capture_discovery(runtime).unwrap();
+    let budget = CaptureUsage {
+        captures: 1000,
+        retained_bytes: 1_000_000_000,
+        host_bytes: 10_000_000,
+        encoded_bytes: 10_000_000,
+    };
+    let plan = CapturePlan {
+        schema_version: 1,
+        selections: discovery
+            .catalog
+            .points
+            .iter()
+            .map(|point| CaptureSelection {
+                id: point.path.clone(),
+                path: point.path.clone(),
+                schedule: CaptureSchedule::default(),
+                slices: Vec::new(),
+                transform: if point.dtype == eredu_core::ObservationDtype::Integer {
+                    CaptureTransform::Preview { max_elements: 4 }
+                } else {
+                    CaptureTransform::Summary
+                },
+            })
+            .collect(),
+        limits: CaptureLimits {
+            per_step: budget,
+            cumulative: budget,
+            physical_native_bytes: None,
+            on_limit: CaptureLimitPolicy::Fail,
+        },
+    }
+    .admit(
+        &discovery.catalog,
+        &discovery.support,
+        &discovery.support.capture,
+        CaptureRequestShape {
+            batch: 1,
+            prompt_tokens: 2,
+            max_predictions: 2,
+        },
+    )
+    .unwrap();
+    let mut generated = eredu_core::ControlledTextGeneration::new(
+        runtime,
+        vec![1, 2],
+        TextGenerationConfig::new(sampling),
+        Allow,
+    )
+    .unwrap();
+    generated.enable_capture(plan).unwrap();
+    let mut tokens = Vec::new();
+    while let Some(token) = generated.next() {
+        tokens.push(token.unwrap().token_id());
+        let step = generated.take_captured_step().unwrap().unwrap();
+        assert_eq!(
+            step.phase,
+            if tokens.len() == 1 {
+                CapturePhase::Prefill
+            } else {
+                CapturePhase::Decode
+            }
+        );
+        for record in step.records {
+            assert!(
+                matches!(
+                    record.outcome,
+                    CaptureOutcome::Captured | CaptureOutcome::Truncated { .. }
+                ),
+                "{}: {:?}",
+                record.path,
+                record.outcome
+            );
+            if discovery.catalog.get(&record.path).unwrap().dtype
+                == eredu_core::ObservationDtype::Integer
+            {
+                assert!(matches!(record.payload, Some(CapturePayload::Tensor(_))));
+            }
+        }
+    }
+    assert_eq!(tokens, ordinary);
+    drop(generated);
+    runtime.parts_mut().1.reset().unwrap();
 }
 
 fn write_qwen35_multimodal_fixture(directory: &Path, moe: bool) {

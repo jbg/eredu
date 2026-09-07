@@ -11,6 +11,7 @@ pub struct MlxModel {
     floating_state_dtype_bytes: NonZeroU8,
     state_residency: eredu_runtime::CacheResidencyPolicy,
     distributed: Option<MlxDistributedSession>,
+    capture_discovery: Option<eredu_core::capture::CaptureDiscovery>,
     #[cfg(any(feature = "image", feature = "audio"))]
     processor: Option<ModelProcessor>,
 }
@@ -28,6 +29,7 @@ impl MlxModel {
             floating_state_dtype_bytes,
             state_residency,
             distributed: None,
+            capture_discovery: None,
             #[cfg(any(feature = "image", feature = "audio"))]
             processor: None,
         }
@@ -35,6 +37,20 @@ impl MlxModel {
 
     pub(crate) const fn floating_state_dtype_bytes(&self) -> NonZeroU8 {
         self.floating_state_dtype_bytes
+    }
+
+    pub(crate) fn with_capture_discovery(
+        mut self,
+        discovery: eredu_core::capture::CaptureDiscovery,
+    ) -> Self {
+        self.capture_discovery = Some(discovery);
+        self
+    }
+
+    pub(crate) fn take_capture_discovery(
+        &mut self,
+    ) -> Option<eredu_core::capture::CaptureDiscovery> {
+        self.capture_discovery.take()
     }
 
     pub(crate) const fn state_residency(&self) -> &eredu_runtime::CacheResidencyPolicy {

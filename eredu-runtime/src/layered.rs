@@ -517,7 +517,7 @@ where
         _forward: &mut C,
         _context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<LayeredUnitAction, E> {
-        let path = format!("{}.input", self.units[group][index]);
+        let path = eredu_core::UnitObservation::Input.path(&self.units[group][index]);
         let mut observer = self.observer.borrow_mut();
         *value = observe_and_intervene(&mut **observer, &path, value)?;
         Ok(LayeredUnitAction::Execute)
@@ -531,7 +531,7 @@ where
         _forward: &mut C,
         _context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<(), E> {
-        let path = format!("{}.output", self.units[group][index]);
+        let path = eredu_core::UnitObservation::Output.path(&self.units[group][index]);
         let mut observer = self.observer.borrow_mut();
         *value = observe_and_intervene(&mut **observer, &path, value)?;
         Ok(())

@@ -60,6 +60,12 @@ it.
   authority. Backends retain the neutral lease alongside native completion
   resources and establish safe completion, terminal failure, or teardown before
   releasing it. A polling error alone is not a universal completion signal.
+  It also owns versioned logical architecture and observation discovery contracts.
+  Architecture-layer projections supply family semantics; runtime support reports
+  combine those declarations with backend collector facts and retained selection.
+  Bounded capture admission and host records are neutral contracts; runtime owns
+  reservation and one-step delivery policy, backends own native transformations,
+  and the facade composes capture with ordinary generation and text termination.
 - `eredu-codec` owns backend-neutral neural audio codec architectures, released
   checkpoint schemas, parameter topology, layout recipes, and typed artifact
   construction. It consumes general neutral tensor, parameter, and runtime

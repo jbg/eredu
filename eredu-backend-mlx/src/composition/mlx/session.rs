@@ -39,6 +39,7 @@ use super::{
 };
 
 mod generation;
+pub(crate) mod bounded_capture;
 mod model_session;
 mod observation;
 mod output_completion;

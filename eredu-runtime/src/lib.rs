@@ -32,6 +32,8 @@ pub mod generation;
 /// Backend-neutral ownership of prepared multimodal tensors.
 pub mod input;
 pub mod inspection;
+/// Bounded observation admission and collection.
+pub mod capture;
 /// Statically dispatched layered architecture lifecycle and resident policy.
 pub mod layered;
 /// Normalized portable policy for cold model preparation.

@@ -24,6 +24,8 @@ pub mod composite_execution;
 pub mod composite_partitioned;
 /// Authoritative model-family identity and Hugging Face/GGUF configuration parsing.
 pub mod configuration;
+/// Logical architecture and observation catalog generation from admitted plans.
+pub mod discovery;
 pub use configuration::{GgufArchitecture, ModelKind};
 /// Architecture-owned external assistant inspection and preparation.
 pub mod external_assistant;

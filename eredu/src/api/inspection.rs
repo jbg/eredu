@@ -2,6 +2,15 @@
 
 use std::path::Path;
 
+/// Inspects artifact headers and returns its logical architecture and capture catalog.
+/// Available with no backend feature; no native device or tensor is created.
+pub fn inspect_architecture(
+    path: impl AsRef<Path>,
+) -> Result<eredu_core::ArchitectureDescriptor, eredu_core::artifact::ArtifactError> {
+    let artifact = eredu_architectures::configuration::inspect_artifact(path)?;
+    Ok(artifact.architecture_plan().architecture_descriptor())
+}
+
 use eredu_core::{
     ArtifactFormat, InspectionIssue, InspectionIssueCode, InspectionReadiness, InspectionSeverity,
     ModelInspectionReport,

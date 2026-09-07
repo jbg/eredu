@@ -1475,6 +1475,54 @@ pub trait TextGenerationBackend: BackendProvider {
     /// Exact completion retaining model execution and token sampling.
     type TextCompletion: Completion<Error = Self::Error>;
 
+    /// Returns observation facts retained from this session's admitted preparation.
+    fn capture_discovery(
+        _runtime: &ModelRuntime<Self>,
+    ) -> Result<crate::capture::CaptureDiscovery, crate::capture::CaptureError> {
+        Err(crate::capture::CaptureError::Unsupported(
+            "backend has no bounded capture discovery".into(),
+        ))
+    }
+
+    /// Enables an immutable capture plan before the first submission. Implementations
+    /// must validate it against this session and reject unsupported combinations.
+    fn configure_text_capture(
+        _runtime: &ModelRuntime<Self>,
+        _state: &mut Self::TextGenerationState,
+        plan: crate::capture::AdmittedCapturePlan,
+    ) -> Result<(), crate::capture::CaptureError> {
+        if plan.is_empty() {
+            Ok(())
+        } else {
+            Err(crate::capture::CaptureError::Unsupported(
+                "backend has no bounded text capture".into(),
+            ))
+        }
+    }
+
+    /// Validates known capture costs and execution combinations without submitting
+    /// native work or advancing sampler state.
+    fn validate_text_capture(
+        _runtime: &ModelRuntime<Self>,
+        plan: &crate::capture::AdmittedCapturePlan,
+    ) -> Result<(), crate::capture::CaptureError> {
+        if plan.is_empty() {
+            Ok(())
+        } else {
+            Err(crate::capture::CaptureError::Unsupported(
+                "backend has no bounded text capture".into(),
+            ))
+        }
+    }
+
+    /// Moves out at most one completed capture step. No implementation may queue
+    /// unconsumed steps without a separately admitted finite buffering contract.
+    fn take_text_capture(
+        _state: &mut Self::TextGenerationState,
+    ) -> Option<crate::capture::CapturedStep> {
+        None
+    }
+
     /// Creates backend sampling state for one sequence.
     fn start_text_generation(
         backend: &Self,
@@ -1670,6 +1718,26 @@ where
     /// Mutably borrows the canonical constraint state.
     pub fn controller_mut(&mut self) -> &mut C {
         &mut self.inner.controller
+    }
+
+    /// Installs capture while preserving the existing sampling/controller state.
+    pub fn enable_capture(
+        &mut self,
+        plan: crate::capture::AdmittedCapturePlan,
+    ) -> Result<(), crate::capture::CaptureError> {
+        if !matches!(self.inner.step, Some(TextGenerationStep::Prefill(_))) {
+            return Err(crate::capture::CaptureError::Invalid(
+                "capture must be configured before generation".into(),
+            ));
+        }
+        B::configure_text_capture(self.inner.runtime, &mut self.inner.backend_state, plan)
+    }
+
+    /// Establishes exact completion before delivering this step's host captures.
+    /// The ordinary machine retains authority and handles errors/drop as before.
+    pub fn take_captured_step(&mut self) -> Result<Option<crate::capture::CapturedStep>, B::Error> {
+        self.inner.resolve_completions_before_decode()?;
+        Ok(B::take_text_capture(&mut self.inner.backend_state))
     }
 }
 

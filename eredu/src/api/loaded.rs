@@ -129,7 +129,7 @@ where
 }
 
 impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
-    fn resolve_text_generation_settings(
+    pub(super) fn resolve_text_generation_settings(
         &self,
         settings: PreparedChatGenerationSettings,
     ) -> Result<
@@ -154,6 +154,20 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
     pub fn generate_prepared_chat<F>(
         &mut self,
         request: PreparedChatGenerationRequest<'_, B, F>,
+    ) -> Result<PreparedChatGenerationOutput, PreparedChatError<B::Error>>
+    where
+        F: FnMut(SemanticEvent),
+    {
+        self.generate_prepared_chat_captured(request, None)
+    }
+
+    pub(super) fn generate_prepared_chat_captured<'a, F>(
+        &'a mut self,
+        request: PreparedChatGenerationRequest<'_, B, F>,
+        capture: Option<(
+            eredu_core::capture::AdmittedCapturePlan,
+            &'a mut dyn FnMut(Option<u32>, Option<eredu_core::capture::CapturedStep>, f64),
+        )>,
     ) -> Result<PreparedChatGenerationOutput, PreparedChatError<B::Error>>
     where
         F: FnMut(SemanticEvent),
@@ -185,7 +199,7 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
         let raw_decoder =
             RawTokenDecoder::with_structural_tokens(decoder, control.structural_tokens);
         let mut pipeline = CommittedTokenPipeline::new(raw_decoder, control.parser);
-        let generator = match input {
+        let mut generator = match input {
             PreparedChatInput::RenderedPrompt(prepared_chat) => {
                 let prompt = self
                     .tokenizer
@@ -210,7 +224,20 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
             }
         }
         .map_err(map_controlled_generation_error)?;
-        let mut source = BackendGenerationTokenSource { generator };
+        let (on_token, capture_enabled) = if let Some((plan, on_token)) = capture {
+            let enabled = !plan.is_empty();
+            if enabled {
+                generator.enable_capture(plan)?;
+            }
+            (Some(on_token), enabled)
+        } else {
+            (None, false)
+        };
+        let mut source = BackendGenerationTokenSource {
+            generator,
+            on_token,
+            capture_enabled,
+        };
         let (token_ids, finish_reason) = drive_committed_generation_cancellable(
             &mut source,
             &mut pipeline,

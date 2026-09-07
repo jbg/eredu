@@ -110,6 +110,18 @@ impl<'a> MlxPreparationMechanisms<'a> {
 }
 
 impl eredu_architectures::PreparationMechanismProvider for MlxPreparationMechanisms<'_> {
+    fn observation_mechanisms(&self) -> eredu_core::ObservationMechanisms {
+        eredu_core::ObservationMechanisms {
+            activation_tensors: true,
+            routing_tensors: true,
+            floating_to_f32: true,
+        }
+    }
+
+    fn capture_capabilities(&self) -> eredu_core::capture::CaptureCapabilities {
+        super::super::session::bounded_capture::capabilities()
+    }
+
     fn preparation_capabilities(&self) -> eredu_core::PreparationMechanismCapabilities {
         super::super::structural::preparation_mechanism_capabilities()
     }
