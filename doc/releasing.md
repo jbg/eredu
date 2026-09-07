@@ -16,6 +16,34 @@ use the next patch. Leave unchanged crates at their published version and
 start new crates at `0.1.0`. A binary-only crate can take a patch for internal
 dependency updates when its command-line interface remains compatible.
 
+## Workspace release set for 2026-09-07
+
+The crates.io API and checksummed published archives were rechecked on
+2026-09-07. The latest versions still match the 2026-09-06 release below.
+This release includes all pending source and dependency changes, including
+architecture discovery, bounded capture and interventions, resumable generation,
+isolated snapshots, session recovery, and Qwen hybrid FP8 checkpoint admission.
+The native release gate must pass on the version-bump commit before publication.
+
+| Crate | Previous | New version | Reason |
+| --- | --- | --- | --- |
+| `safemlx-sys` | 0.2.2 | 0.2.3 | Compatible native build-cache support and shorter Windows CUDA build paths. |
+| `eredu-core` | 0.2.0 | 0.3.0 | Added public inspection-report fields and an exhaustive `GenerationError` variant break struct construction and enum matching. |
+| `safemlx` | 0.3.0 | 0.3.1 | Requires the updated native build support; the public wrapper API is unchanged. |
+| `eredu-nn` | 0.2.0 | 0.2.1 | Adds routing controls and a defaulted selector method without breaking existing implementations. |
+| `eredu-runtime` | 0.2.0 | 0.3.0 | Exposes the new core type identities alongside capture, intervention, and continuation mechanisms. |
+| `eredu-media` | 0.1.0 | 0.2.0 | Its public video-validation API accepts the new core type identity. |
+| `eredu-architectures` | 0.2.0 | 0.3.0 | Public preparation and execution contracts expose the new core/runtime types; includes discovery and the Qwen checkpoint fix. |
+| `eredu-codec` | 0.2.0 | 0.3.0 | Public materialization interfaces expose the new runtime traits and types. |
+| `eredu-evaluation` | 0.2.0 | 0.3.0 | Public fixtures and drivers use the new architecture, codec, core, and runtime types. |
+| `eredu-backend-mlx` | 0.2.0 | 0.3.0 | Implements and exposes the new core/runtime/architecture contracts and native execution controls. |
+| `eredu` | 0.2.0 | 0.3.0 | Adds an exhaustive `PreparedChatError` variant and exposes the new backend contracts. |
+| `eredu-cli` | 0.1.2 | 0.1.3 | Compatible command-line interface with the updated facade and runtime dependencies. |
+
+`eredu-gguf`, `eredu-checkpoint`, `eredu-text`, `eredu-nn-macros`,
+`eredu-backend-mlx-macros`, and `safemlx-internal-macros` retain their published
+versions. The two non-publishable packages also retain their versions.
+
 ## Workspace releases on 2026-09-06
 
 The following pre-release baselines were checked against the crates.io API and published
