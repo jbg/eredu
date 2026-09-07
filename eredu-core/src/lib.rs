@@ -32,6 +32,8 @@ pub mod discovery;
 pub use discovery::*;
 /// Portable execution plans, capabilities, and telemetry.
 pub mod execution;
+/// Completed-token execution control, discovery and snapshot resource contracts.
+pub mod execution_control;
 /// Backend-independent generation lifecycle and output events.
 pub mod generation;
 /// Portable identity for ordered, prepared model input.
@@ -95,10 +97,12 @@ pub use backend::{
     DistributedCommitOutcome, DistributedCommitPhase, DistributedSession,
     DistributedSessionDescriptor, InspectableBackendSession, ModelCapabilityBackend,
     ModelLoadError, ModelLoadingBackend, ModelRuntime, MultimodalPreparationBackend,
-    MultimodalPreparationFailure, PreparedModel, SelectedModelPreparation, SessionCapabilities,
-    SessionCapabilityError, SpeculativeTokenFilterController, Submission, TextGeneration,
-    TextGenerationBackend, TextGenerationConfig, TextSamplingStrategy, TokenFilter,
-    TokenFilterController, TokenFilterError, TokenOutput, ValueDescriptor,
+    MultimodalPreparationFailure, PendingTextInput, PreparedModel, SelectedModelPreparation,
+    SessionCapabilities, SessionCapabilityError, SpeculativeTokenFilterController, Submission,
+    TextContinuationBoundary, TextContinuationError, TextContinuationIdentity, TextDriverIdentity,
+    TextGeneration, TextGenerationBackend, TextGenerationConfig, TextGenerationContinuation,
+    TextGenerationDriver, TextSamplingStrategy, TokenFilter, TokenFilterController,
+    TokenFilterError, TokenOutput, ValueDescriptor,
 };
 pub use capability::{
     apply_admission_policy, estimate_runtime_state, Admission, AdmissionRejection,

@@ -56,7 +56,15 @@ impl TokenOutput for MlxTextToken {
             .try_item::<u32>(&self.stream)
             .map_err(Into::into);
         recovery.seal();
-        let status = recovery.progress();
+        // A successful scalar read can precede safe retirement of its observation
+        // scope. In particular, another thread holding the runtime lock makes
+        // progress() report unsettled even after native completion. Establish the
+        // exact successful boundary; failures retain the nonblocking recovery path.
+        let status = if result.is_ok() {
+            recovery.finish()
+        } else {
+            recovery.progress()
+        };
         if !status.settled || status.failed || status.blocked {
             self.owner.reject_unresolved();
             return Err(Error::ArchitectureModel(
@@ -100,44 +108,62 @@ impl Completion for MlxTextCompletion {
 
     fn is_complete(&self) -> Result<bool, Self::Error> {
         safemlx::try_with_submission_retirement(|| {
-            self.observe(|| token_then_model_is_complete(&self.token, &self.model))
+            self.observe(false, || {
+                token_then_model_is_complete(&self.token, &self.model)
+            })
         })
         .unwrap_or(Ok(false))
     }
 
     fn wait(&self) -> Result<(), Self::Error> {
-        self.observe(|| token_then_model_wait(&self.token, &self.model).map(|()| true))
-            .and_then(|complete| {
-                if complete {
-                    Ok(())
-                } else {
-                    Err(Error::ArchitectureModel(
-                        "sampled output still has unresolved native work".into(),
-                    ))
-                }
-            })
+        self.observe(true, || {
+            token_then_model_wait(&self.token, &self.model).map(|()| true)
+        })
+        .and_then(|complete| {
+            if complete {
+                Ok(())
+            } else {
+                Err(Error::ArchitectureModel(
+                    "sampled output still has unresolved native work".into(),
+                ))
+            }
+        })
     }
 }
 
 impl MlxTextCompletion {
-    fn observe(&self, operation: impl FnOnce() -> Result<bool, Error>) -> Result<bool, Error> {
+    pub(super) fn observe(
+        &self,
+        wait: bool,
+        operation: impl FnOnce() -> Result<bool, Error>,
+    ) -> Result<bool, Error> {
         self.model.owner().ensure_healthy()?;
         let mut observation = self.model.owner().recovery()?;
         let _unwind = self.model.owner().poison_on_unwind();
         let result = operation();
         observation.seal();
-        let status = observation.progress();
-        if status.failed || status.blocked || !status.settled {
+        // A successful wait includes retirement of every observation/sampling
+        // ticket. Runtime-lock contention is temporary pending ownership, not
+        // failure. Polling and actual errors retain the nonblocking path.
+        let status = if wait && result.is_ok() {
+            observation.finish()
+        } else {
+            observation.progress()
+        };
+        if status.failed || status.blocked || (!status.settled && result.is_err()) {
             self.model.owner().reject_unresolved();
             return Err(Error::ArchitectureModel(
                 "native token observation did not establish safe completion".into(),
             ));
         }
-        let sampling = self
-            .recovery
-            .borrow()
-            .as_ref()
-            .map(|scope| scope.progress());
+        let sampling = if wait && matches!(result, Ok(true)) {
+            self.recovery.borrow_mut().take().map(Recovery::finish)
+        } else {
+            self.recovery
+                .borrow()
+                .as_ref()
+                .map(|scope| scope.progress())
+        };
         let sampling_settled = sampling.is_none_or(|status| status.settled);
         if sampling_settled && !matches!(result, Ok(false)) {
             self.recovery.borrow_mut().take();
@@ -150,7 +176,7 @@ impl MlxTextCompletion {
         if result.is_err() {
             self.model.owner().reject_unresolved();
         }
-        result.map(|complete| complete && sampling_settled)
+        result.map(|complete| complete && status.settled && sampling_settled)
     }
 }
 

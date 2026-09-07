@@ -1,6 +1,97 @@
 use super::*;
 
 pub(crate) trait MlxStateMechanisms: LayerRuntimeState<MlxNeuralBackend> + Sized {
+    fn supports_isolated_snapshot(&self) -> bool {
+        false
+    }
+    fn isolated_snapshot(&self, _stream: &Stream) -> Result<Self, Exception> {
+        Err(Exception::custom(
+            "complete isolated snapshot is unsupported for this state realization",
+        ))
+    }
+    fn isolated_snapshot_estimate(
+        &self,
+    ) -> Option<eredu_core::execution_control::SnapshotEstimate> {
+        if !self.supports_isolated_snapshot() {
+            return None;
+        }
+        let mut retained = self
+            .layout()
+            .logical_metadata_bytes()?
+            .checked_add(u64::try_from(std::mem::size_of::<Self>()).ok()?)?
+            .checked_add(u64::try_from(self.layout().len()).ok()?.checked_mul(1024)?)?;
+        for layer in 0..self.layout().len() {
+            // Native role maps also retain slots whose tensor is still absent.
+            retained = retained.checked_add(
+                u64::try_from(self.layout().components(layer)?.len())
+                    .ok()?
+                    .checked_mul(256)?,
+            )?;
+        }
+        for array in self.retained_arrays() {
+            // Logical data plus conservative native-array descriptor/shape allowance.
+            // Include the destination and a possible contiguous materialization.
+            retained = retained
+                .checked_add(u64::try_from(array.nbytes()).ok()?.checked_mul(2)?)?
+                .checked_add(4096)?
+                .checked_add(u64::try_from(array.shape().len()).ok()?.checked_mul(16)?)?;
+        }
+        Some(eredu_core::execution_control::SnapshotEstimate {
+            retained_bytes: retained,
+            copy_bytes: retained,
+        })
+    }
+    fn continuation_capacity_bound(&self, _additional: u64) -> Option<u64> {
+        None
+    }
+    fn isolated_snapshot_growth(&self, additional: u64) -> Option<u64> {
+        if !self.supports_isolated_snapshot() {
+            return None;
+        }
+        // Ordinary text is a single sequence. Interpret only the declared
+        // component geometry, including absent fixed tensors. MLX floating
+        // storage is at most eight bytes; explicit integer components use four.
+        // Charge the full future payload as an additional conservative allowance
+        // (rather than subtracting currently retained data), including the same
+        // materialization/descriptor allowance as an immutable copy.
+        use eredu_core::cache::{StateTensorDimension as Dim, StateTensorDtype};
+        let absolute = u64::try_from(self.offset()).ok()?.checked_add(additional)?;
+        i32::try_from(absolute).ok()?;
+        let prefix = absolute.max(self.continuation_capacity_bound(additional)?);
+        i32::try_from(prefix).ok()?;
+        let mut bytes = 0u64;
+        for layer in 0..self.layout().len() {
+            for component in self.layout().components(layer)? {
+                let mut elements = 1u64;
+                for dimension in component.shape() {
+                    let extent = match dimension {
+                        Dim::Batch | Dim::Scalar => 1,
+                        Dim::Fixed(n) => u64::from(n.get()),
+                        Dim::PrefixTokens => prefix,
+                        Dim::PrefixTokensDiv(n) => prefix / u64::from(n.get()),
+                        // The final remainder is not the maximum over a run.
+                        Dim::PrefixTokensRem(n) => prefix.min(u64::from(n.get()) - 1),
+                    };
+                    elements = elements.checked_mul(extent)?;
+                }
+                let width = match component.dtype() {
+                    StateTensorDtype::Floating => 8,
+                    StateTensorDtype::Float32
+                    | StateTensorDtype::Int32
+                    | StateTensorDtype::Uint32 => 4,
+                };
+                bytes = bytes
+                    .checked_add(elements.checked_mul(width)?.checked_mul(2)?)?
+                    .checked_add(4096)?
+                    .checked_add(
+                        u64::try_from(component.shape().len())
+                            .ok()?
+                            .checked_mul(16)?,
+                    )?;
+            }
+        }
+        Some(bytes)
+    }
     fn offset(&self) -> i32;
     fn realize(
         selected: &SelectedStateRealization,
@@ -73,6 +164,15 @@ pub(super) fn selected_state_manager(
 }
 
 impl MlxStateMechanisms for MlxKeyValueState {
+    fn continuation_capacity_bound(&self, additional: u64) -> Option<u64> {
+        self.continuation_capacity_bound(additional)
+    }
+    fn supports_isolated_snapshot(&self) -> bool {
+        self.supports_isolated_snapshot()
+    }
+    fn isolated_snapshot(&self, stream: &Stream) -> Result<Self, Exception> {
+        self.isolated_snapshot(stream)
+    }
     fn offset(&self) -> i32 {
         MlxKeyValueState::offset(self)
     }
@@ -191,6 +291,15 @@ impl MlxStateMechanisms for MlxKeyValueState {
 }
 
 impl MlxStateMechanisms for MlxHybridState {
+    fn continuation_capacity_bound(&self, additional: u64) -> Option<u64> {
+        self.continuation_capacity_bound(additional)
+    }
+    fn supports_isolated_snapshot(&self) -> bool {
+        self.supports_isolated_snapshot()
+    }
+    fn isolated_snapshot(&self, stream: &Stream) -> Result<Self, Exception> {
+        self.isolated_snapshot(stream)
+    }
     fn offset(&self) -> i32 {
         MlxHybridState::offset(self)
     }

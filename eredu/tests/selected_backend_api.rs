@@ -9,6 +9,55 @@ use eredu::api::{
 };
 use eredu_core::{DevicePlan, ExecutionPlan, QuantizationRequest};
 
+fn operate_selected_text_control(
+    model: &mut eredu::api::LocalModel,
+    request: eredu::api::PreparedObservedGeneration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use eredu_core::execution_control::{GenerationControlHandle, SnapshotLimits};
+    use std::ops::ControlFlow;
+    let mut run =
+        model.start_controlled_chat(request, &[], GenerationControlHandle::default(), |_| {
+            ControlFlow::Continue(())
+        })?;
+    run.enable_snapshots(SnapshotLimits {
+        max_snapshots: 1,
+        max_branches: 1,
+        retained_bytes: 128 << 20,
+        cumulative_copy_bytes: 256 << 20,
+    })?;
+    let snapshot: eredu::api::LocalGenerationSnapshot =
+        run.snapshot(|_| ControlFlow::Continue(()))?;
+    run.step(|_| ControlFlow::Continue(()))?;
+    run.pause(|_| ControlFlow::Continue(()))?;
+    run.restore(&snapshot, |_| ControlFlow::Continue(()))?;
+    assert_eq!(run.token_ids(), snapshot.token_ids());
+    let mut branch = run.fork(
+        &snapshot,
+        eredu::api::GenerationBranchOptions {
+            trace_limits: eredu::api::TraceLimits {
+                per_record_bytes: 16384,
+                total_bytes: 65536,
+            },
+            capture_limits: None,
+            sampling: None,
+            intervention: None,
+        },
+        |_| ControlFlow::Continue(()),
+    )?;
+    run.exchange(&mut branch, |_| ControlFlow::Continue(()))?;
+    let _ = run.output_checkpoint();
+    let _ = run.sampling_state()?;
+    Ok(())
+}
+
+#[test]
+fn selected_text_control_keeps_native_types_out_of_application_code() {
+    let _: fn(
+        &mut eredu::api::LocalModel,
+        eredu::api::PreparedObservedGeneration,
+    ) -> Result<(), Box<dyn std::error::Error>> = operate_selected_text_control;
+}
+
 fn operate_selected_realtime_backend(
     preparation: RealtimePreparationPlan,
     frame: RealtimeInputFrame,

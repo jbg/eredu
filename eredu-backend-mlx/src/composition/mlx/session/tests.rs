@@ -248,3 +248,52 @@ fn dropping_settled_text_completion_releases_model_authority() {
     assert_eq!(authority.require_idle(), Ok(()));
     assert_eq!(sampled.output.evaluated().unwrap().as_slice::<u32>(), &[17]);
 }
+
+#[test]
+fn successful_text_wait_retires_observation_tickets_after_runtime_contention() {
+    use std::{sync::mpsc, time::Duration};
+    let mut authority = SessionAuthority::new();
+    let model = model_submission(
+        Array::from_int(0),
+        TokenValidationBatch::default(),
+        true,
+        authority.begin_submission().unwrap(),
+    )
+    .completion;
+    let sampled = MlxCompletion::submission(Array::from_slice(&[17_u32], &[1])).unwrap();
+    let mut sampling = model.owner().recovery().unwrap();
+    sampling.seal();
+    let completion = MlxTextCompletion {
+        model,
+        token: sampled.completion,
+        recovery: std::cell::RefCell::new(Some(sampling)),
+    };
+    let (start_tx, start_rx) = mpsc::channel();
+    let (held_tx, held_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        start_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        crate::backend::submission_recovery::wait_for_retirement(|| {
+            safemlx::try_with_submission_retirement(|| {
+                held_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                // Test-only bounded contention after the host operation returns.
+                std::thread::sleep(Duration::from_millis(50));
+            })
+            .is_some()
+        });
+    });
+    let result = completion.observe(true, || {
+        output_completion::token_then_model_wait(&completion.token, &completion.model)?;
+        start_tx.send(()).unwrap();
+        held_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(!completion.is_complete().unwrap());
+        assert!(authority.require_idle().is_err());
+        release_tx.send(()).unwrap();
+        Ok(true)
+    });
+    worker.join().unwrap();
+    assert!(result.unwrap());
+    assert_eq!(authority.require_idle(), Ok(()));
+    completion.wait().unwrap();
+}

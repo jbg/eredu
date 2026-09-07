@@ -44,10 +44,11 @@ pub(crate) mod intervention;
 mod model_session;
 mod observation;
 mod output_completion;
+mod text_snapshot;
 pub(super) use crate::backend::submission_recovery as recovery;
 
-pub use generation::MlxTextGenerationState;
-pub use model_session::{MlxModelInput, MlxModelSession};
+pub use generation::{MlxTextGenerationState, MlxTextSamplingState};
+pub use model_session::{MlxModelInput, MlxModelSession, MlxNativeTextState};
 pub use output_completion::{
     MlxModelOutput, MlxSessionCompletion, MlxTextCompletion, MlxTextToken,
 };

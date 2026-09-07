@@ -9,12 +9,13 @@ use eredu_core::{capture::*, intervention::*, ObservationPosition};
 mod activation;
 mod session;
 pub use activation::apply_activation;
+pub(crate) use session::validate_continuation;
 pub use session::{install_session, validate_session, CaptureObserver};
 
 pub(crate) struct InterventionRun {
     pub(crate) plan: AdmittedInterventionPlan,
     pub(crate) records: Option<Vec<InterventionRecord>>,
-    routing_pending: Option<usize>,
+    pub(crate) routing_pending: Option<usize>,
     estimator: std::sync::Arc<dyn InterventionEstimator>,
 }
 
@@ -238,6 +239,11 @@ impl CaptureSession {
     /// preserved in records and fail the attempt; this does not establish rollback.
     pub fn finish_interventions(&self) -> Result<(), CaptureError> {
         if let Some(run) = &self.interventions {
+            if run.routing_pending.is_some() {
+                return Err(CaptureError::Invalid(
+                    "routing intervention has not resolved before the boundary".into(),
+                ));
+            }
             let records = run
                 .records
                 .as_ref()
@@ -374,6 +380,16 @@ pub fn preflight(
     intervention: &AdmittedInterventionPlan,
     estimator: &dyn InterventionEstimator,
 ) -> Result<(), CaptureError> {
+    preflight_continuation(capture, intervention, estimator, 0, CaptureUsage::default())
+}
+
+pub(crate) fn preflight_continuation(
+    capture: &AdmittedCapturePlan,
+    intervention: &AdmittedInterventionPlan,
+    estimator: &dyn InterventionEstimator,
+    next_prediction: u64,
+    inherited: CaptureUsage,
+) -> Result<(), CaptureError> {
     if capture.request() != intervention.request() {
         return Err(CaptureError::Invalid(
             "capture/intervention geometry mismatch".into(),
@@ -400,9 +416,11 @@ pub fn preflight(
             .into_iter()
             .enumerate()
         {
-            let Some((_, last)) = operation
-                .schedule
-                .count_and_last(phase, intervention.request().max_predictions)?
+            let Some((_, last)) = operation.schedule.count_and_last_from(
+                phase,
+                next_prediction,
+                intervention.request().max_predictions,
+            )?
             else {
                 continue;
             };
@@ -438,11 +456,13 @@ pub fn preflight(
             scheduled_costs.push((operation.schedule.clone(), costs));
         }
     }
-    crate::capture::preflight_with_extra(
+    crate::capture::preflight_continuation(
         capture,
         &extra,
         base,
         &scheduled_costs,
+        next_prediction,
+        inherited,
         |source, selection, slice| estimator.capture_usage(source, selection, slice),
     )
 }

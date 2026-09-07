@@ -515,6 +515,50 @@ pub(crate) trait ErasedExternalPredictionExecutable: 'static {
 
 /// Backend-private erased operations for a paired architecture and mutable state.
 pub(crate) trait ErasedReplicatedTextExecutable {
+    fn native_control_support(&self) -> eredu_core::execution_control::ControlSupport {
+        eredu_core::execution_control::ControlSupport::Unsupported {
+            reason: "complete native state copying is unavailable for this executable".into(),
+        }
+    }
+    fn estimate_native_control_state(
+        &self,
+        _saved: Option<&dyn std::any::Any>,
+    ) -> Result<Option<eredu_core::execution_control::SnapshotEstimate>, Error> {
+        Ok(None)
+    }
+    fn capture_native_control_state(&mut self) -> Result<Box<dyn std::any::Any>, Error> {
+        Err(Error::ArchitectureModel(
+            "native control state is unsupported".into(),
+        ))
+    }
+    fn estimate_native_control_growth(
+        &self,
+        _saved: &dyn std::any::Any,
+        _additional: u64,
+    ) -> Result<Option<u64>, Error> {
+        Ok(None)
+    }
+    fn copy_native_control_state(
+        &mut self,
+        _saved: &dyn std::any::Any,
+    ) -> Result<Box<dyn std::any::Any>, Error> {
+        Err(Error::ArchitectureModel(
+            "native control state is unsupported".into(),
+        ))
+    }
+    fn validate_native_control_state(&self, _saved: &dyn std::any::Any) -> Result<(), Error> {
+        Err(Error::ArchitectureModel(
+            "native control state is unsupported".into(),
+        ))
+    }
+    fn exchange_native_control_state(
+        &mut self,
+        _slot: &mut dyn std::any::Any,
+    ) -> Result<(), Error> {
+        Err(Error::ArchitectureModel(
+            "native control state is unsupported".into(),
+        ))
+    }
     fn effective_model_type(&self) -> &str;
     fn capability_estimate(&self) -> &eredu_architectures::capability::CapabilityEstimate;
     #[cfg(test)]

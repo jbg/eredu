@@ -1,5 +1,7 @@
 use super::*;
 
+mod native_control;
+
 struct IndependentMechanisms;
 
 impl eredu_architectures::PreparationMechanismProvider for IndependentMechanisms {
@@ -51,8 +53,10 @@ fn write_safetensors_fixture(root: &Path) {
 }
 
 fn write_safetensors_fixture_with_fill(root: &Path, fill: f32) {
-    use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
+    write_safetensors_fixture_with_values(root, |_, _| fill);
+}
 
+fn write_safetensors_fixture_with_values(root: &Path, value: impl Fn(&str, usize) -> f32) {
     let config = serde_json::json!({
         "model_type": "llama",
         "hidden_size": 16,
@@ -62,6 +66,15 @@ fn write_safetensors_fixture_with_fill(root: &Path, fill: f32) {
         "rms_norm_eps": 0.00001,
         "vocab_size": 64
     });
+    write_configured_safetensors_fixture(root, &config, value);
+}
+
+fn write_configured_safetensors_fixture(
+    root: &Path,
+    config: &serde_json::Value,
+    value: impl Fn(&str, usize) -> f32,
+) {
+    use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
     std::fs::write(
         root.join("config.json"),
         serde_json::to_vec(&config).unwrap(),
@@ -84,7 +97,9 @@ fn write_safetensors_fixture_with_fill(root: &Path, fill: f32) {
             (
                 tensor.key.clone(),
                 tensor.shape.clone(),
-                fill.to_le_bytes().repeat(elements),
+                (0..elements)
+                    .flat_map(|index| value(&tensor.key, index).to_le_bytes())
+                    .collect::<Vec<_>>(),
             )
         })
         .collect::<Vec<_>>();

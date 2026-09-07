@@ -62,17 +62,30 @@ impl CaptureSchedule {
         phase: CapturePhase,
         maximum: u64,
     ) -> Result<Option<(u64, u64)>, CaptureError> {
+        self.count_and_last_from(phase, 0, maximum)
+    }
+
+    /// Counts the remaining absolute schedule without moving its frequency
+    /// origin when a continuation resumes at `next_prediction`.
+    pub fn count_and_last_from(
+        &self,
+        phase: CapturePhase,
+        next_prediction: u64,
+        maximum: u64,
+    ) -> Result<Option<(u64, u64)>, CaptureError> {
         if self.every == 0 {
             return Err(CaptureError::Invalid("zero capture frequency".into()));
         }
         if phase == CapturePhase::Prefill {
-            return Ok((maximum > 0 && self.includes(phase, 0)).then_some((1, 0)));
+            return Ok(
+                (next_prediction == 0 && maximum > 0 && self.includes(phase, 0)).then_some((1, 0)),
+            );
         }
         if !self.decode {
             return Ok(None);
         }
         let end = self.end_prediction.unwrap_or(maximum).min(maximum);
-        let lower = self.first_prediction.max(1);
+        let lower = self.first_prediction.max(1).max(next_prediction);
         if lower >= end {
             return Ok(None);
         }
@@ -874,6 +887,25 @@ impl CaptureLedger {
             step: CaptureUsage::default(),
             total: CaptureUsage::default(),
         }
+    }
+    /// Starts an independently admitted child ledger with the usage already
+    /// consumed at its fork boundary. Inherited usage counts against the child's
+    /// cumulative limits, but not its next step. Later parent work is separate.
+    pub fn with_inherited_usage(
+        plan: &AdmittedCapturePlan,
+        inherited: CaptureUsage,
+    ) -> Result<Self, CaptureError> {
+        if let Some(budget) = inherited.exceeded(plan.plan.limits.cumulative) {
+            return Err(CaptureError::Limit {
+                budget,
+                cumulative: true,
+            });
+        }
+        Ok(Self {
+            limits: plan.plan.limits.clone(),
+            step: CaptureUsage::default(),
+            total: inherited,
+        })
     }
     /// Resets step reservations while preserving cumulative accounting.
     pub fn begin_step(&mut self) {

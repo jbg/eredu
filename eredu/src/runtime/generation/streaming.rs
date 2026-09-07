@@ -12,6 +12,8 @@ use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::num::NonZeroUsize;
 
+mod snapshot;
+
 /// Canonical parser-owned representation of a tool call being assembled.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct InProgressToolCall {
@@ -57,6 +59,17 @@ impl InProgressToolCall {
 pub(crate) trait TokenDecoderBackend {
     type Error;
 
+    /// Complete copied decoder state; unknown disables facade snapshots.
+    fn snapshot_storage_bytes(&self) -> Option<u64> {
+        None
+    }
+
+    /// Conservative future decoder storage and total bytes delivered to parsing
+    /// through a finite generated-token limit, including structural spellings.
+    fn continuation_storage_bounds(&self, _max_tokens: u64) -> Option<(u64, u64)> {
+        None
+    }
+
     fn decode_token(
         &mut self,
         token_id: u32,
@@ -78,6 +91,7 @@ struct RawToken {
 }
 
 /// Decodes raw token pieces while retaining designated structural identities.
+#[derive(Clone)]
 pub(crate) struct RawTokenDecoder<D> {
     backend: D,
     structural_token_ids: BTreeSet<u32>,
@@ -150,7 +164,7 @@ impl fmt::Display for Utf8BufferError {
 }
 
 /// Buffers byte-fallback pieces until a complete UTF-8 prefix is available.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct Utf8Buffer {
     pending: Vec<u8>,
 }
@@ -197,7 +211,7 @@ struct StopMatch {
 ///
 /// Bytes that might still become a stop remain private. Once a complete stop
 /// matches, neither it nor any following bytes can become visible.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct StopMatcher {
     stops: Vec<Vec<u8>>,
     pending: Vec<u8>,
@@ -312,7 +326,7 @@ pub(crate) enum PatternPiece {
 }
 
 /// Buffers suffixes that could be partial triggers, tags, or delimiters.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct PartialPatternBuffer {
     patterns: Vec<(PatternKind, Vec<u8>)>,
     pending: Vec<u8>,
@@ -414,7 +428,7 @@ pub(crate) enum JsonFragmentError {
 }
 
 /// Incrementally identifies one complete JSON object or array.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub(crate) struct JsonFragmentBuffer {
     fragment: String,
     depth: usize,
@@ -496,7 +510,7 @@ impl JsonFragmentBuffer {
 
 /// Sink offered to protocol parsers so semantic state and emitted events stay
 /// synchronized.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct SemanticEventSink {
     events: Vec<SemanticEvent>,
     active_tool_call: Option<InProgressToolCall>,
@@ -580,6 +594,24 @@ impl SemanticEventSink {
 pub(crate) trait ProtocolParser: Send {
     type Error;
 
+    /// Logical live state copied by `fork_box`, including buffered owned data.
+    fn snapshot_storage_bytes(&self) -> Option<u64> {
+        None
+    }
+
+    /// Additional logical storage sufficient for a finite continuation whose
+    /// complete decoded/structural input is at most `input_bytes`. This includes
+    /// initially absent parsing states; unknown custom parsers disable branches.
+    fn continuation_storage_bytes(&self, _input_bytes: u64) -> Option<u64> {
+        None
+    }
+
+    /// Copies exact incremental state without reparsing history or emitting
+    /// events. Custom parsers must explicitly implement independent state copying.
+    fn fork_box(&self) -> Result<Box<dyn ProtocolParser<Error = Self::Error>>, String> {
+        Err("semantic parser does not support exact in-process snapshots".into())
+    }
+
     fn push(&mut self, text: &str, sink: &mut SemanticEventSink) -> Result<(), Self::Error>;
 
     /// Handles one tokenizer-confirmed atomic added token.
@@ -613,6 +645,18 @@ where
     P: ProtocolParser + ?Sized,
 {
     type Error = P::Error;
+
+    fn snapshot_storage_bytes(&self) -> Option<u64> {
+        (**self).snapshot_storage_bytes()
+    }
+
+    fn continuation_storage_bytes(&self, input_bytes: u64) -> Option<u64> {
+        (**self).continuation_storage_bytes(input_bytes)
+    }
+
+    fn fork_box(&self) -> Result<Box<dyn ProtocolParser<Error = Self::Error>>, String> {
+        (**self).fork_box()
+    }
 
     fn push(&mut self, text: &str, sink: &mut SemanticEventSink) -> Result<(), Self::Error> {
         (**self).push(text, sink)
@@ -750,6 +794,19 @@ impl fmt::Debug for ToolRuntimeParser {
 }
 
 impl ToolRuntimeParser {
+    /// Preserves lookbehind, partial protocol state, terminal state and delivery.
+    pub(crate) fn fork(&self) -> Result<Self, String> {
+        Ok(Self {
+            stream: SemanticStream {
+                parser: self.stream.parser.fork_box()?,
+                stops: self.stream.stops.clone(),
+                structural_stops: self.stream.structural_stops.clone(),
+                sink: self.stream.sink.clone(),
+                finished: self.stream.finished,
+            },
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn new<'a, 'b>(
         parser: Box<dyn ProtocolParser<Error = String>>,
@@ -864,6 +921,19 @@ impl<D> CommittedTokenPipeline<D>
 where
     D: TokenDecoderBackend,
 {
+    /// Independent copy including bytes not yet decoded as UTF-8, stop lookbehind,
+    /// parser state and any records awaiting delivery. No token is consumed.
+    pub(crate) fn fork(&self) -> Result<Self, String>
+    where
+        D: Clone,
+    {
+        Ok(Self {
+            decoder: self.decoder.clone(),
+            utf8: self.utf8.clone(),
+            parser: self.parser.fork()?,
+        })
+    }
+
     pub(crate) fn new(decoder: RawTokenDecoder<D>, parser: ToolRuntimeParser) -> Self {
         Self {
             decoder,
@@ -1006,6 +1076,127 @@ pub(crate) enum CommittedGenerationError<S, D> {
     MissingTerminalToken,
 }
 
+/// Rewindable ordinary commitment state. One-shot and controllable generation
+/// use this same token/semantic/termination boundary. Sampler, controller and
+/// native state stay with the source; incremental decoding stays in the pipeline.
+#[derive(Clone)]
+pub(crate) struct CommittedGenerationCursor {
+    sequence: GenerationSequence,
+    finish_reason: Option<FinishReason>,
+    failed: bool,
+}
+
+impl CommittedGenerationCursor {
+    pub(crate) fn new(eos_token_ids: &[u32], max_tokens: NonZeroUsize) -> Self {
+        Self {
+            sequence: GenerationSequence::new(max_tokens.get(), eos_token_ids.iter().copied()),
+            finish_reason: None,
+            failed: false,
+        }
+    }
+
+    pub(crate) fn finish_reason(&self) -> Option<FinishReason> {
+        self.finish_reason
+    }
+
+    /// Canonical history, including terminal special tokens.
+    pub(crate) fn token_ids(&self) -> &[u32] {
+        self.sequence.tokens()
+    }
+
+    /// Advances at most one committed prediction, including its semantic events.
+    /// Cancellation before a submission commits no token and does not flush the
+    /// decoder. Merely retaining this cursor between calls advances no state.
+    pub(crate) fn step<D, T>(
+        &mut self,
+        source: &mut T,
+        pipeline: &mut CommittedTokenPipeline<D>,
+        cancellation: &GenerationCancellationToken,
+        emit: &mut impl FnMut(SemanticEvent),
+    ) -> Result<(), CommittedGenerationError<T::Error, D::Error>>
+    where
+        D: TokenDecoderBackend,
+        T: CommittedTokenSource,
+    {
+        if self.failed {
+            return Err(CommittedGenerationError::Lifecycle(
+                eredu_core::generation::GenerationError::FailedGeneration,
+            ));
+        }
+        let result = self.step_inner(source, pipeline, cancellation, emit);
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
+
+    fn step_inner<D, T>(
+        &mut self,
+        source: &mut T,
+        pipeline: &mut CommittedTokenPipeline<D>,
+        cancellation: &GenerationCancellationToken,
+        emit: &mut impl FnMut(SemanticEvent),
+    ) -> Result<(), CommittedGenerationError<T::Error, D::Error>>
+    where
+        D: TokenDecoderBackend,
+        T: CommittedTokenSource,
+    {
+        if self.finish_reason.is_some() {
+            return Err(CommittedGenerationError::Lifecycle(
+                eredu_core::generation::GenerationError::AlreadyFinished,
+            ));
+        }
+        if self.sequence.observe_cancellation(cancellation) {
+            pipeline.cancel(emit);
+            self.finish_reason = Some(FinishReason::Cancelled);
+            return Ok(());
+        }
+        let token_id = source
+            .next_token()
+            .map_err(CommittedGenerationError::Source)?
+            .ok_or(CommittedGenerationError::MissingTerminalToken)?;
+        let (stop_matched, cancelled_during_delivery) = pipeline
+            .push_cancellable(token_id, cancellation, emit)
+            .map_err(CommittedGenerationError::Pipeline)?;
+        if cancelled_during_delivery && !stop_matched {
+            self.sequence
+                .commit(token_id, TokenTerminalSignals::default())
+                .map_err(CommittedGenerationError::Lifecycle)?;
+            self.sequence.cancel();
+            pipeline.cancel(emit);
+            // Preserve the established callback-cancellation outcome even when
+            // the simultaneously committed token also exhausted the budget.
+            self.finish_reason = Some(FinishReason::Cancelled);
+            return Ok(());
+        }
+        let grammar_complete = if stop_matched {
+            false
+        } else {
+            source
+                .grammar_is_complete()
+                .map_err(CommittedGenerationError::Source)?
+        };
+        let reason = self
+            .sequence
+            .commit(
+                token_id,
+                TokenTerminalSignals {
+                    stop_sequence: stop_matched,
+                    grammar_complete,
+                },
+            )
+            .map_err(CommittedGenerationError::Lifecycle)?
+            .finish_reason;
+        if let Some(reason) = reason {
+            pipeline
+                .finish(reason, emit)
+                .map_err(CommittedGenerationError::Pipeline)?;
+            self.finish_reason = Some(reason);
+        }
+        Ok(())
+    }
+}
+
 /// Drives the production committed-token boundary without owning a second
 /// model loop. The source remains the architecture-dispatched iterator.
 #[allow(clippy::type_complexity)]
@@ -1021,55 +1212,14 @@ where
     D: TokenDecoderBackend,
     T: CommittedTokenSource,
 {
-    let mut sequence = GenerationSequence::new(max_tokens.get(), eos_token_ids.iter().copied());
-    while !sequence.is_finished() {
-        if sequence.observe_cancellation(cancellation) {
-            pipeline.cancel(emit);
-            return Ok((sequence.into_tokens(), FinishReason::Cancelled));
-        }
-
-        let token_id = source
-            .next_token()
-            .map_err(CommittedGenerationError::Source)?
-            .ok_or(CommittedGenerationError::MissingTerminalToken)?;
-        let (stop_matched, cancelled_during_delivery) = pipeline
-            .push_cancellable(token_id, cancellation, emit)
-            .map_err(CommittedGenerationError::Pipeline)?;
-        if cancelled_during_delivery && !stop_matched {
-            sequence
-                .commit(token_id, TokenTerminalSignals::default())
-                .map_err(CommittedGenerationError::Lifecycle)?;
-            sequence.cancel();
-            pipeline.cancel(emit);
-            return Ok((sequence.into_tokens(), FinishReason::Cancelled));
-        }
-        let grammar_complete = if stop_matched {
-            false
-        } else {
-            source
-                .grammar_is_complete()
-                .map_err(CommittedGenerationError::Source)?
-        };
-        let reason = sequence
-            .commit(
-                token_id,
-                TokenTerminalSignals {
-                    stop_sequence: stop_matched,
-                    grammar_complete,
-                },
-            )
-            .map_err(CommittedGenerationError::Lifecycle)?
-            .finish_reason;
-
-        if let Some(reason) = reason {
-            pipeline
-                .finish(reason, emit)
-                .map_err(CommittedGenerationError::Pipeline)?;
-            return Ok((sequence.into_tokens(), reason));
-        }
+    let mut cursor = CommittedGenerationCursor::new(eos_token_ids, max_tokens);
+    while cursor.finish_reason().is_none() {
+        cursor.step(source, pipeline, cancellation, emit)?;
     }
-
-    unreachable!("a non-zero max token limit always terminates the generation loop")
+    let reason = cursor
+        .finish_reason()
+        .expect("generation reached its terminal boundary");
+    Ok((cursor.sequence.into_tokens(), reason))
 }
 
 #[cfg(test)]
@@ -1089,7 +1239,7 @@ mod tests {
     const TOOL_START: &str = "<call:";
     const TOOL_END: &str = "</call>";
 
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     enum SyntheticState {
         Text(PartialPatternBuffer),
         Reasoning(PartialPatternBuffer),
@@ -1098,7 +1248,7 @@ mod tests {
         ToolEnd(PartialPatternBuffer),
     }
 
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     struct SyntheticParser {
         state: SyntheticState,
     }
@@ -1128,6 +1278,10 @@ mod tests {
 
     impl ProtocolParser for SyntheticParser {
         type Error = String;
+
+        fn fork_box(&self) -> Result<Box<dyn ProtocolParser<Error = String>>, String> {
+            Ok(Box::new(self.clone()))
+        }
 
         fn push(&mut self, text: &str, sink: &mut SemanticEventSink) -> Result<(), Self::Error> {
             for character in text.chars() {
@@ -1574,7 +1728,7 @@ mod tests {
         }
     }
 
-    #[derive(Debug, Default)]
+    #[derive(Debug, Default, Clone)]
     struct SyntheticCommittedDecoder;
 
     impl TokenDecoderBackend for SyntheticCommittedDecoder {
@@ -1949,5 +2103,131 @@ mod tests {
         assert!(!format!("{events:?}").contains(REASONING_START));
         assert!(!format!("{events:?}").contains(REASONING_END));
         assert_exactly_one_finished(&events, reason);
+    }
+
+    #[test]
+    fn exact_semantic_forks_preserve_every_byte_boundary_without_redecoding() {
+        #[derive(Clone)]
+        struct CountedDecoder(Rc<Cell<usize>>);
+        impl TokenDecoderBackend for CountedDecoder {
+            type Error = Infallible;
+            fn decode_token(&mut self, id: u32, _: bool) -> Result<Vec<u8>, Infallible> {
+                self.0.set(self.0.get() + 1);
+                Ok(vec![u8::try_from(id).unwrap()])
+            }
+        }
+        let input = "<r>why 🦀</r>Hello <call:id-7:weather>{\"city\":\"Bogotá\"}</call> done[END]";
+        for split in 0..=input.len() {
+            let calls = Rc::new(Cell::new(0));
+            let decoder = RawTokenDecoder::new(CountedDecoder(calls.clone()), []);
+            let parser =
+                ToolRuntimeParser::new(Box::new(SyntheticParser::default()), [], ["[END]"]);
+            let mut original = CommittedTokenPipeline::new(decoder, parser);
+            let mut prefix = Vec::new();
+            for &byte in &input.as_bytes()[..split] {
+                original
+                    .push(u32::from(byte), &mut |e| prefix.push(e))
+                    .unwrap();
+            }
+            let saved = original.fork().unwrap();
+            assert!(
+                original.snapshot_storage_bytes().is_none(),
+                "custom state without an audited estimate must fail closed"
+            );
+            let mut child = saved.fork().unwrap();
+            assert_eq!(
+                calls.get(),
+                split,
+                "fork must not re-decode any committed token"
+            );
+            let mut baseline = Vec::new();
+            let mut branch = Vec::new();
+            for &byte in &input.as_bytes()[split..] {
+                original
+                    .push(u32::from(byte), &mut |e| baseline.push(e))
+                    .unwrap();
+                child
+                    .push(u32::from(byte), &mut |e| branch.push(e))
+                    .unwrap();
+            }
+            original
+                .finish(FinishReason::Eos, &mut |e| baseline.push(e))
+                .unwrap();
+            child
+                .finish(FinishReason::Eos, &mut |e| branch.push(e))
+                .unwrap();
+            assert_eq!(branch, baseline, "split {split}");
+            assert_eq!(calls.get(), split + 2 * (input.len() - split));
+            // Reuse the saved state after both descendants advanced.
+            let mut sibling = saved.fork().unwrap();
+            let mut repeated = Vec::new();
+            for &byte in &input.as_bytes()[split..] {
+                sibling
+                    .push(u32::from(byte), &mut |e| repeated.push(e))
+                    .unwrap();
+            }
+            sibling
+                .finish(FinishReason::Eos, &mut |e| repeated.push(e))
+                .unwrap();
+            assert_eq!(repeated, baseline);
+            prefix.extend(baseline);
+            assert_eq!(visible_text(&prefix), "Hello  done");
+            assert_eq!(reasoning_text(&prefix), "why 🦀");
+            assert_eq!(tool_arguments(&prefix, 0), r#"{"city":"Bogotá"}"#);
+            assert_exactly_one_finished(&prefix, FinishReason::StopSequence);
+        }
+    }
+
+    #[test]
+    fn parser_fork_preserves_undelivered_events_and_terminal_state() {
+        let mut parent = ToolRuntimeParser::new(Box::new(SyntheticParser::default()), [], ["STOP"]);
+        parent.push("visibleSTOP").unwrap();
+        let mut child = parent.fork().unwrap();
+        let events = parent.take_events();
+        assert_eq!(child.take_events(), events);
+        assert!(child.take_events().is_empty());
+        assert!(child.is_finished());
+        child.finish(FinishReason::Eos).unwrap();
+        assert!(child.take_events().is_empty());
+        assert_exactly_one_finished(&events, FinishReason::StopSequence);
+    }
+
+    #[test]
+    fn one_token_cursor_matches_ordinary_driver_and_retains_partial_state() {
+        let bytes = "café 🦀STOP".as_bytes();
+        let (expected_ids, expected_reason, expected_events, _) =
+            synthetic_generation(bytes, None, &[], 100, &["STOP"]);
+        let calls = Rc::new(Cell::new(0));
+        let mut source =
+            SyntheticModel::new(bytes.iter().map(|b| u32::from(*b)), None, calls.clone());
+        let mut pipeline = CommittedTokenPipeline::new(
+            RawTokenDecoder::new(SyntheticCommittedDecoder, []),
+            ToolRuntimeParser::new(Box::new(SyntheticParser::default()), [], ["STOP"]),
+        );
+        let mut cursor =
+            super::CommittedGenerationCursor::new(&[], NonZeroUsize::new(100).unwrap());
+        let mut events = Vec::new();
+        let cancellation = GenerationCancellationToken::new();
+        while cursor.finish_reason().is_none() {
+            let before = calls.get();
+            cursor
+                .step(&mut source, &mut pipeline, &cancellation, &mut |e| {
+                    events.push(e)
+                })
+                .unwrap();
+            assert_eq!(calls.get(), before + 1);
+            // Holding/forking the host state between demands performs no decode,
+            // stop finalization, source request or extra canonical commitment.
+            let _saved_cursor = cursor.clone();
+            let _saved_pipeline = pipeline.fork().unwrap();
+            assert_eq!(calls.get(), before + 1);
+        }
+        assert_eq!(cursor.sequence.tokens(), expected_ids);
+        assert_eq!(cursor.finish_reason(), Some(expected_reason));
+        assert_eq!(events, expected_events);
+        assert!(cursor
+            .step(&mut source, &mut pipeline, &cancellation, &mut |_| {})
+            .is_err());
+        assert_eq!(calls.get(), expected_ids.len());
     }
 }

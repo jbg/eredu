@@ -78,6 +78,19 @@ pub struct GenerationSequence {
 }
 
 impl GenerationSequence {
+    /// Logical data copied with the complete sequence, including EOS policy.
+    /// Excludes allocator capacity and overhead.
+    pub fn snapshot_storage_bytes(&self) -> Option<u64> {
+        let Self {
+            max_tokens: _,
+            eos_token_ids,
+            tokens,
+            finish_reason: _,
+        } = self;
+        (std::mem::size_of::<Self>() as u64)
+            .checked_add((eos_token_ids.len() as u64).checked_mul(4)?)?
+            .checked_add((tokens.len() as u64).checked_mul(4)?)
+    }
     /// Creates an empty output sequence with a fixed token budget.
     pub fn new(max_tokens: usize, eos_token_ids: impl IntoIterator<Item = u32>) -> Self {
         let mut eos_token_ids = eos_token_ids.into_iter().collect::<Vec<_>>();
@@ -863,6 +876,9 @@ pub enum GenerationError {
     /// A token was committed after termination.
     #[error("generation has already finished")]
     AlreadyFinished,
+    /// A prior prediction or its semantic delivery failed and requires recovery.
+    #[error("generation is fenced after a failed prediction or delivery")]
+    FailedGeneration,
     /// A proposal transaction cannot be empty.
     #[error("speculative verification requires at least one proposal")]
     EmptyProposalBlock,

@@ -10,6 +10,24 @@ pub fn validate_session(
     discovery: &InterventionDiscovery,
     estimator: &dyn InterventionEstimator,
 ) -> Result<(), CaptureError> {
+    validate_continuation(
+        capture,
+        plan,
+        discovery,
+        estimator,
+        0,
+        CaptureUsage::default(),
+    )
+}
+
+pub(crate) fn validate_continuation(
+    capture: &AdmittedCapturePlan,
+    plan: &AdmittedInterventionPlan,
+    discovery: &InterventionDiscovery,
+    estimator: &dyn InterventionEstimator,
+    next_prediction: u64,
+    inherited: CaptureUsage,
+) -> Result<(), CaptureError> {
     if plan.request().batch != 1 {
         return Err(CaptureError::Unsupported(
             "interventions require single-sequence text generation".into(),
@@ -24,7 +42,7 @@ pub fn validate_session(
             "intervention admission differs from loaded source/session capabilities".into(),
         ));
     }
-    preflight(capture, &checked, estimator)
+    preflight_continuation(capture, &checked, estimator, next_prediction, inherited)
 }
 
 /// Installs one immutable run after validation. Both capture-only and combined

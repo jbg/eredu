@@ -2,6 +2,8 @@ use super::*;
 use eredu_core::*;
 use std::{cell::Cell, convert::Infallible};
 
+mod checkpoints;
+
 fn fixture(
     transform: CaptureTransform,
 ) -> (

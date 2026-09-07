@@ -44,7 +44,9 @@ pub enum TextDecoderError {
 /// Stateful tokenizer decoder for incrementally generated token ids.
 #[derive(Clone)]
 pub struct TextDecoder {
-    pub(crate) tokenizer: tokenizers::Tokenizer,
+    // Immutable tokenizer configuration is shared between exact decoder forks;
+    // only the incremental IDs/prefix below are independently copied.
+    pub(crate) tokenizer: std::sync::Arc<tokenizers::Tokenizer>,
     pub(crate) skip_special_tokens: bool,
     pub(crate) ids: Vec<u32>,
     pub(crate) prefix: String,
@@ -52,6 +54,62 @@ pub struct TextDecoder {
 }
 
 impl TextDecoder {
+    /// Bounds decoder retention and all text it can hand to an incremental
+    /// parser during a finite generated-token run. Decoder chains may expand
+    /// strings; price each stage, including empty-pattern replacements. Counting
+    /// the maximum full decode once per decision is conservative for incremental
+    /// lookbehind and avoids assuming prefix-stable tokenizer cleanup.
+    pub(crate) fn continuation_storage_bounds(&self, max_tokens: u64) -> Option<(u64, u64)> {
+        use tokenizers::decoders::DecoderWrapper as D;
+        fn decoded_bound(decoder: &D, bytes: u64, count: u64) -> Option<u64> {
+            match decoder {
+                D::Sequence(sequence) => sequence
+                    .get_decoders()
+                    .iter()
+                    .try_fold(bytes, |bytes, decoder| decoded_bound(decoder, bytes, count)),
+                D::ByteLevel(_) | D::ByteFallback(_) => bytes.checked_mul(3),
+                D::BPE(bpe) if bpe.suffix.is_empty() => bytes.checked_mul(2)?.checked_add(count),
+                D::BPE(_) | D::Metaspace(_) | D::Fuse(_) | D::Strip(_) => Some(bytes),
+                D::WordPiece(_) => bytes.checked_add(count),
+                D::CTC(_) => bytes.checked_mul(2)?.checked_add(count),
+                D::Replace(replace) => bytes.checked_add(
+                    bytes
+                        .checked_add(count)?
+                        .checked_mul(replace.content.len() as u64)?,
+                ),
+            }
+        }
+        let token_bytes = self
+            .tokenizer
+            .get_vocab(true)
+            .keys()
+            .map(String::len)
+            .max()? as u64;
+        let raw = token_bytes.checked_mul(max_tokens)?;
+        let decoded = match self.tokenizer.get_decoder() {
+            Some(decoder) => decoded_bound(decoder, raw, max_tokens)?,
+            None => raw.checked_add(max_tokens)?,
+        };
+        let storage = max_tokens.checked_mul(4)?.checked_add(decoded)?;
+        // Include tokenizer-confirmed structural spellings in the same bound.
+        let emitted = decoded.checked_mul(max_tokens)?.checked_add(raw)?;
+        Some((storage, emitted))
+    }
+
+    pub(crate) fn snapshot_storage_bytes(&self) -> Option<u64> {
+        let Self {
+            tokenizer: _,
+            skip_special_tokens: _,
+            ids,
+            prefix,
+            prefix_index: _,
+        } = self;
+        // The immutable tokenizer is shared by Arc; only mutable decoding state
+        // is copied, including text not yet emitted as a complete UTF-8 chunk.
+        (std::mem::size_of::<Self>() as u64)
+            .checked_add((ids.len() as u64).checked_mul(4)?)?
+            .checked_add(prefix.len() as u64)
+    }
     /// Decodes one token, returning text only when the token completes a chunk.
     pub fn step(&mut self, id: u32) -> Result<Option<String>, TextDecoderError> {
         tokenizers::tokenizer::step_decode_stream(
@@ -258,7 +316,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
     /// Creates an independent stateful decoder for streaming generated tokens.
     pub fn text_decoder(&self, skip_special_tokens: bool) -> TextDecoder {
         TextDecoder {
-            tokenizer: (*self.tokenizer).clone(),
+            tokenizer: std::sync::Arc::new((*self.tokenizer).clone()),
             skip_special_tokens,
             ids: Vec::new(),
             prefix: String::new(),

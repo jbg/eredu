@@ -305,6 +305,14 @@ pub(super) struct PreparedChatTokenDecoder {
 impl TokenDecoderBackend for PreparedChatTokenDecoder {
     type Error = TextDecoderError;
 
+    fn snapshot_storage_bytes(&self) -> Option<u64> {
+        self.decoder.snapshot_storage_bytes()
+    }
+
+    fn continuation_storage_bounds(&self, max_tokens: u64) -> Option<(u64, u64)> {
+        self.decoder.continuation_storage_bounds(max_tokens)
+    }
+
     fn decode_token(
         &mut self,
         token_id: u32,
@@ -380,16 +388,10 @@ impl PreparedChatSemanticState {
 
 impl SpeculativeSemanticState for PreparedChatSemanticState {
     fn fork_box(&self) -> Result<Box<dyn SpeculativeSemanticState>, SpeculativeOutputError> {
-        let mut pipeline = Self::build_pipeline(
-            self.initial_decoder.clone(),
-            &self.plan,
-            &self.caller_stop_sequences,
-        )?;
-        for &token in &self.token_ids {
-            pipeline.push(token, &mut |_| {}).map_err(|error| {
-                SpeculativeOutputError::semantic("replay token", error.to_string())
-            })?;
-        }
+        let pipeline = self
+            .pipeline
+            .fork()
+            .map_err(|error| SpeculativeOutputError::semantic("fork semantic state", error))?;
         Ok(Box::new(Self {
             initial_decoder: self.initial_decoder.clone(),
             plan: self.plan.clone(),

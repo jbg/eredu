@@ -512,6 +512,85 @@ pub struct MlxHybridState {
 }
 
 impl MlxHybridState {
+    pub(crate) fn continuation_capacity_bound(&self, additional: u64) -> Option<u64> {
+        self.layers
+            .iter()
+            .try_fold(0, |bound, layer| match &layer.attention {
+                None => Some(bound),
+                Some(MlxHybridAttentionState::KeyValue(MlxKeyValueLayerState::Device(cache))) => {
+                    Some(bound.max(cache.continuation_capacity_bound(additional)?))
+                }
+                _ => None,
+            })
+    }
+
+    pub(crate) fn supports_isolated_snapshot(&self) -> bool {
+        self.manager.is_none()
+            && self.layers.iter().all(|layer| {
+                matches!(
+                    layer.attention,
+                    None | Some(MlxHybridAttentionState::KeyValue(
+                        MlxKeyValueLayerState::Device(_)
+                    ))
+                )
+            })
+    }
+
+    /// Deeply copies attention and every architecture-declared fixed tensor.
+    /// Fixed-state handles must not inherit the transaction checkpoint's sharing.
+    pub(crate) fn isolated_snapshot(&self, stream: &Stream) -> Result<Self, Exception> {
+        if !self.supports_isolated_snapshot() {
+            return Err(Exception::custom(
+                "isolated snapshots of paged/compressed state are unsupported",
+            ));
+        }
+        let layers = self
+            .layers
+            .iter()
+            .map(|layer| {
+                let attention = match &layer.attention {
+                    None => None,
+                    Some(MlxHybridAttentionState::KeyValue(MlxKeyValueLayerState::Device(
+                        cache,
+                    ))) => Some(MlxHybridAttentionState::KeyValue(
+                        MlxKeyValueLayerState::Device(cache.isolated_snapshot(stream)?),
+                    )),
+                    _ => unreachable!("validated device attention and fixed state"),
+                };
+                let fixed = layer
+                    .fixed
+                    .iter()
+                    .map(|(role, value)| {
+                        Ok((
+                            *role,
+                            value
+                                .as_ref()
+                                .map(|value| {
+                                    value
+                                        .as_array()
+                                        .contiguous(false, stream)?
+                                        .deep_clone()
+                                        .map(MlxTensor::from_array)
+                                })
+                                .transpose()?,
+                        ))
+                    })
+                    .collect::<Result<_, Exception>>()?;
+                Ok(MlxHybridLayerState {
+                    attention,
+                    fixed,
+                    fixed_offset: layer.fixed_offset,
+                })
+            })
+            .collect::<Result<_, Exception>>()?;
+        Ok(Self {
+            layout: self.layout.clone(),
+            global_layer_start: self.global_layer_start,
+            layers,
+            manager: None,
+        })
+    }
+
     /// Creates device-resident attention and fixed state from a neutral layout.
     pub fn device(layout: StateLayout) -> Result<Self, Exception> {
         Self::device_with_global_layer_start(layout, 0)
@@ -1138,3 +1217,7 @@ fn hybrid_attention_policy(
 #[cfg(test)]
 #[path = "tests/semantic_transactions.rs"]
 mod semantic_transaction_tests;
+
+#[cfg(test)]
+#[path = "tests/isolated_snapshots.rs"]
+mod isolated_snapshot_tests;

@@ -2,13 +2,20 @@ use super::*;
 
 /// MLX sampling and randomness state for backend-generic text generation.
 pub struct MlxTextGenerationState {
+    pub(super) sampling: MlxTextSamplingState,
+    pub(super) capture: Option<eredu_runtime::capture::CaptureSession>,
+}
+
+/// Native sampling component copied by the shared ordinary snapshot driver.
+/// Capture ownership remains separate; this alone is not a generation snapshot.
+pub struct MlxTextSamplingState {
     pub(super) temperature: f32,
     pub(super) prng: Option<RandomState>,
     pub(super) sampler: MlxTextSampler,
-    pub(super) capture: Option<eredu_runtime::capture::CaptureSession>,
-    pub(super) prediction_index: u64,
+    pub(super) next_prediction: u64,
 }
 
+#[derive(Clone)]
 pub(super) enum MlxTextSampler {
     Standard(GenerationSampler),
     MirostatV2(MirostatV2Sampler),
@@ -60,12 +67,12 @@ pub(super) fn sample_text_submission(
 ) -> Result<Submission<MlxTextToken, MlxTextCompletion>, Error> {
     let operation = super::model_session::ResourceOperation::begin(submission.completion.owner())?;
     let sampled = (|| {
-        let MlxTextGenerationState {
+        let MlxTextSamplingState {
             temperature,
             prng,
             sampler,
             ..
-        } = state;
+        } = &mut state.sampling;
         let mut sampler = FilteredTextSampler { sampler, filter };
         let token = if session.synchronizes_sampling() {
             session
@@ -95,6 +102,11 @@ pub(super) fn sample_text_submission(
         MlxCompletion::submission(token)
     })();
     let (sampled, recovery) = operation.finish(sampled)?;
+    state.sampling.next_prediction = state
+        .sampling
+        .next_prediction
+        .checked_add(1)
+        .ok_or_else(|| Error::ArchitectureModel("text prediction overflow".into()))?;
     Ok(Submission {
         output: MlxTextToken {
             value: sampled.output,
@@ -107,4 +119,70 @@ pub(super) fn sample_text_submission(
             recovery: std::cell::RefCell::new(Some(recovery)),
         },
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn forced_decision_advances_one_rng_draw_and_updates_ordinary_sampler_state_once() {
+        let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+        let logits = MlxTensor::from_array(Array::from_slice(&[1.0f32, 0.2, -0.5, 2.0], &[1, 4]));
+        let filter = TokenFilter::allowed(vec![false, false, true, false]).unwrap();
+        let key = |random: &RandomState| {
+            random
+                .as_array()
+                .evaluated()
+                .unwrap()
+                .as_slice::<u32>()
+                .to_vec()
+        };
+        for adaptive in [false, true] {
+            for temperature in if adaptive { vec![0.8] } else { vec![0.0, 0.8] } {
+                let mut random = RandomState::with_seed(12345).unwrap();
+                let mut expected_random = RandomState::with_seed(12345).unwrap();
+                if temperature != 0.0 {
+                    expected_random
+                        .next_key(&stream)
+                        .unwrap()
+                        .evaluated()
+                        .unwrap();
+                }
+                let mut sampler = if adaptive {
+                    let mut sampler = MirostatV2Sampler::new(5.0, 0.3).unwrap();
+                    sampler.accept_token(1, 0.25).unwrap();
+                    MlxTextSampler::MirostatV2(sampler)
+                } else {
+                    MlxTextSampler::Standard(
+                        GenerationSampler::new()
+                            .top_k(4)
+                            .top_p(1.0)
+                            .min_p(0.0)
+                            .penalties(1.2, 64, 0.1, 0.1)
+                            .with_generated_tokens([1]),
+                    )
+                };
+                let previous_mu = match &sampler {
+                    MlxTextSampler::MirostatV2(s) => Some(s.mu()),
+                    _ => None,
+                };
+                let token = FilteredTextSampler {
+                    sampler: &mut sampler,
+                    filter: &filter,
+                }
+                .sample(&logits, temperature, Some(&mut random), &stream)
+                .unwrap();
+                assert_eq!(MlxSamplingBackend::token_id(&token, &stream).unwrap(), 2);
+                assert_eq!(key(&random), key(&expected_random));
+                match &sampler {
+                    MlxTextSampler::Standard(s) => assert_eq!(s.generated_tokens(), [1, 2]),
+                    MlxTextSampler::MirostatV2(s) => {
+                        assert_eq!(s.generated_tokens(), [1, 2]);
+                        assert!((s.mu() - (previous_mu.unwrap() + 0.3 * 5.0)).abs() < 1e-6);
+                    }
+                }
+            }
+        }
+    }
 }

@@ -194,7 +194,7 @@ impl FormatDialect for GemmaChannelDialect {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 enum GemmaChannelState {
     #[default]
     Visible,
@@ -202,12 +202,12 @@ enum GemmaChannelState {
     Reasoning,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct GemmaChannelParser {
     state: GemmaChannelState,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 enum GemmaToolState {
     #[default]
     Visible,
@@ -216,7 +216,7 @@ enum GemmaToolState {
     ToolCall(String),
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct GemmaToolParser {
     state: GemmaToolState,
 }
@@ -236,8 +236,39 @@ impl GemmaToolParser {
     }
 }
 
+use crate::runtime::generation::storage::{snapshot_fields, SnapshotStorage};
+snapshot_fields!(GemmaChannelParser { state });
+snapshot_fields!(GemmaToolParser { state });
+impl SnapshotStorage for GemmaChannelState {
+    fn heap_bytes(&self) -> Option<u64> {
+        match self {
+            Self::Visible | Self::Reasoning => Some(0),
+            Self::ChannelHeader(v) => v.heap_bytes(),
+        }
+    }
+}
+impl SnapshotStorage for GemmaToolState {
+    fn heap_bytes(&self) -> Option<u64> {
+        match self {
+            Self::Visible | Self::Reasoning => Some(0),
+            Self::ChannelHeader(v) | Self::ToolCall(v) => v.heap_bytes(),
+        }
+    }
+}
+
 impl ProtocolParser for GemmaToolParser {
+    fn continuation_storage_bytes(&self, input: u64) -> Option<u64> {
+        // One mutually exclusive header or raw tool-payload string.
+        input.checked_add(self.snapshot_bytes()?)
+    }
+    fn snapshot_storage_bytes(&self) -> Option<u64> {
+        self.snapshot_bytes()
+    }
     type Error = String;
+
+    fn fork_box(&self) -> Result<Box<dyn ProtocolParser<Error = String>>, String> {
+        Ok(Box::new(self.clone()))
+    }
 
     fn push(&mut self, text: &str, sink: &mut SemanticEventSink) -> Result<(), Self::Error> {
         match &mut self.state {
@@ -349,7 +380,17 @@ impl ProtocolParser for GemmaToolParser {
 }
 
 impl ProtocolParser for GemmaChannelParser {
+    fn continuation_storage_bytes(&self, input: u64) -> Option<u64> {
+        input.checked_add(self.snapshot_bytes()?)
+    }
+    fn snapshot_storage_bytes(&self) -> Option<u64> {
+        self.snapshot_bytes()
+    }
     type Error = String;
+
+    fn fork_box(&self) -> Result<Box<dyn ProtocolParser<Error = String>>, String> {
+        Ok(Box::new(self.clone()))
+    }
 
     fn push(&mut self, text: &str, sink: &mut SemanticEventSink) -> Result<(), Self::Error> {
         match &mut self.state {

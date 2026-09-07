@@ -65,6 +65,8 @@ const QWEN_TEMPLATE: &str =
 const NO_SPECULATIVE_RESULTS_PROMPT_TOKEN: u32 = u32::MAX;
 const MULTIPLE_SPECULATIVE_RESULTS_PROMPT_TOKEN: u32 = u32::MAX - 1;
 
+#[path = "backend_conformance/control.rs"]
+mod control;
 #[path = "backend_conformance/observed_mock.rs"]
 mod observed_mock;
 
@@ -379,6 +381,16 @@ impl DistributedBackend for MockBackend {
 }
 
 impl TextGenerationBackend for MockBackend {
+    fn text_sampling_control_support(
+        _: &ModelRuntime<Self>,
+    ) -> eredu_core::execution_control::ControlSupport {
+        eredu_core::execution_control::ControlSupport::Supported
+    }
+    fn text_execution_control_support(
+        _: &ModelRuntime<Self>,
+    ) -> eredu_core::execution_control::ControlSupport {
+        eredu_core::execution_control::ControlSupport::Supported
+    }
     type Prompt = Vec<u32>;
     type Token = MockToken;
     type TextGenerationState = observed_mock::State;
@@ -450,9 +462,16 @@ impl TextGenerationBackend for MockBackend {
 
     fn start_text_generation(
         _: &Self,
-        _: TextGenerationConfig,
+        config: TextGenerationConfig,
     ) -> Result<Self::TextGenerationState, Self::Error> {
-        Ok(Default::default())
+        Ok(observed_mock::State {
+            sampling: observed_mock::Sampling {
+                temperature: config.sampling().temperature,
+                seed: (config.sampling().temperature > 0.0).then_some(config.seed()),
+                prediction: 0,
+            },
+            ..Default::default()
+        })
     }
 
     fn prepare_text_prompt(
@@ -2197,53 +2216,61 @@ fn assert_prepared_generation_and_speculative_conformance() {
     );
 }
 
+fn unicode_model(first: Option<u32>) -> LoadedModel<MockBackend> {
+    unicode_model_with_vocabulary(first, 64)
+}
+
+fn unicode_model_with_vocabulary(
+    first: Option<u32>,
+    vocabulary_size: u32,
+) -> LoadedModel<MockBackend> {
+    let mut vocabulary: std::collections::HashMap<String, u32> =
+        std::iter::once(("[UNK]".into(), 0))
+            .chain((0..vocabulary_size).map(|i| (format!("ordinary_{i}"), i + 1)))
+            .collect();
+    if let Some(first) = first {
+        vocabulary.retain(|_, id| !(*id >= first && *id <= first + 2));
+        vocabulary.insert("Ã".into(), first);
+        vocabulary.insert("©".into(), first + 1);
+        vocabulary.insert("<|im_end|>".into(), first + 2);
+    }
+    let words = WordLevel::builder()
+        .vocab(vocabulary.into_iter().collect())
+        .unk_token("[UNK]".into())
+        .build()
+        .unwrap();
+    let mut tokenizer = Tokenizer::new(words);
+    tokenizer.with_pre_tokenizer(Some(Whitespace));
+    tokenizer.with_decoder(Some(ByteLevel::default()));
+    tokenizer
+        .add_special_tokens([AddedToken::from("<|im_end|>", true).normalized(false)])
+        .unwrap();
+    let eos = tokenizer.token_to_id("<|im_end|>").unwrap();
+    LoadedModel::from_runtime(
+        ModelRuntime::prepare(MockBackend, ()).unwrap(),
+        ChatTokenizer::from_tokenizer(tokenizer),
+        LoadedTextModelConfig {
+            model_family: ModelKind::Qwen2,
+            effective_model_type: "qwen2".into(),
+            model_id: "unicode-mock".into(),
+            chat_template: Some(ModelChatTemplate::Single(QWEN_TEMPLATE.into())),
+            eos_token_ids: vec![eos],
+            checkpoint_generation_config: None,
+        },
+    )
+}
+
 #[test]
 fn observed_facade_preserves_streaming_unicode_special_tokens_and_eos() {
-    fn model(first: Option<u32>) -> LoadedModel<MockBackend> {
-        let mut vocabulary: std::collections::HashMap<String, u32> =
-            std::iter::once(("[UNK]".into(), 0))
-                .chain((0..64).map(|i| (format!("ordinary_{i}"), i + 1)))
-                .collect();
-        if let Some(first) = first {
-            vocabulary.retain(|_, id| !(*id >= first && *id <= first + 2));
-            vocabulary.insert("Ã".into(), first);
-            vocabulary.insert("©".into(), first + 1);
-            vocabulary.insert("<|im_end|>".into(), first + 2);
-        }
-        let words = WordLevel::builder()
-            .vocab(vocabulary.into_iter().collect())
-            .unk_token("[UNK]".into())
-            .build()
-            .unwrap();
-        let mut tokenizer = Tokenizer::new(words);
-        tokenizer.with_pre_tokenizer(Some(Whitespace));
-        tokenizer.with_decoder(Some(ByteLevel::default()));
-        tokenizer
-            .add_special_tokens([AddedToken::from("<|im_end|>", true).normalized(false)])
-            .unwrap();
-        let eos = tokenizer.token_to_id("<|im_end|>").unwrap();
-        LoadedModel::from_runtime(
-            ModelRuntime::prepare(MockBackend, ()).unwrap(),
-            ChatTokenizer::from_tokenizer(tokenizer),
-            LoadedTextModelConfig {
-                model_family: ModelKind::Qwen2,
-                effective_model_type: "qwen2".into(),
-                model_id: "unicode-mock".into(),
-                chat_template: Some(ModelChatTemplate::Single(QWEN_TEMPLATE.into())),
-                eos_token_ids: vec![eos],
-                checkpoint_generation_config: None,
-            },
-        )
-    }
     let request = || ChatTemplateRequest {
         messages: vec![serde_json::json!({"role":"user", "content":"hello"})],
         add_generation_prompt: true,
         ..Default::default()
     };
-    let mut probe = model(None);
+    let mut probe = unicode_model(None);
     let chat = probe.prepare_chat(request()).unwrap();
     let first = probe.encode(chat.rendered_prompt(), false).unwrap().len() as u32;
-    let mut model = model(Some(first));
+    let mut model = unicode_model(Some(first));
     let chat = model.prepare_chat(request()).unwrap();
     assert_eq!(
         model.encode(chat.rendered_prompt(), false).unwrap().len(),

@@ -369,6 +369,152 @@ impl MlxModelInput {
     }
 }
 
+/// Opaque independently writable model state for one exact loaded executable.
+/// This covers native persistent state only; complete generation snapshots also
+/// compose sampling, pending input, facade semantics and capture admissions.
+pub struct MlxNativeTextState {
+    state: Box<dyn std::any::Any>,
+}
+
+impl eredu_core::execution_control::NativeTextStateBackend for MlxBackend<'_> {
+    type NativeTextState = MlxNativeTextState;
+
+    fn native_text_state_support(
+        runtime: &ModelRuntime<Self>,
+    ) -> eredu_core::execution_control::ControlSupport {
+        use eredu_core::execution_control::ControlSupport;
+        let session = runtime.session();
+        if let Err(error) = session.validate_backend(runtime.backend()) {
+            return ControlSupport::Unsupported {
+                reason: error.to_string(),
+            };
+        }
+        if session.payload.distributed.is_some() {
+            return ControlSupport::Unsupported {
+                reason: "native text snapshots require ordinary single-rank execution".into(),
+            };
+        }
+        session.payload.model.erased().native_control_support()
+    }
+
+    fn estimate_native_text_state(
+        runtime: &ModelRuntime<Self>,
+        saved: Option<&MlxNativeTextState>,
+    ) -> Result<Option<eredu_core::execution_control::SnapshotEstimate>, Error> {
+        let session = runtime.session();
+        session.validate_backend(runtime.backend())?;
+        // Reading estimates performs no reaping, native scopes or native allocation.
+        session
+            .authority
+            .borrow()
+            .require_idle()
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        if !matches!(
+            Self::native_text_state_support(runtime),
+            eredu_core::execution_control::ControlSupport::Supported
+        ) {
+            return Ok(None);
+        }
+        session
+            .payload
+            .model
+            .erased()
+            .estimate_native_control_state(saved.map(|saved| saved.state.as_ref()))
+    }
+
+    fn capture_native_text_state(
+        runtime: &mut ModelRuntime<Self>,
+    ) -> Result<MlxNativeTextState, Error> {
+        let estimate = Self::estimate_native_text_state(runtime, None)?;
+        if estimate.is_none() {
+            return Err(Error::ArchitectureModel(
+                "native text snapshot estimate is unavailable".into(),
+            ));
+        }
+        // The inner Result is deliberate: the copy never changes installed
+        // state. Settle its native work before returning a recoverable copy
+        // error; a failed/unobservable scope still fences the shared engine.
+        runtime
+            .session_mut()
+            .with_model_operation(|model| Ok(model.erased_mut().capture_native_control_state()))?
+            .map(|state| MlxNativeTextState { state })
+    }
+
+    fn estimate_native_text_growth(
+        runtime: &ModelRuntime<Self>,
+        saved: &MlxNativeTextState,
+        additional: u64,
+    ) -> Result<Option<u64>, Error> {
+        Self::validate_native_text_state(runtime, saved)?;
+        runtime
+            .session()
+            .payload
+            .model
+            .erased()
+            .estimate_native_control_growth(saved.state.as_ref(), additional)
+    }
+
+    fn copy_native_text_state(
+        runtime: &mut ModelRuntime<Self>,
+        saved: &MlxNativeTextState,
+    ) -> Result<MlxNativeTextState, Error> {
+        Self::validate_native_text_state(runtime, saved)?;
+        if Self::estimate_native_text_state(runtime, Some(saved))?.is_none() {
+            return Err(Error::ArchitectureModel(
+                "native text snapshot estimate is unavailable".into(),
+            ));
+        }
+        runtime
+            .session_mut()
+            .with_model_operation(|model| {
+                Ok(model
+                    .erased_mut()
+                    .copy_native_control_state(saved.state.as_ref()))
+            })?
+            .map(|state| MlxNativeTextState { state })
+    }
+
+    fn validate_native_text_state(
+        runtime: &ModelRuntime<Self>,
+        saved: &MlxNativeTextState,
+    ) -> Result<(), Error> {
+        let session = runtime.session();
+        session.validate_backend(runtime.backend())?;
+        session
+            .authority
+            .borrow()
+            .require_idle()
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        if let eredu_core::execution_control::ControlSupport::Unsupported { reason } =
+            Self::native_text_state_support(runtime)
+        {
+            return Err(Error::ArchitectureModel(reason));
+        }
+        session
+            .payload
+            .model
+            .erased()
+            .validate_native_control_state(saved.state.as_ref())
+    }
+
+    fn exchange_native_text_state(
+        runtime: &mut ModelRuntime<Self>,
+        slot: &mut MlxNativeTextState,
+    ) -> Result<(), Error> {
+        Self::validate_native_text_state(runtime, slot)?;
+        // The exchange is a checked host move with no native work. It must
+        // therefore not open a scope whose failure could follow the swap.
+        let session = runtime.session_mut();
+        session.ensure_no_submission_in_flight()?;
+        let payload = Rc::get_mut(&mut session.payload)
+            .ok_or_else(|| Error::ArchitectureModel("native payload is still retained".into()))?;
+        payload
+            .model
+            .erased_mut()
+            .exchange_native_control_state(slot.state.as_mut())
+    }
+}
+
 /// The single MLX implementation of architecture-erased prefill and decode.
 ///
 /// Cache state and optional communication belong to the same selected model
@@ -1092,10 +1238,23 @@ impl<'a> InspectableBackendSession<MlxBackend<'a>> for MlxModelSession {
 }
 
 impl<'a> TextGenerationBackend for MlxBackend<'a> {
+    fn text_sampling_control_support(
+        runtime: &ModelRuntime<Self>,
+    ) -> eredu_core::execution_control::ControlSupport {
+        Self::text_execution_control_support(runtime)
+    }
     type Prompt = MlxModelInput;
     type Token = MlxTextToken;
     type TextGenerationState = MlxTextGenerationState;
     type TextCompletion = MlxTextCompletion;
+
+    fn text_execution_control_support(
+        runtime: &ModelRuntime<Self>,
+    ) -> eredu_core::execution_control::ControlSupport {
+        <Self as eredu_core::execution_control::NativeTextStateBackend>::native_text_state_support(
+            runtime,
+        )
+    }
 
     fn intervention_discovery(
         runtime: &ModelRuntime<Self>,
@@ -1233,11 +1392,13 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
                 }
             };
             Ok(MlxTextGenerationState {
-                temperature: sampling.temperature,
-                prng,
-                sampler,
+                sampling: super::generation::MlxTextSamplingState {
+                    temperature: sampling.temperature,
+                    prng,
+                    sampler,
+                    next_prediction: 0,
+                },
                 capture: None,
-                prediction_index: 0,
             })
         })
     }
@@ -1325,14 +1486,10 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
     ) -> Result<Submission<Self::Token, Self::TextCompletion>, Error> {
         let stream = runtime.backend().stream().clone();
         if let Some(capture) = &mut state.capture {
-            state.prediction_index = state
-                .prediction_index
-                .checked_add(1)
-                .ok_or_else(|| Error::ArchitectureModel("capture prediction overflow".into()))?;
             capture
                 .begin_step(
                     eredu_core::capture::CapturePhase::Decode,
-                    state.prediction_index,
+                    state.sampling.next_prediction,
                 )
                 .map_err(|e| Error::ArchitectureModel(e.to_string()))?;
             let (backend, session) = runtime.parts_mut();

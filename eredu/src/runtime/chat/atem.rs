@@ -377,7 +377,7 @@ fn parse_atem_calls(payload: &str) -> Result<Vec<AtemCall>, String> {
     Ok(calls)
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 enum AtemState {
     #[default]
     Header,
@@ -390,7 +390,7 @@ enum AtemState {
     AwaitStart,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct AtemParser {
     state: AtemState,
     header: String,
@@ -449,8 +449,36 @@ impl AtemParser {
     }
 }
 
+use crate::runtime::generation::storage::{snapshot_fields, SnapshotStorage};
+snapshot_fields!(AtemParser {
+    state,
+    header,
+    saw_reasoning
+});
+impl SnapshotStorage for AtemState {
+    fn heap_bytes(&self) -> Option<u64> {
+        match self {
+            Self::Header | Self::Reasoning | Self::Visible | Self::AwaitStart => Some(0),
+            Self::Tool { recipient, payload } => {
+                recipient.heap_bytes()?.checked_add(payload.heap_bytes()?)
+            }
+        }
+    }
+}
+
 impl ProtocolParser for AtemParser {
+    fn continuation_storage_bytes(&self, input: u64) -> Option<u64> {
+        // Header, recipient and raw payload are the only growing owners.
+        input.checked_add(self.snapshot_bytes()?)?.checked_mul(3)
+    }
+    fn snapshot_storage_bytes(&self) -> Option<u64> {
+        self.snapshot_bytes()
+    }
     type Error = String;
+
+    fn fork_box(&self) -> Result<Box<dyn ProtocolParser<Error = String>>, String> {
+        Ok(Box::new(self.clone()))
+    }
 
     fn push(&mut self, text: &str, sink: &mut SemanticEventSink) -> Result<(), Self::Error> {
         match &mut self.state {

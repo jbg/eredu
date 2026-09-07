@@ -409,7 +409,7 @@ fn repeated_rule(item: &str, separator: &str, minimum: usize, maximum: Option<us
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 enum ParserState {
     #[default]
     Channel,
@@ -425,7 +425,7 @@ enum ParserState {
     AfterTool,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct InklingMessageParser {
     state: ParserState,
     allow_tools: bool,
@@ -496,8 +496,38 @@ impl InklingMessageParser {
     }
 }
 
+use crate::runtime::generation::storage::{snapshot_fields, SnapshotStorage};
+snapshot_fields!(InklingMessageParser { state, allow_tools });
+impl SnapshotStorage for ParserState {
+    fn heap_bytes(&self) -> Option<u64> {
+        match self {
+            Self::Channel
+            | Self::Reasoning
+            | Self::ModelAfterReasoning
+            | Self::Text
+            | Self::AfterText
+            | Self::AfterTool => Some(0),
+            Self::Recipient(v) => v.heap_bytes(),
+            Self::ToolPayload { recipient, json } => {
+                recipient.heap_bytes()?.checked_add(json.heap_bytes()?)
+            }
+        }
+    }
+}
+
 impl ProtocolParser for InklingMessageParser {
+    fn continuation_storage_bytes(&self, input: u64) -> Option<u64> {
+        // Recipient and active raw JSON fragment.
+        input.checked_add(self.snapshot_bytes()?)?.checked_mul(2)
+    }
+    fn snapshot_storage_bytes(&self) -> Option<u64> {
+        self.snapshot_bytes()
+    }
     type Error = String;
+
+    fn fork_box(&self) -> Result<Box<dyn ProtocolParser<Error = String>>, String> {
+        Ok(Box::new(self.clone()))
+    }
 
     fn push(&mut self, text: &str, sink: &mut SemanticEventSink) -> Result<(), Self::Error> {
         if text.is_empty() {

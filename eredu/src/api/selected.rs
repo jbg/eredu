@@ -19,6 +19,10 @@ pub fn discover_local_hardware() -> eredu_core::HardwareProfile {
 }
 
 type SelectedBackend = eredu_backend_mlx::backend::MlxBackend<'static>;
+mod control;
+pub use control::{
+    LocalControlledGenerationSession, LocalGenerationBranch, LocalGenerationSnapshot,
+};
 type SelectedDrafter = eredu_backend_mlx::native::MlxDrafter;
 type SelectedPrompt = <SelectedBackend as eredu_core::TextGenerationBackend>::Prompt;
 type SelectedRealtimeState = eredu_runtime::RealtimePayloadState<

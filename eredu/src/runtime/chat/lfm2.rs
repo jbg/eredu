@@ -483,7 +483,7 @@ fn python_string_literal(value: &str, quote: char) -> String {
     output
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum ParserState {
     Text(PartialPatternBuffer),
     ListStart,
@@ -499,7 +499,7 @@ enum ParserState {
     Poisoned,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Lfm2Parser {
     state: ParserState,
 }
@@ -672,8 +672,63 @@ impl Lfm2Parser {
     }
 }
 
+use crate::runtime::generation::storage::{snapshot_fields, SnapshotStorage};
+snapshot_fields!(Lfm2Parser { state });
+snapshot_fields!(PythonValueNormalizer {
+    mode,
+    containers,
+    canonical,
+    started
+});
+impl SnapshotStorage for ParserState {
+    fn heap_bytes(&self) -> Option<u64> {
+        match self {
+            Self::Text(v) => v.heap_bytes(),
+            Self::CallName(v) | Self::Keyword(v) => v.heap_bytes(),
+            Self::Value(v) => v.heap_bytes(),
+            Self::ListStart
+            | Self::ArgumentsStart
+            | Self::AfterValue
+            | Self::AfterCall
+            | Self::CallSeparator
+            | Self::AfterList
+            | Self::Done
+            | Self::Poisoned => Some(0),
+        }
+    }
+}
+impl SnapshotStorage for ValueMode {
+    fn heap_bytes(&self) -> Option<u64> {
+        match self {
+            Self::Normal => Some(0),
+            Self::Word(v) | Self::Number(v) => v.heap_bytes(),
+            Self::String {
+                quote: _,
+                raw,
+                escaped: _,
+            } => raw.heap_bytes(),
+        }
+    }
+}
+
 impl ProtocolParser for Lfm2Parser {
+    fn continuation_storage_bytes(&self, input: u64) -> Option<u64> {
+        // Raw string/word, normalized JSON (six-byte escaping), pending pattern
+        // text, and at most one char-sized container frame per input byte.
+        input
+            .checked_add(self.snapshot_bytes()?)?
+            .checked_mul(8 + std::mem::size_of::<char>() as u64)?
+            .checked_add(TOOL_CALL_START.len() as u64)?
+            .checked_add(std::mem::size_of::<(PatternKind, String)>() as u64)
+    }
+    fn snapshot_storage_bytes(&self) -> Option<u64> {
+        self.snapshot_bytes()
+    }
     type Error = String;
+
+    fn fork_box(&self) -> Result<Box<dyn ProtocolParser<Error = String>>, String> {
+        Ok(Box::new(self.clone()))
+    }
 
     fn push(&mut self, text: &str, sink: &mut SemanticEventSink) -> Result<(), Self::Error> {
         for character in text.chars() {
@@ -715,7 +770,7 @@ impl ProtocolParser for Lfm2Parser {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct PythonValueNormalizer {
     mode: ValueMode,
     containers: Vec<char>,
@@ -723,7 +778,7 @@ struct PythonValueNormalizer {
     started: bool,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 enum ValueMode {
     #[default]
     Normal,

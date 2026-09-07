@@ -15,6 +15,9 @@ use eredu_core::cache::{
 use eredu_core::{DistributedCommitEpoch, DistributedCommitOutcome, DistributedCommitPhase};
 use eredu_nn::{NeuralBackend, Tensor};
 
+mod control;
+pub use control::{ReplicatedTextControlState, ReplicatedTextSnapshotMechanisms};
+
 use crate::{
     observe_model_logits, partitioned_replicated_text_materialization_tasks,
     plan_local_replicated_text_materialization_tasks, replicated_text_materialization_tasks,
@@ -855,6 +858,7 @@ where
     active_commit_epoch: Option<DistributedCommitEpoch>,
     last_commit_outcome: Option<DistributedCommitOutcome>,
     successful_state_restorations: Option<u64>,
+    control_identity: std::sync::Arc<()>,
     control_fence: Option<crate::DistributedExecutionPhase>,
     output_selection: ReplicatedTextOutputSelection,
     backend: PhantomData<fn() -> B>,
@@ -1836,6 +1840,7 @@ where
         active_commit_epoch: None,
         last_commit_outcome: None,
         successful_state_restorations: Some(0),
+        control_identity: std::sync::Arc::new(()),
         control_fence: None,
         output_selection,
         backend: PhantomData,
@@ -1930,6 +1935,7 @@ where
         active_commit_epoch: None,
         last_commit_outcome: None,
         successful_state_restorations: Some(0),
+        control_identity: std::sync::Arc::new(()),
         control_fence: None,
         output_selection,
         backend: PhantomData,

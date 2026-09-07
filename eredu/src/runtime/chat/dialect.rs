@@ -1,5 +1,7 @@
 //! Internal format-dialect implementations.
 
+mod snapshot;
+
 use std::{
     any::Any,
     collections::{BTreeMap, BTreeSet},
@@ -1561,7 +1563,7 @@ enum ChannelKind {
     Text,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum DeclarativeParserState {
     PrefilledChannelOrTool {
         kind: ChannelKind,
@@ -1609,7 +1611,7 @@ enum DeclarativeParserState {
     ToolSuffix,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct DeclarativeParser {
     spec: &'static DeclarativeDialectSpec,
     tagged_tools: BTreeMap<String, TaggedToolSchema>,
@@ -2342,7 +2344,7 @@ impl DeclarativeParser {
 ///
 /// Argument bytes remain in their original JSON spelling so they can be
 /// forwarded as soon as the name and optional protocol call ID are known.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct IncrementalJsonCall {
     phase: JsonCallPhase,
     fragment: String,
@@ -2356,7 +2358,7 @@ struct IncrementalJsonCall {
     complete: bool,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 enum JsonCallPhase {
     #[default]
     Start,
@@ -2380,13 +2382,13 @@ enum JsonCallPhase {
     AfterValue,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct JsonValueAccumulator {
     raw: String,
     kind: JsonValueKind,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum JsonValueKind {
     Container {
         depth: usize,
@@ -2729,7 +2731,7 @@ impl IncrementalJsonCall {
 }
 
 /// Converts the structural-object surface syntax to JSON as it is consumed.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct StructuralObjectNormalizer {
     string_delimiter: &'static str,
     phase: StructuralPhase,
@@ -2739,7 +2741,7 @@ struct StructuralObjectNormalizer {
     complete: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum StructuralPhase {
     Start,
     ObjectKey { key: String, allow_end: bool },
@@ -2749,7 +2751,7 @@ enum StructuralPhase {
     AfterValue,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum StructuralContainer {
     Object { keys: BTreeSet<String> },
     Array,
@@ -2998,7 +3000,17 @@ enum StructuralContainerKind {
 }
 
 impl ProtocolParser for DeclarativeParser {
+    fn continuation_storage_bytes(&self, input_bytes: u64) -> Option<u64> {
+        self.continuation_bound(input_bytes)
+    }
+    fn snapshot_storage_bytes(&self) -> Option<u64> {
+        crate::runtime::generation::storage::SnapshotStorage::snapshot_bytes(self)
+    }
     type Error = String;
+
+    fn fork_box(&self) -> Result<Box<dyn ProtocolParser<Error = String>>, String> {
+        Ok(Box::new(self.clone()))
+    }
 
     fn push(&mut self, text: &str, sink: &mut SemanticEventSink) -> Result<(), Self::Error> {
         self.pending.push_str(text);

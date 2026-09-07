@@ -191,6 +191,114 @@ where
         + 'static,
     P: ReplicatedPredictionCapability<A, S, D> + 'static,
 {
+    fn native_control_support(&self) -> eredu_core::execution_control::ControlSupport {
+        use eredu_core::execution_control::ControlSupport;
+        if self.has_partition_control() {
+            return ControlSupport::Unsupported {
+                reason: "native text snapshots require single-rank execution".into(),
+            };
+        }
+        if P::present() {
+            return ControlSupport::Unsupported {
+                reason: "native text snapshots do not support selected speculative execution"
+                    .into(),
+            };
+        }
+        if self.session.estimate_control_state().is_none() {
+            return ControlSupport::Unsupported {
+                reason: "native state isolation or a complete storage estimate is unavailable"
+                    .into(),
+            };
+        }
+        ControlSupport::Supported
+    }
+
+    fn estimate_native_control_state(
+        &self,
+        saved: Option<&dyn std::any::Any>,
+    ) -> Result<Option<eredu_core::execution_control::SnapshotEstimate>, Error> {
+        if !matches!(
+            self.native_control_support(),
+            eredu_core::execution_control::ControlSupport::Supported
+        ) {
+            return Ok(None);
+        }
+        match saved {
+            None => Ok(self.session.estimate_control_state()),
+            Some(saved) => {
+                let saved = saved.downcast_ref::<eredu_runtime::replicated_session::ReplicatedTextControlState<S>>()
+                    .ok_or_else(|| Error::ArchitectureModel("native control state type differs".into()))?;
+                self.session
+                    .estimate_control_state_copy(saved)
+                    .map_err(|error| Error::ArchitectureModel(error.to_string()))
+            }
+        }
+    }
+
+    fn capture_native_control_state(&mut self) -> Result<Box<dyn std::any::Any>, Error> {
+        if let eredu_core::execution_control::ControlSupport::Unsupported { reason } =
+            self.native_control_support()
+        {
+            return Err(Error::ArchitectureModel(reason));
+        }
+        self.session
+            .capture_control_state(&self.stream)
+            .map(|state| Box::new(state) as Box<dyn std::any::Any>)
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))
+    }
+
+    fn estimate_native_control_growth(
+        &self,
+        saved: &dyn std::any::Any,
+        additional: u64,
+    ) -> Result<Option<u64>, Error> {
+        self.validate_native_control_state(saved)?;
+        let saved = saved
+            .downcast_ref::<eredu_runtime::replicated_session::ReplicatedTextControlState<S>>()
+            .ok_or_else(|| Error::ArchitectureModel("native control state type differs".into()))?;
+        self.session
+            .estimate_control_state_growth(saved, additional)
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))
+    }
+
+    fn copy_native_control_state(
+        &mut self,
+        saved: &dyn std::any::Any,
+    ) -> Result<Box<dyn std::any::Any>, Error> {
+        self.validate_native_control_state(saved)?;
+        let saved = saved
+            .downcast_ref::<eredu_runtime::replicated_session::ReplicatedTextControlState<S>>()
+            .ok_or_else(|| Error::ArchitectureModel("native control state type differs".into()))?;
+        self.session
+            .copy_control_state(saved, &self.stream)
+            .map(|state| Box::new(state) as Box<dyn std::any::Any>)
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))
+    }
+
+    fn validate_native_control_state(&self, saved: &dyn std::any::Any) -> Result<(), Error> {
+        if let eredu_core::execution_control::ControlSupport::Unsupported { reason } =
+            self.native_control_support()
+        {
+            return Err(Error::ArchitectureModel(reason));
+        }
+        let saved = saved
+            .downcast_ref::<eredu_runtime::replicated_session::ReplicatedTextControlState<S>>()
+            .ok_or_else(|| Error::ArchitectureModel("native control state type differs".into()))?;
+        self.session
+            .validate_control_state(saved)
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))
+    }
+
+    fn exchange_native_control_state(&mut self, slot: &mut dyn std::any::Any) -> Result<(), Error> {
+        self.validate_native_control_state(slot)?;
+        let slot = slot
+            .downcast_mut::<eredu_runtime::replicated_session::ReplicatedTextControlState<S>>()
+            .ok_or_else(|| Error::ArchitectureModel("native control state type differs".into()))?;
+        self.session
+            .exchange_control_state(slot)
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))
+    }
+
     fn effective_model_type(&self) -> &str {
         &self.effective_model_type
     }

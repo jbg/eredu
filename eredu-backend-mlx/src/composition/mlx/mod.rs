@@ -22,7 +22,10 @@ pub use loading::{MlxModelConfig, MlxSelectedPreparation};
 pub(crate) use model::Executable;
 #[cfg(any(feature = "image", feature = "audio"))]
 pub(crate) use processor::ModelProcessor;
-pub use session::{MlxModelInput, MlxModelOutput, MlxModelSession, MlxSessionCompletion};
+pub use session::{
+    MlxModelInput, MlxModelOutput, MlxModelSession, MlxNativeTextState, MlxSessionCompletion,
+    MlxTextSamplingState,
+};
 
 pub(crate) use crate::backend::{
     error::Error, MlxBackend, MlxCompletion, MlxDistributedSession, MlxModel,

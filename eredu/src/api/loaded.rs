@@ -80,7 +80,9 @@ pub enum PlannedModelLoadError<E: std::error::Error + Send + Sync + 'static> {
     Loading(#[from] LoadedModelLoadError<E>),
 }
 
-fn map_prepared_chat_setup_error<E>(error: PreparedChatSetupError) -> PreparedChatError<E>
+pub(super) fn map_prepared_chat_setup_error<E>(
+    error: PreparedChatSetupError,
+) -> PreparedChatError<E>
 where
     E: std::error::Error + Send + Sync + 'static,
 {
@@ -90,7 +92,7 @@ where
     }
 }
 
-fn map_controlled_generation_error<E>(
+pub(super) fn map_controlled_generation_error<E>(
     error: eredu_core::ControlledTextGenerationError<E, crate::api::ConstraintError>,
 ) -> PreparedChatError<E>
 where

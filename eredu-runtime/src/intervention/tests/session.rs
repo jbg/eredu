@@ -1,6 +1,8 @@
 use super::*;
 use std::sync::{Arc, Mutex};
 
+mod checkpoints;
+
 struct Facts {
     max_index: u64,
     bytes_per_row: u64,

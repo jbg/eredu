@@ -228,6 +228,16 @@ impl PreparedInputCacheIdentity {
     pub fn prefix_content_fingerprint(&self) -> &str {
         &self.prefix_content_fingerprint
     }
+
+    /// Logical host storage retained by a copied identity, including descriptions
+    /// and both fingerprints. Allocator capacity/overhead is excluded.
+    pub fn logical_metadata_bytes(&self) -> Option<u64> {
+        u64::try_from(std::mem::size_of::<Self>())
+            .ok()?
+            .checked_add(self.prepared.logical_metadata_bytes()?)?
+            .checked_add(u64::try_from(self.semantic_content_fingerprint.len()).ok()?)?
+            .checked_add(u64::try_from(self.prefix_content_fingerprint.len()).ok()?)
+    }
 }
 
 /// Invalid cache identity for a prepared model input.

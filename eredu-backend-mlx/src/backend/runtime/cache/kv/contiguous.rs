@@ -20,6 +20,44 @@ pub struct ConcatKeyValueCache {
 }
 
 impl ConcatKeyValueCache {
+    /// Maximum logical sequence dimension retained after the admitted input
+    /// span. Includes chunk padding and existing capacity; sliding views are
+    /// priced by their logical extent, not the allocator's underlying buffer.
+    pub(crate) fn continuation_capacity_bound(&self, additional: u64) -> Option<u64> {
+        let required = u64::try_from(self.length).ok()?.checked_add(additional)?;
+        let bound = if let Some(window) = self.attention_window {
+            required.min(u64::try_from(window.checked_sub(1)?).ok()?)
+        } else {
+            let step = u64::try_from(self.step.max(1)).ok()?;
+            let padded = required
+                .checked_add(step - 1)?
+                .checked_div(step)?
+                .checked_mul(step)?;
+            match self.max_size {
+                Some(maximum) => padded.min(u64::try_from(maximum).ok()?),
+                None => padded,
+            }
+        };
+        Some(bound.max(u64::try_from(self.capacity).ok()?))
+    }
+
+    /// Independent snapshot of every logical element, including strided/windowed
+    /// views. Preserve capacity, offsets and window metadata with the copied arrays.
+    pub(crate) fn isolated_snapshot(&self, stream: &Stream) -> Result<Self, Exception> {
+        let mut cache = self.clone();
+        cache.keys = self
+            .keys
+            .as_ref()
+            .map(|array| array.contiguous(false, stream)?.deep_clone())
+            .transpose()?;
+        cache.values = self
+            .values
+            .as_ref()
+            .map(|array| array.contiguous(false, stream)?.deep_clone())
+            .transpose()?;
+        Ok(cache)
+    }
+
     /// Creates an empty concatenating key/value cache.
     pub fn new() -> Self {
         Self::default()

@@ -21,6 +21,10 @@ use std::{
     time::Instant,
 };
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 pub(super) fn new_identity(kind: &str) -> String {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     format!(
@@ -47,15 +51,15 @@ pub struct TraceLimits {
 /// Prepared prompt and capture admission. Dropping this value submits no work.
 /// Generation consumes it, preventing accidental reuse with different settings.
 pub struct PreparedObservedGeneration {
-    chat: PreparedChat,
-    prompt_token_ids: Vec<u32>,
-    settings: PreparedChatGenerationSettings,
-    resolved: ResolvedGenerationConfig,
-    plan: AdmittedCapturePlan,
-    intervention: Option<AdmittedInterventionPlan>,
-    session_identity: String,
-    artifact_identity: Option<String>,
-    trace_limits: TraceLimits,
+    pub(super) chat: PreparedChat,
+    pub(super) prompt_token_ids: Vec<u32>,
+    pub(super) settings: PreparedChatGenerationSettings,
+    pub(super) resolved: ResolvedGenerationConfig,
+    pub(super) plan: AdmittedCapturePlan,
+    pub(super) intervention: Option<AdmittedInterventionPlan>,
+    pub(super) session_identity: String,
+    pub(super) artifact_identity: Option<String>,
+    pub(super) trace_limits: TraceLimits,
 }
 
 impl PreparedObservedGeneration {
@@ -101,6 +105,51 @@ pub struct ObservedGenerationRecord {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ObservedGenerationEvent {
+    /// Independent child stream, including the delivered inherited semantic
+    /// prefix. Later deltas may complete a tool call or Unicode/text boundary
+    /// begun in this prefix; no parent journal lookup or replay is required.
+    BranchStarted {
+        /// Parent snapshot, absolute boundary, budgets and prospective changes.
+        lineage: super::GenerationBranchMetadata,
+        /// Exact source prompt for interpreting absolute input/capture positions.
+        prompt_token_ids: Vec<u32>,
+        /// Canonical inherited generated tokens, including special tokens.
+        inherited_token_ids: Vec<u32>,
+        /// Exact semantic events delivered before the snapshot boundary.
+        inherited_semantics: Vec<SemanticEvent>,
+    },
+    /// An immutable complete in-process snapshot was retained at this boundary.
+    SnapshotCreated {
+        /// Serializable metadata only; native handles never enter records.
+        metadata: super::GenerationSnapshotMetadata,
+    },
+    /// Reconcile visible history to this prior output prefix, then consume records
+    /// in the new monotone epoch. Old token/semantic events are not emitted again.
+    Restored {
+        /// Reusable snapshot selected for this restore.
+        snapshot_id: String,
+        /// Prefix to retain in the consumer's output journal.
+        output: super::GenerationOutputCheckpoint,
+    },
+    /// Prospective sampling change at a completed ordinary decision boundary.
+    SamplingChanged {
+        /// First absolute prediction using this change.
+        next_prediction: u64,
+        /// Explicit request, including any new seed.
+        request: eredu_runtime::execution_control::SamplingOverride,
+        /// Retained sampling compatibility before the change.
+        before: eredu_runtime::execution_control::SamplingStateFacts,
+        /// Sampling compatibility after the change.
+        after: eredu_runtime::execution_control::SamplingStateFacts,
+    },
+    /// Quiescent or terminal state of a controllable run. Ordinary one-shot
+    /// generation retains its existing event stream.
+    Lifecycle {
+        /// Completed-token execution state.
+        status: eredu_core::execution_control::GenerationStatus,
+        /// Absolute prediction that would execute next.
+        next_prediction: u64,
+    },
     /// Captures from an operation that failed before a token was committed.
     CaptureFailure {
         /// Index of the unsuccessful prediction attempt.
@@ -125,6 +174,10 @@ pub enum ObservedGenerationEvent {
     Token {
         /// Canonical token identifier, including special/EOS tokens.
         token_id: u32,
+        /// This decision was restricted to one validated canonical token by
+        /// execution control. Ordinary callers always emit false.
+        #[serde(default, skip_serializing_if = "is_false")]
+        forced: bool,
         /// Zero is predicted by prefill; later values are decode predictions.
         prediction_index: u64,
         /// Half-open input positions covered by this forward pass.
@@ -167,8 +220,7 @@ pub enum ObservedGenerationEvent {
 struct Delivery<F> {
     emit: F,
     template: ObservedGenerationRecord,
-    limits: TraceLimits,
-    emitted_bytes: u64,
+    budget: TraceBudget,
     cancellation: GenerationCancellationToken,
     failure: Option<CaptureError>,
     closed: bool,
@@ -184,24 +236,45 @@ impl<F: FnMut(ObservedGenerationRecord) -> ControlFlow<()>> Delivery<F> {
             event,
             ..self.template.clone()
         };
+        if let Err(error) = self.budget.charge(&record) {
+            self.failure = Some(error);
+            self.cancellation.cancel();
+            return;
+        }
+        if (self.emit)(record).is_break() {
+            self.closed = true;
+            self.cancellation.cancel();
+        }
+    }
+}
+
+/// Shared compact-JSON transport accounting. This owner is never snapshotted.
+pub(super) struct TraceBudget {
+    limits: TraceLimits,
+    emitted_bytes: u64,
+}
+impl TraceBudget {
+    pub(super) fn new(limits: TraceLimits) -> Self {
+        Self {
+            limits,
+            emitted_bytes: 0,
+        }
+    }
+    pub(super) fn emitted_bytes(&self) -> u64 {
+        self.emitted_bytes
+    }
+    pub(super) fn charge(&mut self, record: &impl Serialize) -> Result<(), CaptureError> {
         let remaining = self.limits.total_bytes.saturating_sub(self.emitted_bytes);
         let mut sink = TraceCounter {
             used: 0,
             limit: remaining.min(self.limits.per_record_bytes),
         };
-        if serde_json::to_writer(&mut sink, &record).is_err() {
-            self.failure = Some(CaptureError::Limit {
-                budget: CaptureBudget::Encoded,
-                cumulative: remaining < self.limits.per_record_bytes,
-            });
-            self.cancellation.cancel();
-            return;
-        }
+        serde_json::to_writer(&mut sink, record).map_err(|_| CaptureError::Limit {
+            budget: CaptureBudget::Encoded,
+            cumulative: remaining < self.limits.per_record_bytes,
+        })?;
         self.emitted_bytes += sink.used;
-        if (self.emit)(record).is_break() {
-            self.closed = true;
-            self.cancellation.cancel();
-        }
+        Ok(())
     }
 }
 
@@ -383,8 +456,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
         let delivery = RefCell::new(Delivery {
             emit: on_record,
             template,
-            limits: prepared.trace_limits,
-            emitted_bytes: 0,
+            budget: TraceBudget::new(prepared.trace_limits),
             cancellation: cancellation.clone(),
             failure: None,
             closed: false,
@@ -419,6 +491,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
             delivery.prediction += 1;
             delivery.send(ObservedGenerationEvent::Token {
                 token_id,
+                forced: false,
                 prediction_index: index,
                 input_range,
                 committed: true,

@@ -87,6 +87,14 @@ impl Clone for ConstraintController {
 }
 
 impl ConstraintController {
+    pub(crate) fn continuation_storage_bytes(&self, predictions: u64) -> Option<u64> {
+        match &self.runtime {
+            ConstraintRuntime::Forbidden { trigger, .. } => predictions
+                .checked_mul(4)?
+                .checked_add(trigger.len() as u64),
+            ConstraintRuntime::Auto { .. } | ConstraintRuntime::Active(_) => None,
+        }
+    }
     /// Creates canonical constraint state from one prepared-chat plan.
     pub(crate) fn from_generation_plan(
         plan: &GenerationRuntimePlan,
@@ -197,6 +205,38 @@ impl TokenFilterController for ConstraintController {
 
     fn is_complete(&mut self) -> Result<bool, Self::Error> {
         self.grammar_is_complete()
+    }
+}
+
+impl eredu_runtime::execution_control::SnapshotTokenController for ConstraintController {
+    fn snapshot_storage_bytes(&self) -> Option<u64> {
+        let Self {
+            runtime,
+            committed_tokens,
+        } = self;
+        let bytes = (std::mem::size_of::<Self>() as u64)
+            .checked_add((committed_tokens.len() as u64).checked_mul(4)?)?;
+        match runtime {
+            // Immutable token bytes are already retained by Arc. Only the trigger
+            // matcher and committed canonical history are copied for this mode.
+            ConstraintRuntime::Forbidden {
+                vocabulary: _,
+                trigger,
+                pending,
+            } => bytes
+                .checked_add(trigger.len() as u64)?
+                .checked_add(pending.len() as u64),
+            // The pinned Matcher has independent deep cloning, but exposes no
+            // complete live parser/lexer storage estimate. Never substitute a
+            // token count or per-step performance delta for that missing cost.
+            ConstraintRuntime::Auto { .. } | ConstraintRuntime::Active(_) => None,
+        }
+    }
+    fn fork_snapshot(&self) -> Result<Self, String> {
+        if self.snapshot_storage_bytes().is_none() {
+            return Err("complete grammar storage estimate is unavailable".into());
+        }
+        Ok(self.clone())
     }
 }
 

@@ -4,7 +4,14 @@ use eredu_core::intervention::*;
 
 #[derive(Default)]
 pub(super) struct State {
+    pub sampling: Sampling,
     pub capture: Option<eredu_runtime::capture::CaptureSession>,
+}
+
+#[derive(Clone, Default)]
+pub(super) struct Sampling {
+    pub temperature: f32,
+    pub seed: Option<u64>,
     pub prediction: u64,
 }
 
@@ -133,7 +140,7 @@ impl State {
         };
         if let Some(capture) = &mut self.capture {
             capture
-                .begin_step(phase, self.prediction)
+                .begin_step(phase, self.sampling.prediction)
                 .map_err(|e| MockError::Capture(e.to_string()))?;
             use eredu_runtime::ActivationObserver;
             let mut observer = eredu_runtime::intervention::CaptureObserver::new(
@@ -151,7 +158,7 @@ impl State {
             }
             observer.finish()?;
         }
-        self.prediction += 1;
+        self.sampling.prediction += 1;
         Ok((token as f32 * value.scale) as u32)
     }
 }
@@ -288,7 +295,7 @@ pub(super) fn plan() -> CapturePlan {
     }
 }
 
-fn intervention_plan(factor: f32) -> InterventionPlan {
+pub(super) fn intervention_plan(factor: f32) -> InterventionPlan {
     InterventionPlan {
         schema_version: 1,
         operations: vec![InterventionOperation {

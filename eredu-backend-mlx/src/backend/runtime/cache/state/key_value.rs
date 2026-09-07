@@ -222,6 +222,15 @@ pub(super) fn common_selected_placement(
 }
 
 impl MlxKeyValueState {
+    pub(crate) fn continuation_capacity_bound(&self, additional: u64) -> Option<u64> {
+        self.layers.iter().try_fold(0, |bound, layer| match layer {
+            MlxKeyValueLayerState::Device(cache) => {
+                Some(bound.max(cache.continuation_capacity_bound(additional)?))
+            }
+            MlxKeyValueLayerState::Paged(_) => None,
+        })
+    }
+
     /// Creates contiguous execution-device state for every declared layer.
     pub fn device(layout: StateLayout) -> Result<Self, Exception> {
         Self::device_with_global_layer_start(layout, 0)
@@ -394,6 +403,37 @@ impl MlxKeyValueState {
                 .map(MlxKeyValueLayerState::deep_clone_state)
                 .collect::<Result<_, _>>()?,
             paged_transaction_branch: self.paged_transaction_branch,
+        })
+    }
+
+    pub(crate) fn supports_isolated_snapshot(&self) -> bool {
+        self.layers
+            .iter()
+            .all(|layer| matches!(layer, MlxKeyValueLayerState::Device(_)))
+    }
+
+    /// Copies every device array even when an ordinary transaction would rely on
+    /// append-only sharing. Paged catalogs need independent admission separately.
+    pub(crate) fn isolated_snapshot(&self, stream: &Stream) -> Result<Self, Exception> {
+        if !self.supports_isolated_snapshot() {
+            return Err(Exception::custom(
+                "isolated snapshots of paged state are unsupported",
+            ));
+        }
+        Ok(Self {
+            layout: self.layout.clone(),
+            global_layer_start: self.global_layer_start,
+            paged_transaction_branch: self.paged_transaction_branch,
+            layers: self
+                .layers
+                .iter()
+                .map(|layer| match layer {
+                    MlxKeyValueLayerState::Device(cache) => cache
+                        .isolated_snapshot(stream)
+                        .map(MlxKeyValueLayerState::Device),
+                    MlxKeyValueLayerState::Paged(_) => unreachable!("validated device state"),
+                })
+                .collect::<Result<_, _>>()?,
         })
     }
 

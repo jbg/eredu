@@ -273,7 +273,7 @@ enum ContentKind {
     Final,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum ParserState {
     Header { require_start: bool },
     Content(ContentKind),
@@ -282,7 +282,7 @@ enum ParserState {
     Done,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct HarmonyParser {
     state: ParserState,
     pending: String,
@@ -519,8 +519,33 @@ fn longest_marker_prefix(input: &str) -> usize {
         .unwrap_or_default()
 }
 
+use crate::runtime::generation::storage::{snapshot_fields, SnapshotStorage};
+snapshot_fields!(HarmonyParser { state, pending });
+impl SnapshotStorage for ParserState {
+    fn heap_bytes(&self) -> Option<u64> {
+        match self {
+            Self::Header { require_start: _ }
+            | Self::Content(_)
+            | Self::ToolComplete
+            | Self::Done => Some(0),
+            Self::ToolArguments(json) => json.heap_bytes(),
+        }
+    }
+}
+
 impl ProtocolParser for HarmonyParser {
+    fn continuation_storage_bytes(&self, input: u64) -> Option<u64> {
+        // Pending protocol bytes plus the active JSON argument fragment.
+        input.checked_add(self.snapshot_bytes()?)?.checked_mul(2)
+    }
+    fn snapshot_storage_bytes(&self) -> Option<u64> {
+        self.snapshot_bytes()
+    }
     type Error = String;
+
+    fn fork_box(&self) -> Result<Box<dyn ProtocolParser<Error = String>>, String> {
+        Ok(Box::new(self.clone()))
+    }
 
     fn push(&mut self, text: &str, sink: &mut SemanticEventSink) -> Result<(), Self::Error> {
         self.pending.push_str(text);

@@ -2,12 +2,20 @@
 
 use eredu_core::capture::*;
 
+mod checkpoint;
 #[cfg(test)]
 mod tests;
+pub use checkpoint::{
+    CaptureCheckpoint, CaptureForkRequest, InterventionForkRequest, PreparedCaptureRestore,
+};
 
 /// A run owns one ledger and at most one step of host records. Consumers must drain
 /// each step before another is started; there is no producer queue.
 pub struct CaptureSession {
+    // Identity is deliberately not serialized or copied into child sessions.
+    owner: std::sync::Arc<()>,
+    checkpoint_ready: bool,
+    has_step: bool,
     pub(crate) plan: AdmittedCapturePlan,
     pub(crate) ledger: CaptureLedger,
     pub(crate) records: Option<Vec<CaptureRecord>>,
@@ -21,6 +29,9 @@ impl CaptureSession {
     /// Creates an unstarted capture run owning its admission and ledger.
     pub fn new(plan: AdmittedCapturePlan) -> Self {
         Self {
+            owner: std::sync::Arc::new(()),
+            checkpoint_ready: true,
+            has_step: false,
             ledger: CaptureLedger::new(&plan),
             plan,
             records: None,
@@ -34,6 +45,11 @@ impl CaptureSession {
     /// Borrows this run's immutable admission.
     pub fn plan(&self) -> &AdmittedCapturePlan {
         &self.plan
+    }
+
+    /// Immutable intervention admission currently paired with this shared owner.
+    pub fn intervention_plan(&self) -> Option<&eredu_core::intervention::AdmittedInterventionPlan> {
+        self.interventions.as_ref().map(|run| &run.plan)
     }
 
     /// Reserves diagnostic envelopes before execution, including scheduled skips and
@@ -50,6 +66,10 @@ impl CaptureSession {
                 "generation exceeds admitted prediction range".into(),
             ));
         }
+        // Even a failed reservation can consume cumulative resources. A failed
+        // attempt is not a resumable boundary merely because records were drained.
+        self.checkpoint_ready = false;
+        self.has_step = true;
         self.ledger.begin_step();
         let mut records = Vec::new();
         for (selection, point) in self.plan.plan().selections.iter().zip(self.plan.points()) {
@@ -156,6 +176,12 @@ impl CaptureSession {
 
     /// Moves the current bounded record batch to the consumer.
     pub fn take_step(&mut self) -> Option<CapturedStep> {
+        if let Some(records) = &self.records {
+            self.checkpoint_ready = self.finish_interventions().is_ok()
+                && !records
+                    .iter()
+                    .any(|record| matches!(record.outcome, CaptureOutcome::Failed { .. }));
+        }
         self.records.take().map(|records| CapturedStep {
             phase: self.phase,
             prediction_index: self.prediction,
@@ -310,9 +336,20 @@ pub fn validate_session(
         &ResolvedCaptureSlice,
     ) -> Result<CaptureUsage, CaptureError>,
 ) -> Result<(), CaptureError> {
-    if plan.is_empty() {
-        return Ok(());
-    }
+    validate_continuation(plan, discovery, 0, CaptureUsage::default(), estimate)
+}
+
+pub(crate) fn validate_continuation(
+    plan: &AdmittedCapturePlan,
+    discovery: &CaptureDiscovery,
+    next_prediction: u64,
+    inherited: CaptureUsage,
+    estimate: impl FnMut(
+        &[u64],
+        &CaptureSelection,
+        &ResolvedCaptureSlice,
+    ) -> Result<CaptureUsage, CaptureError>,
+) -> Result<(), CaptureError> {
     let checked = plan.plan().clone().admit(
         &discovery.catalog,
         &discovery.support,
@@ -324,20 +361,60 @@ pub fn validate_session(
             "capture admission does not match this session's catalog".into(),
         ));
     }
-    preflight(&checked, estimate)
+    preflight_continuation(
+        &checked,
+        &[],
+        CaptureUsage::default(),
+        &[],
+        next_prediction,
+        inherited,
+        estimate,
+    )
 }
 
 pub(crate) fn preflight_with_extra(
     plan: &AdmittedCapturePlan,
     extra: &[(CaptureSelection, eredu_core::ObservationPoint)],
+    base: CaptureUsage,
+    scheduled_costs: &[(CaptureSchedule, [CaptureUsage; 2])],
+    estimate: impl FnMut(
+        &[u64],
+        &CaptureSelection,
+        &ResolvedCaptureSlice,
+    ) -> Result<CaptureUsage, CaptureError>,
+) -> Result<(), CaptureError> {
+    preflight_continuation(
+        plan,
+        extra,
+        base,
+        scheduled_costs,
+        0,
+        CaptureUsage::default(),
+        estimate,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn preflight_continuation(
+    plan: &AdmittedCapturePlan,
+    extra: &[(CaptureSelection, eredu_core::ObservationPoint)],
     mut base: CaptureUsage,
     scheduled_costs: &[(CaptureSchedule, [CaptureUsage; 2])],
+    next_prediction: u64,
+    inherited: CaptureUsage,
     mut estimate: impl FnMut(
         &[u64],
         &CaptureSelection,
         &ResolvedCaptureSlice,
     ) -> Result<CaptureUsage, CaptureError>,
 ) -> Result<(), CaptureError> {
+    let remaining = plan
+        .request()
+        .max_predictions
+        .checked_sub(next_prediction)
+        .ok_or_else(|| {
+            CaptureError::Invalid("continuation exceeds admitted prediction range".into())
+        })?;
     let entries: Vec<_> = plan
         .plan()
         .selections
@@ -354,25 +431,32 @@ pub(crate) fn preflight_with_extra(
             cumulative: false,
         });
     }
-    let mut total = base.checked_mul(plan.request().max_predictions)?;
+    let mut total = inherited.checked_add(base.checked_mul(remaining)?)?;
     for phase in [CapturePhase::Prefill, CapturePhase::Decode] {
+        if remaining == 0 || (phase == CapturePhase::Prefill && next_prediction > 0) {
+            continue;
+        }
         if phase == CapturePhase::Decode && plan.request().max_predictions <= 1 {
             continue;
         }
         let mut step = base;
         for (schedule, costs) in scheduled_costs {
-            if let Some((count, _)) =
-                schedule.count_and_last(phase, plan.request().max_predictions)?
-            {
+            if let Some((count, _)) = schedule.count_and_last_from(
+                phase,
+                next_prediction,
+                plan.request().max_predictions,
+            )? {
                 let cost = costs[if phase == CapturePhase::Prefill { 0 } else { 1 }];
                 step = step.checked_add(cost)?;
                 total = total.checked_add(cost.checked_mul(count)?)?;
             }
         }
         for &(selection, point) in &entries {
-            let Some((count, last)) = selection
-                .schedule
-                .count_and_last(phase, plan.request().max_predictions)?
+            let Some((count, last)) = selection.schedule.count_and_last_from(
+                phase,
+                next_prediction,
+                plan.request().max_predictions,
+            )?
             else {
                 continue;
             };

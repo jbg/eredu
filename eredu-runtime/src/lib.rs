@@ -27,6 +27,8 @@ pub mod dense;
 pub mod draft;
 /// Portable execution-group topology and scheduling state.
 pub mod execution;
+/// Completed-token lifecycle, snapshot reservation and branch accounting policy.
+pub mod execution_control;
 pub mod execution_plan;
 pub mod expert;
 /// Backend-neutral causal-model and token-sampling contracts.

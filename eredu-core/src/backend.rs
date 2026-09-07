@@ -1,5 +1,11 @@
 //! High-level contract implemented once per execution backend.
 
+mod continuation;
+pub use continuation::{
+    TextContinuationBoundary, TextContinuationError, TextContinuationIdentity, TextDriverIdentity,
+    TextGenerationContinuation, TextGenerationDriver,
+};
+
 use serde::{Deserialize, Serialize};
 use std::{fmt::Debug, path::Path};
 
@@ -1475,6 +1481,27 @@ pub trait TextGenerationBackend: BackendProvider {
     /// Exact completion retaining model execution and token sampling.
     type TextCompletion: Completion<Error = Self::Error>;
 
+    /// Exact support for serial, completed-token control on this loaded session.
+    /// Backends opt in only for verified ordinary single-sequence execution.
+    /// Snapshot mechanisms and complete facade-state support are separate facts.
+    fn text_execution_control_support(
+        _runtime: &ModelRuntime<Self>,
+    ) -> crate::execution_control::ControlSupport {
+        crate::execution_control::ControlSupport::Unsupported {
+            reason: "backend has not declared completed-token control support".into(),
+        }
+    }
+
+    /// Exact support for prospective temperature changes and explicit reseeding.
+    /// The runtime validates policy; the adapter supplies atomic native changes.
+    fn text_sampling_control_support(
+        _runtime: &ModelRuntime<Self>,
+    ) -> crate::execution_control::ControlSupport {
+        crate::execution_control::ControlSupport::Unsupported {
+            reason: "backend has no prospective sampling controls".into(),
+        }
+    }
+
     /// Returns genuine mutable points for this exact loaded session.
     fn intervention_discovery(
         _runtime: &ModelRuntime<Self>,
@@ -1649,9 +1676,23 @@ pub trait ModelCapabilityBackend: TextGenerationBackend {
     fn static_memory(runtime: &ModelRuntime<Self>) -> Result<StaticMemoryReport, CapabilityError>;
 }
 
-enum TextGenerationStep<P, T> {
+/// Input for the next ordinary prediction. A committed token may still be the
+/// pending decode input and must not be inserted into model state until that step.
+pub enum PendingTextInput<P, T> {
+    /// The original prepared prompt, before the first model prediction.
     Prefill(P),
+    /// The preceding committed canonical token, before its successor is predicted.
     Decode(T),
+}
+
+impl<P, T> PendingTextInput<P, T> {
+    /// Borrows the pending native input without cloning or evaluating it.
+    pub fn as_ref(&self) -> PendingTextInput<&P, &T> {
+        match self {
+            Self::Prefill(prompt) => PendingTextInput::Prefill(prompt),
+            Self::Decode(token) => PendingTextInput::Decode(token),
+        }
+    }
 }
 
 /// Failure from either backend execution or portable constraint control.
@@ -1699,18 +1740,18 @@ where
     B: TextGenerationBackend,
     C: TokenFilterController,
 {
-    inner: TextGenerationMachine<'a, B, C>,
+    runtime: &'a mut ModelRuntime<B>,
+    inner: TextGenerationMachine<B, C>,
 }
 
-struct TextGenerationMachine<'a, B, C>
+struct TextGenerationMachine<B, C>
 where
     B: TextGenerationBackend,
     C: TokenFilterController,
 {
-    runtime: &'a mut ModelRuntime<B>,
     backend_state: B::TextGenerationState,
     controller: C,
-    step: Option<TextGenerationStep<B::Prompt, B::Token>>,
+    step: Option<PendingTextInput<B::Prompt, B::Token>>,
     completions: Vec<B::TextCompletion>,
     remaining_tokens: Option<usize>,
 }
@@ -1747,7 +1788,8 @@ where
         config: TextGenerationConfig,
         controller: C,
     ) -> Result<Self, ControlledTextGenerationError<B::Error, C::Error>> {
-        TextGenerationMachine::new(runtime, prompt, config, controller).map(|inner| Self { inner })
+        let inner = TextGenerationMachine::new(runtime, prompt, config, controller)?;
+        Ok(Self { runtime, inner })
     }
 
     /// Mutably borrows the canonical constraint state.
@@ -1760,12 +1802,12 @@ where
         &mut self,
         plan: crate::capture::AdmittedCapturePlan,
     ) -> Result<(), crate::capture::CaptureError> {
-        if !matches!(self.inner.step, Some(TextGenerationStep::Prefill(_))) {
+        if !matches!(self.inner.step, Some(PendingTextInput::Prefill(_))) {
             return Err(crate::capture::CaptureError::Invalid(
                 "capture must be configured before generation".into(),
             ));
         }
-        B::configure_text_capture(self.inner.runtime, &mut self.inner.backend_state, plan)
+        B::configure_text_capture(self.runtime, &mut self.inner.backend_state, plan)
     }
 
     /// Installs admitted interventions and captures before ordinary generation.
@@ -1774,17 +1816,12 @@ where
         capture: crate::capture::AdmittedCapturePlan,
         plan: crate::intervention::AdmittedInterventionPlan,
     ) -> Result<(), crate::capture::CaptureError> {
-        if !matches!(self.inner.step, Some(TextGenerationStep::Prefill(_))) {
+        if !matches!(self.inner.step, Some(PendingTextInput::Prefill(_))) {
             return Err(crate::capture::CaptureError::Invalid(
                 "interventions must be configured before generation".into(),
             ));
         }
-        B::configure_text_interventions(
-            self.inner.runtime,
-            &mut self.inner.backend_state,
-            capture,
-            plan,
-        )
+        B::configure_text_interventions(self.runtime, &mut self.inner.backend_state, capture, plan)
     }
 
     /// Establishes exact completion before delivering this step's host captures.
@@ -1795,13 +1832,13 @@ where
     }
 }
 
-impl<'a, B, C> TextGenerationMachine<'a, B, C>
+impl<B, C> TextGenerationMachine<B, C>
 where
     B: TextGenerationBackend,
     C: TokenFilterController,
 {
     fn new(
-        runtime: &'a mut ModelRuntime<B>,
+        runtime: &ModelRuntime<B>,
         prompt: B::Prompt,
         config: TextGenerationConfig,
         controller: C,
@@ -1809,10 +1846,9 @@ where
         let backend_state = B::start_text_generation(runtime.backend(), config)
             .map_err(ControlledTextGenerationError::Backend)?;
         Ok(Self {
-            runtime,
             backend_state,
             controller,
-            step: Some(TextGenerationStep::Prefill(prompt)),
+            step: Some(PendingTextInput::Prefill(prompt)),
             completions: Vec::new(),
             remaining_tokens: config.sampling().max_new_tokens,
         })
@@ -1862,13 +1898,42 @@ where
         Ok(())
     }
 
-    fn next_output(&mut self) -> Option<ControlledGenerationResult<B, C>> {
+    fn next_committed(
+        &mut self,
+        runtime: &mut ModelRuntime<B>,
+    ) -> Option<Result<ControlledToken<B::Token>, ControlledTextGenerationError<B::Error, C::Error>>>
+    {
+        let token = match self.next_output(runtime)? {
+            Ok(token) => token,
+            Err(error) => return Some(Err(error)),
+        };
+        let token_id = match token.token_id() {
+            Ok(token_id) => token_id,
+            Err(error) => {
+                self.step = None;
+                return Some(Err(ControlledTextGenerationError::Backend(error)));
+            }
+        };
+        if let Err(error) = self.controller.commit_token(token_id) {
+            self.step = None;
+            return Some(Err(ControlledTextGenerationError::Controller(error)));
+        }
+        Some(Ok(ControlledToken {
+            output: token,
+            token_id,
+        }))
+    }
+
+    fn next_output(
+        &mut self,
+        runtime: &mut ModelRuntime<B>,
+    ) -> Option<ControlledGenerationResult<B, C>> {
         if self.remaining_tokens == Some(0) {
             self.step = None;
             return None;
         }
         let step = self.step.take()?;
-        if matches!(step, TextGenerationStep::Decode(_)) {
+        if matches!(step, PendingTextInput::Decode(_)) {
             if let Err(error) = self.resolve_completions_before_decode() {
                 return Some(Err(ControlledTextGenerationError::Backend(error)));
             }
@@ -1878,11 +1943,11 @@ where
             Err(error) => return Some(Err(ControlledTextGenerationError::Controller(error))),
         };
         let submission = match step {
-            TextGenerationStep::Prefill(prompt) => {
-                B::submit_text_prefill(self.runtime, prompt, &filter, &mut self.backend_state)
+            PendingTextInput::Prefill(prompt) => {
+                B::submit_text_prefill(runtime, prompt, &filter, &mut self.backend_state)
             }
-            TextGenerationStep::Decode(token) => {
-                B::submit_text_decode(self.runtime, token, &filter, &mut self.backend_state)
+            PendingTextInput::Decode(token) => {
+                B::submit_text_decode(runtime, token, &filter, &mut self.backend_state)
             }
         };
         let submission = match submission {
@@ -1893,7 +1958,7 @@ where
         if let Err(error) = self.retain_completion(submission.completion) {
             return Some(Err(ControlledTextGenerationError::Backend(error)));
         }
-        self.step = Some(TextGenerationStep::Decode(token.clone()));
+        self.step = Some(PendingTextInput::Decode(token.clone()));
         if let Some(remaining_tokens) = &mut self.remaining_tokens {
             *remaining_tokens -= 1;
         }
@@ -1910,29 +1975,11 @@ where
         Result<ControlledToken<B::Token>, ControlledTextGenerationError<B::Error, C::Error>>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let token = match self.inner.next_output()? {
-            Ok(token) => token,
-            Err(error) => return Some(Err(error)),
-        };
-        let token_id = match token.token_id() {
-            Ok(token_id) => token_id,
-            Err(error) => {
-                self.inner.step = None;
-                return Some(Err(ControlledTextGenerationError::Backend(error)));
-            }
-        };
-        if let Err(error) = self.inner.controller.commit_token(token_id) {
-            self.inner.step = None;
-            return Some(Err(ControlledTextGenerationError::Controller(error)));
-        }
-        Some(Ok(ControlledToken {
-            output: token,
-            token_id,
-        }))
+        self.inner.next_committed(self.runtime)
     }
 }
 
-impl<B, C> Drop for TextGenerationMachine<'_, B, C>
+impl<B, C> Drop for TextGenerationMachine<B, C>
 where
     B: TextGenerationBackend,
     C: TokenFilterController,
@@ -1951,7 +1998,8 @@ where
 /// that state-mutating decode is submitted, and dropping the iterator waits
 /// for every still-retained submission.
 pub struct TextGeneration<'a, B: TextGenerationBackend> {
-    inner: TextGenerationMachine<'a, B, UnconstrainedTokens>,
+    runtime: &'a mut ModelRuntime<B>,
+    inner: TextGenerationMachine<B, UnconstrainedTokens>,
 }
 
 impl<'a, B: TextGenerationBackend> TextGeneration<'a, B> {
@@ -1971,9 +2019,9 @@ impl<'a, B: TextGenerationBackend> TextGeneration<'a, B> {
         prompt: B::Prompt,
         config: TextGenerationConfig,
     ) -> Result<Self, B::Error> {
-        TextGenerationMachine::new(runtime, prompt, config, UnconstrainedTokens)
-            .map(|inner| Self { inner })
-            .map_err(unreachable_unconstrained_error)
+        let inner = TextGenerationMachine::new(runtime, prompt, config, UnconstrainedTokens)
+            .map_err(unreachable_unconstrained_error)?;
+        Ok(Self { runtime, inner })
     }
 }
 
@@ -1994,7 +2042,7 @@ impl<B: TextGenerationBackend> Iterator for TextGeneration<'_, B> {
 
     fn next(&mut self) -> Option<Self::Item> {
         self.inner
-            .next_output()
+            .next_output(self.runtime)
             .map(|result| result.map_err(unreachable_unconstrained_error))
     }
 }
@@ -2751,6 +2799,175 @@ mod tests {
         assert_eq!(generation.next().unwrap().unwrap().token_id(), 8);
         assert!(generation.controller_mut().is_complete().unwrap());
         assert!(generation.next().is_none());
+    }
+
+    fn continuation_config(limit: usize) -> TextGenerationConfig {
+        TextGenerationConfig::new(
+            crate::resolve_generation_config(
+                None,
+                crate::GenerationConfigOverrides {
+                    max_new_tokens: Some(limit),
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn detached_ordinary_continuation_preserves_pending_input_and_commit_order() {
+        let controller = || FixedController {
+            tokens: vec![7, 8, 9],
+            committed: 0,
+        };
+        let mut ordinary_runtime = ModelRuntime::prepare(Mock, 10).unwrap();
+        let ordinary: Vec<_> = ControlledTextGeneration::new(
+            &mut ordinary_runtime,
+            vec![1, 2],
+            continuation_config(3),
+            controller(),
+        )
+        .unwrap()
+        .map(|token| token.unwrap().token_id())
+        .collect();
+
+        let mut runtime = ModelRuntime::prepare(Mock, 10).unwrap();
+        let mut driver = TextGenerationDriver::new(&mut runtime);
+        let mut state = driver
+            .start(vec![1, 2], continuation_config(3), controller())
+            .unwrap();
+        state.require_quiescent().unwrap();
+        assert!(state.is_prefill_pending());
+        assert!(driver.runtime().session().tokens.is_empty());
+        let mut actual = Vec::new();
+        for (index, expected) in ordinary.iter().enumerate() {
+            let token = driver.advance(&mut state).unwrap().unwrap().token_id();
+            actual.push(token);
+            assert_eq!(token, *expected);
+            assert_eq!(state.controller().committed, index + 1);
+            assert_eq!(state.remaining_tokens(), Some(2 - index));
+            // The newest token has been committed but is not in model state.
+            let mut model_inputs = vec![1, 2];
+            model_inputs.extend_from_slice(&ordinary[..index]);
+            assert_eq!(driver.runtime().session().tokens, model_inputs);
+            assert!(!state.is_prefill_pending());
+            assert!(matches!(
+                driver.advance(&mut state),
+                Err(TextContinuationError::NotQuiescent)
+            ));
+            assert_eq!(state.controller().committed, index + 1);
+            assert!(driver.take_completed_step(&mut state).unwrap().is_none());
+            state.require_quiescent().unwrap();
+        }
+        assert!(driver.advance(&mut state).unwrap().is_none());
+        assert_eq!(actual, ordinary);
+        assert_eq!(
+            driver.runtime().session().tokens,
+            ordinary_runtime.session().tokens
+        );
+    }
+
+    #[test]
+    fn detached_continuation_cannot_attach_to_another_driver() {
+        let mut first = ModelRuntime::prepare(Mock, 10).unwrap();
+        let mut other = ModelRuntime::prepare(Mock, 10).unwrap();
+        let mut owner = TextGenerationDriver::new(&mut first);
+        let mut state = owner
+            .start(vec![1, 2], continuation_config(2), UnconstrainedTokens)
+            .unwrap();
+        let mut foreign = TextGenerationDriver::new(&mut other);
+        assert!(matches!(
+            foreign.advance(&mut state),
+            Err(TextContinuationError::IncompatibleDriver)
+        ));
+        assert!(foreign.runtime().session().tokens.is_empty());
+        assert!(owner.advance(&mut state).unwrap().is_some());
+        assert!(matches!(
+            foreign.take_completed_step(&mut state),
+            Err(TextContinuationError::IncompatibleDriver)
+        ));
+        owner.take_completed_step(&mut state).unwrap();
+        drop(owner);
+        let mut replacement = TextGenerationDriver::new(&mut first);
+        assert!(matches!(
+            replacement.advance(&mut state),
+            Err(TextContinuationError::IncompatibleDriver)
+        ));
+        assert_eq!(replacement.runtime().session().tokens, vec![1, 2]);
+    }
+
+    #[test]
+    fn detached_continuation_failure_remains_fenced_after_draining() {
+        struct RejectCommit;
+        impl TokenFilterController for RejectCommit {
+            type Error = std::io::Error;
+            fn current_filter(&mut self) -> Result<TokenFilter, Self::Error> {
+                Ok(TokenFilter::All)
+            }
+            fn commit_token(&mut self, _: u32) -> Result<(), Self::Error> {
+                Err(std::io::Error::other("commit rejected"))
+            }
+            fn is_complete(&mut self) -> Result<bool, Self::Error> {
+                Ok(false)
+            }
+        }
+        let mut runtime = ModelRuntime::prepare(Mock, 10).unwrap();
+        let mut driver = TextGenerationDriver::new(&mut runtime);
+        let mut state = driver
+            .start(vec![1, 2], continuation_config(3), RejectCommit)
+            .unwrap();
+        assert!(matches!(
+            driver.advance(&mut state),
+            Err(TextContinuationError::Generation(
+                ControlledTextGenerationError::Controller(_)
+            ))
+        ));
+        driver.take_completed_step(&mut state).unwrap();
+        assert!(matches!(
+            state.require_quiescent(),
+            Err(TextContinuationError::Failed)
+        ));
+        assert!(matches!(
+            driver.advance(&mut state),
+            Err(TextContinuationError::Failed)
+        ));
+        assert_eq!(driver.runtime().session().tokens, vec![1, 2]);
+    }
+
+    #[test]
+    fn detached_continuation_caught_unwind_cannot_be_resumed() {
+        struct PanickingFilter;
+        impl TokenFilterController for PanickingFilter {
+            type Error = Infallible;
+            fn current_filter(&mut self) -> Result<TokenFilter, Self::Error> {
+                panic!("filter failed while preparing the decision")
+            }
+            fn commit_token(&mut self, _: u32) -> Result<(), Self::Error> {
+                Ok(())
+            }
+            fn is_complete(&mut self) -> Result<bool, Self::Error> {
+                Ok(false)
+            }
+        }
+        let mut runtime = ModelRuntime::prepare(Mock, 10).unwrap();
+        let mut driver = TextGenerationDriver::new(&mut runtime);
+        let mut state = driver
+            .start(vec![1, 2], continuation_config(3), PanickingFilter)
+            .unwrap();
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            driver.advance(&mut state)
+        }))
+        .is_err());
+        driver.take_completed_step(&mut state).unwrap();
+        assert!(matches!(
+            state.require_quiescent(),
+            Err(TextContinuationError::Failed)
+        ));
+        assert!(matches!(
+            driver.advance(&mut state),
+            Err(TextContinuationError::Failed)
+        ));
+        assert!(driver.runtime().session().tokens.is_empty());
     }
 
     #[derive(Debug, Clone)]

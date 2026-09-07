@@ -57,6 +57,87 @@ conversion, completion retention and recovery remain with the backend. Shared
 observers borrow the existing run owner and do not own native completions.
 See [intervention plans](interventions.md) for exact operation and state semantics.
 
+Completed-token control follows the same dependency direction.
+`eredu-core::execution_control` owns versioned support/status/resource contracts
+and the thread-safe pause/cancellation request handle. `eredu-runtime::execution_control`
+also owns canonical choice intersection and prospective sampling validation.
+`TokenChoiceController` retains the ordinary grammar and commits through it once;
+the native sampler consumes a one-candidate decision under its usual RNG/adaptive
+policy. `TextSamplingControlBackend` supplies exact sampling facts and atomic
+native temperature/key installation. It does not validate portable override policy
+or reset history. The facade owns tokenizer membership, bounded override records,
+and explicit field-audited semantic storage estimates; immutable tokenizer data is
+shared across decoder forks. Unknown opaque grammar costs disable snapshots.
+The same runtime module
+owns validated lifecycle transitions and retained-state reservations; cumulative
+copying accounting lives outside rewindable generation state. The existing shared
+`CaptureSession` owns opaque checkpoint/restore/fork of its schedule and record
+lifecycle. Child capture and intervention admissions pass through shared validation
+with the child's actual discovery, session identity and estimator facts. Native
+completion remains a separate prerequisite supplied by the existing backend owner.
+Core's ordinary text machine stores its continuation separately from its runtime
+borrow. `TextGenerationDriver` advances detached continuations through that same
+machine, validates exclusive driver identity, and requires native completion and
+record draining between steps. It does not switch model state or own semantic
+termination; facade composition coordinates those with the native state slots.
+Facade `CommittedGenerationCursor` is the ordinary one-token commitment driver;
+the one-shot loop delegates to it. Exact incremental decoder/parser forks remain
+in the facade and do not replay token history. See [execution control](execution-control.md)
+for the boundary and current implementation status.
+The shared replicated session additionally exposes `ReplicatedTextSnapshotMechanisms`
+for side-effect-free native estimates and isolated state copying. Its control-state
+slots retain exact executable identity, typed state geometry, prepared-input identity
+and commit metadata. The portable session validates and exchanges those slots for
+serial branches without rebuilding the executable or assigning a second native
+completion owner. Backend realization and complete facade snapshot composition are
+separate from this low-level state-slot mechanism.
+`NativeTextStateBackend` provides the narrow outer backend contract for those
+native slots. MLX implements it through the same typed replicated session and
+architecture-erased adapter, without family dispatch. Copy operations settle under
+the existing session authority and recovery owner. Exchange performs a validated
+host move while that authority is idle, so no fallible native submission follows
+the swap. Input-identity and commit metadata are included in portable storage
+estimates. Full generation capabilities remain a facade composition concern.
+
+`TextSnapshotBackend` supplies complete native sampler/RNG and pending-input
+copying beside that model-state contract. `TextContinuationSnapshot` in runtime
+composes those mechanisms with an explicit `SnapshotTokenController` independent
+copy contract and the existing shared capture checkpoint. Every component supplies
+known logical costs before reservation. Restore stages all fallible copies and
+capture validation before native exchange and infallible host installation; no
+sampling or prompt execution is involved. `ManagedTextContinuation` keeps the
+child retention lease with the logical child when native slots are exchanged.
+MLX copies RNG keys and input arrays through its existing submission/recovery
+owner and preserves standard/Mirostat history and absolute next prediction.
+Runtime owns child re-admission, inherited ledger policy and snapshot accounting.
+Native growth facts use the saved typed state and an admitted future input span;
+runtime combines them with sampling/pending-input facts. MLX prices declared
+component geometry, actual cache capacity growth and potentially absent fixed
+state without executing input. Unknown growth rejects runnable branch admission.
+
+Facade `ControlledGenerationSession` borrows the loaded runtime exclusively and
+uses the ordinary committed-token cursor, constraints and semantic pipeline for
+step/pause/resume. Its bounded sequence-numbered delivery shares compact-JSON
+transport accounting with observed generation. Backend
+`text_execution_control_support` is an exact opt-in fact. Full facade snapshots
+are reported separately after complete semantic/grammar storage estimates and
+non-resettable resource limits are established. Built-in semantic parsers have
+explicit logical storage estimates; opaque active llguidance state remains
+unsupported until it supplies complete costs. Snapshot/restore pairs native state
+with exact cursor/parser/decoder state and a versioned consumer output checkpoint.
+The selected `LocalModel` adapter wraps these controls and snapshots without
+exposing native handles or duplicating their policy. Reusable host/native continuation
+checks live in `eredu-evaluation::execution_control`, used only as validation
+tooling, with native forward/reload probes and source-preserving copy failures.
+Facade branch construction derives finite decoder/parser/history growth and pairs
+it with runtime's native growth facts before reserving retention. Its child stream
+starts with explicit parent metadata and the delivered canonical/semantic prefix;
+native and shared capture adapters never reconstruct that output. Branch exchange
+moves lifecycle, cancellation, semantic buffers and transport accounting together.
+Opaque core driver identity prevents a later run on the same loaded executable
+from importing an old branch tree. Shared capture admission and native completion
+ownership remain unchanged by the selected facade wrappers.
+
 This guide defines the boundary between the portable language-model runtime
 and an execution backend. It is intended for backend authors and maintainers of
 `eredu`.

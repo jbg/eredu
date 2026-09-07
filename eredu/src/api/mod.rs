@@ -37,9 +37,16 @@ pub use selected::*;
 pub use tokenizer::{chat_template_kwargs, load_tokenizer, TextMetadataError};
 
 mod capability;
+mod control;
 mod inspection;
 mod loaded;
 mod observed;
+pub use control::{
+    ControlledGenerationBranch, ControlledGenerationError, ControlledGenerationRecord,
+    ControlledGenerationSession, ControlledGenerationSnapshot, GenerationBranchMetadata,
+    GenerationBranchOptions, GenerationOutputCheckpoint, GenerationSnapshotMetadata,
+};
+pub use eredu_runtime::execution_control::{SamplingOverride, SamplingStateFacts};
 pub use inspection::{inspect_architecture, inspect_text_model, TextInspectionOptions};
 pub use loaded::{LoadedModelLoadError, PlannedModelLoadError};
 pub use media::MultimodalPreparationError;

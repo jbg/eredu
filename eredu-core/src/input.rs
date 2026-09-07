@@ -402,6 +402,36 @@ impl PreparedInputIdentity {
         &self.parts
     }
 
+    /// Logical host storage for this payload-free description, including shapes,
+    /// map entries and encoded dtype names. Excludes allocator capacity/overhead;
+    /// no native tensor is inspected or allocated. Overflow returns `None`.
+    pub fn logical_metadata_bytes(&self) -> Option<u64> {
+        fn bytes<T>(count: usize) -> Option<u64> {
+            u64::try_from(std::mem::size_of::<T>().checked_mul(count)?).ok()
+        }
+        fn tensor_heap(tensor: &InputTensorIdentity) -> Option<u64> {
+            let shape = bytes::<usize>(tensor.shape.len())?;
+            match &tensor.dtype {
+                TensorDtype::Encoded(name) => shape.checked_add(u64::try_from(name.len()).ok()?),
+                _ => Some(shape),
+            }
+        }
+        let mut total =
+            bytes::<Self>(1)?.checked_add(bytes::<InputPartDescriptor>(self.parts.len())?)?;
+        for part in &self.parts {
+            total = total
+                .checked_add(tensor_heap(&part.payload)?)?
+                .checked_add(bytes::<(InputMetadataKey, InputTensorIdentity)>(
+                    part.metadata.len(),
+                )?)?
+                .checked_add(bytes::<(u32, InputExtent)>(part.extents.len())?)?;
+            for tensor in part.metadata.values() {
+                total = total.checked_add(tensor_heap(tensor)?)?;
+            }
+        }
+        Some(total)
+    }
+
     /// Number of ordered parts.
     pub fn len(&self) -> usize {
         self.parts.len()

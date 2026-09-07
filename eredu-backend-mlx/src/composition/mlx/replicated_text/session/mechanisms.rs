@@ -1,5 +1,28 @@
 use super::*;
 
+impl<A, S> eredu_runtime::replicated_session::ReplicatedTextSnapshotMechanisms<A, MlxNeuralBackend>
+    for MlxReplicatedTextMechanisms<A, S>
+where
+    S: MlxStateMechanisms,
+    A: eredu_runtime::LayeredArchitecture<MlxNeuralBackend, S, Error = eredu_nn::Error>,
+    A::Unit: 'static,
+{
+    fn estimate_snapshot_state(
+        &self,
+        state: &S,
+    ) -> Option<eredu_core::execution_control::SnapshotEstimate> {
+        state.isolated_snapshot_estimate()
+    }
+
+    fn estimate_snapshot_growth(&self, state: &S, additional: u64) -> Option<u64> {
+        state.isolated_snapshot_growth(additional)
+    }
+
+    fn copy_snapshot_state(&mut self, state: &S, context: &Stream) -> Result<S, Error> {
+        state.isolated_snapshot(context).map_err(Into::into)
+    }
+}
+
 pub(in crate::composition::mlx::replicated_text) struct MlxExecutionReport {
     pub(super) residency: ResidencyReport,
     pub(super) dense: Option<DenseDiskStreamReport>,

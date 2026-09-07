@@ -365,6 +365,37 @@ impl StateLayout {
         self.layers.len()
     }
 
+    /// Logical host storage copied with this complete layout, including nested
+    /// component shapes and segment names. Allocator capacity/overhead is excluded.
+    /// None means checked size arithmetic overflowed, never zero storage.
+    pub fn logical_metadata_bytes(&self) -> Option<u64> {
+        use eredu_core::cache::{StateTensorDimension, StateTensorPolicy};
+        fn bytes<T>(count: usize) -> Option<u64> {
+            u64::try_from(std::mem::size_of::<T>().checked_mul(count)?).ok()
+        }
+        let mut total = bytes::<Self>(1)?
+            .checked_add(bytes::<LayerCachePolicy>(self.layers.len())?)?
+            .checked_add(bytes::<Vec<StateComponentPolicy>>(self.components.len())?)?
+            .checked_add(bytes::<StateSegmentSpec>(self.segments.len())?)?;
+        for layer in self.layers.iter() {
+            total = total.checked_add(bytes::<StateTensorPolicy>(layer.fixed_state().len())?)?;
+            for tensor in layer.fixed_state() {
+                total = total.checked_add(bytes::<StateTensorDimension>(tensor.shape.len())?)?;
+            }
+        }
+        for components in &self.components {
+            total = total.checked_add(bytes::<StateComponentPolicy>(components.len())?)?;
+            for component in components {
+                total =
+                    total.checked_add(bytes::<StateTensorDimension>(component.shape().len())?)?;
+            }
+        }
+        for segment in &self.segments {
+            total = total.checked_add(u64::try_from(segment.id().as_str().len()).ok()?)?;
+        }
+        Some(total)
+    }
+
     /// Returns whether this layout has no layers.
     pub fn is_empty(&self) -> bool {
         self.layers.is_empty()
