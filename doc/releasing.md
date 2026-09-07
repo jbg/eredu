@@ -16,6 +16,34 @@ use the next patch. Leave unchanged crates at their published version and
 start new crates at `0.1.0`. A binary-only crate can take a patch for internal
 dependency updates when its command-line interface remains compatible.
 
+## Automatic planning and LFM2 reply release set for 2026-09-07
+
+The latest stable crates.io versions and checksummed source archives were
+compared with `9ac57b65` on 2026-09-07. Source changes since publication are
+limited to `eredu-core`, `eredu-architectures`, `eredu`, and `eredu-cli`.
+Adding the public `embedded_draft_capacity` field to `ModelResourceProfile`
+breaks downstream struct literals, requiring a new pre-1.0 compatibility line.
+Libraries exposing the updated dependency types advance their compatibility
+lines together; the compatible CLI fixes take a patch release.
+
+| Crate | Previous | New version | Reason |
+| --- | --- | --- | --- |
+| `eredu-core` | 0.4.0 | 0.5.0 | Public resource-profile field addition; automatic drafting respects architecture capacity and applies overrides before admission and sizing. |
+| `eredu-runtime` | 0.4.0 | 0.5.0 | Public runtime contracts expose the updated core types. |
+| `eredu-media` | 0.3.0 | 0.4.0 | Public video-validation APIs use the updated core type identity. |
+| `eredu-architectures` | 0.4.0 | 0.5.0 | Reports exact embedded proposal capacity; public contracts expose updated core/runtime/media types. |
+| `eredu-codec` | 0.4.0 | 0.5.0 | Public materialization contracts expose the updated runtime types. |
+| `eredu-evaluation` | 0.4.0 | 0.5.0 | Public fixtures and drivers expose updated core/runtime/architecture/codec types. |
+| `eredu-backend-mlx` | 0.4.0 | 0.5.0 | Native adapters expose the updated execution contracts. |
+| `eredu` | 0.4.0 | 0.5.0 | Exposes updated dependency contracts and planning overrides; fixes ordinary LFM2 replies without tools. |
+| `eredu-cli` | 0.1.5 | 0.1.6 | Applies all explicit planning overrides before validation and preserves the supported draft width in benchmark candidates. |
+
+All other crate versions remain unchanged. Publish these nine crates in table
+order after the exact version-bump commit passes the native release gate,
+including both stable and Rust 1.89 archive validation. After all uploads
+succeed, create and push one `<crate>-v<version>` tag per released crate at
+that same commit.
+
 ## Tokenizer validity and controlled text release set for 2026-09-07
 
 The latest stable crates.io versions and checksummed source archives were
