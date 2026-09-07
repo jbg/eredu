@@ -1,5 +1,7 @@
 use super::*;
 
+mod intervention;
+
 /// Selector score transform used before top-k group selection.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 #[non_exhaustive]
@@ -339,6 +341,56 @@ impl TopKGroupSelector {
         selection_bias: Option<&Array>,
         stream: &Stream,
     ) -> Result<GroupSelectionOutput, Exception> {
+        let logits = self.project_logits(hidden_states, stream)?;
+        let scores = self.score_function.apply(logits, stream)?;
+        let mut scores_for_choice = scores.clone();
+        if let Some(bias) = self.e_score_correction_bias.as_ref() {
+            scores_for_choice = scores_for_choice.add(bias, stream)?;
+        }
+        if let Some(bias) = selection_bias {
+            scores_for_choice = scores_for_choice.add(bias, stream)?;
+        }
+
+        let top_k_index = self.topk_indices(&scores_for_choice, stream)?;
+        self.weights_for_indices(&scores, top_k_index, stream)
+    }
+
+    /// Returns caller-selected ids, their raw transformed scores, and final
+    /// normalized/scaled selection weights.
+    pub fn select_indices(
+        &mut self,
+        hidden_states: &Array,
+        group_indices: &Array,
+        stream: &Stream,
+    ) -> Result<GroupSelectionOutput, Exception> {
+        let logits = self.project_logits(hidden_states, stream)?;
+        let scores = self.score_function.apply(logits, stream)?;
+        let group_indices = group_indices.reshape(&[-1, self.top_k], stream)?;
+        let mut weights = take_along_axis(scores, &group_indices, -1, stream)?;
+        if self.score_function == TopKGroupScoring::SelectedSoftmax {
+            weights = softmax_axis(&weights, -1, true, stream)?;
+        }
+        let selected_scores = weights.clone();
+        if self.norm_topk_prob {
+            let denominator = weights
+                .sum_axis(-1, true, stream)?
+                .add(Array::from_f32(self.normalization_epsilon), stream)?;
+            weights = weights.divide(denominator, stream)?;
+        }
+        if self.coefficient_scale != 1.0 {
+            weights = weights.multiply(Array::from_f32(self.coefficient_scale), stream)?;
+        }
+        if let Some(scale) = self.learned_coefficient_scale.as_ref() {
+            weights = weights.multiply(scale.take_axis(&group_indices, 0, stream)?, stream)?;
+        }
+        Ok(GroupSelectionOutput {
+            indices: group_indices,
+            scores: selected_scores,
+            weights,
+        })
+    }
+
+    fn project_logits(&self, hidden_states: &Array, stream: &Stream) -> Result<Array, Exception> {
         let flat = self.transform_input(hidden_states, stream)?;
         let logits = if let Some(iquant) = self.iquant {
             let (ggml_type, endian) = iquant.gguf_iquant().expect("IQ selector format");
@@ -383,16 +435,15 @@ impl TopKGroupSelector {
             Some(bias) => logits.add(bias, stream)?,
             None => logits,
         };
-        let scores = self.score_function.apply(logits, stream)?;
-        let mut scores_for_choice = scores.clone();
-        if let Some(bias) = self.e_score_correction_bias.as_ref() {
-            scores_for_choice = scores_for_choice.add(bias, stream)?;
-        }
-        if let Some(bias) = selection_bias {
-            scores_for_choice = scores_for_choice.add(bias, stream)?;
-        }
+        Ok(logits)
+    }
 
-        let top_k_index = self.topk_indices(&scores_for_choice, stream)?;
+    fn weights_for_indices(
+        &self,
+        scores: &Array,
+        top_k_index: Array,
+        stream: &Stream,
+    ) -> Result<GroupSelectionOutput, Exception> {
         let mut top_k_weights = take_along_axis(&scores, &top_k_index, -1, stream)?;
         if self.score_function == TopKGroupScoring::SelectedSoftmax {
             top_k_weights = softmax_axis(&top_k_weights, -1, true, stream)?;
@@ -418,84 +469,6 @@ impl TopKGroupSelector {
             indices: top_k_index,
             scores: selected_scores,
             weights: top_k_weights,
-        })
-    }
-
-    /// Returns caller-selected ids, their raw transformed scores, and final
-    /// normalized/scaled selection weights.
-    pub fn select_indices(
-        &mut self,
-        hidden_states: &Array,
-        group_indices: &Array,
-        stream: &Stream,
-    ) -> Result<GroupSelectionOutput, Exception> {
-        let flat = self.transform_input(hidden_states, stream)?;
-        let logits = if let Some(iquant) = self.iquant {
-            let (ggml_type, endian) = iquant.gguf_iquant().expect("IQ selector format");
-            NativeQuantizedTensor::from_iq_array(
-                self.weight.value.clone(),
-                &[self.group_count, self.input_dims],
-                ggml_type,
-                endian,
-            )?
-            .linear(&flat, true, stream)?
-        } else if let Some(scales) = self.scales.as_ref() {
-            let input = if self.score_function.requires_fp32() {
-                flat.as_dtype(Dtype::Float32, stream)?
-            } else {
-                flat
-            };
-            quantized_matmul_with_mode(
-                &input,
-                self.weight.as_ref(),
-                scales,
-                self.biases.as_ref().as_ref(),
-                true,
-                self.group_size,
-                self.bits,
-                self.mode,
-                stream,
-            )?
-        } else if self.score_function.requires_fp32() {
-            matmul(
-                &flat.as_dtype(Dtype::Float32, stream)?,
-                &self
-                    .weight
-                    .as_ref()
-                    .as_dtype(Dtype::Float32, stream)?
-                    .transpose(stream)?,
-                stream,
-            )?
-        } else {
-            matmul(&flat, self.weight.as_ref().transpose(stream)?, stream)?
-        };
-        let logits = match self.bias.as_ref() {
-            Some(bias) => logits.add(bias, stream)?,
-            None => logits,
-        };
-        let scores = self.score_function.apply(logits, stream)?;
-        let group_indices = group_indices.reshape(&[-1, self.top_k], stream)?;
-        let mut weights = take_along_axis(scores, &group_indices, -1, stream)?;
-        if self.score_function == TopKGroupScoring::SelectedSoftmax {
-            weights = softmax_axis(&weights, -1, true, stream)?;
-        }
-        let selected_scores = weights.clone();
-        if self.norm_topk_prob {
-            let denominator = weights
-                .sum_axis(-1, true, stream)?
-                .add(Array::from_f32(self.normalization_epsilon), stream)?;
-            weights = weights.divide(denominator, stream)?;
-        }
-        if self.coefficient_scale != 1.0 {
-            weights = weights.multiply(Array::from_f32(self.coefficient_scale), stream)?;
-        }
-        if let Some(scale) = self.learned_coefficient_scale.as_ref() {
-            weights = weights.multiply(scale.take_axis(&group_indices, 0, stream)?, stream)?;
-        }
-        Ok(GroupSelectionOutput {
-            indices: group_indices,
-            scores: selected_scores,
-            weights,
         })
     }
 

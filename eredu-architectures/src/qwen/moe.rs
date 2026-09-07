@@ -59,12 +59,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> RoutedGatedPr
             return Err(Error::backend("routed Qwen block requires Qwen3-MoE args"));
         }
         let prefix = format!("{}.layers.{layer}.mlp", args.parameter_root);
-        let routing = TopKGroupSelectionSpec::new(
-            args.num_experts,
-            args.num_experts_per_tok,
-            GroupScoring::Softmax,
-            args.norm_topk_prob,
-        )?;
+        let routing = args.routing_spec()?;
         let router_name = format!("{prefix}.gate.weight");
         let router = B::top_k_group_selector(
             TopKGroupSelectorSpec::new(
@@ -99,12 +94,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> RoutedGatedPr
             ));
         }
         let prefix = format!("{}.layers.{layer}.mlp", global.parameter_root);
-        let routing = TopKGroupSelectionSpec::new(
-            global.num_experts,
-            global.num_experts_per_tok,
-            GroupScoring::Softmax,
-            global.norm_topk_prob,
-        )?;
+        let routing = global.routing_spec()?;
         let router_name = format!("{prefix}.gate.weight");
         let router = B::top_k_group_selector(
             TopKGroupSelectorSpec::new(
@@ -437,7 +427,12 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> FeedForward<B
         match self {
             Self::Dense(mlp) => mlp.forward_feed_forward(input, context),
             Self::Routed(moe) => {
-                let routes = moe.router.select(input, context)?;
+                let routes = eredu_runtime::select_routes_with_provider::<B, P>(
+                    &mut moe.router,
+                    input,
+                    context,
+                    provider,
+                )?;
                 provider
                     .forward_grouped(
                         &mut moe.experts,
@@ -560,6 +555,18 @@ impl<B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeur
     {
         FeedForward::forward_with_provider_parallel(
             self, layer, pass, input, parallel, context, provider,
+        )
+    }
+}
+
+impl ModelArgs {
+    /// The same neutral selection policy drives construction and intervention discovery.
+    pub(crate) fn routing_spec(&self) -> Result<TopKGroupSelectionSpec, Error> {
+        TopKGroupSelectionSpec::new(
+            self.num_experts,
+            self.num_experts_per_tok,
+            GroupScoring::Softmax,
+            self.norm_topk_prob,
         )
     }
 }

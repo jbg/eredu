@@ -102,6 +102,20 @@ pub(super) fn qwen(g: &mut Builder, c: &crate::qwen::ModelArgs) {
             )
         }),
     );
+    if let Ok(spec) = c.routing_spec() {
+        for layer in 0..c.num_hidden_layers as usize {
+            let unit = format!("{}.layers.{layer}", c.parameter_root);
+            if let Some(point) = c.routed_observation_point(&unit, layer) {
+                g.routing_control(
+                    &format!("decoder.layers.{layer}.feed_forward"),
+                    point.path(),
+                    spec,
+                    0,
+                    false,
+                );
+            }
+        }
+    }
 }
 
 pub(super) fn gpt_oss(g: &mut Builder, c: &crate::gpt_oss::ModelArgs) {
@@ -188,6 +202,11 @@ pub(super) fn qwen_hybrid(g: &mut Builder, parsed: &crate::qwen::hybrid::ParsedH
             );
             attrs.shared_expert_width = Some(c.shared_expert_intermediate_size as usize);
             attrs.shared_expert_gated = Some(true);
+            if parsed.vision.is_none() {
+                if let Ok(spec) = c.routing_spec() {
+                    g.routing_control(&ff, &format!("{path}.mlp"), spec, 1, false);
+                }
+            }
             g.moe(
                 &ff,
                 &format!("{path}.mlp"),

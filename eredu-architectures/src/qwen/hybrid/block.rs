@@ -54,12 +54,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SharedRoutedG
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
         let prefix = format!("{prefix}.mlp");
-        let routing = TopKGroupSelectionSpec::new(
-            config.num_experts,
-            config.num_experts_per_tok,
-            GroupScoring::Softmax,
-            config.norm_topk_prob,
-        )?;
+        let routing = config.routing_spec()?;
         let router_name = format!("{prefix}.gate.weight");
         let router = B::top_k_group_selector(
             TopKGroupSelectorSpec::new(
@@ -126,7 +121,9 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SharedRoutedG
         routed.add(&shared.multiply(&shared_gate, context)?, context)
     }
 
-    fn forward_observed_with_provider<P, O>(
+    /// Executes shared/routed feed-forward work with pre-dispatch routing controls
+    /// and separately attributable shared contributions.
+    pub fn forward_observed_with_provider<P, O>(
         &mut self,
         point: eredu_runtime::RoutedObservationPoint,
         input: &B::Tensor,
@@ -139,7 +136,13 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SharedRoutedG
         P::Error: std::fmt::Display,
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {
-        let routes = self.router.select(input, context)?;
+        let routes = eredu_runtime::select_routes_with_observer(
+            &mut self.router,
+            input,
+            context,
+            point.path(),
+            observer,
+        )?;
         let routed = provider
             .forward_grouped(
                 &mut self.experts,
@@ -816,5 +819,17 @@ fn pass<T: Tensor>(input: &T) -> ExpertPass {
         ExpertPass::Prefill
     } else {
         ExpertPass::Decode
+    }
+}
+
+impl HybridConfig {
+    /// Selection policy shared by module construction and intervention discovery.
+    pub(crate) fn routing_spec(&self) -> Result<TopKGroupSelectionSpec, Error> {
+        TopKGroupSelectionSpec::new(
+            self.num_experts,
+            self.num_experts_per_tok,
+            GroupScoring::Softmax,
+            self.norm_topk_prob,
+        )
     }
 }

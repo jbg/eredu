@@ -139,6 +139,29 @@ impl CaptureBackend for ProbeBackend {
 }
 
 #[test]
+fn session_validation_rechecks_loaded_capture_capabilities_before_estimating() {
+    let (plan, catalog, mut support, caps) = fixture(CaptureTransform::Summary);
+    support.capture = caps.clone();
+    let admitted = admit(plan, &catalog, &support, &caps).unwrap();
+    let mut discovery = CaptureDiscovery {
+        artifact_identity: "fixture".into(),
+        catalog,
+        support,
+    };
+    let calls = Cell::new(0);
+    let estimate = |_: &[u64], _: &CaptureSelection, _: &ResolvedCaptureSlice| {
+        calls.set(calls.get() + 1);
+        Ok(CaptureUsage::default())
+    };
+    validate_session(&admitted, &discovery, estimate).unwrap();
+    assert!(calls.get() > 0);
+    calls.set(0);
+    discovery.catalog.points[0].node_id = "different-loaded-node".into();
+    assert!(validate_session(&admitted, &discovery, estimate).is_err());
+    assert_eq!(calls.get(), 0);
+}
+
+#[test]
 fn none_is_not_legacy_capture_all() {
     let (_, catalog, support, capabilities) = fixture(CaptureTransform::Summary);
     let admitted = admit(CapturePlan::none(), &catalog, &support, &capabilities).unwrap();

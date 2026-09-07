@@ -27,6 +27,36 @@ the backend. Physical allocator/private-workspace bounds remain explicitly
 unsupported; logical capture storage is not a bound on total inference memory.
 See [bounded capture](bounded-capture.md) for the accounting and delivery contract.
 
+`eredu-core::intervention` owns the versioned host-only operation schema, exact
+activation payload validation, routing request validation, session/source-bound
+immutable admission, and attributed outcomes. An intervention declaration is
+separate from the observation catalog: observing a value does not authorize
+mutation. Architecture declarations own targets, routing policy and score stages.
+`eredu-nn::routing_intervention::execute_routing_intervention` owns the routing
+action/stage sequence over `RoutingMechanism` primitives; it evaluates the router
+projection once and validates effective decisions before provider dispatch.
+`eredu-runtime::intervention::apply_activation` owns activation operation dispatch,
+exact selected-region validation and update order over `InterventionBackend`
+primitives. No native primitive receives the public intervention action enum.
+Runtime mechanisms also own scheduling, ordered composition, shared capture
+accounting, session admission traversal, immutable installation and observer
+forwarding through `CaptureObserver`. Facade composition owns ordinary generation,
+session association and experiment reset policy.
+Pre-dispatch controls travel through the neutral selector and observed expert
+provider contracts. Architecture construction and discovery consume the same
+selection specifications. MLX implements projection, configured score transforms,
+top-k and coefficient mechanisms, native predicates, exact payload realization and
+native slicing/arithmetic/updates; it has no intervention recipe or family catalog.
+Backend `InterventionEstimator` facts supply indexing constraints, evidence costs
+and additional original-decision resource estimates to the shared cold traversal
+and exact runtime reservation. MLX estimates include group-mask dimensions and
+host partition lookup storage; runtime contains no MLX-specific cost formula.
+Unknown estimates fail, and requests without original evidence neither estimate
+nor construct an original decision. Native prompt inspection, devices, typed error
+conversion, completion retention and recovery remain with the backend. Shared
+observers borrow the existing run owner and do not own native completions.
+See [intervention plans](interventions.md) for exact operation and state semantics.
+
 This guide defines the boundary between the portable language-model runtime
 and an execution backend. It is intended for backend authors and maintainers of
 `eredu`.

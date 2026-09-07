@@ -403,7 +403,13 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> FeedForward<B
         match self {
             Self::Dense(dense) => dense.forward(input, context),
             Self::Sparse(sparse) => {
-                let routes = sparse.router.select(input, context)?;
+                let routes = eredu_runtime::select_routes_with_observer(
+                    &mut sparse.router,
+                    input,
+                    context,
+                    point.path(),
+                    observer,
+                )?;
                 let routed = provider
                     .forward_grouped(
                         &mut sparse.experts,

@@ -46,16 +46,10 @@ pub(super) struct NativeCapture<'a> {
     pub(super) stream: &'a Stream,
 }
 
-/// Reject known impossible bounds before any forward execution. Unknown shapes
-/// remain subject to the exact observer-time check; they never receive a zero cost.
-pub(super) fn preflight(plan: &AdmittedCapturePlan) -> Result<(), CaptureError> {
-    eredu_runtime::capture::preflight(plan, estimate_shape)
-}
-
 /// Includes a conservative logical allowance for source/contiguous backing, all
 /// elementwise reduction temporaries (bounded chunks), host conversion buffers,
 /// and worst-case JSON numbers. Private allocator workspace is not claimed bounded.
-fn estimate_shape(
+pub(super) fn estimate_shape(
     source: &[u64],
     selection: &CaptureSelection,
     slice: &ResolvedCaptureSlice,
@@ -210,6 +204,7 @@ impl CaptureBackend for NativeCapture<'_> {
                     .collect();
                 Ok(CapturePayload::Candidates(CaptureCandidates {
                     stage: CandidateScoreStage::RawLogitsBeforeSampling,
+                    source: CandidateLogitsSource::Original,
                     candidates,
                 }))
             }
@@ -347,33 +342,15 @@ fn histogram(flat: &Array, edges: &[f32], stream: &Stream) -> Result<CaptureHist
     Ok(out)
 }
 
-pub(super) struct BoundedObserver<'a> {
-    pub(super) capture: &'a mut eredu_runtime::capture::CaptureSession,
-    pub(super) stream: &'a Stream,
-}
-
-impl RuntimeActivationObserver<MlxTensor, Exception> for BoundedObserver<'_> {
-    fn observe(&mut self, path: &str, value: &MlxTensor) -> Result<(), Exception> {
-        self.capture
-            .observe(
-                &mut NativeCapture {
-                    stream: self.stream,
-                },
-                path,
-                value,
-            )
-            .map_err(|e| Exception::custom(e.to_string()))
-    }
-    fn observe_routing(
-        &mut self,
-        routing: eredu_runtime::RoutingObservation<'_, MlxTensor>,
-    ) -> Result<(), Exception> {
-        let mut result = Ok(());
-        routing.for_each_tensor(|path, value| {
-            if result.is_ok() {
-                result = self.observe(&path, value);
-            }
-        });
-        result
-    }
+pub(super) fn observer<'a>(
+    capture: &'a mut eredu_runtime::capture::CaptureSession,
+    stream: &'a Stream,
+) -> impl RuntimeActivationObserver<MlxTensor, Exception> + 'a {
+    eredu_runtime::intervention::CaptureObserver::new(
+        capture,
+        NativeCapture { stream },
+        |error: eredu_runtime::capture::CaptureExecutionError<Exception>| {
+            Exception::custom(error.to_string())
+        },
+    )
 }

@@ -6,6 +6,7 @@
 mod checkpoint;
 mod distribution;
 mod evidence;
+pub mod intervention;
 mod parity;
 mod realtime;
 

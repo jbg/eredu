@@ -11,6 +11,8 @@ pub mod automatic_support;
 pub mod backend;
 /// Backend-neutral mutable-cache ownership, storage, and admission algorithms.
 pub mod cache;
+/// Bounded observation admission and collection.
+pub mod capture;
 /// Opaque groups, routes, and capability contracts for distributed mechanisms.
 pub mod communication;
 /// Typed multimodal component graphs and residency accounting.
@@ -32,8 +34,8 @@ pub mod generation;
 /// Backend-neutral ownership of prepared multimodal tensors.
 pub mod input;
 pub mod inspection;
-/// Bounded observation admission and collection.
-pub mod capture;
+/// Immutable intervention scheduling and evidence using the shared capture ledger.
+pub mod intervention;
 /// Statically dispatched layered architecture lifecycle and resident policy.
 pub mod layered;
 /// Normalized portable policy for cold model preparation.
@@ -166,6 +168,7 @@ pub use expert::{
     RoutedExpertProvider, RoutedExpertRequest, RoutedExpertTensorParallelOutput,
     RoutedObservationPoint, TensorParallelRoutedExpertProvider,
 };
+pub use expert::{select_routes_with_observer, select_routes_with_provider};
 pub use generation::{
     CausalModel, ConstrainedSampler, DefaultSampler, GenerationSampler, MirostatV2Sampler,
     PenaltyConfig, Sampler, SamplingBackend, SamplingConfigurationError, SpeculativeSampler,
@@ -176,7 +179,7 @@ pub use input::{
     PreparedInputPart, PreparedInputPayload, PreparedModelInput,
 };
 pub use inspection::{
-    observe_and_intervene, observe_model_logits, ActivationObserver, NoopObserver,
+    observe_and_intervene, observe_model_logits, ActivationObserver, NoopObserver, RoutingDecision,
     RoutingObservation, TargetStateCapture, TargetStateCaptureError, TargetStateTap,
 };
 pub use layered::{

@@ -248,7 +248,13 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMoe<B> 
         P: RoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
     {
-        let routes = self.gate.select(input, context)?;
+        let routes = eredu_runtime::select_routes_with_observer(
+            &mut self.gate,
+            input,
+            context,
+            path,
+            observer,
+        )?;
         let routed = provider
             .forward_relu2_routed(
                 &mut self.experts,

@@ -106,6 +106,19 @@ pub struct PreparedModelSourceGraph {
 }
 
 impl PreparedModelSources {
+    /// Retains architecture-owned mutable hooks with actual selected-session facts.
+    pub fn intervention_discovery(
+        &self,
+        capture: &eredu_core::capture::CaptureDiscovery,
+        mechanisms: &eredu_core::intervention::InterventionMechanisms,
+    ) -> eredu_core::intervention::InterventionDiscovery {
+        eredu_runtime::inspection::intervention_support(
+            self.architecture().intervention_points(),
+            capture,
+            mechanisms,
+        )
+    }
+
     /// Authoritative total selection inseparably paired with these exact sources.
     pub const fn selected(&self) -> &SelectedPreparation {
         &self.selected

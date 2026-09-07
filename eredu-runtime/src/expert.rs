@@ -6,11 +6,14 @@ use eredu_nn::{
 };
 
 use crate::ExpertPass;
+
+mod route_intervention;
 use crate::{
     observe_and_intervene, ActivationObserver, ParameterBankAccess, ParameterBankKey,
     ReplicatedTextMaterializationTask, ReplicatedTextParameterOwner, RoutingObservation,
     WeightLoweringKind,
 };
+pub use route_intervention::{select_routes_with_observer, select_routes_with_provider};
 
 /// One exact selected parameter in an independently addressable bank member.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -1187,6 +1190,26 @@ where
     /// Provider-specific acquisition or execution failure.
     type Error;
 
+    /// Optional pre-dispatch control supplied by an instrumented provider adapter.
+    fn routing_control(
+        &mut self,
+        _token_rows: u64,
+    ) -> Result<Option<eredu_nn::routing_intervention::GroupSelectionControl>, Self::Error> {
+        Ok(None)
+    }
+
+    /// Consumes bounded decision evidence before dispatch. Shared experts are not included.
+    fn routing_applied(
+        &mut self,
+        _original: Option<crate::RoutingDecision<'_, B::Tensor>>,
+        _effective: crate::RoutingDecision<'_, B::Tensor>,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    /// Attributes selector failure without claiming cache rollback.
+    fn routing_failed(&mut self, _message: &str) {}
+
     /// Executes one typed route batch while retaining its acquired resources.
     fn forward_grouped(
         &mut self,
@@ -1372,6 +1395,29 @@ where
     O: ActivationObserver<B::Tensor, E> + ?Sized,
 {
     type Error = ObservedExpertProviderError<P::Error, E>;
+
+    fn routing_control(
+        &mut self,
+        token_rows: u64,
+    ) -> Result<Option<eredu_nn::routing_intervention::GroupSelectionControl>, Self::Error> {
+        self.observer
+            .routing_control(self.point.path(), token_rows)
+            .map_err(ObservedExpertProviderError::Observer)
+    }
+
+    fn routing_applied(
+        &mut self,
+        original: Option<crate::RoutingDecision<'_, B::Tensor>>,
+        effective: crate::RoutingDecision<'_, B::Tensor>,
+    ) -> Result<(), Self::Error> {
+        self.observer
+            .routing_applied(self.point.path(), original, effective)
+            .map_err(ObservedExpertProviderError::Observer)
+    }
+
+    fn routing_failed(&mut self, message: &str) {
+        self.observer.routing_failed(self.point.path(), message);
+    }
 
     fn forward_grouped(
         &mut self,

@@ -8,12 +8,13 @@ mod tests;
 /// A run owns one ledger and at most one step of host records. Consumers must drain
 /// each step before another is started; there is no producer queue.
 pub struct CaptureSession {
-    plan: AdmittedCapturePlan,
-    ledger: CaptureLedger,
-    records: Option<Vec<CaptureRecord>>,
-    prediction: u64,
-    phase: CapturePhase,
-    capture_seconds: f64,
+    pub(crate) plan: AdmittedCapturePlan,
+    pub(crate) ledger: CaptureLedger,
+    pub(crate) records: Option<Vec<CaptureRecord>>,
+    pub(crate) prediction: u64,
+    pub(crate) phase: CapturePhase,
+    pub(crate) capture_seconds: f64,
+    pub(crate) interventions: Option<crate::intervention::InterventionRun>,
 }
 
 impl CaptureSession {
@@ -26,6 +27,7 @@ impl CaptureSession {
             prediction: 0,
             phase: CapturePhase::Prefill,
             capture_seconds: 0.0,
+            interventions: None,
         }
     }
 
@@ -80,6 +82,9 @@ impl CaptureSession {
         self.phase = phase;
         self.prediction = prediction;
         self.capture_seconds = 0.0;
+        if let Some(interventions) = &mut self.interventions {
+            interventions.begin_step(&mut self.ledger, phase, prediction)?;
+        }
         Ok(())
     }
 
@@ -111,59 +116,17 @@ impl CaptureSession {
                 );
             }
             let started = std::time::Instant::now();
-            let result = (|| -> Result<(), CaptureExecutionError<B::Error>> {
-                let shape = backend
-                    .shape(tensor)
-                    .map_err(CaptureExecutionError::Backend)?;
-                self.plan
-                    .request()
-                    .validate_actual(point, self.phase, self.prediction, &shape)?;
-                if let Some(expected) =
-                    self.plan
-                        .request()
-                        .resolve(point, self.phase, self.prediction)?
-                {
-                    if expected != shape {
-                        return Err(CaptureError::Invalid(format!(
-                            "runtime shape for {path}: expected {expected:?}, got {shape:?}"
-                        ))
-                        .into());
-                    }
-                }
-                let slice = resolve_slice(point, selection, &shape)?;
-                let usage = backend.estimate(tensor, selection, &slice)?;
-                record.source_shape = Some(shape);
-                record.selected_shape = Some(slice.shape.clone());
-                if let Some(reason) = self.ledger.reserve(usage)? {
-                    record.outcome = CaptureOutcome::Skipped { reason };
-                    return Ok(());
-                }
-                record.charged = record.charged.checked_add(usage)?;
-                let payload = backend
-                    .transform(tensor, selection, &slice)
-                    .map_err(CaptureExecutionError::Backend)?;
-                let available = elements(&slice.shape)?;
-                record.outcome = match selection.transform {
-                    CaptureTransform::Preview { max_elements } if max_elements < available => {
-                        CaptureOutcome::Truncated {
-                            available_elements: available,
-                            emitted_elements: max_elements,
-                        }
-                    }
-                    _ => CaptureOutcome::Captured,
-                };
-                record.payload = Some(payload);
-                // Count through a bounded sink, without allocating a second JSON buffer.
-                // This is a backend-contract check, not a substitute for the pre-copy estimate.
-                let mut sink = CountingWriter {
-                    written: 0,
-                    limit: record.charged.encoded_bytes,
-                };
-                serde_json::to_writer(&mut sink, record).map_err(|_| {
-                    CaptureError::Invalid("backend underestimated encoded capture size".into())
-                })?;
-                Ok(())
-            })();
+            let result = capture_value(
+                backend,
+                tensor,
+                selection,
+                point,
+                record,
+                self.plan.request(),
+                self.phase,
+                self.prediction,
+                &mut self.ledger,
+            );
             self.capture_seconds += started.elapsed().as_secs_f64();
             if let Err(error) = result {
                 let reason = match &error {
@@ -197,6 +160,10 @@ impl CaptureSession {
             phase: self.phase,
             prediction_index: self.prediction,
             records,
+            interventions: self
+                .interventions
+                .as_mut()
+                .map_or_else(Vec::new, |run| run.take_records()),
             step_usage: self.ledger.step(),
             cumulative_usage: self.ledger.total(),
             capture_seconds: self.capture_seconds,
@@ -204,7 +171,76 @@ impl CaptureSession {
     }
 }
 
-fn bounded_diagnostic(error: &impl std::fmt::Display) -> String {
+/// Shared transformation path for ordinary captures and intervention evidence.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn capture_value<B: CaptureBackend>(
+    backend: &mut B,
+    tensor: &B::Tensor,
+    selection: &CaptureSelection,
+    point: &eredu_core::ObservationPoint,
+    record: &mut CaptureRecord,
+    request: CaptureRequestShape,
+    phase: CapturePhase,
+    prediction: u64,
+    ledger: &mut CaptureLedger,
+) -> Result<(), CaptureExecutionError<B::Error>> {
+    let path = &selection.path;
+
+    let shape = backend
+        .shape(tensor)
+        .map_err(CaptureExecutionError::Backend)?;
+    request.validate_actual(point, phase, prediction, &shape)?;
+    if let Some(expected) = request.resolve(point, phase, prediction)? {
+        if expected != shape {
+            return Err(CaptureError::Invalid(format!(
+                "runtime shape for {path}: expected {expected:?}, got {shape:?}"
+            ))
+            .into());
+        }
+    }
+    let slice = resolve_slice(point, selection, &shape)?;
+    let usage = backend.estimate(tensor, selection, &slice)?;
+    record.source_shape = Some(shape);
+    record.selected_shape = Some(slice.shape.clone());
+    if let Some(reason) = ledger.reserve(usage)? {
+        record.outcome = CaptureOutcome::Skipped { reason };
+        return Ok(());
+    }
+    record.charged = record.charged.checked_add(usage)?;
+    let mut payload = backend
+        .transform(tensor, selection, &slice)
+        .map_err(CaptureExecutionError::Backend)?;
+    if let CapturePayload::Candidates(candidates) = &mut payload {
+        candidates.source = if record.position == eredu_core::ObservationPosition::AfterIntervention
+        {
+            CandidateLogitsSource::Effective
+        } else {
+            CandidateLogitsSource::Original
+        };
+    }
+    let available = elements(&slice.shape)?;
+    record.outcome = match selection.transform {
+        CaptureTransform::Preview { max_elements } if max_elements < available => {
+            CaptureOutcome::Truncated {
+                available_elements: available,
+                emitted_elements: max_elements,
+            }
+        }
+        _ => CaptureOutcome::Captured,
+    };
+    record.payload = Some(payload);
+    // Count through a bounded sink, without allocating a second JSON buffer.
+    // This is a backend-contract check, not a substitute for the pre-copy estimate.
+    let mut sink = CountingWriter {
+        written: 0,
+        limit: record.charged.encoded_bytes,
+    };
+    serde_json::to_writer(&mut sink, record)
+        .map_err(|_| CaptureError::Invalid("backend underestimated encoded capture size".into()))?;
+    Ok(())
+}
+
+pub(crate) fn bounded_diagnostic(error: &impl std::fmt::Display) -> String {
     use std::fmt::Write;
     struct Message(String);
     impl std::fmt::Write for Message {
@@ -253,14 +289,63 @@ pub fn metadata_reservation(
 /// conservatively allow every phase-enabled selection to coincide.
 pub fn preflight(
     plan: &AdmittedCapturePlan,
+    estimate: impl FnMut(
+        &[u64],
+        &CaptureSelection,
+        &ResolvedCaptureSlice,
+    ) -> Result<CaptureUsage, CaptureError>,
+) -> Result<(), CaptureError> {
+    preflight_with_extra(plan, &[], CaptureUsage::default(), &[], estimate)
+}
+
+/// Revalidates admission against the loaded catalog, then checks known geometry
+/// and budgets with backend estimates. Native execution-mode checks stay with the
+/// caller; this helper never accesses a device or starts a submission.
+pub fn validate_session(
+    plan: &AdmittedCapturePlan,
+    discovery: &CaptureDiscovery,
+    estimate: impl FnMut(
+        &[u64],
+        &CaptureSelection,
+        &ResolvedCaptureSlice,
+    ) -> Result<CaptureUsage, CaptureError>,
+) -> Result<(), CaptureError> {
+    if plan.is_empty() {
+        return Ok(());
+    }
+    let checked = plan.plan().clone().admit(
+        &discovery.catalog,
+        &discovery.support,
+        &discovery.support.capture,
+        plan.request(),
+    )?;
+    if checked.identity() != plan.identity() {
+        return Err(CaptureError::Invalid(
+            "capture admission does not match this session's catalog".into(),
+        ));
+    }
+    preflight(&checked, estimate)
+}
+
+pub(crate) fn preflight_with_extra(
+    plan: &AdmittedCapturePlan,
+    extra: &[(CaptureSelection, eredu_core::ObservationPoint)],
+    mut base: CaptureUsage,
+    scheduled_costs: &[(CaptureSchedule, [CaptureUsage; 2])],
     mut estimate: impl FnMut(
         &[u64],
         &CaptureSelection,
         &ResolvedCaptureSlice,
     ) -> Result<CaptureUsage, CaptureError>,
 ) -> Result<(), CaptureError> {
-    let mut base = CaptureUsage::default();
-    for (selection, point) in plan.plan().selections.iter().zip(plan.points()) {
+    let entries: Vec<_> = plan
+        .plan()
+        .selections
+        .iter()
+        .zip(plan.points())
+        .chain(extra.iter().map(|(selection, point)| (selection, point)))
+        .collect();
+    for &(selection, point) in &entries {
         base = base.checked_add(metadata_reservation(selection, point)?)?;
     }
     if let Some(budget) = base.exceeded(plan.plan().limits.per_step) {
@@ -275,7 +360,16 @@ pub fn preflight(
             continue;
         }
         let mut step = base;
-        for (selection, point) in plan.plan().selections.iter().zip(plan.points()) {
+        for (schedule, costs) in scheduled_costs {
+            if let Some((count, _)) =
+                schedule.count_and_last(phase, plan.request().max_predictions)?
+            {
+                let cost = costs[if phase == CapturePhase::Prefill { 0 } else { 1 }];
+                step = step.checked_add(cost)?;
+                total = total.checked_add(cost.checked_mul(count)?)?;
+            }
+        }
+        for &(selection, point) in &entries {
             let Some((count, last)) = selection
                 .schedule
                 .count_and_last(phase, plan.request().max_predictions)?

@@ -38,8 +38,9 @@ use super::{
     Executable, MlxBackend, MlxCompletion, MlxDistributedSession, MlxModel,
 };
 
-mod generation;
 pub(crate) mod bounded_capture;
+mod generation;
+pub(crate) mod intervention;
 mod model_session;
 mod observation;
 mod output_completion;

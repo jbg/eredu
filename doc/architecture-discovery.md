@@ -49,8 +49,9 @@ include `capture` transformation capabilities and conditions. See
 
 Block inputs/outputs and logits are observed **before an intervention at that
 exact path**. Earlier interventions may already have affected them. Routing
-events are read-only observations after expert dispatch; they do not expose a
-pre-dispatch intervention opportunity.
+events remain read-only observations after expert dispatch. Separately declared
+intervention targets support control before dispatch where the loaded session
+advertises it; see [intervention plans](interventions.md).
 
 The initial detailed projections cover Llama/Mistral, Qwen2/3, GPT-OSS, Qwen
 hybrids, LFM2, Kimi Linear, Nemotron-H, and DeepSeek V3. Multimodal components

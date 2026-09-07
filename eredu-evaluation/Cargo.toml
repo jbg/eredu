@@ -25,6 +25,7 @@ eredu-architectures.workspace = true
 eredu-codec.workspace = true
 eredu-core.workspace = true
 eredu-nn.workspace = true
+eredu-runtime.workspace = true
 clap = { version = "4", features = ["derive"] }
 safetensors = "0.8"
 sentencepiece-rs = "0.2.2"
@@ -34,3 +35,4 @@ thiserror.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+half.workspace = true

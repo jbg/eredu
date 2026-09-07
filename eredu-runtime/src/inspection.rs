@@ -2,6 +2,52 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+/// Combines explicit architecture intervention declarations with exact loaded
+/// observation support and backend arithmetic facts. Read-only catalog values
+/// never acquire intervention capabilities through this projection.
+pub fn intervention_support(
+    mut points: Vec<eredu_core::intervention::InterventionPoint>,
+    capture: &eredu_core::capture::CaptureDiscovery,
+    mechanisms: &eredu_core::intervention::InterventionMechanisms,
+) -> eredu_core::intervention::InterventionDiscovery {
+    use eredu_core::{intervention::*, ObservationSupportStatus as S};
+    for point in &mut points {
+        point
+            .operations
+            .retain(|kind| mechanisms.operations.contains(kind));
+        point
+            .dtypes
+            .retain(|dtype| mechanisms.dtypes.contains(dtype));
+        point
+            .score_stages
+            .retain(|stage| mechanisms.score_stages.contains(stage));
+        let path = if point.routing.is_some() {
+            eredu_core::RoutingObservationField::SelectedExperts.path(&point.path)
+        } else {
+            point.path.clone()
+        };
+        if let Some(support) = capture.support.points.iter().find(|p| p.path == path) {
+            point.prefill = support.prefill.clone();
+            point.decode = support.decode.clone();
+        }
+        if point.axes.is_empty()
+            || point.operations.is_empty()
+            || (point.routing.is_none() && point.dtypes.is_empty())
+        {
+            point.prefill = S::Unsupported(
+                "required intervention geometry or native mechanism is not declared".into(),
+            );
+            point.decode = point.prefill.clone();
+        }
+    }
+    InterventionDiscovery {
+        schema_version: INTERVENTION_SCHEMA_VERSION,
+        artifact_identity: capture.artifact_identity.clone(),
+        session_identity: None,
+        points,
+    }
+}
+
 /// Selected, model-independent conditions used to report capture support.
 #[derive(Debug, Clone, Copy)]
 pub struct ObservationExecutionContext {
@@ -206,6 +252,35 @@ impl<T> RoutingObservation<'_, T> {
 
 /// Statically dispatched activation observation and intervention contract.
 pub trait ActivationObserver<T, E> {
+    /// Obtains a validated control before the selector dispatches any experts.
+    /// The default ordinary path allocates and materializes nothing.
+    fn routing_control(
+        &mut self,
+        _path: &str,
+        _token_rows: u64,
+    ) -> Result<Option<eredu_nn::routing_intervention::GroupSelectionControl>, E> {
+        Ok(None)
+    }
+
+    /// Receives original/effective decisions before they reach the expert provider.
+    fn routing_applied(
+        &mut self,
+        _path: &str,
+        _original: Option<RoutingDecision<'_, T>>,
+        _effective: RoutingDecision<'_, T>,
+    ) -> Result<(), E> {
+        Ok(())
+    }
+
+    /// Records a failed control under the enclosing forward pass's failure owner.
+    fn routing_failed(&mut self, _path: &str, _message: &str) {}
+
+    /// Completes an ordinary forward pass under its existing failure owner.
+    /// Scheduled-but-missing interventions must fail before prediction commitment.
+    fn finish(&mut self) -> Result<(), E> {
+        Ok(())
+    }
+
     /// Observes a named backend-native tensor.
     fn observe(&mut self, path: &str, value: &T) -> Result<(), E>;
 
@@ -217,6 +292,23 @@ pub trait ActivationObserver<T, E> {
     /// Observes normalized routed-expert decisions and contributions.
     fn observe_routing(&mut self, _routing: RoutingObservation<'_, T>) -> Result<(), E> {
         Ok(())
+    }
+}
+
+/// Borrowed pre-dispatch decision, independent of expert outputs or shared experts.
+pub struct RoutingDecision<'a, T> {
+    /// Exact global expert IDs shaped `[token_rows, top_k]`.
+    pub ids: &'a T,
+    /// Final coefficients used for dispatch.
+    pub coefficients: &'a T,
+}
+
+impl<'a, T> From<&'a eredu_nn::GroupSelection<T>> for RoutingDecision<'a, T> {
+    fn from(routes: &'a eredu_nn::GroupSelection<T>) -> Self {
+        Self {
+            ids: routes.group_indices(),
+            coefficients: routes.coefficients(),
+        }
     }
 }
 

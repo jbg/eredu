@@ -3,6 +3,112 @@ use crate::{backend::ExecutionContext, module::PhysicalParam};
 use safemlx::{transforms::eval, Device, DeviceType};
 
 #[test]
+fn routing_intervention_preserves_grouped_selected_softmax_epsilon_and_learned_scales() {
+    use eredu_nn::routing_intervention::{
+        GroupScoreStage, GroupSelectionAction, GroupSelectionControl,
+    };
+    let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+    let stream = execution.stream();
+    let mut selector = TopKGroupSelector::new_with_quantization(
+        TopKGroupSelectorConfig::new(
+            2,
+            4,
+            1,
+            TopKGroupScoring::SelectedSoftmax,
+            true,
+            0.25,
+            1.5,
+            2,
+            1,
+            false,
+            true,
+            None,
+            false,
+            true,
+        )
+        .unwrap(),
+        None,
+        stream,
+    )
+    .unwrap();
+    selector.weight = PhysicalParam::new(Array::from_slice(
+        &[0.0f32, 2.0f32.ln(), 3.0f32.ln(), 4.0f32.ln()],
+        &[4, 1],
+    ));
+    selector.e_score_correction_bias =
+        PhysicalParam::new(Some(Array::from_slice(&[0.0f32; 4], &[4])));
+    selector.learned_coefficient_scale =
+        PhysicalParam::new(Some(Array::from_slice(&[2.0f32, 3.0, 4.0, 5.0], &[4])));
+    let input = Array::from_slice(&[1.0f32], &[1, 1]);
+    let mut control = GroupSelectionControl {
+        expected: selector.selection_spec().unwrap(),
+        learned_coefficient_scale: true,
+        first_row: 0,
+        end_row: 1,
+        row_stride: 1,
+        action: GroupSelectionAction::Force(vec![0, 1]),
+        capture_original: true,
+    };
+    for raw in [false, true] {
+        if raw {
+            control.action = GroupSelectionAction::Bias {
+                stage: GroupScoreStage::RawLogits,
+                ids: vec![0, 1],
+                values: vec![10.0 + 2.0f32.ln(), 10.0],
+            };
+        }
+        let (original, effective) = selector
+            .select_intervened(&input, &control, stream)
+            .unwrap();
+        assert!(original.is_some());
+        for slot in 0..2 {
+            let id = effective
+                .indices
+                .try_index_device((0, slot), stream)
+                .unwrap()
+                .item::<i32>(stream);
+            let weight = effective
+                .weights
+                .try_index_device((0, slot), stream)
+                .unwrap()
+                .item::<f32>(stream);
+            let expected = if raw {
+                if id == 0 {
+                    1.2
+                } else {
+                    1.8
+                }
+            } else if id == 0 {
+                0.8
+            } else {
+                2.4
+            };
+            assert!(id == 0 || id == 1);
+            assert!(
+                (weight - expected).abs() < 1e-5,
+                "id {id}: {weight} vs {expected}"
+            );
+        }
+    }
+    control.action = GroupSelectionAction::Force(vec![0, 2]);
+    assert!(
+        selector
+            .select_intervened(&input, &control, stream)
+            .is_err(),
+        "cross-group forcing must fail"
+    );
+    control.action = GroupSelectionAction::Force(vec![0, 1]);
+    selector.learned_coefficient_scale =
+        PhysicalParam::new(Some(Array::from_slice(&[-1.0f32; 4], &[4])));
+    assert!(
+        selector
+            .select_intervened(&input, &control, stream)
+            .is_err(),
+        "invalid learned coefficients must fail before dispatch"
+    );
+}
+
+#[test]
 #[ignore = "requires MLX runtime execution"]
 fn mlx_selected_softmax_selector_applies_input_and_group_scales() {
     let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));

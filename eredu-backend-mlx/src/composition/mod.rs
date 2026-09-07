@@ -34,6 +34,42 @@ impl<'a> NeutralActivationObserver<'a> {
 impl eredu_runtime::ActivationObserver<crate::MlxTensor, eredu_nn::Error>
     for NeutralActivationObserver<'_>
 {
+    fn routing_control(
+        &mut self,
+        path: &str,
+        rows: u64,
+    ) -> Result<Option<eredu_nn::routing_intervention::GroupSelectionControl>, eredu_nn::Error>
+    {
+        self.inner
+            .routing_control(path, rows)
+            .map_err(eredu_nn::Error::backend)
+    }
+
+    fn routing_applied(
+        &mut self,
+        path: &str,
+        original: Option<eredu_runtime::RoutingDecision<'_, crate::MlxTensor>>,
+        effective: eredu_runtime::RoutingDecision<'_, crate::MlxTensor>,
+    ) -> Result<(), eredu_nn::Error> {
+        self.inner
+            .routing_applied(
+                path,
+                original.map(|value| eredu_runtime::RoutingDecision {
+                    ids: value.ids.as_array(),
+                    coefficients: value.coefficients.as_array(),
+                }),
+                eredu_runtime::RoutingDecision {
+                    ids: effective.ids.as_array(),
+                    coefficients: effective.coefficients.as_array(),
+                },
+            )
+            .map_err(eredu_nn::Error::backend)
+    }
+
+    fn routing_failed(&mut self, path: &str, message: &str) {
+        self.inner.routing_failed(path, message);
+    }
+
     fn observe(&mut self, path: &str, value: &crate::MlxTensor) -> Result<(), eredu_nn::Error> {
         self.inner
             .observe(path, value.as_array())

@@ -550,6 +550,31 @@ impl LocalModel {
         self.inner.capture_discovery()
     }
 
+    /// Returns the loaded session's retained intervention capabilities.
+    pub fn intervention_discovery(
+        &self,
+    ) -> Result<eredu_core::intervention::InterventionDiscovery, eredu_core::capture::CaptureError>
+    {
+        self.inner.intervention_discovery()
+    }
+
+    /// Admits prospective interventions and bounded capture for ordinary generation.
+    /// Reset before preparing an independent experiment. Generation uses the same
+    /// `generate_observed_chat` method, sampler, constraints and completion owner.
+    pub fn prepare_intervened_chat(
+        &self,
+        chat: &super::PreparedChat,
+        settings: super::PreparedChatGenerationSettings,
+        capture: eredu_core::capture::CapturePlan,
+        intervention: eredu_core::intervention::InterventionPlan,
+        limits: super::TraceLimits,
+    ) -> Result<super::PreparedObservedGeneration, super::PreparedChatError<LocalBackendError>>
+    {
+        self.inner
+            .prepare_intervened_chat(chat, settings, capture, intervention, limits)
+            .map_err(map_prepared_chat_error)
+    }
+
     /// Prepares prompt alignment, ordinary generation settings, and bounded capture.
     pub fn prepare_observed_chat(
         &self,

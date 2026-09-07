@@ -166,6 +166,7 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
         request: PreparedChatGenerationRequest<'_, B, F>,
         capture: Option<(
             eredu_core::capture::AdmittedCapturePlan,
+            Option<eredu_core::intervention::AdmittedInterventionPlan>,
             &'a mut dyn FnMut(Option<u32>, Option<eredu_core::capture::CapturedStep>, f64),
         )>,
     ) -> Result<PreparedChatGenerationOutput, PreparedChatError<B::Error>>
@@ -224,9 +225,11 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
             }
         }
         .map_err(map_controlled_generation_error)?;
-        let (on_token, capture_enabled) = if let Some((plan, on_token)) = capture {
-            let enabled = !plan.is_empty();
-            if enabled {
+        let (on_token, capture_enabled) = if let Some((plan, intervention, on_token)) = capture {
+            let enabled = !plan.is_empty() || intervention.as_ref().is_some_and(|p| !p.is_empty());
+            if let Some(intervention) = intervention {
+                generator.enable_interventions(plan, intervention)?;
+            } else if enabled {
                 generator.enable_capture(plan)?;
             }
             (Some(on_token), enabled)

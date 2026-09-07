@@ -96,6 +96,7 @@ impl Drop for TestDirectory {
 struct MockBackend;
 struct MockSession {
     authority: eredu_core::SessionAuthority,
+    intervention_identity: String,
     distributed: MockDistributedSession,
 }
 struct Done;
@@ -204,6 +205,7 @@ impl BackendProvider for MockBackend {
             .validate(SessionCapabilities::new(true, true, false))?;
         Ok(MockSession {
             authority: eredu_core::SessionAuthority::new(),
+            intervention_identity: eredu_core::intervention::new_intervention_session_identity(),
             distributed: MockDistributedSession {
                 descriptor: DistributedSessionDescriptor::new(
                     2,
@@ -382,6 +384,42 @@ impl TextGenerationBackend for MockBackend {
     type TextGenerationState = observed_mock::State;
     type TextCompletion = MockSessionCompletion;
 
+    fn intervention_discovery(
+        runtime: &ModelRuntime<Self>,
+    ) -> Result<eredu_core::intervention::InterventionDiscovery, eredu_core::capture::CaptureError>
+    {
+        Ok(observed_mock::intervention_discovery(
+            &runtime.session().intervention_identity,
+        ))
+    }
+    fn validate_text_interventions(
+        runtime: &ModelRuntime<Self>,
+        capture: &eredu_core::capture::AdmittedCapturePlan,
+        plan: &eredu_core::intervention::AdmittedInterventionPlan,
+    ) -> Result<(), eredu_core::capture::CaptureError> {
+        Self::validate_text_capture(runtime, capture)?;
+        eredu_runtime::intervention::validate_session(
+            capture,
+            plan,
+            &Self::intervention_discovery(runtime)?,
+            &observed_mock::Estimates,
+        )
+    }
+
+    fn configure_text_interventions(
+        runtime: &ModelRuntime<Self>,
+        state: &mut Self::TextGenerationState,
+        capture: eredu_core::capture::AdmittedCapturePlan,
+        plan: eredu_core::intervention::AdmittedInterventionPlan,
+    ) -> Result<(), eredu_core::capture::CaptureError> {
+        Self::validate_text_interventions(runtime, &capture, &plan)?;
+        eredu_runtime::intervention::install_session(
+            &mut state.capture,
+            capture,
+            Some((plan, std::sync::Arc::new(observed_mock::Estimates))),
+        )
+    }
+
     fn capture_discovery(
         _: &ModelRuntime<Self>,
     ) -> Result<eredu_core::capture::CaptureDiscovery, eredu_core::capture::CaptureError> {
@@ -399,8 +437,7 @@ impl TextGenerationBackend for MockBackend {
         plan: eredu_core::capture::AdmittedCapturePlan,
     ) -> Result<(), eredu_core::capture::CaptureError> {
         observed_mock::validate(&plan)?;
-        state.capture = Some(eredu_runtime::capture::CaptureSession::new(plan));
-        Ok(())
+        eredu_runtime::intervention::install_session(&mut state.capture, plan, None)
     }
     fn take_text_capture(
         state: &mut Self::TextGenerationState,
@@ -433,12 +470,16 @@ impl TextGenerationBackend for MockBackend {
     ) -> Result<Submission<Self::Token, Self::TextCompletion>, Self::Error> {
         let sequence = prompt.len();
         let submission = runtime.prefill(prompt)?;
-        state.observe(eredu_core::capture::CapturePhase::Prefill, sequence)?;
+        let output = state.observe(
+            eredu_core::capture::CapturePhase::Prefill,
+            sequence,
+            submission.output,
+        )?;
         Ok(Submission {
             output: MockToken(if submission.output == 999 {
                 999
             } else {
-                apply_filter(submission.output, filter)
+                apply_filter(output, filter)
             }),
             completion: submission.completion,
         })
@@ -451,9 +492,13 @@ impl TextGenerationBackend for MockBackend {
         state: &mut Self::TextGenerationState,
     ) -> Result<Submission<Self::Token, Self::TextCompletion>, Self::Error> {
         let submission = runtime.decode(token.0)?;
-        state.observe(eredu_core::capture::CapturePhase::Decode, 1)?;
+        let output = state.observe(
+            eredu_core::capture::CapturePhase::Decode,
+            1,
+            submission.output,
+        )?;
         Ok(Submission {
-            output: MockToken(apply_filter(submission.output, filter)),
+            output: MockToken(apply_filter(output, filter)),
             completion: submission.completion,
         })
     }

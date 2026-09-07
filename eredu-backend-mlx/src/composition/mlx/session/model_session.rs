@@ -382,6 +382,7 @@ pub struct MlxModelSession {
     floating_state_dtype_bytes: std::num::NonZeroU8,
     capabilities: eredu_core::SessionCapabilities,
     capture_discovery: Option<eredu_core::capture::CaptureDiscovery>,
+    intervention_discovery: Option<eredu_core::intervention::InterventionDiscovery>,
     state_residency: CacheResidencyPolicy,
 }
 
@@ -416,6 +417,11 @@ impl MlxModelSession {
         let processor = model.take_processor();
         let distributed = model.take_distributed();
         let capture_discovery = model.take_capture_discovery();
+        let mut intervention_discovery = model.take_intervention_discovery();
+        if let Some(discovery) = &mut intervention_discovery {
+            discovery.session_identity =
+                Some(eredu_core::intervention::new_intervention_session_identity());
+        }
         let (executable, target) = model.into_execution_parts();
         #[cfg(test)]
         crate::tests::support::path_instrumentation::session_reset_attempt();
@@ -439,6 +445,7 @@ impl MlxModelSession {
             floating_state_dtype_bytes,
             capabilities: realized_capabilities,
             capture_discovery,
+            intervention_discovery,
             state_residency,
         };
         session.reset()?;
@@ -939,6 +946,10 @@ impl MlxModelSession {
                 &mut ArrayObserverAdapter { inner: observer },
             )
         });
+        let output = output.and_then(|output| {
+            observer.finish()?;
+            Ok(output)
+        });
         let (output, owner, recovery) = operation.finish_execution(output)?;
         Ok(model_array_submission(
             output,
@@ -961,6 +972,10 @@ impl MlxModelSession {
             backend.stream(),
             &mut ArrayObserverAdapter { inner: observer },
         );
+        let output = output.and_then(|output| {
+            observer.finish()?;
+            Ok(output)
+        });
         let (output, owner, recovery) = operation.finish_execution(output)?;
         Ok(model_array_submission(
             output,
@@ -1082,6 +1097,61 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
     type TextGenerationState = MlxTextGenerationState;
     type TextCompletion = MlxTextCompletion;
 
+    fn intervention_discovery(
+        runtime: &ModelRuntime<Self>,
+    ) -> Result<eredu_core::intervention::InterventionDiscovery, eredu_core::capture::CaptureError>
+    {
+        runtime
+            .session()
+            .intervention_discovery
+            .clone()
+            .ok_or_else(|| {
+                eredu_core::capture::CaptureError::Unsupported(
+                    "session has no retained intervention catalog".into(),
+                )
+            })
+    }
+
+    fn validate_text_interventions(
+        runtime: &ModelRuntime<Self>,
+        capture: &eredu_core::capture::AdmittedCapturePlan,
+        plan: &eredu_core::intervention::AdmittedInterventionPlan,
+    ) -> Result<(), eredu_core::capture::CaptureError> {
+        use eredu_core::capture::*;
+        Self::validate_text_capture(runtime, capture)?;
+        if plan.is_empty() {
+            return Ok(());
+        }
+        if runtime.session().payload.distributed.is_some() {
+            return Err(CaptureError::Unsupported(
+                "interventions require ordinary single-rank text generation".into(),
+            ));
+        }
+        eredu_runtime::intervention::validate_session(
+            capture,
+            plan,
+            &Self::intervention_discovery(runtime)?,
+            &super::intervention::NativeInterventionEstimator,
+        )
+    }
+
+    fn configure_text_interventions(
+        runtime: &ModelRuntime<Self>,
+        state: &mut Self::TextGenerationState,
+        capture: eredu_core::capture::AdmittedCapturePlan,
+        plan: eredu_core::intervention::AdmittedInterventionPlan,
+    ) -> Result<(), eredu_core::capture::CaptureError> {
+        Self::validate_text_interventions(runtime, &capture, &plan)?;
+        eredu_runtime::intervention::install_session(
+            &mut state.capture,
+            capture,
+            Some((
+                plan,
+                std::sync::Arc::new(super::intervention::NativeInterventionEstimator),
+            )),
+        )
+    }
+
     fn capture_discovery(
         runtime: &ModelRuntime<Self>,
     ) -> Result<eredu_core::capture::CaptureDiscovery, eredu_core::capture::CaptureError> {
@@ -1098,10 +1168,7 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
         plan: eredu_core::capture::AdmittedCapturePlan,
     ) -> Result<(), eredu_core::capture::CaptureError> {
         Self::validate_text_capture(runtime, &plan)?;
-        if !plan.is_empty() {
-            state.capture = Some(eredu_runtime::capture::CaptureSession::new(plan));
-        }
-        Ok(())
+        eredu_runtime::intervention::install_session(&mut state.capture, plan, None)
     }
 
     fn validate_text_capture(
@@ -1118,20 +1185,11 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
                     .into(),
             ));
         }
-        let discovery = Self::capture_discovery(runtime)?;
-        let checked = plan.plan().clone().admit(
-            &discovery.catalog,
-            &discovery.support,
-            &discovery.support.capture,
-            plan.request(),
-        )?;
-        if checked.identity() != plan.identity() {
-            return Err(CaptureError::Invalid(
-                "capture admission does not match this session's catalog".into(),
-            ));
-        }
-        super::bounded_capture::preflight(&checked)?;
-        Ok(())
+        eredu_runtime::capture::validate_session(
+            plan,
+            &Self::capture_discovery(runtime)?,
+            super::bounded_capture::estimate_shape,
+        )
     }
 
     fn take_text_capture(
@@ -1216,6 +1274,30 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
     ) -> Result<Submission<Self::Token, Self::TextCompletion>, Error> {
         let stream = runtime.backend().stream().clone();
         if let Some(capture) = &mut state.capture {
+            if prompt.with_borrowed(|input| {
+                input
+                    .parts
+                    .iter()
+                    .any(|part| part.modality() != InputModality::Text)
+            }) {
+                return Err(Error::ArchitectureModel("capture/interventions require ordinary text input; media execution is unsupported".into()));
+            }
+            let request = capture.plan().request();
+            let aligned = prompt.with_borrowed(|input| {
+                if input.parts.len() != 1 {
+                    return false;
+                }
+                let input::InputPayload::TokenIds(tokens) = input.parts[0].payload() else {
+                    return false;
+                };
+                let shape = tokens.shape();
+                shape.len() == 2
+                    && u64::try_from(shape[0]) == Ok(request.batch)
+                    && u64::try_from(shape[1]) == Ok(request.prompt_tokens)
+            });
+            if !aligned {
+                return Err(Error::ArchitectureModel("capture/interventions require one token-ID prompt matching admitted batch and prompt length".into()));
+            }
             capture
                 .begin_step(eredu_core::capture::CapturePhase::Prefill, 0)
                 .map_err(|e| Error::ArchitectureModel(e.to_string()))?;
@@ -1223,10 +1305,7 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
             let submission = session.submit_prefill_with_observer(
                 backend,
                 prompt,
-                &mut super::bounded_capture::BoundedObserver {
-                    capture,
-                    stream: &stream,
-                },
+                &mut super::bounded_capture::observer(capture, &stream),
             )?;
             let submission = Submission {
                 output: MlxModelOutput::new(Some(MlxTensor::from_array(submission.output))),
@@ -1267,10 +1346,7 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
             let submission = session.submit_decode_with_observer(
                 backend,
                 input,
-                &mut super::bounded_capture::BoundedObserver {
-                    capture,
-                    stream: &stream,
-                },
+                &mut super::bounded_capture::observer(capture, &stream),
             )?;
             let submission = Submission {
                 output: MlxModelOutput::new(Some(MlxTensor::from_array(submission.output))),

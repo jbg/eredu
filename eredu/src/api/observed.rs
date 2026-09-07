@@ -10,6 +10,7 @@ use eredu_core::{
     generation::{
         FinishReason, GenerationCancellationToken, ResolvedGenerationConfig, SemanticEvent,
     },
+    intervention::{AdmittedInterventionPlan, InterventionDiscovery, InterventionPlan},
     TextGenerationBackend,
 };
 use serde::{Deserialize, Serialize};
@@ -51,6 +52,7 @@ pub struct PreparedObservedGeneration {
     settings: PreparedChatGenerationSettings,
     resolved: ResolvedGenerationConfig,
     plan: AdmittedCapturePlan,
+    intervention: Option<AdmittedInterventionPlan>,
     session_identity: String,
     artifact_identity: Option<String>,
     trace_limits: TraceLimits,
@@ -64,6 +66,10 @@ impl PreparedObservedGeneration {
     /// Immutable admitted capture selections and request geometry.
     pub fn capture_plan(&self) -> &AdmittedCapturePlan {
         &self.plan
+    }
+    /// Immutable prospective intervention admission, absent for an ordinary run.
+    pub fn intervention_plan(&self) -> Option<&AdmittedInterventionPlan> {
+        self.intervention.as_ref()
     }
     /// Checkpoint defaults combined with explicit request settings.
     pub fn generation_config(&self) -> ResolvedGenerationConfig {
@@ -84,6 +90,9 @@ pub struct ObservedGenerationRecord {
     pub session_id: String,
     /// Digest of the admitted plan, catalog point semantics, and request shape.
     pub capture_plan_id: String,
+    /// Session/source-bound intervention identity, absent for an ordinary run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intervention_plan_id: Option<String>,
     /// Ordered generation progress or terminal outcome.
     pub event: ObservedGenerationEvent,
 }
@@ -124,7 +133,7 @@ pub enum ObservedGenerationEvent {
         committed: bool,
         /// Rank owning these complete values. Partitioned capture is rejected.
         rank: u32,
-        /// Bounded records, absent for a capture-none run.
+        /// Bounded records, absent when both capture and intervention plans are empty.
         captures: Option<CapturedStep>,
         /// Submission, capture, sampling, token read and exact completion elapsed time.
         step_seconds: f64,
@@ -215,6 +224,49 @@ impl std::io::Write for TraceCounter {
 }
 
 impl<B: TextGenerationBackend> LoadedModel<B> {
+    /// Returns genuine mutable points and actual loaded-session support.
+    pub fn intervention_discovery(&self) -> Result<InterventionDiscovery, CaptureError> {
+        B::intervention_discovery(&self.runtime)
+    }
+
+    /// Admits capture and intervention together before any native work. Plans apply
+    /// prospectively; cached states are never retroactively recomputed. Reset the
+    /// session before preparing an independent experiment. There is no hot plan
+    /// replacement or resumable snapshot API.
+    pub fn prepare_intervened_chat(
+        &self,
+        chat: &PreparedChat,
+        settings: PreparedChatGenerationSettings,
+        capture: CapturePlan,
+        intervention: InterventionPlan,
+        trace_limits: TraceLimits,
+    ) -> Result<PreparedObservedGeneration, PreparedChatError<B::Error>> {
+        let mut prepared = self.prepare_observed_chat(chat, settings, capture, trace_limits)?;
+        if intervention.schema_version != eredu_core::intervention::INTERVENTION_SCHEMA_VERSION {
+            return Err(CaptureError::Invalid("unsupported intervention schema".into()).into());
+        }
+        if intervention.operations.is_empty() {
+            return Ok(prepared);
+        }
+        let discovery = self.intervention_discovery()?;
+        if prepared
+            .artifact_identity
+            .as_ref()
+            .is_some_and(|identity| identity != &discovery.artifact_identity)
+        {
+            return Err(CaptureError::Invalid(
+                "capture/intervention source identities differ".into(),
+            )
+            .into());
+        }
+        let admitted =
+            intervention.admit(&discovery, prepared.plan.request(), &self.session_identity)?;
+        B::validate_text_interventions(&self.runtime, &prepared.plan, &admitted)?;
+        prepared.artifact_identity = Some(discovery.artifact_identity);
+        prepared.intervention = Some(admitted);
+        Ok(prepared)
+    }
+
     /// Returns the exact loaded session's retained catalog and capture support.
     pub fn capture_discovery(&self) -> Result<CaptureDiscovery, CaptureError> {
         B::capture_discovery(&self.runtime)
@@ -281,6 +333,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
             settings,
             resolved: config.sampling(),
             plan: admitted,
+            intervention: None,
             session_identity: self.session_identity.clone(),
             artifact_identity,
             trace_limits,
@@ -317,6 +370,10 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
             artifact_identity: prepared.artifact_identity,
             session_id: self.session_identity.clone(),
             capture_plan_id: prepared.plan.identity().into(),
+            intervention_plan_id: prepared
+                .intervention
+                .as_ref()
+                .map(|plan| plan.identity().into()),
             event: ObservedGenerationEvent::Completed {
                 reason: FinishReason::Cancelled,
                 generated_tokens: 0,
@@ -399,7 +456,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
                         cancellation,
                         on_event,
                     },
-                    Some((prepared.plan, &mut on_token)),
+                    Some((prepared.plan, prepared.intervention, &mut on_token)),
                 ),
             }
         };

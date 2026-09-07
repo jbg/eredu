@@ -18,6 +18,8 @@ pub use eredu_nn_macros::Parameterized;
 pub mod multimodal;
 /// Checked tensor-independent normalization and mask geometry.
 pub mod operation_geometry;
+/// Typed pre-dispatch controls for architecture-configured expert selectors.
+pub mod routing_intervention;
 /// Pure sequence layouts shared by patch-based encoders.
 pub mod sequence_layout;
 
@@ -1918,6 +1920,10 @@ pub struct GroupSelection<T> {
 }
 
 impl<T> GroupSelection<T> {
+    /// Consumes a decision into IDs, selected scores, and effective coefficients.
+    pub fn into_parts(self) -> (T, T, T) {
+        (self.group_indices, self.selected_scores, self.coefficients)
+    }
     /// Creates one selected group batch.
     pub fn new(group_indices: T, selected_scores: T, coefficients: T) -> Self {
         Self {
@@ -2252,6 +2258,20 @@ impl Default for GatedProductPolicy {
 
 /// Statically dispatched top-k selector.
 pub trait GroupSelectionOperator<T: Tensor>: Clone + Debug + Parameterized<T> {
+    /// Executes a validated pre-dispatch control using this selector's ordinary
+    /// scoring, grouping, normalization and scaling policy. Unsupported backends
+    /// reject rather than silently dispatching ordinary routes.
+    fn select_intervened(
+        &mut self,
+        _input: &T,
+        _control: &routing_intervention::GroupSelectionControl,
+        _context: &T::Context,
+    ) -> Result<routing_intervention::IntervenedGroupSelection<T>, Error> {
+        Err(Error::backend(
+            "pre-dispatch routing interventions are unsupported",
+        ))
+    }
+
     /// Selects group IDs and selection weights without host materialization.
     fn select(&mut self, logits: &T, context: &T::Context) -> Result<GroupSelection<T>, Error>;
 

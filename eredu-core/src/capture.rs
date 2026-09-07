@@ -723,6 +723,17 @@ pub enum CandidateScoreStage {
     RawLogitsBeforeSampling,
 }
 
+/// Whether raw candidates precede or follow mutation at the logits hook.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CandidateLogitsSource {
+    /// Before interventions at this hook; earlier hooks may already have changed it.
+    #[default]
+    Original,
+    /// After interventions at this hook, before ordinary sampler processing.
+    Effective,
+}
+
 /// One exact vocabulary identity and finite raw model score.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CaptureCandidate {
@@ -737,6 +748,9 @@ pub struct CaptureCandidate {
 pub struct CaptureCandidates {
     /// Explicit score-processing stage; never inferred to be a probability.
     pub stage: CandidateScoreStage,
+    /// Explicit intervention position. Older records describe original logits.
+    #[serde(default)]
+    pub source: CandidateLogitsSource,
     /// Descending scores; equal-score ordering follows the native sorter.
     pub candidates: Vec<CaptureCandidate>,
 }
@@ -979,6 +993,9 @@ pub struct CapturedStep {
     pub prediction_index: u64,
     /// At most one record for each admitted selection.
     pub records: Vec<CaptureRecord>,
+    /// Attributed intervention outcomes and optional evidence sharing these budgets.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub interventions: Vec<crate::intervention::InterventionRecord>,
     /// Reservations charged to this forward step.
     pub step_usage: CaptureUsage,
     /// Reservations charged since the start of this run.

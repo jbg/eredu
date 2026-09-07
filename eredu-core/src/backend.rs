@@ -1475,6 +1475,41 @@ pub trait TextGenerationBackend: BackendProvider {
     /// Exact completion retaining model execution and token sampling.
     type TextCompletion: Completion<Error = Self::Error>;
 
+    /// Returns genuine mutable points for this exact loaded session.
+    fn intervention_discovery(
+        _runtime: &ModelRuntime<Self>,
+    ) -> Result<crate::intervention::InterventionDiscovery, crate::capture::CaptureError> {
+        Err(crate::capture::CaptureError::Unsupported(
+            "backend has no intervention discovery".into(),
+        ))
+    }
+
+    /// Checks both plans without submitting work or changing model/sampler state.
+    fn validate_text_interventions(
+        runtime: &ModelRuntime<Self>,
+        capture: &crate::capture::AdmittedCapturePlan,
+        plan: &crate::intervention::AdmittedInterventionPlan,
+    ) -> Result<(), crate::capture::CaptureError> {
+        if !plan.is_empty() {
+            return Err(crate::capture::CaptureError::Unsupported(
+                "backend has no text interventions".into(),
+            ));
+        }
+        Self::validate_text_capture(runtime, capture)
+    }
+
+    /// Installs immutable plans before the first submission. Diagnostics and
+    /// evidence must share capture accounting and ordinary completion ownership.
+    fn configure_text_interventions(
+        runtime: &ModelRuntime<Self>,
+        state: &mut Self::TextGenerationState,
+        capture: crate::capture::AdmittedCapturePlan,
+        plan: crate::intervention::AdmittedInterventionPlan,
+    ) -> Result<(), crate::capture::CaptureError> {
+        Self::validate_text_interventions(runtime, &capture, &plan)?;
+        Self::configure_text_capture(runtime, state, capture)
+    }
+
     /// Returns observation facts retained from this session's admitted preparation.
     fn capture_discovery(
         _runtime: &ModelRuntime<Self>,
@@ -1731,6 +1766,25 @@ where
             ));
         }
         B::configure_text_capture(self.inner.runtime, &mut self.inner.backend_state, plan)
+    }
+
+    /// Installs admitted interventions and captures before ordinary generation.
+    pub fn enable_interventions(
+        &mut self,
+        capture: crate::capture::AdmittedCapturePlan,
+        plan: crate::intervention::AdmittedInterventionPlan,
+    ) -> Result<(), crate::capture::CaptureError> {
+        if !matches!(self.inner.step, Some(TextGenerationStep::Prefill(_))) {
+            return Err(crate::capture::CaptureError::Invalid(
+                "interventions must be configured before generation".into(),
+            ));
+        }
+        B::configure_text_interventions(
+            self.inner.runtime,
+            &mut self.inner.backend_state,
+            capture,
+            plan,
+        )
     }
 
     /// Establishes exact completion before delivering this step's host captures.

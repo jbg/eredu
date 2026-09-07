@@ -12,11 +12,26 @@ pub struct MlxModel {
     state_residency: eredu_runtime::CacheResidencyPolicy,
     distributed: Option<MlxDistributedSession>,
     capture_discovery: Option<eredu_core::capture::CaptureDiscovery>,
+    intervention_discovery: Option<eredu_core::intervention::InterventionDiscovery>,
     #[cfg(any(feature = "image", feature = "audio"))]
     processor: Option<ModelProcessor>,
 }
 
 impl MlxModel {
+    pub(crate) fn with_intervention_discovery(
+        mut self,
+        discovery: eredu_core::intervention::InterventionDiscovery,
+    ) -> Self {
+        self.intervention_discovery = Some(discovery);
+        self
+    }
+
+    pub(crate) fn take_intervention_discovery(
+        &mut self,
+    ) -> Option<eredu_core::intervention::InterventionDiscovery> {
+        self.intervention_discovery.take()
+    }
+
     pub(crate) fn new(
         model: Executable,
         floating_state_dtype_bytes: NonZeroU8,
@@ -30,6 +45,7 @@ impl MlxModel {
             state_residency,
             distributed: None,
             capture_discovery: None,
+            intervention_discovery: None,
             #[cfg(any(feature = "image", feature = "audio"))]
             processor: None,
         }

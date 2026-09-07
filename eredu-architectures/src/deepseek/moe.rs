@@ -256,7 +256,13 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> RoutedPlusSha
         O: ActivationObserver<B::Tensor, Error> + ?Sized,
     {
         let routes = match source {
-            RouteSource::Learned => self.router.select(input, context)?,
+            RouteSource::Learned => eredu_runtime::select_routes_with_observer(
+                &mut self.router,
+                input,
+                context,
+                path,
+                observer,
+            )?,
             RouteSource::Selected(ids) => self.router.select_indices(input, ids, context)?,
         };
         let routed = provider

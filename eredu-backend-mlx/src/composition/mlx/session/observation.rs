@@ -176,6 +176,37 @@ impl<O> RuntimeActivationObserver<Array, Exception> for ArrayObserverAdapter<'_,
 where
     O: RuntimeActivationObserver<MlxTensor, Exception> + ?Sized,
 {
+    fn routing_control(
+        &mut self,
+        path: &str,
+        rows: u64,
+    ) -> Result<Option<eredu_nn::routing_intervention::GroupSelectionControl>, Exception> {
+        self.inner.routing_control(path, rows)
+    }
+
+    fn routing_applied(
+        &mut self,
+        path: &str,
+        original: Option<eredu_runtime::RoutingDecision<'_, Array>>,
+        effective: eredu_runtime::RoutingDecision<'_, Array>,
+    ) -> Result<(), Exception> {
+        self.inner.routing_applied(
+            path,
+            original.map(|value| eredu_runtime::RoutingDecision {
+                ids: MlxTensor::ref_cast(value.ids),
+                coefficients: MlxTensor::ref_cast(value.coefficients),
+            }),
+            eredu_runtime::RoutingDecision {
+                ids: MlxTensor::ref_cast(effective.ids),
+                coefficients: MlxTensor::ref_cast(effective.coefficients),
+            },
+        )
+    }
+
+    fn routing_failed(&mut self, path: &str, message: &str) {
+        self.inner.routing_failed(path, message);
+    }
+
     fn observe(&mut self, path: &str, value: &Array) -> Result<(), Exception> {
         self.inner.observe(path, MlxTensor::ref_cast(value))
     }

@@ -10,10 +10,35 @@ impl ArtifactArchitecturePlan {
     /// Describes admitted family semantics and implemented observation points.
     /// This only reads the retained plan; it never opens weights or creates a device.
     pub fn architecture_descriptor(&self) -> ArchitectureDescriptor {
+        self.discovery_builder().finish()
+    }
+
+    /// Genuine mutable hooks declared alongside their instrumentation geometry.
+    /// This catalog is separate from read-only observations and graph nodes.
+    pub fn intervention_points(&self) -> Vec<eredu_core::intervention::InterventionPoint> {
+        let graph = self.discovery_builder();
+        graph
+            .interventions
+            .into_iter()
+            .filter(|point| {
+                graph
+                    .descriptor
+                    .observations
+                    .get(&if point.routing.is_some() {
+                        RoutingObservationField::SelectedExperts.path(&point.path)
+                    } else {
+                        point.path.clone()
+                    })
+                    .is_some()
+            })
+            .collect()
+    }
+
+    fn discovery_builder(&self) -> Builder {
         let mut graph = Builder::new();
         if let Some(projector) = self.gguf_media_projector() {
             families::gguf_composite(&mut graph, projector.model());
-            return graph.finish();
+            return graph;
         }
         if let Some(plan) = self.safetensors_architecture() {
             match plan.model() {
@@ -32,7 +57,7 @@ impl ArtifactArchitecturePlan {
                 other => families::remaining_gguf(&mut graph, other),
             }
         }
-        graph.finish()
+        graph
     }
 }
 
@@ -55,11 +80,49 @@ fn axes(width: usize) -> Vec<TensorAxis> {
 
 struct Builder {
     descriptor: ArchitectureDescriptor,
+    interventions: Vec<eredu_core::intervention::InterventionPoint>,
 }
 
 impl Builder {
+    fn routing_control(
+        &mut self,
+        node: &str,
+        path: &str,
+        spec: eredu_nn::TopKGroupSelectionSpec,
+        shared_experts: u32,
+        learned_coefficient_scale: bool,
+    ) {
+        use eredu_core::intervention::*;
+        use eredu_nn::GroupScoring as S;
+        let scoring = match spec.scoring() {
+            S::Softmax => RoutingScoring::Softmax,
+            S::SelectedSoftmax => RoutingScoring::SelectedSoftmax,
+            S::Sigmoid => RoutingScoring::Sigmoid,
+            S::SqrtSoftplus => RoutingScoring::SqrtSoftplus,
+            _ => return,
+        };
+        self.interventions.push(InterventionPoint {
+            path: path.into(), node_id: node.into(), stage: InterventionStage::RoutingBeforeDispatch,
+            axes: vec![TensorAxis { name: "token".into(), dimension: SymbolicDimension::TokenRows }, TensorAxis { name: "selected_expert".into(), dimension: SymbolicDimension::Known(spec.top_k() as usize) }],
+            dtypes: vec![], operations: vec![InterventionKind::ExcludeExperts, InterventionKind::ZeroExpertContribution, InterventionKind::BiasRoutingScores, InterventionKind::ForceExperts],
+            score_stages: vec![RoutingScoreStage::RawLogits, RoutingScoreStage::TransformedScores, RoutingScoreStage::RankingScores],
+            prefill: ObservationSupportStatus::Unverified("requires loaded-session routing mechanisms".into()),
+            decode: ObservationSupportStatus::Unverified("requires loaded-session routing mechanisms".into()),
+            conditions: vec!["Global routed-expert IDs; shared experts are unchanged".into(),
+                "Force selects exactly top-k distinct IDs per selected token row and uses architecture weights".into(),
+                "Zero contribution preserves IDs and other coefficient magnitudes; expert computation may still occur".into()],
+            routing: Some(InterventionRoutingPolicy {
+                expert_count: spec.group_count() as u32, top_k: spec.top_k() as u32, scoring,
+                normalize_selected: spec.normalize_selected(), normalization_epsilon: spec.normalization_epsilon(),
+                coefficient_scale: spec.coefficient_scale(), groups: spec.selection_partitions() as u32,
+                selected_groups: spec.selected_groups() as u32, learned_coefficient_scale, shared_experts,
+            }),
+        });
+    }
+
     fn new() -> Self {
         Self {
+            interventions: vec![],
             descriptor: ArchitectureDescriptor {
                 schema_version: DISCOVERY_SCHEMA_VERSION,
                 nodes: vec![],
@@ -158,6 +221,33 @@ impl Builder {
         shape: Option<Vec<TensorAxis>>,
         routing: bool,
     ) {
+        // The activation-hook declaration registers both surfaces. Read-only
+        // routing events deliberately create no mutable intervention target.
+        if !routing {
+            use eredu_core::intervention::*;
+            let logits = path == MODEL_LOGITS_OBSERVATION_PATH;
+            let mut operations = vec![
+                InterventionKind::Zero,
+                InterventionKind::Scale,
+                InterventionKind::Mask,
+                InterventionKind::Replace,
+                InterventionKind::Add,
+            ];
+            if logits {
+                operations.push(InterventionKind::MaskLogits);
+            }
+            self.interventions.push(InterventionPoint {
+                path: path.clone(), node_id: node.into(),
+                stage: if logits { InterventionStage::LogitsBeforeSampling } else { InterventionStage::Activation },
+                axes: shape.clone().unwrap_or_default(),
+                dtypes: vec![InterventionDtype::Float32, InterventionDtype::Float16, InterventionDtype::Bfloat16],
+                operations, score_stages: vec![],
+                prefill: ObservationSupportStatus::Unverified("requires loaded-session support".into()),
+                decode: ObservationSupportStatus::Unverified("requires loaded-session support".into()),
+                conditions: vec!["Runtime dtype must exactly match the plan; no payload broadcasting or dtype conversion".into()],
+                routing: None,
+            });
+        }
         self.get_mut(node).observation_paths.push(path.clone());
         self.descriptor.observations.points.push(ObservationPoint {
             path,

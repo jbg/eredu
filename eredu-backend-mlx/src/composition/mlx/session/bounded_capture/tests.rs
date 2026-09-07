@@ -204,6 +204,7 @@ fn bounded_native_candidates_use_last_prediction_raw_scores() {
         panic!()
     };
     assert_eq!(result.stage, CandidateScoreStage::RawLogitsBeforeSampling);
+    assert_eq!(result.source, CandidateLogitsSource::Original);
     assert_eq!(
         result.candidates,
         [

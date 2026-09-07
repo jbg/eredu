@@ -647,6 +647,8 @@ dependencies = [
  "eredu-codec",
  "eredu-core",
  "eredu-nn",
+ "eredu-runtime",
+ "half",
  "safetensors",
  "sentencepiece-rs",
  "serde",

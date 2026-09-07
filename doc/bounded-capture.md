@@ -22,6 +22,15 @@ tokenizer, or text-decoding loop. `CapturePlan::none()` means none; an empty
 selection list also means none. The older `ObservationRequest` retains its
 capture-all interpretation of empty selectors for compatibility.
 
+Use `intervention_discovery` and `prepare_intervened_chat` to admit prospective
+activation/routing controls together with capture, then call the same
+`generate_observed_chat`. Intervention outcomes and before/after evidence share
+capture budgets and native completion ownership. Shared session validation and
+observer forwarding serve capture-only and combined runs. Additional original
+routing-decision resources use backend estimates at admission and runtime, while
+evidence transforms keep their existing capture charges. See
+[intervention plans](interventions.md) for the estimator and backend integration contracts.
+
 Run the complete facade example, with an artifact containing tokenizer and chat
 metadata:
 

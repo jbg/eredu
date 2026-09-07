@@ -506,3 +506,235 @@ fn invalid_configuration_is_returned_as_a_total_report() {
     );
     assert!(!report.issues.is_empty());
 }
+
+#[test]
+fn native_intervention_loaded_dense_preserves_rng_and_returns_effective_logits() {
+    use eredu_core::{
+        capture::*, intervention::*, ControlledTextGeneration, GenerationConfigOverrides,
+        ModelRuntime, TextGenerationBackend, TextGenerationConfig,
+    };
+    struct Unconstrained;
+    impl eredu_core::TokenFilterController for Unconstrained {
+        type Error = std::convert::Infallible;
+        fn current_filter(&mut self) -> Result<eredu_core::TokenFilter, Self::Error> {
+            Ok(eredu_core::TokenFilter::All)
+        }
+        fn commit_token(&mut self, _: u32) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        fn is_complete(&mut self) -> Result<bool, Self::Error> {
+            Ok(false)
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    write_safetensors_fixture_with_fill(root.path(), 0.03);
+    let stream = crate::test_stream();
+    let backend = crate::native::backend(stream, stream);
+    let model = eredu_core::load_model(&backend, root.path(), MlxLoadRequest::default()).unwrap();
+    let mut runtime = ModelRuntime::from_prepared(backend, model).unwrap();
+    let discovery =
+        <crate::backend::MlxBackend as TextGenerationBackend>::intervention_discovery(&runtime)
+            .unwrap();
+    let captures =
+        <crate::backend::MlxBackend as TextGenerationBackend>::capture_discovery(&runtime).unwrap();
+    let request = CaptureRequestShape {
+        batch: 1,
+        prompt_tokens: 2,
+        max_predictions: 4,
+    };
+    let budget = CaptureUsage {
+        captures: 1000,
+        retained_bytes: 1_000_000_000,
+        host_bytes: 10_000_000,
+        encoded_bytes: 10_000_000,
+    };
+    let capture = CapturePlan {
+        schema_version: 1,
+        selections: vec![],
+        limits: CaptureLimits {
+            per_step: budget,
+            cumulative: budget,
+            physical_native_bytes: None,
+            on_limit: CaptureLimitPolicy::Fail,
+        },
+    }
+    .admit(
+        &captures.catalog,
+        &captures.support,
+        &captures.support.capture,
+        request,
+    )
+    .unwrap();
+    let sampling = eredu_core::resolve_generation_config(
+        None,
+        GenerationConfigOverrides {
+            temperature: Some(0.7),
+            max_new_tokens: Some(4),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mut results = Vec::new();
+    for experiment in 0..3 {
+        runtime.parts_mut().1.reset().unwrap();
+        let operations = if experiment == 1 {
+            discovery
+                .points
+                .iter()
+                .filter(|point| point.prefill == eredu_core::ObservationSupportStatus::Supported)
+                .enumerate()
+                .map(|(i, point)| InterventionOperation {
+                    id: format!("identity-{i}"),
+                    target: point.path.clone(),
+                    schedule: CaptureSchedule::default(),
+                    slices: vec![],
+                    action: InterventionAction::Scale {
+                        dtype: InterventionDtype::Float32,
+                        factor: 1.0,
+                    },
+                    evidence: InterventionEvidence::Preview { max_elements: 2 },
+                })
+                .collect()
+        } else if experiment == 2 {
+            let mut values = vec![-1000.0; 64];
+            values[7] = 1000.0;
+            vec![InterventionOperation {
+                id: "force-token".into(),
+                target: eredu_core::MODEL_LOGITS_OBSERVATION_PATH.into(),
+                schedule: CaptureSchedule {
+                    decode: false,
+                    ..Default::default()
+                },
+                slices: vec![CaptureSlice {
+                    axis: "sequence".into(),
+                    start: 1,
+                    end: 2,
+                    stride: 1,
+                }],
+                action: InterventionAction::Replace {
+                    tensor: InterventionTensor {
+                        shape: vec![1, 1, 64],
+                        values: InterventionValues::Float32(values),
+                    },
+                },
+                evidence: InterventionEvidence::Preview { max_elements: 8 },
+            }]
+        } else {
+            vec![]
+        };
+        let plan = InterventionPlan {
+            schema_version: 1,
+            operations,
+        }
+        .admit(&discovery, request, "native-test-session")
+        .unwrap();
+        <crate::backend::MlxBackend as TextGenerationBackend>::validate_text_interventions(
+            &runtime, &capture, &plan,
+        )
+        .unwrap();
+        let mut generator = ControlledTextGeneration::new(
+            &mut runtime,
+            vec![1, 2],
+            TextGenerationConfig::new(sampling).with_seed(73),
+            Unconstrained,
+        )
+        .unwrap();
+        if experiment != 0 {
+            generator
+                .enable_interventions(capture.clone(), plan)
+                .unwrap();
+        }
+        let mut tokens = Vec::new();
+        while let Some(token) = generator.next() {
+            tokens.push(token.unwrap().token_id());
+            if experiment != 0 {
+                let step = generator.take_captured_step().unwrap().unwrap();
+                for record in &step.interventions {
+                    assert_eq!(
+                        record.outcome,
+                        if experiment == 2 && step.prediction_index > 0 {
+                            InterventionOutcome::Inactive
+                        } else {
+                            InterventionOutcome::Applied
+                        }
+                    );
+                    if record.outcome == InterventionOutcome::Applied {
+                        assert_eq!(record.evidence.len(), 2);
+                        assert!(record.evidence.iter().all(|e| e.payload.is_some()));
+                    }
+                }
+            }
+        }
+        drop(generator);
+        results.push(tokens);
+    }
+    assert_eq!(
+        results[0], results[1],
+        "scale-one interventions must preserve the ordinary sampler RNG progression"
+    );
+    assert_eq!(
+        results[2][0], 7,
+        "the ordinary sampler must consume the replacement logits"
+    );
+    for (fail_dtype, prompt_mismatch) in [(false, false), (true, false), (false, true)] {
+        runtime.parts_mut().1.reset().unwrap();
+        let plan = InterventionPlan {
+            schema_version: 1,
+            operations: vec![InterventionOperation {
+                id: "lifecycle".into(),
+                target: eredu_core::MODEL_LOGITS_OBSERVATION_PATH.into(),
+                schedule: CaptureSchedule::default(),
+                slices: vec![],
+                action: InterventionAction::Scale {
+                    dtype: if fail_dtype {
+                        InterventionDtype::Float16
+                    } else {
+                        InterventionDtype::Float32
+                    },
+                    factor: 1.0,
+                },
+                evidence: InterventionEvidence::Preview { max_elements: 2 },
+            }],
+        }
+        .admit(&discovery, request, "native-test-session")
+        .unwrap();
+        let mut generator = ControlledTextGeneration::new(
+            &mut runtime,
+            if prompt_mismatch { vec![1] } else { vec![1, 2] },
+            TextGenerationConfig::new(sampling).with_seed(73),
+            Unconstrained,
+        )
+        .unwrap();
+        generator
+            .enable_interventions(capture.clone(), plan.clone())
+            .unwrap();
+        let result = generator.next().unwrap();
+        if prompt_mismatch {
+            assert!(result.is_err());
+            assert!(
+                generator.take_captured_step().unwrap().is_none(),
+                "known prompt mismatch must fail before starting the native step"
+            );
+        } else if fail_dtype {
+            assert!(result.is_err());
+            let step = generator.take_captured_step().unwrap().unwrap();
+            assert!(matches!(
+                step.interventions[0].outcome,
+                InterventionOutcome::Failed { .. }
+            ));
+        } else {
+            assert_eq!(result.unwrap().token_id(), results[0][0]);
+            assert!(
+                generator
+                    .enable_interventions(capture.clone(), plan)
+                    .is_err(),
+                "hot replacement after prefill must fail"
+            );
+        }
+        // Drop an unfinished run, including a failed forward that may have written
+        // cache state. The native owner must settle work before reset can succeed.
+        drop(generator);
+        runtime.parts_mut().1.reset().unwrap();
+    }
+    runtime.parts_mut().1.reset().unwrap();
+}

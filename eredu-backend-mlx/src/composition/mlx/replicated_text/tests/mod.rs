@@ -2,6 +2,7 @@ use super::*;
 
 mod admission_failures;
 mod execution;
+mod routing_interventions;
 mod selection_and_lowering;
 mod state_and_controls;
 

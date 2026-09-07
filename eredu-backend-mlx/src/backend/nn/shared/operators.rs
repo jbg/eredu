@@ -385,6 +385,31 @@ impl Parameterized<MlxTensor> for MlxTopKGroupSelector {
 }
 
 impl GroupSelectionOperator<MlxTensor> for MlxTopKGroupSelector {
+    fn select_intervened(
+        &mut self,
+        input: &MlxTensor,
+        control: &eredu_nn::routing_intervention::GroupSelectionControl,
+        context: &Stream,
+    ) -> Result<eredu_nn::routing_intervention::IntervenedGroupSelection<MlxTensor>, ComputeError>
+    {
+        let (original, effective) = compute(self.module.select_intervened(
+            input.as_array(),
+            control,
+            context,
+        ))?;
+        let convert = |output: super::super::grouped::GroupSelectionOutput| {
+            GroupSelection::new(
+                MlxTensor::from_array(output.indices),
+                MlxTensor::from_array(output.scores),
+                MlxTensor::from_array(output.weights),
+            )
+        };
+        Ok(eredu_nn::routing_intervention::IntervenedGroupSelection {
+            original: original.map(convert),
+            effective: convert(effective),
+        })
+    }
+
     fn select(
         &mut self,
         input: &MlxTensor,
