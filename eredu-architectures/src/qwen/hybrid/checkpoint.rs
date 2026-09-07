@@ -189,56 +189,16 @@ pub fn unit_recipes(
     } else {
         format!("mtp.layers.{}.mlp.experts", flat - target_layers)
     };
-    let gate_up = format!("{root}.gate_up_proj");
-    if store.tensor_metadata(&gate_up).is_err() {
-        let gate = format!("{root}.gate_proj");
-        let up = format!("{root}.up_proj");
-        if store.tensor_metadata(&gate).is_ok() && store.tensor_metadata(&up).is_ok() {
-            recipes.insert(
-                gate_up,
-                DerivedWeightRecipe::Concatenate {
-                    axis: 1,
-                    inputs: vec![
-                        DerivedWeightRecipe::source(gate, TensorSelection::Full),
-                        DerivedWeightRecipe::source(up, TensorSelection::Full),
-                    ],
-                },
-            );
-        } else {
-            let inputs = (0..config.num_experts)
-                .map(|expert| DerivedWeightRecipe::Concatenate {
-                    axis: 0,
-                    inputs: vec![
-                        DerivedWeightRecipe::source(
-                            format!("{root}.{expert}.gate_proj.weight"),
-                            TensorSelection::Full,
-                        ),
-                        DerivedWeightRecipe::source(
-                            format!("{root}.{expert}.up_proj.weight"),
-                            TensorSelection::Full,
-                        ),
-                    ],
-                })
-                .collect();
-            recipes.insert(gate_up, DerivedWeightRecipe::Stack { axis: 0, inputs });
+    for (binding, recipe) in expert_bank_recipes(
+        store,
+        &root,
+        0..config.num_experts as usize,
+        TensorSelection::Full,
+    )? {
+        let target = format!("{root}.{binding}");
+        if recipe != DerivedWeightRecipe::source(&target, TensorSelection::Full) {
+            recipes.insert(target, recipe);
         }
-    }
-    let down = format!("{root}.down_proj");
-    if store.tensor_metadata(&down).is_err() {
-        recipes.insert(
-            down,
-            DerivedWeightRecipe::Stack {
-                axis: 0,
-                inputs: (0..config.num_experts)
-                    .map(|expert| {
-                        DerivedWeightRecipe::source(
-                            format!("{root}.{expert}.down_proj.weight"),
-                            TensorSelection::Full,
-                        )
-                    })
-                    .collect(),
-            },
-        );
     }
     Ok(recipes)
 }
@@ -304,17 +264,35 @@ pub fn expert_recipes<C: RecipeCatalog + ?Sized>(
     } else {
         format!("mtp.layers.{}.mlp.experts", layer - target)
     };
-    let selection = TensorSelection::Range {
-        axis: 0,
-        start: expert,
-        end: expert + 1,
+    expert_bank_recipes(
+        catalog,
+        &root,
+        expert..expert + 1,
+        TensorSelection::Range {
+            axis: 0,
+            start: expert,
+            end: expert + 1,
+        },
+    )
+}
+
+// Keep physical aliases and FP8 companions identical for full-bank preparation
+// and independently resident experts. Recipes retain the selected physical keys.
+fn expert_bank_recipes<C: RecipeCatalog + ?Sized>(
+    catalog: &C,
+    root: &str,
+    experts: std::ops::Range<usize>,
+    selection: TensorSelection,
+) -> Result<BTreeMap<String, DerivedWeightRecipe>, String> {
+    let source = |name: &str| {
+        std::iter::once(name.to_owned())
+            .chain(aliases(name))
+            .find(|name| catalog.tensor_metadata(name).is_ok())
     };
-    let packed = catalog
-        .tensor_metadata(&format!("{root}.gate_up_proj"))
-        .is_ok();
+    let packed = source(&format!("{root}.gate_up_proj")).is_some();
     let split_banks = ["gate_proj", "up_proj", "down_proj"]
         .into_iter()
-        .all(|name| catalog.tensor_metadata(&format!("{root}.{name}")).is_ok());
+        .all(|name| source(&format!("{root}.{name}")).is_some());
     let mut recipes = BTreeMap::new();
     if packed {
         for (target_name, required) in [
@@ -327,15 +305,15 @@ pub fn expert_recipes<C: RecipeCatalog + ?Sized>(
             ("down_proj_scales", false),
             ("down_proj_biases", false),
         ] {
-            let source = format!("{root}.{target_name}");
-            if catalog.tensor_metadata(&source).is_err() {
+            let name = format!("{root}.{target_name}");
+            let Some(source) = source(&name) else {
                 if required {
-                    return Err(format!("missing packed Qwen hybrid expert tensor {source}"));
+                    return Err(format!("missing packed Qwen hybrid expert tensor {name}"));
                 }
                 continue;
-            }
+            };
             recipes.insert(
-                target_name.into(),
+                target_name.replace("_scale_inv", "_scales"),
                 DerivedWeightRecipe::source(source, selection.clone()),
             );
         }
@@ -347,21 +325,32 @@ pub fn expert_recipes<C: RecipeCatalog + ?Sized>(
                 inputs: ["gate_proj", "up_proj"]
                     .into_iter()
                     .map(|name| {
-                        DerivedWeightRecipe::source(format!("{root}.{name}"), selection.clone())
+                        DerivedWeightRecipe::source(
+                            source(&format!("{root}.{name}")).expect("split bank exists"),
+                            selection.clone(),
+                        )
                     })
                     .collect(),
             },
         );
         recipes.insert(
             "down_proj".into(),
-            DerivedWeightRecipe::source(format!("{root}.down_proj"), selection.clone()),
+            DerivedWeightRecipe::source(
+                source(&format!("{root}.down_proj")).expect("split bank exists"),
+                selection.clone(),
+            ),
         );
         for suffix in ["scales", "biases", "scale_inv"] {
-            let gate = format!("{root}.gate_proj_{suffix}");
-            let up = format!("{root}.up_proj_{suffix}");
-            if catalog.tensor_metadata(&gate).is_ok() && catalog.tensor_metadata(&up).is_ok() {
+            let gate = source(&format!("{root}.gate_proj_{suffix}"));
+            let up = source(&format!("{root}.up_proj_{suffix}"));
+            let target_suffix = if suffix == "scale_inv" {
+                "scales"
+            } else {
+                suffix
+            };
+            if let (Some(gate), Some(up)) = (gate, up) {
                 recipes.insert(
-                    format!("gate_up_proj_{suffix}"),
+                    format!("gate_up_proj_{target_suffix}"),
                     DerivedWeightRecipe::Concatenate {
                         axis: 1,
                         inputs: vec![
@@ -371,65 +360,64 @@ pub fn expert_recipes<C: RecipeCatalog + ?Sized>(
                     },
                 );
             }
-            let down = format!("{root}.down_proj_{suffix}");
-            if catalog.tensor_metadata(&down).is_ok() {
+            if let Some(down) = source(&format!("{root}.down_proj_{suffix}")) {
                 recipes.insert(
-                    format!("down_proj_{suffix}"),
+                    format!("down_proj_{target_suffix}"),
                     DerivedWeightRecipe::source(down, selection.clone()),
                 );
             }
         }
     } else {
-        let projection = |names: &[&str], suffix: &str| {
-            names
-                .iter()
-                .map(|name| format!("{root}.{expert}.{name}.{suffix}"))
-                .find(|name| catalog.tensor_metadata(name).is_ok())
-                .map(|name| DerivedWeightRecipe::source(name, TensorSelection::Full))
-                .ok_or_else(|| {
-                    format!("missing split Qwen hybrid expert {expert} tensor under {root}")
-                })
-        };
-        let gate = projection(&["gate_proj", "w1"], "weight")?;
-        let up = projection(&["up_proj", "w3"], "weight")?;
-        let down = projection(&["down_proj", "w2"], "weight")?;
-        recipes.insert(
-            "gate_up_proj".into(),
-            DerivedWeightRecipe::Stack {
-                axis: 0,
-                inputs: vec![DerivedWeightRecipe::Concatenate {
-                    axis: 0,
-                    inputs: vec![gate, up],
-                }],
-            },
-        );
-        recipes.insert(
-            "down_proj".into(),
-            DerivedWeightRecipe::Stack {
-                axis: 0,
-                inputs: vec![down],
-            },
-        );
-        if let (Ok(gate), Ok(up), Ok(down)) = (
-            projection(&["gate_proj", "w1"], "weight_scale_inv"),
-            projection(&["up_proj", "w3"], "weight_scale_inv"),
-            projection(&["down_proj", "w2"], "weight_scale_inv"),
-        ) {
+        for (suffix, target_suffix) in [("weight", ""), ("weight_scale_inv", "_scales")] {
+            let mut gate_up_inputs = Vec::new();
+            let mut down_inputs = Vec::new();
+            for expert in experts.clone() {
+                let projection = |names: &[&str]| {
+                    names.iter().find_map(|name| {
+                        source(&format!("{root}.{expert}.{name}.{suffix}"))
+                            .map(|name| DerivedWeightRecipe::source(name, TensorSelection::Full))
+                    })
+                };
+                match (
+                    projection(&["gate_proj", "w1"]),
+                    projection(&["up_proj", "w3"]),
+                    projection(&["down_proj", "w2"]),
+                ) {
+                    (Some(gate), Some(up), Some(down)) => {
+                        gate_up_inputs.push(DerivedWeightRecipe::Concatenate {
+                            axis: 0,
+                            inputs: vec![gate, up],
+                        });
+                        down_inputs.push(down);
+                    }
+                    (None, None, None) if suffix != "weight" => {}
+                    _ => {
+                        return Err(format!(
+                            "missing split Qwen hybrid expert {expert} {suffix} tensor under {root}"
+                        ));
+                    }
+                }
+            }
+            if gate_up_inputs.is_empty() {
+                continue;
+            }
+            if gate_up_inputs.len() != experts.len() {
+                return Err(format!(
+                    "incomplete Qwen hybrid expert {suffix} bank under {root}"
+                ));
+            }
             recipes.insert(
-                "gate_up_proj_scale_inv".into(),
+                format!("gate_up_proj{target_suffix}"),
                 DerivedWeightRecipe::Stack {
                     axis: 0,
-                    inputs: vec![DerivedWeightRecipe::Concatenate {
-                        axis: 0,
-                        inputs: vec![gate, up],
-                    }],
+                    inputs: gate_up_inputs,
                 },
             );
             recipes.insert(
-                "down_proj_scale_inv".into(),
+                format!("down_proj{target_suffix}"),
                 DerivedWeightRecipe::Stack {
                     axis: 0,
-                    inputs: vec![down],
+                    inputs: down_inputs,
                 },
             );
         }
@@ -472,11 +460,9 @@ pub fn expert_residency_catalog<C: RecipeCatalog + ?Sized>(
         for expert in 0..experts {
             let recipes = expert_recipes(catalog, config, layer, expert)?;
             let gate_up_quantizable = !recipes.contains_key("gate_up_proj_scales")
-                && !recipes.contains_key("gate_up_proj_biases")
-                && !recipes.contains_key("gate_up_proj_scale_inv");
+                && !recipes.contains_key("gate_up_proj_biases");
             let down_quantizable = !recipes.contains_key("down_proj_scales")
-                && !recipes.contains_key("down_proj_biases")
-                && !recipes.contains_key("down_proj_scale_inv");
+                && !recipes.contains_key("down_proj_biases");
             let parameters = recipes
                 .into_iter()
                 .map(|(binding, recipe)| {
@@ -1648,6 +1634,8 @@ mod tests {
             "linear_num_key_heads": 2,
             "linear_num_value_heads": 4,
             "intermediate_size": 48,
+            "num_experts": 0,
+            "num_experts_per_tok": 0,
             "layer_types": ["linear_attention", "full_attention"]
         }))
         .unwrap()
@@ -1733,7 +1721,7 @@ mod tests {
     }
 
     #[test]
-    fn qwen36_fp8_checkpoint_admits_aliased_convolution_and_dense_recurrent_projections() {
+    fn qwen36_fp8_checkpoint_admits_and_prepares_aliased_experts() {
         // Reduced Qwen/Qwen3.6-35B-A3B-FP8 layout from revision
         // 95a723d08a9490559dae23d0cff1d9466213d989: separate FP8 expert matrices,
         // BF16 recurrent controls, and top-level exclusions in checkpoint names.
@@ -1743,7 +1731,7 @@ mod tests {
             "language_model",
             "model.model",
         ] {
-            let config = model_args_from_config_value(&json!({
+            let config_value = json!({
                 "model_type": "qwen3_5_moe",
                 "quantization_config": {
                     "quant_method": "fp8", "fmt": "e4m3",
@@ -1761,12 +1749,12 @@ mod tests {
                     "max_position_embeddings": 128, "linear_conv_kernel_dim": 4,
                     "linear_key_head_dim": 8, "linear_value_head_dim": 8,
                     "linear_num_key_heads": 2, "linear_num_value_heads": 4,
-                    "moe_intermediate_size": 16, "shared_expert_intermediate_size": 16,
+                    "moe_intermediate_size": 128, "shared_expert_intermediate_size": 16,
                     "num_experts": 2, "num_experts_per_tok": 1,
                     "layer_types": ["linear_attention"]
                 }
-            }))
-            .unwrap();
+            });
+            let config = model_args_from_config_value(&config_value).unwrap();
             let plan = composite_safetensors_plan(&config).unwrap();
             let mut tensors = Vec::new();
             for (name, shape) in [
@@ -1793,12 +1781,12 @@ mod tests {
                 ("mlp.shared_expert.gate_proj", vec![16, 32]),
                 ("mlp.shared_expert.up_proj", vec![16, 32]),
                 ("mlp.shared_expert.down_proj", vec![32, 16]),
-                ("mlp.experts.0.gate_proj", vec![16, 32]),
-                ("mlp.experts.0.up_proj", vec![16, 32]),
-                ("mlp.experts.0.down_proj", vec![32, 16]),
-                ("mlp.experts.1.gate_proj", vec![16, 32]),
-                ("mlp.experts.1.up_proj", vec![16, 32]),
-                ("mlp.experts.1.down_proj", vec![32, 16]),
+                ("mlp.experts.0.gate_proj", vec![128, 32]),
+                ("mlp.experts.0.up_proj", vec![128, 32]),
+                ("mlp.experts.0.down_proj", vec![32, 128]),
+                ("mlp.experts.1.gate_proj", vec![128, 32]),
+                ("mlp.experts.1.up_proj", vec![128, 32]),
+                ("mlp.experts.1.down_proj", vec![32, 128]),
             ] {
                 let name = format!("{prefix}.layers.0.{name}.weight");
                 let bytes = vec![0; shape.iter().product::<usize>()];
@@ -1817,6 +1805,91 @@ mod tests {
             assert!(resolved
                 .source_keys()
                 .contains(&format!("{prefix}.layers.0.linear_attn.conv1d.weight")));
+
+            let artifact = tempfile::tempdir().unwrap();
+            std::fs::write(
+                artifact.path().join("config.json"),
+                serde_json::to_vec(&config_value).unwrap(),
+            )
+            .unwrap();
+            safetensors::tensor::serialize_to_file(
+                tensors.iter().map(|(name, dtype, shape, bytes)| {
+                    (
+                        name.as_str(),
+                        safetensors::tensor::TensorView::new(*dtype, shape.clone(), bytes).unwrap(),
+                    )
+                }),
+                None,
+                &artifact.path().join("model.safetensors"),
+            )
+            .unwrap();
+            let inspection = crate::configuration::inspect_artifact(artifact.path()).unwrap();
+            let execution = crate::replicated_text::replicated_text_execution_class(&inspection)
+                .unwrap_or_else(|error| panic!("{prefix}: {error}"));
+            let crate::replicated_text::ReplicatedTextExecutionClass::Routed(requirements) =
+                execution
+            else {
+                panic!("expected routed Qwen execution for {prefix}");
+            };
+            for (binding, shape, dtype) in [
+                (
+                    "gate_up_proj",
+                    vec![2, 256, 32],
+                    eredu_checkpoint::recipe::RecipeDtype::F8E4M3,
+                ),
+                (
+                    "down_proj",
+                    vec![2, 32, 128],
+                    eredu_checkpoint::recipe::RecipeDtype::F8E4M3,
+                ),
+                (
+                    "gate_up_proj_scales",
+                    vec![2, 2, 1],
+                    eredu_checkpoint::recipe::RecipeDtype::F32,
+                ),
+                (
+                    "down_proj_scales",
+                    vec![2, 1, 1],
+                    eredu_checkpoint::recipe::RecipeDtype::F32,
+                ),
+            ] {
+                let target = format!("model.layers.0.mlp.experts.{binding}");
+                let parameter = requirements
+                    .text()
+                    .parameters()
+                    .iter()
+                    .find(|parameter| parameter.name() == target)
+                    .unwrap();
+                assert_eq!(
+                    parameter.native_executable(),
+                    if binding.ends_with("_scales") {
+                        eredu_checkpoint::LinearFormat::Dense
+                    } else {
+                        config.text.linear_format(&target)
+                    }
+                );
+                let recipe = &requirements.text().derived_recipes()[&target];
+                let output = recipe.infer(&store).unwrap();
+                assert_eq!(output.shape, shape, "{prefix}: {target}");
+                assert_eq!(output.dtype, dtype, "{prefix}: {target}");
+                assert!(recipe
+                    .source_keys()
+                    .iter()
+                    .all(|key| key.starts_with(&format!("{prefix}.layers.0.mlp.experts."))));
+                for expert in 0..2 {
+                    let recipes = expert_recipes(&store, &config.text, 0, expert).unwrap();
+                    let output = recipes[binding].infer(&store).unwrap();
+                    let mut selected_shape = shape.clone();
+                    selected_shape[0] = 1;
+                    assert_eq!(output.shape, selected_shape);
+                    assert_eq!(output.dtype, dtype);
+                    assert!(recipes[binding]
+                        .source_keys()
+                        .iter()
+                        .all(|key| key
+                            .starts_with(&format!("{prefix}.layers.0.mlp.experts.{expert}."))));
+                }
+            }
 
             // Honoring dense exclusions must preserve strict FP8 scale admission.
             tensors.retain(|(name, _, _, _)| !name.ends_with("in_proj_qkv.weight_scale_inv"));

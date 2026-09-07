@@ -3,7 +3,7 @@ use super::*;
 const GROUPED_PROJECTION_CHUNK_THRESHOLD: i32 = 64;
 const GROUPED_PROJECTION_CHUNK_TOKENS: i32 = 32;
 
-/// Packed gated-product bank with optional MLX affine or MXFP4 projections.
+/// Packed gated-product bank with optional MLX affine, MXFP4, or block-FP8 projections.
 #[derive(Debug, Clone, PhysicalParameters)]
 #[module(root = crate)]
 pub struct PackedGatedProductGroups {
@@ -23,8 +23,8 @@ pub struct PackedGatedProductGroups {
     pub gate_up_iquant: Option<WeightQuantization>,
     /// Optional checkpoint-native IQ encoding for the down projection.
     pub down_iquant: Option<WeightQuantization>,
-    /// Whether weights/scales use checkpoint-native block FP8 with E8M0 scales.
-    pub native_fp8_e8m0: bool,
+    /// Whether projections use checkpoint-native block FP8.
+    pub native_fp8: bool,
     #[param]
     /// Concatenated gate/up weights shaped `[groups, 2 * intermediate, hidden]`.
     pub gate_up_proj: PhysicalParam<Array>,
@@ -195,7 +195,7 @@ impl PackedGatedProductGroups {
             down_affine,
             gate_up_iquant,
             down_iquant,
-            native_fp8_e8m0: false,
+            native_fp8: false,
             gate_up_proj,
             gate_up_proj_bias: if projection_biases[0] {
                 PhysicalParam::<Option<Array>>::unloaded_some(
@@ -233,7 +233,20 @@ impl PackedGatedProductGroups {
     }
 
     /// Rebuilds projection storage for native block-FP8 group tensors.
-    pub fn with_native_fp8_e8m0(mut self, stream: &Stream) -> Result<Self, Exception> {
+    pub fn with_native_fp8(
+        mut self,
+        format: eredu_checkpoint::BlockFp8Format,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
+        if format.block_rows != 128 || format.block_columns != 128 {
+            return Err(Exception::custom(
+                "MLX block-FP8 groups require [128, 128] blocks",
+            ));
+        }
+        let scale_dtype = match format.scale_encoding {
+            eredu_checkpoint::BlockFp8ScaleEncoding::FloatingPoint => Dtype::Float32,
+            eredu_checkpoint::BlockFp8ScaleEncoding::Ue8m0 => Dtype::Uint8,
+        };
         let ceil128 = |value: i32| (value + 127) / 128;
         self.gate_up_proj = PhysicalParam::<Array>::unloaded(
             &[self.group_count, 2 * self.intermediate_dim, self.hidden_dim],
@@ -246,7 +259,7 @@ impl PackedGatedProductGroups {
                 ceil128(2 * self.intermediate_dim),
                 ceil128(self.hidden_dim),
             ],
-            Dtype::Uint8,
+            scale_dtype,
             stream,
         )?;
         self.down_proj = PhysicalParam::<Array>::unloaded(
@@ -260,10 +273,10 @@ impl PackedGatedProductGroups {
                 ceil128(self.hidden_dim),
                 ceil128(self.intermediate_dim),
             ],
-            Dtype::Uint8,
+            scale_dtype,
             stream,
         )?;
-        self.native_fp8_e8m0 = true;
+        self.native_fp8 = true;
         Ok(self)
     }
 
@@ -277,7 +290,7 @@ impl PackedGatedProductGroups {
         let num_tokens = hidden_states.dim(0);
         let plan = topk_group_plan(top_k_index, stream)?;
         let hidden = gather_grouped_rows(hidden_states, &plan, stream)?;
-        let gate_up = if self.native_fp8_e8m0 {
+        let gate_up = if self.native_fp8 {
             crate::backend::nn::fp8::grouped_linear(
                 &hidden,
                 self.gate_up_proj.as_ref(),
@@ -357,7 +370,7 @@ impl PackedGatedProductGroups {
             }
         };
         let activated = gate.multiply(up, stream)?;
-        let output = if self.native_fp8_e8m0 {
+        let output = if self.native_fp8 {
             crate::backend::nn::fp8::grouped_linear(
                 &activated,
                 self.down_proj.as_ref(),

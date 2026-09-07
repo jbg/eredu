@@ -1069,6 +1069,18 @@ recipe, including inferred physical weight, scale, affine-bias, MXFP4, and
 block-FP8 geometry. The union of routed plan addresses and catalog paths must
 also exactly match the independently derived family layer schedule, so a
 coordinated omission from both plan and catalog is invalid.
+
+Qwen hybrid recipes resolve admitted checkpoint aliases and assemble weights and
+FP8 scale companions through the same construction for whole banks and individual
+experts. Checkpoint inverse scales become the architecture's declared grouped
+scale parameters; derived scale companions retain floating-point storage rather
+than inheriting the weight's FP8 format. MLX represents FP8 values and exponent
+scales as byte arrays while preserving their source encoding and byte accounting.
+Its grouped adapter supports floating-point and UE8M0 scales with 128-by-128 blocks,
+and its capability report applies that geometry to both direct and derived FP8
+weights. These representation rules remain backend mechanisms; checkpoint aliases
+and companion identities remain architecture policy.
+
 Expert identity is not a backend ownership address. The backend consumes the
 resulting atomic declaration directly and never infers eligibility or companion
 identity from binding spelling, dtype, or rank. Addressable exclusions in the

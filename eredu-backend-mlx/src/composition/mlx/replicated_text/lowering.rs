@@ -40,9 +40,10 @@ pub(crate) fn supports_direct(descriptor: &WeightLoweringDescriptor) -> bool {
         (SourceTensorEncoding::RecipeOutput(StoredDtype::U8), LinearFormat::MxFp4) => true,
         (SourceTensorEncoding::RecipeOutput(StoredDtype::F4), LinearFormat::MxFp4) => true,
         (
-            SourceTensorEncoding::Safetensors(StoredDtype::F8E4M3),
+            SourceTensorEncoding::Safetensors(StoredDtype::F8E4M3)
+            | SourceTensorEncoding::RecipeOutput(StoredDtype::F8E4M3),
             LinearFormat::E4M3BlockFp8(format),
-        ) => format.validate().is_ok(),
+        ) => format.validate().is_ok() && format.block_rows == 128 && format.block_columns == 128,
         (SourceTensorEncoding::Gguf { ggml_type, .. }, LinearFormat::Dense) => {
             matches!(
                 ggml_type,

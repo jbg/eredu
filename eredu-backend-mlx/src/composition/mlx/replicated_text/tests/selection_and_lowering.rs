@@ -283,6 +283,40 @@ fn selected_store_geometry_mismatch_rejects_before_construction_or_payload_open(
 
 #[test]
 fn exact_lowering_rejects_unsupported_encodings_and_incoherent_physical_geometry() {
+    let fp8 = LinearFormat::E4M3BlockFp8(
+        eredu_checkpoint::BlockFp8Format::new(
+            128,
+            128,
+            eredu_checkpoint::BlockFp8ScaleEncoding::FloatingPoint,
+        )
+        .unwrap(),
+    );
+    for encoding in [
+        SourceTensorEncoding::Safetensors(StoredDtype::F8E4M3),
+        SourceTensorEncoding::RecipeOutput(StoredDtype::F8E4M3),
+    ] {
+        for (shape, supported) in [(vec![2, 256, 128], true), (vec![2, 255, 128], false)] {
+            let descriptor = WeightLoweringDescriptor::new(
+                encoding.clone(),
+                fp8,
+                shape,
+                vec![2, 256, 128],
+                Some(2),
+            )
+            .unwrap();
+            assert_eq!(supports_direct(&descriptor), supported);
+        }
+    }
+    let wrong_fp8 = WeightLoweringDescriptor::new(
+        SourceTensorEncoding::RecipeOutput(StoredDtype::F8E5M2),
+        fp8,
+        vec![2, 256, 128],
+        vec![2, 256, 128],
+        Some(2),
+    )
+    .unwrap();
+    assert!(!supports_direct(&wrong_fp8));
+
     let affine = LinearFormat::Affine(eredu_checkpoint::AffineQuantization::new(32, 4).unwrap());
     let gguf = |physical_shape| {
         WeightLoweringDescriptor::new(

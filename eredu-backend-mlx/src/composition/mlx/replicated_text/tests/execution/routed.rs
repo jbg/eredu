@@ -1,4 +1,133 @@
 #[test]
+fn qwen_hybrid_aliased_fp8_experts_execute_resident_and_addressable() {
+    use safetensors::{tensor::serialize_to_file, tensor::TensorView, Dtype};
+
+    let mut config = routed_qwen_hybrid_config();
+    config["moe_intermediate_size"] = 128.into();
+    config["quantization_config"] = serde_json::json!({
+        "quant_method": "fp8", "fmt": "e4m3", "activation_scheme": "dynamic",
+        "weight_block_size": [128, 128],
+        "modules_to_not_convert": ["model.embed_tokens"]
+    });
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join("config.json"),
+        serde_json::to_vec(&config).unwrap(),
+    )
+    .unwrap();
+    let resolved = eredu_architectures::configuration::MODEL_CONFIGURATIONS
+        .resolve_safetensors(&config)
+        .unwrap();
+    let plan = resolved
+        .architecture_plan()
+        .safetensors_architecture()
+        .unwrap()
+        .checkpoint();
+    let constraints = plan.common_tensors.iter().chain(
+        plan.layout_groups
+            .iter()
+            .filter(|group| group.required)
+            .flat_map(|group| {
+                group
+                    .variants
+                    .iter()
+                    .find(|variant| variant.id == "independent")
+                    .unwrap_or(&group.variants[0])
+                    .tensors
+                    .iter()
+            }),
+    );
+    let tensors = constraints
+        .filter(|constraint| {
+            constraint.requirement == eredu_checkpoint::schema::TensorRequirement::Required
+        })
+        .map(|constraint| {
+            let elements = constraint.shape.iter().product::<usize>();
+            let (dtype, bytes) = if constraint.dtype
+                == eredu_checkpoint::schema::StoredDtypeConstraint::Exact(
+                    eredu_checkpoint::StoredDtype::F8E4M3,
+                ) {
+                (Dtype::F8_E4M3, vec![0x18_u8; elements])
+            } else {
+                let value = if constraint.key.contains("norm")
+                    || constraint.role == eredu_checkpoint::schema::TensorRole::Companion
+                {
+                    1.0_f32
+                } else {
+                    0.005_f32
+                };
+                (
+                    Dtype::F32,
+                    (0..elements).flat_map(|_| value.to_le_bytes()).collect(),
+                )
+            };
+            (
+                constraint
+                    .key
+                    .replacen("model.", "model.language_model.", 1),
+                constraint.shape.clone(),
+                dtype,
+                bytes,
+            )
+        })
+        .collect::<Vec<_>>();
+    serialize_to_file(
+        tensors.iter().map(|(name, shape, dtype, bytes)| {
+            (
+                name.as_str(),
+                TensorView::new(*dtype, shape.clone(), bytes).unwrap(),
+            )
+        }),
+        None,
+        &root.path().join("model.safetensors"),
+    )
+    .unwrap();
+
+    let (stream, weights_stream) = execution_streams();
+    let mut outputs = Vec::new();
+    for addressable in [false, true] {
+        let inspection = eredu_architectures::configuration::inspect_artifact(root.path()).unwrap();
+        let mut options = crate::MlxLoadRequest::default();
+        if addressable {
+            options = crate::MlxLoadRequest::from_normalized(
+                options.normalized().clone().with_weight_residency(
+                    eredu_runtime::WeightResidency::with_independent_parameter_banks(
+                        eredu_runtime::OrdinaryWeightResidency::FullyResident,
+                        eredu_runtime::ParameterBankLoadOptions::default(),
+                    ),
+                ),
+            );
+        }
+        let plan = eredu_core::plan_model_preparation(
+            inspection,
+            options.normalized().preparation_policy().unwrap(),
+            eredu_core::SessionCapabilities::default(),
+        )
+        .unwrap();
+        let model = materialize_model_plan(plan, options, &stream, &weights_stream)
+            .unwrap_or_else(|error| panic!("addressable={addressable}: {error}"));
+        let mut executable = model.into_executable();
+        let mut logits = Vec::new();
+        for token in [1_u32, 2] {
+            let output = executable
+                .erased_mut()
+                .decode(&Array::from_slice(&[token], &[1, 1]), &stream)
+                .unwrap()
+                .evaluated()
+                .unwrap()
+                .as_slice::<f32>()
+                .to_vec();
+            assert_eq!(output.len(), 64);
+            assert!(output.iter().all(|value| value.is_finite()));
+            assert!(output.iter().any(|value| *value != 0.0));
+            logits.extend(output);
+        }
+        outputs.push(logits);
+    }
+    assert_eq!(outputs[0], outputs[1]);
+}
+
+#[test]
 fn routed_deepseek_v4_pooling_state_uses_shared_checkpoint_and_prompt_cache_controls() {
     let (stream, weights_stream) = execution_streams();
     let root = tiny_heterogeneous_artifact(routed_deepseek_v4_config());

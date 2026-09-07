@@ -216,14 +216,13 @@ impl GroupedNeuralBackend for MlxNeuralBackend {
         };
         let native_fp8 = match (gate_up.format().encoding(), down.format().encoding()) {
             (LinearFormat::E4M3BlockFp8(gate), LinearFormat::E4M3BlockFp8(down))
-                if gate == down
-                    && gate.scale_encoding == eredu_checkpoint::BlockFp8ScaleEncoding::Ue8m0 =>
+                if gate == down =>
             {
-                true
+                Some(gate)
             }
             (LinearFormat::E4M3BlockFp8(_), LinearFormat::E4M3BlockFp8(_)) => {
                 return Err(ComputeError::backend(
-                    "MLX packed block-FP8 groups require matching UE8M0 formats",
+                    "MLX packed block-FP8 groups require matching formats",
                 ));
             }
             (LinearFormat::E4M3BlockFp8(_), _) | (_, LinearFormat::E4M3BlockFp8(_)) => {
@@ -231,7 +230,7 @@ impl GroupedNeuralBackend for MlxNeuralBackend {
                     "packed group projections must use one physical format",
                 ));
             }
-            _ => false,
+            _ => None,
         };
         let mut module = compute(common::grouped::PackedGatedProductGroups::new(
             spec.group_count(),
@@ -243,8 +242,8 @@ impl GroupedNeuralBackend for MlxNeuralBackend {
             context,
         ))?;
         module = compute(module.with_policy(policy))?;
-        if native_fp8 {
-            module = compute(module.with_native_fp8_e8m0(context))?;
+        if let Some(format) = native_fp8 {
+            module = compute(module.with_native_fp8(format, context))?;
         }
         let mut topology = vec![
             ("gate_up_proj", gate_up.weight().clone()),

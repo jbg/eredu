@@ -4060,7 +4060,11 @@ fn finalize_materialization_parameters_with_recipes(
             replacement
         } else {
             let role = derived_target_role(target);
-            let native = config.native_format(target);
+            let native = if role == ReplicatedTextParameterRole::FormatCompanion {
+                LinearFormat::Dense
+            } else {
+                config.native_format(target)
+            };
             let mut logical_shape = linear_shapes
                 .get(target)
                 .cloned()

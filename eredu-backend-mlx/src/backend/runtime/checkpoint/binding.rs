@@ -366,12 +366,18 @@ fn mlx_parameter_binding_target(parameter: &crate::MlxTensor) -> Option<Paramete
         dtype: recipe_dtype_from_mlx(parameter.as_array().dtype()),
         // Floating parameters are unloaded handles whose storage is replaced by
         // the materialized source. Their initial dtype does not request a cast.
-        // Packed and integer parameters retain exact representation matching.
+        // FP8 values and exponent scales use MLX byte arrays without conversion.
+        // Other packed and integer parameters retain exact representation matching.
         permitted_source_dtypes: match parameter.as_array().dtype() {
             safemlx::Dtype::Float16 | safemlx::Dtype::Bfloat16 | safemlx::Dtype::Float32 => vec![
                 eredu_checkpoint::recipe::RecipeDtype::F16,
                 eredu_checkpoint::recipe::RecipeDtype::BF16,
                 eredu_checkpoint::recipe::RecipeDtype::F32,
+            ],
+            safemlx::Dtype::Uint8 => vec![
+                eredu_checkpoint::recipe::RecipeDtype::U8,
+                eredu_checkpoint::recipe::RecipeDtype::F8E4M3,
+                eredu_checkpoint::recipe::RecipeDtype::F8E8M0,
             ],
             _ => Vec::new(),
         },

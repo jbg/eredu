@@ -124,6 +124,42 @@ fn floating_slots_preserve_selected_f16_bf16_and_f32_storage() {
 }
 
 #[test]
+fn byte_slots_preserve_fp8_values_and_exponent_scales() {
+    let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+    let bytes = [0x38_u8, 0x40, 0xb8, 0];
+    for stored in [safetensors::Dtype::F8_E4M3, safetensors::Dtype::F8_E8M0] {
+        let (_directory, store) = source(stored, &bytes);
+        let mut parameter = Parameter(crate::MlxTensor::from_array(Array::from_slice(
+            &[0_u8; 4],
+            &[1, 4],
+        )));
+        for bindings in [
+            build_module_bindings(&parameter, "", &store).unwrap(),
+            exact_bindings(&parameter, &store).unwrap(),
+        ] {
+            assert_eq!(bindings[0].expected_bytes(), 4);
+            let materialized =
+                materialize_module_bindings(&store, &bindings, &stream, &stream).unwrap();
+            populate_module_from_arrays_excluding(&mut parameter, &materialized, |_| false)
+                .unwrap();
+            assert_eq!(parameter.0.as_array().dtype(), Dtype::Uint8);
+            assert_eq!(
+                parameter
+                    .0
+                    .as_array()
+                    .evaluated()
+                    .unwrap()
+                    .to_native_bytes(),
+                bytes
+            );
+        }
+        let (_directory, floating) = source(safetensors::Dtype::F32, &[0; 16]);
+        assert!(build_module_bindings(&parameter, "", &floating).is_err());
+        assert!(exact_bindings(&parameter, &floating).is_err());
+    }
+}
+
+#[test]
 fn floating_slots_reject_integer_and_unsupported_f64_sources() {
     let parameter = Parameter(crate::MlxTensor::from_array(Array::from_slice(
         &[0.0f32; 4],
