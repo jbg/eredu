@@ -16,7 +16,24 @@ use the next patch. Leave unchanged crates at their published version and
 start new crates at `0.1.0`. A binary-only crate can take a patch for internal
 dependency updates when its command-line interface remains compatible.
 
-## Workspace release set for 2026-09-07
+## Qwen hybrid FP8 fix release set for 2026-09-07
+
+The latest crates.io versions and checksummed archives were rechecked after the
+initial September 7 release. The four previous versions below were published
+from `91dcd4d6`; this release includes the loading fix committed as `d1c03698`.
+
+| Crate | Previous | New version | Reason |
+| --- | --- | --- | --- |
+| `eredu-architectures` | 0.3.0 | 0.3.1 | Resolves Qwen hybrid expert aliases consistently, assembles FP8 scale companions, and preserves their floating-point format. Public type signatures are unchanged. |
+| `eredu-backend-mlx` | 0.3.0 | 0.3.1 | Requires the fixed architecture recipes, admits derived FP8 weights, preserves encoded bytes, and binds grouped floating-point scales. Renamed grouped helpers are crate-private. |
+| `eredu` | 0.3.0 | 0.3.1 | Raises the architecture and optional MLX dependency minimums so consumers receive the fix. |
+| `eredu-cli` | 0.1.3 | 0.1.4 | Requires the updated facade and includes the fixed dependencies in its packaged lockfile; the CLI is unchanged. |
+
+All other crate versions remain unchanged. Publish these four crates in table
+order after the native release gate passes for the exact version-bump commit,
+then tag that same commit for each published version.
+
+## Initial workspace release set for 2026-09-07
 
 The crates.io API and checksummed published archives were rechecked on
 2026-09-07. The latest versions still match the 2026-09-06 release below.
