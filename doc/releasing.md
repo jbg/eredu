@@ -16,6 +16,33 @@ use the next patch. Leave unchanged crates at their published version and
 start new crates at `0.1.0`. A binary-only crate can take a patch for internal
 dependency updates when its command-line interface remains compatible.
 
+## Tokenizer validity and controlled text release set for 2026-09-07
+
+The latest stable crates.io versions and checksummed source archives were
+rechecked on 2026-09-07 against `4eb715e4`. Source changes since publication are
+limited to `eredu-core`, `eredu-text`, `eredu-runtime`, `eredu-backend-mlx` and
+`eredu`. The core change adds `NoExecutableToken` to the exhaustive public
+`TokenFilterError` enum, requiring a new pre-1.0 compatibility line. Libraries
+that expose the updated dependency types advance their compatibility lines too.
+
+| Crate | Previous | New version | Reason |
+| --- | --- | --- | --- |
+| `eredu-core` | 0.3.0 | 0.4.0 | Exhaustive error-enum addition; shared closed token-domain intersection and padded-logits projection. |
+| `eredu-text` | 0.1.0 | 0.1.1 | Compatible canonical token-ID enumeration and corrected sparse-vocabulary fingerprints. |
+| `eredu-runtime` | 0.3.0 | 0.4.0 | Exposes the new core types and uses shared validity for forced-token admission. |
+| `eredu-media` | 0.2.0 | 0.3.0 | Public video-validation APIs use the new core type identity. |
+| `eredu-architectures` | 0.3.1 | 0.4.0 | Public execution and preparation contracts expose updated core/runtime/media types. |
+| `eredu-codec` | 0.3.0 | 0.4.0 | Public materialization contracts expose the updated runtime types. |
+| `eredu-evaluation` | 0.3.0 | 0.4.0 | Public fixtures and drivers expose updated core/runtime/architecture/codec types. |
+| `eredu-backend-mlx` | 0.3.1 | 0.4.0 | Exposes updated execution contracts and masks undefined padded logits before sampling. |
+| `eredu` | 0.3.1 | 0.4.0 | Exposes updated dependency contracts; adds controlled templated text generation with capture, intervention and continuation support. |
+| `eredu-cli` | 0.1.4 | 0.1.5 | Updates internal dependencies to the fixed generation stack without changing its CLI. |
+
+All other crate versions remain unchanged. Publish these ten crates in table
+order after the exact version-bump commit passes the native release gate and both
+archive-validation toolchains. After all uploads succeed, create and push one
+`<crate>-v<version>` tag per released crate at that same commit.
+
 ## Qwen hybrid FP8 fix release set for 2026-09-07
 
 The latest crates.io versions and checksummed archives were rechecked after the
