@@ -72,6 +72,7 @@ pub trait TextSnapshotBackend: NativeTextStateBackend {
         Ok(None)
     }
     /// Copies pending input without executing it, sampling or retokenizing.
+    #[allow(clippy::type_complexity)]
     fn copy_pending_input(
         runtime: &mut ModelRuntime<Self>,
         input: Option<PendingTextInput<&Self::Prompt, &Self::Token>>,
@@ -178,6 +179,7 @@ impl<B: eredu_core::TextGenerationBackend, C: TokenFilterController> ManagedText
         }
     }
     /// Advances the installed continuation using the existing ordinary driver.
+    #[allow(clippy::type_complexity)]
     pub fn advance(
         &mut self,
         driver: &mut eredu_core::TextGenerationDriver<'_, B>,
@@ -491,6 +493,7 @@ impl<B: TextSnapshotBackend, C: SnapshotTokenController> TextContinuationSnapsho
     /// under the branch reservation. Preparation receives the independently
     /// copied child sampler and re-admitted capture owner; it cannot replace the
     /// installed parent continuation. On failure no runnable child is published.
+    #[allow(clippy::type_complexity)]
     pub fn fork_with<H>(
         &self,
         boundary: &mut TextContinuationBoundary<'_, '_, B, C>,

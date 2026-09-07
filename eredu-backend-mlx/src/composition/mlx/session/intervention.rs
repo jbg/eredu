@@ -199,7 +199,7 @@ impl InterventionBackend for NativeCapture<'_> {
         keep: &[bool],
         fill: f32,
     ) -> Result<MlxTensor, Exception> {
-        let mask = Array::from_slice(keep, &value.shape());
+        let mask = Array::from_slice(keep, value.shape());
         Ok(MlxTensor::from_array(safemlx::ops::r#where(
             mask,
             value.as_array(),
@@ -251,7 +251,7 @@ impl InterventionBackend for NativeCapture<'_> {
         }
         let mask = safemlx::ops::broadcast_to(
             Array::from_slice(&keep, &[vocabulary]),
-            &value.shape(),
+            value.shape(),
             self.stream,
         )?;
         Ok(MlxTensor::from_array(safemlx::ops::r#where(

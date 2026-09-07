@@ -819,8 +819,12 @@ fn components(
     for component in graph.units().iter().filter(|c| c.kind == K::Assembly) {
         merge_capture(g, &component.id);
     }
-    let mut index = 0;
-    for component in graph.units().iter().filter(|c| c.kind == K::Decoder) {
+    for (index, component) in graph
+        .units()
+        .iter()
+        .filter(|c| c.kind == K::Decoder)
+        .enumerate()
+    {
         let path = format!("{root}.layers.{index}");
         g.get_mut(&component.id).layer_index = Some(index);
         g.get_mut(&component.id).output_axes = Some(axes(width));
@@ -838,7 +842,6 @@ fn components(
                 false,
             );
         }
-        index += 1;
     }
     let mut shape = axes(vocab);
     shape[2].name = "vocabulary".into();

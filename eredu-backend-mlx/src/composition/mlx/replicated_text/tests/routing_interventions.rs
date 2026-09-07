@@ -73,7 +73,7 @@ impl RoutedExpertProvider<B> for Probe {
         }
         Ok(MlxTensor::from_array(Array::from_slice(
             &data,
-            &request.input.shape(),
+            request.input.shape(),
         )))
     }
     fn forward_relu2_routed(

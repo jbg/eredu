@@ -51,6 +51,7 @@ fn operate_selected_text_control(
 }
 
 #[test]
+#[allow(clippy::type_complexity)]
 fn selected_text_control_keeps_native_types_out_of_application_code() {
     let _: fn(
         &mut eredu::api::LocalModel,

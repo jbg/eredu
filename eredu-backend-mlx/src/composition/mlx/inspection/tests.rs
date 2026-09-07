@@ -80,7 +80,7 @@ fn write_configured_safetensors_fixture(
         serde_json::to_vec(&config).unwrap(),
     )
     .unwrap();
-    let resolved = eredu_architectures::configuration::resolve_model_config(&config).unwrap();
+    let resolved = eredu_architectures::configuration::resolve_model_config(config).unwrap();
     let checkpoint = resolved.architecture.checkpoint();
     let tensors = checkpoint
         .common_tensors

@@ -1898,6 +1898,7 @@ where
         Ok(())
     }
 
+    #[allow(clippy::type_complexity)]
     fn next_committed(
         &mut self,
         runtime: &mut ModelRuntime<B>,

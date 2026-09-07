@@ -23,7 +23,7 @@ The crates.io API and checksummed published archives were rechecked on
 This release includes all pending source and dependency changes, including
 architecture discovery, bounded capture and interventions, resumable generation,
 isolated snapshots, session recovery, and Qwen hybrid FP8 checkpoint admission.
-The native release gate must pass on the version-bump commit before publication.
+The native release gate must pass on the final release commit before publication.
 
 | Crate | Previous | New version | Reason |
 | --- | --- | --- | --- |

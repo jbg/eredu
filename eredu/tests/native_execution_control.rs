@@ -107,7 +107,7 @@ fn write_weights(root: &Path) {
         );
     }
     let mut header = serde_json::to_vec(&header).unwrap();
-    while header.len() % 8 != 0 {
+    while !header.len().is_multiple_of(8) {
         header.push(b' ');
     }
     let mut weights = std::fs::File::create(root.join("model.safetensors")).unwrap();

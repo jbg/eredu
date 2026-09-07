@@ -178,6 +178,7 @@ impl<'a, B: TextGenerationBackend> TextGenerationDriver<'a, B> {
     /// Advances at most one constraint-committed canonical token using the
     /// ordinary sampler and pending input. Call `take_completed_step` before
     /// advancing again or composing a pause/snapshot boundary.
+    #[allow(clippy::type_complexity)]
     pub fn advance<C: TokenFilterController>(
         &mut self,
         state: &mut TextGenerationContinuation<B, C>,
@@ -293,6 +294,7 @@ impl<B: TextGenerationBackend, C: TokenFilterController> TextContinuationBoundar
     }
 
     /// Read-only mechanism inputs. No host or native state advances here.
+    #[allow(clippy::type_complexity)]
     pub fn parts(
         &self,
     ) -> (
@@ -310,6 +312,7 @@ impl<B: TextGenerationBackend, C: TokenFilterController> TextContinuationBoundar
     /// Native mechanism access while the pending input remains read-only.
     /// Callers retain the existing completion owner and must not submit ordinary
     /// model predictions through this snapshot-composition borrow.
+    #[allow(clippy::type_complexity)]
     pub fn mechanism_parts(
         &mut self,
     ) -> (

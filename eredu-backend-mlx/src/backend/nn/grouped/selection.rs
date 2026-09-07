@@ -444,7 +444,7 @@ impl TopKGroupSelector {
         top_k_index: Array,
         stream: &Stream,
     ) -> Result<GroupSelectionOutput, Exception> {
-        let mut top_k_weights = take_along_axis(&scores, &top_k_index, -1, stream)?;
+        let mut top_k_weights = take_along_axis(scores, &top_k_index, -1, stream)?;
         if self.score_function == TopKGroupScoring::SelectedSoftmax {
             top_k_weights = softmax_axis(&top_k_weights, -1, true, stream)?;
         }
