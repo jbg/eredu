@@ -37,8 +37,8 @@ pub struct GenerationSnapshotMetadata {
     pub intervention_plan_id: Option<String>,
     /// Exact immutable tokenizer fingerprint of this run.
     pub tokenizer_identity: [u8; 32],
-    /// Initial generation and semantic-policy identity, including constraint
-    /// blueprint, termination, tokenizer and seed. Later choices are retained
+    /// Initial generation policy identity, including text versus semantic mode,
+    /// constraint blueprint, termination, tokenizer and seed. Later choices are retained
     /// exactly in the opaque saved state and attributed through control records.
     pub configuration_identity: [u8; 32],
     /// Prospective canonical choice saved before its ordinary commitment.

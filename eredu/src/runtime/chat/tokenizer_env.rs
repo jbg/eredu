@@ -245,7 +245,7 @@ fn vocabulary_bytes(
             bytes.extend_from_slice(token.as_bytes());
             bytes
         } else {
-            decoder.token_bytes(&token)?
+            decoder.token_bytes(token)?
         };
     }
 

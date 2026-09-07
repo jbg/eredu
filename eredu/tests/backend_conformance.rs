@@ -2225,6 +2225,14 @@ fn unicode_model_with_vocabulary(
     first: Option<u32>,
     vocabulary_size: u32,
 ) -> LoadedModel<MockBackend> {
+    unicode_model_with_template(first, vocabulary_size, QWEN_TEMPLATE)
+}
+
+fn unicode_model_with_template(
+    first: Option<u32>,
+    vocabulary_size: u32,
+    template: &str,
+) -> LoadedModel<MockBackend> {
     let mut vocabulary: std::collections::HashMap<String, u32> =
         std::iter::once(("[UNK]".into(), 0))
             .chain((0..vocabulary_size).map(|i| (format!("ordinary_{i}"), i + 1)))
@@ -2254,7 +2262,7 @@ fn unicode_model_with_vocabulary(
             model_family: ModelKind::Qwen2,
             effective_model_type: "qwen2".into(),
             model_id: "unicode-mock".into(),
-            chat_template: Some(ModelChatTemplate::Single(QWEN_TEMPLATE.into())),
+            chat_template: Some(ModelChatTemplate::Single(template.into())),
             eos_token_ids: vec![eos],
             checkpoint_generation_config: None,
         },

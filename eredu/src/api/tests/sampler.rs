@@ -838,3 +838,33 @@ fn snapshot_forks_retain_validity_without_copying_or_loosening_it() {
     assert!(!child.current_filter().unwrap().allows(256));
     assert!(parent.filter_at(&[]).is_ok());
 }
+
+#[test]
+fn text_controller_excludes_dominant_padding_before_sampling_and_after_snapshot() {
+    use eredu_core::TokenFilterController;
+    use eredu_runtime::execution_control::{SnapshotTokenController, TokenChoiceController};
+    let validity = std::sync::Arc::new(TokenFilter::allowed(vec![true, false, true]).unwrap());
+    let mut controller = ConstraintController::text(validity);
+    let before = controller.snapshot_storage_bytes().unwrap();
+    assert!(!controller.is_complete().unwrap());
+    assert!(controller.commit_token(1).is_err());
+    assert!(controller.commit_token(3).is_err());
+    controller.commit_token(0).unwrap();
+    assert_eq!(controller.snapshot_storage_bytes(), Some(before + 4));
+    assert_eq!(controller.continuation_storage_bytes(5), Some(20));
+    let child = controller.fork_snapshot().unwrap();
+    let mut choices = TokenChoiceController::new(child, TokenDomain::new(3));
+    assert!(choices.force_next(1).is_err());
+    assert!(choices.force_next(3).is_err());
+    // A hole and padded positions dominate both valid IDs; masking must precede top-k.
+    let logits = vec![1.0, 500.0, 2.0, 1000.0, 900.0];
+    let mut sampler = ConstrainedSampler::new(GenerationSampler::new().top_k(1), choices);
+    assert_eq!(
+        Sampler::<TestSamplingBackend>::sample(&mut sampler, &logits, 0.0, None, &()).unwrap(),
+        2
+    );
+    assert_eq!(
+        controller.filter_at(&[0]).unwrap(),
+        TokenFilter::allowed(vec![true, false, true]).unwrap()
+    );
+}

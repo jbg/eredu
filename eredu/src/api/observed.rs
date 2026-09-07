@@ -50,6 +50,9 @@ pub struct TraceLimits {
 
 /// Prepared prompt and capture admission. Dropping this value submits no work.
 /// Generation consumes it, preventing accidental reuse with different settings.
+/// Both controlled entry points accept this value, including intervened requests:
+/// [`LoadedModel::start_controlled_chat`] requires semantic support, while
+/// [`LoadedModel::start_controlled_text`] explicitly selects ordinary text decoding.
 pub struct PreparedObservedGeneration {
     pub(super) chat: PreparedChat,
     pub(super) prompt_token_ids: Vec<u32>,
@@ -304,8 +307,9 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
 
     /// Admits capture and intervention together before any native work. Plans apply
     /// prospectively; cached states are never retroactively recomputed. Reset the
-    /// session before preparing an independent experiment. There is no hot plan
-    /// replacement or resumable snapshot API.
+    /// session before preparing an independent experiment. Controlled entry points
+    /// support pausing, snapshots and prospective branch changes when the backend
+    /// and complete continuation storage estimates support them.
     pub fn prepare_intervened_chat(
         &self,
         chat: &PreparedChat,

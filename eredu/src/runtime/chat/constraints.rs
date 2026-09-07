@@ -36,6 +36,7 @@ pub(crate) struct ConstraintController {
 }
 
 enum ConstraintRuntime {
+    Text,
     Forbidden {
         vocabulary: Arc<Vec<Vec<u8>>>,
         trigger: Vec<u8>,
@@ -53,6 +54,7 @@ enum ConstraintRuntime {
 impl Clone for ConstraintRuntime {
     fn clone(&self) -> Self {
         match self {
+            Self::Text => Self::Text,
             Self::Forbidden {
                 vocabulary,
                 trigger,
@@ -89,6 +91,15 @@ impl Clone for ConstraintController {
 }
 
 impl ConstraintController {
+    /// Grammar-free generation still retains the exact tokenizer-valid domain.
+    pub(crate) fn text(validity: Arc<TokenFilter>) -> Self {
+        Self {
+            runtime: ConstraintRuntime::Text,
+            committed_tokens: Vec::new(),
+            validity,
+        }
+    }
+
     /// Retains the facade's immutable tokenizer domain across grammar forks,
     /// speculative histories and execution-control snapshots.
     pub(crate) fn with_validity(mut self, validity: Arc<TokenFilter>) -> Self {
@@ -114,6 +125,7 @@ impl ConstraintController {
 
     pub(crate) fn continuation_storage_bytes(&self, predictions: u64) -> Option<u64> {
         match &self.runtime {
+            ConstraintRuntime::Text => predictions.checked_mul(4),
             ConstraintRuntime::Forbidden { trigger, .. } => predictions
                 .checked_mul(4)?
                 .checked_add(trigger.len() as u64),
@@ -172,14 +184,18 @@ impl ConstraintController {
     pub(crate) fn grammar_is_complete(&mut self) -> Result<bool, ConstraintError> {
         match &mut self.runtime {
             ConstraintRuntime::Active(grammar) => grammar.is_complete().map_err(constraint_error),
-            ConstraintRuntime::Forbidden { .. } | ConstraintRuntime::Auto { .. } => Ok(false),
+            ConstraintRuntime::Text
+            | ConstraintRuntime::Forbidden { .. }
+            | ConstraintRuntime::Auto { .. } => Ok(false),
         }
     }
 
     pub(crate) fn prefix_is_complete(&self, history: &[u32]) -> Result<bool, ConstraintError> {
         match &mut self.runtime_at(history)? {
             ConstraintRuntime::Active(grammar) => grammar.is_complete().map_err(constraint_error),
-            ConstraintRuntime::Forbidden { .. } | ConstraintRuntime::Auto { .. } => Ok(false),
+            ConstraintRuntime::Text
+            | ConstraintRuntime::Forbidden { .. }
+            | ConstraintRuntime::Auto { .. } => Ok(false),
         }
     }
 
@@ -215,7 +231,9 @@ impl ConstraintController {
                 .allowed_tokens()
                 .map(|mask| Some(mask.iter().collect()))
                 .map_err(constraint_error),
-            ConstraintRuntime::Forbidden { .. } | ConstraintRuntime::Auto { .. } => Ok(None),
+            ConstraintRuntime::Text
+            | ConstraintRuntime::Forbidden { .. }
+            | ConstraintRuntime::Auto { .. } => Ok(None),
         }
     }
 }
@@ -247,6 +265,7 @@ impl eredu_runtime::execution_control::SnapshotTokenController for ConstraintCon
         let bytes = (std::mem::size_of::<Self>() as u64)
             .checked_add((committed_tokens.len() as u64).checked_mul(4)?)?;
         match runtime {
+            ConstraintRuntime::Text => Some(bytes),
             // Immutable token bytes are already retained by Arc. Only the trigger
             // matcher and committed canonical history are copied for this mode.
             ConstraintRuntime::Forbidden {
@@ -284,6 +303,8 @@ fn token_filter_at_runtime(
     runtime: &mut ConstraintRuntime,
 ) -> Result<TokenFilter, ConstraintError> {
     let allowed = match runtime {
+        // This grammar filter is intersected with baseline validity by the controller.
+        ConstraintRuntime::Text => return Ok(TokenFilter::All),
         ConstraintRuntime::Active(grammar) => {
             let allowed = grammar.allowed_tokens().map_err(constraint_error)?;
             (0..allowed.len())
@@ -328,6 +349,7 @@ fn commit_runtime_token(
     token: u32,
 ) -> Result<(), ConstraintError> {
     match runtime {
+        ConstraintRuntime::Text => Ok(()),
         ConstraintRuntime::Forbidden {
             vocabulary,
             trigger,

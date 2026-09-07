@@ -3017,6 +3017,39 @@ fn explicit_thinking_requires_a_recognized_semantic_protocol_unless_opted_out() 
 }
 
 #[test]
+fn controlled_text_requires_raw_thinking_opt_in_even_with_a_recognized_parser() {
+    let compiler = Ok(ConstraintCompiler::synthetic_for_tests());
+    for allow_unparsed_reasoning in [false, true] {
+        let mut tokenizer = production_chat_tokenizer(50);
+        let prepared = prepare_chat_from_parts(
+            &mut tokenizer,
+            ModelChatTemplate::Single(QWEN3_CURRENT_FIXTURE_WITH_TERMINATOR.into()),
+            "thinking-text",
+            &[],
+            Some(&compiler),
+            ChatTemplateRequest {
+                messages: vec![json!({"role": "user", "content": "hello"})],
+                enable_thinking: Some(true),
+                allow_unparsed_reasoning,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(prepared.capabilities().reasoning_parser.is_supported());
+        assert_eq!(
+            prepared.text_generation_support().is_supported(),
+            allow_unparsed_reasoning
+        );
+        let runtime = super::request::prepared_text_control_runtime(
+            &prepared,
+            &[],
+            std::sync::Arc::new(eredu_core::TokenFilter::allowed(vec![true; 256]).unwrap()),
+        );
+        assert_eq!(runtime.is_ok(), allow_unparsed_reasoning);
+    }
+}
+
+#[test]
 fn mistral_architecture_name_does_not_grant_an_unregistered_template_support() {
     let raw = Tokenizer::new(WordLevel::default());
     let mut tokenizer = ChatTokenizer::from_tokenizer(raw);

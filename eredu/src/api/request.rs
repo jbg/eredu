@@ -463,6 +463,23 @@ pub(super) fn prepared_chat_control_runtime(
     })
 }
 
+pub(super) fn prepared_text_control_runtime(
+    prepared_chat: &PreparedChat,
+    caller_stop_sequences: &[String],
+    validity: std::sync::Arc<TokenFilter>,
+) -> Result<PreparedChatControlRuntime, PreparedChatSetupError> {
+    if let CapabilitySupport::Unsupported { reason } = prepared_chat.text_generation_support() {
+        return Err(PreparedChatSetupError::Semantic(reason.clone()));
+    }
+    Ok(PreparedChatControlRuntime {
+        controller: ConstraintController::text(validity),
+        parser: crate::runtime::generation::streaming::ToolRuntimeParser::text(
+            caller_stop_sequences.iter().map(String::as_str),
+        ),
+        structural_tokens: HashMap::new(),
+    })
+}
+
 pub(super) struct BackendGenerationTokenSource<'a, B>
 where
     B: eredu_core::TextGenerationBackend,
@@ -1667,6 +1684,17 @@ pub(crate) fn prepare_chat_from_parts(
         .unwrap_or_else(|| "no semantic protocol was recognized".into());
     let tool_surface_requested =
         !request.tools.is_empty() || request.tool_choice == ToolChoice::Required;
+    let text_generation_support = if tool_surface_requested {
+        CapabilitySupport::Unsupported {
+            reason: "controlled text generation does not support tool declarations or required tool calls; prepare a request without tools".into(),
+        }
+    } else if request.enable_thinking == Some(true) && !request.allow_unparsed_reasoning {
+        CapabilitySupport::Unsupported {
+            reason: "controlled text generation does not parse explicit thinking; set allow_unparsed_reasoning to opt into raw output".into(),
+        }
+    } else {
+        CapabilitySupport::Supported
+    };
     let tool_protocol_available = profile.tool_dialect.is_some()
         && profile.tool_dialect_parameters.is_some()
         && constraint_compiler.is_some_and(Result::is_ok);
@@ -1881,6 +1909,7 @@ pub(crate) fn prepare_chat_from_parts(
         format_profile_identity: profile.identity,
         native_tool_support,
         semantic_support,
+        text_generation_support,
         capabilities,
         generation_runtime_plan,
         eos_token_ids: eos_token_ids.to_vec(),

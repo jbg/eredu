@@ -82,7 +82,8 @@ pub struct ChatTemplateRequest {
     /// different levels. A recognized format profile validates the values it
     /// supports before rendering.
     pub reasoning_effort: Option<String>,
-    /// Permit explicit thinking when no semantic reasoning parser is recognized.
+    /// Permit explicit thinking when no semantic reasoning parser is recognized
+    /// or when the caller explicitly selects controlled text generation.
     ///
     /// The default is fail-closed because raw fallback may expose reasoning
     /// wire markers and content as visible text.
@@ -482,6 +483,7 @@ pub struct PreparedChat {
     pub(crate) native_tool_support: NativeToolSupport,
     /// Semantic response parsing capability, independent of tool constraints.
     pub(crate) semantic_support: SemanticSupport,
+    pub(crate) text_generation_support: CapabilitySupport,
     pub(crate) capabilities: ChatCapabilities,
     pub(crate) generation_runtime_plan: Option<GenerationRuntimePlan>,
     /// Checkpoint EOS token IDs used to stop generation.
@@ -521,6 +523,16 @@ impl PreparedChat {
     /// Returns semantic response parsing capability for the selected protocol.
     pub fn semantic_support(&self) -> &SemanticSupport {
         &self.semantic_support
+    }
+
+    /// Admission for explicit controlled text generation. Tool declarations
+    /// (even with `ToolChoice::None`) and required tool calls are rejected.
+    /// Explicit thinking requires `allow_unparsed_reasoning`, since text mode
+    /// exposes decoded reasoning as ordinary text even on recognized templates.
+    /// This reports request admission; the loaded backend must separately support
+    /// execution control, and snapshots require complete estimates and limits.
+    pub fn text_generation_support(&self) -> &CapabilitySupport {
+        &self.text_generation_support
     }
 
     /// Returns independently gated protocol capabilities.

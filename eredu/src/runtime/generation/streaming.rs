@@ -778,7 +778,35 @@ where
     }
 }
 
-/// Independent protocol parsing state for one prepared tool generation.
+/// Stateless text delivery; the shared stream owns stops and terminal events.
+struct TextParser;
+
+impl ProtocolParser for TextParser {
+    type Error = String;
+
+    fn snapshot_storage_bytes(&self) -> Option<u64> {
+        Some(0)
+    }
+
+    fn continuation_storage_bytes(&self, _: u64) -> Option<u64> {
+        Some(0)
+    }
+
+    fn fork_box(&self) -> Result<Box<dyn ProtocolParser<Error = String>>, String> {
+        Ok(Box::new(Self))
+    }
+
+    fn push(&mut self, text: &str, sink: &mut SemanticEventSink) -> Result<(), String> {
+        sink.text(text);
+        Ok(())
+    }
+
+    fn finish(&mut self, _: &mut SemanticEventSink) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// Independent text or protocol parsing state for one prepared generation.
 pub(crate) struct ToolRuntimeParser {
     stream: SemanticStream<Box<dyn ProtocolParser<Error = String>>>,
 }
@@ -794,6 +822,10 @@ impl fmt::Debug for ToolRuntimeParser {
 }
 
 impl ToolRuntimeParser {
+    pub(crate) fn text<'a>(caller_stops: impl IntoIterator<Item = &'a str>) -> Self {
+        Self::new_with_structural_stops(Box::new(TextParser), [], caller_stops, [])
+    }
+
     /// Preserves lookbehind, partial protocol state, terminal state and delivery.
     pub(crate) fn fork(&self) -> Result<Self, String> {
         Ok(Self {

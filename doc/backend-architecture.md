@@ -9,6 +9,15 @@ requests intersect the same immutable mask with their grammar controller. Forced
 choices further restrict that intersection. The grammar and output parsers retain
 their existing activation, EOS and termination behavior.
 
+The facade exposes explicit `start_controlled_text` alongside strict
+`start_controlled_chat`. Both consume the same admitted observed/intervened prompt
+and share one ordinary execution driver. Text mode retains tokenizer validity,
+incremental decoding, EOS and caller stops without a semantic grammar or profile.
+Tool/thinking admission stays in facade preparation; backends receive the same
+neutral filters and native execution requests. Text/semantic mode participates in
+snapshot compatibility, with decoder and stop state covered by existing portable
+copying and storage accounting. See [LM Inspector execution control](lm-inspector-execution-control.md).
+
 `eredu-core::TokenFilter` owns closed-set intersection and projection to an actual
 output width: missing mask entries are forbidden, a shorter output uses the mask's
 prefix, and an empty executable intersection is an error. Native samplers realize

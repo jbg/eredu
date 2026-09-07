@@ -63,6 +63,28 @@ impl LocalGenerationSnapshot {
 }
 
 impl LocalModel {
+    /// Starts text decoding from exact prepared prompt IDs with the same records
+    /// and session controls as [`Self::start_controlled_chat`]. Special tokens
+    /// are skipped; checkpoint EOS and caller stops terminate output. Tokenizer
+    /// validity remains enforced without semantic grammar or parsing.
+    ///
+    /// Rejects tool declarations (even with `ToolChoice::None`) and required tool
+    /// calls. Explicit thinking requires `allow_unparsed_reasoning`. Inspect
+    /// `PreparedChat::text_generation_support` for admission before starting.
+    /// See [`crate::api::LoadedModel::start_controlled_text`] for full semantics.
+    pub fn start_controlled_text<'a>(
+        &'a mut self,
+        prepared: PreparedObservedGeneration,
+        caller_stop_sequences: &[String],
+        control: GenerationControlHandle,
+        emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
+    ) -> Result<LocalControlledGenerationSession<'a>> {
+        self.inner
+            .start_controlled_text(prepared, caller_stop_sequences, control, emit)
+            .map(|inner| LocalControlledGenerationSession { inner })
+            .map_err(map_error)
+    }
+
     /// Starts ordinary completed-token control with existing prepared capture and
     /// intervention admissions. No prediction or random draw occurs at startup.
     pub fn start_controlled_chat<'a>(

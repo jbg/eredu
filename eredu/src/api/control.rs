@@ -3,7 +3,9 @@
 use super::{
     loaded::map_prepared_chat_setup_error,
     observed::{new_identity, TraceBudget},
-    request::{prepared_chat_control_runtime, PreparedChatTokenDecoder},
+    request::{
+        prepared_chat_control_runtime, prepared_text_control_runtime, PreparedChatTokenDecoder,
+    },
     ConstraintError, LoadedModel, ObservedGenerationEvent, ObservedGenerationRecord,
     PreparedChatError, PreparedObservedGeneration,
 };
@@ -18,6 +20,12 @@ use std::{cell::RefCell, ops::ControlFlow, time::Instant};
 
 type ControlConstraints = TokenChoiceController<ConstraintController>;
 type ControlConstraintError = TokenChoiceError<ConstraintError>;
+
+#[derive(Clone, Copy, Serialize)]
+enum OutputMode {
+    Semantic,
+    Text,
+}
 
 mod branch;
 mod snapshot;
@@ -613,12 +621,94 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
     /// model prediction or RNG draw occurs here. Initial attribution is charged
     /// and delivered before returning the session. Unsupported execution fails
     /// before native prompt or sampler construction.
+    /// Requires executable semantic support; never falls back to text.
     pub fn start_controlled_chat<'a>(
         &'a mut self,
         prepared: PreparedObservedGeneration,
         caller_stop_sequences: &[String],
         control: GenerationControlHandle,
+        emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
+    ) -> Result<ControlledGenerationSession<'a, B>, ControlledGenerationError<B::Error>> {
+        self.start_controlled_generation(
+            prepared,
+            caller_stop_sequences,
+            control,
+            emit,
+            OutputMode::Semantic,
+        )
+    }
+
+    /// Starts controlled text generation from the exact prepared prompt IDs,
+    /// retaining observed/intervened admission, sampling, EOS and all controls.
+    /// No prediction or RNG draw occurs at startup. Incremental output uses
+    /// `SemanticEvent::TextDelta` and `Finished`, skips special tokens, and honors
+    /// caller stops. It applies tokenizer validity without a semantic grammar,
+    /// tool parsing, reasoning classification or profile-specific stops.
+    ///
+    /// Rejects tool declarations (including `ToolChoice::None`) and required
+    /// tool calls. Explicit thinking requires `allow_unparsed_reasoning` even
+    /// for recognized templates. Inspect `PreparedChat::text_generation_support`
+    /// before preparation; existing `prepare_chat` admission still applies.
+    ///
+    /// ```no_run
+    /// use eredu::api::*;
+    /// use eredu::runtime::chat::{ChatTemplateRequest, SemanticSupport};
+    /// use eredu_core::{TextGenerationBackend, capture::CapturePlan, intervention::InterventionPlan};
+    /// use std::ops::ControlFlow;
+    ///
+    /// fn generate<B: TextGenerationBackend>(
+    ///     model: &mut LoadedModel<B>,
+    ///     request: ChatTemplateRequest,
+    ///     capture: CapturePlan,
+    ///     intervention: Option<InterventionPlan>,
+    /// ) -> Result<(), Box<dyn std::error::Error>> {
+    ///     let chat = model.prepare_chat(request)?;
+    ///     let semantic = matches!(chat.semantic_support(), SemanticSupport::Supported);
+    ///     let trace = TraceLimits { per_record_bytes: 65_536, total_bytes: 1_048_576 };
+    ///     let prepared = match intervention {
+    ///         Some(plan) => model.prepare_intervened_chat(
+    ///             &chat, Default::default(), capture, plan, trace)?,
+    ///         None => model.prepare_observed_chat(
+    ///             &chat, Default::default(), capture, trace)?,
+    ///     };
+    ///     let emit = |record: ControlledGenerationRecord| {
+    ///         println!("{record:?}");
+    ///         ControlFlow::Continue(())
+    ///     };
+    ///     // Text admission is enforced here; a UI can inspect
+    ///     // chat.text_generation_support() beforehand to explain rejection.
+    ///     let mut session = if semantic {
+    ///         model.start_controlled_chat(prepared, &[], Default::default(), emit)?
+    ///     } else {
+    ///         model.start_controlled_text(prepared, &[], Default::default(), emit)?
+    ///     };
+    ///     session.run(emit)?;
+    ///     Ok(())
+    /// }
+    /// ```
+    pub fn start_controlled_text<'a>(
+        &'a mut self,
+        prepared: PreparedObservedGeneration,
+        caller_stop_sequences: &[String],
+        control: GenerationControlHandle,
+        emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
+    ) -> Result<ControlledGenerationSession<'a, B>, ControlledGenerationError<B::Error>> {
+        self.start_controlled_generation(
+            prepared,
+            caller_stop_sequences,
+            control,
+            emit,
+            OutputMode::Text,
+        )
+    }
+
+    fn start_controlled_generation<'a>(
+        &'a mut self,
+        prepared: PreparedObservedGeneration,
+        caller_stop_sequences: &[String],
+        control: GenerationControlHandle,
         mut emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
+        mode: OutputMode,
     ) -> Result<ControlledGenerationSession<'a, B>, ControlledGenerationError<B::Error>> {
         if prepared.session_identity != self.session_identity {
             return Err(CaptureError::Invalid(
@@ -634,7 +724,11 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
         let (config, max_tokens) = self
             .resolve_text_generation_settings(prepared.settings)
             .map_err(PreparedChatError::Generation)?;
-        let semantic = prepared_chat_control_runtime(
+        let prepare_runtime = match mode {
+            OutputMode::Semantic => prepared_chat_control_runtime,
+            OutputMode::Text => prepared_text_control_runtime,
+        };
+        let semantic = prepare_runtime(
             &prepared.chat,
             caller_stop_sequences,
             self.token_validity.clone(),
@@ -644,26 +738,35 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
         // any later prospective changes. Compatibility also requires the opaque
         // exact driver/run identities, never this digest alone.
         use sha2::Digest;
-        let generation_plan = prepared
-            .chat
-            .generation_runtime_plan()
-            .expect("validated prepared chat runtime");
-        let choice = match generation_plan.tool_choice() {
-            crate::runtime::chat::ToolChoice::None => "none",
-            crate::runtime::chat::ToolChoice::Auto => "auto",
-            crate::runtime::chat::ToolChoice::Required => "required",
+        let semantic_identity = match mode {
+            OutputMode::Text => None,
+            OutputMode::Semantic => {
+                let plan = prepared
+                    .chat
+                    .generation_runtime_plan()
+                    .expect("validated semantic plan");
+                let choice = match plan.tool_choice() {
+                    crate::runtime::chat::ToolChoice::None => "none",
+                    crate::runtime::chat::ToolChoice::Auto => "auto",
+                    crate::runtime::chat::ToolChoice::Required => "required",
+                };
+                Some((
+                    prepared.chat.format_profile_identity(),
+                    plan.generation_constraint().fingerprint,
+                    choice,
+                    prepared.chat.profile_stop_sequences(),
+                ))
+            }
         };
         let configuration_identity: [u8; 32] = sha2::Sha256::digest(
             serde_json::to_vec(&(
                 EXECUTION_CONTROL_SCHEMA_VERSION,
+                mode,
                 self.tokenizer_fingerprint,
                 prepared.resolved,
                 prepared.settings.seed,
-                prepared.chat.format_profile_identity(),
-                generation_plan.generation_constraint().fingerprint,
-                choice,
+                semantic_identity,
                 prepared.chat.eos_token_ids(),
-                prepared.chat.profile_stop_sequences(),
                 caller_stop_sequences,
             ))
             .map_err(|error| CaptureError::Invalid(error.to_string()))?,

@@ -28,6 +28,53 @@ bounded `CapturePlan`, or `prepare_intervened_chat` with a validated interventio
 request. `CapturePlan::none()` selects ordinary delivery. Pass the result to
 `start_controlled_chat(prepared, stops, control, callback)`.
 
+For an unrecognized template, explicitly select
+`start_controlled_text(prepared, stops, control, callback)`. Both `LoadedModel<B>`
+and `LocalModel` expose it with the same arguments and session return type as their
+chat entry point. `start_controlled_chat` remains strict.
+
+```rust
+// model: LocalModel (the same selection works with LoadedModel<B>)
+let chat = model.prepare_chat(request)?;
+let semantic = matches!(chat.semantic_support(), SemanticSupport::Supported);
+// A UI can show chat.text_generation_support().unsupported_reason() before starting.
+let prepared = match intervention {
+    Some(plan) => model.prepare_intervened_chat(&chat, settings, capture, plan, trace_limits)?,
+    None => model.prepare_observed_chat(&chat, settings, capture, trace_limits)?,
+};
+let mut session = if semantic {
+    model.start_controlled_chat(prepared, &stops, control, &mut emit)?
+} else {
+    model.start_controlled_text(prepared, &stops, control, &mut emit)?
+};
+session.step(&mut emit)?; // Existing session handling stays unchanged.
+```
+
+Import `SemanticSupport` from `eredu::runtime::chat`. The
+[`LoadedModel::start_controlled_text` rustdoc](../eredu/src/api/control.rs) contains
+a complete generic example. Capture, intervention, trace and control types retain
+their existing public paths.
+
+Text mode consumes the prepared prompt IDs exactly, including the rendered
+generation prefix. It retains checkpoint sampling defaults, overrides, seed and
+EOS, and emits the existing token records plus `SemanticEvent::TextDelta` and
+`Finished`. It decodes incrementally, skips special tokens and matches caller
+stops, without interpreting tool calls, reasoning, or profile-specific stops.
+Reasoning and tool-like ordinary text can therefore appear literally. Tokenizer
+validity still excludes holes and padded logits positions before sampling and
+forced-token admission; grammar constraints in semantic mode further restrict
+that same domain.
+
+Text admission rejects every nonempty tool declaration list, including with
+`ToolChoice::None`, and rejects `ToolChoice::Required` even with no declarations.
+Use a request with no tools and `Auto` or `None`; text mode provides no tool
+suppression or tool-output guarantee. This conservative rule preserves requested
+tool constraints instead of silently dropping them. Existing `prepare_chat`
+thinking admission remains in force. Additionally, explicit `enable_thinking: true`
+requires `allow_unparsed_reasoning: true` to select text mode, even if the template
+has a recognized reasoning parser. Template defaults remain unchanged. Admission
+fails through the existing prepared-chat error convention before native startup.
+
 Check `session.capabilities()`. Stepping and pausing describe the actual loaded
 configuration. Configure `enable_snapshots(SnapshotLimits { ... })` once before
 retaining state. This rejects unknown native, grammar or semantic costs. Creating
@@ -35,12 +82,15 @@ a snapshot additionally establishes whether complete continuation growth is know
 for branching; `capabilities().fork` then reports that result. Every fork still
 validates its own plans and budgets.
 
-Current complete facade snapshots require the forbidden-tool constraint mode on a
-supported tool profile. The example explicitly declares a tool and sets
+Complete facade snapshots support text mode and the forbidden-tool constraint
+mode on a supported tool profile. The runnable example declares a tool and sets
 `ToolChoice::None`. Active and automatic llguidance constraints have independent
 copying but no complete storage estimate and reject snapshots. A no-tools request
 may still use an active semantic grammar. Show the returned support reason in the
 UI; do not interpret native KV-copy support as full generation-snapshot support.
+Text snapshots retain partial Unicode, caller-stop lookbehind, pending forced
+choices and decoder state. Snapshot compatibility includes text versus semantic
+mode. Native support and bounded retention/copying admission still apply.
 
 ## Drive one logical run
 
@@ -129,7 +179,11 @@ routing intervention. Facade tests cover semantic history, partial Unicode,
 terminal behavior, canonical forcing, sibling isolation and monotone accounting.
 
 Native local-facade tests also verify sampled partial UTF-8 restoration and execute
-the complete observed/intervened example on a generated Qwen2 checkpoint. Run them
+the complete observed/intervened example on a generated Qwen2 checkpoint. Explicit
+text tests use a deliberately unrecognized template, restore and fork partial UTF-8,
+and compare greedy/sampled output against ordinary token generation with a padded
+logits vocabulary. Portable tests also cover tool/thinking admission, literal
+protocol-like text, non-EOS special tokens and caller-stop lookbehind. Run native tests
 with `cargo test -p eredu --no-default-features --features mlx --test native_execution_control`.
 For an accessible Metal GPU, run
 `cargo test -p eredu --test native_execution_control native_metal -- --ignored`.

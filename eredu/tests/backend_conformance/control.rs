@@ -6,6 +6,9 @@ use std::ops::ControlFlow;
 #[path = "control/snapshots.rs"]
 mod snapshots;
 
+#[path = "control/text.rs"]
+mod text;
+
 fn setup() -> (
     LoadedModel<MockBackend>,
     PreparedChat,
