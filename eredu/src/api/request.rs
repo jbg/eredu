@@ -261,12 +261,14 @@ pub struct PreparedChatSpeculativeConstraint {
 impl PreparedChatSpeculativeConstraint {
     pub(super) fn from_prepared_chat(
         prepared_chat: &PreparedChat,
+        validity: std::sync::Arc<TokenFilter>,
     ) -> Result<Self, ConstraintError> {
         let generation_plan = prepared_chat
             .generation_runtime_plan()
             .expect("supported prepared chats carry a generation runtime plan");
         Ok(Self {
-            controller: ConstraintController::from_generation_plan(generation_plan)?,
+            controller: ConstraintController::from_generation_plan(generation_plan)?
+                .with_validity(validity),
         })
     }
 }
@@ -430,6 +432,7 @@ impl SpeculativeSemanticState for PreparedChatSemanticState {
 pub(super) fn prepared_chat_control_runtime(
     prepared_chat: &PreparedChat,
     caller_stop_sequences: &[String],
+    validity: std::sync::Arc<TokenFilter>,
 ) -> Result<PreparedChatControlRuntime, PreparedChatSetupError> {
     let semantic_plan = match prepared_chat.semantic_support() {
         SemanticSupport::Supported => prepared_chat
@@ -444,7 +447,8 @@ pub(super) fn prepared_chat_control_runtime(
     let generation_plan = prepared_chat
         .generation_runtime_plan()
         .expect("supported prepared chats carry a generation runtime plan");
-    let controller = ConstraintController::from_generation_plan(generation_plan)?;
+    let controller =
+        ConstraintController::from_generation_plan(generation_plan)?.with_validity(validity);
     let parser = semantic_plan
         .create_parser_with_stops(caller_stop_sequences.iter().map(String::as_str))
         .map_err(PreparedChatSetupError::Semantic)?;

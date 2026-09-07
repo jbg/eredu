@@ -13,7 +13,24 @@ use eredu_core::{
 use eredu_text::tokenizer::Tokenizer as ChatTokenizer;
 use tokenizers::{models::wordlevel::WordLevel, AddedToken, Tokenizer};
 
-struct MockBackend;
+struct MockBackend {
+    logits: Vec<f32>,
+}
+
+impl MockBackend {
+    fn sample(&self, filter: &TokenFilter) -> Result<MockToken, MockError> {
+        let allowed = filter
+            .allowed_mask_for(self.logits.len())
+            .map_err(|_| MockError)?;
+        self.logits
+            .iter()
+            .enumerate()
+            .filter(|(id, _)| allowed.as_ref().is_none_or(|mask| mask[*id]))
+            .max_by(|(_, a), (_, b)| a.total_cmp(b))
+            .map(|(id, _)| MockToken(id as u32))
+            .ok_or(MockError)
+    }
+}
 struct MockSession;
 
 #[derive(Clone)]
@@ -148,12 +165,12 @@ impl TextGenerationBackend for MockBackend {
     fn submit_text_prefill(
         runtime: &mut ModelRuntime<Self>,
         prompt: Self::Prompt,
-        _: &TokenFilter,
+        filter: &TokenFilter,
         _: &mut Self::TextGenerationState,
     ) -> Result<Submission<Self::Token, Self::TextCompletion>, Self::Error> {
         let submission = runtime.prefill(prompt)?;
         Ok(Submission {
-            output: MockToken(submission.output),
+            output: runtime.backend().sample(filter)?,
             completion: submission.completion,
         })
     }
@@ -161,12 +178,12 @@ impl TextGenerationBackend for MockBackend {
     fn submit_text_decode(
         runtime: &mut ModelRuntime<Self>,
         token: Self::Token,
-        _: &TokenFilter,
+        filter: &TokenFilter,
         _: &mut Self::TextGenerationState,
     ) -> Result<Submission<Self::Token, Self::TextCompletion>, Self::Error> {
         let submission = runtime.decode(token.0)?;
         Ok(Submission {
-            output: MockToken(submission.output),
+            output: runtime.backend().sample(filter)?,
             completion: submission.completion,
         })
     }
@@ -174,7 +191,13 @@ impl TextGenerationBackend for MockBackend {
 
 #[test]
 fn loaded_model_generates_without_an_mlx_dependency() {
-    let runtime = ModelRuntime::prepare(MockBackend, ()).unwrap();
+    let runtime = ModelRuntime::prepare(
+        MockBackend {
+            logits: vec![0.0, 1.0, 100.0, 200.0],
+        },
+        (),
+    )
+    .unwrap();
     let mut tokenizer = Tokenizer::new(WordLevel::default());
     tokenizer
         .add_tokens([
@@ -207,7 +230,7 @@ fn loaded_model_generates_without_an_mlx_dependency() {
         .map(|token| token.unwrap().token_id().unwrap())
         .collect::<Vec<_>>();
 
-    assert_eq!(tokens, vec![1, 2, 3]);
+    assert_eq!(tokens, vec![1, 1, 1]);
     assert_eq!(model.model_family(), ModelKind::Qwen35);
     assert_eq!(model.effective_model_type(), "qwen3_5_text");
 }
@@ -249,4 +272,128 @@ fn tokenizer_and_text_inspection_are_available_without_mlx() {
     assert_eq!(report.text_generation, InspectionReadiness::Ready);
 
     std::fs::remove_dir_all(directory).unwrap();
+}
+
+fn sparse_vocabulary_model(logits: Vec<f32>) -> LoadedModel<MockBackend> {
+    let words = WordLevel::builder()
+        .vocab(
+            [
+                ("[UNK]".to_owned(), 0),
+                ("a".into(), 2),
+                ("<|im_end|>".into(), 5),
+            ]
+            .into_iter()
+            .collect(),
+        )
+        .unk_token("[UNK]".into())
+        .build()
+        .unwrap();
+    let mut tokenizer = Tokenizer::new(words);
+    tokenizer.with_decoder(Some(tokenizers::decoders::byte_level::ByteLevel::default()));
+    tokenizer.with_pre_tokenizer(Some(tokenizers::pre_tokenizers::whitespace::Whitespace));
+    tokenizer
+        .add_special_tokens([AddedToken::from("<|im_end|>", true).normalized(false)])
+        .unwrap();
+    LoadedModel::from_runtime(
+        ModelRuntime::prepare(MockBackend { logits }, ()).unwrap(),
+        ChatTokenizer::from_tokenizer(tokenizer),
+        LoadedTextModelConfig {
+            model_family: ModelKind::Qwen2,
+            effective_model_type: "qwen2".into(),
+            model_id: "sparse-vocabulary".into(),
+            chat_template: Some(
+                include_str!("fixtures/chat_templates/qwen2.5-7b-instruct-acbd9653.jinja").into(),
+            ),
+            eos_token_ids: vec![5],
+            checkpoint_generation_config: None,
+        },
+    )
+}
+
+#[test]
+fn ordinary_and_semantic_generation_exclude_holes_and_padded_logits() {
+    use eredu::api::{
+        PreparedChatGenerationRequest, PreparedChatGenerationSettings, PreparedChatInput,
+    };
+    use eredu::runtime::chat::ChatTemplateRequest;
+    for (logits, expected) in [
+        (vec![0.0, 100.0, 10.0, 200.0, 300.0, 1.0, 400.0, 500.0], 2),
+        // A shorter output prefix still intersects the sparse tokenizer domain.
+        (vec![0.0, 100.0, 10.0], 2),
+        // A mapped EOS remains eligible despite larger invalid logits.
+        (vec![0.0, 100.0, 1.0, 200.0, 300.0, 10.0, 400.0], 5),
+    ] {
+        let mut model = sparse_vocabulary_model(logits);
+        let overrides = GenerationConfigOverrides {
+            max_new_tokens: Some(2),
+            ..Default::default()
+        };
+        let config = TextGenerationConfig::new(model.resolve_generation_config(overrides).unwrap());
+        let ordinary: Vec<_> = model
+            .generate_tokens(vec![2], config)
+            .unwrap()
+            .map(|token| token.unwrap().token_id().unwrap())
+            .collect();
+        assert_eq!(ordinary, [expected, expected]);
+        let chat = model
+            .prepare_chat(ChatTemplateRequest {
+                messages: vec![serde_json::json!({"role": "user", "content": "a"})],
+                add_generation_prompt: true,
+                ..Default::default()
+            })
+            .unwrap();
+        let semantic = model
+            .generate_prepared_chat(PreparedChatGenerationRequest {
+                input: PreparedChatInput::rendered_prompt(&chat),
+                settings: PreparedChatGenerationSettings { overrides, seed: 0 },
+                caller_stop_sequences: &[],
+                cancellation: Default::default(),
+                on_event: |_| {},
+            })
+            .unwrap();
+        if expected == 5 {
+            assert_eq!(semantic.token_ids, [5]);
+            // The Qwen parser also recognizes this EOS spelling as a profile stop.
+            assert_eq!(
+                semantic.finish_reason,
+                eredu_core::FinishReason::StopSequence
+            );
+        } else {
+            assert_eq!(semantic.token_ids, [expected, expected]);
+        }
+    }
+}
+
+#[test]
+fn ordinary_generation_fails_if_no_mapped_id_is_executable() {
+    let words = WordLevel::builder()
+        .vocab([("a".to_owned(), 4)].into_iter().collect())
+        .build()
+        .unwrap();
+    let mut model = LoadedModel::from_runtime(
+        ModelRuntime::prepare(
+            MockBackend {
+                logits: vec![100.0, 200.0],
+            },
+            (),
+        )
+        .unwrap(),
+        ChatTokenizer::from_tokenizer(Tokenizer::new(words)),
+        LoadedTextModelConfig {
+            model_family: ModelKind::Qwen2,
+            effective_model_type: "qwen2".into(),
+            model_id: "empty-intersection".into(),
+            chat_template: None,
+            eos_token_ids: vec![],
+            checkpoint_generation_config: None,
+        },
+    );
+    let config =
+        TextGenerationConfig::new(model.resolve_generation_config(Default::default()).unwrap());
+    assert!(model
+        .generate_tokens(vec![0], config)
+        .unwrap()
+        .next()
+        .unwrap()
+        .is_err());
 }

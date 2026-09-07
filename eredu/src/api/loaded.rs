@@ -194,8 +194,12 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
 
         let prepared_chat = input.prepared_chat();
         let (config, max_tokens) = self.resolve_text_generation_settings(settings)?;
-        let control = prepared_chat_control_runtime(prepared_chat, caller_stop_sequences)
-            .map_err(map_prepared_chat_setup_error)?;
+        let control = prepared_chat_control_runtime(
+            prepared_chat,
+            caller_stop_sequences,
+            self.token_validity.clone(),
+        )
+        .map_err(map_prepared_chat_setup_error)?;
         let decoder = PreparedChatTokenDecoder {
             decoder: self.text_decoder(true),
         };
@@ -401,7 +405,10 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
                 )));
             }
         };
-        let constraint = PreparedChatSpeculativeConstraint::from_prepared_chat(prepared_chat)?;
+        let constraint = PreparedChatSpeculativeConstraint::from_prepared_chat(
+            prepared_chat,
+            self.token_validity.clone(),
+        )?;
         let semantic = PreparedChatSemanticState::new(
             PreparedChatTokenDecoder {
                 decoder: self.text_decoder(true),

@@ -50,15 +50,19 @@ pub(super) fn from_tokenizer(
     remove_input_prefixes(&mut tokenizer)?;
 
     let decoder = DecoderKind::inspect(&tokenizer)?;
-    let vocab_size = tokenizer.get_vocab_size(true) as u32;
-    if let Some(id) = eos_token_ids.iter().find(|&&id| id >= vocab_size) {
+    let vocabulary = eredu_text::tokenizer::token_id_vocabulary(&tokenizer);
+    let vocab_size = vocabulary
+        .last_key_value()
+        .and_then(|(&id, _)| id.checked_add(1))
+        .ok_or("tokenizer has an empty or unrepresentable token ID domain")?;
+    if let Some(id) = eos_token_ids.iter().find(|id| !vocabulary.contains_key(id)) {
         return Err(format!(
-            "EOS token ID {id} is outside tokenizer vocabulary {vocab_size}"
+            "EOS token ID {id} has no consistent tokenizer mapping"
         ));
     }
 
     let mut info = TokRxInfo::new(vocab_size, 0);
-    let token_bytes = vocabulary_bytes(&tokenizer, &decoder, &mut info)?;
+    let token_bytes = vocabulary_bytes(&tokenizer, &vocabulary, &decoder, &mut info)?;
     if let Some(&primary_eos) = eos_token_ids.first() {
         info.tok_eos = primary_eos;
     }
@@ -205,6 +209,7 @@ impl DecoderKind {
 
 fn vocabulary_bytes(
     tokenizer: &Tokenizer,
+    vocabulary: &std::collections::BTreeMap<u32, String>,
     decoder: &DecoderKind,
     info: &mut TokRxInfo,
 ) -> Result<Vec<Vec<u8>>, String> {
@@ -212,6 +217,9 @@ fn vocabulary_bytes(
     let mut special_ids = HashSet::new();
 
     for (id, added) in tokenizer.get_added_tokens_decoder() {
+        if !vocabulary.contains_key(&id) {
+            continue;
+        }
         let bracketed = added.content.starts_with('<') && added.content.ends_with('>');
         if added.special || bracketed {
             match added.content.as_str() {
@@ -229,10 +237,8 @@ fn vocabulary_bytes(
         }
     }
 
-    for id in 0..info.vocab_size {
-        let token = tokenizer
-            .id_to_token(id)
-            .ok_or_else(|| format!("tokenizer vocabulary has no token for ID {id}"))?;
+    // Empty slots are absent from TokTrie, not invented tokenizer entries.
+    for (&id, token) in vocabulary {
         token_bytes[id as usize] = if special_ids.contains(&id) {
             let mut bytes = Vec::with_capacity(token.len() + 1);
             bytes.push(TokTrie::SPECIAL_TOKEN_MARKER);
@@ -268,6 +274,25 @@ fn byte_level_alphabet() -> HashMap<char, u8> {
 mod tests {
     use super::*;
     use tokenizers::{decoders::byte_level::ByteLevel, models::bpe::BPE, AddedToken};
+
+    #[test]
+    fn sparse_ids_keep_their_positions_and_unmapped_eos_is_rejected() {
+        let model = BPE::builder()
+            .vocab_and_merges([("a".to_owned(), 0), ("b".to_owned(), 5)], Vec::new())
+            .build()
+            .unwrap();
+        let mut raw = Tokenizer::new(model);
+        raw.with_decoder(Some(ByteLevel::default()));
+        let tokenizer = ChatTokenizer::from_tokenizer(raw);
+        let environment = from_tokenizer(&tokenizer, &[5]).unwrap();
+        assert_eq!(environment.tok_trie().vocab_size(), 6);
+        assert_eq!(environment.tok_trie().token(5), b"b");
+        assert!(environment.tok_trie().token(1).is_empty());
+        assert!(from_tokenizer(&tokenizer, &[1])
+            .err()
+            .unwrap()
+            .contains("no consistent tokenizer mapping"));
+    }
 
     #[test]
     fn current_hugging_face_tokenizer_builds_toktrie_without_serialization() {

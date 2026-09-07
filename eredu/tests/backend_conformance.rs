@@ -1615,7 +1615,8 @@ fn assert_automatic_planning_conformance() {
     assert_eq!(realized_report.plan, report.plan);
     let model = planned.model_mut();
     assert_eq!(model.backend_descriptor().name(), "mock");
-    assert_eq!(client_code(model), vec![1, 2, 3]);
+    // This fixture maps only IDs 0 and 1; the facade excludes undefined IDs.
+    assert_eq!(client_code(model), vec![1, 0, 1]);
 
     let wrong_backend = report
         .plan
@@ -1952,7 +1953,7 @@ fn assert_loading_generation_capability_and_multimodal_conformance() {
     let prepared = multimodal_client_code(&model);
     assert_eq!(prepared, vec![1, 2_001, 7, 1]);
     capability_client_code(&model, &prepared);
-    assert_eq!(client_code(&mut model), vec![1, 2, 3]);
+    assert_eq!(client_code(&mut model), vec![1, 0, 1]);
 }
 
 fn assert_distributed_conformance() {

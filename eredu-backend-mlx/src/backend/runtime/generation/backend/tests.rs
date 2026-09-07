@@ -1,4 +1,4 @@
-use super::{effective_allowed_mask, MlxSamplingBackend};
+use super::MlxSamplingBackend;
 use crate::MlxTensor;
 use eredu_core::TokenFilter;
 use eredu_runtime::{GenerationSampler, MirostatV2Sampler, Sampler, SamplingBackend, TokenDomain};
@@ -9,11 +9,24 @@ use crate::backend::{nn::tensor::TokenValidationScope, random::RandomState, Exec
 #[test]
 fn token_filter_accepts_a_truncated_output_vocabulary_prefix() {
     assert_eq!(
-        effective_allowed_mask(&[false, true, false, true], 3).unwrap(),
+        TokenFilter::Allowed(vec![false, true, false, true])
+            .allowed_mask_for(3)
+            .unwrap()
+            .unwrap()
+            .as_ref(),
         &[false, true, false]
     );
-    assert!(effective_allowed_mask(&[false, false, true], 2).is_err());
-    assert!(effective_allowed_mask(&[true], 2).is_err());
+    assert!(TokenFilter::Allowed(vec![false, false, true])
+        .allowed_mask_for(2)
+        .is_err());
+    assert_eq!(
+        TokenFilter::Allowed(vec![true])
+            .allowed_mask_for(2)
+            .unwrap()
+            .unwrap()
+            .as_ref(),
+        &[true, false]
+    );
 }
 
 #[test]
@@ -21,7 +34,10 @@ fn token_filter_accepts_a_truncated_output_vocabulary_prefix() {
 fn mlx_token_filter_precedes_sampling_policy() {
     let execution = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
     let stream = execution.stream();
-    let raw = MlxTensor::from_array(Array::from_slice(&[100.0f32, 10.0], &[1, 2]));
+    let raw = MlxTensor::from_array(Array::from_slice(
+        &[100.0f32, 10.0, 1000.0, 2000.0],
+        &[1, 4],
+    ));
     let filter = TokenFilter::allowed(vec![false, true]).unwrap();
     let masked = MlxSamplingBackend::apply_token_filter(&raw, &filter, stream).unwrap();
     let mut sampler = GenerationSampler::new().top_k(1).top_p(1.0).min_p(0.0);

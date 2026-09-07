@@ -12,6 +12,20 @@ use eredu_text::tokenizer::{
 use serde_json::{Map, Value};
 use tokenizers::Tokenizer;
 
+/// Closed generation domain, including holes and added/special tokens. Empty
+/// vocabularies remain closed and fail at the sampler's executable-domain check.
+pub(crate) fn tokenizer_token_filter(tokenizer: &Tokenizer) -> eredu_core::TokenFilter {
+    let vocabulary = eredu_text::tokenizer::token_id_vocabulary(tokenizer);
+    let width = vocabulary
+        .last_key_value()
+        .map_or(0, |(&id, _)| id as usize + 1);
+    let mut allowed = vec![false; width];
+    for id in vocabulary.into_keys() {
+        allowed[id as usize] = true;
+    }
+    eredu_core::TokenFilter::Allowed(allowed)
+}
+
 /// Backend-independent tokenizer, chat-template, and text-sidecar failure.
 #[derive(Debug, thiserror::Error)]
 pub enum TextMetadataError {

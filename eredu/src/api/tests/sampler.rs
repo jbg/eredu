@@ -160,11 +160,11 @@ impl SamplingBackend for TestSamplingBackend {
         _: &Self::Context,
     ) -> Result<Self::Logits, Self::Error> {
         let mut masked = logits.clone();
-        if let Some(allowed) = filter.allowed_mask() {
-            if allowed.len() != masked.len() {
-                return Err("test filter does not match the vocabulary".into());
-            }
-            for (logit, allowed) in masked.iter_mut().zip(allowed) {
+        if let Some(allowed) = filter
+            .allowed_mask_for(masked.len())
+            .map_err(|e| e.to_string())?
+        {
+            for (logit, allowed) in masked.iter_mut().zip(allowed.iter()) {
                 if !allowed {
                     *logit = f32::NEG_INFINITY;
                 }
@@ -740,4 +740,101 @@ fn mirostat_v2_validates_configuration() {
     let mut sampler = MirostatV2Sampler::default();
     assert!(sampler.accept_token(0, 0.0).is_err());
     assert!(sampler.accept_token(0, 1.1).is_err());
+}
+
+#[test]
+fn tokenizer_validity_intersects_grammar_for_sampling_forcing_and_speculation() {
+    use eredu_core::TokenFilterController;
+    use eredu_runtime::execution_control::{TokenChoiceController, TokenChoiceError};
+    use std::sync::Arc;
+
+    let plan = synthetic_plan(ToolChoice::Required);
+    let mut grammar = ConstraintController::from_generation_plan(&plan).unwrap();
+    let grammar_filter = grammar.current_filter().unwrap();
+    let valid = (0..256).find(|&id| grammar_filter.allows(id)).unwrap();
+    let forbidden = (0..256).find(|&id| !grammar_filter.allows(id)).unwrap();
+    let mut validity = vec![false; 256];
+    validity[valid as usize] = true;
+    validity[forbidden as usize] = true;
+    let controller = grammar.with_validity(Arc::new(TokenFilter::allowed(validity).unwrap()));
+    let mut choices = TokenChoiceController::new(controller.clone(), TokenDomain::new(256));
+    assert!(matches!(
+        choices.force_next(300),
+        Err(TokenChoiceError::InvalidToken(300))
+    ));
+    let hole = (0..256).find(|&id| id != valid && id != forbidden).unwrap();
+    assert!(matches!(
+        choices.force_next(hole),
+        Err(TokenChoiceError::Forbidden(_))
+    ));
+    assert!(matches!(
+        choices.force_next(forbidden),
+        Err(TokenChoiceError::Forbidden(_))
+    ));
+    choices.force_next(valid).unwrap();
+
+    let mut logits = vec![100.0; 270]; // Holes and padding beat every valid token.
+    logits[forbidden as usize] = 200.0; // Grammar must further restrict validity.
+    logits[valid as usize] = 1.0;
+    let mut sampler =
+        ConstrainedSampler::new(GenerationSampler::new().top_k(1), controller.clone());
+    assert_eq!(
+        Sampler::<TestSamplingBackend>::sample(&mut sampler, &logits, 0.0, None, &()).unwrap(),
+        valid
+    );
+    let mut speculative = ConstrainedSampler::new(DefaultSampler, controller.clone());
+    let processed = process_logits(&mut speculative, &logits, &[]);
+    assert_eq!(sample_processed(&speculative, &processed), valid);
+    assert!(SpeculativeSampler::<TestSamplingBackend>::process_logits(
+        &mut speculative,
+        &logits,
+        0.0,
+        &[hole],
+        &()
+    )
+    .is_err());
+    assert_eq!(
+        Sampler::<TestSamplingBackend>::sample(
+            &mut ConstrainedSampler::new(DefaultSampler, choices),
+            &logits,
+            0.0,
+            None,
+            &()
+        )
+        .unwrap(),
+        valid
+    );
+
+    let mut only_forbidden = vec![false; 256];
+    only_forbidden[forbidden as usize] = true;
+    let mut empty =
+        controller.with_validity(Arc::new(TokenFilter::allowed(only_forbidden).unwrap()));
+    assert!(empty
+        .current_filter()
+        .unwrap_err()
+        .to_string()
+        .contains("does not allow any"));
+}
+
+#[test]
+fn snapshot_forks_retain_validity_without_copying_or_loosening_it() {
+    use eredu_core::TokenFilterController;
+    use eredu_runtime::execution_control::SnapshotTokenController;
+    let plan = synthetic_plan(ToolChoice::None);
+    let mut validity = vec![false; 256];
+    validity[b'a' as usize] = true;
+    let mut parent = ConstraintController::from_generation_plan(&plan)
+        .unwrap()
+        .with_validity(std::sync::Arc::new(TokenFilter::allowed(validity).unwrap()));
+    let bytes = parent.snapshot_storage_bytes().unwrap();
+    let mut child = parent.fork_snapshot().unwrap();
+    assert_eq!(child.snapshot_storage_bytes(), Some(bytes));
+    assert_eq!(
+        parent.current_filter().unwrap(),
+        child.current_filter().unwrap()
+    );
+    assert!(child.commit_token(b'b' as u32).is_err());
+    child.commit_token(b'a' as u32).unwrap();
+    assert!(!child.current_filter().unwrap().allows(256));
+    assert!(parent.filter_at(&[]).is_ok());
 }

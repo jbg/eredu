@@ -521,3 +521,60 @@ fn controlled_facade_closes_broken_consumers_and_fences_panics_and_transport_fai
         assert_eq!(session.next_prediction(), position);
     }
 }
+
+#[test]
+fn controlled_choices_use_sparse_tokenizer_ids_instead_of_entry_count() {
+    let base = unicode_model(None);
+    let mut value: serde_json::Value =
+        serde_json::from_str(&base.tokenizer().to_string(false).unwrap()).unwrap();
+    // Leave IDs 2 and 3 unmapped, preserving the high mapped IDs and EOS.
+    let vocabulary = value["model"]["vocab"].as_object_mut().unwrap();
+    vocabulary.remove("ordinary_1");
+    vocabulary.remove("ordinary_2");
+    // Keep the special token's explicit ID when the tokenizer is reconstructed.
+    vocabulary.insert("<|im_end|>".into(), serde_json::json!(65));
+    let tokenizer = Tokenizer::from_bytes(serde_json::to_vec(&value).unwrap()).unwrap();
+    assert!(tokenizer.get_vocab_size(true) < 65);
+    let eos = tokenizer.token_to_id("<|im_end|>").unwrap();
+    let mut model = LoadedModel::from_runtime(
+        ModelRuntime::prepare(MockBackend, ()).unwrap(),
+        ChatTokenizer::from_tokenizer(tokenizer),
+        LoadedTextModelConfig {
+            model_family: ModelKind::Qwen2,
+            effective_model_type: "qwen2".into(),
+            model_id: "sparse-control".into(),
+            chat_template: Some(QWEN_TEMPLATE.into()),
+            eos_token_ids: vec![eos],
+            checkpoint_generation_config: None,
+        },
+    );
+    let chat = model
+        .prepare_chat(ChatTemplateRequest {
+            messages: vec![serde_json::json!({"role":"user", "content":"hello"})],
+            add_generation_prompt: true,
+            ..Default::default()
+        })
+        .unwrap();
+    let prepared = model
+        .prepare_observed_chat(
+            &chat,
+            PreparedChatGenerationSettings::default(),
+            CapturePlan::none(),
+            limits(),
+        )
+        .unwrap();
+    let mut session = model
+        .start_controlled_chat(prepared, &[], Default::default(), |_| {
+            ControlFlow::Continue(())
+        })
+        .unwrap();
+    assert!(session.force_next_token(2).is_err());
+    assert!(session.force_next_token(eos + 1).is_err());
+    assert_eq!(session.next_prediction(), 0);
+    session.force_next_token(64).unwrap();
+    session.step(|_| ControlFlow::Continue(())).unwrap();
+    assert_eq!(session.token_ids(), [64]);
+    session.force_next_token(eos).unwrap();
+    session.step(|_| ControlFlow::Continue(())).unwrap();
+    assert_eq!(session.token_ids(), [64, eos]);
+}

@@ -130,6 +130,10 @@ pub trait SamplingBackend {
     ) -> Result<Self::Logits, Self::Error>;
 
     /// Masks tokens rejected by a portable vocabulary filter.
+    /// Explicit masks are closed sets: wider logits must mask the missing IDs,
+    /// while narrower logits use the executable prefix. Reject an empty
+    /// intersection before sampling; [`TokenFilter::allowed_mask_for`] implements
+    /// this shared domain policy without backend tensors.
     fn apply_token_filter(
         logits: &Self::Logits,
         filter: &TokenFilter,

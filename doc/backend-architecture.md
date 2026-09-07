@@ -1,5 +1,25 @@
 # Language-model backend architecture
 
+Tokenizer ID membership and model output width are separate domains. The facade
+builds a closed validity mask from actual canonical, round-tripping tokenizer IDs,
+including added and special tokens; holes and inconsistent mappings are excluded.
+Raw text and templated fallback pass it to core's ordinary text machine via
+`TextGeneration::with_token_filter`. Semantic, observed, controlled and speculative
+requests intersect the same immutable mask with their grammar controller. Forced
+choices further restrict that intersection. The grammar and output parsers retain
+their existing activation, EOS and termination behavior.
+
+`eredu-core::TokenFilter` owns closed-set intersection and projection to an actual
+output width: missing mask entries are forbidden, a shorter output uses the mask's
+prefix, and an empty executable intersection is an error. Native samplers realize
+these restrictions before their existing sampling policy; they neither reconstruct
+tokenizers nor infer missing tokens. MLX uses negative infinity for rejected logits.
+Low-level core callers that own no tokenizer may still explicitly use `All`.
+Validity is shared immutably by controller snapshots and speculative forks; sparse
+token IDs participate in the versioned vocabulary fingerprint used for compatibility.
+A forced mapped ID outside a shorter model output fails when that output's width
+is available, before sampling. No model-specific padding convention is assumed.
+
 Architecture and capture discovery follows the same ownership boundaries.
 `eredu-core::discovery` owns the versioned logical graph, symbolic axes, declared
 observation catalog, and separate execution-support reports.

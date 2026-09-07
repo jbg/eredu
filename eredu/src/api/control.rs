@@ -634,8 +634,12 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
         let (config, max_tokens) = self
             .resolve_text_generation_settings(prepared.settings)
             .map_err(PreparedChatError::Generation)?;
-        let semantic = prepared_chat_control_runtime(&prepared.chat, caller_stop_sequences)
-            .map_err(map_prepared_chat_setup_error)?;
+        let semantic = prepared_chat_control_runtime(
+            &prepared.chat,
+            caller_stop_sequences,
+            self.token_validity.clone(),
+        )
+        .map_err(map_prepared_chat_setup_error)?;
         // Versioned initial policy identity; saved native sampler state retains
         // any later prospective changes. Compatibility also requires the opaque
         // exact driver/run identities, never this digest alone.
@@ -669,7 +673,12 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
             decoder: self.text_decoder(true),
         };
         let vocabulary = std::sync::Arc::clone(&decoder.decoder.tokenizer);
-        let domain = eredu_runtime::TokenDomain::new(vocabulary.get_vocab_size(true));
+        let domain = eredu_runtime::TokenDomain::new(
+            self.token_validity
+                .allowed_mask()
+                .expect("facade always supplies a closed token domain")
+                .len(),
+        );
         let pipeline = CommittedTokenPipeline::new(
             RawTokenDecoder::with_structural_tokens(decoder, semantic.structural_tokens),
             semantic.parser,

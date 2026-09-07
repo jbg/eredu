@@ -1380,6 +1380,8 @@ pub enum TokenFilter {
     /// Every vocabulary token may be selected.
     All,
     /// One boolean per canonical vocabulary id; `true` permits selection.
+    /// IDs beyond this mask are forbidden, even when model logits are wider.
+    /// A narrower model output uses only the executable prefix of the mask.
     Allowed(Vec<bool>),
 }
 
@@ -1402,6 +1404,48 @@ impl TokenFilter {
             Self::Allowed(mask) => Some(mask),
         }
     }
+
+    /// Whether this closed set permits a canonical token ID.
+    pub fn allows(&self, token: u32) -> bool {
+        self.allowed_mask()
+            .is_none_or(|mask| mask.get(token as usize).copied().unwrap_or(false))
+    }
+
+    /// Intersects independent restrictions, rejecting an empty allowed set.
+    pub fn intersection(&self, other: &Self) -> Result<Self, TokenFilterError> {
+        match (self.allowed_mask(), other.allowed_mask()) {
+            (None, None) => Ok(Self::All),
+            (Some(mask), None) | (None, Some(mask)) => Self::allowed(mask.to_vec()),
+            (Some(left), Some(right)) => {
+                Self::allowed(left.iter().zip(right).map(|(a, b)| *a && *b).collect())
+            }
+        }
+    }
+
+    /// Realizes a closed allow set at the model's actual output width.
+    /// Missing IDs are false; a truncated prefix must still allow a token.
+    pub fn allowed_mask_for(
+        &self,
+        output_width: usize,
+    ) -> Result<Option<std::borrow::Cow<'_, [bool]>>, TokenFilterError> {
+        if output_width == 0 {
+            return Err(TokenFilterError::EmptyVocabulary);
+        }
+        let Some(mask) = self.allowed_mask() else {
+            return Ok(None);
+        };
+        let prefix = &mask[..mask.len().min(output_width)];
+        if !prefix.iter().any(|allowed| *allowed) {
+            return Err(TokenFilterError::NoExecutableToken { output_width });
+        }
+        Ok(Some(if mask.len() >= output_width {
+            std::borrow::Cow::Borrowed(prefix)
+        } else {
+            let mut mask = mask.to_vec();
+            mask.resize(output_width, false);
+            std::borrow::Cow::Owned(mask)
+        }))
+    }
 }
 
 /// Invalid portable token-filter construction.
@@ -1413,6 +1457,12 @@ pub enum TokenFilterError {
     /// Fail closed instead of asking a backend to sample an impossible row.
     #[error("token filter does not allow any vocabulary token")]
     NoAllowedToken,
+    /// The intersection with the model's output domain is empty.
+    #[error("token filter permits no token in the model output vocabulary of size {output_width}")]
+    NoExecutableToken {
+        /// Actual logits width.
+        output_width: usize,
+    },
 }
 
 /// Backend-independent logical controller for constrained token selection.
@@ -1447,14 +1497,14 @@ pub trait SpeculativeTokenFilterController: TokenFilterController + Clone {
     fn prefix_is_complete(&self, history: &[u32]) -> Result<bool, Self::Error>;
 }
 
-#[derive(Debug, Clone, Copy)]
-struct UnconstrainedTokens;
+#[derive(Debug, Clone)]
+struct FixedTokenFilter(TokenFilter);
 
-impl TokenFilterController for UnconstrainedTokens {
+impl TokenFilterController for FixedTokenFilter {
     type Error = std::convert::Infallible;
 
     fn current_filter(&mut self) -> Result<TokenFilter, Self::Error> {
-        Ok(TokenFilter::All)
+        Ok(self.0.clone())
     }
 
     fn commit_token(&mut self, _: u32) -> Result<(), Self::Error> {
@@ -2000,7 +2050,7 @@ where
 /// for every still-retained submission.
 pub struct TextGeneration<'a, B: TextGenerationBackend> {
     runtime: &'a mut ModelRuntime<B>,
-    inner: TextGenerationMachine<B, UnconstrainedTokens>,
+    inner: TextGenerationMachine<B, FixedTokenFilter>,
 }
 
 impl<'a, B: TextGenerationBackend> TextGeneration<'a, B> {
@@ -2010,8 +2060,22 @@ impl<'a, B: TextGenerationBackend> TextGeneration<'a, B> {
         prompt_token_ids: Vec<u32>,
         config: TextGenerationConfig,
     ) -> Result<Self, B::Error> {
+        Self::with_token_filter(runtime, prompt_token_ids, config, TokenFilter::All)
+    }
+
+    /// Starts ordinary generation with a fixed portable validity restriction.
+    /// Tokenizer-owning callers supply their mapped IDs here; sampling, history,
+    /// completions and limits use the same machine as controlled generation.
+    pub fn with_token_filter(
+        runtime: &'a mut ModelRuntime<B>,
+        prompt_token_ids: Vec<u32>,
+        config: TextGenerationConfig,
+        filter: TokenFilter,
+    ) -> Result<Self, B::Error> {
         let prompt = B::prepare_text_prompt(runtime.backend(), prompt_token_ids)?;
-        Self::from_prompt(runtime, prompt, config)
+        let inner = TextGenerationMachine::new(runtime, prompt, config, FixedTokenFilter(filter))
+            .map_err(unreachable_unconstrained_error)?;
+        Ok(Self { runtime, inner })
     }
 
     /// Starts generation from an opaque backend-prepared prompt.
@@ -2020,8 +2084,9 @@ impl<'a, B: TextGenerationBackend> TextGeneration<'a, B> {
         prompt: B::Prompt,
         config: TextGenerationConfig,
     ) -> Result<Self, B::Error> {
-        let inner = TextGenerationMachine::new(runtime, prompt, config, UnconstrainedTokens)
-            .map_err(unreachable_unconstrained_error)?;
+        let inner =
+            TextGenerationMachine::new(runtime, prompt, config, FixedTokenFilter(TokenFilter::All))
+                .map_err(unreachable_unconstrained_error)?;
         Ok(Self { runtime, inner })
     }
 }
@@ -2121,6 +2186,40 @@ pub trait DistributedBackend: BackendProvider {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn closed_token_sets_intersect_and_project_to_executable_output_width() {
+        use super::{TokenFilter, TokenFilterError};
+        let valid = TokenFilter::allowed(vec![false, true, false, true]).unwrap();
+        assert_eq!(
+            valid.allowed_mask_for(6).unwrap().unwrap().as_ref(),
+            &[false, true, false, true, false, false]
+        );
+        assert_eq!(
+            valid.allowed_mask_for(3).unwrap().unwrap().as_ref(),
+            &[false, true, false]
+        );
+        assert_eq!(
+            valid.allowed_mask_for(1),
+            Err(TokenFilterError::NoExecutableToken { output_width: 1 })
+        );
+        assert_eq!(
+            valid.allowed_mask_for(0),
+            Err(TokenFilterError::EmptyVocabulary)
+        );
+        assert!(!valid.allows(4));
+        let grammar = TokenFilter::allowed(vec![true, true]).unwrap();
+        assert_eq!(
+            valid.intersection(&grammar).unwrap(),
+            TokenFilter::Allowed(vec![false, true])
+        );
+        assert_eq!(valid.intersection(&TokenFilter::All).unwrap(), valid);
+        assert_eq!(
+            valid.intersection(&TokenFilter::Allowed(vec![true])),
+            Err(TokenFilterError::NoAllowedToken)
+        );
+        assert!(TokenFilter::Allowed(vec![]).allowed_mask_for(2).is_err());
+    }
+
     use super::*;
     use std::{convert::Infallible, io::Write};
 
@@ -2874,7 +2973,11 @@ mod tests {
         let mut other = ModelRuntime::prepare(Mock, 10).unwrap();
         let mut owner = TextGenerationDriver::new(&mut first);
         let mut state = owner
-            .start(vec![1, 2], continuation_config(2), UnconstrainedTokens)
+            .start(
+                vec![1, 2],
+                continuation_config(2),
+                FixedTokenFilter(TokenFilter::All),
+            )
             .unwrap();
         let mut foreign = TextGenerationDriver::new(&mut other);
         assert!(matches!(

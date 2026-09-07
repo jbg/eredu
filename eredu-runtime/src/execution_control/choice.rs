@@ -85,10 +85,7 @@ impl<C: TokenFilterController> TokenChoiceController<C> {
         &self.inner
     }
     fn check_filter(filter: &TokenFilter, token: u32) -> Result<(), TokenChoiceError<C::Error>> {
-        if filter
-            .allowed_mask()
-            .is_some_and(|mask| !mask.get(token as usize).copied().unwrap_or(false))
-        {
+        if !filter.allows(token) {
             Err(TokenChoiceError::Forbidden(token))
         } else {
             Ok(())

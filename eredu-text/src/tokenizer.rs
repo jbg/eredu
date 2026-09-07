@@ -19,21 +19,31 @@ use crate::error::Error;
 const DEFAULT_CHAT_TEMPLATE_NAME: &str = "default";
 const TOOL_USE_CHAT_TEMPLATE_NAME: &str = "tool_use";
 
+/// Canonical IDs with a consistent token mapping in both directions.
+/// The number of entries is not the ID extent: tokenizers may contain holes.
+/// Ambiguous aliases use the tokenizer's canonical reverse spelling; IDs whose
+/// reverse spelling encodes to a different ID are excluded.
+pub fn token_id_vocabulary(tokenizer: &tokenizers::Tokenizer) -> BTreeMap<u32, String> {
+    tokenizer
+        .get_vocab(true)
+        .into_values()
+        .filter_map(|id| {
+            let token = tokenizer.id_to_token(id)?;
+            (tokenizer.token_to_id(&token) == Some(id)).then_some((id, token))
+        })
+        .collect()
+}
+
 /// Computes a stable fingerprint of the complete token-id vocabulary mapping.
 pub fn vocabulary_fingerprint(tokenizer: &tokenizers::Tokenizer) -> [u8; 32] {
-    let vocabulary_size = tokenizer.get_vocab_size(true);
+    let vocabulary = token_id_vocabulary(tokenizer);
     let mut hasher = Sha256::new();
-    hasher.update(b"eredu-token-id-vocabulary-v1");
-    hasher.update((vocabulary_size as u64).to_le_bytes());
-    for token_id in 0..vocabulary_size {
-        hasher.update((token_id as u64).to_le_bytes());
-        match tokenizer.id_to_token(token_id as u32) {
-            Some(token) => {
-                hasher.update((token.len() as u64).to_le_bytes());
-                hasher.update(token.as_bytes());
-            }
-            None => hasher.update(u64::MAX.to_le_bytes()),
-        }
+    hasher.update(b"eredu-token-id-vocabulary-v2");
+    hasher.update((vocabulary.len() as u64).to_le_bytes());
+    for (token_id, token) in vocabulary {
+        hasher.update(token_id.to_le_bytes());
+        hasher.update((token.len() as u64).to_le_bytes());
+        hasher.update(token.as_bytes());
     }
     hasher.finalize().into()
 }
@@ -1011,6 +1021,54 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sparse_vocabulary_and_fingerprint_include_ids_beyond_entry_count() {
+        fn tokenizer(high: &str) -> tokenizers::Tokenizer {
+            tokenizers::Tokenizer::new(
+                tokenizers::models::wordlevel::WordLevel::builder()
+                    .vocab(
+                        [("a".to_owned(), 0), (high.to_owned(), 9)]
+                            .into_iter()
+                            .collect(),
+                    )
+                    .build()
+                    .unwrap(),
+            )
+        }
+        let first = tokenizer("b");
+        let second = tokenizer("c");
+        assert_eq!(first.get_vocab_size(true), 2);
+        assert_eq!(
+            super::token_id_vocabulary(&first)
+                .into_keys()
+                .collect::<Vec<_>>(),
+            [0, 9]
+        );
+        assert_ne!(
+            super::vocabulary_fingerprint(&first),
+            super::vocabulary_fingerprint(&second)
+        );
+    }
+
+    #[test]
+    fn inconsistent_reverse_mapping_is_excluded() {
+        // Duplicate Unigram spellings expose both IDs in the reverse direction,
+        // while token_to_id selects only the canonical one.
+        let model = tokenizers::models::unigram::Unigram::from(
+            vec![("a".into(), 0.0), ("a".into(), -1.0)],
+            Some(0),
+            false,
+        )
+        .unwrap();
+        let tokenizer = tokenizers::Tokenizer::new(model);
+        let vocabulary = super::token_id_vocabulary(&tokenizer);
+        let canonical = tokenizer.token_to_id("a").unwrap();
+        assert_eq!(vocabulary.len(), 1);
+        assert!(vocabulary.contains_key(&canonical));
+        assert!(tokenizer.id_to_token(1 - canonical).is_some());
+        assert!(!vocabulary.contains_key(&(1 - canonical)));
+    }
+
     use minijinja::Environment;
     use std::{collections::BTreeSet, path::PathBuf};
 

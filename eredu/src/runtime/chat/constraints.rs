@@ -32,6 +32,7 @@ const MAX_SCHEMA_DEPTH: usize = 64;
 pub(crate) struct ConstraintController {
     runtime: ConstraintRuntime,
     committed_tokens: Vec<u32>,
+    validity: Arc<TokenFilter>,
 }
 
 enum ConstraintRuntime {
@@ -82,11 +83,35 @@ impl Clone for ConstraintController {
         Self {
             runtime: self.runtime.clone(),
             committed_tokens: self.committed_tokens.clone(),
+            validity: Arc::clone(&self.validity),
         }
     }
 }
 
 impl ConstraintController {
+    /// Retains the facade's immutable tokenizer domain across grammar forks,
+    /// speculative histories and execution-control snapshots.
+    pub(crate) fn with_validity(mut self, validity: Arc<TokenFilter>) -> Self {
+        self.validity = validity;
+        self
+    }
+
+    fn validate_token(&self, token: u32) -> Result<(), ConstraintError> {
+        if self.validity.allows(token) {
+            Ok(())
+        } else {
+            Err(ConstraintError::new(format!(
+                "token {token} has no consistent tokenizer mapping"
+            )))
+        }
+    }
+
+    fn restrict(&self, filter: TokenFilter) -> Result<TokenFilter, ConstraintError> {
+        self.validity
+            .intersection(&filter)
+            .map_err(|error| constraint_error(error.to_string()))
+    }
+
     pub(crate) fn continuation_storage_bytes(&self, predictions: u64) -> Option<u64> {
         match &self.runtime {
             ConstraintRuntime::Forbidden { trigger, .. } => predictions
@@ -135,6 +160,7 @@ impl ConstraintController {
         Ok(Self {
             runtime,
             committed_tokens: Vec::new(),
+            validity: Arc::new(TokenFilter::All),
         })
     }
 
@@ -165,16 +191,18 @@ impl ConstraintController {
         }
         let mut runtime = self.runtime.clone();
         for &token in &history[self.committed_tokens.len()..] {
+            self.validate_token(token)?;
             commit_runtime_token(&mut runtime, token)?;
         }
         Ok(runtime)
     }
 
     pub(crate) fn filter_at(&self, history: &[u32]) -> Result<TokenFilter, ConstraintError> {
-        token_filter_at_runtime(&mut self.runtime_at(history)?)
+        self.restrict(token_filter_at_runtime(&mut self.runtime_at(history)?)?)
     }
 
     pub(crate) fn commit(&mut self, token: u32) -> Result<(), ConstraintError> {
+        self.validate_token(token)?;
         commit_runtime_token(&mut self.runtime, token)?;
         self.committed_tokens.push(token);
         Ok(())
@@ -196,7 +224,8 @@ impl TokenFilterController for ConstraintController {
     type Error = ConstraintError;
 
     fn current_filter(&mut self) -> Result<TokenFilter, Self::Error> {
-        token_filter_at_runtime(&mut self.runtime)
+        let filter = token_filter_at_runtime(&mut self.runtime)?;
+        self.restrict(filter)
     }
 
     fn commit_token(&mut self, token_id: u32) -> Result<(), Self::Error> {
@@ -213,6 +242,7 @@ impl eredu_runtime::execution_control::SnapshotTokenController for ConstraintCon
         let Self {
             runtime,
             committed_tokens,
+            validity: _, // Immutable Arc data is shared, not copied by snapshots.
         } = self;
         let bytes = (std::mem::size_of::<Self>() as u64)
             .checked_add((committed_tokens.len() as u64).checked_mul(4)?)?;

@@ -149,6 +149,7 @@ pub struct LoadedModel<B: TextGenerationBackend> {
     pub(crate) runtime: ModelRuntime<B>,
     pub(crate) tokenizer: ChatTokenizer,
     pub(crate) tokenizer_fingerprint: [u8; 32],
+    pub(crate) token_validity: std::sync::Arc<eredu_core::TokenFilter>,
     pub(crate) chat_template: Option<ModelChatTemplate>,
     pub(crate) model_family: ModelKind,
     pub(crate) effective_model_type: String,
@@ -254,11 +255,14 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
         config: LoadedTextModelConfig,
     ) -> Self {
         let tokenizer_fingerprint = eredu_text::tokenizer::vocabulary_fingerprint(&tokenizer);
+        let token_validity =
+            std::sync::Arc::new(super::tokenizer::tokenizer_token_filter(&tokenizer));
         Self {
             session_identity: super::observed::new_identity("session"),
             runtime,
             tokenizer,
             tokenizer_fingerprint,
+            token_validity,
             chat_template: config.chat_template,
             model_family: config.model_family,
             effective_model_type: config.effective_model_type,
@@ -338,12 +342,19 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
     }
 
     /// Starts asynchronous text generation from tokenizer ids.
+    /// Only IDs with a consistent mapping in this model's tokenizer may be
+    /// sampled, even when the model's output vocabulary is padded or sparse.
     pub fn generate_tokens(
         &mut self,
         prompt_token_ids: Vec<u32>,
         config: TextGenerationConfig,
     ) -> Result<TextGeneration<'_, B>, B::Error> {
-        TextGeneration::new(&mut self.runtime, prompt_token_ids, config)
+        TextGeneration::with_token_filter(
+            &mut self.runtime,
+            prompt_token_ids,
+            config,
+            (*self.token_validity).clone(),
+        )
     }
 
     /// Returns the model id passed to chat-template rendering.

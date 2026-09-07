@@ -170,12 +170,14 @@ impl SamplingBackend for MlxSamplingBackend {
         filter: &TokenFilter,
         stream: &Stream,
     ) -> Result<MlxTensor, Exception> {
-        let Some(allowed) = filter.allowed_mask() else {
+        let vocab_size = logits.as_array().dim(-1) as usize;
+        let Some(allowed) = filter
+            .allowed_mask_for(vocab_size)
+            .map_err(|error| Exception::custom(error.to_string()))?
+        else {
             return Ok(logits.clone());
         };
         let logits = logits.as_array();
-        let vocab_size = logits.dim(-1) as usize;
-        let allowed = effective_allowed_mask(allowed, vocab_size).map_err(Exception::custom)?;
         let row_count = logits.size() / vocab_size;
         let invalid = (0..row_count)
             .flat_map(|_| allowed.iter().map(|allowed| !allowed))
@@ -279,21 +281,6 @@ impl SamplingBackend for MlxSamplingBackend {
     }
 }
 
-fn effective_allowed_mask(allowed: &[bool], vocab_size: usize) -> Result<&[bool], String> {
-    let Some(allowed) = allowed.get(..vocab_size) else {
-        return Err(format!(
-            "token filter vocabulary size {} is smaller than logits vocabulary size {vocab_size}",
-            allowed.len()
-        ));
-    };
-    if !allowed.iter().any(|allowed| *allowed) {
-        return Err(format!(
-            "token filter permits no token in the logits vocabulary prefix of size {vocab_size}"
-        ));
-    }
-    Ok(allowed)
-}
-
 fn sample_categorical(
     logits: &Array,
     random: Option<&mut RandomState>,
@@ -306,7 +293,7 @@ fn sample_categorical(
 }
 
 fn mask_logits(mask: Array, logits: Array, stream: &Stream) -> Result<Array, Exception> {
-    let minimum = Array::from_f32(logits.dtype().finfo_min()? as f32);
+    let minimum = Array::from_f32(f32::NEG_INFINITY);
     safemlx::ops::r#where(mask, minimum, logits, stream)
 }
 
