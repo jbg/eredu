@@ -2049,9 +2049,13 @@ configuration before the factory realizes that plan. Platform applications
 therefore do not need a concrete backend crate merely to create and complete a
 model session.
 
-Architecture inspection also reports embedded-draft depth from the normalized,
-admitted artifact composition in `ModelResourceProfile`. The neutral automatic
-planner consumes that observation directly; concrete backends must not infer
+Architecture inspection reports both embedded-draft depth and maximum proposal
+capacity from the normalized, admitted artifact composition in
+`ModelResourceProfile`. Capacity comes from the architecture's prediction
+contract; fused predictors can propose more tokens than their physical layer
+count. The neutral automatic planner caps its preferred draft width at that
+capacity and leaves automatic drafting disabled when capacity is unknown.
+Explicit draft widths are validated as requested. Concrete backends must not infer
 family semantics by searching raw configuration documents. In particular, a
 DeepSeek-V4 base GGUF has target blocks only: its `nextn_predict_layers`
 metadata describes weights omitted into a companion artifact, so base admission
@@ -2068,7 +2072,13 @@ does not realize a device or stream, open payload data, construct an
 architecture, or provoke a failed native load to discover the requirement.
 Automatic planning retains that single admitted artifact inspection through
 every candidate admission, feedback choice, expert-cache mutation, and exact
-bounded-residency probe. The final mutated plan is admitted and probed again,
+bounded-residency probe. Applications may supply deterministic, idempotent plan
+overrides, which are applied before candidate validation and sizing. The CLI
+translates every explicit planning override through this path in quick and plan
+mode; reports and cached plans describe the validated result. Residency probes
+use the overridden plan's budgets. Feedback and cached plans are reusable only
+when they already satisfy the current overrides, so their measurements cannot
+silently replace an explicit choice. The final plan is admitted and probed again,
 then loading consumes the same retained inspection; automatic loading cannot
 reinspect a changed path or construct a route different from the report.
 

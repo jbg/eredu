@@ -164,7 +164,20 @@ where
     P: PreparationMechanismProvider,
 {
     let descriptor = inspection.architecture_plan().architecture_descriptor();
-    let capabilities = match architecture_capabilities(&inspection) {
+    let capabilities = architecture_capabilities(&inspection).and_then(|capabilities| {
+        let capacity = inspection
+            .architecture_plan()
+            .prediction_target_projection()
+            .map_err(PreparationSelectionError::PredictionProjection)?
+            .map(|(_, extension)| {
+                crate::prediction_extension::embedded_prediction_capacity(&extension)
+            })
+            .transpose()
+            .map_err(PreparationSelectionError::PredictionProjection)?
+            .map_or(0, |capacity| capacity.get());
+        Ok((capabilities, capacity))
+    });
+    let (capabilities, embedded_capacity) = match capabilities {
         Ok(capabilities) => capabilities,
         Err(error) => {
             let mut report =
@@ -189,6 +202,10 @@ where
                 capabilities.embedded_draft_layers(),
                 safetensors_processor(&inspection, media),
             );
+            report.resources.embedded_draft_capacity = eredu_core::Observed::exact(
+                embedded_capacity,
+                "normalized architecture prediction contract",
+            );
             record_gguf_media(&mut report, &inspection, media);
             record_discovery(&mut report, descriptor, Some(&preparation), mechanisms);
             ModelInspectionOutcome {
@@ -206,6 +223,10 @@ where
             report.record_architecture_capabilities(
                 capabilities.input_modalities(),
                 capabilities.embedded_draft_layers(),
+            );
+            report.resources.embedded_draft_capacity = eredu_core::Observed::exact(
+                embedded_capacity,
+                "normalized architecture prediction contract",
             );
             reject_selection(&mut report, error);
             record_media(&mut report, &inspection, media);
@@ -512,6 +533,9 @@ fn invalidate_architecture(report: &mut ModelInspectionReport, detail: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::preparation_selection::tests::{
+        inspected_config, prediction_config, BoundedIndependentAdapter,
+    };
 
     #[test]
     fn missing_artifact_is_a_total_report_without_a_selection() {
@@ -566,5 +590,63 @@ mod tests {
             outcome.report().requested_load,
             InspectionReadiness::Missing
         );
+    }
+
+    #[test]
+    fn inspection_reports_capacity_even_when_embedded_drafting_is_disabled_or_rejected() {
+        let qwen = serde_json::json!({
+            "model_type":"qwen3_next", "vocab_size":64, "hidden_size":32,
+            "num_hidden_layers":4, "mtp_num_hidden_layers":1, "num_attention_heads":4,
+            "num_key_value_heads":2, "head_dim":8, "max_position_embeddings":128,
+            "linear_conv_kernel_dim":4, "linear_key_head_dim":8, "linear_value_head_dim":8,
+            "linear_num_key_heads":2, "linear_num_value_heads":4, "intermediate_size":48,
+            "moe_intermediate_size":16, "shared_expert_intermediate_size":24,
+            "num_experts_per_tok":2, "num_experts":8,
+            "layer_types":["linear_attention","linear_attention","linear_attention","full_attention"]
+        });
+        let dspark = serde_json::json!({
+            "architectures":["DeepseekV4ForCausalLM"],"model_type":"deepseek_v4",
+            "hidden_size":16,"moe_intermediate_size":8,"num_hidden_layers":2,
+            "num_attention_heads":2,"num_key_value_heads":1,"head_dim":4,
+            "qk_rope_head_dim":2,"q_lora_rank":2,"o_lora_rank":2,"o_groups":2,
+            "vocab_size":32,"max_position_embeddings":128,"sliding_window":8,
+            "compress_ratios":[0,0,0],"index_n_heads":2,"index_head_dim":4,"index_topk":1,
+            "hc_mult":2,"hc_sinkhorn_iters":2,"n_routed_experts":2,"n_shared_experts":1,
+            "num_experts_per_tok":1,"num_hash_layers":0,"scoring_func":"sqrtsoftplus",
+            "topk_method":"noaux_tc","norm_topk_prob":true,"routed_scaling_factor":1.0,
+            "swiglu_limit":4.0,"num_nextn_predict_layers":1,"dspark_block_size":4,
+            "dspark_noise_token_id":0,"dspark_target_layer_ids":[0,1],"dspark_markov_rank":2
+        });
+        for (config, capacity) in [(prediction_config(), 1), (qwen, 1), (dspark, 4)] {
+            let (_root, inspection) = inspected_config(config);
+            for drafting in [
+                eredu_runtime::DraftingLoadRequest::Disabled,
+                eredu_runtime::DraftingLoadRequest::embedded(capacity + 1).unwrap(),
+            ] {
+                let request = NormalizedLoadRequest::default().with_drafting(drafting);
+                let outcome = inspect_selected_model(
+                    inspection.clone(),
+                    &request,
+                    &BoundedIndependentAdapter::default(),
+                    MediaFeatureAvailability {
+                        image: false,
+                        audio: false,
+                    },
+                );
+                assert_eq!(
+                    outcome.report().resources.embedded_draft_layers.value(),
+                    Some(&1)
+                );
+                assert_eq!(
+                    outcome.report().resources.embedded_draft_capacity.value(),
+                    Some(&capacity)
+                );
+                if drafting == eredu_runtime::DraftingLoadRequest::Disabled {
+                    assert!(outcome.report().is_loadable(), "{:?}", outcome.report());
+                } else {
+                    assert!(!outcome.report().is_loadable());
+                }
+            }
+        }
     }
 }

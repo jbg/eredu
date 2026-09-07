@@ -108,6 +108,24 @@ impl LocalBackendFactory {
         let (report, inspection) = retained.into_parts();
         Ok((report, LocalRetainedModelInspection { inner: inspection }))
     }
+
+    /// Applies caller-owned overrides before candidate admission while retaining inspection.
+    pub fn plan_retained_with_overrides(
+        &self,
+        planner: &crate::AutomaticPlanner,
+        request: &crate::AutomaticPlanRequest,
+        overrides: impl Fn(
+            &crate::ExecutionPlan,
+            &eredu_core::ModelResourceProfile,
+        ) -> Result<crate::ExecutionPlan, crate::AutomaticPlanningError>,
+    ) -> Result<
+        (crate::ExecutionPlanReport, LocalRetainedModelInspection),
+        crate::AutomaticPlanningError,
+    > {
+        let retained = planner.plan_retained_with_overrides(&self.inner, request, overrides)?;
+        let (report, inspection) = retained.into_parts();
+        Ok((report, LocalRetainedModelInspection { inner: inspection }))
+    }
 }
 
 /// Scoped opt-in for selected-backend speculative component timing.

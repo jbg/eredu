@@ -140,6 +140,9 @@ pub struct ModelResourceProfile {
     /// Embedded prediction depth derived from normalized architecture policy.
     #[serde(default = "unobserved_embedded_draft_layers")]
     pub embedded_draft_layers: Observed<usize>,
+    /// Maximum embedded proposal width, which can differ from physical prediction depth.
+    #[serde(default = "unobserved_embedded_draft_layers")]
+    pub embedded_draft_capacity: Observed<usize>,
     /// Sum of encoded tensor payload bytes, excluding container metadata.
     pub stored_tensor_bytes: Observed<u64>,
     /// Largest encoded logical or physical tensor payload.
@@ -171,6 +174,7 @@ impl ModelResourceProfile {
             tensor_count: None,
             checkpoint_shards: None,
             embedded_draft_layers: unobserved_embedded_draft_layers(),
+            embedded_draft_capacity: unobserved_embedded_draft_layers(),
             stored_tensor_bytes: Observed::unavailable(
                 "checkpoint tensor catalog was not established",
             ),
@@ -1196,6 +1200,23 @@ impl AutomaticPlanner {
         backend: &B,
         request: &AutomaticPlanRequest,
     ) -> Result<RetainedAutomaticPlan<B::Inspection>, AutomaticPlanningError> {
+        self.plan_retained_with_overrides(backend, request, |plan, _| Ok(plan.clone()))
+    }
+
+    /// Plans with caller-owned overrides applied before every candidate admission and probe.
+    ///
+    /// The override function must be deterministic and idempotent. It receives the retained
+    /// architecture observations and must preserve the request's device and single-device
+    /// topology. Feedback is eligible only when its measured plan already satisfies overrides.
+    pub fn plan_retained_with_overrides<B: AutomaticPlanningBackend>(
+        &self,
+        backend: &B,
+        request: &AutomaticPlanRequest,
+        overrides: impl Fn(
+            &ExecutionPlan,
+            &ModelResourceProfile,
+        ) -> Result<ExecutionPlan, AutomaticPlanningError>,
+    ) -> Result<RetainedAutomaticPlan<B::Inspection>, AutomaticPlanningError> {
         validate_request(request, &self.policy)?;
         let backend_id = backend.backend_id();
         if request.device.backend != backend_id {
@@ -1232,57 +1253,25 @@ impl AutomaticPlanner {
         );
         let model_bytes = observed_u64(&resources.materialized_parameter_bytes)
             .or_else(|| observed_u64(&resources.stored_tensor_bytes));
-        let candidates = base_candidates(
+        let embedded_capacity = resources.embedded_draft_capacity.value().copied();
+        let drafting = match embedded_capacity.filter(|capacity| *capacity > 0) {
+            Some(capacity) => DraftingPlan::Embedded {
+                max_draft_tokens: self.policy.embedded_mtp_draft_tokens.min(capacity),
+                lookahead: true,
+                adaptive_lookahead: true,
+            },
+            None => DraftingPlan::Disabled,
+        };
+        let mut candidates = base_candidates(
             request.device.clone(),
             device_budget,
             host_budget,
             &self.policy,
         );
-        let resident = backend.admit_candidate(&inspection, &candidates[0])?;
-        let mut layerwise = backend.admit_candidate(&inspection, &candidates[1])?;
-        let mut disk = backend.admit_candidate(&inspection, &candidates[2])?;
-        let resident_fits = model_bytes.is_some_and(|bytes| bytes <= device_budget);
-        let layerwise_host_fits = model_bytes.is_some_and(|bytes| {
-            if hardware.physical_memory_semantics == HardwareMemorySemantics::Unified {
-                bytes <= host_budget.saturating_mul(2)
-            } else {
-                bytes <= host_budget
-            }
-        });
-        if !resident_fits || !resident.supported {
-            apply_bounded_probe(
-                backend,
-                &inspection,
-                &candidates[1],
-                device_budget,
-                &mut layerwise,
-                &mut resources,
-                false,
-            )?;
-            apply_bounded_probe(
-                backend,
-                &inspection,
-                &candidates[2],
-                device_budget,
-                &mut disk,
-                &mut resources,
-                true,
-            )?;
+        for candidate in &mut candidates {
+            candidate.drafting = drafting.clone();
+            *candidate = overrides(candidate, &resources)?;
         }
-        let selected =
-            if resident_fits && resident.supported {
-                0
-            } else if layerwise_host_fits && layerwise.supported {
-                1
-            } else if disk.supported {
-                2
-            } else {
-                return Err(AutomaticPlanningError::Invalid(format!(
-                "no loadable single-device policy: resident: {}; layerwise: {}; disk-streamed: {}",
-                rejection(&resident), rejection(&layerwise), rejection(&disk)
-            )));
-            };
-        let mut plan = candidates[selected].clone();
         let mut entries = vec![PlanExplanationEntry {
             level: PlanExplanationLevel::Decision,
             code: "single_device_scope".into(),
@@ -1291,36 +1280,98 @@ impl AutomaticPlanner {
                 request.device.backend, request.device.device, self.policy.memory_headroom_percent
             ),
         }];
-        if selected > 0 {
+        let mut selected = None;
+        for candidate in candidates {
+            validate_candidate(&candidate, request)?;
+            let mut admission = backend.admit_candidate(&inspection, &candidate)?;
+            let fits = match candidate.residency() {
+                ResidencyPlan::FullyResident => {
+                    model_bytes.is_some_and(|bytes| bytes <= device_budget)
+                }
+                ResidencyPlan::LayerwiseHost {
+                    host_budget_bytes, ..
+                } => {
+                    let capacity = host_budget_bytes.unwrap_or(host_budget);
+                    model_bytes.is_some_and(|bytes| {
+                        bytes
+                            <= if hardware.physical_memory_semantics
+                                == HardwareMemorySemantics::Unified
+                            {
+                                capacity.saturating_mul(2)
+                            } else {
+                                capacity
+                            }
+                    })
+                }
+                ResidencyPlan::DenseDiskStream { .. } => true,
+            };
+            if !fits {
+                admission.supported = false;
+                admission
+                    .rejection
+                    .get_or_insert_with(|| "the model exceeds the residency memory budget".into());
+            }
+            probe_candidate(
+                backend,
+                &inspection,
+                &candidate,
+                device_budget,
+                &mut admission,
+                &mut resources,
+            )?;
+            if admission.supported {
+                selected = Some(candidate);
+                break;
+            }
             entries.push(PlanExplanationEntry {
                 level: PlanExplanationLevel::Rejection,
-                code: "fully_resident_not_admitted".into(),
-                detail: resident
-                    .rejection
-                    .unwrap_or_else(|| "the model exceeds the device memory budget".into()),
+                code: match candidate.residency() {
+                    ResidencyPlan::FullyResident => "fully_resident_not_admitted",
+                    ResidencyPlan::LayerwiseHost { .. } => "layerwise_not_admitted",
+                    ResidencyPlan::DenseDiskStream { .. } => "disk_stream_not_admitted",
+                }
+                .into(),
+                detail: format!("{:?}: {}", candidate.residency(), rejection(&admission)),
             });
         }
-        if selected > 1 {
-            entries.push(PlanExplanationEntry {
-                level: PlanExplanationLevel::Rejection,
-                code: "layerwise_not_admitted".into(),
-                detail: layerwise
-                    .rejection
-                    .unwrap_or_else(|| "the model exceeds the host-backed admission budget".into()),
-            });
+        let mut plan = selected.ok_or_else(|| {
+            AutomaticPlanningError::Invalid(format!(
+                "no loadable single-device policy: {}",
+                entries
+                    .iter()
+                    .filter(|entry| entry.level == PlanExplanationLevel::Rejection)
+                    .map(|entry| entry.detail.as_str())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ))
+        })?;
+        let mut summary = match plan.residency() {
+            ResidencyPlan::FullyResident => {
+                "selected fully resident execution for the lowest expected latency"
+            }
+            ResidencyPlan::LayerwiseHost { .. } => {
+                "selected host-backed layerwise execution with a validated bounded device window"
+            }
+            ResidencyPlan::DenseDiskStream { .. } => "selected bounded dense disk streaming",
         }
-        let mut summary = match selected {
-            0 => "selected fully resident execution for the lowest expected latency".to_string(),
-            1 => "selected host-backed layerwise execution with a validated bounded device window"
-                .to_string(),
-            _ => "selected bounded dense disk streaming because resident and layerwise admission failed"
-                .to_string(),
-        };
+        .to_string();
 
-        if selected > 0 {
-            let expert_plan = with_expert_cache(plan.clone(), &self.policy);
-            let expert = backend.admit_candidate(&inspection, &expert_plan)?;
-            if expert.supported {
+        if !matches!(plan.residency(), ResidencyPlan::FullyResident)
+            && plan.expert_cache().is_none()
+        {
+            let expert_plan =
+                overrides(&with_expert_cache(plan.clone(), &self.policy), &resources)?;
+            validate_candidate(&expert_plan, request)?;
+            let mut expert = backend.admit_candidate(&inspection, &expert_plan)?;
+            probe_candidate(
+                backend,
+                &inspection,
+                &expert_plan,
+                device_budget,
+                &mut expert,
+                &mut resources,
+            )?;
+            if expert.supported && expert_plan.expert_cache().is_some() {
                 plan = expert_plan;
                 entries.push(PlanExplanationEntry {
                     level: PlanExplanationLevel::Decision,
@@ -1330,20 +1381,6 @@ impl AutomaticPlanner {
             }
         }
 
-        let embedded_layers = resources.embedded_draft_layers.value().copied();
-        if embedded_layers.is_some_and(|layers| layers > 0) {
-            plan.drafting = DraftingPlan::Embedded {
-                max_draft_tokens: self.policy.embedded_mtp_draft_tokens,
-                lookahead: true,
-                adaptive_lookahead: true,
-            };
-            entries.push(PlanExplanationEntry {
-                level: PlanExplanationLevel::Decision,
-                code: "embedded_mtp_selected".into(),
-                detail: "checkpoint metadata advertises embedded prediction layers".into(),
-            });
-        }
-
         if let Some((feedback, samples, median)) = select_feedback_plan(
             backend,
             &inspection,
@@ -1351,7 +1388,7 @@ impl AutomaticPlanner {
             &hardware,
             &resources,
             &self.policy,
-            embedded_layers,
+            &overrides,
         )? {
             plan = feedback;
             summary = format!(
@@ -1361,6 +1398,17 @@ impl AutomaticPlanner {
                 level: PlanExplanationLevel::Decision,
                 code: "prior_telemetry_selected".into(),
                 detail: format!("selected using {samples} matching runtime sample(s)"),
+            });
+        }
+
+        if let DraftingPlan::Embedded {
+            max_draft_tokens, ..
+        } = plan.drafting
+        {
+            entries.push(PlanExplanationEntry {
+                level: PlanExplanationLevel::Decision,
+                code: "embedded_mtp_selected".into(),
+                detail: format!("selected {max_draft_tokens} embedded draft token(s); architecture capacity is {}", embedded_capacity.map_or_else(|| "unknown".into(), |capacity| capacity.to_string())),
             });
         }
 
@@ -1513,6 +1561,53 @@ fn base_candidates(
     [resident, layerwise, disk]
 }
 
+fn validate_candidate(
+    plan: &ExecutionPlan,
+    request: &AutomaticPlanRequest,
+) -> Result<(), AutomaticPlanningError> {
+    plan.validate_structure()
+        .map_err(|error| AutomaticPlanningError::Invalid(error.to_string()))?;
+    if plan.device != request.device
+        || plan.topology
+            != crate::topology::ParallelTopology::new(1, 1, 1, 1).expect("singleton topology")
+    {
+        return Err(AutomaticPlanningError::Invalid(
+            "automatic overrides must preserve the selected device and singleton topology".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn probe_candidate<B: AutomaticPlanningBackend>(
+    backend: &B,
+    inspection: &B::Inspection,
+    plan: &ExecutionPlan,
+    default_device_budget: u64,
+    admission: &mut CandidateAdmission,
+    resources: &mut ModelResourceProfile,
+) -> Result<(), AutomaticPlanningError> {
+    let budget = match plan.residency() {
+        ResidencyPlan::FullyResident => return Ok(()),
+        ResidencyPlan::LayerwiseHost {
+            device_budget_bytes,
+            ..
+        } => device_budget_bytes.unwrap_or(default_device_budget),
+        ResidencyPlan::DenseDiskStream {
+            device_budget_bytes,
+            ..
+        } => *device_budget_bytes,
+    };
+    apply_bounded_probe(
+        backend,
+        inspection,
+        plan,
+        budget,
+        admission,
+        resources,
+        matches!(plan.residency(), ResidencyPlan::DenseDiskStream { .. }),
+    )
+}
+
 fn apply_bounded_probe<B: AutomaticPlanningBackend>(
     backend: &B,
     inspection: &B::Inspection,
@@ -1600,7 +1695,10 @@ fn select_feedback_plan<B: AutomaticPlanningBackend>(
     hardware: &HardwareProfile,
     resources: &ModelResourceProfile,
     policy: &AutomaticPlannerPolicy,
-    embedded_layers: Option<usize>,
+    overrides: &impl Fn(
+        &ExecutionPlan,
+        &ModelResourceProfile,
+    ) -> Result<ExecutionPlan, AutomaticPlanningError>,
 ) -> Result<Option<(ExecutionPlan, usize, f64)>, AutomaticPlanningError> {
     let mut groups: Vec<(ExecutionPlan, Vec<f64>)> = Vec::new();
     for telemetry in &request.prior_telemetry {
@@ -1620,8 +1718,9 @@ fn select_feedback_plan<B: AutomaticPlanningBackend>(
             || prior_hardware.operating_system != hardware.operating_system
             || prior_hardware.architecture != hardware.architecture
             || matches!(plan.drafting, DraftingPlan::External { .. })
-            || (matches!(plan.drafting, DraftingPlan::Embedded { .. })
-                && embedded_layers == Some(0))
+            || overrides(plan, resources)? != *plan
+            || matches!(plan.drafting, DraftingPlan::Embedded { max_draft_tokens, .. }
+                if !resources.embedded_draft_capacity.value().is_some_and(|capacity| max_draft_tokens <= *capacity))
         {
             continue;
         }
@@ -1642,7 +1741,9 @@ fn select_feedback_plan<B: AutomaticPlanningBackend>(
     }
     let mut accepted = Vec::new();
     for (plan, mut rates) in groups {
-        if !backend.admit_candidate(inspection, &plan)?.supported {
+        if validate_candidate(&plan, request).is_err()
+            || !backend.admit_candidate(inspection, &plan)?.supported
+        {
             continue;
         }
         rates.sort_by(f64::total_cmp);
@@ -1715,6 +1816,8 @@ mod tests {
     struct MockPlanningBackend {
         model_bytes: u64,
         embedded_layers: usize,
+        embedded_capacity: Option<usize>,
+        required_cached_shards: Option<usize>,
     }
 
     impl Default for MockPlanningBackend {
@@ -1722,6 +1825,8 @@ mod tests {
             Self {
                 model_bytes: 2 << 30,
                 embedded_layers: 0,
+                embedded_capacity: Some(0),
+                required_cached_shards: None,
             }
         }
     }
@@ -1766,6 +1871,10 @@ mod tests {
             profile.model_family = Some("llama".into());
             profile.embedded_draft_layers =
                 Observed::exact(self.embedded_layers, "normalized architecture fixture");
+            profile.embedded_draft_capacity = self.embedded_capacity.map_or_else(
+                || Observed::unavailable("unknown fixture capacity"),
+                |capacity| Observed::exact(capacity, "architecture contract fixture"),
+            );
             profile.stored_tensor_bytes = Observed::exact(self.model_bytes, "fixture");
             profile.materialized_parameter_bytes = Observed::exact(self.model_bytes, "fixture");
             Ok((profile, ()))
@@ -1774,11 +1883,22 @@ mod tests {
         fn admit_candidate(
             &self,
             _inspection: &Self::Inspection,
-            _plan: &ExecutionPlan,
+            plan: &ExecutionPlan,
         ) -> Result<CandidateAdmission, AutomaticPlanningError> {
+            let rejection = if matches!(plan.drafting(), DraftingPlan::Embedded { max_draft_tokens, .. } if *max_draft_tokens > self.embedded_capacity.unwrap_or(0))
+            {
+                Some("draft capacity exceeded".into())
+            } else if self
+                .required_cached_shards
+                .is_some_and(|required| plan.max_cached_shards() != required)
+            {
+                Some("cached-shard override missing".into())
+            } else {
+                None
+            };
             Ok(CandidateAdmission {
-                supported: true,
-                rejection: None,
+                supported: rejection.is_none(),
+                rejection,
             })
         }
 
@@ -1814,6 +1934,8 @@ mod tests {
                 &MockPlanningBackend {
                     model_bytes: 10 << 30,
                     embedded_layers: 2,
+                    embedded_capacity: Some(2),
+                    ..MockPlanningBackend::default()
                 },
                 &request,
             )
@@ -1830,6 +1952,70 @@ mod tests {
             observed_u64(&report.resources.pinned_parameter_bytes),
             Some(1 << 20)
         );
+    }
+
+    #[test]
+    fn automatic_draft_width_respects_capacity_instead_of_physical_depth() {
+        let request = AutomaticPlanRequest::new("model", DevicePlan::new("mock", "gpu:0").unwrap());
+        for (capacity, expected) in [
+            (Some(1), 1),
+            (Some(2), 2),
+            (Some(8), 3),
+            (Some(0), 0),
+            (None, 0),
+        ] {
+            let backend = MockPlanningBackend {
+                embedded_layers: 1,
+                embedded_capacity: capacity,
+                ..MockPlanningBackend::default()
+            };
+            let report = AutomaticPlanner::default()
+                .plan(&backend, &request)
+                .unwrap();
+            match report.plan.drafting() {
+                DraftingPlan::Embedded {
+                    max_draft_tokens, ..
+                } => assert_eq!(*max_draft_tokens, expected),
+                DraftingPlan::Disabled => assert_eq!(expected, 0),
+                other => panic!("unexpected drafting {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_draft_width_is_validated_without_silent_clamping() {
+        let backend = MockPlanningBackend {
+            embedded_layers: 1,
+            embedded_capacity: Some(1),
+            ..MockPlanningBackend::default()
+        };
+        let request = AutomaticPlanRequest::new("model", DevicePlan::new("mock", "gpu:0").unwrap());
+        let error = AutomaticPlanner::default()
+            .plan_retained_with_overrides(&backend, &request, |plan, _| {
+                Ok(plan.clone().with_drafting(DraftingPlan::Embedded {
+                    max_draft_tokens: 3,
+                    lookahead: false,
+                    adaptive_lookahead: false,
+                }))
+            })
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("draft capacity exceeded"));
+    }
+
+    #[test]
+    fn resource_documents_without_capacity_remain_unknown() {
+        let mut profile =
+            ModelResourceProfile::unmeasured("model".into(), ArtifactFormat::SafeTensors);
+        profile.embedded_draft_layers = Observed::exact(1, "legacy depth");
+        let mut encoded = serde_json::to_value(profile).unwrap();
+        encoded
+            .as_object_mut()
+            .unwrap()
+            .remove("embedded_draft_capacity");
+        let decoded: ModelResourceProfile = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.embedded_draft_layers.value(), Some(&1));
+        assert_eq!(decoded.embedded_draft_capacity.value(), None);
     }
 
     #[test]
@@ -1929,6 +2115,8 @@ mod tests {
             inner: MockPlanningBackend {
                 model_bytes: 10 << 30,
                 embedded_layers: 2,
+                embedded_capacity: Some(2),
+                ..MockPlanningBackend::default()
             },
             inspections: std::cell::Cell::new(0),
             admissions: std::cell::RefCell::new(Vec::new()),
@@ -1954,6 +2142,79 @@ mod tests {
         ));
         let (_, inspection) = retained.into_parts();
         assert_eq!(inspection, 7);
+    }
+
+    #[test]
+    fn overrides_precede_every_admission_and_probe_including_expert_cache() {
+        let backend = RetainedPlanningBackend {
+            inner: MockPlanningBackend {
+                model_bytes: 64 << 30,
+                embedded_layers: 1,
+                embedded_capacity: Some(1),
+                required_cached_shards: Some(7),
+            },
+            inspections: std::cell::Cell::new(0),
+            admissions: std::cell::RefCell::new(Vec::new()),
+            bounded_probes: std::cell::RefCell::new(Vec::new()),
+        };
+        let request = AutomaticPlanRequest::new("model", DevicePlan::new("mock", "gpu:0").unwrap());
+        assert!(AutomaticPlanner::default()
+            .plan(&backend, &request)
+            .is_err());
+        backend.admissions.borrow_mut().clear();
+        backend.inspections.set(0);
+        let retained = AutomaticPlanner::default()
+            .plan_retained_with_overrides(&backend, &request, |plan, _| {
+                Ok(plan
+                    .clone()
+                    .with_drafting(DraftingPlan::Disabled)
+                    .with_max_cached_shards(7)
+                    .with_residency(ResidencyPlan::DenseDiskStream {
+                        device_budget_bytes: 8 << 20,
+                        host_budget_bytes: 16 << 20,
+                        host_lookahead: 1,
+                        background_queue: 1,
+                    }))
+            })
+            .unwrap();
+        assert_eq!(backend.inspections.get(), 1);
+        assert!(retained.report().plan.expert_cache().is_some());
+        for plan in backend
+            .admissions
+            .borrow()
+            .iter()
+            .chain(backend.bounded_probes.borrow().iter())
+        {
+            assert_eq!(plan.max_cached_shards(), 7);
+            assert_eq!(plan.drafting(), &DraftingPlan::Disabled);
+            assert!(
+                matches!(plan.residency(), ResidencyPlan::DenseDiskStream { device_budget_bytes, .. } if *device_budget_bytes == 8 << 20)
+            );
+        }
+        assert_eq!(
+            backend.bounded_probes.borrow().last(),
+            Some(&retained.report().plan)
+        );
+    }
+
+    #[test]
+    fn overridden_device_budget_is_used_for_candidate_probes() {
+        let backend = MockPlanningBackend::default();
+        let request = AutomaticPlanRequest::new("model", DevicePlan::new("mock", "gpu:0").unwrap());
+        let error = AutomaticPlanner::default()
+            .plan_retained_with_overrides(&backend, &request, |plan, _| {
+                Ok(plan.clone().with_residency(ResidencyPlan::DenseDiskStream {
+                    device_budget_bytes: 1 << 20,
+                    host_budget_bytes: 16 << 20,
+                    host_lookahead: 1,
+                    background_queue: 1,
+                }))
+            })
+            .err()
+            .unwrap();
+        assert!(error
+            .to_string()
+            .contains("device budget 1048576 bytes cannot contain"));
     }
 
     #[test]
@@ -2000,6 +2261,77 @@ mod tests {
 
         assert!(matches!(report.plan.drafting(), DraftingPlan::Disabled));
         assert!(!report
+            .explanation
+            .entries
+            .iter()
+            .any(|entry| entry.code == "prior_telemetry_selected"));
+    }
+
+    #[test]
+    fn feedback_must_satisfy_current_capacity_and_explicit_overrides() {
+        let backend = MockPlanningBackend {
+            embedded_layers: 1,
+            embedded_capacity: Some(1),
+            ..MockPlanningBackend::default()
+        };
+        let request = AutomaticPlanRequest::new("model", DevicePlan::new("mock", "gpu:0").unwrap());
+        let measured = |width| ExecutionTelemetry {
+            schema_version: AUTOMATIC_SCHEMA_VERSION,
+            effective_model_type: "fixture".into(),
+            plan: Some(
+                ExecutionPlan::fully_resident(request.device.clone()).with_drafting(
+                    DraftingPlan::Embedded {
+                        max_draft_tokens: width,
+                        lookahead: false,
+                        adaptive_lookahead: false,
+                    },
+                ),
+            ),
+            plan_explanation: None,
+            hardware: Some(backend.discover_hardware().unwrap()),
+            resources: Some(backend.inspect_resources(&request.model_path).unwrap().0),
+            prompt_tokens: 1,
+            generated_tokens: 10,
+            stop_reason: "length".into(),
+            timing: TimingTelemetry::new(
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                None,
+                100,
+                Duration::from_secs(2),
+            ),
+            allocator: None,
+            residency: None,
+            expert_cache: None,
+            speculative: None,
+        };
+        let request = request
+            .clone()
+            .with_prior_telemetry([measured(1), measured(8)]);
+        let report = AutomaticPlanner::default()
+            .plan(&backend, &request)
+            .unwrap();
+        assert!(report
+            .explanation
+            .entries
+            .iter()
+            .any(|entry| entry.code == "prior_telemetry_selected"));
+        assert!(matches!(
+            report.plan.drafting(),
+            DraftingPlan::Embedded {
+                max_draft_tokens: 1,
+                lookahead: false,
+                ..
+            }
+        ));
+        let retained = AutomaticPlanner::default()
+            .plan_retained_with_overrides(&backend, &request, |plan, _| {
+                Ok(plan.clone().with_drafting(DraftingPlan::Disabled))
+            })
+            .unwrap();
+        assert_eq!(retained.report().plan.drafting(), &DraftingPlan::Disabled);
+        assert!(!retained
+            .report()
             .explanation
             .entries
             .iter()

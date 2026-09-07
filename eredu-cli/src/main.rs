@@ -522,6 +522,28 @@ impl AutomaticCliOverrides {
         self.explicit.is_empty()
     }
 
+    fn apply_to_plan(
+        &self,
+        plan: &ExecutionPlan,
+        original: &Cli,
+        draft_model_path: Option<&Path>,
+        resources: &ModelResourceProfile,
+    ) -> Result<ExecutionPlan> {
+        if self.is_empty() {
+            return Ok(plan.clone());
+        }
+        let mut args = original.clone();
+        apply_automatic_plan(&mut args, plan)?;
+        self.restore(&mut args, original);
+        let embedded_mtp = draft_model_path.is_none()
+            && args.speculative_draft_tokens > 0
+            && resources
+                .embedded_draft_capacity
+                .value()
+                .is_some_and(|capacity| *capacity > 0);
+        cli_execution_plan(&args, draft_model_path, embedded_mtp)
+    }
+
     fn restore(&self, args: &mut Cli, original: &Cli) {
         if self.contains("mlx_cache_limit_bytes") {
             args.mlx_cache_limit_bytes = original.mlx_cache_limit_bytes;
@@ -1438,6 +1460,27 @@ fn automatic_plan(
         .map_err(Into::into)
 }
 
+fn automatic_plan_with_overrides(
+    model_path: &Path,
+    args: &Cli,
+    overrides: &AutomaticCliOverrides,
+    draft_model_path: Option<&Path>,
+    prior_telemetry: &[ExecutionTelemetry],
+) -> Result<(
+    ExecutionPlanReport,
+    eredu::api::LocalRetainedModelInspection,
+)> {
+    let request = AutomaticPlanRequest::new(model_path, device_plan(args.device)?)
+        .with_prior_telemetry(prior_telemetry.iter().cloned());
+    LocalBackendFactory::default()
+        .plan_retained_with_overrides(&AutomaticPlanner::default(), &request, |plan, resources| {
+            overrides
+                .apply_to_plan(plan, args, draft_model_path, resources)
+                .map_err(|error| eredu_core::AutomaticPlanningError::Invalid(error.to_string()))
+        })
+        .map_err(Into::into)
+}
+
 fn push_unique_plan(
     plans: &mut Vec<ExecutionPlan>,
     seen: &mut HashSet<Vec<u8>>,
@@ -1492,11 +1535,7 @@ fn automatic_benchmark_candidates(
             let mut variant = variant.with_drafting(DraftingPlan::Disabled);
             push_unique_plan(&mut plans, &mut seen, variant.clone());
             if embedded {
-                variant = variant.with_drafting(DraftingPlan::Embedded {
-                    max_draft_tokens: 3,
-                    lookahead: true,
-                    adaptive_lookahead: true,
-                });
+                variant = variant.with_drafting(heuristic.plan.drafting().clone());
                 push_unique_plan(&mut plans, &mut seen, variant);
             }
         }
@@ -1864,8 +1903,15 @@ fn apply_automatic_plan(args: &mut Cli, plan: &ExecutionPlan) -> Result<()> {
             args.disable_speculative_lookahead = !lookahead;
             args.disable_speculative_adaptive_lookahead = !adaptive_lookahead;
         }
-        DraftingPlan::External { .. } => {
-            bail!("single-device automatic planning cannot apply an external drafting plan")
+        DraftingPlan::External {
+            max_draft_tokens,
+            lookahead,
+            adaptive_lookahead,
+            ..
+        } => {
+            args.speculative_draft_tokens = *max_draft_tokens;
+            args.disable_speculative_lookahead = !lookahead;
+            args.disable_speculative_adaptive_lookahead = !adaptive_lookahead;
         }
         _ => bail!("unsupported speculative drafting plan"),
     }
@@ -1874,16 +1920,26 @@ fn apply_automatic_plan(args: &mut Cli, plan: &ExecutionPlan) -> Result<()> {
 
 fn automatic_report_with_cache(
     model_path: &Path,
-    device: CliDevice,
+    args: &Cli,
+    overrides: &AutomaticCliOverrides,
+    draft_model_path: Option<&Path>,
     cache_path: Option<&Path>,
     prior_telemetry: &[ExecutionTelemetry],
 ) -> Result<ExecutionPlanReport> {
     if let Some(path) = cache_path {
-        let observations = automatic_observations(model_path, device)?;
+        let observations = automatic_observations(model_path, args.device)?;
         let key = automatic_cache_key(model_path, &observations)?;
         if prior_telemetry.is_empty() {
             if let Some(mut cached) = cached_automatic_report(path, &key)? {
-                if cached_plan_resource_admitted(&observations, &cached.plan)
+                if (!matches!(cached.plan.drafting(), DraftingPlan::External { .. })
+                    || args.draft_model.is_some())
+                    && overrides.apply_to_plan(
+                        &cached.plan,
+                        args,
+                        draft_model_path,
+                        &observations.resources,
+                    )? == cached.plan
+                    && cached_plan_resource_admitted(&observations, &cached.plan)
                     && inspect_candidate(model_path, &cached.plan)?.supported
                 {
                     cached.explanation.entries.insert(
@@ -1901,11 +1957,25 @@ fn automatic_report_with_cache(
                 }
             }
         }
-        let heuristic = automatic_plan(model_path, device, prior_telemetry)?;
+        let heuristic = automatic_plan_with_overrides(
+            model_path,
+            args,
+            overrides,
+            draft_model_path,
+            prior_telemetry,
+        )?
+        .0;
         write_auto_plan_cache(path, key, heuristic.clone(), None)?;
         Ok(heuristic)
     } else {
-        automatic_plan(model_path, device, prior_telemetry)
+        automatic_plan_with_overrides(
+            model_path,
+            args,
+            overrides,
+            draft_model_path,
+            prior_telemetry,
+        )
+        .map(|(report, _)| report)
     }
 }
 
@@ -1914,22 +1984,16 @@ fn apply_automatic_report(
     original: &Cli,
     overrides: &AutomaticCliOverrides,
     mut report: ExecutionPlanReport,
-    model_path: &Path,
-    draft_model_path: Option<&Path>,
 ) -> Result<ExecutionPlanReport> {
     apply_automatic_plan(args, &report.plan)?;
     overrides.restore(args, original);
     validate_args(args)?;
-    let embedded_mtp = draft_model_path.is_none()
-        && args.speculative_draft_tokens > 0
-        && model_advertises_embedded_mtp(model_path);
-    report.plan = cli_execution_plan(args, draft_model_path, embedded_mtp)?;
     if !overrides.is_empty() {
         report.explanation.entries.push(PlanExplanationEntry {
             level: PlanExplanationLevel::Decision,
             code: "explicit_cli_overrides".into(),
             detail: format!(
-                "applied explicit CLI overrides after automatic selection: {}",
+                "applied explicit CLI overrides before candidate validation: {}",
                 AUTOMATIC_OVERRIDE_ARGUMENTS
                     .iter()
                     .copied()
@@ -1984,6 +2048,17 @@ fn main() -> Result<()> {
                     args.device
                 );
             }
+            let plan = if automatic_overrides.is_empty() {
+                plan
+            } else {
+                let observations = automatic_observations(&model_path, args.device)?;
+                automatic_overrides.apply_to_plan(
+                    &plan,
+                    &original_args,
+                    draft_model_path.as_deref(),
+                    &observations.resources,
+                )?
+            };
             exact_automatic_report(&model_path, plan)
         })
         .transpose()?;
@@ -1993,8 +2068,6 @@ fn main() -> Result<()> {
             &original_args,
             &automatic_overrides,
             report,
-            &model_path,
-            draft_model_path.as_deref(),
         )?)
     } else {
         match args.auto {
@@ -2034,7 +2107,9 @@ fn main() -> Result<()> {
                 AutoMode::Plan => {
                     let report = automatic_report_with_cache(
                         &model_path,
-                        args.device,
+                        &original_args,
+                        &automatic_overrides,
+                        draft_model_path.as_deref(),
                         args.auto_cache.as_deref(),
                         &automatic_feedback,
                     )?;
@@ -2043,8 +2118,6 @@ fn main() -> Result<()> {
                         &original_args,
                         &automatic_overrides,
                         report,
-                        &model_path,
-                        draft_model_path.as_deref(),
                     )?;
                     serde_json::to_writer_pretty(io::stdout().lock(), &report)
                         .context("failed to serialize automatic execution plan")?;
@@ -2052,11 +2125,13 @@ fn main() -> Result<()> {
                     return Ok(());
                 }
                 AutoMode::Quick => {
-                    let request = AutomaticPlanRequest::new(&model_path, device_plan(args.device)?)
-                        .with_prior_telemetry(automatic_feedback.iter().cloned());
-                    let planning_factory = LocalBackendFactory::default();
-                    let (report, inspection) =
-                        planning_factory.plan_retained(&AutomaticPlanner::default(), &request)?;
+                    let (report, inspection) = automatic_plan_with_overrides(
+                        &model_path,
+                        &original_args,
+                        &automatic_overrides,
+                        draft_model_path.as_deref(),
+                        &automatic_feedback,
+                    )?;
                     retained_automatic_inspection = Some(inspection);
                     if let Some(path) = &args.auto_cache {
                         let observations = automatic_observations(&model_path, args.device)?;
@@ -2068,8 +2143,6 @@ fn main() -> Result<()> {
                         &original_args,
                         &automatic_overrides,
                         report,
-                        &model_path,
-                        draft_model_path.as_deref(),
                     )?;
                     eprintln!("automatic plan: {}", report.explanation.summary);
                     Some(report)
@@ -3518,6 +3591,7 @@ mod tests {
             tensor_count: Some(1),
             checkpoint_shards: Some(1),
             embedded_draft_layers: Observed::unsupported("fixture"),
+            embedded_draft_capacity: Observed::unsupported("fixture"),
             stored_tensor_bytes: Observed::exact(7, "fixture"),
             largest_stored_tensor_bytes: Observed::exact(7, "fixture"),
             materialized_parameter_bytes: Observed::unavailable("fixture"),
@@ -3590,6 +3664,172 @@ mod tests {
         assert!(applied.dense_disk_stream);
         assert_eq!(applied.device_budget_bytes, Some(1234));
         assert_eq!(applied.cached_shards, 7);
+    }
+
+    #[test]
+    fn automatic_override_merge_covers_drafting_transformation_and_residency() {
+        let mut resources = ModelResourceProfile::unmeasured(
+            "model".into(),
+            eredu_core::ArtifactFormat::SafeTensors,
+        );
+        resources.embedded_draft_layers = Observed::exact(1, "fixture");
+        resources.embedded_draft_capacity = Observed::exact(1, "fixture");
+        let base = ExecutionPlan::fully_resident(device_plan(CliDevice::Cpu).unwrap())
+            .with_drafting(DraftingPlan::Embedded {
+                max_draft_tokens: 1,
+                lookahead: true,
+                adaptive_lookahead: true,
+            });
+        let cases: &[&[&str]] = &[
+            &["--speculative-draft-tokens", "0"],
+            &[
+                "--speculative-draft-tokens",
+                "3",
+                "--disable-speculative-lookahead",
+                "--disable-speculative-adaptive-lookahead",
+            ],
+            &[
+                "--quantize",
+                "4",
+                "--quantization-mode",
+                "mxfp4",
+                "--cached-shards",
+                "7",
+            ],
+            &[
+                "--draft-model",
+                "assistant",
+                "--speculative-draft-tokens",
+                "2",
+                "--speculative-draft-device",
+                "cpu",
+            ],
+            &[
+                "--dense-disk-stream",
+                "--device-budget-bytes",
+                "16777216",
+                "--host-budget-bytes",
+                "33554432",
+                "--dense-host-lookahead",
+                "3",
+                "--dense-background-queue",
+                "4",
+                "--expert-cache",
+                "--expert-cache-device-budget-bytes",
+                "4194304",
+                "--expert-cache-host-budget-bytes",
+                "8388608",
+                "--expert-cache-scratch-bytes",
+                "1048576",
+                "--expert-cache-prefill-bank-bytes",
+                "524288",
+                "--expert-cache-eviction",
+                "lfu",
+                "--expert-cache-benchmark",
+                "--mlx-cache-limit-bytes",
+                "0",
+            ],
+            &[
+                "--layerwise-host",
+                "--device-layer-window",
+                "2",
+                "--device-budget-bytes",
+                "16777216",
+                "--host-budget-bytes",
+                "33554432",
+            ],
+        ];
+        for (index, flags) in cases.iter().enumerate() {
+            let matches = Cli::command()
+                .try_get_matches_from(
+                    ["eredu", "--model", "model-id", "--device", "cpu"]
+                        .into_iter()
+                        .chain(flags.iter().copied()),
+                )
+                .unwrap();
+            let original = Cli::from_arg_matches(&matches).unwrap();
+            validate_args(&original).unwrap();
+            let overrides = AutomaticCliOverrides::from_matches(&matches);
+            let draft = original.draft_model.as_deref().map(Path::new);
+            let plan = overrides
+                .apply_to_plan(&base, &original, draft, &resources)
+                .unwrap();
+            assert_eq!(
+                overrides
+                    .apply_to_plan(&plan, &original, draft, &resources)
+                    .unwrap(),
+                plan,
+                "overrides must be idempotent"
+            );
+            match index {
+                0 => assert_eq!(plan.drafting(), &DraftingPlan::Disabled),
+                1 => assert!(matches!(
+                    plan.drafting(),
+                    DraftingPlan::Embedded {
+                        max_draft_tokens: 3,
+                        lookahead: false,
+                        adaptive_lookahead: false
+                    }
+                )),
+                2 => {
+                    assert_eq!(
+                        plan.weight_transformation(),
+                        WeightTransformationPlan::MxFp4
+                    );
+                    assert_eq!(plan.max_cached_shards(), 7);
+                }
+                3 => assert!(matches!(
+                    plan.drafting(),
+                    DraftingPlan::External {
+                        max_draft_tokens: 2,
+                        placement: super::DraftPlacementPlan::Device { .. },
+                        ..
+                    }
+                )),
+                4 => {
+                    assert!(matches!(
+                        plan.residency(),
+                        ResidencyPlan::DenseDiskStream {
+                            device_budget_bytes: 16777216,
+                            host_budget_bytes: 33554432,
+                            host_lookahead: 3,
+                            background_queue: 4
+                        }
+                    ));
+                    let expert = plan.expert_cache().unwrap();
+                    assert_eq!(expert.device_budget_bytes(), Some(4194304));
+                    assert_eq!(expert.host_budget_bytes(), Some(8388608));
+                    assert_eq!(expert.scratch_bytes(), 1048576);
+                    assert_eq!(expert.prefill_bank_bytes(), 524288);
+                    assert_eq!(
+                        expert.eviction_policy(),
+                        super::CacheEvictionPolicy::LeastFrequentlyUsed
+                    );
+                }
+                5 => assert!(matches!(
+                    plan.residency(),
+                    ResidencyPlan::LayerwiseHost {
+                        device_layer_window: 2,
+                        device_budget_bytes: Some(16777216),
+                        host_budget_bytes: Some(33554432)
+                    }
+                )),
+                _ => unreachable!(),
+            }
+            let mut applied = original.clone();
+            apply_automatic_plan(&mut applied, &plan).unwrap();
+            overrides.restore(&mut applied, &original);
+            validate_args(&applied).unwrap();
+            assert_eq!(
+                cli_execution_plan(
+                    &applied,
+                    draft,
+                    draft.is_none() && applied.speculative_draft_tokens > 0
+                )
+                .unwrap(),
+                plan
+            );
+        }
     }
 
     #[test]
