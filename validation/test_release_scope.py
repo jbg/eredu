@@ -60,8 +60,19 @@ class ReleaseScopeTests(unittest.TestCase):
         old = '[dependencies]\nserde="1"\n'
         self.assertFalse(self.scoped(old, old.replace('"1"', '"2"'), "eredu/Cargo.toml"))
 
+    def test_public_dependency_type_identity_changes_require_full(self):
+        old = '[package]\nname="eredu"\nversion="0.3.0"\n'
+        self.assertFalse(self.scoped(old, old.replace("0.3.0", "0.4.0"), "eredu/Cargo.toml"))
+        old = '[workspace.dependencies]\neredu={version="0.3.0",path="eredu"}\n'
+        self.assertTrue(self.scoped(old, old.replace("0.3.0", "0.3.1"), "Cargo.toml"))
+        self.assertFalse(self.scoped(old, old.replace("0.3.0", "0.4.0"), "Cargo.toml"))
+
     def test_new_test_does_not_force_full(self):
         self.assertTrue(self.scoped("fn f() {}", "fn f() {}\n#[test]\nfn checks() {}"))
+
+    def test_test_attributes_cannot_hide_production_api_changes(self):
+        for attribute in ("#[test]", "#[cfg(test)]"):
+            self.assertFalse(self.scoped("pub fn f() {}", attribute + "\npub fn f() {}"))
 
     def test_existing_macro_does_not_force_full_but_changing_it_does(self):
         macro = "macro_rules! m { () => { 1 }; } "

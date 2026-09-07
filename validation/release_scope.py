@@ -52,7 +52,19 @@ def public_surface(source: str) -> list[list[str]]:
     for start, token in enumerate(tokens):
         if token != "pub" or tokens[start + 1:start + 2] == ["("]:
             continue
-        declaration = []
+        # Attributes can hide or change a public item even when its signature
+        # stays identical (for example adding #[test] or #[cfg(test)]).
+        attribute_start = start
+        while attribute_start > 0 and tokens[attribute_start - 1] == "]":
+            position = attribute_start - 1
+            nested = 1
+            while position > 0 and nested:
+                position -= 1
+                nested += (tokens[position] == "]") - (tokens[position] == "[")
+            if position == 0 or tokens[position - 1] != "#":
+                break
+            attribute_start = position - 1
+        declaration = tokens[attribute_start:start]
         depth = 0
         brackets = 0
         parentheses = 0
@@ -71,7 +83,7 @@ def public_surface(source: str) -> list[list[str]]:
                         # Const expressions in signatures need a real Rust
                         # parser. Conservatively include the remainder so any
                         # edit here requires full verification.
-                        declaration.extend(tokens[start + len(declaration):])
+                        declaration.extend(tokens[attribute_start + len(declaration):])
                     break
                 depth += 1
             elif item == "}":
@@ -111,15 +123,28 @@ def opaque_surface(source: str) -> list[list[str]]:
 
 def normalized_manifest(text: str, members: set[str]) -> dict:
     value = tomllib.loads(text)
-    value.get("package", {}).pop("version", None)
+    package = value.get("package", {})
+    if "version" in package:
+        package["version"] = patch_identity(package["version"])
     sections = [value, value.get("workspace", {})]
     sections.extend(value.get("target", {}).values())
     for section in sections:
         for kind in ("dependencies", "dev-dependencies", "build-dependencies"):
             for name, dep in section.get(kind, {}).items():
                 if isinstance(dep, dict) and dep.get("package", name) in members:
-                    dep.pop("version", None)
+                    if "version" in dep:
+                        dep["version"] = patch_identity(dep["version"])
     return value
+
+
+def patch_identity(version):
+    # Internal patch minimums can follow a bounded fix; changing a crate's
+    # compatibility line can change public dependency type identities.
+    if isinstance(version, str) and (match := re.fullmatch(r"([\^=]?)(\d+)\.(\d+)\.\d+", version)):
+        prefix, major, minor = match.groups()
+        if major != "0" or minor != "0":
+            return f"{prefix}{major}.{minor}.*"
+    return version
 
 
 def scoped_change(path: str, before: str | None, after: str | None, members: set[str]) -> bool:
@@ -134,7 +159,7 @@ def scoped_change(path: str, before: str | None, after: str | None, members: set
             data = tomllib.loads(text)
             for package in data.get("package", []):
                 if package["name"] in members and "source" not in package:
-                    package.pop("version", None)
+                    package["version"] = patch_identity(package["version"])
             return data
         return normalized(before) == normalized(after)
     if not any(fnmatch.fnmatchcase(path, pattern) for pattern in SCOPED):
@@ -149,7 +174,7 @@ def scoped_change(path: str, before: str | None, after: str | None, members: set
     if attributes(before) != attributes(after):
         # New tests are expected; other attribute changes require full coverage.
         def production_attrs(text):
-            return [a for a in attributes(text) if a not in ("#[test]", "#[cfg(test)]")]
+            return [a for a in attributes(text) if a != "#[test]"]
         if production_attrs(before) != production_attrs(after):
             return False
     if path == PRIVATE or "/tests/" in path or path.endswith("_tests.rs"):
