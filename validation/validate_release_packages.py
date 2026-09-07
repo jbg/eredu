@@ -13,6 +13,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -179,6 +180,13 @@ def staging_directory(base: Path):
             yield active
         finally:
             shutil.rmtree(active)
+
+
+def staging_root(workspace: Path) -> Path:
+    # Cargo searches ancestor manifests/configuration, including above target.
+    # Keep archive/consumer checks outside the invoking workspace entirely.
+    identity = hashlib.sha256(str(workspace.resolve()).encode()).hexdigest()[:16]
+    return Path(tempfile.gettempdir()) / f"eredu-release-staging-{identity}"
 
 
 def normalize_source_times(root: Path) -> None:
@@ -517,7 +525,7 @@ def main() -> int:
         return 0
 
     sizes: list[tuple[str, int]] = []
-    with staging_directory(workspace / "target" / "release-staging") as root:
+    with staging_directory(staging_root(workspace)) as root:
         release_workspace = root / "copy"
         target_dir = arguments.target_dir.resolve() if arguments.target_dir else root / "target"
         release_workspace.mkdir()

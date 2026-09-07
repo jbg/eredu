@@ -10,10 +10,12 @@ import subprocess
 import tarfile
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from validate_release_packages import (
     copy_release_source, index_path, normalize_source_times,
-    stage_package, staging_directory, write_cargo_config,
+    stage_package, staging_directory, staging_root, validate_packaged_tests,
+    validate_downstream_consumer, write_cargo_config,
 )
 
 
@@ -176,6 +178,28 @@ class ReleaseStagingTests(unittest.TestCase):
                         current.append(entry["index"])
                     checksums.append(current)
             self.assertEqual(checksums[0], checksums[1])
+
+    def test_packaged_checks_are_isolated_from_enclosing_workspace(self):
+        with tempfile.TemporaryDirectory() as temporary, redirect_stdout(io.StringIO()):
+            root = Path(temporary)
+            workspace = root / "project"
+            workspace.mkdir()
+            (workspace / "Cargo.toml").write_text('[workspace]\nmembers=[]\n')
+            environment = dict(os.environ, CARGO_HOME=str(root / "cargo-home"),
+                               CARGO_TARGET_DIR=str(root / "target"), CARGO_INCREMENTAL="0")
+            package = self.package("fixture-leaf")
+            package["targets"] = [{"kind": ["lib"]}]
+            archive = self.archive(root, package, "pub fn value() -> u8 { 1 }")
+            with patch("tempfile.gettempdir", return_value=str(root)):
+                base = staging_root(workspace)
+            self.assertFalse(base.is_relative_to(workspace))
+            with staging_directory(base) as stage:
+                config = stage / "config.toml"
+                write_cargo_config(config, [])
+                validate_packaged_tests(package, archive, stage / "tests", config, environment)
+                entry = stage_package(package, archive, stage / "registries", [])
+                write_cargo_config(config, [entry])
+                validate_downstream_consumer(package, stage / "consumers", config, environment)
 
 
 if __name__ == "__main__":
