@@ -62,34 +62,36 @@ external native directory; remove the selected `.native-build` tree explicitly
 when a completely fresh native build is wanted.
 
 The shared CI cache action identifies the installed compiler, CMake, runner
-image, Xcode and Metal or the CUDA toolkit, and Linux CUDA/cuDNN/NCCL package versions. Its
-native key also includes the native sources and build scripts, but excludes
-Rust crate manifests and Cargo.lock. Metal's random installation mount path
-is excluded from its compiler fingerprint; its version and target remain.
-The toolkit variant includes Windows
-CUDA/cuDNN versions and target architecture. Rust artifacts use a separate
-key with the Rust toolchain and Cargo dependency versions. Only the shared
-macOS preflight build caches Rust artifacts: caching full Rust test trees for
-every matrix entry would quickly exhaust the repository's 10 GB budget and
-evict the expensive native builds. That Rust cache keeps one baseline per
-toolchain and dependency set, rather than a new entry for every source commit.
-Native files must be available before
-restoring Rust artifacts that may refer to them.
+image, Xcode/Metal or CUDA toolkit, and installed Linux CUDA dependencies.
+Native build keys include native sources and build scripts independently of
+Rust manifests and package versions. A native tree must be available before
+restoring Rust build-script outputs that refer to it.
 
-Successful native builds are saved before downstream tests and Rust builds,
-so a later failure does not throw away the expensive native compilation.
-Preflight finishes and saves its Rust cache before the macOS workspace job
-starts, allowing that job to reuse its build as well.
+Native macOS, Apple cross-builds, and stable/MSRV archive validation restore
+separate Rust snapshots. Successful main builds save at most 512 MiB per
+configuration after removing incremental and packaged outputs; Cargo rebuilds
+any evicted compiler outputs normally. Native and archive test builds disable
+Rust debug information and incremental compilation to reduce snapshot size.
+Archive jobs retain `target/release-validation`, while staging fresh registries
+so changed unpublished archives cannot reuse old registry contents.
+
+Rust keys include the source commit and fall back across compatible dependency
+versions, allowing the snapshot to improve after source-only fixes. Gate cleanup
+keeps only the newest snapshot per configuration, with a 4 GiB aggregate Rust
+budget, and removes the superseded `rust-v2` snapshots. It leaves all native
+caches untouched. Pull requests restore caches but do not save Rust snapshots or
+run cache cleanup. Missing caches only affect performance, never test selection.
 
 ## CI ordering
 
-The Native release gate calls preflight before any of the broad platform or
-archive jobs. Windows CUDA 12.9 is built once per candidate; main and manual
-release runs add CUDA 13.0 in that same workflow. Apple cross-builds start only
-after native feedback has succeeded. A successful main/manual gate already
-validates that exact release commit, so publication does not need another
-identical matrix. The first build under a new native cache key still needs to
-compile the native library; subsequent Rust-only changes reuse it.
+The release planner selects scoped or full verification from actual changes
+since a successful full main run; see [releasing](releasing.md). Linux, Windows,
+and stable/MSRV archive jobs run alongside combined native macOS validation.
+Native backend tests are not repeated in a second macOS workspace job. Full
+Apple cross-builds use at most four concurrent runners, reserving the fifth
+standard macOS slot for native validation instead of waiting for it to finish. Nightly and explicitly requested full runs retain the entire platform
+matrix. A successful main/manual gate validates the exact release commit, so
+publication does not need another identical matrix.
 
-For a Windows-only change or retry, dispatch `Windows CUDA compatibility`.
-That focused workflow covers both toolkits without waiting for a macOS runner.
+For a Windows-only retry, dispatch `Windows CUDA compatibility`; it covers both
+toolkits without waiting for macOS.

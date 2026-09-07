@@ -3,6 +3,9 @@ name: Linux builds
 on:
   workflow_call:
     inputs:
+      full:
+        type: boolean
+        default: true
       run_gpu:
         type: boolean
         default: false
@@ -12,6 +15,7 @@ permissions:
 
 jobs:
   msrv:
+    if: inputs.full
     name: Rust 1.89 compatibility
     runs-on: ubuntu-22.04
     steps:
@@ -58,29 +62,43 @@ jobs:
           sudo apt-get install -y libblas-dev liblapack-dev liblapacke-dev
           python3 -m pip install --user "cmake>=3.25"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Test scoped architecture and portable consumers
+        if: ${{ !inputs.full }}
+        run: |
+          cargo test --locked -p eredu-architectures
+          cargo test --locked -p eredu --no-default-features --test portable_facade --test backend_conformance
+          cargo test --locked -p eredu-cli --no-default-features --features mlx
       - name: Build and link safemlx tests
+        if: inputs.full
         run: cargo test -p safemlx --lib --no-run
       - name: Test CPU completion events without a GPU backend
+        if: inputs.full
         run: cargo test -p safemlx --test events --no-default-features
       - name: Check the Linux workspace
+        if: inputs.full
         run: cargo check --workspace
       - name: Lint the workspace with warnings denied
+        if: inputs.full
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: Check the isolated audio feature
+        if: inputs.full
         run: |
           cargo check -p eredu-backend-mlx --no-default-features --features audio
           cargo check -p eredu --no-default-features --features mlx,audio
       - name: Test the portable facade without default features
+        if: inputs.full
         run: |
           cargo test --locked -p eredu --no-default-features --test portable_facade
           cargo test --locked -p eredu --no-default-features --test backend_conformance
       - name: Test CPU-safe native tool calling
+        if: inputs.full
         run: |
           cargo test --locked -p eredu --lib api::tests::production_
           cargo test --locked -p eredu --lib runtime::chat::
           cargo test --locked -p eredu --lib runtime::generation::streaming::tests::
 
   cuda-build:
+    if: inputs.full
     name: Rust 1.89 CUDA and NCCL compatibility
     runs-on: ubuntu-22.04
     env:

@@ -1,0 +1,23 @@
+name: Save a bounded Rust build
+description: Keep reusable compiler outputs without unbounded target archives.
+inputs:
+  key:
+    required: true
+    description: Primary Rust key from build-cache.
+  target:
+    default: target
+    description: Cargo target directory.
+runs:
+  using: composite
+  steps:
+    - name: Bound the Rust snapshot
+      if: github.ref == 'refs/heads/main'
+      shell: bash
+      env:
+        CACHE_TARGET: ${{ inputs.target }}
+      run: python3 validation/rust_cache.py prune "$CACHE_TARGET" --max-mib 512
+    - uses: actions/cache/save@v4
+      if: github.ref == 'refs/heads/main'
+      with:
+        path: ${{ inputs.target }}
+        key: ${{ inputs.key }}

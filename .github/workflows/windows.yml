@@ -3,6 +3,9 @@ name: Windows builds
 on:
   workflow_call:
     inputs:
+      full:
+        type: boolean
+        default: true
       extended_cuda:
         type: boolean
         default: false
@@ -37,6 +40,7 @@ jobs:
           ninja --version
           Get-Command cl
       - name: Test the pure-Rust GGUF backend
+        if: inputs.full
         run: cargo test -p eredu-gguf
       - name: Test the portable facade and CPU CLI
         run: |
@@ -44,17 +48,22 @@ jobs:
           cargo test --locked -p eredu --no-default-features --test backend_conformance
           cargo test --locked -p eredu-cli --no-default-features --features mlx
       - name: Build and final-link safemlx tests
+        if: inputs.full
         run: |
           cargo test -p safemlx --lib --no-run --no-default-features
           cargo test -p safemlx --test events --no-run --no-default-features
       - name: Run Windows file-format tests, including Unicode Rust GGUF paths
+        if: inputs.full
         run: cargo test -p safemlx --lib --no-default-features ops::io::tests -- --test-threads=1
       - name: Build a linked safemlx executable
+        if: inputs.full
         run: cargo build -p safemlx --example tutorial --no-default-features
       - name: Compile the backend-neutral integration tests
+        if: inputs.full
         run: cargo test -p safemlx-tests --no-run
 
   cuda-msvc:
+    if: inputs.full
     name: CUDA 12.9 required
     uses: ./.github/workflows/windows-cuda-build.yml
     with:
@@ -89,6 +98,7 @@ jobs:
           nvidia-smi
           nvcc --version
       - name: Test the pure-Rust GGUF backend
+        if: inputs.full
         run: cargo test --release -p eredu-gguf
       - name: Run safemlx CUDA tests
         run: cargo test --release -p safemlx --features cuda --lib --no-default-features

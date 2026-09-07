@@ -32,8 +32,14 @@ on:
       - 'eredu-*/**'
       - 'examples/eredu-ios/**'
       - 'validation/**'
+  schedule:
+    - cron: "23 3 * * *"
   workflow_dispatch:
     inputs:
+      full:
+        description: Force the complete compatibility matrix
+        type: boolean
+        default: false
       run_windows_gpu:
         description: Also run on the preconfigured self-hosted Windows NVIDIA runner
         type: boolean
@@ -52,27 +58,82 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  preflight:
+  plan:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      full: ${{ steps.scope.outputs.full }}
+      packages: ${{ steps.scope.outputs.packages }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install the repository Rust toolchain
+        run: rustup toolchain install
+      - name: Select verification from changes since the last full success
+        id: scope
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE_FULL: ${{ github.event_name == 'schedule' || inputs.full == true }}
+        run: |
+          args=()
+          if [[ "$FORCE_FULL" == true ]]; then args+=(--full); fi
+          python3 validation/release_scope.py "${args[@]}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-plan
+          path: release-plan.json
+      - name: Check validation tooling
+        run: python3 -m unittest discover -s validation -p 'test_release_*.py'
+
+  native:
+    needs: plan
     uses: ./.github/workflows/preflight.yml
+    with:
+      full: ${{ needs.plan.outputs.full == 'true' }}
 
   apple:
-    needs: preflight
+    needs: plan
+    if: needs.plan.outputs.full == 'true'
     uses: ./.github/workflows/apple-platforms.yml
 
   linux:
-    needs: preflight
+    needs: plan
     uses: ./.github/workflows/linux.yml
     with:
+      full: ${{ needs.plan.outputs.full == 'true' }}
       run_gpu: ${{ github.event_name == 'workflow_dispatch' && inputs.run_linux_gpu == true }}
 
   windows:
-    needs: preflight
+    needs: plan
     uses: ./.github/workflows/windows.yml
     with:
-      # Main and explicit release validation cover both toolkits in one matrix.
-      extended_cuda: ${{ github.event_name != 'pull_request' }}
+      full: ${{ needs.plan.outputs.full == 'true' }}
+      extended_cuda: ${{ needs.plan.outputs.full == 'true' }}
       run_windows_gpu: ${{ github.event_name == 'workflow_dispatch' && inputs.run_windows_gpu == true }}
 
   packages:
-    needs: preflight
+    needs: plan
     uses: ./.github/workflows/release-packages.yml
+    with:
+      packages: ${{ needs.plan.outputs.packages }}
+
+  cache-maintenance:
+    needs: [native, apple, linux, windows, packages]
+    if: always() && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-22.04
+    continue-on-error: true
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Retain bounded Rust snapshots
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 validation/rust_cache.py retain --max-mib 4096

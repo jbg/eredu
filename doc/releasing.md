@@ -131,8 +131,8 @@ adding that archive to an ephemeral local registry. After staging a library, it
 also checks a new lock-free downstream crate that depends on the staged package
 with default features disabled. This lets consumers and the next workspace crate
 resolve the exact unpublished version while retaining Cargo's normal package
-verification. Package builds use a temporary target directory that is removed
-after validation. Nothing contacts a registry publishing API and no credentials
+verification. Package builds use a temporary target directory by default, or retain compiler
+outputs in an explicit `--target-dir` for subsequent runs. Nothing contacts a registry publishing API and no credentials
 are required.
 
 This catches:
@@ -168,24 +168,60 @@ and `audio`) without `mlx` at the minimum supported Rust version. These checks
 keep optional facade features from accidentally activating the native backend
 or depending on its availability.
 
-The `Native release gate` is the single CI entry point. It runs automatically
-for code changes on main and pull requests, and can be dispatched manually.
-Its native preflight runs ordinary backend tests with normal parallelism,
-then all self-contained Ring tests serially, using Metal and Accelerate throughout. Only
-after preflight succeeds do the Apple, Linux, Windows, and archive-validation
-workflows start. The Apple cross-build matrix therefore cannot delay native
-feedback for the same candidate.
+The `Native release gate` is the single CI entry point. It runs on main and
+pull requests, nightly, and by manual dispatch. A small planning job compares the
+candidate with the most recent successful **full** main gate; a version-only
+follow-up therefore cannot hide the preceding source change. The plan is printed
+in the job summary and retained as the `release-plan` artifact. Before the first
+new full run, the baseline is `084458c3`, verified by
+[the September 7 full gate](https://github.com/jbg/eredu/actions/runs/34130046331).
+Expired or missing newer receipts fall back to that older baseline.
 
-Before publication, require a successful **main push or manual dispatch** of
-this workflow for the exact release commit. Both include Windows CUDA 12.9.1
-and 13.0.2 in the same run, together with the complete platform and archive
-checks. Reuse that successful run; do not launch a second release matrix for
-an already-validated commit. Pull-request runs cover CUDA 12.9.1 only and are
-not the full release gate. The Windows CUDA compatibility workflow retains
-nightly and manual coverage of both toolkits. It runs independently of the
-macOS queue, so Windows-only retries can start immediately.
-Self-hosted GPU execution remains explicit opt-in through the gate's
-`run_windows_gpu` and `run_linux_gpu` inputs.
+Scoped eligibility is intentionally narrow and follows changed source, not the
+SemVer number. The initial reviewed scope covers Qwen hybrid checkpoint recipes,
+replicated-text lowering, and the private grouped/binding implementations used by
+the FP8 fix. It still runs architecture tests, the ordinary native Metal backend
+suite (including FP8 resident/addressable regressions and required native-device
+admission), portable facade conformance, and native CLI consumers on macOS,
+Linux, and Windows. Changing public declarations, platform/feature attributes,
+external dependencies, native/build/toolchain inputs, other production code, or
+the scope rules themselves requires the full matrix. The classifier is a
+conservative verification selector, not an API compatibility checker.
+
+Full validation retains workspace and Ring tests, all six Apple cross targets,
+Linux CPU/MSRV/CUDA/NCCL, and Windows CPU plus CUDA 12.9.1 and 13.0.2. Nightly
+runs and the dispatch `full` input always select full validation. Self-hosted GPU
+execution remains explicit opt-in through `run_windows_gpu` and `run_linux_gpu`.
+Linux, Windows, and archive jobs start alongside native validation. Ordinary
+backend tests and ignored Ring cases each run once in the combined macOS job.
+Apple cross-builds have at most four concurrent builds, reserving the fifth
+standard macOS slot for native validation. Target-mapping checks share the native
+job rather than taking another macOS runner. The full matrix can therefore run
+alongside native validation without a second serial barrier.
+
+Before publication, require a successful **main push or manual dispatch** gate
+for the exact release commit and inspect its release plan. Either automatically
+selected scope is valid; do not manually omit a failed required check. Reuse that
+successful run rather than launching a second identical matrix. These are
+verification workflows; they never publish crates or create release tags.
+
+For a bounded release, validate just its release roots and unpublished workspace
+dependencies (normal, build, development, optional and target-specific):
+
+```bash
+python3 validation/validate_release_packages.py \
+  --packages eredu-architectures eredu-backend-mlx eredu eredu-cli \
+  --target-dir target/release-validation
+```
+
+Unselected published dependencies resolve from crates.io, rather than being
+repackaged from the workspace. Registry lookup errors fail validation; they do
+not count as proof that a dependency is published. The CI plan supplies the
+changed crate roots in publication order. Infrastructure-only full checks and
+nightly audits validate every package. Both stable and Rust 1.89 archive jobs
+remain mandatory. The target directory can persist across runs, while each
+staged registry has a fresh identity so a different archive with the same
+name/version cannot accidentally reuse stale staged sources.
 
 To run the same preflight locally on an Apple silicon host outside a sandbox:
 

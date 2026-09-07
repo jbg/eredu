@@ -1,7 +1,17 @@
 name: Release package validation
 
 on:
+  workflow_dispatch:
+    inputs:
+      packages:
+        description: JSON array of release crates; unpublished dependencies are added automatically
+        type: string
+        required: true
   workflow_call:
+    inputs:
+      packages:
+        type: string
+        required: true
 
 permissions:
   contents: read
@@ -16,17 +26,39 @@ jobs:
         rust: ["1.89.0", stable]
     env:
       RUSTUP_TOOLCHAIN: ${{ matrix.rust }}
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
       - uses: actions/checkout@v4
       - if: matrix.rust == '1.89.0'
         uses: dtolnay/rust-toolchain@1.89.0
       - if: matrix.rust == 'stable'
         uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
       - name: Install native CPU build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y libblas-dev liblapack-dev liblapacke-dev
           python3 -m pip install --user "cmake>=3.25"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - uses: ./.github/actions/build-cache
+        id: cache
+        with:
+          variant: archives-${{ matrix.rust }}
+          rust: 'true'
+          target: target/release-validation
       - name: Build release archives in publication order
-        run: python3 validation/validate_release_packages.py
+        env:
+          RELEASE_PACKAGES: ${{ inputs.packages }}
+        run: python3 validation/validate_release_packages.py --packages-json "$RELEASE_PACKAGES" --target-dir target/release-validation
+      - uses: ./.github/actions/save-native-cache
+        with:
+          key: ${{ steps.cache.outputs.native-key }}
+          hit: ${{ steps.cache.outputs.native-hit }}
+      - uses: ./.github/actions/save-rust-cache
+        with:
+          key: ${{ steps.cache.outputs.rust-key }}
+          target: target/release-validation

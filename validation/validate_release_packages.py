@@ -13,6 +13,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import urllib.error
+import urllib.request
 from typing import Any
 
 
@@ -186,10 +188,12 @@ def registry_dependency(
     source = dependency.get("source")
     if actual_name in publishable_names:
         registry = None
+    elif dependency.get("path") is not None:
+        # Unchanged workspace dependencies are deliberately resolved from the
+        # real registry, just as they will be after this release is published.
+        registry = "https://github.com/rust-lang/crates.io-index"
     elif source and source.startswith("registry+"):
         registry = source.removeprefix("registry+")
-    elif dependency.get("path") is not None:
-        raise RuntimeError(f"cannot stage non-publishable path dependency {actual_name}")
     else:
         raise RuntimeError(f"cannot stage non-registry dependency {actual_name}: {source}")
 
@@ -370,11 +374,55 @@ def validate_downstream_consumer(
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
+        "--packages", nargs="+", help="release roots; add unpublished workspace dependencies automatically",
+    )
+    parser.add_argument(
+        "--packages-json", help="JSON release roots from the CI release plan (an empty list validates nothing)",
+    )
+    parser.add_argument(
+        "--target-dir", type=Path, help="retain compiled dependencies between archive-validation runs",
+    )
+    parser.add_argument(
         "--allow-dirty",
         action="store_true",
         help="validate tracked and untracked working-tree source instead of requiring a clean tree",
     )
     return parser.parse_args()
+
+
+def published(name: str, version: str) -> bool:
+    request = urllib.request.Request(
+        f"https://index.crates.io/{index_path(name).as_posix()}",
+        headers={"User-Agent": "eredu-release-validation"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=45) as response:
+            records = response.read().splitlines()
+    except urllib.error.HTTPError as error:
+        if error.code == 404:
+            return False
+        raise
+    return any(record["vers"] == version and not record.get("yanked", False)
+               for line in records if (record := json.loads(line)))
+
+
+def release_closure(packages: dict[str, dict[str, Any]], roots: list[str], available=published) -> list[str]:
+    """Stage release roots plus unpublished dependencies, never all consumers."""
+    unknown = set(roots) - packages.keys()
+    if unknown:
+        raise RuntimeError(f"unknown release crates: {sorted(unknown)}")
+    selected = set(roots)
+    checked = set(roots)
+    pending = list(roots)
+    while pending:
+        for dependency in packages[pending.pop()]["dependencies"]:
+            name = dependency["name"]
+            if name in packages and name not in checked:
+                checked.add(name)
+                if not available(name, packages[name]["version"]):
+                    selected.add(name)
+                    pending.append(name)
+    return [name for name in RELEASE_ORDER if name in selected]
 
 
 def main() -> int:
@@ -391,7 +439,18 @@ def main() -> int:
     metadata = cargo_metadata(workspace)
     packages = publishable_packages(metadata)
     validate_release_order(packages)
-    publishable_names = set(packages)
+    if arguments.packages is not None and arguments.packages_json is not None:
+        raise RuntimeError("use only one of --packages or --packages-json")
+    roots = arguments.packages
+    if arguments.packages_json is not None:
+        roots = json.loads(arguments.packages_json)
+        if not isinstance(roots, list) or not all(isinstance(name, str) for name in roots):
+            raise RuntimeError("--packages-json must contain a list of crate names")
+    order = list(RELEASE_ORDER) if roots is None else release_closure(packages, roots)
+    publishable_names = set(order)
+    if not order:
+        print("No release archives selected.")
+        return 0
 
     sizes: list[tuple[str, int]] = []
     with tempfile.TemporaryDirectory(prefix="eredu-release-packages-") as temporary:
@@ -399,11 +458,11 @@ def main() -> int:
         release_workspace = root / "workspace"
         index = root / "index"
         downloads = root / "downloads"
-        target_dir = root / "target"
+        target_dir = arguments.target_dir.resolve() if arguments.target_dir else root / "target"
         release_workspace.mkdir()
         index.mkdir()
         downloads.mkdir()
-        target_dir.mkdir()
+        target_dir.mkdir(parents=True, exist_ok=True)
         copy_release_source(workspace, release_workspace)
 
         (index / "config.json").write_text(
@@ -433,7 +492,7 @@ def main() -> int:
         environment = toolchain_environment(workspace)
         environment["CARGO_TARGET_DIR"] = str(target_dir)
 
-        for crate_name in RELEASE_ORDER:
+        for crate_name in order:
             package = packages[crate_name]
             print(f"\n==> Packaging {crate_name} {package['version']}", flush=True)
             run(
