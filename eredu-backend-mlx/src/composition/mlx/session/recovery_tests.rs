@@ -65,21 +65,23 @@ fn late_terminal_failure_cannot_publish_a_successful_model_operation() {
 }
 
 #[test]
-fn retry_requires_fresh_restoration_and_settled_healthy_native_scope() {
-    use super::model_session::restored_error_permits_retry;
+fn recovery_requires_fresh_restoration_and_no_native_failure() {
+    use super::model_session::restored_error_permits_recovery;
     use super::Error;
     let restored = Error::after_model_call("restored", Some(1), Some(2));
-    assert!(restored_error_permits_retry(
-        status(true, false, false),
-        &restored
-    ));
+    for settled in [false, true] {
+        assert!(restored_error_permits_recovery(
+            status(settled, false, false),
+            &restored
+        ));
+    }
     for native in [
-        status(false, false, false),
+        status(false, true, false),
         status(false, false, true),
         status(true, true, false),
         status(true, false, true),
     ] {
-        assert!(!restored_error_permits_retry(native, &restored));
+        assert!(!restored_error_permits_recovery(native, &restored));
     }
     for (before, after) in [
         (Some(1), Some(1)),
@@ -89,12 +91,12 @@ fn retry_requires_fresh_restoration_and_settled_healthy_native_scope() {
         (None, Some(1)),
     ] {
         let stale = Error::after_model_call("not newly restored", before, after);
-        assert!(!restored_error_permits_retry(
+        assert!(!restored_error_permits_recovery(
             status(true, false, false),
             &stale
         ));
     }
-    assert!(!restored_error_permits_retry(
+    assert!(!restored_error_permits_recovery(
         status(true, false, false),
         &Error::ArchitectureModel("unknown host failure".into())
     ));
@@ -337,6 +339,134 @@ fn native_session(backend: &super::MlxBackend<'_>) -> (tempfile::TempDir, super:
         eredu_core::load_model(backend, artifact.path(), crate::MlxLoadRequest::default()).unwrap();
     let session = backend.create_session(model).unwrap();
     (artifact, session)
+}
+
+#[test]
+fn restored_execution_error_excludes_reuse_until_native_retirement() {
+    use eredu_core::Completion as _;
+    let stream = crate::test_stream();
+    let backend = super::MlxBackend::new(stream, stream);
+    let (_artifact, mut session) = native_session(&backend);
+    let native = Rc::new(Cell::new(status(false, false, false)));
+    let error = session
+        .test_failed_operation(
+            FakeProbe(Rc::clone(&native)),
+            super::Error::after_model_call("restored model failure", Some(1), Some(2)),
+            true,
+        )
+        .unwrap_err();
+    assert!(error.model_state_preserved());
+
+    let entered = Cell::new(false);
+    let pending = session
+        .with_model_operation(|_| {
+            entered.set(true);
+            Ok(())
+        })
+        .unwrap_err();
+    assert!(
+        !entered.get(),
+        "pending recovery must exclude model mutation"
+    );
+    assert!(!pending.to_string().contains("fenced"));
+    assert!(session.reset().is_err());
+    assert!(session.submit_token_decode(&backend, 2).is_err());
+
+    native.set(status(true, false, false));
+    recovery::wait_for_retirement(|| session.ensure_no_submission_in_flight().is_ok());
+    session.reset().unwrap();
+    session
+        .submit_token_decode(&backend, 2)
+        .unwrap()
+        .completion
+        .wait()
+        .unwrap();
+}
+
+#[test]
+fn restored_execution_error_keeps_late_native_failure_terminal() {
+    let stream = crate::test_stream();
+    let backend = super::MlxBackend::new(stream, stream);
+    for failed in [
+        status(false, true, false),
+        status(false, false, true),
+        status(true, true, false),
+    ] {
+        let (_artifact, mut session) = native_session(&backend);
+        let native = Rc::new(Cell::new(status(false, false, false)));
+        assert!(session
+            .test_failed_operation(
+                FakeProbe(Rc::clone(&native)),
+                super::Error::after_model_call("restored model failure", Some(1), Some(2)),
+                true,
+            )
+            .unwrap_err()
+            .model_state_preserved());
+        native.set(failed);
+        recovery::wait_for_retirement(|| {
+            session
+                .ensure_no_submission_in_flight()
+                .unwrap_err()
+                .to_string()
+                .contains("fenced")
+        });
+        native.set(status(true, false, false));
+        recovery::wait_for_retirement(|| session.test_payload_weak().strong_count() == 1);
+        assert!(session.reset().unwrap_err().to_string().contains("fenced"));
+        assert!(session.submit_token_decode(&backend, 2).is_err());
+    }
+}
+
+#[test]
+fn restored_execution_error_retains_payload_after_session_drop() {
+    let stream = crate::test_stream();
+    let backend = super::MlxBackend::new(stream, stream);
+    let (_artifact, mut session) = native_session(&backend);
+    let native = Rc::new(Cell::new(status(false, false, false)));
+    let payload = session.test_payload_weak();
+    assert!(session
+        .test_failed_operation(
+            FakeProbe(Rc::clone(&native)),
+            super::Error::after_model_call("restored model failure", Some(1), Some(2)),
+            true,
+        )
+        .unwrap_err()
+        .model_state_preserved());
+    drop(session);
+    recovery::reap();
+    assert!(payload.upgrade().is_some());
+    native.set(status(true, false, false));
+    recovery::wait_for_retirement(|| payload.upgrade().is_none());
+}
+
+#[test]
+fn pending_recovery_does_not_excuse_unknown_or_enclosing_operation_errors() {
+    let stream = crate::test_stream();
+    let backend = super::MlxBackend::new(stream, stream);
+    for (error, allow_preservation) in [
+        (
+            super::Error::ArchitectureModel("unknown host failure".into()),
+            true,
+        ),
+        (
+            super::Error::after_model_call("stale restoration", Some(1), Some(1)),
+            true,
+        ),
+        (
+            super::Error::after_model_call("enclosed model restored", Some(1), Some(2)),
+            false,
+        ),
+    ] {
+        let (_artifact, mut session) = native_session(&backend);
+        let native = Rc::new(Cell::new(status(false, false, false)));
+        assert!(session
+            .test_failed_operation(FakeProbe(Rc::clone(&native)), error, allow_preservation)
+            .is_err());
+        assert!(session.reset().unwrap_err().to_string().contains("fenced"));
+        native.set(status(true, false, false));
+        recovery::wait_for_retirement(|| session.test_payload_weak().strong_count() == 1);
+        assert!(session.reset().unwrap_err().to_string().contains("fenced"));
+    }
 }
 
 #[test]

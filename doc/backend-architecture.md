@@ -2102,6 +2102,13 @@ Failure remains a session poison even after its resources become reclaimable.
 The neutral runtime supplies fresh successful state-restoration evidence for
 recoverable errors. Only that evidence combined with an independently settled,
 healthy native scope permits retry; unknown host errors and unwinds do not.
+When restoration is proven but native cleanup is still pending, MLX retains the
+executable and its submission lease in nonblocking recovery without poisoning
+the session. The lease prevents reset or new execution until every scope safely
+retires. Runtime-lock contention leaves this recovery pending; a later native
+failure or unobservable scope permanently poisons the session even after its
+resources retire. Error callers must allow retirement to complete before reuse.
+
 `SessionAdmission` compares complete admitted and realized capability
 reports before publication, rather than accepting a subset or assuming universal
 backend facilities. Sampled-token completion and model validation both finish

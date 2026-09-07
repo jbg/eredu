@@ -749,6 +749,9 @@ fn native_intervention_loaded_dense_preserves_rng_and_returns_effective_logits()
         // Drop an unfinished run, including a failed forward that may have written
         // cache state. The native owner must settle work before reset can succeed.
         drop(generator);
+        crate::backend::submission_recovery::wait_for_retirement(|| {
+            runtime.session().ensure_no_submission_in_flight().is_ok()
+        });
         runtime.parts_mut().1.reset().unwrap();
     }
     runtime.parts_mut().1.reset().unwrap();

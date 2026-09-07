@@ -197,15 +197,15 @@ impl<P: Probe> Drop for ResourceOperation<P> {
     }
 }
 
-struct SessionOperation<'a> {
+struct SessionOperation<'a, P: Probe = safemlx::SubmissionScope> {
     session: &'a mut MlxModelSession,
     owner: Rc<SubmissionResources>,
-    recovery: Option<Recovery<ScopeRetention>>,
+    recovery: Option<Recovery<ScopeRetention, P>>,
     handed_off: bool,
 }
 
-pub(super) fn restored_error_permits_retry(status: Status, error: &Error) -> bool {
-    status.settled && !status.failed && !status.blocked && error.model_state_preserved()
+pub(super) fn restored_error_permits_recovery(status: Status, error: &Error) -> bool {
+    !status.failed && !status.blocked && error.model_state_preserved()
 }
 
 pub(super) fn complete_model_operation<T, P: Probe>(
@@ -225,7 +225,7 @@ pub(super) fn complete_model_operation<T, P: Probe>(
     Ok(value)
 }
 
-impl SessionOperation<'_> {
+impl<P: Probe> SessionOperation<'_, P> {
     fn model(&mut self) -> &mut Executable {
         &mut Rc::get_mut(&mut self.session.payload)
             .expect("idle session has exclusive native payload ownership")
@@ -235,14 +235,14 @@ impl SessionOperation<'_> {
     fn finish<T>(
         self,
         result: Result<T, Error>,
-    ) -> Result<(T, Rc<SubmissionResources>, Recovery<ScopeRetention>), Error> {
+    ) -> Result<(T, Rc<SubmissionResources>, Recovery<ScopeRetention, P>), Error> {
         self.finish_with_preservation(result, false)
     }
 
     fn finish_execution<T>(
         self,
         result: Result<T, Error>,
-    ) -> Result<(T, Rc<SubmissionResources>, Recovery<ScopeRetention>), Error> {
+    ) -> Result<(T, Rc<SubmissionResources>, Recovery<ScopeRetention, P>), Error> {
         self.finish_with_preservation(result, true)
     }
 
@@ -250,7 +250,7 @@ impl SessionOperation<'_> {
         mut self,
         result: Result<T, Error>,
         allow_preservation: bool,
-    ) -> Result<(T, Rc<SubmissionResources>, Recovery<ScopeRetention>), Error> {
+    ) -> Result<(T, Rc<SubmissionResources>, Recovery<ScopeRetention, P>), Error> {
         self.owner
             .payload
             .replace(Some(Rc::clone(&self.session.payload)));
@@ -267,9 +267,13 @@ impl SessionOperation<'_> {
             ));
         }
         let value = match result {
-            Err(error) if allow_preservation && restored_error_permits_retry(status, &error) => {
+            Err(error) if allow_preservation && restored_error_permits_recovery(status, &error) => {
                 // Only a direct model call can supply this evidence. A larger
                 // speculative/cache operation may have other mutated state.
+                // Pending cleanup keeps the restored executable and its lease
+                // in recovery without permanently poisoning the session. The
+                // lease still excludes reuse until every scope retires, and a
+                // later failed/blocked observation still poisons its owner.
                 self.handed_off = true;
                 self.owner.request_release();
                 self.recovery.take();
@@ -286,7 +290,7 @@ impl SessionOperation<'_> {
     }
 }
 
-impl Drop for SessionOperation<'_> {
+impl<P: Probe> Drop for SessionOperation<'_, P> {
     fn drop(&mut self) {
         if self.handed_off {
             return;
@@ -533,6 +537,27 @@ pub struct MlxModelSession {
 }
 
 impl MlxModelSession {
+    #[cfg(test)]
+    pub(super) fn test_failed_operation(
+        &mut self,
+        probe: impl Probe,
+        error: Error,
+        allow_preservation: bool,
+    ) -> Result<(), Error> {
+        self.ensure_no_submission_in_flight()?;
+        let lease = self.authority.borrow_mut().begin_submission().unwrap();
+        let owner = SubmissionResources::new(lease, Rc::clone(&self.poison));
+        let recovery = Recovery::with_probe(owner.ticket(), probe);
+        SessionOperation {
+            session: self,
+            owner,
+            recovery: Some(recovery),
+            handed_off: false,
+        }
+        .finish_with_preservation::<()>(Err(error), allow_preservation)
+        .map(|_| ())
+    }
+
     #[cfg(test)]
     pub(super) fn test_payload_weak(&self) -> std::rc::Weak<OrdinaryRetirement<SessionPayload>> {
         Rc::downgrade(&self.payload)

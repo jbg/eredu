@@ -1,5 +1,5 @@
 #[test]
-fn invalid_token_failure_requires_restoration_proof_or_fences_session_mutation() {
+fn invalid_token_failure_restores_state_before_session_reuse() {
     let (stream, weights_stream) = execution_streams();
     let root = tiny_artifact("llama", true);
     let inspection = eredu_architectures::configuration::inspect_artifact(root.path()).unwrap();
@@ -121,28 +121,22 @@ fn invalid_token_failure_requires_restoration_proof_or_fences_session_mutation()
     .err()
     .expect("out-of-domain token must fail exact mechanism completion");
     assert!(error.to_string().contains("outside 0..64"));
-    if let Ok(target) = session.neutral_prediction_target_mut() {
-        assert!(error.model_state_preserved());
-        assert_eq!(target.state_snapshot(), before);
-        assert_eq!(target.fixed_numeric_state_snapshot().unwrap(), before_numeric);
-        let recovered = eredu_core::BackendSession::decode(
-            &mut session,
-            &backend,
-            Array::from_slice(&[2_u32], &[1, 1]),
-        )
-        .expect("proven restoration permits retry");
-        eredu_core::Completion::wait(&recovered.completion).unwrap();
-    } else {
-        assert!(session.reset().is_err());
-        let retry = eredu_core::BackendSession::decode(
-            &mut session,
-            &backend,
-            Array::from_slice(&[2_u32], &[1, 1]),
-        )
-        .err()
-        .expect("unresolved or failed native validation must fence later mutation");
-        assert!(retry.to_string().contains("fenced after prior operation failure"));
-    }
+    assert!(error.model_state_preserved());
+    // Error cleanup is nonblocking: restored state stays unavailable while
+    // another runtime user prevents safe retirement of the native scope.
+    crate::backend::submission_recovery::wait_for_retirement(|| {
+        session.ensure_no_submission_in_flight().is_ok()
+    });
+    let target = session.neutral_prediction_target_mut().unwrap();
+    assert_eq!(target.state_snapshot(), before);
+    assert_eq!(target.fixed_numeric_state_snapshot().unwrap(), before_numeric);
+    let recovered = eredu_core::BackendSession::decode(
+        &mut session,
+        &backend,
+        Array::from_slice(&[2_u32], &[1, 1]),
+    )
+    .expect("proven restoration and native retirement permit retry");
+    eredu_core::Completion::wait(&recovered.completion).unwrap();
 }
 
 #[test]
