@@ -54,19 +54,31 @@ def public_surface(source: str) -> list[list[str]]:
             continue
         declaration = []
         depth = 0
+        brackets = 0
+        parentheses = 0
+        angles = 0
         aggregate = False
         for item in tokens[start:]:
             declaration.append(item)
             aggregate |= item in ("struct", "enum", "trait", "union")
+            brackets += (item == "[") - (item == "]")
+            parentheses += (item == "(") - (item == ")")
+            if depth == 0:
+                angles = max(0, angles + (item == "<") - (item == ">"))
             if item == "{":
                 if not aggregate:
+                    if brackets or parentheses or angles:
+                        # Const expressions in signatures need a real Rust
+                        # parser. Conservatively include the remainder so any
+                        # edit here requires full verification.
+                        declaration.extend(tokens[start + len(declaration):])
                     break
                 depth += 1
             elif item == "}":
                 depth -= 1
                 if depth == 0:
                     break
-            elif item == ";" and depth == 0:
+            elif item == ";" and depth == 0 and brackets == 0 and parentheses == 0:
                 break
         declarations.append(declaration)
     return declarations
@@ -157,6 +169,8 @@ def full_baseline(head: str) -> str:
             continue
         if subprocess.run(["git", "merge-base", "--is-ancestor", sha, head], cwd=ROOT).returncode:
             continue
+        if sha == BOOTSTRAP_BASE:
+            return sha
         artifacts = json.loads(subprocess.check_output([
             "gh", "api", f"repos/{{owner}}/{{repo}}/actions/runs/{run['databaseId']}/artifacts",
         ], cwd=ROOT))
@@ -173,23 +187,40 @@ def full_baseline(head: str) -> str:
 
 
 def plan(base: str, head: str, packages: dict, force_full: bool = False) -> dict:
+    head = git("rev-parse", head)
     if subprocess.run(["git", "merge-base", "--is-ancestor", base, head], cwd=ROOT).returncode:
         raise RuntimeError("full verification baseline must be an ancestor of the candidate")
     paths = git("diff", "--name-only", base, head).splitlines()
     members = set(packages)
     reasons = []
     selected = set()
+    # Scope is cumulative since full verification, but archive roots are pending
+    # changes since each crate's own release. A previous scoped release must not
+    # force its already-published crates into every subsequent patch release.
+    for name, package in packages.items():
+        directory = Path(package["manifest_path"]).parent.relative_to(ROOT).as_posix()
+        tag = subprocess.run(["git", "rev-parse", "--verify", f"refs/tags/{name}-v{package['version']}^{{commit}}"],
+                             cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        reference = base
+        if tag.returncode == 0:
+            released = tag.stdout.strip()
+            if released != head and subprocess.run(
+                ["git", "merge-base", "--is-ancestor", released, head], cwd=ROOT
+            ).returncode == 0:
+                reference = released
+        if git("diff", "--name-only", reference, head, "--", directory):
+            selected.add(name)
     for path in paths:
-        for name, package in packages.items():
-            directory = Path(package["manifest_path"]).parent.relative_to(ROOT).as_posix()
-            if path.startswith(directory + "/"):
-                selected.add(name)
         def read(revision):
             result = subprocess.run(["git", "show", f"{revision}:{path}"], cwd=ROOT,
                                     text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
             return result.stdout if result.returncode == 0 else None
         if not scoped_change(path, read(base), read(head), members):
             reasons.append(path)
+    changed_lines = sum(int(value) for row in git("diff", "--numstat", base, head).splitlines()
+                        for value in row.split("\t")[:2] if value.isdigit())
+    if changed_lines > 1000 or len(paths) > 20:
+        reasons.append("change exceeds the scoped limit (1,000 changed lines / 20 files)")
     full = force_full or bool(reasons)
     # Infrastructure-only changes and scheduled audits still exercise packaging.
     if force_full or (not selected and full):

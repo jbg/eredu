@@ -1,8 +1,10 @@
 import tempfile
 from pathlib import Path
+import subprocess
 import unittest
+from unittest.mock import patch
 
-from release_scope import PRIVATE, public_surface, scoped_change
+from release_scope import PRIVATE, plan, public_surface, scoped_change
 from rust_cache import expired, prune
 from validate_release_packages import release_closure, registry_dependency
 
@@ -20,6 +22,8 @@ class ReleaseScopeTests(unittest.TestCase):
     def test_multiline_api_type_change_requires_full(self):
         self.assertFalse(self.scoped("pub fn load(\n x: i32,\n) { }",
                                      "pub fn load(\n x: u32,\n) { }"))
+        self.assertFalse(self.scoped("pub fn load() -> [u8; 4] { todo!() }",
+                                     "pub fn load() -> [u8; 8] { todo!() }"))
 
     def test_enum_variant_and_struct_field_changes_require_full(self):
         for before, after in [("pub enum E { A }", "pub enum E { A, B }"),
@@ -99,6 +103,44 @@ class ReleaseArchiveSelectionTests(unittest.TestCase):
         record = registry_dependency(dependency, {"eredu"})
         self.assertEqual(record["registry"], "https://github.com/rust-lang/crates.io-index")
         self.assertIsNone(registry_dependency(dependency, {"eredu-core"})["registry"])
+
+    def test_past_scoped_release_is_not_repackaged_and_version_followup_keeps_scope(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            def git(*args):
+                return subprocess.check_output(["git", *args], cwd=root, text=True).strip()
+            def write(path, contents):
+                file = root / path
+                file.parent.mkdir(parents=True, exist_ok=True)
+                file.write_text(contents)
+            def commit():
+                git("add", ".")
+                git("-c", "user.name=Test", "-c", "user.email=test@invalid", "commit", "-qm", "fixture")
+                return git("rev-parse", "HEAD")
+            git("init", "-q")
+            architecture = "eredu-architectures/src/qwen/hybrid/checkpoint.rs"
+            binding = "eredu-backend-mlx/src/backend/runtime/checkpoint/binding.rs"
+            write(architecture, "pub fn recipe() -> u8 { 0 }")
+            write(binding, "fn bind() { }")
+            write("eredu-backend-mlx/Cargo.toml", '[package]\nname="eredu-backend-mlx"\nversion="0.3.1"\n')
+            base = commit()
+            write(architecture, "pub fn recipe() -> u8 { 1 }")
+            commit()
+            git("tag", "eredu-architectures-v0.3.1")
+            write(binding, "fn bind() { let _ = 1; }")
+            commit()
+            write("eredu-backend-mlx/src/platform.rs", "fn new_platform_code() {}")
+            commit()
+            write("eredu-backend-mlx/Cargo.toml", '[package]\nname="eredu-backend-mlx"\nversion="0.3.2"\n')
+            head = commit()
+            packages = {name: {"manifest_path": str(root / name / "Cargo.toml"), "version": version}
+                        for name, version in [("eredu-architectures", "0.3.1"), ("eredu-backend-mlx", "0.3.2")]}
+            with patch("release_scope.ROOT", root):
+                result = plan(base, head, packages)
+            self.assertEqual(result["packages"], ["eredu-backend-mlx"])
+            # A later version-only commit cannot turn the preceding
+            # unrecognized platform change into scoped verification.
+            self.assertTrue(result["full"])
 
 
 class RustCacheTests(unittest.TestCase):

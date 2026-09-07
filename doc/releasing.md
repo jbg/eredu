@@ -178,7 +178,8 @@ new full run, the baseline is `084458c3`, verified by
 Expired or missing newer receipts fall back to that older baseline.
 
 Scoped eligibility is intentionally narrow and follows changed source, not the
-SemVer number. The initial reviewed scope covers Qwen hybrid checkpoint recipes,
+SemVer number. Changes spanning more than 20 files or 1,000 added/deleted lines
+require full validation. The initial reviewed scope covers Qwen hybrid checkpoint recipes,
 replicated-text lowering, and the private grouped/binding implementations used by
 the FP8 fix. It still runs architecture tests, the ordinary native Metal backend
 suite (including FP8 resident/addressable regressions and required native-device
@@ -216,8 +217,9 @@ python3 validation/validate_release_packages.py \
 
 Unselected published dependencies resolve from crates.io, rather than being
 repackaged from the workspace. Registry lookup errors fail validation; they do
-not count as proof that a dependency is published. The CI plan supplies the
-changed crate roots in publication order. Infrastructure-only full checks and
+not count as proof that a dependency is published. The CI plan supplies pending crate roots in publication order, comparing each
+crate with its own current-version release tag. Previously published scoped
+changes therefore do not accumulate in the next release's archive set. Infrastructure-only full checks and
 nightly audits validate every package. Both stable and Rust 1.89 archive jobs
 remain mandatory. The target directory can persist across runs, while each
 staged registry has a fresh identity so a different archive with the same
