@@ -151,6 +151,40 @@ impl FormatDialect for Lfm2Dialect {
         })
     }
 
+    fn semantic_constraint_configuration(
+        &self,
+        parameters: DialectParameters,
+        resolved_structural_token_ids: &[u32],
+        eos_token_ids: &[u32],
+    ) -> Result<ConstraintConfiguration, String> {
+        Self::parameters(parameters)?;
+        if resolved_structural_token_ids.len() != STRUCTURAL_TOKENS.len() {
+            return Err(format!(
+                "LFM2 declares {} structural tokens but {} tokenizer IDs were resolved",
+                STRUCTURAL_TOKENS.len(),
+                resolved_structural_token_ids.len()
+            ));
+        }
+        // The disabled-tool placeholder is only used to obtain tokenizer data
+        // for forbidden-trigger sampling. Ordinary replies need a text grammar
+        // that ends at the assistant message boundary, never a tool-call end.
+        let terminal_ids = std::iter::once(resolved_structural_token_ids[2])
+            .chain(eos_token_ids.iter().copied())
+            .collect::<BTreeSet<_>>();
+        let terminals = terminal_ids
+            .into_iter()
+            .map(|id| format!("<[{id}]>"))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        Ok(ConstraintConfiguration {
+            grammar: TopLevelGrammar::from_lark(format!(
+                "start: LFM2_TEXT* terminal\n\
+                 LFM2_TEXT: /[^<]|<[^|]/\n\
+                 terminal: {terminals}\n"
+            )),
+        })
+    }
+
     fn auto_activation_trigger(
         &self,
         parameters: DialectParameters,

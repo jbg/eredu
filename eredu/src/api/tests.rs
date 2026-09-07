@@ -1918,6 +1918,78 @@ fn production_gpt_oss_template_renders_harmony_history_and_runtime_profile() {
 }
 
 #[test]
+fn lfm2_without_tools_generates_text_and_stops_at_message_end() {
+    for eos_token_ids in [&[255][..], &[255, 254][..], &[254][..]] {
+        let compiler = Ok(ConstraintCompiler::synthetic_with_eos_aliases_for_tests(
+            eos_token_ids,
+        ));
+        for template in [
+            LFM25_8B_FIXTURE_WITH_TERMINATOR,
+            LFM25_VL_FIXTURE_WITH_TERMINATOR,
+        ] {
+            for tool_choice in [ToolChoice::None, ToolChoice::Auto] {
+                let mut tokenizer = lfm2_chat_tokenizer(252);
+                let prepared = prepare_chat_from_parts(
+                    &mut tokenizer,
+                    ModelChatTemplate::Single(template.trim_end_matches('\n').into()),
+                    "lfm2-text-regression",
+                    eos_token_ids,
+                    Some(&compiler),
+                    ChatTemplateRequest {
+                        messages: vec![json!({"role": "user", "content": "Why is the sky blue?"})],
+                        tool_choice,
+                        add_generation_prompt: true,
+                        ..ChatTemplateRequest::default()
+                    },
+                )
+                .unwrap();
+                assert!(matches!(
+                    prepared.semantic_support(),
+                    crate::runtime::chat::SemanticSupport::Supported
+                ));
+                assert!(prepared.tool_runtime_plan().is_none());
+                let plan = prepared.generation_runtime_plan().unwrap();
+                let answer = "Blue light scatters more.\n2 < 3; café.";
+                assert!(plan_accepts(plan, &format!("{answer}<|im_end|>")));
+                assert!(!plan_accepts(plan, answer));
+                assert!(!plan_accepts(plan, "__eredu_lfm2_tools_disabled__"));
+                assert!(!plan_accepts(
+                    plan,
+                    "<|tool_call_start|>[lookup(value=7)]<|tool_call_end|>"
+                ));
+
+                let mut constraints =
+                    crate::runtime::chat::constraints::ConstraintController::from_generation_plan(
+                        plan,
+                    )
+                    .unwrap();
+                let mut history = Vec::new();
+                for token in answer.bytes().map(u32::from) {
+                    assert!(constraints.filter_at(&history).unwrap().allows(token));
+                    constraints.commit(token).unwrap();
+                    history.push(token);
+                }
+                assert!(!constraints.grammar_is_complete().unwrap());
+                constraints.commit(254).unwrap();
+                assert!(constraints.grammar_is_complete().unwrap());
+
+                let mut parser = plan.create_parser().unwrap();
+                assert!(parser.push(&format!("{answer}<|im_end|>")).unwrap());
+                let text = parser
+                    .events()
+                    .iter()
+                    .filter_map(|event| match event {
+                        SemanticEvent::TextDelta(text) => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<String>();
+                assert_eq!(text, answer);
+            }
+        }
+    }
+}
+
+#[test]
 fn production_lfm2_templates_render_tools_prior_calls_and_results() {
     let compiler = Ok(ConstraintCompiler::synthetic_for_tests());
     let tools = vec![production_tool("lookup")];
