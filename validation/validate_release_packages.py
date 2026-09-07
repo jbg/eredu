@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -12,7 +13,7 @@ import shlex
 import shutil
 import subprocess
 import sys
-import tempfile
+import time
 import urllib.error
 import urllib.request
 from typing import Any
@@ -42,6 +43,7 @@ RELEASE_ORDER = (
 )
 
 MAX_ARCHIVE_BYTES = 10 * 1024 * 1024
+SOURCE_EPOCH = 946684800  # Stable source mtimes across fresh CI checkouts.
 
 
 def run(
@@ -52,6 +54,7 @@ def run(
     env: dict[str, str] | None = None,
 ) -> str:
     print(f"+ {shlex.join(command)}", flush=True)
+    started = time.monotonic()
     result = subprocess.run(
         command,
         cwd=cwd,
@@ -60,6 +63,7 @@ def run(
         stdout=subprocess.PIPE if capture else None,
         env=env,
     )
+    print(f"    elapsed: {time.monotonic() - started:.2f}s", flush=True)
     return result.stdout if capture else ""
 
 
@@ -123,14 +127,15 @@ def validate_release_order(packages: dict[str, dict[str, Any]]) -> None:
                 )
 
 
-def copy_release_source(source: Path, destination: Path) -> None:
+def copy_release_source(source: Path, destination: Path) -> str:
     """Copy Git package candidates without the enormous build directory."""
     files = run(
         ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
         cwd=source,
         capture=True,
     ).split("\0")
-    for relative_text in files:
+    digest = hashlib.sha256()
+    for relative_text in sorted(set(files)):
         if not relative_text:
             continue
         relative = Path(relative_text)
@@ -143,6 +148,43 @@ def copy_release_source(source: Path, destination: Path) -> None:
             destination_file.symlink_to(os.readlink(source_file))
         else:
             shutil.copy2(source_file, destination_file)
+            os.utime(destination_file, (SOURCE_EPOCH, SOURCE_EPOCH))
+        # Include names, modes and symlink targets, not checkout mtimes.
+        contents = (os.readlink(source_file).encode() if source_file.is_symlink()
+                    else destination_file.read_bytes())
+        digest.update(json.dumps([relative_text, source_file.lstat().st_mode,
+                                  hashlib.sha256(contents).hexdigest()]).encode())
+    return digest.hexdigest()
+
+
+@contextmanager
+def staging_directory(base: Path):
+    """Stable paths, exclusive writers, and no accumulated source snapshots."""
+    base.mkdir(parents=True, exist_ok=True)
+    with (base / "lock").open("a+b") as lock:
+        if os.name == "nt":
+            import msvcrt
+            lock.write(b"\0")
+            lock.flush()
+            lock.seek(0)
+            msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(lock, fcntl.LOCK_EX)
+        active = base / "active"
+        # A previous interrupted invocation may have left generated files.
+        shutil.rmtree(active, ignore_errors=True)
+        active.mkdir()
+        try:
+            yield active
+        finally:
+            shutil.rmtree(active)
+
+
+def normalize_source_times(root: Path) -> None:
+    for path in root.rglob("*"):
+        if path.is_file() and not path.is_symlink():
+            os.utime(path, (SOURCE_EPOCH, SOURCE_EPOCH))
 
 
 def index_path(crate_name: str) -> Path:
@@ -237,17 +279,17 @@ def registry_record(
     return record
 
 
-def write_cargo_config(config: Path, index: Path, staged: list[dict[str, Any]]) -> None:
-    lines = [
-        "[registries.staged]",
-        f'index = {json.dumps(index.as_uri())}',
-    ]
+def write_cargo_config(config: Path, staged: list[dict[str, Any]]) -> None:
+    lines = []
+    for package in staged:
+        lines.extend([f'[registries.{package["name"]}]',
+                      f'index = {json.dumps(package["index"].as_uri())}', ""])
     if staged:
         lines.extend(["", "[patch.crates-io]"])
         for package in staged:
             lines.append(
                 f'{json.dumps(package["name"])} = '
-                f'{{ version = "={package["version"]}", registry = "staged" }}'
+                f'{{ version = "={package["version"]}", registry = "{package["name"]}" }}'
             )
     config.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -273,25 +315,44 @@ def git_commit_index(index: Path, relative_path: Path, message: str) -> None:
 def stage_package(
     package: dict[str, Any],
     archive: Path,
-    index: Path,
-    downloads: Path,
-    publishable_names: set[str],
-) -> None:
+    destination: Path,
+    staged: list[dict[str, Any]],
+) -> dict[str, Any]:
     name = package["name"]
     version = package["version"]
+    checksum = hashlib.sha256(archive.read_bytes()).hexdigest()
+    # Each archive has its own immutable registry. Adding the next crate must
+    # not change the identities of dependencies that Cargo already compiled.
+    dependencies = {entry["name"]: entry["index"].as_uri() for entry in staged}
+    record = registry_record(package, checksum, set(dependencies))
+    for dependency in record["deps"]:
+        dependency_name = dependency.get("package", dependency["name"])
+        if dependency_name in dependencies:
+            dependency["registry"] = dependencies[dependency_name]
+    encoded = json.dumps(record, separators=(",", ":"), sort_keys=True) + "\n"
+    identity = hashlib.sha256(encoded.encode()).hexdigest()
+    root = destination / identity
+    index = root / "index"
+    downloads = root / "downloads"
+    if index.exists():
+        if ((index / index_path(name)).read_text() != encoded
+                or hashlib.sha256((downloads / name / version / "download").read_bytes()).hexdigest() != checksum):
+            raise RuntimeError(f"immutable registry contents changed: {root}")
+        return {"name": name, "version": version, "index": index}
+    index.mkdir(parents=True)
     download = downloads / name / version / "download"
     download.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(archive, download)
-    checksum = hashlib.sha256(archive.read_bytes()).hexdigest()
-
+    (index / "config.json").write_text(
+        json.dumps({"dl": downloads.as_uri(), "api": "http://127.0.0.1:9"}) + "\n")
+    run(["git", "init", "--quiet", "--initial-branch=main"], cwd=index)
     relative_index_path = index_path(name)
     index_file = index / relative_index_path
     index_file.parent.mkdir(parents=True, exist_ok=True)
-    record = registry_record(package, checksum, publishable_names)
-    with index_file.open("a", encoding="utf-8") as handle:
-        json.dump(record, handle, separators=(",", ":"), sort_keys=True)
-        handle.write("\n")
+    index_file.write_text(encoded, encoding="utf-8")
     git_commit_index(index, relative_index_path, f"Stage {name} {version}")
+    print(f"    immutable registry: {identity}", flush=True)
+    return {"name": name, "version": version, "index": index}
 
 
 def validate_packaged_tests(
@@ -305,12 +366,15 @@ def validate_packaged_tests(
     if not any(library_kinds.intersection(target["kind"]) for target in package["targets"]):
         return
 
+    destination = destination / hashlib.sha256(archive.read_bytes()).hexdigest()
     shutil.unpack_archive(archive, destination, "gztar")
     package_root = destination / f'{package["name"]}-{package["version"]}'
+    normalize_source_times(package_root)
     run(
         [
             "cargo",
             "test",
+            "--timings",
             "--no-run",
             "--all-targets",
             "--no-default-features",
@@ -357,15 +421,16 @@ def validate_downstream_consumer(
                 "",
                 "[dependencies]",
                 f'{package["name"]} = {{ version = "={package["version"]}", '
-                'registry = "staged", default-features = false }',
+                f'registry = "{package["name"]}", default-features = false }}',
                 "",
             ]
         ),
         encoding="utf-8",
     )
     (source / "lib.rs").write_text("", encoding="utf-8")
+    normalize_source_times(consumer)
     run(
-        ["cargo", "check", "--config", str(config)],
+        ["cargo", "check", "--timings", "--config", str(config)],
         cwd=consumer,
         env=environment,
     )
@@ -447,48 +512,23 @@ def main() -> int:
         if not isinstance(roots, list) or not all(isinstance(name, str) for name in roots):
             raise RuntimeError("--packages-json must contain a list of crate names")
     order = list(RELEASE_ORDER) if roots is None else release_closure(packages, roots)
-    publishable_names = set(order)
     if not order:
         print("No release archives selected.")
         return 0
 
     sizes: list[tuple[str, int]] = []
-    with tempfile.TemporaryDirectory(prefix="eredu-release-packages-") as temporary:
-        root = Path(temporary)
-        release_workspace = root / "workspace"
-        index = root / "index"
-        downloads = root / "downloads"
+    with staging_directory(workspace / "target" / "release-staging") as root:
+        release_workspace = root / "copy"
         target_dir = arguments.target_dir.resolve() if arguments.target_dir else root / "target"
         release_workspace.mkdir()
-        index.mkdir()
-        downloads.mkdir()
         target_dir.mkdir(parents=True, exist_ok=True)
-        copy_release_source(workspace, release_workspace)
-
-        (index / "config.json").write_text(
-            json.dumps({"dl": downloads.as_uri(), "api": "http://127.0.0.1:9"}) + "\n",
-            encoding="utf-8",
-        )
-        run(["git", "init", "--quiet", "--initial-branch=main"], cwd=index)
-        run(["git", "add", "config.json"], cwd=index)
-        run(
-            [
-                "git",
-                "-c",
-                "user.name=Eredu release validation",
-                "-c",
-                "user.email=release-validation@invalid",
-                "commit",
-                "--quiet",
-                "-m",
-                "Initialize staged registry",
-            ],
-            cwd=index,
-        )
+        identity = copy_release_source(workspace, release_workspace)
+        release_workspace = release_workspace.rename(root / f"workspace-{identity}")
+        print(f"Release source identity: {identity}", flush=True)
 
         config = root / "cargo-config.toml"
         staged: list[dict[str, Any]] = []
-        write_cargo_config(config, index, staged)
+        write_cargo_config(config, staged)
         environment = toolchain_environment(workspace)
         environment["CARGO_TARGET_DIR"] = str(target_dir)
 
@@ -524,12 +564,12 @@ def main() -> int:
                 config,
                 environment,
             )
-            stage_package(package, archive, index, downloads, publishable_names)
-            staged.append(package)
-            write_cargo_config(config, index, staged)
+            entry = stage_package(package, archive, root / "registries", staged)
+            staged.append(entry)
+            write_cargo_config(config, staged)
             validate_downstream_consumer(
                 package,
-                root / "downstream-consumers",
+                root / "downstream-consumers" / entry["index"].parent.name,
                 config,
                 environment,
             )

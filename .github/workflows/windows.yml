@@ -44,14 +44,11 @@ jobs:
         run: cargo test -p eredu-gguf
       - name: Test the portable facade and CPU CLI
         run: |
-          cargo test --locked -p eredu --no-default-features --test portable_facade
-          cargo test --locked -p eredu --no-default-features --test backend_conformance
+          cargo test --locked -p eredu --no-default-features --test portable_facade --test backend_conformance
           cargo test --locked -p eredu-cli --no-default-features --features mlx
       - name: Build and final-link safemlx tests
         if: inputs.full
-        run: |
-          cargo test -p safemlx --lib --no-run --no-default-features
-          cargo test -p safemlx --test events --no-run --no-default-features
+        run: cargo test -p safemlx --lib --test events --no-run --no-default-features
       - name: Run Windows file-format tests, including Unicode Rust GGUF paths
         if: inputs.full
         run: cargo test -p safemlx --lib --no-default-features ops::io::tests -- --test-threads=1

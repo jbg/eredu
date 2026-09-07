@@ -7,17 +7,24 @@ inputs:
   target:
     default: target
     description: Cargo target directory.
+  hit:
+    default: 'false'
+    description: Exact Rust cache hit; immutable snapshots need no second save.
+  max-mib:
+    default: '1024'
+    description: Maximum uncompressed snapshot size, within the shared 4 GiB compressed budget.
 runs:
   using: composite
   steps:
     - name: Bound the Rust snapshot
-      if: github.ref == 'refs/heads/main'
+      if: github.ref == 'refs/heads/main' && inputs.hit != 'true'
       shell: bash
       env:
         CACHE_TARGET: ${{ inputs.target }}
-      run: python3 validation/rust_cache.py prune "$CACHE_TARGET" --max-mib 512
+        CACHE_MAX_MIB: ${{ inputs.max-mib }}
+      run: python3 validation/rust_cache.py prune "$CACHE_TARGET" --max-mib "$CACHE_MAX_MIB"
     - uses: actions/cache/save@v4
-      if: github.ref == 'refs/heads/main'
+      if: github.ref == 'refs/heads/main' && inputs.hit != 'true'
       with:
         path: ${{ inputs.target }}
         key: ${{ inputs.key }}

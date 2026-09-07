@@ -124,10 +124,10 @@ rustup toolchain install 1.89.0 --profile minimal
 RUSTUP_TOOLCHAIN=1.89.0 python3 validation/validate_release_packages.py
 ```
 
-The validator copies the Git package candidates to a temporary workspace, then
+The validator copies the Git package candidates to a content-identified workspace, then
 runs `cargo package` for each crate. It unpacks each archive, compiles its
 library unit tests, and runs its doctests with default features disabled before
-adding that archive to an ephemeral local registry. After staging a library, it
+adding that archive to its own content-identified local registry. After staging a library, it
 also checks a new lock-free downstream crate that depends on the staged package
 with default features disabled. This lets consumers and the next workspace crate
 resolve the exact unpublished version while retaining Cargo's normal package
@@ -221,9 +221,17 @@ not count as proof that a dependency is published. The CI plan supplies pending 
 crate with its own current-version release tag. Previously published scoped
 changes therefore do not accumulate in the next release's archive set. Infrastructure-only full checks and
 nightly audits validate every package. Both stable and Rust 1.89 archive jobs
-remain mandatory. The target directory can persist across runs, while each
-staged registry has a fresh identity so a different archive with the same
-name/version cannot accidentally reuse stale staged sources.
+remain mandatory. The target directory can persist across runs. Each staged
+registry is identified by the archive checksum and its complete index record,
+including the exact registry identities of its staged dependencies. Identical
+archives and dependencies therefore reuse their identities across runs;
+different bytes at the same name/version receive a different identity. Adding
+a later crate does not change the identities of earlier dependencies. Staged
+source paths are content-identified and their mtimes are normalized, while
+downstream consumers still start without lockfiles. A process lock protects
+staging, and temporary sources and registries are removed at the end. Cargo's
+normal package verification, packaged tests, doctests and downstream checks
+remain mandatory on both toolchains.
 
 To run the same preflight locally on an Apple silicon host outside a sandbox:
 

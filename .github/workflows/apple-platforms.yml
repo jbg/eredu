@@ -49,13 +49,22 @@ jobs:
       - name: Cross-build the MLX stack and facade
         run: |
           cargo build --locked --release -p safemlx --target "${{ matrix.target }}"
-          cargo build --locked --release -p eredu-backend-mlx --features metal,accelerate --target "${{ matrix.target }}"
-          cargo build --locked --release -p eredu --no-default-features --features mlx,metal --target "${{ matrix.target }}"
+          cargo build --locked --release -p eredu-backend-mlx -p eredu --no-default-features \
+            --features eredu-backend-mlx/metal,eredu-backend-mlx/accelerate,eredu/mlx,eredu/metal \
+            --target "${{ matrix.target }}" --timings
       - name: Cross-build the iOS example
         if: startsWith(matrix.target, 'aarch64-apple-ios')
         run: cargo build --locked --release -p eredu-ios --target "${{ matrix.target }}"
       - name: Verify Metal resource
         run: test -s "target/${{ matrix.target }}/release/safemlx-resources/mlx.metallib"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: apple-timings-${{ matrix.target }}
+          path: target/cargo-timings
+          retention-days: 7
       - uses: ./.github/actions/save-rust-cache
         with:
           key: ${{ steps.cache.outputs.rust-key }}
+          hit: ${{ steps.cache.outputs.rust-hit }}
+          max-mib: 768

@@ -3,6 +3,7 @@
 import argparse
 import json
 from pathlib import Path
+import re
 import shutil
 import subprocess
 
@@ -10,22 +11,48 @@ import subprocess
 def prune(root: Path, limit: int) -> int:
     # Do this only after all Cargo commands finish. Removing outputs lets Cargo
     # rebuild missing units normally; no source, native cache, or lockfile is touched.
-    for directory in list(root.rglob("incremental")) + list(root.rglob("package")) + list(root.rglob("examples")):
+    if limit < 0:
+        raise ValueError("cache limit must be nonnegative")
+    for directory in list(root.rglob("incremental")) + list(root.rglob("package")):
         if directory.is_dir():
             shutil.rmtree(directory)
-    # Test executables are large and are not reused as dependencies. Prefer
-    # compiler libraries and metadata over binaries that Cargo can relink.
-    for path in root.rglob("*"):
-        if path.is_file() and path.parent.name == "deps" and path.suffix in ("", ".exe", ".pdb"):
-            path.unlink()
     files = [path for path in root.rglob("*") if path.is_file() and not path.is_symlink()]
     sizes = {path: path.stat().st_size for path in files}
     total = sum(sizes.values())
-    for path in sorted(files, key=lambda path: path.stat().st_mtime):
+    # Keep complete Cargo units: metadata, dependency files, fingerprints and
+    # executables belong together. File-by-file eviction can strand a costly
+    # binary by removing its tiny fingerprint, forcing a full recompilation.
+    units: dict[tuple, list[Path]] = {}
+    for path in files:
+        relative = path.relative_to(root)
+        key = (str(relative),)
+        for position, part in enumerate(relative.parts):
+            match = re.search(r"-([0-9a-f]{16})(?:\.|$)", part)
+            if match:
+                # deps, .fingerprint, build and examples share their profile
+                # directory but use different names for the same unit hash.
+                key = (*relative.parts[:max(0, position - 1)], match[1])
+                break
+        units.setdefault(key, []).append(path)
+
+    def priority(paths):
+        # Dependency libraries first; then complete test/example executables;
+        # then other outputs. Within each class retain the most recent units.
+        libraries = any(p.suffix in (".rlib", ".rmeta", ".so", ".dylib", ".dll") for p in paths)
+        binary = any(p.suffix in ("", ".exe") and p.parent.name in ("deps", "examples") for p in paths)
+        support = any("build" in p.relative_to(root).parts or p.name == "mlx.metallib" for p in paths)
+        return (3 if support else 2 if libraries else 1 if binary else 0,
+                max(p.stat().st_mtime_ns for p in paths))
+
+    removed = 0
+    for paths in sorted(units.values(), key=priority):
         if total <= limit:
             break
-        total -= sizes[path]
-        path.unlink()
+        for path in paths:
+            total -= sizes[path]
+            path.unlink()
+        removed += 1
+    print(f"Rust snapshot: {sum(sizes.values())} -> {total} bytes; evicted {removed} complete units")
     return total
 
 
@@ -35,9 +62,9 @@ def expired(caches: list[dict], limit: int) -> list[int]:
     remove = []
     for cache in sorted(caches, key=lambda c: c["created_at"], reverse=True):
         key = cache["key"]
-        if not key.startswith(("rust-v2-", "rust-v3-")):
+        if not key.startswith(("rust-v2-", "rust-v3-", "rust-v4-")):
             continue
-        configuration = key.split("--", 1)[0]
+        configuration = key.split("--", 1)[0].split("-", 2)[2]
         size = cache["size_in_bytes"]
         if key.startswith("rust-v2-") or configuration in seen or total + size > limit:
             remove.append(cache["id"])

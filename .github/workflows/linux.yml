@@ -88,14 +88,12 @@ jobs:
       - name: Test the portable facade without default features
         if: inputs.full
         run: |
-          cargo test --locked -p eredu --no-default-features --test portable_facade
-          cargo test --locked -p eredu --no-default-features --test backend_conformance
+          cargo test --locked -p eredu --no-default-features --test portable_facade --test backend_conformance
       - name: Test CPU-safe native tool calling
         if: inputs.full
         run: |
-          cargo test --locked -p eredu --lib api::tests::production_
-          cargo test --locked -p eredu --lib runtime::chat::
-          cargo test --locked -p eredu --lib runtime::generation::streaming::tests::
+          cargo test --locked -p eredu --lib -- \
+            api::tests::production_ runtime::chat:: runtime::generation::streaming::tests::
 
   cuda-build:
     if: inputs.full
@@ -149,12 +147,16 @@ jobs:
       - name: Compile facade and MLX backend tests and residency example with CUDA
         run: |
           cargo test -j 1 --locked -p eredu --no-default-features --features "nccl,image,audio" --lib --no-run
-          cargo test -j 1 --locked -p eredu-backend-mlx --features "nccl,image" --lib --no-run
+          cargo test -j 1 --locked -p eredu-backend-mlx --features "nccl,image" --lib --test mimi_codec --no-run --timings
           cargo test -j 1 --locked -p eredu-backend-mlx --features nccl --example llama_residency --no-run
-      - name: Compile the CUDA Mimi integration test
-        run: cargo test -j 1 --locked -p eredu-backend-mlx --features "nccl,image" --test mimi_codec --no-run
       - name: Build and final-link the CUDA language-model CLI tests
         run: cargo test -j 1 --locked -p eredu-cli --no-default-features --features nccl --no-run
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: linux-cuda-timings
+          path: target/cargo-timings
+          retention-days: 7
 
   cuda-gpu-smoke:
     if: inputs.run_gpu

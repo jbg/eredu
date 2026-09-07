@@ -10,6 +10,9 @@ inputs:
   target:
     description: Cargo target directory to cache.
     default: target
+  rust-scope:
+    description: Distinguish validation subsets on the same commit while sharing fallback artifacts.
+    default: all
 outputs:
   native-key:
     description: Key for saving a successful native build.
@@ -20,6 +23,9 @@ outputs:
   rust-key:
     description: Key for saving this candidate's Rust snapshot.
     value: ${{ steps.rust.outputs.cache-primary-key }}
+  rust-hit:
+    description: Whether the Rust snapshot was an exact hit.
+    value: ${{ steps.rust.outputs.cache-hit }}
 runs:
   using: composite
   steps:
@@ -50,7 +56,8 @@ runs:
         path: ${{ inputs.target }}
         # Refresh successful source builds, then retain only the latest bounded
         # snapshot per configuration in the gate's cache-maintenance job.
-        key: rust-v3-${{ runner.os }}-${{ runner.arch }}-${{ inputs.variant }}--${{ steps.tools.outputs.native }}-${{ steps.tools.outputs.rust }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml') }}--${{ github.sha }}
+        key: rust-v4-${{ runner.os }}-${{ runner.arch }}-${{ inputs.variant }}--${{ steps.tools.outputs.native }}-${{ steps.tools.outputs.rust }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml') }}--${{ github.sha }}-${{ inputs.rust-scope }}
         restore-keys: |
+          ${{ steps.native.outputs.cache-matched-key != '' && format('rust-v4-{0}-{1}-{2}--{3}-{4}-', runner.os, runner.arch, inputs.variant, steps.tools.outputs.native, steps.tools.outputs.rust) || 'no-native-cache-no-rust-restore-' }}
           ${{ steps.native.outputs.cache-matched-key != '' && format('rust-v3-{0}-{1}-{2}--{3}-{4}-', runner.os, runner.arch, inputs.variant, steps.tools.outputs.native, steps.tools.outputs.rust) || 'no-native-cache-no-rust-restore-' }}
         lookup-only: ${{ steps.native.outputs.cache-matched-key == '' }}

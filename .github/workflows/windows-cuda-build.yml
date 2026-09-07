@@ -102,11 +102,7 @@ jobs:
           key: ${{ steps.cache.outputs.native-key }}
           hit: ${{ steps.cache.outputs.native-hit }}
       - name: Build and final-link safemlx CUDA tests
-        run: |
-          cargo test --locked -j 1 -p safemlx --features cuda --lib --no-run --no-default-features
-          cargo test --locked -j 1 -p safemlx --features cuda --test events --no-run --no-default-features
-      - name: Build the linked CUDA smoke executable
-        run: cargo test --locked -j 1 -p safemlx --features cuda --example cuda_smoke --no-default-features --no-run
+        run: cargo test --locked -j 1 -p safemlx --features cuda --lib --test events --example cuda_smoke --no-run --no-default-features --timings
       - name: Build and final-link eredu configurations
         run: cargo test --locked -j 1 -p eredu --no-default-features --features "cuda,image,audio" --no-run
       - name: Build and final-link the eredu CLI tests
@@ -115,3 +111,9 @@ jobs:
         run: |
           cargo test --locked -j 1 -p eredu-backend-mlx --features cuda --test mimi_codec --no-run
           cargo test --locked -j 1 -p safemlx-tests --no-default-features --features cuda --no-run
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-cuda-timings-${{ inputs.cuda }}
+          path: target/cargo-timings
+          retention-days: 7

@@ -44,12 +44,19 @@ jobs:
           sudo apt-get install -y libblas-dev liblapack-dev liblapacke-dev
           python3 -m pip install --user "cmake>=3.25"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Identify archive cache scope
+        env:
+          RELEASE_PACKAGES: ${{ inputs.packages }}
+        run: |
+          mkdir -p target
+          python3 -c 'import json, os, pathlib; pathlib.Path("target/release-package-scope.json").write_text(json.dumps(sorted(json.loads(os.environ["RELEASE_PACKAGES"]))))'
       - uses: ./.github/actions/build-cache
         id: cache
         with:
           variant: archives-${{ matrix.rust }}
           rust: 'true'
           target: target/release-validation
+          rust-scope: ${{ hashFiles('target/release-package-scope.json') }}
       - name: Build release archives in publication order
         env:
           RELEASE_PACKAGES: ${{ inputs.packages }}
@@ -58,7 +65,14 @@ jobs:
         with:
           key: ${{ steps.cache.outputs.native-key }}
           hit: ${{ steps.cache.outputs.native-hit }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: archive-timings-${{ matrix.rust }}
+          path: target/release-validation/cargo-timings
+          retention-days: 7
       - uses: ./.github/actions/save-rust-cache
         with:
           key: ${{ steps.cache.outputs.rust-key }}
+          hit: ${{ steps.cache.outputs.rust-hit }}
           target: target/release-validation

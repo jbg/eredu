@@ -155,6 +155,38 @@ class ReleaseArchiveSelectionTests(unittest.TestCase):
 
 
 class RustCacheTests(unittest.TestCase):
+    def test_complete_test_executable_is_retained_when_it_fits(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary)
+            files = ["debug/deps/checks-0123456789abcdef",
+                     "debug/deps/checks-0123456789abcdef.d",
+                     "debug/.fingerprint/checks-0123456789abcdef/test-lib-checks.json"]
+            for name in files:
+                path = target / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"x" * 32)
+            self.assertEqual(prune(target, 96), 96)
+            self.assertTrue(all((target / name).exists() for name in files))
+            self.assertEqual(prune(target, 64), 0)
+            self.assertFalse(any((target / name).exists() for name in files))
+
+    def test_dependency_libraries_take_priority_when_snapshot_is_full(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary)
+            (target / "deps").mkdir()
+            library = target / "deps/liblibrary-0123456789abcdef.rlib"
+            binary = target / "deps/checks-fedcba9876543210"
+            library.write_bytes(b"x" * 32)
+            binary.write_bytes(b"x" * 64)
+            self.assertEqual(prune(target, 64), 32)
+            self.assertTrue(library.exists())
+            self.assertFalse(binary.exists())
+
+    def test_new_cache_revision_replaces_old_snapshot_of_same_configuration(self):
+        caches = [{"id": 1, "key": "rust-v3-mac--old--sha", "size_in_bytes": 100, "created_at": "1"},
+                  {"id": 2, "key": "rust-v4-mac--new--sha", "size_in_bytes": 100, "created_at": "2"}]
+        self.assertEqual(expired(caches, 200), [1])
+
     def test_snapshot_bound_preserves_source_outside_target(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

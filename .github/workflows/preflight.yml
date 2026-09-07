@@ -43,12 +43,12 @@ jobs:
       - name: Test scoped native backend and CLI consumers
         if: ${{ !inputs.full }}
         run: |
-          cargo test --locked -p eredu-backend-mlx --features metal,accelerate --lib
-          cargo test --locked -p eredu-cli --no-default-features --features mlx,metal
+          cargo test --locked -p eredu-backend-mlx --features metal,accelerate --lib --timings
+          cargo test --locked -p eredu-cli --no-default-features --features mlx,metal --timings
       - name: Test the macOS workspace
         if: inputs.full
         run: |
-          cargo test --locked --workspace --features eredu-backend-mlx/metal,eredu-backend-mlx/accelerate -- \
+          cargo test --locked --workspace --timings --features eredu-backend-mlx/metal,eredu-backend-mlx/accelerate -- \
             --skip cpu_stream_creation_is_concurrent_safe \
             --skip async_eval_cpu_streams_are_concurrent_safe
       - name: Test MLX neutral semantic operator parity
@@ -75,6 +75,14 @@ jobs:
       - name: Test concurrent MLX use
         if: inputs.full
         run: cargo test --locked -p safemlx --features metal,accelerate --lib concurrent_safe -- --test-threads=1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: native-timings
+          path: target/cargo-timings
+          retention-days: 7
       - uses: ./.github/actions/save-rust-cache
         with:
           key: ${{ steps.cache.outputs.rust-key }}
+          hit: ${{ steps.cache.outputs.rust-hit }}
+          max-mib: 1536

@@ -68,17 +68,27 @@ Rust manifests and package versions. A native tree must be available before
 restoring Rust build-script outputs that refer to it.
 
 Native macOS, Apple cross-builds, and stable/MSRV archive validation restore
-separate Rust snapshots. Successful main builds save at most 512 MiB per
-configuration after removing incremental and packaged outputs; Cargo rebuilds
-any evicted compiler outputs normally. Native and archive test builds disable
+separate Rust snapshots. Successful main builds save up to 768 MiB for each
+Apple cross target, 1 GiB for each archive toolchain, and 1.5 GiB for native
+macOS. Pruning removes incremental and packaged outputs, then evicts whole
+Cargo units with their fingerprints and dependency files. Native build support
+and dependency libraries take priority; test and example executables remain
+when they fit, avoiding unnecessary recompilation. Cargo rebuilds any evicted
+outputs normally. Native and archive test builds disable
 Rust debug information and incremental compilation to reduce snapshot size.
-Archive jobs retain `target/release-validation`, while staging fresh registries
-so changed unpublished archives cannot reuse old registry contents.
+Archive jobs retain `target/release-validation`. Each staged registry has an
+identity derived from its exact archive checksum and dependency records, so
+identical inputs can reuse compiled outputs and changed unpublished archives
+cannot reuse old registry contents. Source paths and mtimes are reproducible;
+staging is exclusively locked and cleaned after validation.
 
 Rust keys include the source commit and fall back across compatible dependency
 versions, allowing the snapshot to improve after source-only fixes. Gate cleanup
 keeps only the newest snapshot per configuration, with a 4 GiB aggregate Rust
-budget, and removes the superseded `rust-v2` snapshots. It leaves all native
+budget across all cache revisions, and removes the superseded `rust-v2`
+snapshots. The `rust-v4` keys fall back to compatible `rust-v3` snapshots during
+migration. Archive subsets have distinct exact keys on the same commit but
+share fallback artifacts. Exact hits are not saved again. Cleanup leaves all native
 caches untouched. Pull requests restore caches but do not save Rust snapshots or
 run cache cleanup. Missing caches only affect performance, never test selection.
 
@@ -92,6 +102,13 @@ Apple cross-builds use at most four concurrent runners, reserving the fifth
 standard macOS slot for native validation instead of waiting for it to finish. Nightly and explicitly requested full runs retain the entire platform
 matrix. A successful main/manual gate validates the exact release commit, so
 publication does not need another identical matrix.
+
+Compatible target selections share one Cargo invocation (for example, the
+Windows CUDA library, completion-event tests, and smoke executable). Apple
+backend and facade builds share a feature configuration. Standalone safemlx,
+portable facade, weak facade features, isolated audio, and minimal native
+feature checks remain separate. Native, Apple, archive and CUDA jobs retain
+Cargo timing reports for seven days; archive commands also report elapsed time.
 
 For a Windows-only retry, dispatch `Windows CUDA compatibility`; it covers both
 toolkits without waiting for macOS.
