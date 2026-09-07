@@ -9,6 +9,19 @@ mod model;
 mod mtp;
 mod parallel;
 
+/// Checkpoint spellings shared by tensor admission and FP8 exclusion policy.
+fn text_checkpoint_aliases(name: &str) -> Vec<String> {
+    name.strip_prefix("model.")
+        .map(|rest| {
+            vec![
+                format!("model.language_model.{rest}"),
+                format!("language_model.{rest}"),
+                format!("model.model.{rest}"),
+            ]
+        })
+        .unwrap_or_default()
+}
+
 pub use block::{expert_bank_spec, Block, FeedForward, SharedRoutedGatedProduct, TokenMixer};
 pub use checkpoint::{
     composite_safetensors_plan, conditional_load_time_quantization,

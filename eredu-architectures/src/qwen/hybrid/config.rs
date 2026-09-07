@@ -387,7 +387,7 @@ pub struct QwenFp8QuantizationConfig {
     /// Weight block geometry; must be `[128, 128]`.
     #[serde(default)]
     pub weight_block_size: Option<Vec<i32>>,
-    /// Canonical module patterns intentionally retained in dense storage.
+    /// Canonical or checkpoint module names intentionally retained in dense storage.
     #[serde(default)]
     pub modules_to_not_convert: Vec<String>,
 }
@@ -412,9 +412,16 @@ impl QwenFp8QuantizationConfig {
     }
 
     fn excludes(&self, weight: &str) -> bool {
-        self.modules_to_not_convert
-            .iter()
-            .any(|module| weight == module || weight.starts_with(&format!("{module}.")))
+        let excluded = |name: &str| {
+            self.modules_to_not_convert.iter().any(|module| {
+                name.strip_prefix(module)
+                    .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with('.'))
+            })
+        };
+        excluded(weight)
+            || super::text_checkpoint_aliases(weight)
+                .iter()
+                .any(|alias| excluded(alias))
     }
 }
 
@@ -1407,6 +1414,54 @@ mod tests {
             "num_experts": 8,
             "layer_types": ["linear_attention", "linear_attention", "linear_attention", "full_attention"]
         })
+    }
+
+    #[test]
+    fn fp8_exclusions_match_checkpoint_aliases_at_module_boundaries() {
+        for prefix in [
+            "model",
+            "model.language_model",
+            "language_model",
+            "model.model",
+        ] {
+            let mut value = text_config("qwen3_5_moe_text");
+            value["quantization_config"] = json!({
+                "quant_method": "fp8", "fmt": "e4m3",
+                "activation_scheme": "dynamic", "weight_block_size": [128, 128],
+                "modules_to_not_convert": [
+                    format!("{prefix}.layers.0.linear_attn.in_proj_a.weight"),
+                    format!("{prefix}.layers.0.linear_attn.in_proj_b"),
+                    format!("{prefix}.layers.0.mlp.shared_expert"),
+                    "model.visual", "visual", "lm_head"
+                ]
+            });
+            let config = model_args_from_config_value(&value).unwrap().text;
+            for name in [
+                "model.layers.0.linear_attn.in_proj_a.weight",
+                "model.layers.0.linear_attn.in_proj_b.weight",
+                "model.layers.0.mlp.shared_expert.up_proj.weight",
+                "lm_head.weight",
+            ] {
+                assert_eq!(
+                    config.linear_format(name),
+                    LinearFormat::Dense,
+                    "{prefix}: {name}"
+                );
+            }
+            for name in [
+                "model.layers.0.linear_attn.in_proj_qkv.weight",
+                "model.layers.0.linear_attn.in_proj_z.weight",
+                "model.layers.0.linear_attn.in_proj_ba.weight",
+                "model.layers.0.linear_attn.in_proj_a.weight_extra",
+                "model.layers.1.linear_attn.in_proj_a.weight",
+                "model.layers.0.mlp.experts.0.up_proj.weight",
+            ] {
+                assert!(
+                    matches!(config.linear_format(name), LinearFormat::E4M3BlockFp8(_)),
+                    "{prefix}: {name}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -2,6 +2,8 @@
 
 use std::collections::{BTreeMap, HashMap};
 
+use super::text_checkpoint_aliases as aliases;
+
 use eredu_checkpoint::{
     recipe::{AtomicRecipeSet, DerivedWeightRecipe, RecipeCatalog},
     schema::{
@@ -1297,15 +1299,19 @@ fn add_linear_attention(
         required: true,
         variants,
     });
-    common.push(SafetensorsTensorConstraint::required(
-        format!("{prefix}.conv1d.weight"),
-        vec![
-            add(mul(2, key)?, value)?,
-            1,
-            dim(config.linear_conv_kernel_dim, "linear_conv_kernel_dim")?,
-        ],
-        StoredDtypeConstraint::Floating,
-    ));
+    let conv = format!("{prefix}.conv1d.weight");
+    common.push(
+        SafetensorsTensorConstraint::required(
+            &conv,
+            vec![
+                add(mul(2, key)?, value)?,
+                1,
+                dim(config.linear_conv_kernel_dim, "linear_conv_kernel_dim")?,
+            ],
+            StoredDtypeConstraint::Floating,
+        )
+        .with_aliases(aliases(&conv)),
+    );
     vector(common, format!("{prefix}.dt_bias"), heads);
     vector(common, format!("{prefix}.A_log"), heads);
     vector(
@@ -1571,18 +1577,6 @@ fn vector(output: &mut Vec<SafetensorsTensorConstraint>, name: impl Into<String>
     );
 }
 
-fn aliases(name: &str) -> Vec<String> {
-    name.strip_prefix("model.")
-        .map(|rest| {
-            vec![
-                format!("model.language_model.{rest}"),
-                format!("language_model.{rest}"),
-                format!("model.model.{rest}"),
-            ]
-        })
-        .unwrap_or_default()
-}
-
 fn dim(value: i32, name: &str) -> Result<usize, String> {
     usize::try_from(value)
         .ok()
@@ -1607,6 +1601,7 @@ mod tests {
     use eredu_checkpoint::{
         recipe::RecipeCatalog,
         store::{MemoryWeightStore, StoreError, TensorMetadata},
+        validation::{resolve_safetensors_plan, CheckpointIssueKind, CheckpointValidation},
         StoredDtype,
     };
     use safetensors::tensor::Dtype;
@@ -1735,6 +1730,107 @@ mod tests {
         assert_eq!(target.text.quantization, Some(quantization));
         assert!(!target.vision.unwrap().linear_formats.is_empty());
         assert!(source.vision.unwrap().linear_formats.is_empty());
+    }
+
+    #[test]
+    fn qwen36_fp8_checkpoint_admits_aliased_convolution_and_dense_recurrent_projections() {
+        // Reduced Qwen/Qwen3.6-35B-A3B-FP8 layout from revision
+        // 95a723d08a9490559dae23d0cff1d9466213d989: separate FP8 expert matrices,
+        // BF16 recurrent controls, and top-level exclusions in checkpoint names.
+        for prefix in [
+            "model",
+            "model.language_model",
+            "language_model",
+            "model.model",
+        ] {
+            let config = model_args_from_config_value(&json!({
+                "model_type": "qwen3_5_moe",
+                "quantization_config": {
+                    "quant_method": "fp8", "fmt": "e4m3",
+                    "activation_scheme": "dynamic", "weight_block_size": [128, 128],
+                    "modules_to_not_convert": [
+                        "model.embed_tokens",
+                        format!("{prefix}.layers.0.linear_attn.in_proj_a"),
+                        format!("{prefix}.layers.0.linear_attn.in_proj_b")
+                    ]
+                },
+                "text_config": {
+                    "model_type": "qwen3_5_moe_text",
+                    "vocab_size": 64, "hidden_size": 32, "num_hidden_layers": 1,
+                    "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 8,
+                    "max_position_embeddings": 128, "linear_conv_kernel_dim": 4,
+                    "linear_key_head_dim": 8, "linear_value_head_dim": 8,
+                    "linear_num_key_heads": 2, "linear_num_value_heads": 4,
+                    "moe_intermediate_size": 16, "shared_expert_intermediate_size": 16,
+                    "num_experts": 2, "num_experts_per_tok": 1,
+                    "layer_types": ["linear_attention"]
+                }
+            }))
+            .unwrap();
+            let plan = composite_safetensors_plan(&config).unwrap();
+            let mut tensors = Vec::new();
+            for (name, shape) in [
+                ("embed_tokens.weight", vec![64, 32]),
+                ("norm.weight", vec![32]),
+                ("layers.0.input_layernorm.weight", vec![32]),
+                ("layers.0.post_attention_layernorm.weight", vec![32]),
+                ("layers.0.linear_attn.conv1d.weight", vec![64, 1, 4]),
+                ("layers.0.linear_attn.in_proj_a.weight", vec![4, 32]),
+                ("layers.0.linear_attn.in_proj_b.weight", vec![4, 32]),
+                ("layers.0.linear_attn.A_log", vec![4]),
+                ("layers.0.linear_attn.dt_bias", vec![4]),
+                ("layers.0.linear_attn.norm.weight", vec![8]),
+                ("layers.0.mlp.gate.weight", vec![2, 32]),
+                ("layers.0.mlp.shared_expert_gate.weight", vec![1, 32]),
+            ] {
+                let bytes = vec![0; shape.iter().product::<usize>() * 2];
+                tensors.push((format!("{prefix}.{name}"), Dtype::BF16, shape, bytes));
+            }
+            for (name, shape) in [
+                ("linear_attn.in_proj_qkv", vec![64, 32]),
+                ("linear_attn.in_proj_z", vec![32, 32]),
+                ("linear_attn.out_proj", vec![32, 32]),
+                ("mlp.shared_expert.gate_proj", vec![16, 32]),
+                ("mlp.shared_expert.up_proj", vec![16, 32]),
+                ("mlp.shared_expert.down_proj", vec![32, 16]),
+                ("mlp.experts.0.gate_proj", vec![16, 32]),
+                ("mlp.experts.0.up_proj", vec![16, 32]),
+                ("mlp.experts.0.down_proj", vec![32, 16]),
+                ("mlp.experts.1.gate_proj", vec![16, 32]),
+                ("mlp.experts.1.up_proj", vec![16, 32]),
+                ("mlp.experts.1.down_proj", vec![32, 16]),
+            ] {
+                let name = format!("{prefix}.layers.0.{name}.weight");
+                let bytes = vec![0; shape.iter().product::<usize>()];
+                tensors.push((name.clone(), Dtype::F8_E4M3, shape, bytes));
+                tensors.push((
+                    format!("{name}_scale_inv"),
+                    Dtype::F32,
+                    vec![1, 1],
+                    vec![0; 4],
+                ));
+            }
+            let store = MemoryWeightStore::from_safetensors(tensors.clone()).unwrap();
+            let resolved = resolve_safetensors_plan(&store as &dyn CheckpointSource, &plan)
+                .unwrap_or_else(|error| panic!("{prefix}: {error:?}"));
+            assert_eq!(resolved.source_keys().len(), tensors.len());
+            assert!(resolved
+                .source_keys()
+                .contains(&format!("{prefix}.layers.0.linear_attn.conv1d.weight")));
+
+            // Honoring dense exclusions must preserve strict FP8 scale admission.
+            tensors.retain(|(name, _, _, _)| !name.ends_with("in_proj_qkv.weight_scale_inv"));
+            let store = MemoryWeightStore::from_safetensors(tensors).unwrap();
+            let error =
+                resolve_safetensors_plan(&store as &dyn CheckpointSource, &plan).unwrap_err();
+            assert!(
+                matches!(error, CheckpointValidation::Invalid(ref issues) if issues.iter().any(
+                    |issue| issue.kind == CheckpointIssueKind::CompanionMismatch
+                        && issue.tensor_name.as_deref() == Some("model.layers.0.linear_attn.in_proj_qkv.weight_scale_inv")
+                )),
+                "{prefix}: {error:?}"
+            );
+        }
     }
 
     #[test]
