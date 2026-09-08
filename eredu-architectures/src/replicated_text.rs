@@ -47,11 +47,16 @@ struct QwenHybridReplicated;
 
 #[derive(Debug)]
 struct InspectionCheckpointSource {
+    recipes: eredu_checkpoint::recipe::RecipeInferenceCache,
     metadata: BTreeMap<String, eredu_checkpoint::store::TensorMetadata>,
     backend: eredu_checkpoint::store::WeightStoreBackend,
 }
 
 impl eredu_checkpoint::store::CheckpointSource for InspectionCheckpointSource {
+    fn recipe_cache(&self) -> Option<&eredu_checkpoint::recipe::RecipeInferenceCache> {
+        Some(&self.recipes)
+    }
+
     fn source_keys(&self) -> Vec<String> {
         self.metadata.keys().cloned().collect()
     }
@@ -3483,6 +3488,7 @@ fn safetensors_inspection_recipe_source(
         );
     }
     Ok(Arc::new(InspectionCheckpointSource {
+        recipes: Default::default(),
         metadata,
         backend: eredu_checkpoint::store::WeightStoreBackend::Safetensors,
     }))

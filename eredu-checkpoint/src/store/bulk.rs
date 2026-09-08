@@ -106,24 +106,24 @@ pub(super) fn prepare(
     }
     let mut entries = Vec::with_capacity(keys.len());
     for (path, group) in groups {
-        let shard = store.acquire_shard(&CatalogEntry {
-            shard: path.clone(),
-        })?;
+        let admission = store.shards.admission(&path);
+        let header = admission.header(&path)?;
+        store.lock_cache()?.touched.insert(path.clone());
         for (index, key) in group {
-            let info = shard
+            let info = header
                 .metadata
                 .info(key)
                 .ok_or_else(|| StoreError::UnknownTensor { key: key.into() })?;
-            let metadata = metadata_for_info(key, &path, info)?;
-            let start = shard
+            let metadata = header.tensors[key].clone();
+            let start = header
                 .payload_offset
                 .checked_add(info.data_offsets.0)
                 .ok_or_else(|| StoreError::Overflow {
                     context: "bulk tensor offset".into(),
                 })?;
-            entries.push((index, metadata, start, Arc::clone(&shard.admitted_file)));
+            entries.push((index, metadata, start, Arc::clone(&admission.file)));
         }
-        // The next shard can be opened even with a one-shard cache bound.
+        // Header admission is independent of the payload-cache window.
     }
     entries.sort_unstable_by_key(|entry| entry.0);
     let mut batch = EncodedReadBatch {
@@ -254,7 +254,7 @@ mod tests {
         assert_eq!(diagnostics.physical_reads, 2);
         assert_eq!(diagnostics.physical_read_bytes, 32);
         assert_eq!(diagnostics.payload_shard_paths.len(), 2);
-        assert_eq!(diagnostics.currently_cached_shards, 1);
+        assert_eq!(diagnostics.currently_cached_shards, 0);
     }
 
     #[test]

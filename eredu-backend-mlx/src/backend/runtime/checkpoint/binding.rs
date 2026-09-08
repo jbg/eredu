@@ -8,7 +8,6 @@ use eredu_checkpoint::store::{ReadPolicy, TensorReadRequest};
 use eredu_nn::{ParameterId, Parameterized};
 use eredu_runtime::{
     ModuleBindingPlan, ParameterBindingTarget, ReplicatedTextMaterializationTask, WeightBinding,
-    WeightBindingPlan,
 };
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -184,9 +183,7 @@ pub fn materialize_module_bindings(
     source_stream: &Stream,
     execution_stream: &Stream,
 ) -> Result<BTreeMap<String, Array>, ModuleBindingError> {
-    eredu_runtime::preflight_bindings::<MlxNeuralBackend>(store, bindings)
-        .map_err(|error| ModuleBindingError::BindingPlan(error.to_string()))?;
-    let plan = WeightBindingPlan::new(bindings)
+    let plan = eredu_runtime::preflight_bindings::<MlxNeuralBackend>(store, bindings)
         .map_err(|error| ModuleBindingError::BindingPlan(error.to_string()))?;
     let mut arrays = BTreeMap::new();
     let mut pending = VecDeque::with_capacity(MODEL_LOAD_MATERIALIZATION_BUFFERS);

@@ -8,16 +8,17 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Mutex, MutexGuard, Weak,
+        Arc, Mutex, MutexGuard, OnceLock, Weak,
     },
     time::SystemTime,
 };
 
 use crate::{
+    recipe::RecipeInferenceCache,
     safetensors::{SafetensorsShards, MAX_HEADER_BYTES},
     StoredDtype,
 };
-use safetensors::tensor::{Dtype, Metadata, TensorInfo};
+use safetensors::tensor::{Dtype, Metadata};
 
 /// Catalog metadata for one logical checkpoint tensor.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -52,7 +53,7 @@ pub struct TensorSourceProvenance {
 }
 
 /// A requested logical subset of a checkpoint tensor.
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub enum TensorSelection {
     /// Selects the complete tensor.
     Full,
@@ -243,6 +244,7 @@ impl EncodedTensorLease for MemoryLease {
 /// Immutable in-memory SafeTensors-compatible encoded tensors.
 #[derive(Debug, Default)]
 pub struct MemoryWeightStore {
+    recipes: RecipeInferenceCache,
     tensors: BTreeMap<String, Arc<MemoryTensor>>,
 }
 
@@ -267,11 +269,18 @@ impl MemoryWeightStore {
                 )));
             }
         }
-        Ok(Self { tensors: catalog })
+        Ok(Self {
+            tensors: catalog,
+            recipes: RecipeInferenceCache::default(),
+        })
     }
 }
 
 impl WeightStore for MemoryWeightStore {
+    fn recipe_cache(&self) -> Option<&RecipeInferenceCache> {
+        Some(&self.recipes)
+    }
+
     type Lease = MemoryLease;
 
     fn keys(&self) -> Vec<String> {
@@ -349,6 +358,10 @@ impl WeightStore for MemoryWeightStore {
 }
 
 impl CheckpointSource for MemoryWeightStore {
+    fn recipe_cache(&self) -> Option<&RecipeInferenceCache> {
+        Some(&self.recipes)
+    }
+
     fn source_keys(&self) -> Vec<String> {
         WeightStore::keys(self)
     }
@@ -368,6 +381,13 @@ impl CheckpointSource for MemoryWeightStore {
 
 /// Object-safe cold-path checkpoint source used by generic materializers.
 pub trait CheckpointSource: Send + Sync {
+    /// Inference cache bound to this immutable catalog and authorization view.
+    /// Returning a cache promises metadata and provenance remain fixed, and
+    /// every returned lease/read batch is checked against that same catalog.
+    fn recipe_cache(&self) -> Option<&RecipeInferenceCache> {
+        None
+    }
+
     /// Returns all logical catalog keys in deterministic order.
     fn source_keys(&self) -> Vec<String>;
     /// Returns metadata without reading tensor payloads.
@@ -500,11 +520,12 @@ pub struct PreparedTensorSource {
 
 /// Checkpoint source pinned to an exact metadata and provenance snapshot.
 ///
-/// The wrapper revalidates the source before each acquisition and validates
-/// the resulting lease before returning it. This closes the interval between
+/// The wrapper admits metadata and provenance once, then validates each
+/// resulting lease before returning it. This closes the interval between
 /// header-only preparation and deferred materialization without converting or
 /// buffering payloads.
 pub struct PreparedCheckpointSource {
+    recipes: RecipeInferenceCache,
     source: SharedCheckpointSource,
     catalog: BTreeMap<String, PreparedTensorSource>,
 }
@@ -521,10 +542,20 @@ impl PreparedCheckpointSource {
         catalog: BTreeMap<String, TensorMetadata>,
         max_cached_shards: usize,
     ) -> Result<Self, StoreError> {
-        let source: SharedCheckpointSource = Arc::new(SafetensorsWeightStore::open_admitted(
+        let source = Arc::new(SafetensorsWeightStore::open_admitted(
             shards,
             max_cached_shards,
         )?);
+        if source.catalog.len() != catalog.len() {
+            return Err(StoreError::PreparedCatalogMismatch {
+                key: "<catalog>".into(),
+            });
+        }
+        for (key, metadata) in &catalog {
+            if source.cached_metadata(key)? != *metadata {
+                return Err(StoreError::PreparedCatalogMismatch { key: key.clone() });
+            }
+        }
         let catalog = catalog
             .into_iter()
             .map(|(key, metadata)| {
@@ -546,7 +577,11 @@ impl PreparedCheckpointSource {
                 )
             })
             .collect();
-        Self::new(source, catalog)
+        Ok(Self {
+            source,
+            catalog,
+            recipes: RecipeInferenceCache::default(),
+        })
     }
 
     /// Pins a source to the supplied exact catalog.
@@ -554,7 +589,11 @@ impl PreparedCheckpointSource {
         source: SharedCheckpointSource,
         catalog: BTreeMap<String, PreparedTensorSource>,
     ) -> Result<Self, StoreError> {
-        let prepared = Self { source, catalog };
+        let prepared = Self {
+            source,
+            catalog,
+            recipes: RecipeInferenceCache::default(),
+        };
         let mut source_keys = prepared.source.source_keys();
         source_keys.sort();
         if source_keys != prepared.catalog.keys().cloned().collect::<Vec<_>>() {
@@ -612,15 +651,24 @@ impl PreparedCheckpointSource {
                 key: request.key.clone(),
             });
         }
-        self.validate_current(&request.key)
+        Ok(())
     }
 }
 
 impl CheckpointSource for PreparedCheckpointSource {
+    fn recipe_cache(&self) -> Option<&RecipeInferenceCache> {
+        Some(self.source.recipe_cache().unwrap_or(&self.recipes))
+    }
+
     fn prepare_encoded_read(
         &self,
         keys: &[String],
     ) -> Result<Option<EncodedReadBatch>, StoreError> {
+        // This child's fixed catalog was compared once at construction. Its
+        // read contract already binds every batch to that same catalog.
+        if self.source.recipe_cache().is_some() {
+            return self.source.prepare_encoded_read(keys);
+        }
         for key in keys {
             self.expected(key)?;
         }
@@ -643,14 +691,15 @@ impl CheckpointSource for PreparedCheckpointSource {
     }
 
     fn source_metadata(&self, key: &str) -> Result<TensorMetadata, StoreError> {
-        self.validate_current(key)?;
         Ok(self.expected(key)?.metadata.clone())
     }
 
     fn acquire_lease(&self, request: TensorReadRequest) -> Result<CheckpointLease, StoreError> {
-        self.validate_current(&request.key)?;
+        self.expected(&request.key)?;
         let lease = self.source.acquire_lease(request.clone())?;
-        self.validate_lease(&request, &lease)?;
+        if self.source.recipe_cache().is_none() {
+            self.validate_lease(&request, &lease)?;
+        }
         Ok(lease)
     }
 
@@ -659,7 +708,6 @@ impl CheckpointSource for PreparedCheckpointSource {
     }
 
     fn source_provenance(&self, key: &str) -> Result<TensorSourceProvenance, StoreError> {
-        self.validate_current(key)?;
         Ok(self.expected(key)?.provenance.clone())
     }
 
@@ -689,6 +737,7 @@ impl CheckpointSource for PreparedCheckpointSource {
 /// This is used by split model/projector artifacts while preserving each
 /// source's native leases, bounded-read guarantees, and physical diagnostics.
 pub struct CompositeCheckpointSource {
+    recipes: RecipeInferenceCache,
     sources: Vec<SharedCheckpointSource>,
     owners: BTreeMap<String, usize>,
 }
@@ -714,7 +763,11 @@ impl CompositeCheckpointSource {
                 }
             }
         }
-        Ok(Self { sources, owners })
+        Ok(Self {
+            sources,
+            owners,
+            recipes: RecipeInferenceCache::default(),
+        })
     }
 
     fn source_for(&self, key: &str) -> Result<&dyn CheckpointSource, StoreError> {
@@ -727,6 +780,13 @@ impl CompositeCheckpointSource {
 }
 
 impl CheckpointSource for CompositeCheckpointSource {
+    fn recipe_cache(&self) -> Option<&RecipeInferenceCache> {
+        self.sources
+            .iter()
+            .all(|source| source.recipe_cache().is_some())
+            .then_some(&self.recipes)
+    }
+
     fn prepare_encoded_read(
         &self,
         keys: &[String],
@@ -859,6 +919,7 @@ impl CheckpointSource for CompositeCheckpointSource {
 /// payload reads and acquiring an authorized lease preserves the source's
 /// exact provenance and bounded-read guarantees.
 pub struct RestrictedCheckpointSource {
+    recipes: RecipeInferenceCache,
     source: SharedCheckpointSource,
     contract: String,
     denied: BTreeSet<String>,
@@ -888,6 +949,7 @@ impl RestrictedCheckpointSource {
         Ok(Self {
             source,
             contract,
+            recipes: RecipeInferenceCache::default(),
             denied,
             allowed: None,
         })
@@ -917,6 +979,7 @@ impl RestrictedCheckpointSource {
         Ok(Self {
             source,
             contract,
+            recipes: RecipeInferenceCache::default(),
             denied,
             allowed: Some(allowed),
         })
@@ -957,6 +1020,10 @@ impl RestrictedCheckpointSource {
 }
 
 impl CheckpointSource for RestrictedCheckpointSource {
+    fn recipe_cache(&self) -> Option<&RecipeInferenceCache> {
+        self.source.recipe_cache().map(|_| &self.recipes)
+    }
+
     fn prepare_encoded_read(
         &self,
         keys: &[String],
@@ -1028,6 +1095,7 @@ impl CheckpointSource for RestrictedCheckpointSource {
 /// The wrapper is cold-path policy only: it filters catalog inspection and
 /// rejects every lease request not selected by the resolved physical layout.
 pub struct ResolvedCheckpointSource {
+    recipes: RecipeInferenceCache,
     source: Arc<dyn CheckpointSource>,
     contract: crate::validation::ResolvedCheckpointPlan,
 }
@@ -1038,7 +1106,11 @@ impl ResolvedCheckpointSource {
         source: Arc<dyn CheckpointSource>,
         contract: crate::validation::ResolvedCheckpointPlan,
     ) -> Self {
-        Self { source, contract }
+        Self {
+            source,
+            contract,
+            recipes: RecipeInferenceCache::default(),
+        }
     }
 
     /// Returns the resolved contract identity.
@@ -1064,6 +1136,10 @@ impl ResolvedCheckpointSource {
 }
 
 impl CheckpointSource for ResolvedCheckpointSource {
+    fn recipe_cache(&self) -> Option<&RecipeInferenceCache> {
+        self.source.recipe_cache().map(|_| &self.recipes)
+    }
+
     fn prepare_encoded_read(
         &self,
         keys: &[String],
@@ -1139,6 +1215,13 @@ impl CheckpointSource for ResolvedCheckpointSource {
 
 /// Persistent checkpoint storage contract with a concrete lease type.
 pub trait WeightStore {
+    /// Inference cache bound to this immutable catalog and authorization view.
+    /// Returning a cache promises metadata and provenance remain fixed, and
+    /// every returned lease/read batch is checked against that same catalog.
+    fn recipe_cache(&self) -> Option<&RecipeInferenceCache> {
+        None
+    }
+
     /// Encoded lease retaining the source lifetime.
     type Lease: EncodedTensorLease;
 
@@ -1192,7 +1275,7 @@ pub struct WeightStoreDiagnostics {
 }
 
 /// Structured neutral checkpoint store failures.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum StoreError {
     /// The configured cached-shard or reader limit was zero.
     #[error("maximum cached-shard count must be nonzero")]
@@ -1314,8 +1397,7 @@ pub const DEFAULT_MAX_CACHED_SHARDS: usize = 4;
 struct CachedShard {
     path: PathBuf,
     admitted_file: Arc<AdmittedFile>,
-    metadata: Metadata,
-    payload_offset: usize,
+    admission: Arc<AdmittedShard>,
     // Share overlapping leases without retaining a second resident checkpoint.
     // The Vec indirection releases the payload when its last lease ends, even
     // while a weak cache entry still retains the small Arc allocation.
@@ -1410,12 +1492,12 @@ impl AdmittedFileIdentity {
 }
 
 #[derive(Debug)]
-struct AdmittedFile {
+pub(crate) struct AdmittedFile {
     identity: AdmittedFileIdentity,
 }
 
 impl AdmittedFile {
-    fn open(path: &Path) -> Result<Self, StoreError> {
+    pub(crate) fn open(path: &Path) -> Result<Self, StoreError> {
         let file = File::open(path).map_err(|error| fs_error(path, error))?;
         let identity = AdmittedFileIdentity::from_metadata(
             path,
@@ -1446,6 +1528,89 @@ impl AdmittedFile {
             });
         }
         Ok(())
+    }
+}
+
+/// Header admission survives payload-cache eviction and is shared by cloned shard sets.
+#[derive(Debug)]
+pub(crate) struct AdmittedShard {
+    pub(crate) file: Arc<AdmittedFile>,
+    expected: Option<BTreeSet<String>>,
+    header: OnceLock<Result<AdmittedHeader, StoreError>>,
+    #[cfg(test)]
+    header_reads: AtomicU64,
+}
+
+#[derive(Debug)]
+pub(crate) struct AdmittedHeader {
+    pub(crate) metadata: Metadata,
+    pub(crate) payload_offset: usize,
+    pub(crate) tensors: BTreeMap<String, TensorMetadata>,
+}
+
+impl AdmittedShard {
+    pub(crate) fn new(path: &Path, expected: Option<BTreeSet<String>>) -> Result<Self, StoreError> {
+        Ok(Self {
+            file: Arc::new(AdmittedFile::open(path)?),
+            expected,
+            header: OnceLock::new(),
+            #[cfg(test)]
+            header_reads: AtomicU64::new(0),
+        })
+    }
+
+    pub(crate) fn header(&self, path: &Path) -> Result<&AdmittedHeader, StoreError> {
+        self.header
+            .get_or_init(|| {
+                #[cfg(test)]
+                self.header_reads.fetch_add(1, Ordering::Relaxed);
+                let (payload_offset, metadata) = read_safetensors_metadata(path, &self.file)?;
+                if let Some(expected) = &self.expected {
+                    let actual = metadata.offset_keys().into_iter().collect::<BTreeSet<_>>();
+                    if let Some(key) = expected.difference(&actual).next() {
+                        return Err(StoreError::ContradictoryIndexMapping {
+                            key: key.clone(),
+                            path: path.into(),
+                        });
+                    }
+                    if let Some(key) = actual.difference(expected).next() {
+                        return Err(StoreError::UnindexedShardTensor {
+                            key: key.clone(),
+                            path: path.into(),
+                        });
+                    }
+                }
+                let tensors = metadata
+                    .tensors()
+                    .into_iter()
+                    .map(|(name, info)| {
+                        // Zero dimensions are not model parameters; other geometry was
+                        // established by Metadata's checked offset/shape validation.
+                        if info.shape.contains(&0) {
+                            return Err(io_error(
+                                path,
+                                format!("tensor {name:?} has a zero dimension"),
+                            ));
+                        }
+                        let tensor = TensorMetadata {
+                            name: name.clone(),
+                            logical_shape: info.shape.clone(),
+                            physical_shape: info.shape.clone(),
+                            stored_dtype: stored_dtype_from_safetensors(info.dtype),
+                            encoded_byte_len: (info.data_offsets.1 - info.data_offsets.0) as u64,
+                            backing_shard: Some(path.into()),
+                        };
+                        Ok((name, tensor))
+                    })
+                    .collect::<Result<_, StoreError>>()?;
+                Ok(AdmittedHeader {
+                    metadata,
+                    payload_offset,
+                    tensors,
+                })
+            })
+            .as_ref()
+            .map_err(Clone::clone)
     }
 }
 
@@ -1490,9 +1655,7 @@ impl EncodedTensorLease for SafetensorsLease {
 #[derive(Debug)]
 pub struct SafetensorsWeightStore {
     catalog: BTreeMap<String, CatalogEntry>,
-    indexed_shards: BTreeMap<PathBuf, BTreeSet<String>>,
-    admitted_files: BTreeMap<PathBuf, Arc<AdmittedFile>>,
-    metadata: Mutex<BTreeMap<String, TensorMetadata>>,
+    shards: SafetensorsShards,
     cache: Arc<Mutex<CacheState>>,
     read_telemetry: Arc<SafetensorsReadTelemetry>,
     max_cached_shards: usize,
@@ -1524,79 +1687,38 @@ impl SafetensorsWeightStore {
         if max_cached_shards == 0 {
             return Err(StoreError::InvalidShardCacheLimit);
         }
-        // Snapshot every admitted object without retaining one descriptor per
-        // shard. A selected shard is reopened and validated against this exact
-        // identity only after preflight.
-        let admitted_files = shards
-            .payload_paths()
-            .iter()
-            .map(|path| AdmittedFile::open(path).map(|file| (path.clone(), Arc::new(file))))
-            .collect::<Result<BTreeMap<_, _>, _>>()?;
-        if let Some(locations) = shards.tensor_locations() {
-            let mut indexed_shards = BTreeMap::<PathBuf, BTreeSet<String>>::new();
-            for (key, shard) in locations {
-                indexed_shards
-                    .entry(shard.clone())
-                    .or_default()
-                    .insert(key.clone());
-            }
-            let catalog = locations
+        let catalog = if let Some(locations) = shards.tensor_locations() {
+            locations
                 .iter()
-                .map(|(key, shard)| {
+                .map(|(key, path)| {
                     (
                         key.clone(),
                         CatalogEntry {
-                            shard: shard.clone(),
+                            shard: path.clone(),
                         },
                     )
                 })
-                .collect();
-            return Ok(Self {
-                catalog,
-                indexed_shards,
-                admitted_files,
-                metadata: Mutex::new(BTreeMap::new()),
-                cache: Arc::new(Mutex::new(CacheState::default())),
-                read_telemetry: Arc::new(SafetensorsReadTelemetry::default()),
-                max_cached_shards,
-            });
-        }
-        let file = shards
-            .payload_paths()
-            .first()
-            .expect("unindexed discovery returns one payload")
-            .clone();
-        let admitted_file = Arc::clone(
-            admitted_files
-                .get(&file)
-                .expect("admitted payload has an identity snapshot"),
-        );
-        Self::from_single_file(file, admitted_file, admitted_files, max_cached_shards)
-    }
-
-    fn from_single_file(
-        file: PathBuf,
-        admitted_file: Arc<AdmittedFile>,
-        admitted_files: BTreeMap<PathBuf, Arc<AdmittedFile>>,
-        max_cached_shards: usize,
-    ) -> Result<Self, StoreError> {
-        let discovered = inspect_file(&file, &admitted_file)?;
-        let catalog = discovered
-            .keys()
-            .map(|key| {
-                (
-                    key.clone(),
-                    CatalogEntry {
-                        shard: file.clone(),
-                    },
-                )
-            })
-            .collect();
+                .collect()
+        } else {
+            let path = &shards.payload_paths()[0];
+            shards
+                .admission(path)
+                .header(path)?
+                .tensors
+                .keys()
+                .map(|key| {
+                    (
+                        key.clone(),
+                        CatalogEntry {
+                            shard: path.clone(),
+                        },
+                    )
+                })
+                .collect()
+        };
         Ok(Self {
             catalog,
-            indexed_shards: BTreeMap::new(),
-            admitted_files,
-            metadata: Mutex::new(discovered),
+            shards,
             cache: Arc::new(Mutex::new(CacheState::default())),
             read_telemetry: Arc::new(SafetensorsReadTelemetry::default()),
             max_cached_shards,
@@ -1619,7 +1741,6 @@ impl SafetensorsWeightStore {
             .get(&canonical_path)
             .map(|entry| Arc::clone(&entry.shard))
         {
-            drop(shard.admitted_file.open_validated(&canonical_path)?);
             cache.hits = cache.hits.saturating_add(1);
             cache.entries.get_mut(&canonical_path).unwrap().last_used = tick;
             return Ok(shard);
@@ -1648,56 +1769,14 @@ impl SafetensorsWeightStore {
                 });
             }
         }
-        let admitted_file =
-            Arc::clone(self.admitted_files.get(&canonical_path).ok_or_else(|| {
-                StoreError::Internal(format!(
-                    "admitted SafeTensors file is missing for {}",
-                    canonical_path.display()
-                ))
-            })?);
-        let (payload_offset, metadata) =
-            read_safetensors_metadata(&canonical_path, &admitted_file)?;
+        let admission = Arc::clone(self.shards.admission(&canonical_path));
+        admission.header(&canonical_path)?;
         let shard = Arc::new(CachedShard {
-            path: entry.shard.clone(),
-            admitted_file,
-            metadata,
-            payload_offset,
+            path: canonical_path.clone(),
+            admitted_file: Arc::clone(&admission.file),
+            admission,
             full_tensors: Mutex::new(BTreeMap::new()),
         });
-        if let Some(expected) = self.indexed_shards.get(&shard.path) {
-            let actual = shard
-                .metadata
-                .offset_keys()
-                .into_iter()
-                .collect::<BTreeSet<_>>();
-            if let Some(key) = expected.difference(&actual).next() {
-                return Err(StoreError::ContradictoryIndexMapping {
-                    key: key.clone(),
-                    path: shard.path.clone(),
-                });
-            }
-            if let Some(key) = actual.difference(expected).next() {
-                return Err(StoreError::UnindexedShardTensor {
-                    key: key.clone(),
-                    path: shard.path.clone(),
-                });
-            }
-            let discovered = expected
-                .iter()
-                .map(|key| {
-                    let info = shard
-                        .metadata
-                        .info(key)
-                        .expect("exact shard validation established the tensor");
-                    metadata_for_info(key, &shard.path, info)
-                        .map(|metadata| (key.clone(), metadata))
-                })
-                .collect::<Result<BTreeMap<_, _>, _>>()?;
-            self.metadata
-                .lock()
-                .map_err(|_| StoreError::Internal("metadata cache is poisoned".into()))?
-                .extend(discovered);
-        }
         cache.touched.insert(entry.shard.clone());
         cache.entries.insert(
             canonical_path,
@@ -1710,31 +1789,28 @@ impl SafetensorsWeightStore {
     }
 
     fn cached_metadata(&self, key: &str) -> Result<TensorMetadata, StoreError> {
-        self.metadata
-            .lock()
-            .map_err(|_| StoreError::Internal("metadata cache is poisoned".into()))?
+        let entry = self
+            .catalog
+            .get(key)
+            .ok_or_else(|| StoreError::UnknownTensor { key: key.into() })?;
+        let metadata = self
+            .shards
+            .admission(&entry.shard)
+            .header(&entry.shard)?
+            .tensors
             .get(key)
             .cloned()
-            .ok_or_else(|| {
-                StoreError::Internal(format!(
-                    "opened safetensors shard did not populate metadata for {key:?}"
-                ))
-            })
-    }
-
-    fn validate_admitted_path(&self, path: &Path) -> Result<(), StoreError> {
-        let admitted = self.admitted_files.get(path).ok_or_else(|| {
-            StoreError::Internal(format!(
-                "admitted SafeTensors file is missing for {}",
-                path.display()
-            ))
-        })?;
-        drop(admitted.open_validated(path)?);
-        Ok(())
+            .ok_or_else(|| StoreError::UnknownTensor { key: key.into() })?;
+        self.lock_cache()?.touched.insert(entry.shard.clone());
+        Ok(metadata)
     }
 }
 
 impl WeightStore for SafetensorsWeightStore {
+    fn recipe_cache(&self) -> Option<&RecipeInferenceCache> {
+        Some(self.shards.recipe_cache())
+    }
+
     type Lease = SafetensorsLease;
 
     fn keys(&self) -> Vec<String> {
@@ -1742,26 +1818,6 @@ impl WeightStore for SafetensorsWeightStore {
     }
 
     fn metadata(&self, key: &str) -> Result<TensorMetadata, StoreError> {
-        if let Some(metadata) = self
-            .metadata
-            .lock()
-            .map_err(|_| StoreError::Internal("metadata cache is poisoned".into()))?
-            .get(key)
-            .cloned()
-        {
-            let entry = self
-                .catalog
-                .get(key)
-                .ok_or_else(|| StoreError::UnknownTensor { key: key.into() })?;
-            self.validate_admitted_path(&entry.shard)?;
-            return Ok(metadata);
-        }
-        let entry = self
-            .catalog
-            .get(key)
-            .ok_or_else(|| StoreError::UnknownTensor { key: key.into() })?;
-        let shard = self.acquire_shard(entry)?;
-        drop(shard);
         self.cached_metadata(key)
     }
 
@@ -1774,7 +1830,8 @@ impl WeightStore for SafetensorsWeightStore {
             })?;
         let shard = self.acquire_shard(entry)?;
         let metadata = self.cached_metadata(&request.key)?;
-        let info = shard.metadata.info(&request.key).ok_or_else(|| {
+        let header = shard.admission.header(&shard.path)?;
+        let info = header.metadata.info(&request.key).ok_or_else(|| {
             io_error(
                 &entry.shard,
                 format!("shard does not contain tensor {:?}", request.key),
@@ -1782,7 +1839,7 @@ impl WeightStore for SafetensorsWeightStore {
         })?;
         let output_shape =
             validate_selection(&request.key, &metadata.logical_shape, &request.selection)?;
-        let payload_start = shard
+        let payload_start = header
             .payload_offset
             .checked_add(info.data_offsets.0)
             .ok_or_else(|| StoreError::Overflow {
@@ -1811,6 +1868,9 @@ impl WeightStore for SafetensorsWeightStore {
         let complete_tensor =
             read.ranges.len() == 1 && read.ranges[0].start == 0 && read.ranges[0].end == tensor_len;
         let cache_hit = cached.is_some();
+        if cache_hit {
+            drop(shard.admitted_file.open_validated(&shard.path)?);
+        }
         let bytes = match cached {
             Some(bytes) if complete_tensor => bytes,
             Some(bytes) => Arc::new(copy_safetensors_ranges(
@@ -1887,6 +1947,10 @@ impl WeightStore for SafetensorsWeightStore {
 }
 
 impl CheckpointSource for SafetensorsWeightStore {
+    fn recipe_cache(&self) -> Option<&RecipeInferenceCache> {
+        Some(self.shards.recipe_cache())
+    }
+
     fn prepare_encoded_read(
         &self,
         keys: &[String],
@@ -1926,18 +1990,6 @@ impl crate::validation::SafetensorsCatalog for SafetensorsWeightStore {
     }
 }
 
-fn inspect_file(
-    path: &Path,
-    admitted_file: &AdmittedFile,
-) -> Result<BTreeMap<String, TensorMetadata>, StoreError> {
-    let (_, metadata) = read_safetensors_metadata(path, admitted_file)?;
-    metadata
-        .tensors()
-        .into_iter()
-        .map(|(key, info)| metadata_for_info(&key, path, info).map(|metadata| (key, metadata)))
-        .collect()
-}
-
 fn read_safetensors_metadata(
     path: &Path,
     admitted_file: &AdmittedFile,
@@ -1945,10 +1997,7 @@ fn read_safetensors_metadata(
     let mut file = admitted_file.open_validated(path)?;
     file.seek(SeekFrom::Start(0))
         .map_err(|error| io_error(path, error))?;
-    let file_len = file
-        .metadata()
-        .map_err(|error| fs_error(path, error))?
-        .len();
+    let file_len = admitted_file.identity.len;
     let metadata = read_safetensors_metadata_from(path, &mut file, file_len)?;
     admitted_file.validate_file(path, &file)?;
     Ok(metadata)
@@ -1990,7 +2039,7 @@ fn read_safetensors_metadata_from(
     reader
         .read_exact(&mut encoded_header[8..])
         .map_err(|error| io_error(path, error))?;
-    let metadata = serde_json::from_slice::<Metadata>(&encoded_header[8..]).map_err(|error| {
+    let metadata = crate::safetensors::parse_header(&encoded_header[8..]).map_err(|error| {
         StoreError::MalformedSafetensors {
             path: path.to_path_buf(),
             message: error.to_string(),
@@ -2297,19 +2346,6 @@ fn copy_safetensors_ranges(
         );
     }
     Ok(output)
-}
-
-fn metadata_for_info(
-    key: &str,
-    path: &Path,
-    info: &TensorInfo,
-) -> Result<TensorMetadata, StoreError> {
-    let payload_len = info
-        .data_offsets
-        .1
-        .checked_sub(info.data_offsets.0)
-        .ok_or_else(|| io_error(path, format!("tensor {key:?} has descending offsets")))?;
-    metadata_for_parts(key, path, info.dtype, &info.shape, payload_len)
 }
 
 fn metadata_for_parts(
@@ -2620,6 +2656,178 @@ mod tests {
     }
 
     #[test]
+    fn shard_admission_survives_views_stores_and_payload_cache_eviction() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut locations = BTreeMap::new();
+        for key in ["left", "right"] {
+            let member = format!("{key}.safetensors");
+            serialize_to_file(
+                [(key, TensorView::new(Dtype::U8, vec![1], &[7]).unwrap())],
+                None,
+                &directory.path().join(&member),
+            )
+            .unwrap();
+            locations.insert(key, member);
+        }
+        std::fs::write(
+            directory.path().join("model.safetensors.index.json"),
+            serde_json::to_vec(&serde_json::json!({"weight_map": locations})).unwrap(),
+        )
+        .unwrap();
+        let shards = SafetensorsShards::discover(directory.path()).unwrap();
+        let catalog =
+            crate::safetensors::SafetensorsMetadataCatalog::from_admitted(shards.clone()).unwrap();
+        let store = SafetensorsWeightStore::open_admitted(shards.clone(), 1).unwrap();
+        for _ in 0..3 {
+            for key in ["left", "right"] {
+                assert_eq!(store.metadata(key).unwrap(), *catalog.tensor(key).unwrap());
+                drop(
+                    store
+                        .acquire(TensorReadRequest {
+                            key: key.into(),
+                            selection: TensorSelection::Full,
+                            policy: ReadPolicy::RequireBounded,
+                        })
+                        .unwrap(),
+                );
+            }
+        }
+        assert!(store.diagnostics().unwrap().evictions >= 4);
+        let prepared = PreparedCheckpointSource::open_admitted_safetensors(
+            shards.clone(),
+            catalog.tensors().clone(),
+            1,
+        )
+        .unwrap();
+        let left = &locations["left"];
+        std::fs::remove_file(directory.path().join(left)).unwrap();
+        // Metadata and direct-read preparation are pure admitted-catalog operations.
+        for _ in 0..4 {
+            assert_eq!(
+                prepared.source_metadata("left").unwrap(),
+                *catalog.tensor("left").unwrap()
+            );
+            prepared.source_provenance("left").unwrap();
+            prepared
+                .prepare_encoded_read(&["left".into()])
+                .unwrap()
+                .unwrap();
+        }
+        assert!(prepared
+            .acquire_lease(TensorReadRequest {
+                key: "left".into(),
+                selection: TensorSelection::Full,
+                policy: ReadPolicy::RequireBounded
+            })
+            .is_err());
+        for path in shards.payload_paths() {
+            assert_eq!(
+                shards.admission(path).header_reads.load(Ordering::Relaxed),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn failed_header_admission_is_not_retried() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("broken.safetensors");
+        std::fs::write(&path, b"broken").unwrap();
+        std::fs::write(
+            directory.path().join("model.safetensors.index.json"),
+            br#"{"weight_map":{"weight":"broken.safetensors"}}"#,
+        )
+        .unwrap();
+        let shards = SafetensorsShards::discover_catalog(directory.path()).unwrap();
+        let store = SafetensorsWeightStore::open_admitted(shards.clone(), 1).unwrap();
+        let first = store.metadata("weight").unwrap_err().to_string();
+        std::fs::write(&path, b"different header").unwrap();
+        assert_eq!(store.metadata("weight").unwrap_err().to_string(), first);
+        assert_eq!(
+            shards
+                .admission(&shards.payload_paths()[0])
+                .header_reads
+                .load(Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[test]
+    fn prepared_catalog_substitution_is_rejected_without_rereading_headers() {
+        let directory = tempfile::tempdir().unwrap();
+        serialize_to_file(
+            [(
+                "weight",
+                TensorView::new(Dtype::U8, vec![2], &[1, 2]).unwrap(),
+            )],
+            None,
+            &directory.path().join("model.safetensors"),
+        )
+        .unwrap();
+        let catalog =
+            crate::safetensors::SafetensorsMetadataCatalog::discover(directory.path()).unwrap();
+        let mut changed = catalog.tensors().clone();
+        changed.get_mut("weight").unwrap().logical_shape = vec![1, 2];
+        assert!(matches!(
+            PreparedCheckpointSource::open_admitted_safetensors(
+                catalog.admitted_shards(),
+                changed,
+                1
+            ),
+            Err(StoreError::PreparedCatalogMismatch { .. })
+        ));
+        let shards = catalog.shards();
+        assert_eq!(
+            shards
+                .admission(&shards.payload_paths()[0])
+                .header_reads
+                .load(Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[test]
+    fn recipe_caches_preserve_catalog_and_restricted_view_identity() {
+        use crate::recipe::DerivedWeightRecipe;
+        let source: SharedCheckpointSource = Arc::new(
+            MemoryWeightStore::from_safetensors([
+                ("allowed".into(), Dtype::U8, vec![1], vec![1]),
+                ("denied".into(), Dtype::U8, vec![2], vec![1, 2]),
+            ])
+            .unwrap(),
+        );
+        let recipe = DerivedWeightRecipe::source("denied", TensorSelection::Full);
+        assert_eq!(recipe.infer(source.as_ref()).unwrap().shape, [2]);
+        let view: SharedCheckpointSource = Arc::new(
+            RestrictedCheckpointSource::including(
+                source.clone(),
+                "allowed only",
+                BTreeSet::from(["allowed".into()]),
+            )
+            .unwrap(),
+        );
+        for _ in 0..2 {
+            assert!(matches!(
+                recipe.infer(view.as_ref()),
+                Err(crate::recipe::RecipeError::Store(
+                    StoreError::UnauthorizedTensor { .. }
+                ))
+            ));
+        }
+        let other: SharedCheckpointSource = Arc::new(
+            MemoryWeightStore::from_safetensors([(
+                "denied".into(),
+                Dtype::U8,
+                vec![3],
+                vec![1, 2, 3],
+            )])
+            .unwrap(),
+        );
+        assert_eq!(recipe.infer(other.as_ref()).unwrap().shape, [3]);
+        assert_eq!(recipe.infer(source.as_ref()).unwrap().shape, [2]);
+    }
+
+    #[test]
     fn lease_exposes_encoding_selection_and_bounded_read_proof() {
         let lease = Lease {
             metadata: TensorMetadata {
@@ -2780,7 +2988,7 @@ mod tests {
     }
 
     #[test]
-    fn prepared_safetensors_open_rejects_catalog_substitution_before_payload_reads() {
+    fn prepared_safetensors_rejects_changed_admitted_file_before_payload_reads() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("model.safetensors");
         let original = f32_bytes(&[1.0, 2.0]);
@@ -2806,14 +3014,25 @@ mod tests {
         )
         .unwrap();
 
+        let prepared = PreparedCheckpointSource::open_admitted_safetensors(
+            admitted.admitted_shards(),
+            admitted.tensors().clone(),
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            prepared.source_metadata("weight").unwrap().logical_shape,
+            [2]
+        );
         assert!(matches!(
-            PreparedCheckpointSource::open_admitted_safetensors(
-                admitted.admitted_shards(),
-                admitted.tensors().clone(),
-                1,
-            ),
-            Err(StoreError::PreparedCatalogMismatch { key }) if key == "weight"
+            prepared.acquire_lease(TensorReadRequest {
+                key: "weight".into(),
+                selection: TensorSelection::Full,
+                policy: ReadPolicy::RequireBounded,
+            }),
+            Err(StoreError::AdmittedFileChanged { .. })
         ));
+        assert_eq!(prepared.source_diagnostics().unwrap().physical_reads, 0);
     }
 
     #[cfg(unix)]

@@ -1,6 +1,7 @@
 //! Backend-neutral immutable-weight residency declarations and control state.
 
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, BTreeSet},
     sync::Weak,
     time::Duration,
@@ -391,80 +392,103 @@ impl WeightBinding {
 /// Validated owner/alias partition for one atomic binding unit.
 #[derive(Debug)]
 pub struct WeightBindingPlan<'a> {
-    owners: Vec<&'a WeightBinding>,
-    aliases: Vec<(&'a WeightBinding, &'a WeightBinding)>,
+    bindings: Cow<'a, [WeightBinding]>,
+    owners: Vec<usize>,
+    aliases: Vec<(usize, usize)>,
 }
 
 impl<'a> WeightBindingPlan<'a> {
     /// Validates unique identities, owner existence, cycles, and byte geometry.
     pub fn new(bindings: &'a [WeightBinding]) -> Result<Self, ResidencyDeclarationError> {
-        let by_name = bindings
-            .iter()
-            .map(|binding| (binding.name(), binding))
-            .collect::<BTreeMap<_, _>>();
-        if by_name.len() != bindings.len() {
-            let duplicate = bindings
-                .iter()
-                .map(WeightBinding::name)
-                .find(|name| bindings.iter().filter(|item| item.name() == *name).count() > 1)
-                .unwrap_or("<unknown>");
-            return Err(ResidencyDeclarationError::DuplicateLogicalBinding {
-                name: duplicate.to_owned(),
-            });
-        }
+        Self::build(Cow::Borrowed(bindings))
+    }
 
-        fn resolve<'a>(
-            binding: &'a WeightBinding,
-            by_name: &BTreeMap<&str, &'a WeightBinding>,
-            visiting: &mut BTreeSet<String>,
-        ) -> Result<&'a WeightBinding, ResidencyDeclarationError> {
-            let Some(owner_name) = binding.alias_of() else {
-                return Ok(binding);
-            };
-            if !visiting.insert(binding.name().to_owned()) {
+    /// Retains validated declarations and their partition for deferred loading.
+    pub fn owned(
+        bindings: Vec<WeightBinding>,
+    ) -> Result<WeightBindingPlan<'static>, ResidencyDeclarationError> {
+        WeightBindingPlan::build(Cow::Owned(bindings))
+    }
+
+    fn build(bindings: Cow<'a, [WeightBinding]>) -> Result<Self, ResidencyDeclarationError> {
+        let mut by_name = BTreeMap::new();
+        for (index, binding) in bindings.iter().enumerate() {
+            if by_name.insert(binding.name(), index).is_some() {
+                return Err(ResidencyDeclarationError::DuplicateLogicalBinding {
+                    name: binding.name().into(),
+                });
+            }
+        }
+        fn resolve(
+            index: usize,
+            bindings: &[WeightBinding],
+            by_name: &BTreeMap<&str, usize>,
+            resolved: &mut [Option<usize>],
+            visiting: &mut [bool],
+        ) -> Result<usize, ResidencyDeclarationError> {
+            if let Some(owner) = resolved[index] {
+                return Ok(owner);
+            }
+            let binding = &bindings[index];
+            if visiting[index] {
                 return Err(ResidencyDeclarationError::BindingAliasCycle {
-                    name: binding.name().to_owned(),
+                    name: binding.name().into(),
                 });
             }
-            let owner = by_name.get(owner_name).copied().ok_or_else(|| {
-                ResidencyDeclarationError::UnknownBindingAliasOwner {
-                    alias: binding.name().to_owned(),
-                    owner: owner_name.to_owned(),
+            visiting[index] = true;
+            let owner = match binding.alias_of() {
+                None => index,
+                Some(name) => {
+                    let owner = *by_name.get(name).ok_or_else(|| {
+                        ResidencyDeclarationError::UnknownBindingAliasOwner {
+                            alias: binding.name().into(),
+                            owner: name.into(),
+                        }
+                    })?;
+                    resolve(owner, bindings, by_name, resolved, visiting)?
                 }
-            })?;
-            let resolved = resolve(owner, by_name, visiting)?;
-            visiting.remove(binding.name());
-            Ok(resolved)
+            };
+            visiting[index] = false;
+            resolved[index] = Some(owner);
+            Ok(owner)
         }
-
-        let owners = bindings
-            .iter()
-            .filter(|binding| !binding.is_alias())
-            .collect::<Vec<_>>();
+        let mut resolved = vec![None; bindings.len()];
+        let mut visiting = vec![false; bindings.len()];
+        let mut owners = Vec::new();
         let mut aliases = Vec::new();
-        for alias in bindings.iter().filter(|binding| binding.is_alias()) {
-            let owner = resolve(alias, &by_name, &mut BTreeSet::new())?;
-            if alias.expected_bytes() != owner.expected_bytes() {
-                return Err(ResidencyDeclarationError::BindingAliasByteMismatch {
-                    alias: alias.name().to_owned(),
-                    owner: owner.name().to_owned(),
-                    alias_bytes: alias.expected_bytes(),
-                    owner_bytes: owner.expected_bytes(),
-                });
+        for (index, binding) in bindings.iter().enumerate() {
+            let owner = resolve(index, &bindings, &by_name, &mut resolved, &mut visiting)?;
+            if owner == index {
+                owners.push(index);
+            } else {
+                if binding.expected_bytes() != bindings[owner].expected_bytes() {
+                    return Err(ResidencyDeclarationError::BindingAliasByteMismatch {
+                        alias: binding.name().into(),
+                        owner: bindings[owner].name().into(),
+                        alias_bytes: binding.expected_bytes(),
+                        owner_bytes: bindings[owner].expected_bytes(),
+                    });
+                }
+                aliases.push((index, owner));
             }
-            aliases.push((alias, owner));
         }
-        Ok(Self { owners, aliases })
+        Ok(Self {
+            bindings,
+            owners,
+            aliases,
+        })
     }
 
     /// Canonical bindings which require physical materialization.
-    pub fn owners(&self) -> impl Iterator<Item = &'a WeightBinding> + '_ {
-        self.owners.iter().copied()
+    pub fn owners(&self) -> impl Iterator<Item = &WeightBinding> {
+        self.owners.iter().map(|index| &self.bindings[*index])
     }
 
     /// Logical aliases paired with their resolved canonical owners.
-    pub fn aliases(&self) -> impl Iterator<Item = (&'a WeightBinding, &'a WeightBinding)> + '_ {
-        self.aliases.iter().copied()
+    pub fn aliases(&self) -> impl Iterator<Item = (&WeightBinding, &WeightBinding)> {
+        self.aliases
+            .iter()
+            .map(|(alias, owner)| (&self.bindings[*alias], &self.bindings[*owner]))
     }
 }
 

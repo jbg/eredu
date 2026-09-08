@@ -81,6 +81,7 @@ struct ReaderCache {
 
 #[derive(Debug)]
 struct StoreInner {
+    recipes: crate::recipe::RecipeInferenceCache,
     catalog: BTreeMap<String, CatalogEntry>,
     unclaimed_keys: BTreeSet<String>,
     readers: Mutex<ReaderCache>,
@@ -238,6 +239,7 @@ impl GgufWeightStoreBuilder {
         let count = materializers.len();
         Ok(GgufWeightStore {
             inner: Arc::new(StoreInner {
+                recipes: Default::default(),
                 catalog: self.catalog,
                 unclaimed_keys: self.unclaimed_keys,
                 readers: Mutex::new(ReaderCache {
@@ -384,6 +386,10 @@ impl EncodedTensorLease for GgufLease {
 }
 
 impl WeightStore for GgufWeightStore {
+    fn recipe_cache(&self) -> Option<&crate::recipe::RecipeInferenceCache> {
+        Some(&self.inner.recipes)
+    }
+
     type Lease = GgufLease;
 
     fn keys(&self) -> Vec<String> {
@@ -483,6 +489,10 @@ impl WeightStore for GgufWeightStore {
 }
 
 impl CheckpointSource for GgufWeightStore {
+    fn recipe_cache(&self) -> Option<&crate::recipe::RecipeInferenceCache> {
+        Some(&self.inner.recipes)
+    }
+
     fn source_keys(&self) -> Vec<String> {
         WeightStore::keys(self)
     }

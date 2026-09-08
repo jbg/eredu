@@ -1911,9 +1911,12 @@ fn selected_binding_plan_does_not_repeat_backend_preflight() {
     );
     let binding =
         WeightBinding::new("weight", "single-preflight", TensorSelection::Full, 16).unwrap();
-    let selected = select_bindings::<FakeBackend>(source, vec![binding]).unwrap();
+    let alias = WeightBinding::alias("alias", "weight", 16).unwrap();
+    let chained_alias = WeightBinding::alias("chained", "alias", 16).unwrap();
+    let selected =
+        select_bindings::<FakeBackend>(source, vec![chained_alias, binding, alias]).unwrap();
     let unit = materialize_selected_bindings::<FakeBackend>(selected, &()).unwrap();
-    assert_eq!(unit.len(), 1);
+    assert_eq!(unit.len(), 3);
 }
 
 fn atomic_binding_fixture(

@@ -108,7 +108,24 @@ pub(crate) fn preflight_mlx_recipe(
         Ok(())
     }
 
+    // MLX representation limits here are constant and contain no device facts.
+    struct MlxRecipeRepresentation;
     fn visit(
+        recipe: &DerivedWeightRecipe,
+        source: &dyn CheckpointSource,
+    ) -> Result<(), WeightRecipeError> {
+        if let Some(cache) = source.recipe_cache() {
+            cache
+                .validate::<MlxRecipeRepresentation>(recipe, || {
+                    visit_uncached(recipe, source).map_err(|error| error.to_string())
+                })
+                .map_err(WeightRecipeError::Preflight)
+        } else {
+            visit_uncached(recipe, source)
+        }
+    }
+
+    fn visit_uncached(
         recipe: &DerivedWeightRecipe,
         source: &dyn CheckpointSource,
     ) -> Result<(), WeightRecipeError> {
@@ -604,6 +621,9 @@ fn usize_to_i32(value: usize, context: &'static str) -> Result<i32, WeightRecipe
 /// Structured validation and materialization failures for derived weights.
 #[derive(Debug, thiserror::Error)]
 pub enum WeightRecipeError {
+    /// Retained metadata-only MLX representation validation failure.
+    #[error("{0}")]
+    Preflight(String),
     /// Backend-neutral recipe validation or shape inference failed.
     #[error(transparent)]
     Neutral(#[from] eredu_checkpoint::recipe::RecipeError),

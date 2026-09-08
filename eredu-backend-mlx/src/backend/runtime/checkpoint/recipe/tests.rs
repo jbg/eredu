@@ -136,6 +136,72 @@ fn bitwise_view_preserves_checkpoint_bytes() {
 }
 
 #[test]
+fn repeated_recipe_preflight_reuses_inference_and_representation_checks() {
+    use eredu_checkpoint::{recipe::RecipeInferenceCache, store::*};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct Source {
+        inner: MemoryWeightStore,
+        cache: RecipeInferenceCache,
+        queries: AtomicUsize,
+    }
+    impl CheckpointSource for Source {
+        fn recipe_cache(&self) -> Option<&RecipeInferenceCache> {
+            Some(&self.cache)
+        }
+        fn source_keys(&self) -> Vec<String> {
+            self.inner.source_keys()
+        }
+        fn source_metadata(&self, key: &str) -> Result<TensorMetadata, StoreError> {
+            self.queries.fetch_add(1, Ordering::Relaxed);
+            self.inner.source_metadata(key)
+        }
+        fn acquire_lease(&self, _: TensorReadRequest) -> Result<CheckpointLease, StoreError> {
+            panic!("preflight must not acquire payloads")
+        }
+        fn source_diagnostics(&self) -> Result<WeightStoreDiagnostics, StoreError> {
+            self.inner.source_diagnostics()
+        }
+    }
+    let source = Source {
+        inner: MemoryWeightStore::from_safetensors([(
+            "weight".into(),
+            SafeDtype::F32,
+            vec![2, 2],
+            vec![0; 16],
+        )])
+        .unwrap(),
+        cache: Default::default(),
+        queries: AtomicUsize::new(0),
+    };
+    let child = DerivedWeightRecipe::source("weight", TensorSelection::Full);
+    let recipe = DerivedWeightRecipe::Stack {
+        axis: 0,
+        inputs: vec![child.clone(); 64],
+    };
+    preflight_mlx_recipe(&recipe, &source).unwrap();
+    let queries = source.queries.load(Ordering::Relaxed);
+    assert_eq!(queries, 3); // Inference, native source geometry, encoding provenance.
+    for _ in 0..4 {
+        preflight_mlx_recipe(&recipe, &source).unwrap();
+        preflight_mlx_recipe(&child, &source).unwrap();
+        recipe.infer(&source as &dyn CheckpointSource).unwrap();
+    }
+    assert_eq!(source.queries.load(Ordering::Relaxed), queries);
+    let missing = DerivedWeightRecipe::source("missing", TensorSelection::Full);
+    let failure = preflight_mlx_recipe(&missing, &source)
+        .unwrap_err()
+        .to_string();
+    let queries = source.queries.load(Ordering::Relaxed);
+    assert_eq!(
+        preflight_mlx_recipe(&missing, &source)
+            .unwrap_err()
+            .to_string(),
+        failure
+    );
+    assert_eq!(source.queries.load(Ordering::Relaxed), queries);
+}
+
+#[test]
 fn recipe_preflight_reads_only_checkpoint_metadata() {
     let (_dir, store) = fixture();
     let recipe = DerivedWeightRecipe::Transpose {
@@ -322,7 +388,7 @@ fn materializes_ordered_expert_stack_on_cpu() {
 }
 
 #[test]
-fn materializes_cross_shard_join_with_one_mapping() {
+fn materializes_cross_shard_join_with_one_shard_cache_limit() {
     let (_dir, store) = one_mapping_cross_shard_fixture();
     let recipe = DerivedWeightRecipe::Stack {
         axis: 0,
@@ -339,9 +405,9 @@ fn materializes_cross_shard_join_with_one_mapping() {
         &[1, 2, 3, 4, 5, 6, 7, 8]
     );
     let diagnostics = store.source_diagnostics().unwrap();
-    assert_eq!(diagnostics.currently_cached_shards, 1);
+    assert_eq!(diagnostics.currently_cached_shards, 0);
     assert_eq!(diagnostics.touched_shard_paths.len(), 2);
-    assert!(diagnostics.evictions >= 1);
+    assert_eq!(diagnostics.evictions, 0);
 }
 
 #[test]

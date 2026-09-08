@@ -1,6 +1,10 @@
 //! Backend-neutral derived-weight recipes and shape inference.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    any::TypeId,
+    collections::{BTreeMap, BTreeSet, HashMap},
+    sync::{Arc, Mutex, OnceLock},
+};
 
 use crate::store::{CheckpointSource, StoreError, TensorMetadata, TensorSelection, WeightStore};
 use crate::StoredDtype;
@@ -9,6 +13,72 @@ use crate::StoredDtype;
 pub trait RecipeCatalog {
     /// Returns source tensor metadata without reading its payload.
     fn tensor_metadata(&self, key: &str) -> Result<TensorMetadata, StoreError>;
+
+    /// Retained inference for this exact immutable catalog. Mutable catalogs
+    /// leave this unset; restricted views must use a separate cache.
+    fn recipe_cache(&self) -> Option<&RecipeInferenceCache> {
+        None
+    }
+}
+
+/// Inference results owned by one immutable catalog, including failed results.
+/// Shared subrecipes and concurrent callers compute each result only once.
+#[derive(Debug, Default)]
+pub struct RecipeInferenceCache {
+    entries: Mutex<RecipeResults<RecipeMetadata, RecipeError>>,
+    validations: Mutex<HashMap<TypeId, RecipeResults<(), String>>>,
+}
+
+type RecipeResults<T, E> = HashMap<DerivedWeightRecipe, Arc<OnceLock<Result<T, E>>>>;
+
+impl RecipeInferenceCache {
+    /// Retains a caller's cold, metadata-only validation result for this recipe.
+    /// `V` identifies one fixed validator: its answer must depend only on the
+    /// recipe and this immutable catalog, never mutable device/runtime facts.
+    /// The caller owns validation semantics; this stores only success or text,
+    /// without retaining the closure or any backend/native resources.
+    pub fn validate<V: 'static>(
+        &self,
+        recipe: &DerivedWeightRecipe,
+        validate: impl FnOnce() -> Result<(), String>,
+    ) -> Result<(), String> {
+        let cell = {
+            let mut validators = self
+                .validations
+                .lock()
+                .map_err(|_| "recipe validation cache is poisoned".to_owned())?;
+            let entries = validators.entry(TypeId::of::<V>()).or_default();
+            if let Some(cell) = entries.get(recipe) {
+                Arc::clone(cell)
+            } else {
+                let cell = Arc::new(OnceLock::new());
+                entries.insert(recipe.clone(), Arc::clone(&cell));
+                cell
+            }
+        };
+        cell.get_or_init(validate).clone()
+    }
+
+    fn infer<C: RecipeCatalog + ?Sized>(
+        &self,
+        recipe: &DerivedWeightRecipe,
+        catalog: &C,
+    ) -> Result<RecipeMetadata, RecipeError> {
+        let cell = {
+            let mut entries = self
+                .entries
+                .lock()
+                .map_err(|_| StoreError::Internal("recipe inference cache is poisoned".into()))?;
+            if let Some(cell) = entries.get(recipe) {
+                Arc::clone(cell)
+            } else {
+                let cell = Arc::new(OnceLock::new());
+                entries.insert(recipe.clone(), Arc::clone(&cell));
+                cell
+            }
+        };
+        cell.get_or_init(|| recipe.infer_uncached(catalog)).clone()
+    }
 }
 
 /// Cold-path capability for proving that every recipe source can be read with
@@ -38,12 +108,20 @@ impl<T: WeightStore> BoundedRecipeSource for T {
 }
 
 impl<T: WeightStore> RecipeCatalog for T {
+    fn recipe_cache(&self) -> Option<&RecipeInferenceCache> {
+        WeightStore::recipe_cache(self)
+    }
+
     fn tensor_metadata(&self, key: &str) -> Result<TensorMetadata, StoreError> {
         self.metadata(key)
     }
 }
 
 impl RecipeCatalog for dyn CheckpointSource + '_ {
+    fn recipe_cache(&self) -> Option<&RecipeInferenceCache> {
+        CheckpointSource::recipe_cache(self)
+    }
+
     fn tensor_metadata(&self, key: &str) -> Result<TensorMetadata, StoreError> {
         self.source_metadata(key)
     }
@@ -65,7 +143,7 @@ impl BoundedRecipeSource for dyn CheckpointSource + '_ {
 }
 
 /// Scalar representation produced by a recipe operation.
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
 #[non_exhaustive]
 #[allow(missing_docs)]
 pub enum RecipeDtype {
@@ -645,7 +723,7 @@ impl RecipeMetadata {
 }
 
 /// Typed operations needed to derive a runtime parameter from checkpoint tensors.
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
 #[allow(missing_docs)]
 pub enum DerivedWeightRecipe {
     Source {
@@ -732,14 +810,19 @@ impl DerivedWeightRecipe {
                     .ok_or_else(|| StoreError::UnknownTensor { key: key.into() })
             }
         }
-        let catalog = Catalog(
-            batch
-                .tensors()
-                .iter()
-                .map(|value| (value.name.as_str(), value))
-                .collect(),
-        );
-        let output = self.infer(&catalog)?;
+        let output = if source.recipe_cache().is_some() {
+            // Immutable sources bind read batches to the same admitted catalog.
+            self.infer(source)?
+        } else {
+            let catalog = Catalog(
+                batch
+                    .tensors()
+                    .iter()
+                    .map(|value| (value.name.as_str(), value))
+                    .collect(),
+            );
+            self.infer(&catalog)?
+        };
         if output.byte_len != batch.byte_len() as u64 {
             // Packed sub-byte tensors may have padding that cannot be joined
             // as bytes. Leave those transformations to the ordinary path.
@@ -1005,6 +1088,16 @@ impl DerivedWeightRecipe {
 
     /// Validates every operation and infers its exact output metadata.
     pub fn infer<C: RecipeCatalog + ?Sized>(
+        &self,
+        catalog: &C,
+    ) -> Result<RecipeMetadata, RecipeError> {
+        match catalog.recipe_cache() {
+            Some(cache) => cache.infer(self, catalog),
+            None => self.infer_uncached(catalog),
+        }
+    }
+
+    fn infer_uncached<C: RecipeCatalog + ?Sized>(
         &self,
         catalog: &C,
     ) -> Result<RecipeMetadata, RecipeError> {
@@ -1969,7 +2062,7 @@ fn element_count(shape: &[usize], context: &'static str) -> Result<u64, RecipeEr
 }
 
 /// Structured neutral recipe validation failures.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 #[allow(missing_docs)]
 pub enum RecipeError {
     #[error("derived-weight source key must not be empty")]
@@ -2077,6 +2170,99 @@ mod tests {
 
     struct Catalog;
     struct Lease;
+
+    #[test]
+    fn distinct_recipe_validators_run_once_even_on_failure_and_under_concurrency() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Supported;
+        struct Unsupported;
+        let cache = RecipeInferenceCache::default();
+        let recipe = DerivedWeightRecipe::source("weight", TensorSelection::Full);
+        let calls = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    cache
+                        .validate::<Supported>(&recipe, || {
+                            calls.fetch_add(1, Ordering::Relaxed);
+                            Ok(())
+                        })
+                        .unwrap();
+                    assert_eq!(
+                        cache
+                            .validate::<Unsupported>(&recipe, || {
+                                calls.fetch_add(1, Ordering::Relaxed);
+                                Err("unsupported encoding".into())
+                            })
+                            .unwrap_err(),
+                        "unsupported encoding"
+                    );
+                });
+            }
+        });
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn immutable_recipe_inference_is_shared_across_subtrees_and_concurrent_calls() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct CountingCatalog {
+            cache: RecipeInferenceCache,
+            calls: AtomicUsize,
+        }
+        impl RecipeCatalog for CountingCatalog {
+            fn recipe_cache(&self) -> Option<&RecipeInferenceCache> {
+                Some(&self.cache)
+            }
+            fn tensor_metadata(&self, key: &str) -> Result<TensorMetadata, StoreError> {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                if key == "missing" {
+                    return Err(StoreError::UnknownTensor { key: key.into() });
+                }
+                Ok(TensorMetadata {
+                    name: key.into(),
+                    logical_shape: vec![2, 2],
+                    physical_shape: vec![2, 2],
+                    stored_dtype: StoredDtype::F32,
+                    encoded_byte_len: 16,
+                    backing_shard: None,
+                })
+            }
+        }
+        let catalog = CountingCatalog {
+            cache: Default::default(),
+            calls: AtomicUsize::new(0),
+        };
+        let stack = DerivedWeightRecipe::Stack {
+            axis: 0,
+            inputs: (0..64)
+                .map(|i| DerivedWeightRecipe::source(format!("expert.{i}"), TensorSelection::Full))
+                .collect(),
+        };
+        let recipe = DerivedWeightRecipe::Concatenate {
+            axis: 0,
+            inputs: vec![stack.clone(), stack.clone()],
+        };
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    assert_eq!(recipe.infer(&catalog).unwrap().shape, [128, 2, 2]);
+                    assert_eq!(stack.infer(&catalog).unwrap().shape, [64, 2, 2]);
+                    if let DerivedWeightRecipe::Stack { inputs, .. } = &stack {
+                        for input in inputs {
+                            input.infer(&catalog).unwrap();
+                        }
+                    }
+                    assert!(
+                        DerivedWeightRecipe::source("missing", TensorSelection::Full)
+                            .infer(&catalog)
+                            .is_err()
+                    );
+                });
+            }
+        });
+        assert_eq!(catalog.calls.load(Ordering::Relaxed), 65);
+    }
 
     #[test]
     fn stacked_member_selection_reads_metadata_linearly_and_preserves_exact_recipes() {

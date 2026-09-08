@@ -569,6 +569,29 @@ Source-store binding checks provenance once per shared task for that handoff;
 unchanged member recipes reuse their inferred metadata, while transformed recipes
 require new inference.
 
+SafeTensors admission resolves each distinct shard member once and retains one
+checked header, exact index membership, file identity, and tensor catalog per
+physical shard. Cloned admissions, core inspection, prepared stores, and bounded
+payload-cache eviction share those results, including failed header admission.
+Core projects tensor descriptors from this catalog instead of parsing headers.
+Prepared metadata and provenance queries are in-memory snapshot lookups; new
+leases and encoded batches must match that snapshot. File-change checks occur
+when bytes are read or a cached payload is acquired, rather than on metadata
+queries. A file changed after header admission is rejected at that read boundary.
+
+Each immutable recipe catalog retains inference for complete recipes and shared
+subrecipes. SafeTensors catalog/store clones share the cache; restricted views
+have their own authorization scope. Mutable custom catalogs do not opt into this
+contract. A source that supplies a cache promises stable metadata/provenance and
+read batches/leases checked against that catalog. The same neutral storage can
+retain success or failure text for a caller-defined, fixed metadata validator;
+it never retains validator closures or native resources. MLX owns its constant
+representation checks and reuses these results across preflight calls. Dynamic
+device capabilities and validation of newly materialized resources remain
+separate. Inference and validator results are initialized once under concurrency.
+Binding preflight returns its validated owner/alias partition; selected binding
+plans own that partition through materialization without reconstructing it.
+
 Exact checkpoint content identity is demand-driven. `eredu-checkpoint` records
 file identity, size and change metadata without retaining per-shard file handles;
 when requested it hashes each admitted file in one sequential pass, checking
@@ -594,7 +617,8 @@ identities, groups reads by shard and offset, and coalesces adjacent source and
 destination spans. It owns no payload buffer or shard-cache lease. Prepared and
 restricted source views preserve catalog and authorization checks for this path;
 file identity is checked once before and after each shard's batch of reads.
-Recipe inference uses the batch's in-memory metadata. Unsupported transforms,
+Recipe inference reuses the immutable source's retained result, or uses batch
+metadata for custom sources without an immutable catalog. Unsupported transforms,
 partial selections, and source encodings retain the ordinary materializer.
 
 On CPU and Metal, MLX materialization allocates the final contiguous array first

@@ -1,21 +1,19 @@
 //! Canonical discovery and index validation for SafeTensors checkpoints.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
-    fs::File,
-    io::Read,
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::{Component, Path, PathBuf},
+    sync::Arc,
 };
 
 use serde::{de::MapAccess, Deserialize, Deserializer};
 
 use crate::{
     recipe::RecipeCatalog,
-    store::{StoreError, TensorMetadata},
+    store::{AdmittedShard, StoreError, TensorMetadata},
     validation::{CatalogTensorMetadata, SafetensorsCatalog},
-    StoredDtype,
 };
-use safetensors::tensor::{Dtype, Metadata};
+use safetensors::tensor::{Metadata, TensorInfo};
 
 pub(crate) const MAX_HEADER_BYTES: u64 = 100_000_000;
 
@@ -26,11 +24,13 @@ pub(crate) const MAX_HEADER_BYTES: u64 = 100_000_000;
 /// payload beneath the checkpoint access root. Snapshot payload symlinks may
 /// target the sibling repository `blobs` directory, but no path may escape that
 /// repository.
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct SafetensorsShards {
     payload_paths: Vec<PathBuf>,
     logical_payload_paths: BTreeMap<String, PathBuf>,
     tensor_locations: Option<BTreeMap<String, PathBuf>>,
+    admissions: BTreeMap<PathBuf, Arc<AdmittedShard>>,
+    recipes: Arc<crate::recipe::RecipeInferenceCache>,
 }
 
 impl SafetensorsShards {
@@ -38,15 +38,20 @@ impl SafetensorsShards {
     pub fn discover(path: impl AsRef<Path>) -> Result<Self, SafetensorsShardError> {
         let path = path.as_ref();
         let shards = Self::discover_catalog(path)?;
-        if let Some(locations) = shards.tensor_locations() {
-            let mut indexed_names = BTreeMap::<PathBuf, BTreeSet<String>>::new();
-            for (tensor, payload) in locations {
-                indexed_names
-                    .entry(payload.clone())
-                    .or_default()
-                    .insert(tensor.clone());
-            }
-            validate_indexed_shards(&path.join("model.safetensors.index.json"), &indexed_names)?;
+        for payload in shards.payload_paths() {
+            shards
+                .admission(payload)
+                .header(payload)
+                .map_err(|error| match error {
+                    StoreError::ContradictoryIndexMapping { .. }
+                    | StoreError::UnindexedShardTensor { .. } => {
+                        SafetensorsShardError::MalformedIndex {
+                            path: path.join("model.safetensors.index.json"),
+                            message: error.to_string(),
+                        }
+                    }
+                    other => malformed_shard(payload, other.to_string()),
+                })?;
         }
         Ok(shards)
     }
@@ -65,7 +70,10 @@ impl SafetensorsShards {
             payload_paths: vec![payload.clone()],
             logical_payload_paths: BTreeMap::from([("weights".into(), payload)]),
             tensor_locations: None,
-        })
+            admissions: BTreeMap::new(),
+            recipes: Arc::default(),
+        }
+        .admit()?)
     }
 
     fn discover_directory(root: &Path) -> Result<Self, SafetensorsShardError> {
@@ -77,7 +85,10 @@ impl SafetensorsShards {
                 payload_paths: vec![payload.clone()],
                 logical_payload_paths: BTreeMap::from([("weights".into(), payload)]),
                 tensor_locations: None,
-            });
+                admissions: BTreeMap::new(),
+                recipes: Arc::default(),
+            }
+            .admit()?);
         }
 
         let raw =
@@ -104,17 +115,51 @@ impl SafetensorsShards {
                     message: "tensor names must not be empty".into(),
                 });
             }
-            let relative = validate_relative_shard_path(Path::new(&relative))?;
-            let payload = admit_payload(&root.join(relative), &access_root)?;
-            payload_paths.insert(payload.clone());
-            logical_payload_paths.insert(relative.to_string_lossy().into_owned(), payload.clone());
+            let payload = if let Some(payload) = logical_payload_paths.get(&relative) {
+                PathBuf::clone(payload)
+            } else {
+                let member = validate_relative_shard_path(Path::new(&relative))?;
+                let payload = admit_payload(&root.join(member), &access_root)?;
+                payload_paths.insert(payload.clone());
+                logical_payload_paths.insert(relative, payload.clone());
+                payload
+            };
             tensor_locations.insert(tensor, payload);
         }
         Ok(Self {
             payload_paths: payload_paths.into_iter().collect(),
             logical_payload_paths,
             tensor_locations: Some(tensor_locations),
-        })
+            admissions: BTreeMap::new(),
+            recipes: Arc::default(),
+        }
+        .admit()?)
+    }
+
+    fn admit(mut self) -> Result<Self, SafetensorsShardError> {
+        let mut expected = BTreeMap::<PathBuf, BTreeSet<String>>::new();
+        if let Some(locations) = &self.tensor_locations {
+            for (key, path) in locations {
+                expected
+                    .entry(path.clone())
+                    .or_default()
+                    .insert(key.clone());
+            }
+        }
+        for path in &self.payload_paths {
+            let shard = AdmittedShard::new(path, expected.remove(path))
+                .map_err(|error| malformed_shard(path, error.to_string()))?;
+            self.admissions.insert(path.clone(), Arc::new(shard));
+        }
+        Ok(self)
+    }
+
+    pub(crate) fn recipe_cache(&self) -> &crate::recipe::RecipeInferenceCache {
+        &self.recipes
+    }
+
+    pub(crate) fn admission(&self, path: &Path) -> &Arc<AdmittedShard> {
+        &self.admissions[path]
     }
 
     /// Returns the canonical, deterministically ordered payload paths.
@@ -144,6 +189,16 @@ impl SafetensorsShards {
     }
 }
 
+// Memoization is not part of the value's catalog identity.
+impl PartialEq for SafetensorsShards {
+    fn eq(&self, other: &Self) -> bool {
+        self.payload_paths == other.payload_paths
+            && self.logical_payload_paths == other.logical_payload_paths
+            && self.tensor_locations == other.tensor_locations
+    }
+}
+impl Eq for SafetensorsShards {}
+
 /// Exact header-only metadata for one strictly admitted SafeTensors shard set.
 ///
 /// Construction performs strict [`SafetensorsShards`] discovery and reads only
@@ -159,11 +214,19 @@ pub struct SafetensorsMetadataCatalog {
 impl SafetensorsMetadataCatalog {
     /// Discovers an exact shard set and validates all tensor metadata from headers only.
     pub fn discover(path: impl AsRef<Path>) -> Result<Self, SafetensorsShardError> {
-        let shards = SafetensorsShards::discover(path)?;
+        Self::from_admitted(SafetensorsShards::discover(path)?)
+    }
+
+    /// Builds a catalog using the retained shard admissions without rereading headers.
+    pub fn from_admitted(shards: SafetensorsShards) -> Result<Self, SafetensorsShardError> {
         let mut tensors = BTreeMap::new();
         for shard in shards.payload_paths() {
-            for (name, metadata) in read_tensor_metadata(shard)? {
-                if tensors.insert(name.clone(), metadata).is_some() {
+            let header = shards
+                .admission(shard)
+                .header(shard)
+                .map_err(|error| malformed_shard(shard, error.to_string()))?;
+            for (name, metadata) in &header.tensors {
+                if tensors.insert(name.clone(), metadata.clone()).is_some() {
                     return Err(malformed_shard(
                         shard,
                         format!("tensor {name:?} occurs in more than one admitted shard"),
@@ -171,31 +234,15 @@ impl SafetensorsMetadataCatalog {
                 }
             }
         }
-        if let Some(locations) = shards.tensor_locations() {
-            if let Some(name) = tensors.keys().find(|name| !locations.contains_key(*name)) {
-                return Err(malformed_shard(
-                    tensors[name]
-                        .backing_shard
-                        .as_deref()
-                        .expect("SafeTensors metadata retains shard provenance"),
-                    format!("tensor {name:?} is absent from the admitted index"),
-                ));
-            }
-            for (name, expected_shard) in locations {
-                let actual_shard = tensors
-                    .get(name)
-                    .and_then(|metadata| metadata.backing_shard.as_ref());
-                if actual_shard != Some(expected_shard) {
-                    return Err(malformed_shard(
-                        expected_shard,
-                        format!(
-                            "indexed tensor {name:?} retained unexpected shard provenance {actual_shard:?}"
-                        ),
-                    ));
-                }
-            }
-        }
         Ok(Self { shards, tensors })
+    }
+
+    /// Returns the absolute encoded byte offset retained during header admission.
+    pub fn tensor_offset(&self, name: &str) -> Option<u64> {
+        let tensor = self.tensors.get(name)?;
+        let path = tensor.backing_shard.as_ref()?;
+        let header = self.shards.admission(path).header(path).ok()?;
+        Some((header.payload_offset + header.metadata.info(name)?.data_offsets.0) as u64)
     }
 
     /// Returns the strictly admitted shard set used to build this catalog.
@@ -241,6 +288,10 @@ impl SafetensorsCatalog for SafetensorsMetadataCatalog {
 }
 
 impl RecipeCatalog for SafetensorsMetadataCatalog {
+    fn recipe_cache(&self) -> Option<&crate::recipe::RecipeInferenceCache> {
+        Some(&self.shards.recipes)
+    }
+
     fn tensor_metadata(&self, key: &str) -> Result<TensorMetadata, StoreError> {
         self.tensors
             .get(key)
@@ -331,7 +382,10 @@ impl<'de> Deserialize<'de> for UniqueWeightMap {
 }
 
 #[derive(Debug)]
-struct UniqueHeader(BTreeMap<String, serde_json::Value>);
+struct UniqueHeader {
+    metadata: Option<HashMap<String, String>>,
+    tensors: Vec<(String, TensorInfo)>,
+}
 
 impl<'de> Deserialize<'de> for UniqueHeader {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -350,179 +404,33 @@ impl<'de> Deserialize<'de> for UniqueHeader {
             where
                 A: MapAccess<'de>,
             {
-                let mut values = BTreeMap::new();
-                while let Some((key, value)) = map.next_entry::<String, serde_json::Value>()? {
-                    if values.insert(key.clone(), value).is_some() {
+                let mut seen = BTreeSet::new();
+                let mut metadata = None;
+                let mut tensors = Vec::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    if !seen.insert(key.clone()) {
                         return Err(serde::de::Error::custom(format!(
                             "duplicate SafeTensors header entry for {key:?}"
                         )));
                     }
+                    if key == "__metadata__" {
+                        metadata = map.next_value()?;
+                    } else {
+                        tensors.push((key, map.next_value::<TensorInfo>()?));
+                    }
                 }
-                Ok(UniqueHeader(values))
+                Ok(UniqueHeader { metadata, tensors })
             }
         }
         deserializer.deserialize_map(Visitor)
     }
 }
 
-fn validate_indexed_shards(
-    index_path: &Path,
-    indexed_names: &BTreeMap<PathBuf, BTreeSet<String>>,
-) -> Result<(), SafetensorsShardError> {
-    for (shard, expected) in indexed_names {
-        let actual = read_tensor_names(shard)?;
-        if let Some(tensor) = expected.difference(&actual).next() {
-            return Err(SafetensorsShardError::MalformedIndex {
-                path: index_path.to_path_buf(),
-                message: format!(
-                    "weight_map assigns tensor {tensor:?} to {}, but that shard does not contain it",
-                    shard.display()
-                ),
-            });
-        }
-        if let Some(tensor) = actual.difference(expected).next() {
-            return Err(SafetensorsShardError::MalformedIndex {
-                path: index_path.to_path_buf(),
-                message: format!(
-                    "shard {} contains tensor {tensor:?}, but weight_map does not assign it to that shard",
-                    shard.display()
-                ),
-            });
-        }
-    }
-    Ok(())
-}
-
-fn read_tensor_names(path: &Path) -> Result<BTreeSet<String>, SafetensorsShardError> {
-    let mut file = File::open(path).map_err(|error| io_error(path, error))?;
-    let file_len = file
-        .metadata()
-        .map_err(|error| io_error(path, error))?
-        .len();
-    let mut length = [0_u8; 8];
-    file.read_exact(&mut length)
-        .map_err(|error| malformed_shard(path, error.to_string()))?;
-    let header_len = u64::from_le_bytes(length);
-    if header_len > MAX_HEADER_BYTES {
-        return Err(malformed_shard(
-            path,
-            format!("header exceeds {MAX_HEADER_BYTES} bytes"),
-        ));
-    }
-    let payload_start = 8_u64
-        .checked_add(header_len)
-        .ok_or_else(|| malformed_shard(path, "header length overflow"))?;
-    if payload_start > file_len {
-        return Err(malformed_shard(path, "header exceeds shard length"));
-    }
-    let header_len = usize::try_from(header_len)
-        .map_err(|_| malformed_shard(path, "header length overflows usize"))?;
-    let mut header = vec![0_u8; header_len];
-    file.read_exact(&mut header)
-        .map_err(|error| malformed_shard(path, error.to_string()))?;
-    let raw = serde_json::from_slice::<UniqueHeader>(&header)
-        .map_err(|error| malformed_shard(path, error.to_string()))?;
-    Ok(raw
-        .0
-        .into_keys()
-        .filter(|name| name != "__metadata__")
-        .collect())
-}
-
-fn read_tensor_metadata(
-    path: &Path,
-) -> Result<BTreeMap<String, TensorMetadata>, SafetensorsShardError> {
-    let mut file = File::open(path).map_err(|error| io_error(path, error))?;
-    let file_len = file
-        .metadata()
-        .map_err(|error| io_error(path, error))?
-        .len();
-    let mut length = [0_u8; 8];
-    file.read_exact(&mut length)
-        .map_err(|error| malformed_shard(path, error.to_string()))?;
-    let header_len = u64::from_le_bytes(length);
-    if header_len > MAX_HEADER_BYTES {
-        return Err(malformed_shard(
-            path,
-            format!("header exceeds {MAX_HEADER_BYTES} bytes"),
-        ));
-    }
-    let payload_start = 8_u64
-        .checked_add(header_len)
-        .ok_or_else(|| malformed_shard(path, "header length overflow"))?;
-    if payload_start > file_len {
-        return Err(malformed_shard(path, "header exceeds shard length"));
-    }
-    let header_len_usize = usize::try_from(header_len)
-        .map_err(|_| malformed_shard(path, "header length overflows usize"))?;
-    let mut header = vec![0_u8; header_len_usize];
-    file.read_exact(&mut header)
-        .map_err(|error| malformed_shard(path, error.to_string()))?;
-    serde_json::from_slice::<UniqueHeader>(&header)
-        .map_err(|error| malformed_shard(path, error.to_string()))?;
-    let metadata: Metadata = serde_json::from_slice(&header)
-        .map_err(|error| malformed_shard(path, error.to_string()))?;
-    let encoded_len = u64::try_from(metadata.data_len())
-        .map_err(|_| malformed_shard(path, "encoded payload length overflows u64"))?;
-    let expected_file_len = payload_start
-        .checked_add(encoded_len)
-        .ok_or_else(|| malformed_shard(path, "shard length overflow"))?;
-    if expected_file_len != file_len {
-        return Err(malformed_shard(
-            path,
-            format!(
-                "header describes {encoded_len} payload bytes, but shard length provides {}",
-                file_len - payload_start
-            ),
-        ));
-    }
-    metadata
-        .tensors()
-        .into_iter()
-        .map(|(name, info)| {
-            let encoded_byte_len = info
-                .data_offsets
-                .1
-                .checked_sub(info.data_offsets.0)
-                .and_then(|length| u64::try_from(length).ok())
-                .ok_or_else(|| malformed_shard(path, format!("tensor {name:?} length overflow")))?;
-            Ok((
-                name.clone(),
-                TensorMetadata {
-                    name,
-                    logical_shape: info.shape.clone(),
-                    physical_shape: info.shape.clone(),
-                    stored_dtype: stored_dtype(info.dtype),
-                    encoded_byte_len,
-                    backing_shard: Some(path.to_path_buf()),
-                },
-            ))
-        })
-        .collect()
-}
-
-fn stored_dtype(dtype: Dtype) -> StoredDtype {
-    match dtype {
-        Dtype::BOOL => StoredDtype::Bool,
-        Dtype::U8 => StoredDtype::U8,
-        Dtype::I8 => StoredDtype::I8,
-        Dtype::I16 => StoredDtype::I16,
-        Dtype::U16 => StoredDtype::U16,
-        Dtype::F16 => StoredDtype::F16,
-        Dtype::BF16 => StoredDtype::BF16,
-        Dtype::I32 => StoredDtype::I32,
-        Dtype::U32 => StoredDtype::U32,
-        Dtype::F32 => StoredDtype::F32,
-        Dtype::F64 => StoredDtype::F64,
-        Dtype::I64 => StoredDtype::I64,
-        Dtype::U64 => StoredDtype::U64,
-        Dtype::C64 => StoredDtype::C64,
-        Dtype::F8_E4M3 => StoredDtype::F8E4M3,
-        Dtype::F4 => StoredDtype::F4,
-        Dtype::F8_E8M0 => StoredDtype::F8E8M0,
-        Dtype::F8_E5M2 => StoredDtype::F8E5M2,
-        other => StoredDtype::Other(format!("{other:?}")),
-    }
+/// Decode JSON once, rejecting duplicate names before typed offset validation.
+pub(crate) fn parse_header(bytes: &[u8]) -> Result<Metadata, serde_json::Error> {
+    let mut header = serde_json::from_slice::<UniqueHeader>(bytes)?;
+    header.tensors.sort_by_key(|(_, info)| info.data_offsets);
+    Metadata::new(header.metadata, header.tensors).map_err(serde::de::Error::custom)
 }
 
 fn malformed_shard(path: &Path, message: impl Into<String>) -> SafetensorsShardError {
@@ -595,6 +503,8 @@ fn io_error(path: &Path, error: std::io::Error) -> SafetensorsShardError {
 
 #[cfg(test)]
 mod tests {
+    use crate::StoredDtype;
+    use std::fs::File;
     use std::io::Write;
 
     use super::*;
@@ -623,6 +533,18 @@ mod tests {
             .unwrap();
         file.write_all(&header).unwrap();
         file.set_len(8 + header.len() as u64 + payload_len).unwrap();
+    }
+
+    #[test]
+    fn header_admission_rejects_duplicate_tensor_fields() {
+        assert!(parse_header(
+            br#"{"weight":{"dtype":"U8","dtype":"I8","shape":[1],"data_offsets":[0,1]}}"#
+        )
+        .is_err());
+        assert!(parse_header(
+            br#"{"weight":{"dtype":"U8","shape":[1],"shape":[1],"data_offsets":[0,1]}}"#
+        )
+        .is_err());
     }
 
     #[test]
@@ -909,7 +831,11 @@ mod tests {
         std::fs::create_dir_all(&snapshot).unwrap();
         std::fs::create_dir_all(&blobs).unwrap();
         let blob = blobs.join("payload");
-        std::fs::write(&blob, []).unwrap();
+        write_header_and_sparse_payload(
+            &blob,
+            serde_json::json!({"weight": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]}}),
+            1,
+        );
         symlink("../../blobs/payload", snapshot.join("model.safetensors")).unwrap();
 
         let shards = SafetensorsShards::discover(&snapshot).unwrap();

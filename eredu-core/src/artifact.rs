@@ -20,7 +20,6 @@ use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::File,
-    io::Read,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -1270,17 +1269,25 @@ fn inspect_safetensors<R: ModelConfigurationResolver>(
     let config_path = path.join("config.json");
     let json: Value = serde_json::from_reader(File::open(&config_path)?)?;
     let (configuration, resolved_plan) = resolver.resolve_safetensors(&json)?.into_parts();
-    let shards = SafetensorsShards::discover(path)?;
-    let mut descriptors = Vec::new();
-    let mut names = BTreeSet::new();
-    for shard in shards.payload_paths() {
-        for descriptor in inspect_safetensors_header(shard)? {
-            if !names.insert(descriptor.name.clone()) {
-                return Err(ArtifactError::DuplicateTensor(descriptor.name));
-            }
-            descriptors.push(descriptor);
-        }
-    }
+    let catalog = eredu_checkpoint::safetensors::SafetensorsMetadataCatalog::discover(path)?;
+    let shards = catalog.admitted_shards();
+    let descriptors = catalog.tensors().values().map(|metadata| TensorDescriptor {
+        name: metadata.name.clone(),
+        shape: metadata.logical_shape.clone(),
+        dtype: stored_to_tensor_dtype(&metadata.stored_dtype),
+        storage: Some(TensorStorage {
+            member: metadata
+                .backing_shard
+                .as_ref()
+                .expect("admitted shard")
+                .display()
+                .to_string(),
+            offset: catalog
+                .tensor_offset(&metadata.name)
+                .expect("admitted tensor offset"),
+            length: metadata.encoded_byte_len,
+        }),
+    });
     let tensors = TensorCatalog::new(descriptors)?;
     if tensors.is_empty() {
         return Err(ArtifactError::InvalidArtifact(
@@ -1307,106 +1314,27 @@ fn inspect_safetensors<R: ModelConfigurationResolver>(
     })
 }
 
-#[derive(Deserialize)]
-struct RawSafetensorInfo {
-    dtype: String,
-    shape: Vec<usize>,
-    data_offsets: [u64; 2],
-}
-
-fn inspect_safetensors_header(path: &Path) -> Result<Vec<TensorDescriptor>, ArtifactError> {
-    const MAX_HEADER_BYTES: u64 = 100_000_000;
-    let mut file = File::open(path)?;
-    let file_len = file.metadata()?.len();
-    let mut length = [0_u8; 8];
-    file.read_exact(&mut length)?;
-    let header_len = u64::from_le_bytes(length);
-    if header_len > MAX_HEADER_BYTES {
-        return Err(ArtifactError::InvalidArtifact(format!(
-            "SafeTensors header in {} exceeds {MAX_HEADER_BYTES} bytes",
-            path.display()
-        )));
-    }
-    let mut header = vec![
-        0_u8;
-        usize::try_from(header_len).map_err(|_| {
-            ArtifactError::InvalidArtifact("SafeTensors header length overflows usize".into())
-        })?
-    ];
-    file.read_exact(&mut header)?;
-    let raw: BTreeMap<String, Value> = serde_json::from_slice(&header)?;
-    let payload_start = 8_u64
-        .checked_add(header_len)
-        .ok_or_else(|| ArtifactError::InvalidArtifact("SafeTensors offset overflow".into()))?;
-    let mut entries = raw
-        .into_iter()
-        .filter(|(name, _)| name != "__metadata__")
-        .map(|(name, value)| {
-            serde_json::from_value::<RawSafetensorInfo>(value).map(|info| (name, info))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    entries.sort_by_key(|(_, info)| info.data_offsets[0]);
-    let mut output = Vec::with_capacity(entries.len());
-    let mut expected_offset = 0_u64;
-    for (name, info) in entries {
-        // SafeTensors rank-zero tensors are scalar parameters with one stored
-        // element. Gemma media clipping bounds use this representation.
-        if info.shape.contains(&0) {
-            return Err(ArtifactError::InvalidArtifact(format!(
-                "SafeTensors tensor {name:?} has an invalid shape"
-            )));
-        }
-        let [start, end] = info.data_offsets;
-        if start != expected_offset || end < start {
-            return Err(ArtifactError::InvalidArtifact(format!(
-                "SafeTensors tensor {name:?} has non-contiguous data offsets"
-            )));
-        }
-        expected_offset = end;
-        let absolute = payload_start
-            .checked_add(start)
-            .ok_or_else(|| ArtifactError::InvalidArtifact("SafeTensors offset overflow".into()))?;
-        output.push(TensorDescriptor {
-            name,
-            shape: info.shape,
-            dtype: safetensors_dtype(&info.dtype),
-            storage: Some(TensorStorage {
-                member: path.display().to_string(),
-                offset: absolute,
-                length: end - start,
-            }),
-        });
-    }
-    if payload_start
-        .checked_add(expected_offset)
-        .ok_or_else(|| ArtifactError::InvalidArtifact("SafeTensors length overflow".into()))?
-        != file_len
-    {
-        return Err(ArtifactError::InvalidArtifact(format!(
-            "SafeTensors payload length does not match header in {}",
-            path.display()
-        )));
-    }
-    Ok(output)
-}
-
-fn safetensors_dtype(dtype: &str) -> TensorDtype {
+fn stored_to_tensor_dtype(dtype: &StoredDtype) -> TensorDtype {
     match dtype {
-        "BOOL" => TensorDtype::Bool,
-        "U8" => TensorDtype::U8,
-        "I8" => TensorDtype::I8,
-        "I16" => TensorDtype::I16,
-        "U16" => TensorDtype::U16,
-        "F16" => TensorDtype::F16,
-        "BF16" => TensorDtype::Bf16,
-        "I32" => TensorDtype::I32,
-        "U32" => TensorDtype::U32,
-        "F32" => TensorDtype::F32,
-        "F64" => TensorDtype::F64,
-        "I64" => TensorDtype::I64,
-        "U64" => TensorDtype::U64,
-        "C64" => TensorDtype::Complex64,
-        other => TensorDtype::Encoded(other.into()),
+        StoredDtype::Bool => TensorDtype::Bool,
+        StoredDtype::U8 => TensorDtype::U8,
+        StoredDtype::I8 => TensorDtype::I8,
+        StoredDtype::I16 => TensorDtype::I16,
+        StoredDtype::U16 => TensorDtype::U16,
+        StoredDtype::F16 => TensorDtype::F16,
+        StoredDtype::BF16 => TensorDtype::Bf16,
+        StoredDtype::I32 => TensorDtype::I32,
+        StoredDtype::U32 => TensorDtype::U32,
+        StoredDtype::F32 => TensorDtype::F32,
+        StoredDtype::F64 => TensorDtype::F64,
+        StoredDtype::I64 => TensorDtype::I64,
+        StoredDtype::U64 => TensorDtype::U64,
+        StoredDtype::C64 => TensorDtype::Complex64,
+        StoredDtype::F8E4M3 => TensorDtype::Encoded("F8_E4M3".into()),
+        StoredDtype::F8E5M2 => TensorDtype::Encoded("F8_E5M2".into()),
+        StoredDtype::F8E8M0 => TensorDtype::Encoded("F8_E8M0".into()),
+        StoredDtype::F4 => TensorDtype::Encoded("F4".into()),
+        StoredDtype::Other(name) => TensorDtype::Encoded(name.clone()),
     }
 }
 
@@ -1743,12 +1671,25 @@ mod tests {
         file.write_all(header).unwrap();
         file.write_all(&[0_u8; 16]).unwrap();
         drop(file);
+        let prepared =
+            open_prepared_safetensors_artifact(inspection.tensors(), shards, resolution, 1)
+                .unwrap();
+        assert_eq!(
+            prepared
+                .source_metadata("token_embd.weight")
+                .unwrap()
+                .logical_shape,
+            [2, 2]
+        );
         assert!(matches!(
-            open_prepared_safetensors_artifact(inspection.tensors(), shards, resolution, 1,),
-            Err(ArtifactError::CheckpointStore(
-                eredu_checkpoint::store::StoreError::PreparedCatalogMismatch { .. }
-            ))
+            prepared.acquire_lease(eredu_checkpoint::store::TensorReadRequest {
+                key: "token_embd.weight".into(),
+                selection: eredu_checkpoint::store::TensorSelection::Full,
+                policy: eredu_checkpoint::store::ReadPolicy::RequireBounded,
+            }),
+            Err(eredu_checkpoint::store::StoreError::AdmittedFileChanged { .. })
         ));
+        assert_eq!(prepared.source_diagnostics().unwrap().physical_reads, 0);
     }
 
     struct FixtureResolver;
@@ -2084,13 +2025,19 @@ mod tests {
 
     #[test]
     fn safetensors_native_dtypes_remain_typed_in_the_portable_catalog() {
-        assert_eq!(safetensors_dtype("BOOL"), TensorDtype::Bool);
-        assert_eq!(safetensors_dtype("I64"), TensorDtype::I64);
-        assert_eq!(safetensors_dtype("U32"), TensorDtype::U32);
-        assert_eq!(safetensors_dtype("F64"), TensorDtype::F64);
-        assert_eq!(safetensors_dtype("C64"), TensorDtype::Complex64);
         assert_eq!(
-            safetensors_dtype("F8_E4M3"),
+            stored_to_tensor_dtype(&StoredDtype::Bool),
+            TensorDtype::Bool
+        );
+        assert_eq!(stored_to_tensor_dtype(&StoredDtype::I64), TensorDtype::I64);
+        assert_eq!(stored_to_tensor_dtype(&StoredDtype::U32), TensorDtype::U32);
+        assert_eq!(stored_to_tensor_dtype(&StoredDtype::F64), TensorDtype::F64);
+        assert_eq!(
+            stored_to_tensor_dtype(&StoredDtype::C64),
+            TensorDtype::Complex64
+        );
+        assert_eq!(
+            stored_to_tensor_dtype(&StoredDtype::F8E4M3),
             TensorDtype::Encoded("F8_E4M3".into())
         );
     }

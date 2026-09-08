@@ -938,7 +938,7 @@ pub struct MaterializedUnit<B: ParameterBackend> {
 /// backend to select them again.
 pub struct SelectedBindingPlan<B: ParameterBackend> {
     source: SharedCheckpointSource,
-    bindings: Vec<WeightBinding>,
+    plan: WeightBindingPlan<'static>,
     backend: PhantomData<fn() -> B>,
 }
 
@@ -946,16 +946,15 @@ impl<B: ParameterBackend> std::fmt::Debug for SelectedBindingPlan<B> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("SelectedBindingPlan")
-            .field("bindings", &self.bindings)
+            .field("plan", &self.plan)
             .finish_non_exhaustive()
     }
 }
 
 fn validated_binding_plan<'a, B: ParameterBackend>(
     source: &dyn CheckpointSource,
-    bindings: &'a [WeightBinding],
+    plan: WeightBindingPlan<'a>,
 ) -> Result<WeightBindingPlan<'a>, ParameterOrchestrationError<B::ParameterError>> {
-    let plan = WeightBindingPlan::new(bindings)?;
     for binding in plan.owners() {
         let inferred = binding.source_recipe().infer(source)?;
         if inferred.byte_len() != binding.expected_bytes() {
@@ -974,11 +973,11 @@ fn validated_binding_plan<'a, B: ParameterBackend>(
 }
 
 /// Validates a complete binding unit before any payload read or native work.
-pub fn preflight_bindings<B: ParameterBackend>(
+pub fn preflight_bindings<'a, B: ParameterBackend>(
     source: &dyn CheckpointSource,
-    bindings: &[WeightBinding],
-) -> Result<(), ParameterOrchestrationError<B::ParameterError>> {
-    validated_binding_plan::<B>(source, bindings).map(|_| ())
+    bindings: &'a [WeightBinding],
+) -> Result<WeightBindingPlan<'a>, ParameterOrchestrationError<B::ParameterError>> {
+    validated_binding_plan::<B>(source, WeightBindingPlan::new(bindings)?)
 }
 
 /// Selects a complete immutable binding unit against one exact source.
@@ -991,10 +990,10 @@ pub fn select_bindings<B: ParameterBackend>(
     source: SharedCheckpointSource,
     bindings: Vec<WeightBinding>,
 ) -> Result<SelectedBindingPlan<B>, ParameterOrchestrationError<B::ParameterError>> {
-    validated_binding_plan::<B>(source.as_ref(), &bindings)?;
+    let plan = validated_binding_plan::<B>(source.as_ref(), WeightBindingPlan::owned(bindings)?)?;
     Ok(SelectedBindingPlan {
         source,
-        bindings,
+        plan,
         backend: PhantomData,
     })
 }
@@ -1042,7 +1041,7 @@ pub fn materialize_bindings<B: ParameterBackend>(
     bindings: &[WeightBinding],
     context: &B::MaterializationContext,
 ) -> Result<MaterializedUnit<B>, ParameterOrchestrationError<B::ParameterError>> {
-    let plan = validated_binding_plan::<B>(source, bindings)?;
+    let plan = preflight_bindings::<B>(source, bindings)?;
     materialize_validated_plan::<B>(source, plan, context)
 }
 
@@ -1054,11 +1053,9 @@ pub fn materialize_selected_bindings<B: ParameterBackend>(
 ) -> Result<MaterializedUnit<B>, ParameterOrchestrationError<B::ParameterError>> {
     let SelectedBindingPlan {
         source,
-        bindings,
+        plan,
         backend: _,
     } = selected;
-    let plan = WeightBindingPlan::new(&bindings)
-        .expect("selected binding declarations remain immutable after admission");
     materialize_validated_plan::<B>(source.as_ref(), plan, context)
 }
 
