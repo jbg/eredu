@@ -1414,6 +1414,13 @@ extensions without a dedicated typed composition fail before target payload
 construction. An excluded prediction selection cannot fall back to a complete
 or pipeline target shell.
 
+Conditional Qwen hybrid prediction units include their routed expert banks in
+the exact extension parameter tasks. The generic materializer populates those
+resident banks, and prediction uses the neutral resident expert provider
+independently of the target's expert cache. Fused QKV and gate/up placement
+maps FP8 scale companions into block-row coordinates while retaining logical
+weight-row coordinates for the weights themselves.
+
 For SafeTensors and GGUF materialization, architecture preparation also
 identifies the checkpoint parameter that establishes the generic floating-state
 dtype and resolves its schema-declared physical aliases against the inspected

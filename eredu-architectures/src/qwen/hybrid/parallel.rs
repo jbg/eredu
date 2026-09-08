@@ -872,10 +872,7 @@ fn block_groups<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>(
                 |metadata, shape| {
                     let name = metadata.id.as_str();
                     if name.contains("in_proj_qkv") {
-                        Ok(MemberSharding::PartitionedSegments {
-                            axis: 0,
-                            segments: segments.clone(),
-                        })
+                        segmented_member_sharding(config, metadata, 0, &segments)
                     } else if name.contains("in_proj_z")
                         || name.contains("in_proj_b")
                         || name.contains("in_proj_a")
@@ -956,10 +953,7 @@ fn block_groups<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>(
                 &moe.experts,
                 |metadata, _| {
                     if metadata.id.as_str().contains("gate_up") {
-                        Ok(MemberSharding::PartitionedSegments {
-                            axis: 1,
-                            segments: segments.clone(),
-                        })
+                        segmented_member_sharding(config, metadata, 1, &segments)
                     } else {
                         Ok(MemberSharding::Partitioned { axis: 2 })
                     }
@@ -997,6 +991,44 @@ fn block_groups<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>(
         }
     }
     Ok(groups)
+}
+
+// Segments describe logical weight rows. FP8 scale companions instead contain
+// one row per weight block, including on the expert bank's rank-3 row axis.
+fn segmented_member_sharding(
+    config: &HybridConfig,
+    metadata: &eredu_nn::ParameterMetadata,
+    axis: usize,
+    segments: &[Range<usize>],
+) -> Result<MemberSharding, ParallelPlanError> {
+    let mut segments = segments.to_vec();
+    if metadata.linear_companion == Some(eredu_nn::LinearCompanionRole::Scale) {
+        let weight = metadata.linear_companion_of.as_ref().ok_or_else(|| {
+            invalid(format!(
+                "scale {} has no owning weight",
+                metadata.id.as_str()
+            ))
+        })?;
+        if let eredu_checkpoint::LinearFormat::E4M3BlockFp8(format) =
+            config.linear_format(weight.as_str())
+        {
+            let block = usize::try_from(format.block_rows)
+                .map_err(|_| invalid("FP8 block rows exceed usize"))?;
+            for segment in &mut segments {
+                if block == 0
+                    || !segment.start.is_multiple_of(block)
+                    || !segment.end.is_multiple_of(block)
+                {
+                    return Err(invalid(format!(
+                        "FP8 scale {} segment {segment:?} is not aligned to {block} rows",
+                        metadata.id.as_str(),
+                    )));
+                }
+                *segment = segment.start / block..segment.end / block;
+            }
+        }
+    }
+    Ok(MemberSharding::PartitionedSegments { axis, segments })
 }
 
 /// Declares semantic placement for a target or configured prediction unit.

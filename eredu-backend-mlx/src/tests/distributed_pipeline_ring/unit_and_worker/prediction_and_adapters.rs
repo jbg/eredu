@@ -96,9 +96,107 @@ fn public_replicated_prediction_variants_install_only_the_neutral_extension() {
     write_qwen35_multimodal_fixture(qwen.path(), false);
     assert_extension(qwen.path(), 1);
 
+    let qwen_moe = tempfile::tempdir().unwrap();
+    write_qwen35_multimodal_fixture(qwen_moe.path(), true);
+    assert_extension(qwen_moe.path(), 1);
+
     let nemotron = tempfile::tempdir().unwrap();
     write_nemotron_mtp_fixture(nemotron.path());
     assert_extension(nemotron.path(), 1);
+}
+
+#[test]
+fn public_qwen_hybrid_moe_embedded_scheduler_executes() {
+    for (moe, fp8_experts) in [(false, false), (true, false), (true, true)] {
+        let checkpoint = tempfile::tempdir().unwrap();
+        write_qwen35_multimodal_fixture_with_prediction(checkpoint.path(), moe, 1, fp8_experts);
+        let factory = crate::composition::mlx::automatic::MlxBackendFactory::default();
+        let request = eredu_core::AutomaticPlanRequest::new(
+            checkpoint.path(),
+            DevicePlan::new("mlx", "cpu:0").unwrap(),
+        );
+        let (report, inspection) = eredu_core::AutomaticPlanner::default()
+            .plan_retained(&factory, &request)
+            .unwrap()
+            .into_parts();
+        assert!(matches!(
+            report.plan.drafting(),
+            DraftingPlan::Embedded {
+                max_draft_tokens: 1,
+                ..
+            }
+        ));
+        let selected =
+            eredu_core::select_execution_plan_target(&factory, &report.plan, inspection.clone())
+                .unwrap();
+        let mut runtime =
+            eredu_core::realize_execution_plan_target(&factory, &report.plan, selected)
+                .unwrap()
+                .into_runtime()
+                .unwrap();
+        assert_eq!(
+            runtime.session().speculative_capability(),
+            SpeculativeCapability::Ready {
+                draft_source: eredu_core::SpeculativeDraftSource::Embedded,
+            }
+        );
+
+        let prompt = Array::from_slice(&[1u32, 2], &[1, 2]);
+        let parts = [text_input_part(&prompt)];
+        let output = run_neutral_embedded_mtp(
+            &mut runtime,
+            synthetic_prediction_input(&parts, &[1, 2]),
+            SpeculativeConfig {
+                max_tokens: 3,
+                max_draft_tokens: 1,
+                temperature: 0.0,
+                eos_token_ids: Vec::new(),
+            },
+        )
+        .unwrap();
+        assert_eq!(output.token_ids().len(), 3);
+        assert!(output.stats().draft_tokens() > 0);
+
+        let ordinary_plan = report.plan.with_drafting(DraftingPlan::Disabled);
+        let selected =
+            eredu_core::select_execution_plan_target(&factory, &ordinary_plan, inspection).unwrap();
+        let mut ordinary =
+            eredu_core::realize_execution_plan_target(&factory, &ordinary_plan, selected)
+                .unwrap()
+                .into_runtime()
+                .unwrap();
+        let mut ordinary_output = ordinary
+            .prefill(synthetic_prediction_input(&parts, &[1, 2]))
+            .unwrap()
+            .wait()
+            .unwrap();
+        let mut tokens = Vec::new();
+        for step in 0..3 {
+            let logits = ordinary_output.logits().unwrap().as_array();
+            let vocabulary = logits.dim(-1) as usize;
+            let logits = logits.evaluated().unwrap();
+            let scores = logits.as_slice::<f32>();
+            let scores = &scores[scores.len() - vocabulary..];
+            assert!(scores.iter().all(|score| score.is_finite()));
+            // Preserve the first vocabulary index on ties, as greedy sampling does.
+            let token = (0..scores.len()).fold(0, |best, index| {
+                if scores[index] > scores[best] {
+                    index
+                } else {
+                    best
+                }
+            }) as u32;
+            tokens.push(token);
+            if step < 2 {
+                ordinary_output = ordinary
+                    .decode(Array::from_slice(&[token], &[1, 1]))
+                    .unwrap()
+                    .wait()
+                    .unwrap();
+            }
+        }
+        assert_eq!(output.token_ids(), tokens);
+    }
 }
 
 #[cfg(feature = "metal")]

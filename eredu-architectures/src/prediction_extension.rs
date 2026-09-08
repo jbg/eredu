@@ -3247,11 +3247,10 @@ where
             })
         }
         SafetensorsModelConfig::QwenHybrid(args) => {
-            if args.text.is_moe() {
-                return Err(invalid(
-                    "Qwen hybrid routed prediction requires an extension expert provider",
-                ));
-            }
+            // Prediction units carry their own resident expert banks, populated
+            // by the same exact parameter tasks as their attention and shared
+            // projections. Execution uses ResidentExpertProvider, independently
+            // of the target's expert residency policy.
             let source_architecture = crate::qwen::hybrid::ConditionalLayeredModel::<B>::new(
                 args.clone(),
                 source_context,

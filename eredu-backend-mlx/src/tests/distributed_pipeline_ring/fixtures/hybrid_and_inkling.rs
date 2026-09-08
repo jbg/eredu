@@ -255,17 +255,18 @@ fn verify_bounded_hybrid_capture(runtime: &mut ModelRuntime<crate::backend::MlxB
 }
 
 fn write_qwen35_multimodal_fixture(directory: &Path, moe: bool) {
-    write_qwen35_multimodal_fixture_with_prediction(directory, moe, 1);
+    write_qwen35_multimodal_fixture_with_prediction(directory, moe, 1, false);
 }
 
 fn write_qwen35_zero_prediction_fixture(directory: &Path) {
-    write_qwen35_multimodal_fixture_with_prediction(directory, false, 0);
+    write_qwen35_multimodal_fixture_with_prediction(directory, false, 0, false);
 }
 
 fn write_qwen35_multimodal_fixture_with_prediction(
     directory: &Path,
     moe: bool,
     prediction_layers: usize,
+    fp8_experts: bool,
 ) {
     let mut text_config = if moe {
         qwen_hybrid_moe_config("qwen3_5_moe_text")
@@ -273,7 +274,12 @@ fn write_qwen35_multimodal_fixture_with_prediction(
         qwen_hybrid_config("qwen3_5_text")
     };
     text_config["mtp_num_hidden_layers"] = prediction_layers.into();
-    let config = serde_json::json!({
+    if fp8_experts {
+        text_config["moe_intermediate_size"] = 128.into();
+        text_config["linear_key_head_dim"] = 64.into();
+        text_config["linear_value_head_dim"] = 64.into();
+    }
+    let mut config = serde_json::json!({
         "architectures": [if moe { "Qwen3_5MoeForConditionalGeneration" } else { "Qwen3_5ForConditionalGeneration" }],
         "model_type": if moe { "qwen3_5_moe" } else { "qwen3_5" },
         "image_token_id": 42,
@@ -313,6 +319,101 @@ fn write_qwen35_multimodal_fixture_with_prediction(
     );
     initialize_fixture(&mut model, stream);
     save_parameter_fixture(directory, &config, &model);
+    if fp8_experts {
+        // Match the released Qwen3.6 layout: independent E4M3 expert matrices
+        // and inverse block scales, including the separate MTP expert bank.
+        let mut excluded = Vec::new();
+        let mut weight_map = serde_json::Map::new();
+        for shard in [
+            "layer-0.safetensors",
+            "layer-1.safetensors",
+            "static.safetensors",
+        ] {
+            let bytes = std::fs::read(directory.join(shard)).unwrap();
+            let source = safetensors::SafeTensors::deserialize(&bytes).unwrap();
+            let mut tensors = Vec::new();
+            for (name, tensor) in source.tensors() {
+                let Some((root, projection)) = name.split_once(".mlp.experts.") else {
+                    if name.ends_with(".linear_attn.in_proj_qkv.weight") {
+                        let shape = tensor.shape().to_vec();
+                        tensors.push((
+                            name.clone(),
+                            Dtype::F8_E4M3,
+                            shape.clone(),
+                            vec![0x38; shape.iter().product()],
+                        ));
+                        let scales = vec![shape[0].div_ceil(128), shape[1].div_ceil(128)];
+                        let bytes = (0..scales.iter().product::<usize>())
+                            .flat_map(|_| 0.005f32.to_le_bytes())
+                            .collect();
+                        tensors.push((format!("{name}_scale_inv"), Dtype::F32, scales, bytes));
+                        continue;
+                    }
+                    excluded.push(name.trim_end_matches(".weight").to_owned());
+                    tensors.push((
+                        name,
+                        tensor.dtype(),
+                        tensor.shape().to_vec(),
+                        tensor.data().to_vec(),
+                    ));
+                    continue;
+                };
+                let [experts, rows, columns] = *tensor.shape() else {
+                    panic!("expected a packed fixture expert bank: {name}");
+                };
+                let projections = match projection {
+                    "gate_up_proj" => vec![
+                        ("gate_proj", rows / 2, columns),
+                        ("up_proj", rows / 2, columns),
+                    ],
+                    "down_proj" => vec![("down_proj", rows, columns)],
+                    _ => panic!("unexpected fixture expert projection: {name}"),
+                };
+                for expert in 0..experts {
+                    for &(projection, rows, columns) in &projections {
+                        let name = format!("{root}.mlp.experts.{expert}.{projection}.weight");
+                        tensors.push((
+                            name.clone(),
+                            Dtype::F8_E4M3,
+                            vec![rows, columns],
+                            vec![0x38; rows * columns],
+                        ));
+                        let shape = vec![rows.div_ceil(128), columns.div_ceil(128)];
+                        let scales = (0..shape.iter().product::<usize>())
+                            .flat_map(|_| 0.005f32.to_le_bytes())
+                            .collect();
+                        tensors.push((format!("{name}_scale_inv"), Dtype::F32, shape, scales));
+                    }
+                }
+            }
+            let views = tensors
+                .iter()
+                .map(|(name, dtype, shape, bytes)| {
+                    weight_map.insert(name.clone(), shard.into());
+                    (
+                        name.as_str(),
+                        TensorView::new(*dtype, shape.clone(), bytes).unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            serialize_to_file(views, None, &directory.join(shard)).unwrap();
+        }
+        config["quantization_config"] = serde_json::json!({
+            "quant_method": "fp8", "fmt": "e4m3", "activation_scheme": "dynamic",
+            "weight_block_size": [128, 128], "modules_to_not_convert": excluded,
+        });
+        std::fs::write(
+            directory.join("config.json"),
+            serde_json::to_vec(&config).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            directory.join("model.safetensors.index.json"),
+            serde_json::to_vec(&serde_json::json!({"metadata": {}, "weight_map": weight_map}))
+                .unwrap(),
+        )
+        .unwrap();
+    }
 }
 
 fn write_qwen3_vl_fixture(directory: &Path, moe: bool) {
