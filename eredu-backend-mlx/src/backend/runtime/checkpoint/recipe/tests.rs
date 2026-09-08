@@ -43,6 +43,76 @@ fn fixture() -> (tempfile::TempDir, Arc<SafetensorsWeightStore>) {
     (dir, store)
 }
 
+#[cfg(not(feature = "cuda"))]
+#[test]
+fn direct_expert_join_owns_final_bytes_without_retaining_source_leases() {
+    let (directory, store) = fixture();
+    let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+    let context = MlxParameterMaterializationContext::new(&stream, &stream);
+    let recipe = DerivedWeightRecipe::Stack {
+        axis: 0,
+        inputs: [("right", "left"), ("left", "right")]
+            .map(|(gate, up)| DerivedWeightRecipe::Concatenate {
+                axis: 0,
+                inputs: vec![
+                    DerivedWeightRecipe::source(gate, TensorSelection::Full),
+                    DerivedWeightRecipe::source(up, TensorSelection::Full),
+                ],
+            })
+            .to_vec(),
+    };
+    let pending = recipe
+        .prepare_materialization(store.as_ref(), &context)
+        .unwrap();
+    assert!(pending.sources.is_empty());
+    let (output, _) = pending.into_parts();
+    drop(store);
+    drop(directory);
+    assert_eq!(output.shape(), &[2, 4, 2]);
+    assert_eq!(
+        output.evaluated().unwrap().as_slice::<i32>(),
+        &[5, 6, 7, 8, 1, 2, 3, 4, 1, 2, 3, 4, 5, 6, 7, 8]
+    );
+}
+
+#[cfg(not(feature = "cuda"))]
+#[test]
+fn direct_fp8_join_preserves_encoded_values() {
+    let directory = tempfile::tempdir().unwrap();
+    let bytes = [0x00, 0x38, 0x80, 0x7e, 0xb8, 0x40, 0x01, 0xfe];
+    serialize_to_file(
+        [
+            (
+                "gate",
+                TensorView::new(SafeDtype::F8_E4M3, vec![2, 2], &bytes[..4]).unwrap(),
+            ),
+            (
+                "up",
+                TensorView::new(SafeDtype::F8_E4M3, vec![2, 2], &bytes[4..]).unwrap(),
+            ),
+        ],
+        None,
+        &directory.path().join("model.safetensors"),
+    )
+    .unwrap();
+    let store = SafetensorsWeightStore::open(directory.path()).unwrap();
+    let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+    let recipe = DerivedWeightRecipe::Concatenate {
+        axis: 0,
+        inputs: vec![
+            DerivedWeightRecipe::source("up", TensorSelection::Full),
+            DerivedWeightRecipe::source("gate", TensorSelection::Full),
+        ],
+    };
+    let output = recipe.materialize(&store, &stream).unwrap();
+    assert_eq!(output.dtype(), Dtype::Uint8);
+    assert_eq!(output.shape(), &[4, 2]);
+    assert_eq!(
+        output.evaluated().unwrap().as_slice::<u8>(),
+        &[0xb8, 0x40, 0x01, 0xfe, 0x00, 0x38, 0x80, 0x7e]
+    );
+}
+
 #[test]
 fn bitwise_view_preserves_checkpoint_bytes() {
     let (_dir, store) = fixture();

@@ -1,11 +1,61 @@
 /* Copyright © 2023-2024 Apple Inc. */
 
 #include <cstring>
+#include <limits>
 
 #include "mlx/c/array.h"
 #include "mlx/c/error.h"
 #include "mlx/c/private/mlx.h"
+#include "mlx/c/private/prepared_array_output.h"
 #include "mlx/c/string.h"
+
+extern "C" int mlx_array_new_host(
+    mlx_array* result,
+    void** data,
+    const int* shape,
+    int dim,
+    mlx_dtype dtype) {
+  try {
+    if (!result || !data || dim < 0 || (dim > 0 && !shape)) {
+      throw std::invalid_argument("Invalid host array arguments.");
+    }
+    using namespace mlx::core;
+    auto kind = allocator::allocator().host_transfer_storage_kind(
+        allocator::HostTransferPolicy::transfer);
+    if (kind != allocator::HostTransferStorageKind::cpu &&
+        kind != allocator::HostTransferStorageKind::metal_shared) {
+      throw std::invalid_argument("Direct host arrays require CPU or Metal storage.");
+    }
+    auto cpp_dtype = mlx_dtype_to_cpp(dtype);
+    size_t bytes = size_of(cpp_dtype);
+    // Check suffix extents as well as the total: a leading zero must not
+    // conceal overflowing strides in the array descriptor.
+    for (int i = dim; i-- > 0;) {
+      if (shape[i] < 0 ||
+          (shape[i] && bytes > std::numeric_limits<size_t>::max() / shape[i])) {
+        throw std::invalid_argument("Invalid or overflowing host array shape.");
+      }
+      bytes *= shape[i];
+    }
+    mlx_array_output_preparation_ publication(*result);
+    auto cpp_shape = dim ? Shape(shape, shape + dim) : Shape{};
+    array value(allocator::Buffer{nullptr}, std::move(cpp_shape), cpp_dtype);
+    value.set_data(allocator::malloc(bytes));
+    auto pointer = value.data<void>();
+    if (bytes) {
+      if (!pointer) {
+        throw std::runtime_error("Unable to allocate host array storage.");
+      }
+      std::memset(pointer, 0, bytes);
+    }
+    publication.publish(std::move(value));
+    *data = pointer;
+    return 0;
+  } catch (std::exception& e) {
+    mlx_error(e.what());
+    return 1;
+  }
+}
 
 extern "C" size_t mlx_dtype_size(mlx_dtype dtype) {
   return mlx_dtype_to_cpp(dtype).size();

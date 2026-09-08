@@ -588,6 +588,27 @@ copies after their final lease retires. Native materialization retains its sourc
 leases until completion, then releases those host buffers independently of the
 resident native weights.
 
+For byte-preserving leading-axis joins, checkpoint recipes can instead compile
+an exact encoded read batch. The batch retains admitted metadata and file
+identities, groups reads by shard and offset, and coalesces adjacent source and
+destination spans. It owns no payload buffer or shard-cache lease. Prepared and
+restricted source views preserve catalog and authorization checks for this path;
+file identity is checked once before and after each shard's batch of reads.
+Recipe inference uses the batch's in-memory metadata. Unsupported transforms,
+partial selections, and source encodings retain the ordinary materializer.
+
+On CPU and Metal, MLX materialization allocates the final contiguous array first
+and supplies its writable bytes to that neutral read batch. The safe native
+initializer owns an exclusive, zero-initialized allocation until all reads
+succeed, then publishes an immutable array. Apple unified memory lets the GPU
+use that same allocation. Expert stacking and gate/up concatenation require no
+per-expert native arrays or checkpoint-sized staging copy on this path. The
+optimization follows each selected binding's recipe, so it neither changes
+residency selection nor eagerly reads otherwise nonresident banks. Native
+allocation and pointer access remain inside `safemlx`/`safemlx-sys`; checkpoint
+code only receives a bounded mutable byte slice. CUDA retains its existing
+materialization and transfer path.
+
 After selection, `PreparedModelSources` is the sole architecture-aware
 SafeTensors/GGUF source factory for model loading. It opens every admitted
 physical source once, retains exact resolutions and metadata, composes typed

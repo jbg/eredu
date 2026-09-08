@@ -50,6 +50,72 @@ unsafe extern "C" fn drop_owned_vec<T>(payload: *mut c_void) {
     }
 }
 
+#[cfg(all(test, not(feature = "cuda")))]
+mod direct_init_tests {
+    use super::*;
+    use crate::{Device, DeviceType};
+
+    #[test]
+    fn initializer_writes_the_final_native_allocation() {
+        let mut initialized_at = std::ptr::null();
+        let value = Array::try_init_with(&[4], Dtype::Uint8, |bytes| {
+            assert_eq!(bytes, &[0; 4]);
+            initialized_at = bytes.as_ptr();
+            bytes.copy_from_slice(&[1, 2, 3, 4]);
+            Ok::<_, crate::error::Exception>(())
+        })
+        .unwrap();
+        let clone = value.clone();
+        drop(value);
+        let evaluated = clone.evaluated().unwrap();
+        assert_eq!(evaluated.as_slice::<u8>().as_ptr(), initialized_at);
+        assert_eq!(evaluated.as_slice::<u8>(), &[1, 2, 3, 4]);
+        let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+        let sum = clone
+            .sum(false, &stream)
+            .unwrap()
+            .try_item::<u32>(&stream)
+            .unwrap();
+        assert_eq!(sum, 10);
+        #[cfg(feature = "metal")]
+        {
+            let stream = Stream::new_with_device(&Device::new(DeviceType::Gpu, 0));
+            let promoted = clone.copy(&stream).unwrap();
+            let evaluated = promoted.evaluated().unwrap();
+            assert_eq!(evaluated.as_slice::<u8>().as_ptr(), initialized_at);
+            assert_eq!(
+                promoted
+                    .sum(false, &stream)
+                    .unwrap()
+                    .try_item::<u32>(&stream)
+                    .unwrap(),
+                10
+            );
+        }
+    }
+
+    #[test]
+    fn initializer_errors_and_invalid_shapes_do_not_publish_arrays() {
+        let result = Array::try_init_with(&[2], Dtype::Float32, |_bytes| {
+            Err(crate::error::Exception::custom("read failed"))
+        });
+        assert!(result.is_err());
+        let mut called = false;
+        let result = Array::try_init_with(&[-1], Dtype::Uint8, |_| {
+            called = true;
+            Ok::<_, crate::error::Exception>(())
+        });
+        assert!(result.is_err());
+        assert!(!called);
+        let result = Array::try_init_with(&[0, i32::MAX, i32::MAX, i32::MAX], Dtype::Uint8, |_| {
+            called = true;
+            Ok::<_, crate::error::Exception>(())
+        });
+        assert!(result.is_err());
+        assert!(!called);
+    }
+}
+
 #[cfg(feature = "safetensors")]
 unsafe extern "C" fn retain_borrowed_data(_: *mut c_void) {}
 
@@ -213,7 +279,8 @@ impl Array {
         Array { c_array }
     }
 
-    /// Transfers an owned, typed host allocation into an MLX array without copying it.
+    /// Transfers an owned, typed host allocation into an MLX array, adopting
+    /// its storage without copying when the native backend supports it.
     pub fn try_from_owned_data<T: ArrayElement + 'static>(
         values: Vec<T>,
         shape: &[i32],
@@ -224,6 +291,48 @@ impl Array {
             ));
         }
         unsafe { Self::try_from_owned_host_data(values, shape, T::DTYPE) }
+    }
+
+    /// Initializes an array directly in its final CPU or shared Metal storage.
+    ///
+    /// The callback receives exclusive access to zero-initialized bytes. The
+    /// array becomes observable only after the callback succeeds; errors and
+    /// unwinding release the allocation. No intermediate host allocation or
+    /// host-to-device copy is needed. CUDA storage is unsupported.
+    pub fn try_init_with<E: From<crate::error::Exception>>(
+        shape: &[i32],
+        dtype: Dtype,
+        initialize: impl FnOnce(&mut [u8]) -> std::result::Result<(), E>,
+    ) -> std::result::Result<Self, E> {
+        let len = checked_elements(shape)?
+            .checked_mul(dtype_byte_width(dtype))
+            .filter(|len| *len <= isize::MAX as usize)
+            .ok_or_else(|| crate::error::Exception::custom("array byte count overflow"))?;
+        let rank = i32::try_from(shape.len())
+            .map_err(|_| crate::error::Exception::custom("shape is too large"))?;
+        let mut data: *mut c_void = std::ptr::null_mut();
+        let value = {
+            let _guard = runtime_lock::enter();
+            Self::try_from_op(|output| unsafe {
+                safemlx_sys::mlx_array_new_host(
+                    output,
+                    &mut data,
+                    shape.as_ptr(),
+                    rank,
+                    dtype.into(),
+                )
+            })?
+        };
+        // SAFETY: native construction initializes the entire checked extent.
+        // `value` is exclusively owned and cannot be shared until this callback
+        // returns. The callback's borrow cannot outlive this allocation.
+        let bytes = if len == 0 {
+            &mut []
+        } else {
+            unsafe { std::slice::from_raw_parts_mut(data.cast::<u8>(), len) }
+        };
+        initialize(bytes)?;
+        Ok(value)
     }
 
     /// Copies a checked typed slice into a new MLX array.

@@ -124,6 +124,17 @@ mlx_array mlx_array_new_data(
     int dim,
     mlx_dtype dtype);
 /**
+ * Allocate a zero-initialized, host-addressable array in native storage.
+ * The returned writable pointer is exclusively owned by the new array and must
+ * not be used after the array is shared or submitted. CPU and Metal only.
+ */
+int mlx_array_new_host(
+    mlx_array* result,
+    void** data,
+    const int* shape,
+    int dim,
+    mlx_dtype dtype);
+/**
  * New array from existing buffer.
  * @param data A buffer which will be copied.
  * @param shape Shape of the array.

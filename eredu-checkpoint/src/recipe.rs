@@ -143,6 +143,30 @@ pub struct RecipeMetadata {
     pub byte_len: u64,
 }
 
+/// A validated recipe whose output can be filled directly from encoded ranges.
+/// This owns metadata and read admission, never a tensor allocation.
+pub struct EncodedRecipeRead {
+    output: RecipeMetadata,
+    batch: crate::store::EncodedReadBatch,
+}
+
+impl EncodedRecipeRead {
+    /// Exact logical shape, dtype, and byte length of the output.
+    pub fn output(&self) -> &RecipeMetadata {
+        &self.output
+    }
+
+    /// Exact source encodings in destination order.
+    pub fn sources(&self) -> &[TensorMetadata] {
+        self.batch.tensors()
+    }
+
+    /// Fills the caller's final output allocation in recipe order.
+    pub fn read_into(self, output: &mut [u8]) -> Result<(), StoreError> {
+        self.batch.read_into(output)
+    }
+}
+
 /// A named recipe collection that becomes observable only after every output
 /// has passed metadata inference. This is the atomic unit used for fused
 /// weights and their affine or FP8 companions.
@@ -666,6 +690,64 @@ pub enum DerivedWeightRecipe {
 }
 
 impl DerivedWeightRecipe {
+    /// Compiles byte-preserving, leading-axis joins into one bounded read batch.
+    ///
+    /// Unsupported transformations or sources return `None` without payload
+    /// reads. Supported recipes are inferred once against the admitted batch's
+    /// in-memory metadata, so large expert joins do not re-open every source.
+    pub fn prepare_encoded_read(
+        &self,
+        source: &dyn CheckpointSource,
+    ) -> Result<Option<EncodedRecipeRead>, RecipeError> {
+        fn collect(recipe: &DerivedWeightRecipe, keys: &mut Vec<String>) -> bool {
+            match recipe {
+                DerivedWeightRecipe::Source {
+                    key,
+                    selection: TensorSelection::Full,
+                } => {
+                    keys.push(key.clone());
+                    true
+                }
+                DerivedWeightRecipe::Concatenate { axis: 0, inputs }
+                | DerivedWeightRecipe::Stack { axis: 0, inputs } => {
+                    inputs.iter().all(|input| collect(input, keys))
+                }
+                DerivedWeightRecipe::Reshape { input, .. } => collect(input, keys),
+                _ => false,
+            }
+        }
+        let mut keys = Vec::new();
+        if !collect(self, &mut keys) {
+            return Ok(None);
+        }
+        let Some(batch) = source.prepare_encoded_read(&keys)? else {
+            return Ok(None);
+        };
+        struct Catalog<'a>(BTreeMap<&'a str, &'a TensorMetadata>);
+        impl RecipeCatalog for Catalog<'_> {
+            fn tensor_metadata(&self, key: &str) -> Result<TensorMetadata, StoreError> {
+                self.0
+                    .get(key)
+                    .map(|value| (*value).clone())
+                    .ok_or_else(|| StoreError::UnknownTensor { key: key.into() })
+            }
+        }
+        let catalog = Catalog(
+            batch
+                .tensors()
+                .iter()
+                .map(|value| (value.name.as_str(), value))
+                .collect(),
+        );
+        let output = self.infer(&catalog)?;
+        if output.byte_len != batch.byte_len() as u64 {
+            // Packed sub-byte tensors may have padding that cannot be joined
+            // as bytes. Leave those transformations to the ordinary path.
+            return Ok(None);
+        }
+        Ok(Some(EncodedRecipeRead { output, batch }))
+    }
+
     /// Creates a recipe reading one selected checkpoint tensor.
     pub fn source(key: impl Into<String>, selection: TensorSelection) -> Self {
         Self::Source {
@@ -1433,7 +1515,7 @@ fn push_concatenate_selection<C: RecipeCatalog + ?Sized>(
             return Err(RecipeError::SelectionPushdownUnsupported {
                 operation: "concatenate",
                 reason: "a storage-contiguous span has no concatenate-axis semantics".into(),
-            })
+            });
         }
     }
     match rewritten.len() {
@@ -1468,7 +1550,7 @@ fn push_stack_selection<C: RecipeCatalog + ?Sized>(
                 return Err(RecipeError::SelectionPushdownUnsupported {
                     operation: "stack",
                     reason: "a storage-contiguous span has no stack-axis semantics".into(),
-                })
+                });
             }
         };
         return Ok(DerivedWeightRecipe::Stack {

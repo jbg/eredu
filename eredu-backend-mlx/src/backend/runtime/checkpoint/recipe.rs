@@ -298,6 +298,38 @@ impl MlxWeightRecipeExt for DerivedWeightRecipe {
         context: &MlxParameterMaterializationContext,
         borrow_sources: bool,
     ) -> Result<PendingWeightRecipe, WeightRecipeError> {
+        // On CPU and unified-memory Metal, the allocation filled by checkpoint
+        // I/O is already suitable for execution. Recipes own the layout plan;
+        // the native wrapper owns allocation and publication of immutable data.
+        #[cfg(not(feature = "cuda"))]
+        if let Some(read) = self.prepare_encoded_read(store)? {
+            // Byte-preserving joins already proved a single common dtype.
+            if let Some(source) = read.sources().first() {
+                super::store::safetensors_dtype(&source.name, &source.stored_dtype)?;
+            }
+            let mut shape = read
+                .output()
+                .shape
+                .iter()
+                .map(|dimension| usize_to_i32(*dimension, "direct recipe output shape"))
+                .collect::<Result<Vec<_>, _>>()?;
+            let dtype = mlx_dtype(&read.output().dtype)?;
+            if read.output().dtype == RecipeDtype::F4 {
+                let last = shape
+                    .last_mut()
+                    .filter(|last| **last % 2 == 0)
+                    .ok_or(WeightRecipeError::InvalidMxFp4LogicalShape)?;
+                *last /= 2;
+            }
+            let output = Array::try_init_with(&shape, dtype, |bytes| {
+                read.read_into(bytes)
+                    .map_err(WeightRecipeError::CheckpointStore)
+            })?;
+            return Ok(PendingWeightRecipe {
+                output,
+                sources: Vec::new(),
+            });
+        }
         self.infer(store)?;
         let mut sources = Vec::new();
         let source_stream = context.source_stream();

@@ -377,6 +377,17 @@ pub trait CheckpointSource: Send + Sync {
     /// Returns deterministic storage diagnostics.
     fn source_diagnostics(&self) -> Result<WeightStoreDiagnostics, StoreError>;
 
+    /// Prepares an ordered, bounded read of complete encoded tensors into
+    /// caller-owned storage. Unsupported sources return `None` without reading
+    /// payloads. The returned batch retains exact file admission and metadata;
+    /// execution checks each shard once before and after reading its ranges.
+    fn prepare_encoded_read(
+        &self,
+        _keys: &[String],
+    ) -> Result<Option<EncodedReadBatch>, StoreError> {
+        Ok(None)
+    }
+
     /// Returns exact container provenance without opening tensor payloads.
     fn source_provenance(&self, key: &str) -> Result<TensorSourceProvenance, StoreError> {
         let metadata = self.source_metadata(key)?;
@@ -422,6 +433,9 @@ pub trait CheckpointSource: Send + Sync {
 
 /// Shared ownership of one backend-neutral checkpoint source.
 pub type SharedCheckpointSource = Arc<dyn CheckpointSource>;
+
+mod bulk;
+pub use bulk::EncodedReadBatch;
 
 /// Opens one exact admitted SafeTensors source and applies its retained resolution.
 ///
@@ -603,6 +617,27 @@ impl PreparedCheckpointSource {
 }
 
 impl CheckpointSource for PreparedCheckpointSource {
+    fn prepare_encoded_read(
+        &self,
+        keys: &[String],
+    ) -> Result<Option<EncodedReadBatch>, StoreError> {
+        for key in keys {
+            self.expected(key)?;
+        }
+        let Some(batch) = self.source.prepare_encoded_read(keys)? else {
+            return Ok(None);
+        };
+        for metadata in batch.tensors() {
+            let expected = self.expected(&metadata.name)?;
+            if metadata != &expected.metadata || expected.provenance != bulk::provenance(metadata) {
+                return Err(StoreError::PreparedCatalogMismatch {
+                    key: metadata.name.clone(),
+                });
+            }
+        }
+        Ok(Some(batch))
+    }
+
     fn source_keys(&self) -> Vec<String> {
         self.catalog.keys().cloned().collect()
     }
@@ -692,6 +727,27 @@ impl CompositeCheckpointSource {
 }
 
 impl CheckpointSource for CompositeCheckpointSource {
+    fn prepare_encoded_read(
+        &self,
+        keys: &[String],
+    ) -> Result<Option<EncodedReadBatch>, StoreError> {
+        let mut owner = None;
+        for key in keys {
+            let current = *self
+                .owners
+                .get(key)
+                .ok_or_else(|| StoreError::UnknownTensor { key: key.clone() })?;
+            if owner.is_some_and(|previous| previous != current) {
+                return Ok(None);
+            }
+            owner = Some(current);
+        }
+        match owner {
+            Some(owner) => self.sources[owner].prepare_encoded_read(keys),
+            None => Ok(None),
+        }
+    }
+
     fn source_keys(&self) -> Vec<String> {
         self.owners.keys().cloned().collect()
     }
@@ -901,6 +957,16 @@ impl RestrictedCheckpointSource {
 }
 
 impl CheckpointSource for RestrictedCheckpointSource {
+    fn prepare_encoded_read(
+        &self,
+        keys: &[String],
+    ) -> Result<Option<EncodedReadBatch>, StoreError> {
+        for key in keys {
+            self.authorize(key)?;
+        }
+        self.source.prepare_encoded_read(keys)
+    }
+
     fn source_keys(&self) -> Vec<String> {
         self.source
             .source_keys()
@@ -998,6 +1064,18 @@ impl ResolvedCheckpointSource {
 }
 
 impl CheckpointSource for ResolvedCheckpointSource {
+    fn prepare_encoded_read(
+        &self,
+        keys: &[String],
+    ) -> Result<Option<EncodedReadBatch>, StoreError> {
+        for key in keys {
+            if !self.source.is_authoritative_materialized_key(key) {
+                self.authorize(key)?;
+            }
+        }
+        self.source.prepare_encoded_read(keys)
+    }
+
     fn source_keys(&self) -> Vec<String> {
         self.source
             .source_keys()
@@ -1415,7 +1493,7 @@ pub struct SafetensorsWeightStore {
     indexed_shards: BTreeMap<PathBuf, BTreeSet<String>>,
     admitted_files: BTreeMap<PathBuf, Arc<AdmittedFile>>,
     metadata: Mutex<BTreeMap<String, TensorMetadata>>,
-    cache: Mutex<CacheState>,
+    cache: Arc<Mutex<CacheState>>,
     read_telemetry: Arc<SafetensorsReadTelemetry>,
     max_cached_shards: usize,
 }
@@ -1478,7 +1556,7 @@ impl SafetensorsWeightStore {
                 indexed_shards,
                 admitted_files,
                 metadata: Mutex::new(BTreeMap::new()),
-                cache: Mutex::new(CacheState::default()),
+                cache: Arc::new(Mutex::new(CacheState::default())),
                 read_telemetry: Arc::new(SafetensorsReadTelemetry::default()),
                 max_cached_shards,
             });
@@ -1519,7 +1597,7 @@ impl SafetensorsWeightStore {
             indexed_shards: BTreeMap::new(),
             admitted_files,
             metadata: Mutex::new(discovered),
-            cache: Mutex::new(CacheState::default()),
+            cache: Arc::new(Mutex::new(CacheState::default())),
             read_telemetry: Arc::new(SafetensorsReadTelemetry::default()),
             max_cached_shards,
         })
@@ -1809,6 +1887,13 @@ impl WeightStore for SafetensorsWeightStore {
 }
 
 impl CheckpointSource for SafetensorsWeightStore {
+    fn prepare_encoded_read(
+        &self,
+        keys: &[String],
+    ) -> Result<Option<EncodedReadBatch>, StoreError> {
+        bulk::prepare(self, keys).map(Some)
+    }
+
     fn source_keys(&self) -> Vec<String> {
         WeightStore::keys(self)
     }
@@ -2377,7 +2462,7 @@ fn select_safetensors_bytes(
             return Err(StoreError::BoundedSelectionUnavailable {
                 key: key.into(),
                 message: "packed contiguous selection is not byte aligned".into(),
-            })
+            });
         }
         TensorSelection::Full => unreachable!(),
     };

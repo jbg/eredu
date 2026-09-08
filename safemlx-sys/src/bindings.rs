@@ -123,6 +123,16 @@ extern "C" {
     ) -> mlx_array;
 }
 extern "C" {
+    #[doc = " Allocate a zero-initialized, host-addressable array in native storage.\n The returned writable pointer is exclusively owned by the new array and must\n not be used after the array is shared or submitted. CPU and Metal only."]
+    pub fn mlx_array_new_host(
+        result: *mut mlx_array,
+        data: *mut *mut ::std::os::raw::c_void,
+        shape: *const ::std::os::raw::c_int,
+        dim: ::std::os::raw::c_int,
+        dtype: mlx_dtype,
+    ) -> ::std::os::raw::c_int;
+}
+extern "C" {
     #[doc = " New array from existing buffer.\n @param data A buffer which will be copied.\n @param shape Shape of the array.\n @param dim Number of dimensions (size of `shape`).\n @param dtype Type of array elements.\n @param dtor Callback for when the buffer is no longer needed."]
     pub fn mlx_array_new_data_managed(
         data: *mut ::std::os::raw::c_void,
