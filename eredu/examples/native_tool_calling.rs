@@ -3,14 +3,14 @@
 //! Run with a target checkpoint and, optionally, an external Gemma 4 assistant:
 //! `cargo run -p eredu --example native_tool_calling -- TARGET [DRAFTER]`.
 
+use eredu_backend_mlx::MlxBackendFactory;
 use std::{env, num::NonZeroUsize};
 
 use eredu::{
     api::{
-        default_local_device, local_device_plan, LocalBackendFactory, LocalDevice, LocalModel,
-        LocalPreparedChatGenerationRequest, LocalPreparedChatInput,
-        LocalPreparedChatSpeculativeGenerationRequest, PreparedChatGenerationSettings,
-        PreparedChatSpeculativeGenerationOptions,
+        default_local_device, local_device_plan, LoadedModel, LocalDevice,
+        PreparedChatGenerationRequest, PreparedChatGenerationSettings, PreparedChatInput,
+        PreparedChatSpeculativeGenerationOptions, PreparedChatSpeculativeGenerationRequest,
     },
     runtime::chat::{ChatTemplateRequest, NativeToolSupport, ParallelToolCallPolicy, ToolChoice},
 };
@@ -40,7 +40,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
     let planned =
-        LocalModel::load_execution_plan(&LocalBackendFactory::default(), &target_path, &plan)?;
+        LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &target_path, &plan)?;
     let (mut model, mut drafting) = planned.into_parts();
     let prepared = model.prepare_chat(ChatTemplateRequest {
         messages: vec![json!({
@@ -98,9 +98,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err("external drafting plan was not realized".into());
         }
         model
-            .generate_prepared_chat_speculative(LocalPreparedChatSpeculativeGenerationRequest {
-                input: LocalPreparedChatInput::rendered_prompt(&prepared),
-                drafting: &mut drafting,
+            .generate_prepared_chat_speculative(PreparedChatSpeculativeGenerationRequest {
+                input: PreparedChatInput::rendered_prompt(&prepared),
+                drafting: drafting
+                    .as_speculative_draft()
+                    .expect("drafting is enabled"),
                 settings,
                 options: PreparedChatSpeculativeGenerationOptions {
                     max_draft_tokens: NonZeroUsize::new(3).unwrap(),
@@ -113,8 +115,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .finish_reason()
     } else {
         model
-            .generate_prepared_chat(LocalPreparedChatGenerationRequest {
-                input: LocalPreparedChatInput::rendered_prompt(&prepared),
+            .generate_prepared_chat(PreparedChatGenerationRequest {
+                input: PreparedChatInput::rendered_prompt(&prepared),
                 settings,
                 caller_stop_sequences: &[],
                 cancellation: GenerationCancellationToken::new(),

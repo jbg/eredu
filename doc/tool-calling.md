@@ -5,7 +5,7 @@ emits protocol-neutral semantic events. Applications do not need to build a
 grammar, inspect tokenizer internals, or parse a checkpoint-specific wire
 format.
 
-The sole model-level chat-rendering entry point is `LocalModel::prepare_chat`,
+The sole model-level chat-rendering entry point is `LoadedModel::prepare_chat`,
 including for chats without tools. It renders the selected checkpoint template,
 validates the request, and returns the prompt and its generation metadata.
 Applications can encode `PreparedChat::rendered_prompt()` for raw token
@@ -58,8 +58,8 @@ different tools without sharing mutable parser state.
 Choose one cohesive generation call:
 
 - `generate_prepared_chat` for ordinary constrained generation;
-- `generate_prepared_chat_speculative` with the opaque `LocalDrafting` loaded from the
-  same execution plan; or
+- `generate_prepared_chat_speculative` with `drafting.as_speculative_draft()`
+  from the `RealizedDrafting<D>` loaded by the same execution plan; or
 - `generate_prepared_chat_speculative_batch` for independently scheduled requests.
 
 The batch API and explicit `SpeculativeDraft` variants are backend-generic
@@ -94,8 +94,8 @@ event.
 
 ```rust,ignore
 let mut events = Vec::new();
-let output = model.generate_prepared_chat(LocalPreparedChatGenerationRequest {
-    input: LocalPreparedChatInput::rendered_prompt(&prepared),
+let output = model.generate_prepared_chat(PreparedChatGenerationRequest {
+    input: PreparedChatInput::rendered_prompt(&prepared),
     settings: PreparedChatGenerationSettings::default(),
     caller_stop_sequences: &[],
     cancellation: GenerationCancellationToken::new(),

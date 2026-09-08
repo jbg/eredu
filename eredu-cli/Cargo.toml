@@ -13,7 +13,7 @@ readme = "README.md"
 
 [features]
 default = ["mlx", "metal"]
-mlx = ["eredu/mlx"]
+mlx = ["eredu/mlx", "dep:eredu-backend-mlx"]
 metal = ["mlx", "eredu/metal"]
 cuda = ["mlx", "eredu/cuda"]
 nccl = ["cuda", "eredu/nccl"]
@@ -31,6 +31,8 @@ anyhow.workspace = true
 clap.workspace = true
 hf-cache-reader = "=0.1.0"
 eredu = { workspace = true, default-features = false }
+eredu-backend-mlx = { workspace = true, optional = true }
+eredu-architectures.workspace = true
 eredu-checkpoint.workspace = true
 eredu-core.workspace = true
 eredu-runtime.workspace = true

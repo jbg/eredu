@@ -2,7 +2,7 @@
 
 `LoadedModel::capture_discovery()` returns the loaded session's retained catalog,
 selected support, bounded transformations, and exact prepared-source identity.
-The local facade exposes the same method on `LocalModel`. Cold
+MLX applications use the same generic model API. Cold
 `inspect_architecture()` remains independent of native execution.
 
 1. Prepare a chat using the loaded model's ordinary `prepare_chat` API.
@@ -139,7 +139,7 @@ Consumer panic uses ordinary Rust unwinding and the same generator drop path.
 Successful cancellation preserves the ordinary model state at the last completed
 forward boundary; the run's sampler, decoder, and capture ledger are dropped.
 It does not produce a resumable snapshot. Use the ordinary session reset before
-an independent prompt (`LocalModel::reset` for the local facade).
+an independent prompt (`LoadedModel::reset` for MLX).
 Captured host data from a failed attempt can appear in a `CaptureFailure` event,
 followed by `Failed`; it is never attributed to a committed token. Reuse follows
 the existing backend state-preservation/reset contract, including proven rollback.

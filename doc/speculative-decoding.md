@@ -69,13 +69,12 @@ The prepared-chat client surface is backend-generic. A backend implements
 `SpeculativeGenerationBackend`, supplies its own associated drafter type and
 typed execution-resource visitor handoff, and then uses the same
 `LoadedModel<B>::generate_prepared_chat_speculative` and batch APIs.
-Applications using the selected backend instead receive an opaque
-`LocalDrafting` alongside `LocalModel` and call
-`LocalModel::generate_prepared_chat_speculative`; neither the native drafter
-nor its error type crosses the facade. `SpeculativeCapability` and
-`SpeculativeDraftSource` are portable core values; absence of the capability
-implementation fails at the type boundary rather than silently falling back to
-ordinary generation.
+Applications receive `RealizedDrafting<D>` alongside `LoadedModel<B>` and pass
+`drafting.as_speculative_draft()` to `generate_prepared_chat_speculative`.
+MLX uses the same generic types, with the factory supplying its native drafter.
+`SpeculativeCapability` and `SpeculativeDraftSource` are portable core values;
+absence of the capability implementation fails at the type boundary rather
+than silently falling back to ordinary generation.
 
 ## Execution placement
 

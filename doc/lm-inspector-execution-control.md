@@ -2,12 +2,12 @@
 
 Keep native models and sessions on one owning worker. Send pause/cancel requests
 through `GenerationControlHandle`; send step, resume, snapshot, restore and branch
-commands to that worker. The session exclusively borrows its `LocalModel`, and
+commands to that worker. The session exclusively borrows its `LoadedModel`, and
 native handles do not need to become `Send` or `Sync`.
 
-Use `eredu::api::LocalModel` with the selected backend features. Backend-generic
-consumers use `LoadedModel<B>` and the same control API. The complete runnable
-example is:
+Use `eredu::api::LoadedModel<B>` with your backend factory. MLX applications
+use `eredu_backend_mlx::MlxBackendFactory` with the same control API. The complete
+runnable example is:
 
 ```sh
 cargo run -p eredu --no-default-features --features mlx \
@@ -29,12 +29,12 @@ request. `CapturePlan::none()` selects ordinary delivery. Pass the result to
 `start_controlled_chat(prepared, stops, control, callback)`.
 
 For an unrecognized template, explicitly select
-`start_controlled_text(prepared, stops, control, callback)`. Both `LoadedModel<B>`
-and `LocalModel` expose it with the same arguments and session return type as their
-chat entry point. `start_controlled_chat` remains strict.
+`start_controlled_text(prepared, stops, control, callback)`. `LoadedModel<B>`
+exposes it with the same arguments and session return type as its chat entry
+point. `start_controlled_chat` remains strict.
 
 ```rust
-// model: LocalModel (the same selection works with LoadedModel<B>)
+// model: LoadedModel<B>
 let chat = model.prepare_chat(request)?;
 let semantic = matches!(chat.semantic_support(), SemanticSupport::Supported);
 // A UI can show chat.text_generation_support().unsupported_reason() before starting.
@@ -117,7 +117,7 @@ Index records by `generation.run_id`, `sequence` and `epoch`. Sequences increase
 through the run's entire journal; a restore increases epoch and never refunds
 transport, capture or copying consumption.
 
-1. Save the `LocalGenerationSnapshot` handle and its serializable metadata.
+1. Save the `ControlledGenerationSnapshot<B>` handle and its serializable metadata.
 2. A snapshot's `output.next_prediction` is the next absolute decision. The most
    recently committed token may still be pending decode input; do not feed it again.
 3. On `Restored { output, ... }`, restore the view represented by the original

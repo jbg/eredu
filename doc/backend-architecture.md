@@ -154,7 +154,7 @@ non-resettable resource limits are established. Built-in semantic parsers have
 explicit logical storage estimates; opaque active llguidance state remains
 unsupported until it supplies complete costs. Snapshot/restore pairs native state
 with exact cursor/parser/decoder state and a versioned consumer output checkpoint.
-The selected `LocalModel` adapter wraps these controls and snapshots without
+The generic `LoadedModel<B>` exposes these controls and snapshots without
 exposing native handles or duplicating their policy. Reusable host/native continuation
 checks live in `eredu-evaluation::execution_control`, used only as validation
 tooling, with native forward/reload probes and source-preserving copy failures.
@@ -165,7 +165,7 @@ native and shared capture adapters never reconstruct that output. Branch exchang
 moves lifecycle, cancellation, semantic buffers and transport accounting together.
 Opaque core driver identity prevents a later run on the same loaded executable
 from importing an old branch tree. Shared capture admission and native completion
-ownership remain unchanged by the selected facade wrappers.
+ownership remain in the neutral control API for every backend.
 
 This guide defines the boundary between the portable language-model runtime
 and an execution backend. It is intended for backend authors and maintainers of
@@ -241,23 +241,21 @@ features; a concrete backend feature adds only native conversion. Backend featur
 name the active public spelling; published Cargo features are selectable API,
 not a privacy mechanism.
 
-The facade root exposes only the `api` and `runtime` namespaces. The `api`
-namespace exposes facade-owned operations and the opaque selected-backend
-adapter. `LocalBackendFactory`, `LocalModel`,
-`LocalPlannedModel`, `LocalDrafting`, `LocalPrompt`, and local generation
-iterators are facade-owned wrappers with private backend state. The selected
-factory does not implement the public neutral factory traits, and the facade
-does not name or alias the concrete backend, session, prompt, drafter, token,
-completion, or error types in its public selected API. The implementation crate
-exports composition-owned adapter factories at its flat root and deliberately
-makes its reusable `backend` module tree public for backend authors. Family
-composition and architecture-erased dispatch remain crate-private. Raw native
-binding APIs retain their canonical `safemlx` paths rather than being
-re-exported by the implementation crate. Native
-facade integration tests realize execution plans through facade-owned methods;
-tests that require backend facilities live in `eredu-backend-mlx`, while facade
-sampling-policy tests use neutral sampling traits and mock backends. Direct
-backend consumers import neutral contracts from their owning crates.
+The facade root exposes the `api` and `runtime` namespaces. `LoadedModel<B>`,
+`PlannedModel<B, D>`, prepared-chat requests, and controlled generation sessions,
+snapshots, and branches are the canonical application API for every backend.
+Applications select MLX by importing `eredu_backend_mlx::MlxBackendFactory` and
+passing it to the generic loading methods; inference supplies the backend type.
+Explicit model annotations use `LoadedModel<MlxBackend<'static>>`. The facade
+provides no wrappers or aliases that fix these generic types to MLX. Backend
+errors retain their concrete type in the generic facade error enums.
+
+The implementation crate exports composition-owned adapter factories at its
+flat root and makes its reusable `backend` module tree public for backend
+authors. Family composition and architecture-erased dispatch remain
+crate-private. Raw native binding APIs retain their canonical `safemlx` paths.
+Native facade integration tests use the same generic model and control APIs
+as portable conformance tests, which use neutral traits and mock backends.
 
 The facade does not re-export dependency-owned types. Architecture identities
 and preparation plans come from `eredu-architectures`; artifact, execution,
@@ -269,29 +267,22 @@ canonical import path and prevents a facade release from committing to aliases
 for operations it does not own. In particular, the facade exposes no
 prompt-cache types because it exposes no prompt-cache operation.
 
-The selected adapter exposes only facade-owned causal and realtime model,
-planning, drafting, scheduler, completed-step, and error wrappers. The realtime
-factory loads an architecture-owned preparation directly into the facade model.
-The facade submits portable input frames to the neutral runtime scheduler and
-receives portable output frames only after the runtime-owned transition has
-completed and committed. Concrete mechanism types and handle-oriented
-constructors remain private.
-Explicit native sessions and token handles remain backend-author concerns;
-streams and distributed collective groups come directly from `safemlx`.
+Realtime applications use `PreparedRealtimeModel<M>`,
+`RealtimeSessionScheduler`, and `ReleasedRealtimeSession` directly. The MLX
+`create_realtime_execution` helper realizes an architecture-owned preparation
+and returns the native context and execution mechanism. The generic model
+retains the selected session identity; runtime scheduling retains admission,
+transaction, completion, and host-publication policy.
 
-Application targets depend on `eredu` for facade operations and directly on
-the neutral crates whose public values they construct. Infrastructure-aware
-clients such as the CLI likewise import low-level policies from their owning
-crates. The
-selected-local-backend API owns device-plan creation, process runtime
-configuration, allocator telemetry, and diagnostic benchmarks, while
-`LocalModel::synchronize` is the sole application-facing synchronization entry
-point. These APIs do not expose native tensors, streams, devices, or random
-state. Direct native binding access remains an explicit backend-author concern
-through `safemlx`; native session adapters remain in the implementation crate.
-Those adapters own native resources and outer type erasure, while shared
+Application targets depend on `eredu` for facade operations, their selected
+backend for factories, and the neutral crates whose public values they
+construct. Backend dependencies remain feature-gated. The MLX facade helpers
+provide device-plan creation, process runtime configuration, allocator
+telemetry, and diagnostic benchmarks. MLX-specific reset, synchronization, and
+telemetry methods operate directly on `LoadedModel<MlxBackend<'_>>`.
+Backend adapters own native resources and outer type erasure, while shared
 replicated-text execution and stateful lifecycle orchestration remain in the
-neutral runtime. Neither surface is an application dependency.
+neutral runtime.
 `LocalLoadOptions` and `LocalInspectionOptions` contain only neutral
 quantization, residency, and session-capability policy, while native
 device-bound contexts are selected only by backend tooling. `LocalBackendError`
@@ -2107,18 +2098,17 @@ consumes a `PreparedModel`, so an executable cannot be paired with state or
 session mechanisms created by another backend. Replicated prepared models
 already contain the neutral lifecycle paired with their concrete mechanisms.
 
-`ModelRuntime<B>` owns a backend and its sole session. Backend-generic clients
-use `eredu::api::LoadedModel<B>`, whose runtime remains private while portable
-model operations stay generic. Applications using the selected local backend
-use `eredu::api::LocalModel`, which also erases the backend parameter and maps
-native loading and generation failures into `LocalBackendError`.
+`ModelRuntime<B>` owns a backend and its sole session. All facade clients use
+`eredu::api::LoadedModel<B>`, whose runtime remains private while portable model
+operations stay generic. Loading and generation failures retain `B::Error` in
+their generic error types.
 
 Automatic planning produces a portable `ExecutionPlan`. An
 `ExecutionPlanBackendFactory` realizes the complete plan into a target backend,
 backend load options, and the selected disabled, embedded, or external drafting
-configuration. `LocalModel::load_execution_plan` and `LocalModel::plan_and_load`
-therefore do not require callers to construct or name backend devices, queues,
-streams, assistant models, sessions, or errors. Concrete device families are
+configuration. `LoadedModel::load_execution_plan` and `LoadedModel::plan_and_load`
+therefore infer the backend from its factory without requiring callers to
+construct backend devices, queues, streams, assistant models, or sessions. Concrete device families are
 validated against the backend features and runtime hardware during realization.
 The backend reports the canonical identity derived from that realized device
 binding rather than echoing the plan's requested identifier.
@@ -2157,8 +2147,8 @@ the selected local backend and rejects accelerator choices when that
 build contains no native accelerator family. `LocalRuntimeConfiguration`
 applies any process-global allocator or embedded accelerator-library
 configuration before the factory realizes that plan. Platform applications
-therefore do not need a concrete backend crate merely to create and complete a
-model session.
+import the concrete backend factory and use the generic facade to load and
+operate the session.
 
 Architecture inspection reports both embedded-draft depth and maximum proposal
 capacity from the normalized, admitted artifact composition in
@@ -2995,8 +2985,9 @@ A new backend should:
 11. run the reusable backend and architecture conformance suites.
 
 Facade selection is an upward dependency on the backend's adapter, not
-ownership of concrete composition: the facade may select and opaquely wrap the
-adapter, while the backend must not depend on facade APIs or orchestration.
+ownership of concrete composition: the facade composes generic model and request
+APIs with the adapter, while the backend must not depend on facade APIs or
+orchestration.
 Concrete binding consumes architecture-owned declarations and does not take
 ownership of model-family configuration, checkpoint naming, execution
 equations, or state geometry.

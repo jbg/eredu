@@ -25,18 +25,10 @@ pub mod runtime;
 
 // Internal bindings keep implementation paths concise without adding public
 // aliases for contracts owned by dependency crates.
-#[cfg(feature = "mlx")]
-use eredu_architectures::moshi::RealtimePreparationPlan;
 #[cfg(test)]
 use eredu_architectures::{GgufArchitecture, ModelKind};
 #[cfg(feature = "mlx")]
-use eredu_core::scheduler::{
-    RequestId, RequestStatus, SchedulerCapabilities, SchedulerLimits, SchedulerReport, WorkId,
-};
-#[cfg(feature = "mlx")]
 use eredu_core::{
-    AllocatorTelemetry, AutomaticPlanRequest, AutomaticPlanner, AutomaticPlanningError, DevicePlan,
-    ExecutionPlan, ExecutionPlanReport, ExpertCacheTelemetry, ModelInspectionReport,
-    QuantizationRequest, RealtimeInputFrame, RealtimeOutputFrame, RealtimeSampling,
-    RealtimeSpeechConfig, ResidencyTelemetry, SessionCapabilities,
+    AllocatorTelemetry, AutomaticPlanningError, DevicePlan, ExecutionPlan, ExpertCacheTelemetry,
+    ModelInspectionReport, QuantizationRequest, ResidencyTelemetry, SessionCapabilities,
 };

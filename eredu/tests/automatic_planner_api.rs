@@ -1,4 +1,5 @@
-use eredu::api::{LocalBackendFactory, LocalInspectionOptions};
+use eredu::api::LocalInspectionOptions;
+use eredu_backend_mlx::MlxBackendFactory;
 use eredu_core::{AutomaticPlanRequest, DevicePlan, ExecutionPlan};
 
 #[test]
@@ -11,7 +12,7 @@ fn portable_planner_inputs_round_trip_and_build_inspection_options() {
 
     let plan = ExecutionPlan::fully_resident(device);
     let options =
-        LocalInspectionOptions::for_execution_plan(&LocalBackendFactory::default(), &plan).unwrap();
+        LocalInspectionOptions::for_execution_plan(&MlxBackendFactory::default(), &plan).unwrap();
     assert_eq!(
         options.load().drafting(),
         eredu_runtime::DraftingLoadRequest::Disabled

@@ -29,20 +29,21 @@ crates; the facade does not duplicate those types at its root or under `api`.
 
 ## Loading a model
 
-`LocalModel` owns one selected backend session together with tokenizer, EOS,
-generation-default, and chat-template metadata. Its backend, session, prompts,
-token handles, drafting resources, and native errors remain private:
+`LoadedModel<B>` is the canonical model API. It owns one backend session with
+tokenizer, EOS, generation-default, and chat-template metadata. Pass a concrete
+backend factory to infer `B`; the same API also works with mock backends:
 
 ```rust,no_run
 # #[cfg(feature = "mlx")]
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
-use eredu::api::{default_local_device, local_device_plan, LocalBackendFactory, LocalModel};
+use eredu::api::{default_local_device, local_device_plan, LoadedModel};
 use eredu_core::ExecutionPlan;
+use eredu_backend_mlx::MlxBackendFactory;
 
 let device = local_device_plan(default_local_device())?;
 let plan = ExecutionPlan::fully_resident(device);
-let factory = LocalBackendFactory::default();
-let planned = LocalModel::load_execution_plan(&factory, "/path/to/model", &plan)?;
+let factory = MlxBackendFactory::default();
+let planned = LoadedModel::load_execution_plan(&factory, "/path/to/model", &plan)?;
 let (mut model, drafting) = planned.into_parts();
 # Ok::<(), Box<dyn std::error::Error>>(())
 # }
@@ -57,24 +58,25 @@ needs an explicit device.
 
 Model-family architecture modules remain owned by `eredu-architectures`.
 Reusable MLX tensors, operators, caches, streams, and family composition live
-in `eredu-backend-mlx`. Application clients use the flat selected-local-backend
-adapter in `eredu::api`; backend implementers and backend-specific tooling
-import the implementation crate directly.
+in `eredu-backend-mlx`. Application clients import the backend factory from that
+crate and use the generic facade types in `eredu::api`.
 
-Use `LocalModel::load_execution_plan` or `LocalModel::plan_and_load` when the
-application wants portable plan-to-backend realization. These entry points
-construct the selected backend and any embedded or external speculative
-drafter described by the plan. Backend implementers can use the separate
-generic `LoadedModel<B>` API with a backend imported from its owning crate.
+Use `LoadedModel::load_execution_plan` or `LoadedModel::plan_and_load` for
+portable plan-to-backend realization. These entry points return
+`PlannedModel<B, D>`, which owns the target and `RealizedDrafting<D>`. Automatic
+planning can retain its artifact inspection for
+`LoadedModel::load_inspected_execution_plan`. Prepared-chat requests, controlled
+generation sessions, snapshots, and branches keep their backend parameter too.
+Low-level token generation returns `B::Token`; use `eredu_core::TokenOutput` to
+obtain its vocabulary ID.
 
-Realtime speech models use the selected facade's concrete application API.
-`eredu_architectures::moshi::prepare_realtime_model` inspects the artifact,
-`LocalRealtimeBackendFactory` loads it, and `LocalRealtimeScheduler` accepts
-and returns `eredu_core` host token frames. Native backend traits, streams,
-tensors, sessions, and completions stay behind the facade. The
-realtime factory's default uses `default_local_device`, matching ordinary local
-model loading; construct it with an explicit `LocalDevice` to override that
-choice.
+Realtime speech uses `eredu::api::realtime::PreparedRealtimeModel<M>` and
+`eredu_runtime::RealtimeSessionScheduler`. For MLX,
+`eredu_backend_mlx::create_realtime_execution` loads an architecture-prepared
+model and returns its context and execution mechanism. The runtime scheduler
+accepts portable host frames and commits completed transitions before host
+output is delivered. Released sessions use the generic `ReleasedRealtimeSession`
+type.
 
 ## Cargo features
 

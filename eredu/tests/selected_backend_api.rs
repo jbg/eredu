@@ -3,14 +3,13 @@ use eredu::api::realtime::{
     SessionCapabilities,
 };
 use eredu::api::{
-    inspect_local_model, LocalBackendError, LocalBackendFactory, LocalDevice,
-    LocalInspectionOptions, LocalLoadOptions, LocalRealtimeBackendFactory, LocalRealtimeModel,
-    LocalRealtimeScheduler,
+    inspect_local_model, LocalBackendError, LocalInspectionOptions, LocalLoadOptions,
 };
+use eredu_backend_mlx::{backend::MlxBackend, MlxBackendFactory};
 use eredu_core::{DevicePlan, ExecutionPlan, QuantizationRequest};
 
 fn operate_selected_text_control(
-    model: &mut eredu::api::LocalModel,
+    model: &mut eredu::api::LoadedModel<MlxBackend<'static>>,
     request: eredu::api::PreparedObservedGeneration,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use eredu_core::execution_control::{GenerationControlHandle, SnapshotLimits};
@@ -25,7 +24,7 @@ fn operate_selected_text_control(
         retained_bytes: 128 << 20,
         cumulative_copy_bytes: 256 << 20,
     })?;
-    let snapshot: eredu::api::LocalGenerationSnapshot =
+    let snapshot: eredu::api::ControlledGenerationSnapshot<MlxBackend<'static>> =
         run.snapshot(|_| ControlFlow::Continue(()))?;
     run.step(|_| ControlFlow::Continue(()))?;
     run.pause(|_| ControlFlow::Continue(()))?;
@@ -52,9 +51,9 @@ fn operate_selected_text_control(
 
 #[test]
 #[allow(clippy::type_complexity)]
-fn selected_text_control_keeps_native_types_out_of_application_code() {
+fn mlx_text_control_uses_generic_model_and_snapshot_types() {
     let _: fn(
-        &mut eredu::api::LocalModel,
+        &mut eredu::api::LoadedModel<MlxBackend<'static>>,
         eredu::api::PreparedObservedGeneration,
     ) -> Result<(), Box<dyn std::error::Error>> = operate_selected_text_control;
 }
@@ -63,30 +62,63 @@ fn operate_selected_realtime_backend(
     preparation: RealtimePreparationPlan,
     frame: RealtimeInputFrame,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let factory = LocalRealtimeBackendFactory::new(LocalDevice::Cpu);
-    let mut model = factory.load(preparation)?;
-    assert_eq!(model.backend_name(), "mlx");
-    let _ = model.speech_config();
-
-    let mut scheduler = LocalRealtimeScheduler::new(&model, SchedulerLimits::new(1, 4)?)?;
+    let device = DevicePlan::new("mlx", "cpu:0")?;
+    let (backend, execution) = eredu_backend_mlx::create_realtime_execution(
+        preparation,
+        &device,
+        eredu_backend_mlx::MlxLoadRequest::default(),
+    )?;
+    let selected = execution.selected().clone();
+    let mut model = eredu::api::realtime::PreparedRealtimeModel::new(
+        execution,
+        &selected,
+        SessionCapabilities::new(true, true, false),
+    );
+    let schedule = model.session_identity().schedule().clone();
+    let mut scheduler = eredu_runtime::RealtimeSessionScheduler::new(
+        model.session_identity().clone(),
+        SchedulerLimits::new(1, 4)?,
+    )?;
+    let sampling = RealtimeSampling::greedy();
+    let samplers = eredu_architectures::moshi::realtime_generation_samplers(&schedule, sampling)?;
+    let state = eredu_runtime::RealtimePayloadState::fresh(
+        backend.new_realtime_model_state(model.mechanism())?,
+        schedule.clone(),
+    );
+    let generation = eredu_runtime::RealtimeGenerationState::new(
+        state,
+        schedule,
+        sampling,
+        samplers,
+        backend.realize_random_state(None)?,
+    )?;
     let request = RequestId::new(7);
-    scheduler.register_request(&model, request, RealtimeSampling::greedy())?;
-    let _ = scheduler.enqueue(&model, request, frame)?;
-    for completed in scheduler.run_bounded(&mut model, 1)? {
-        let (_work, output) = completed.into_parts();
+    scheduler.register(request, generation)?;
+    scheduler.enqueue(request, frame)?;
+    let progress =
+        scheduler.run_local_bounded(std::time::Instant::now(), 1, |_, frame, branch| {
+            backend.submit_realtime_frame(model.mechanism_mut(), frame, branch)
+        })?;
+    if let Some((_, failure)) = progress.failed.first() {
+        return Err(failure.to_string().into());
+    }
+    for (_, _, transition) in progress.committed {
+        let output = transition.into_host_output()?;
         let _ = output.text_tokens();
     }
-    scheduler.finish_request(request)?;
+    let session = scheduler.release(request)?;
+    let _ = session.committed_batch();
+    scheduler.resume(request, session)?;
+    scheduler.finish(request)?;
     Ok(())
 }
 
 #[test]
-fn facade_exposes_complete_selected_realtime_operations() {
+fn mlx_realtime_uses_generic_model_scheduler_and_session_types() {
     let _: fn(
         RealtimePreparationPlan,
         RealtimeInputFrame,
     ) -> Result<(), Box<dyn std::error::Error>> = operate_selected_realtime_backend;
-    let _ = std::mem::size_of::<LocalRealtimeModel>();
 }
 
 #[test]
@@ -104,7 +136,7 @@ fn selected_load_policy_is_facade_owned_and_portable() {
 
     let plan = ExecutionPlan::fully_resident(DevicePlan::new("mlx", "cpu:0").unwrap());
     let planned =
-        LocalInspectionOptions::for_execution_plan(&LocalBackendFactory::default(), &plan).unwrap();
+        LocalInspectionOptions::for_execution_plan(&MlxBackendFactory::default(), &plan).unwrap();
     assert_eq!(
         planned.load().drafting(),
         eredu_runtime::DraftingLoadRequest::Disabled

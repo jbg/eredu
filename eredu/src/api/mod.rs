@@ -1,9 +1,9 @@
 //! Backend-neutral language-model facade.
 //!
 //! This module is available without an execution backend. Enabling the
-//! `mlx` feature adds the selected local execution adapter. The `metal`,
-//! `cuda`, `image`, and `audio` features only configure that adapter when it is
-//! selected.
+//! `mlx` feature adds MLX runtime and diagnostic helpers. Models, requests,
+//! generation controls, and realtime mechanisms retain their generic parameters;
+//! import a concrete backend factory from its owning crate to select execution.
 //!
 //! Backend implementation traits and their errors are imported from
 //! `eredu-core`, not this facade namespace.
@@ -14,13 +14,6 @@ mod portable;
 pub mod realtime;
 mod request;
 mod tokenizer;
-
-#[cfg(feature = "mlx")]
-use crate::runtime::chat::PreparedChat;
-#[cfg(feature = "mlx")]
-use eredu_architectures::ModelKind;
-#[cfg(feature = "mlx")]
-use eredu_text::tokenizer::Tokenizer as ChatTokenizer;
 
 #[cfg(feature = "mlx")]
 mod selected;

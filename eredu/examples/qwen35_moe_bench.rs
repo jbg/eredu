@@ -1,9 +1,10 @@
 use std::{path::PathBuf, time::Instant};
 
 use eredu::api::{
-    default_local_device, local_device_plan, reset_local_allocator_peak, LocalBackendFactory,
-    LocalModel,
+    default_local_device, local_device_plan, reset_local_allocator_peak, LoadedModel,
 };
+use eredu_backend_mlx::{backend::MlxBackend, MlxBackendFactory};
+use eredu_core::TokenOutput as _;
 use eredu_core::{
     ExecutionPlan, GenerationConfigOverrides, TextGenerationConfig, WeightTransformationPlan,
 };
@@ -51,7 +52,7 @@ fn main() -> anyhow::Result<()> {
     reset_local_allocator_peak()?;
     let load_start = Instant::now();
     let planned =
-        LocalModel::load_execution_plan(&LocalBackendFactory::default(), &model_dir, &plan)?;
+        LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &model_dir, &plan)?;
     let (mut model, _) = planned.into_parts();
     model.synchronize()?;
     let load_elapsed = load_start.elapsed();
@@ -114,7 +115,7 @@ struct BenchResult {
 }
 
 fn run_case(
-    model: &mut LocalModel,
+    model: &mut LoadedModel<MlxBackend<'_>>,
     prompt: &str,
     decode_tokens: usize,
 ) -> anyhow::Result<BenchResult> {
@@ -132,7 +133,7 @@ fn run_case(
     let Some(first) = generator.next() else {
         anyhow::bail!("generator produced no tokens");
     };
-    let first = first?;
+    let first = first?.token_id()?;
     let prefill_s = prefill_start.elapsed().as_secs_f64();
     ids.push(first);
 
@@ -141,7 +142,7 @@ fn run_case(
         let Some(token) = generator.next() else {
             break;
         };
-        ids.push(token?);
+        ids.push(token?.token_id()?);
     }
     let decode_s = decode_start.elapsed().as_secs_f64();
     let decode_count = ids.len().saturating_sub(1);
@@ -165,7 +166,10 @@ fn run_case(
     })
 }
 
-fn prompt_near_token_count(model: &mut LocalModel, target_tokens: usize) -> anyhow::Result<String> {
+fn prompt_near_token_count(
+    model: &mut LoadedModel<MlxBackend<'_>>,
+    target_tokens: usize,
+) -> anyhow::Result<String> {
     let base = "Discuss hybrid linear attention, sparse mixture-of-experts routing, recurrent cache updates, grouped convolution, and vocabulary projection in a text generation runtime. ";
     let mut prompt = "Summarize linear attention performance.".to_string();
     while model.encode(&prompt, false)?.len() < target_tokens {

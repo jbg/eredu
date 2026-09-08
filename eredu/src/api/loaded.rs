@@ -524,7 +524,8 @@ where
         Self::load_inspected_execution_plan(factory, inspection, plan)
     }
 
-    pub(crate) fn load_inspected_execution_plan<F>(
+    /// Realizes a plan using the exact artifact inspection retained by the planner.
+    pub fn load_inspected_execution_plan<F>(
         factory: &F,
         mut inspection: eredu_core::ArtifactInspection<
             eredu_architectures::processor_plan::ArtifactArchitecturePlan,

@@ -114,8 +114,11 @@ users explicitly select native execution support. Enable `image` or `audio`
 for the corresponding processor support. Neutral codec constructors use the
 base generic checkpoint and parameter-materialization mechanisms.
 
-Application clients should use portable `ExecutionPlan`, `LocalLoadOptions`,
-and `LocalInspectionOptions` values through `eredu::api`. Backend tooling may
+Application clients pass `eredu_core::ExecutionPlan` and this crate's
+`MlxBackendFactory` to `eredu::api::LoadedModel::load_execution_plan`. Models,
+requests, and controls retain their backend parameters. `LocalLoadOptions` and
+`LocalInspectionOptions` in `eredu::api` provide portable inspection policy.
+Backend tooling may
 instead pass a checked neutral `ParallelRankTopology` and a process-local
 `native::DeviceAssignment` through the root `MlxLoadRequest` adapter. Selection
 projects the architecture's exact groups and routes into an opaque manifest

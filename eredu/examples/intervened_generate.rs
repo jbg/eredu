@@ -1,9 +1,9 @@
 //! Baseline/reset/modified experiment through the ordinary facade generator.
 use eredu::api::{
-    local_device_plan, LocalBackendFactory, LocalDevice, LocalModel,
-    PreparedChatGenerationSettings, TraceLimits,
+    local_device_plan, LoadedModel, LocalDevice, PreparedChatGenerationSettings, TraceLimits,
 };
 use eredu::runtime::chat::ChatTemplateRequest;
+use eredu_backend_mlx::MlxBackendFactory;
 use eredu_core::{
     capture::*, intervention::*, ExecutionPlan, GenerationConfigOverrides,
     ObservationSupportStatus, SessionCapabilities,
@@ -30,7 +30,7 @@ fn main() -> anyhow::Result<()> {
     let execution = ExecutionPlan::fully_resident(local_device_plan(LocalDevice::Cpu)?)
         .with_required_session_capabilities(SessionCapabilities::new(true, true, true));
     let (mut model, _) =
-        LocalModel::load_execution_plan(&LocalBackendFactory::default(), path, &execution)?
+        LoadedModel::load_execution_plan(&MlxBackendFactory::default(), path, &execution)?
             .into_parts();
     let discovery = model.intervention_discovery()?;
     eprintln!("{}", serde_json::to_string_pretty(&discovery)?);

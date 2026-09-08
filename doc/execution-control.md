@@ -211,9 +211,9 @@ positions remain absolute; subtract the parent snapshot's next prediction for a
 branch-local decision index. Existing capture values remain before-intervention
 observations; intervention evidence retains its existing before/after meaning.
 
-`LocalModel::start_controlled_chat` exposes the same behavior through opaque
-`LocalControlledGenerationSession`, `LocalGenerationSnapshot` and
-`LocalGenerationBranch` wrappers. Applications need no native backend type.
+`LoadedModel<B>::start_controlled_chat` returns `ControlledGenerationSession<B>`;
+snapshots and branches use `ControlledGenerationSnapshot<B>` and
+`ControlledGenerationBranch<B>`. These generic types are also the MLX application API.
 
 `force_next_token(id)` validates canonical vocabulary membership and the current
 grammar, then restricts the ordinary sampler to that one candidate. It commits

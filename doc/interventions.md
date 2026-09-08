@@ -1,7 +1,7 @@
 # Prospective intervention plans
 
-`LoadedModel::intervention_discovery()` and `LocalModel::intervention_discovery()`
-return versioned mutable targets for the actual loaded session. These are separate
+`LoadedModel::intervention_discovery()`
+returns versioned mutable targets for the actual loaded session. These are separate
 from architecture nodes and read-only observations. Each target joins an existing
 node identity, declares an execution stage, semantic axes, exact supported dtypes,
 operations, and prefill/decode support. Unverified, conditional, and unsupported

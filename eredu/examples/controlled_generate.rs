@@ -1,12 +1,13 @@
 //! Complete local facade workflow; bounded JSONL records go to stdout.
 use eredu::{
     api::{
-        local_device_plan, ControlledGenerationRecord, GenerationBranchOptions,
-        LocalBackendFactory, LocalDevice, LocalModel, ObservedGenerationEvent,
-        PreparedChatGenerationSettings, SamplingOverride, TraceLimits,
+        local_device_plan, ControlledGenerationRecord, GenerationBranchOptions, LoadedModel,
+        LocalDevice, ObservedGenerationEvent, PreparedChatGenerationSettings, SamplingOverride,
+        TraceLimits,
     },
     runtime::chat::{ChatTemplateRequest, ToolChoice},
 };
+use eredu_backend_mlx::MlxBackendFactory;
 use eredu_core::{
     capture::*, execution_control::*, intervention::*, ExecutionPlan, GenerationConfigOverrides,
     ObservationSupportStatus, SemanticEvent, SessionCapabilities,
@@ -57,7 +58,7 @@ pub fn run_example(
     let execution = ExecutionPlan::fully_resident(local_device_plan(LocalDevice::Cpu)?)
         .with_required_session_capabilities(SessionCapabilities::new(true, true, true));
     let (mut model, _) =
-        LocalModel::load_execution_plan(&LocalBackendFactory::default(), artifact, &execution)?
+        LoadedModel::load_execution_plan(&MlxBackendFactory::default(), artifact, &execution)?
             .into_parts();
     let discovery = model.intervention_discovery()?;
     let target = discovery

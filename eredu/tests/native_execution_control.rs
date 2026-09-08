@@ -3,6 +3,8 @@ use eredu::{
     api::*,
     runtime::chat::{ChatTemplateRequest, ToolChoice},
 };
+use eredu_backend_mlx::MlxBackendFactory;
+use eredu_core::TokenOutput as _;
 use eredu_core::{
     capture::*, execution_control::*, ExecutionPlan, GenerationConfigOverrides, SemanticEvent,
     SessionCapabilities,
@@ -172,7 +174,7 @@ fn native_facade(device: LocalDevice, text: bool) {
     let execution = ExecutionPlan::fully_resident(local_device_plan(device).unwrap())
         .with_required_session_capabilities(SessionCapabilities::new(true, true, true));
     let (mut model, _) =
-        LocalModel::load_execution_plan(&LocalBackendFactory::default(), &root.0, &execution)
+        LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &root.0, &execution)
             .unwrap()
             .into_parts();
     let chat = model
@@ -313,7 +315,7 @@ fn native_text_matches_ordinary_sampling_with_checkpoint_defaults_and_padded_log
     std::fs::write(root.0.join("chat_template.jinja"), "{% for m in messages %}{{ m.content }}{% endfor %}{% if add_generation_prompt %} word3 word7{% endif %}").unwrap();
     let execution = ExecutionPlan::fully_resident(local_device_plan(LocalDevice::Cpu).unwrap());
     let (mut model, _) =
-        LocalModel::load_execution_plan(&LocalBackendFactory::default(), &root.0, &execution)
+        LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &root.0, &execution)
             .unwrap()
             .into_parts();
     for temperature in [0.0, 1.7] {
@@ -353,7 +355,7 @@ fn native_text_matches_ordinary_sampling_with_checkpoint_defaults_and_padded_log
             )
             .unwrap()
             .take(12)
-            .map(Result::unwrap)
+            .map(|token| token.unwrap().token_id().unwrap())
             .collect();
         assert!(baseline.iter().all(|id| *id < 32));
         model.reset().unwrap();

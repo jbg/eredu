@@ -975,6 +975,11 @@ pub enum RealizedDrafting<D> {
 }
 
 impl<D> RealizedDrafting<D> {
+    /// Returns whether speculative execution is enabled.
+    pub const fn is_enabled(&self) -> bool {
+        !matches!(self, Self::Disabled)
+    }
+
     /// Borrows the request-level draft selection when speculative execution is enabled.
     pub fn as_speculative_draft(&mut self) -> Option<SpeculativeDraft<'_, D>> {
         match self {

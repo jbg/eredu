@@ -6,12 +6,14 @@ use std::{
 
 use eredu::{
     api::{
-        default_local_device, local_device_plan, LocalBackendFactory, LocalModel,
-        LocalPreparedChatInput, LocalPreparedChatSpeculativeGenerationRequest,
-        PreparedChatGenerationSettings, PreparedChatSpeculativeGenerationOptions,
+        default_local_device, local_device_plan, LoadedModel, PreparedChatGenerationSettings,
+        PreparedChatInput, PreparedChatSpeculativeGenerationOptions,
+        PreparedChatSpeculativeGenerationRequest,
     },
     runtime::chat::{ChatTemplateRequest, PreparedChat},
 };
+use eredu_backend_mlx::MlxBackendFactory;
+use eredu_core::TokenOutput as _;
 use eredu_core::{
     DraftPlacementPlan, DraftingPlan, ExecutionPlan, GenerationCancellationToken,
     GenerationConfigOverrides, TextGenerationConfig,
@@ -80,7 +82,7 @@ struct GenerationResult {
 fn prepare_prompt(target_dir: &PathBuf, prompt: &str) -> anyhow::Result<PreparedChat> {
     let plan = ExecutionPlan::fully_resident(local_device_plan(default_local_device())?);
     let planned =
-        LocalModel::load_execution_plan(&LocalBackendFactory::default(), target_dir, &plan)?;
+        LoadedModel::load_execution_plan(&MlxBackendFactory::default(), target_dir, &plan)?;
     let (mut loaded, _) = planned.into_parts();
     loaded
         .prepare_chat(ChatTemplateRequest {
@@ -101,7 +103,7 @@ fn run_greedy(
 ) -> anyhow::Result<GenerationResult> {
     let plan = ExecutionPlan::fully_resident(local_device_plan(default_local_device())?);
     let planned =
-        LocalModel::load_execution_plan(&LocalBackendFactory::default(), target_dir, &plan)?;
+        LoadedModel::load_execution_plan(&MlxBackendFactory::default(), target_dir, &plan)?;
     let (mut loaded, _) = planned.into_parts();
     let prompt_tokens = loaded.encode(prompt, false)?;
     let eos = loaded.eos_token_ids().to_vec();
@@ -117,7 +119,7 @@ fn run_greedy(
             .generate_tokens(prompt_tokens, TextGenerationConfig::new(resolved))?
             .take(max_tokens);
         for token in generator {
-            let id = token?;
+            let id = token?.token_id()?;
             if eos.contains(&id) {
                 break;
             }
@@ -149,15 +151,17 @@ fn run_speculative(
             adaptive_lookahead: false,
         });
     let planned =
-        LocalModel::load_execution_plan(&LocalBackendFactory::default(), target_dir, &plan)?;
+        LoadedModel::load_execution_plan(&MlxBackendFactory::default(), target_dir, &plan)?;
     let (mut target, mut drafting) = planned.into_parts();
     if !drafting.is_enabled() {
         anyhow::bail!("external drafting plan was not realized");
     }
-    let output = target.generate_prepared_chat_speculative(
-        LocalPreparedChatSpeculativeGenerationRequest {
-            input: LocalPreparedChatInput::rendered_prompt(prepared),
-            drafting: &mut drafting,
+    let output =
+        target.generate_prepared_chat_speculative(PreparedChatSpeculativeGenerationRequest {
+            input: PreparedChatInput::rendered_prompt(prepared),
+            drafting: drafting
+                .as_speculative_draft()
+                .expect("drafting is enabled"),
             settings: PreparedChatGenerationSettings {
                 overrides: GenerationConfigOverrides {
                     temperature: Some(0.0),
@@ -173,8 +177,7 @@ fn run_speculative(
             caller_stop_sequences: &[],
             cancellation: GenerationCancellationToken::new(),
             on_event: |_| {},
-        },
-    )?;
+        })?;
     let mut generated = output.token_ids().to_vec();
     let stats = output.stats();
     if generated

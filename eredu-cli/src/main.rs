@@ -14,17 +14,18 @@ use clap::{parser::ValueSource, ArgMatches, CommandFactory, FromArgMatches, Pars
 use eredu::{
     api::{
         benchmark_local_expert_cache, configure_local_runtime, discover_local_hardware,
-        inspect_local_model, local_device_plan, reset_local_allocator_peak, LocalBackendFactory,
-        LocalDevice, LocalExpertCacheBenchmarkSample, LocalInspectionOptions, LocalModel,
-        LocalPreparedChatGenerationRequest, LocalPreparedChatInput,
-        LocalPreparedChatSpeculativeGenerationRequest, LocalRuntimeConfiguration,
-        LocalSpeculativeComponentTimingGuard, PreparedChatGenerationSettings,
-        PreparedChatSpeculativeGenerationOptions, TextDecoder, TextModelError,
+        inspect_local_model, local_device_plan, reset_local_allocator_peak, LoadedModel,
+        LocalDevice, LocalExpertCacheBenchmarkSample, LocalInspectionOptions,
+        LocalRuntimeConfiguration, PreparedChatGenerationRequest, PreparedChatGenerationSettings,
+        PreparedChatInput, PreparedChatSpeculativeGenerationOptions,
+        PreparedChatSpeculativeGenerationRequest, TextDecoder, TextModelError,
     },
     runtime::chat::{
         ChatTemplateRequest, NativeToolSupport, ParallelToolCallPolicy, SemanticSupport, ToolChoice,
     },
 };
+use eredu_backend_mlx::MlxBackendFactory;
+use eredu_core::TokenOutput as _;
 use eredu_core::{
     residency::CacheEvictionPolicy, speculative::SpeculativeStats, speculative_decoding_telemetry,
     AutomaticPlanRequest, AutomaticPlanner, DeviceCapabilities, DevicePlan, DraftPlacementPlan,
@@ -1282,7 +1283,7 @@ fn cached_plan_resource_admitted(observations: &ExecutionPlanReport, plan: &Exec
 }
 
 fn candidate_load_options(plan: &ExecutionPlan) -> Result<eredu::api::LocalLoadOptions> {
-    Ok(LocalInspectionOptions::for_execution_plan(&LocalBackendFactory::default(), plan)?.load())
+    Ok(LocalInspectionOptions::for_execution_plan(&MlxBackendFactory::default(), plan)?.load())
 }
 
 fn inspect_candidate(model_path: &Path, plan: &ExecutionPlan) -> Result<AutoCandidate> {
@@ -1472,8 +1473,8 @@ fn automatic_plan(
 ) -> Result<ExecutionPlanReport> {
     let request = AutomaticPlanRequest::new(model_path, device_plan(device)?)
         .with_prior_telemetry(prior_telemetry.iter().cloned());
-    LocalBackendFactory::default()
-        .plan(&AutomaticPlanner::default(), &request)
+    AutomaticPlanner::default()
+        .plan(&MlxBackendFactory::default(), &request)
         .map_err(Into::into)
 }
 
@@ -1485,16 +1486,21 @@ fn automatic_plan_with_overrides(
     prior_telemetry: &[ExecutionTelemetry],
 ) -> Result<(
     ExecutionPlanReport,
-    eredu::api::LocalRetainedModelInspection,
+    eredu_core::ArtifactInspection<eredu_architectures::processor_plan::ArtifactArchitecturePlan>,
 )> {
     let request = AutomaticPlanRequest::new(model_path, device_plan(args.device)?)
         .with_prior_telemetry(prior_telemetry.iter().cloned());
-    LocalBackendFactory::default()
-        .plan_retained_with_overrides(&AutomaticPlanner::default(), &request, |plan, resources| {
-            overrides
-                .apply_to_plan(plan, args, draft_model_path, resources)
-                .map_err(|error| eredu_core::AutomaticPlanningError::Invalid(error.to_string()))
-        })
+    AutomaticPlanner::default()
+        .plan_retained_with_overrides(
+            &MlxBackendFactory::default(),
+            &request,
+            |plan, resources| {
+                overrides
+                    .apply_to_plan(plan, args, draft_model_path, resources)
+                    .map_err(|error| eredu_core::AutomaticPlanningError::Invalid(error.to_string()))
+            },
+        )
+        .map(|retained| retained.into_parts())
         .map_err(Into::into)
 }
 
@@ -2234,12 +2240,12 @@ fn main() -> Result<()> {
     };
     let load_started = Instant::now();
     let factory =
-        LocalBackendFactory::default().with_residency_diagnostics(args.verbose, args.verbose);
+        MlxBackendFactory::default().with_residency_diagnostics(args.verbose, args.verbose);
     let planned = match retained_automatic_inspection {
         Some(inspection) => {
-            LocalModel::load_retained_execution_plan(&factory, inspection, &execution_plan)
+            LoadedModel::load_inspected_execution_plan(&factory, inspection, &execution_plan)
         }
-        None => LocalModel::load_execution_plan(&factory, &model_path, &execution_plan),
+        None => LoadedModel::load_execution_plan(&factory, &model_path, &execution_plan),
     }
     .with_context(|| format!("failed to load model from {}", model_path.display()))?;
     let (mut model, mut drafting) = planned.into_parts();
@@ -2385,7 +2391,7 @@ fn main() -> Result<()> {
     let drafting_enabled = drafting.is_enabled();
     let _component_timing_guard = args
         .verbose
-        .then(LocalSpeculativeComponentTimingGuard::enable);
+        .then(eredu_backend_mlx::SpeculativeComponentTimingGuard::enable);
     let scheduler_options = SpeculativeSchedulerOptions {
         adaptive_lookahead: !args.disable_speculative_adaptive_lookahead,
         ..SpeculativeSchedulerOptions::default()
@@ -2408,9 +2414,11 @@ fn main() -> Result<()> {
             let cancellation = GenerationCancellationToken::new();
             let cancel_on_error = cancellation.clone();
             let output = model.generate_prepared_chat_speculative(
-                LocalPreparedChatSpeculativeGenerationRequest {
-                    input: LocalPreparedChatInput::rendered_prompt(prepared),
-                    drafting: &mut drafting,
+                PreparedChatSpeculativeGenerationRequest {
+                    input: PreparedChatInput::rendered_prompt(prepared),
+                    drafting: drafting
+                        .as_speculative_draft()
+                        .expect("drafting is enabled"),
                     settings,
                     options: PreparedChatSpeculativeGenerationOptions {
                         max_draft_tokens: NonZeroUsize::new(args.speculative_draft_tokens).expect(
@@ -2449,8 +2457,8 @@ fn main() -> Result<()> {
         } else {
             let cancellation = GenerationCancellationToken::new();
             let cancel_on_error = cancellation.clone();
-            let output = model.generate_prepared_chat(LocalPreparedChatGenerationRequest {
-                input: LocalPreparedChatInput::rendered_prompt(prepared),
+            let output = model.generate_prepared_chat(PreparedChatGenerationRequest {
+                input: PreparedChatInput::rendered_prompt(prepared),
                 settings,
                 caller_stop_sequences: &args.stop_sequences,
                 cancellation,
@@ -2495,7 +2503,7 @@ fn main() -> Result<()> {
         };
         let generator = model.generate_tokens(prompt_token_ids.clone(), config)?;
         for token in generator {
-            let token_id = token?;
+            let token_id = token?.token_id()?;
             if time_to_first_token.is_none() {
                 time_to_first_token = Some(generation_started.elapsed());
             }

@@ -603,6 +603,8 @@ dependencies = [
  "anyhow",
  "clap",
  "eredu",
+ "eredu-architectures",
+ "eredu-backend-mlx",
  "eredu-checkpoint",
  "eredu-core",
  "eredu-runtime",
@@ -670,6 +672,7 @@ name = "eredu-ios"
 version = "0.1.0"
 dependencies = [
  "eredu",
+ "eredu-backend-mlx",
  "eredu-core",
  "serde_json",
 ]

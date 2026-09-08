@@ -1,10 +1,12 @@
 use std::path::PathBuf;
 
 use eredu::{
-    api::{default_local_device, local_device_plan, LocalBackendFactory, LocalModel},
+    api::{default_local_device, local_device_plan, LoadedModel},
     runtime::chat::ChatTemplateRequest,
 };
 use eredu_architectures::ModelKind;
+use eredu_backend_mlx::{backend::MlxBackend, MlxBackendFactory};
+use eredu_core::TokenOutput as _;
 use eredu_core::{ExecutionPlan, GenerationConfigOverrides, TextGenerationConfig};
 
 fn main() -> anyhow::Result<()> {
@@ -25,7 +27,7 @@ fn main() -> anyhow::Result<()> {
 
     let plan = ExecutionPlan::fully_resident(local_device_plan(default_local_device())?);
     let planned =
-        LocalModel::load_execution_plan(&LocalBackendFactory::default(), &model_dir, &plan)?;
+        LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &model_dir, &plan)?;
     let (mut model, _) = planned.into_parts();
 
     let prepared = model.prepare_chat(ChatTemplateRequest {
@@ -52,7 +54,7 @@ fn main() -> anyhow::Result<()> {
             model.generate_tokens(ids, TextGenerationConfig::new(resolved).with_seed(0))?;
         for _ in 0..120 {
             let token = match generator.next() {
-                Some(token) => token?,
+                Some(token) => token?.token_id()?,
                 None => break,
             };
             let id = token;
@@ -79,7 +81,10 @@ fn gemma4_message(prompt: &str, model_family: ModelKind) -> serde_json::Value {
     }
 }
 
-fn print_first_token_distribution(model: &mut LocalModel, tokens: Vec<u32>) -> anyhow::Result<()> {
+fn print_first_token_distribution(
+    model: &mut LoadedModel<MlxBackend<'_>>,
+    tokens: Vec<u32>,
+) -> anyhow::Result<()> {
     let resolved = model.resolve_generation_config(GenerationConfigOverrides {
         temperature: Some(0.0),
         ..Default::default()
@@ -88,7 +93,7 @@ fn print_first_token_distribution(model: &mut LocalModel, tokens: Vec<u32>) -> a
     let Some(first) = generator.next() else {
         return Ok(());
     };
-    let first_id = first?;
+    let first_id = first?.token_id()?;
     drop(generator);
     println!(
         "first greedy id: {first_id} {:?}",

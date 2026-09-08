@@ -1,13 +1,15 @@
 use std::path::PathBuf;
 
 use eredu::{
-    api::{default_local_device, local_device_plan, LocalBackendFactory, LocalModel},
+    api::{default_local_device, local_device_plan, LoadedModel},
     runtime::chat::ChatTemplateRequest,
 };
+use eredu_backend_mlx::{backend::MlxBackend, MlxBackendFactory};
+use eredu_core::TokenOutput as _;
 use eredu_core::{ExecutionPlan, GenerationConfigOverrides, TextGenerationConfig};
 
 fn generate(
-    model: &mut LocalModel,
+    model: &mut LoadedModel<MlxBackend<'_>>,
     prompt: &str,
     max_tokens: usize,
     temperature: f32,
@@ -23,7 +25,7 @@ fn generate(
     let mut output_ids = Vec::new();
     let generator = model.generate_tokens(prompt_ids, TextGenerationConfig::new(sampling))?;
     for token in generator {
-        let token_id = token?;
+        let token_id = token?.token_id()?;
         output_ids.push(token_id);
         if eos_token_ids.contains(&token_id) {
             break;
@@ -56,7 +58,7 @@ fn main() -> anyhow::Result<()> {
 
     let plan = ExecutionPlan::fully_resident(local_device_plan(default_local_device())?);
     let planned =
-        LocalModel::load_execution_plan(&LocalBackendFactory::default(), &gguf_file, &plan)?;
+        LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &gguf_file, &plan)?;
     let (mut model, _) = planned.into_parts();
 
     println!("model family: {}", model.model_family().canonical_name());

@@ -5,11 +5,12 @@
 
 use eredu::{
     api::{
-        local_device_plan, LocalBackendFactory, LocalDevice, LocalModel,
-        LocalPreparedChatGenerationRequest, LocalPreparedChatInput, PreparedChatGenerationSettings,
+        local_device_plan, LoadedModel, LocalDevice, PreparedChatGenerationRequest,
+        PreparedChatGenerationSettings, PreparedChatInput,
     },
     runtime::chat::{ChatTemplateRequest, NativeToolSupport, ToolChoice},
 };
+use eredu_backend_mlx::MlxBackendFactory;
 use eredu_core::{ExecutionPlan, FinishReason, ResidencyPlan, SemanticEvent};
 use serde_json::json;
 
@@ -36,7 +37,7 @@ fn accelerator_plan() -> ExecutionPlan {
 fn smoke_with_plan(environment: &str, expected_profile_prefix: &str, plan: ExecutionPlan) {
     let path = std::env::var(environment)
         .unwrap_or_else(|_| panic!("{environment} must name a local checkpoint"));
-    let planned = LocalModel::load_execution_plan(&LocalBackendFactory::default(), &path, &plan)
+    let planned = LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &path, &plan)
         .unwrap_or_else(|error| panic!("failed to load {environment}={path:?}: {error}"));
     let (mut model, _) = planned.into_parts();
     let prepared = model
@@ -89,8 +90,8 @@ fn smoke_with_plan(environment: &str, expected_profile_prefix: &str, plan: Execu
 
     let mut events = Vec::new();
     let output = model
-        .generate_prepared_chat(LocalPreparedChatGenerationRequest {
-            input: LocalPreparedChatInput::rendered_prompt(&prepared),
+        .generate_prepared_chat(PreparedChatGenerationRequest {
+            input: PreparedChatInput::rendered_prompt(&prepared),
             settings: PreparedChatGenerationSettings {
                 overrides: eredu_core::GenerationConfigOverrides {
                     temperature: Some(0.0),

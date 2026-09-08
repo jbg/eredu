@@ -2,6 +2,8 @@
 
 //! Small C ABI used by the Eredu iOS example.
 
+use eredu_backend_mlx::{backend::MlxBackend, MlxBackendFactory};
+use eredu_core::TokenOutput as _;
 use std::{
     ffi::{c_char, c_void, CStr, CString},
     path::PathBuf,
@@ -13,7 +15,7 @@ use std::{
 
 use eredu::{
     api::{
-        configure_local_runtime, local_device_plan, LocalBackendFactory, LocalDevice, LocalModel,
+        configure_local_runtime, local_device_plan, LoadedModel, LocalDevice,
         LocalRuntimeConfiguration,
     },
     runtime::chat::ChatTemplateRequest,
@@ -87,7 +89,7 @@ fn publish_error(out: *mut *mut c_char, message: String) {
 }
 
 fn generate(
-    model: &mut LocalModel,
+    model: &mut LoadedModel<MlxBackend<'_>>,
     prompt: &str,
     callback: TextCallback,
     context: usize,
@@ -132,7 +134,9 @@ fn generate(
     let mut generated_tokens = 0_u64;
     let mut ttft = None;
     for token in generator {
-        let token_id = token.map_err(|error| error.to_string())?;
+        let token_id = token
+            .and_then(|token| token.token_id())
+            .map_err(|error| error.to_string())?;
         if eos.contains(&token_id) {
             break;
         }
@@ -168,7 +172,7 @@ fn worker_main(
             local_device_plan(LocalDevice::Accelerator(0)).map_err(|error| error.to_string())?,
         );
         let planned =
-            LocalModel::load_execution_plan(&LocalBackendFactory::default(), &model_path, &plan)
+            LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &model_path, &plan)
                 .map_err(|error| error.to_string())?;
         let (mut model, _) = planned.into_parts();
         model.synchronize().map_err(|error| error.to_string())?;

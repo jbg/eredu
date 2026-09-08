@@ -25,7 +25,7 @@ load policy:
 
 The same requirement applies to realtime loading. An unsupported requirement
 fails before checkpoint payload materialization. Loaded realtime models expose
-the admitted report with `LocalRealtimeModel::session_capabilities`; exact
+the admitted report with `PreparedRealtimeModel::session_capabilities`; exact
 capability coverage is documented by the selected backend.
 
 These facade-owned options are configured with builders and queried with
