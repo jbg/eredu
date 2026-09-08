@@ -161,7 +161,7 @@ impl InklingToolDialect {
                 "type": "object",
                 "properties": {
                     "name": {"type": "string", "enum": [tool.name]},
-                    "args": tool.parameters,
+                    "args": crate::runtime::chat::tool_schema::arguments_schema(&tool.parameters, "/properties/args")?,
                 },
                 "required": ["name", "args"],
                 "additionalProperties": false,
@@ -491,7 +491,7 @@ impl InklingMessageParser {
         let id = format!("call_{}", sink.next_tool_index());
         sink.start_tool_call(id, name.to_owned());
         sink.tool_arguments(&arguments);
-        sink.end_tool_call();
+        sink.end_tool_call()?;
         Ok(())
     }
 }

@@ -516,6 +516,7 @@ pub(crate) struct SemanticEventSink {
     active_tool_call: Option<InProgressToolCall>,
     next_tool_index: usize,
     tool_calls_enabled: bool,
+    tool_schemas: Option<crate::runtime::chat::tool_schema::ToolSchemas>,
 }
 
 impl Default for SemanticEventSink {
@@ -525,6 +526,7 @@ impl Default for SemanticEventSink {
             active_tool_call: None,
             next_tool_index: 0,
             tool_calls_enabled: true,
+            tool_schemas: None,
         }
     }
 }
@@ -576,13 +578,20 @@ impl SemanticEventSink {
         self.events.push(event);
     }
 
-    pub(crate) fn end_tool_call(&mut self) {
+    pub(crate) fn end_tool_call(&mut self) -> Result<(), String> {
         if !self.tool_calls_enabled {
-            return;
+            return Ok(());
         }
-        debug_assert!(self.active_tool_call.is_some());
+        let call = self
+            .active_tool_call
+            .as_ref()
+            .expect("tool end requires an active call");
+        if let Some(schemas) = &self.tool_schemas {
+            schemas.validate(&call.name, &call.arguments)?;
+        }
         self.active_tool_call = None;
         self.events.push(SemanticEvent::ToolCallEnd);
+        Ok(())
     }
 
     fn finish(&mut self, reason: FinishReason) {
@@ -862,6 +871,12 @@ impl ToolRuntimeParser {
                 structural_stop_spellings,
             ),
         }
+    }
+
+    pub(crate) fn with_tool_schemas(mut self, tools: &[serde_json::Value]) -> Result<Self, String> {
+        self.stream.sink.tool_schemas =
+            Some(crate::runtime::chat::tool_schema::ToolSchemas::new(tools)?);
+        Ok(self)
     }
 
     #[cfg(test)]
@@ -1379,7 +1394,7 @@ mod tests {
                                     ));
                                 }
                                 PatternPiece::Match { index: 0, .. } => {
-                                    sink.end_tool_call();
+                                    sink.end_tool_call()?;
                                     self.state = SyntheticState::Text(text_patterns());
                                 }
                                 PatternPiece::Match { index, .. } => {

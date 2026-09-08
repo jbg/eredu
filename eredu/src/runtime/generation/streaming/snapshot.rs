@@ -26,7 +26,8 @@ snapshot_fields!(SemanticEventSink {
     events,
     active_tool_call,
     next_tool_index,
-    tool_calls_enabled
+    tool_calls_enabled,
+    tool_schemas
 });
 snapshot_fields!(ToolRuntimeParser { stream });
 

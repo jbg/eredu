@@ -137,8 +137,10 @@ impl HarmonyDialect {
 
         for (index, tool) in tools.iter().enumerate() {
             let name = literal(&tool.name)?;
-            let schema =
-                serde_json::to_string(&tool.parameters).expect("validated schemas serialize");
+            let schema = serde_json::to_string(
+                &crate::runtime::chat::tool_schema::arguments_schema(&tool.parameters, "")?,
+            )
+            .expect("validated schemas serialize");
             match tool_choice {
                 ToolChoice::Required => {
                     grammar.push_str(&format!(
@@ -561,7 +563,7 @@ impl ProtocolParser for HarmonyParser {
                         "Harmony function call stopped before complete JSON arguments".into(),
                     );
                 }
-                sink.end_tool_call();
+                sink.end_tool_call()?;
                 self.state = ParserState::Done;
                 Ok(())
             }

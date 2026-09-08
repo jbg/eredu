@@ -139,6 +139,17 @@ impl AtemDialect {
                     format!("({parameter})?")
                 });
             }
+            if !crate::runtime::chat::tool_schema::has_simple_properties(&tool.parameters) {
+                let parameter = format!("atem_any_parameter_{index}");
+                grammar.push_str(&format!(
+                    "{parameter}: {} ATEM_STRING+ {} ATEM_STRING* {}\n",
+                    json_literal("<atem:parameter name=\""),
+                    json_literal("\">"),
+                    json_literal("</atem:parameter>\n"),
+                ));
+                parameters.clear();
+                parameters.push(format!("{parameter}*"));
+            }
             grammar.push_str(&format!(
                 "tool_call_{index}: {} {} {} {}\n\
                  direct_tool_call_{index}: {} {} {} {}\n",
@@ -441,7 +452,7 @@ impl AtemParser {
                     &serde_json::to_string(&arguments)
                         .expect("validated ATEM arguments serialize as JSON"),
                 );
-                sink.end_tool_call();
+                sink.end_tool_call()?;
             }
         }
         self.state = AtemState::AwaitStart;

@@ -1,5 +1,15 @@
 # Language-model backend architecture
 
+Tool-schema admission and completed-argument validation belong to the facade.
+Application JSON Schemas are retained unchanged for rendering and checked with
+the portable `jsonschema` validator without remote or filesystem retrieval.
+Dialect grammars enforce the constraints they can represent and retain protocol
+syntax, function names and call limits for other schemas. The shared semantic
+event sink validates the complete argument object before emitting `ToolCallEnd`;
+immutable validators are shared across forks while partial arguments remain
+private to each parser. Backends continue to consume neutral token filters and
+do not interpret schemas or decide which tool calls applications execute.
+
 Tokenizer ID membership and model output width are separate domains. The facade
 builds a closed validity mask from actual canonical, round-tripping tokenizer IDs,
 including added and special tokens; holes and inconsistent mappings are excluded.

@@ -12,6 +12,7 @@ pub(crate) mod harmony;
 pub(crate) mod inkling;
 pub(crate) mod lfm2;
 mod tokenizer_env;
+pub(crate) mod tool_schema;
 
 use std::{
     collections::{HashMap, HashSet},
@@ -174,7 +175,7 @@ impl SemanticRuntimePlan {
         let parser = self
             .dialect
             .incremental_parser_state_with_tools(self.dialect_parameters, &self.tools)?;
-        Ok(ToolRuntimeParser::new_with_structural_stops(
+        ToolRuntimeParser::new_with_structural_stops(
             parser,
             self.profile_stop_sequences.iter().map(String::as_str),
             caller_stops,
@@ -186,7 +187,8 @@ impl SemanticRuntimePlan {
                         .any(|token| token.spelling == stop.as_str())
                 })
                 .map(String::as_str),
-        ))
+        )
+        .with_tool_schemas(&self.tools)
     }
 }
 
@@ -319,7 +321,8 @@ impl GenerationRuntimePlan {
                 .iter()
                 .map(String::as_str),
             std::iter::empty(),
-        );
+        )
+        .with_tool_schemas(&self.semantic.tools)?;
         if self.tool_choice == ToolChoice::None {
             parser.disable_tool_calls();
         }

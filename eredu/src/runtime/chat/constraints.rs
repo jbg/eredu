@@ -2,11 +2,7 @@
 
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::{
-    collections::{BTreeSet, HashSet},
-    num::NonZeroUsize,
-    sync::Arc,
-};
+use std::{num::NonZeroUsize, sync::Arc};
 
 use eredu_core::{SpeculativeTokenFilterController, TokenFilter, TokenFilterController};
 use eredu_text::tokenizer::Tokenizer as ChatTokenizer;
@@ -15,6 +11,8 @@ use llguidance::{
     Matcher, ParserFactory,
 };
 use serde_json::{json, Map, Value};
+
+pub(crate) use super::tool_schema::parse_tools;
 use sha2::{Digest, Sha256};
 
 use crate::{
@@ -25,8 +23,6 @@ use crate::{
         ParallelToolCallPolicy, ToolChoice,
     },
 };
-
-const MAX_SCHEMA_DEPTH: usize = 64;
 
 /// Canonical backend-independent grammar and activation state.
 pub(crate) struct ConstraintController {
@@ -614,40 +610,56 @@ impl ConstraintCompiler {
         let grammar_structural_token_ids =
             &resolved_structural_token_ids[..grammar_structural_token_spellings.len()];
         dialect.incremental_parser_state_with_tools(parameters, tools)?;
+        // Schema admission is independent of the grammar engine's supported subset.
+        // Every completed call is checked against the original schema by the sink.
+        parse_tools(tools)?;
         let configuration = if tool_surface {
-            dialect.constraint_configuration(
+            let configuration = dialect.constraint_configuration(
                 parameters,
                 tools,
                 tool_choice,
                 parallel_tool_calls,
                 grammar_structural_token_ids,
-            )?
+            )?;
+            match self.compile_matcher(configuration.grammar.clone()) {
+                Ok(matcher) => (configuration, matcher),
+                Err(_) => {
+                    // Keep protocol, function names and call limits constrained.
+                    // Only argument-schema enforcement moves to completion.
+                    let syntax_tools = tools
+                        .iter()
+                        .map(|tool| {
+                            let mut tool = tool.clone();
+                            tool["function"]["parameters"] = json!({"type": "object"});
+                            tool
+                        })
+                        .collect::<Vec<_>>();
+                    let configuration = dialect.constraint_configuration(
+                        parameters,
+                        &syntax_tools,
+                        tool_choice,
+                        parallel_tool_calls,
+                        grammar_structural_token_ids,
+                    )?;
+                    let matcher = self.compile_matcher(configuration.grammar.clone())?;
+                    (configuration, matcher)
+                }
+            }
         } else {
-            dialect.semantic_constraint_configuration(
+            let configuration = dialect.semantic_constraint_configuration(
                 parameters,
                 grammar_structural_token_ids,
                 &self.eos_token_ids,
-            )?
+            )?;
+            let matcher = self.compile_matcher(configuration.grammar.clone())?;
+            (configuration, matcher)
         };
+        let (configuration, matcher) = configuration;
         let fingerprint: [u8; 32] = Sha256::digest(
-            serde_json::to_vec(&configuration.grammar).expect("grammar configuration serializes"),
+            serde_json::to_vec(&(&configuration.grammar, tools))
+                .expect("grammar configuration serializes"),
         )
         .into();
-        let parser = self
-            .factory
-            .create_parser(configuration.grammar)
-            .map_err(|error| format!("failed to compile tool grammar: {error}"))?;
-        let mut matcher = Matcher::new(Ok(parser));
-        if let Some(error) = matcher.get_error() {
-            return Err(format!("failed to compile tool grammar: {error}"));
-        }
-        let warnings = matcher.grammar_warnings();
-        if !warnings.is_empty() {
-            return Err(format!(
-                "tool grammar produced unsupported warnings: {}",
-                warnings.join("; ")
-            ));
-        }
         Ok(GenerationRuntimePlan::new(GenerationRuntimePlanParts {
             tool_choice,
             tool_surface,
@@ -669,6 +681,28 @@ impl ConstraintCompiler {
             resolved_structural_token_ids,
             profile_stop_sequences: runtime_stop_sequences,
         }))
+    }
+
+    fn compile_matcher(
+        &self,
+        grammar: llguidance::api::TopLevelGrammar,
+    ) -> Result<Matcher, String> {
+        let parser = self
+            .factory
+            .create_parser(grammar)
+            .map_err(|error| format!("failed to compile tool grammar: {error}"))?;
+        let mut matcher = Matcher::new(Ok(parser));
+        if let Some(error) = matcher.get_error() {
+            return Err(format!("failed to compile tool grammar: {error}"));
+        }
+        let warnings = matcher.grammar_warnings();
+        if !warnings.is_empty() {
+            return Err(format!(
+                "tool grammar produced unsupported warnings: {}",
+                warnings.join("; ")
+            ));
+        }
+        Ok(matcher)
     }
 
     #[cfg(test)]
@@ -831,12 +865,6 @@ impl GenerationConstraint {
     }
 }
 
-#[derive(Debug)]
-pub(crate) struct ToolDefinition {
-    pub(crate) name: String,
-    pub(crate) parameters: Value,
-}
-
 pub(crate) fn tool_call_bounds(
     tool_choice: ToolChoice,
     parallel_tool_calls: ParallelToolCallPolicy,
@@ -876,18 +904,34 @@ pub(crate) fn tool_call_schema(
     call_id: Option<DeclarativeCallId>,
 ) -> Result<Value, String> {
     let tools = parse_tools(tools)?;
+    let tool_count = tools.len();
     let item_schema = if tools.is_empty() {
         json!({"type": "null"})
     } else {
         let alternatives = tools
             .into_iter()
-            .map(|tool| {
+            .enumerate()
+            .map(|(index, tool)| {
                 let mut properties = Map::from_iter([
                     (
                         name_field.to_owned(),
                         json!({"type": "string", "enum": [tool.name]}),
                     ),
-                    (arguments_field.to_owned(), tool.parameters),
+                    (
+                        arguments_field.to_owned(),
+                        crate::runtime::chat::tool_schema::arguments_schema(
+                            &tool.parameters,
+                            &format!(
+                                "{}/properties/{}",
+                                if tool_count == 1 {
+                                    String::new()
+                                } else {
+                                    format!("/oneOf/{index}")
+                                },
+                                arguments_field.replace('~', "~0").replace('/', "~1")
+                            ),
+                        )?,
+                    ),
                 ]);
                 let mut required = vec![
                     Value::String(name_field.to_owned()),
@@ -903,14 +947,14 @@ pub(crate) fn tool_call_schema(
                     properties.insert(call_id.field.to_owned(), Value::Object(id_schema));
                     required.push(Value::String(call_id.field.to_owned()));
                 }
-                json!({
+                Ok(json!({
                     "type": "object",
                     "properties": properties,
                     "required": required,
                     "additionalProperties": false,
-                })
+                }))
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, String>>()?;
         if alternatives.len() == 1 {
             alternatives.into_iter().next().expect("one alternative")
         } else {
@@ -919,436 +963,6 @@ pub(crate) fn tool_call_schema(
     };
 
     Ok(item_schema)
-}
-
-pub(crate) fn parse_tools(tools: &[Value]) -> Result<Vec<ToolDefinition>, String> {
-    let mut names = HashSet::new();
-    tools
-        .iter()
-        .enumerate()
-        .map(|(index, tool)| {
-            let path = format!("tools[{index}]");
-            let object = tool
-                .as_object()
-                .ok_or_else(|| format!("{path} must be an object"))?;
-            reject_unknown_keys(object, &["type", "function"], &path)?;
-            if object.get("type").and_then(Value::as_str) != Some("function") {
-                return Err(format!("{path}.type must be \"function\""));
-            }
-            let function = object
-                .get("function")
-                .and_then(Value::as_object)
-                .ok_or_else(|| format!("{path}.function must be an object"))?;
-            reject_unknown_keys(
-                function,
-                &["name", "description", "parameters"],
-                &format!("{path}.function"),
-            )?;
-            let name = function
-                .get("name")
-                .and_then(Value::as_str)
-                .filter(|name| !name.is_empty())
-                .ok_or_else(|| format!("{path}.function.name must be a non-empty string"))?;
-            validate_function_name(name, &format!("{path}.function.name"))?;
-            let name = name.to_owned();
-            if !names.insert(name.clone()) {
-                return Err(format!("duplicate tool function name {name:?}"));
-            }
-            if function
-                .get("description")
-                .is_some_and(|description| !description.is_string())
-            {
-                return Err(format!("{path}.function.description must be a string"));
-            }
-            let parameters = function
-                .get("parameters")
-                .ok_or_else(|| format!("{path}.function.parameters is required"))?;
-            let parameters =
-                resolve_and_validate_schema(parameters, &format!("{path}.function.parameters"))?;
-            if parameters.get("type").and_then(Value::as_str) != Some("object") {
-                return Err(format!(
-                    "{path}.function.parameters must resolve to an object schema"
-                ));
-            }
-            Ok(ToolDefinition { name, parameters })
-        })
-        .collect()
-}
-
-fn validate_function_name(name: &str, path: &str) -> Result<(), String> {
-    if name.len() > 64 {
-        return Err(format!("{path} must be at most 64 bytes"));
-    }
-    if !name
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
-    {
-        return Err(format!(
-            "{path} must contain only ASCII letters, digits, underscores, or hyphens"
-        ));
-    }
-    Ok(())
-}
-
-fn reject_unknown_keys(
-    object: &Map<String, Value>,
-    allowed: &[&str],
-    path: &str,
-) -> Result<(), String> {
-    if let Some(key) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
-        return Err(format!("{path} contains unsupported field {key:?}"));
-    }
-    Ok(())
-}
-
-fn resolve_and_validate_schema(schema: &Value, path: &str) -> Result<Value, String> {
-    if !schema.is_object() {
-        return Err(format!("{path} must be a JSON Schema object"));
-    }
-    let mut reference_stack = Vec::new();
-    resolve_schema(schema, schema, path, &mut reference_stack, 0)
-}
-
-fn resolve_schema(
-    schema: &Value,
-    root: &Value,
-    path: &str,
-    reference_stack: &mut Vec<String>,
-    depth: usize,
-) -> Result<Value, String> {
-    if depth > MAX_SCHEMA_DEPTH {
-        return Err(format!("{path} exceeds the supported schema nesting depth"));
-    }
-    let object = schema
-        .as_object()
-        .ok_or_else(|| format!("{path} must be a JSON Schema object"))?;
-    if let Some(reference) = object.get("$ref") {
-        if object.len() != 1 {
-            return Err(format!("{path} cannot combine $ref with sibling keywords"));
-        }
-        let reference = reference
-            .as_str()
-            .ok_or_else(|| format!("{path}.$ref must be a string"))?;
-        if reference_stack.iter().any(|active| active == reference) {
-            return Err(format!(
-                "{path} contains unsupported recursive reference {reference:?}"
-            ));
-        }
-        let target = resolve_local_reference(root, reference, path)?;
-        reference_stack.push(reference.to_owned());
-        let resolved = resolve_schema(target, root, path, reference_stack, depth + 1);
-        reference_stack.pop();
-        return resolved;
-    }
-
-    validate_schema_keywords(object, path)?;
-    let mut resolved = Map::new();
-    for (keyword, value) in object {
-        match keyword.as_str() {
-            "$defs" | "definitions" => {
-                validate_definition_map(value, root, path, reference_stack, depth + 1)?;
-            }
-            "properties" => {
-                let properties = value
-                    .as_object()
-                    .ok_or_else(|| format!("{path}.properties must be an object"))?;
-                let mut output = Map::new();
-                for (name, property) in properties {
-                    output.insert(
-                        name.clone(),
-                        resolve_schema(
-                            property,
-                            root,
-                            &format!("{path}.properties[{name:?}]"),
-                            reference_stack,
-                            depth + 1,
-                        )?,
-                    );
-                }
-                resolved.insert(keyword.clone(), Value::Object(output));
-            }
-            "items" => {
-                resolved.insert(
-                    keyword.clone(),
-                    resolve_schema(
-                        value,
-                        root,
-                        &format!("{path}.items"),
-                        reference_stack,
-                        depth + 1,
-                    )?,
-                );
-            }
-            "additionalProperties" if value.is_object() => {
-                resolved.insert(
-                    keyword.clone(),
-                    resolve_schema(
-                        value,
-                        root,
-                        &format!("{path}.additionalProperties"),
-                        reference_stack,
-                        depth + 1,
-                    )?,
-                );
-            }
-            _ => {
-                resolved.insert(keyword.clone(), value.clone());
-            }
-        }
-    }
-    validate_schema_shape(&resolved, path)?;
-    Ok(Value::Object(resolved))
-}
-
-fn validate_definition_map(
-    definitions: &Value,
-    root: &Value,
-    path: &str,
-    reference_stack: &mut Vec<String>,
-    depth: usize,
-) -> Result<(), String> {
-    let definitions = definitions
-        .as_object()
-        .ok_or_else(|| format!("{path} definitions must be an object"))?;
-    for (name, definition) in definitions {
-        resolve_schema(
-            definition,
-            root,
-            &format!("{path} definition {name:?}"),
-            reference_stack,
-            depth,
-        )?;
-    }
-    Ok(())
-}
-
-fn validate_schema_keywords(schema: &Map<String, Value>, path: &str) -> Result<(), String> {
-    const SUPPORTED: &[&str] = &[
-        "$ref",
-        "$defs",
-        "definitions",
-        "type",
-        "properties",
-        "required",
-        "additionalProperties",
-        "items",
-        "minItems",
-        "maxItems",
-        "enum",
-        "description",
-        "title",
-        "default",
-    ];
-    if let Some(keyword) = schema
-        .keys()
-        .find(|keyword| !SUPPORTED.contains(&keyword.as_str()))
-    {
-        let kind = if matches!(
-            keyword.as_str(),
-            "allOf" | "anyOf" | "oneOf" | "not" | "if" | "then" | "else"
-        ) {
-            "composition"
-        } else {
-            "keyword"
-        };
-        return Err(format!(
-            "{path} contains unsupported schema {kind} {keyword:?}"
-        ));
-    }
-    Ok(())
-}
-
-fn validate_schema_shape(schema: &Map<String, Value>, path: &str) -> Result<(), String> {
-    let schema_type = schema
-        .get("type")
-        .map(|value| {
-            value
-                .as_str()
-                .ok_or_else(|| format!("{path}.type must be one string, not a union"))
-        })
-        .transpose()?;
-    if let Some(schema_type) = schema_type {
-        if !matches!(
-            schema_type,
-            "object" | "array" | "string" | "number" | "integer" | "boolean" | "null"
-        ) {
-            return Err(format!("{path}.type {schema_type:?} is unsupported"));
-        }
-    }
-
-    let has_object_keywords = schema.contains_key("properties")
-        || schema.contains_key("required")
-        || schema.contains_key("additionalProperties");
-    let has_array_keywords = schema.contains_key("items")
-        || schema.contains_key("minItems")
-        || schema.contains_key("maxItems");
-    if has_object_keywords && has_array_keywords {
-        return Err(format!("{path} mixes object and array keywords"));
-    }
-    let structural_type = if has_object_keywords {
-        Some("object")
-    } else if has_array_keywords {
-        Some("array")
-    } else {
-        None
-    };
-    if let Some(structural_type) = structural_type {
-        if schema_type != Some(structural_type) {
-            return Err(format!(
-                "{path} uses {structural_type} keywords without type {structural_type:?}"
-            ));
-        }
-    }
-
-    if schema_type == Some("object") {
-        let properties = match schema.get("properties") {
-            Some(properties) => properties
-                .as_object()
-                .ok_or_else(|| format!("{path}.properties must be an object"))?,
-            None => {
-                static EMPTY_PROPERTIES: std::sync::LazyLock<Map<String, Value>> =
-                    std::sync::LazyLock::new(Map::new);
-                &EMPTY_PROPERTIES
-            }
-        };
-        if let Some(required) = schema.get("required") {
-            let required = required
-                .as_array()
-                .ok_or_else(|| format!("{path}.required must be an array"))?;
-            let mut seen = BTreeSet::new();
-            for name in required {
-                let name = name
-                    .as_str()
-                    .ok_or_else(|| format!("{path}.required entries must be strings"))?;
-                if !seen.insert(name) {
-                    return Err(format!("{path}.required contains duplicate {name:?}"));
-                }
-                if !properties.contains_key(name) {
-                    return Err(format!("{path}.required names unknown property {name:?}"));
-                }
-            }
-        }
-        if let Some(additional) = schema.get("additionalProperties") {
-            if !additional.is_boolean() && !additional.is_object() {
-                return Err(format!(
-                    "{path}.additionalProperties must be a boolean or schema object"
-                ));
-            }
-        }
-    }
-
-    if schema_type == Some("array") {
-        if !schema.get("items").is_some_and(Value::is_object) {
-            return Err(format!("{path}.items must be a schema object"));
-        }
-        let min = schema_usize(schema, "minItems", path)?;
-        let max = schema_usize(schema, "maxItems", path)?;
-        if min.zip(max).is_some_and(|(min, max)| min > max) {
-            return Err(format!("{path}.minItems exceeds maxItems"));
-        }
-    }
-
-    if let Some(values) = schema.get("enum") {
-        let values = values
-            .as_array()
-            .filter(|values| !values.is_empty())
-            .ok_or_else(|| format!("{path}.enum must be a non-empty array"))?;
-        if let Some(schema_type) = schema_type {
-            if let Some(value) = values
-                .iter()
-                .find(|value| !value_matches_type(value, schema_type))
-            {
-                return Err(format!(
-                    "{path}.enum value {value} does not match type {schema_type:?}"
-                ));
-            }
-        }
-    }
-    for annotation in ["description", "title"] {
-        if schema
-            .get(annotation)
-            .is_some_and(|value| !value.is_string())
-        {
-            return Err(format!("{path}.{annotation} must be a string"));
-        }
-    }
-    if schema_type.is_none() && !schema.contains_key("enum") {
-        return Err(format!(
-            "{path} must declare a supported type, enum, or local $ref"
-        ));
-    }
-    Ok(())
-}
-
-fn schema_usize(
-    schema: &Map<String, Value>,
-    keyword: &str,
-    path: &str,
-) -> Result<Option<usize>, String> {
-    schema
-        .get(keyword)
-        .map(|value| {
-            value
-                .as_u64()
-                .and_then(|value| usize::try_from(value).ok())
-                .ok_or_else(|| format!("{path}.{keyword} must be a non-negative integer"))
-        })
-        .transpose()
-}
-
-fn value_matches_type(value: &Value, schema_type: &str) -> bool {
-    match schema_type {
-        "object" => value.is_object(),
-        "array" => value.is_array(),
-        "string" => value.is_string(),
-        "number" => value.is_number(),
-        "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
-        "boolean" => value.is_boolean(),
-        "null" => value.is_null(),
-        _ => false,
-    }
-}
-
-fn resolve_local_reference<'a>(
-    root: &'a Value,
-    reference: &str,
-    path: &str,
-) -> Result<&'a Value, String> {
-    if !reference.starts_with('#') {
-        return Err(format!(
-            "{path} uses unsupported non-local reference {reference:?}"
-        ));
-    }
-    if reference.contains('%') {
-        return Err(format!(
-            "{path} uses unsupported percent-encoded reference {reference:?}"
-        ));
-    }
-    let pointer = &reference[1..];
-    if pointer.is_empty() {
-        return Ok(root);
-    }
-    if !pointer.starts_with('/') {
-        return Err(format!("{path} has invalid local reference {reference:?}"));
-    }
-    for segment in pointer[1..].split('/') {
-        let bytes = segment.as_bytes();
-        let mut index = 0;
-        while index < bytes.len() {
-            if bytes[index] == b'~' {
-                if bytes
-                    .get(index + 1)
-                    .is_none_or(|escaped| !matches!(escaped, b'0' | b'1'))
-                {
-                    return Err(format!("{path} has invalid local reference {reference:?}"));
-                }
-                index += 1;
-            }
-            index += 1;
-        }
-    }
-    root.pointer(pointer)
-        .ok_or_else(|| format!("{path} references missing schema {reference:?}"))
 }
 
 #[cfg(test)]
@@ -1424,7 +1038,13 @@ mod tests {
                 return false;
             }
         }
-        state.is_complete().unwrap()
+        state.is_complete().unwrap() && {
+            let mut parser = plan.create_parser().unwrap();
+            parser.push(&value.to_string()).is_ok()
+                && parser
+                    .finish(eredu_core::generation::FinishReason::GrammarComplete)
+                    .is_ok()
+        }
     }
 
     #[test]
@@ -1614,7 +1234,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_references_schemas_keywords_and_compositions() {
+    fn rejects_invalid_references_and_malformed_schemas() {
         let compiler = compiler();
         let invalid = [
             tool(
@@ -1627,12 +1247,12 @@ mod tests {
             ),
             tool("malformed", json!({"type": "object", "required": "x"})),
             tool(
-                "unsupported",
-                json!({"type": "object", "patternProperties": {".*": {"type": "string"}}}),
+                "malformed_union",
+                json!({"type": "object", "properties": {"x": {"type": ["string", 7]}}}),
             ),
             tool(
-                "composition",
-                json!({"type": "object", "properties": {"x": {"oneOf": [{"type": "string"}, {"type": "number"}]}}}),
+                "malformed_minimum",
+                json!({"type": "object", "properties": {"x": {"minimum": "zero"}}}),
             ),
         ];
         for tool in invalid {
@@ -1646,13 +1266,256 @@ mod tests {
                     Vec::new(),
                 )
                 .unwrap_err();
-            assert!(
-                error.contains("reference")
-                    || error.contains("required")
-                    || error.contains("unsupported"),
-                "{error}"
+            assert!(error.contains("tools[0].function.parameters"), "{error}");
+        }
+    }
+
+    #[test]
+    fn common_constraints_remain_enforced_during_decoding() {
+        let plan = compiler()
+            .compile_tool_plan(
+                &DECLARATIVE_DIALECT,
+                SYNTHETIC_PARAMETERS,
+                &[tool(
+                    "check",
+                    json!({"type": "object", "properties": {
+                "count": {"type": "integer", "minimum": 2},
+                "value": {"oneOf": [{"type": "string"}, {"type": "null"}]}
+            }, "required": ["count", "value"], "additionalProperties": false}),
+                )],
+                ToolChoice::Required,
+                ParallelToolCallPolicy::Disabled,
+                Vec::new(),
+            )
+            .unwrap();
+        for arguments in [
+            json!({"count": 1, "value": null}),
+            json!({"count": 2, "value": false}),
+        ] {
+            let output = json!({"calls": [{"name": "check", "arguments": arguments}]}).to_string();
+            let mut grammar = plan.generation_constraint().grammar_state();
+            assert!(output
+                .bytes()
+                .any(|byte| grammar.commit(u32::from(byte)).is_err()));
+        }
+    }
+
+    #[test]
+    fn each_tool_keeps_its_own_reference_root() {
+        let schema = |kind| {
+            json!({
+                "$defs": {"value": {"type": kind}},
+                "properties": {"x": {"$ref": "#/$defs/value"}}, "required": ["x"]
+            })
+        };
+        let plan = compiler()
+            .compile_tool_plan(
+                &DECLARATIVE_DIALECT,
+                SYNTHETIC_PARAMETERS,
+                &[
+                    tool("text", schema("string")),
+                    tool("number", schema("integer")),
+                ],
+                ToolChoice::Required,
+                ParallelToolCallPolicy::Disabled,
+                Vec::new(),
+            )
+            .unwrap();
+        for (name, value, valid) in [
+            ("text", json!("hi"), true),
+            ("number", json!(2), true),
+            ("text", json!(2), false),
+            ("number", json!("hi"), false),
+        ] {
+            assert_eq!(
+                accepts(
+                    &plan,
+                    json!({"calls": [{"name": name, "arguments": {"x": value}}]})
+                ),
+                valid
             );
         }
+    }
+
+    #[test]
+    fn accepts_application_schemas_and_checks_completed_arguments() {
+        let cases = [
+            (
+                json!({"type": "integer", "minimum": 2, "maximum": 8, "multipleOf": 2}),
+                json!(4),
+                json!(3),
+            ),
+            (
+                json!({"anyOf": [{"type": "string"}, {"type": "null"}]}),
+                json!(null),
+                json!(9),
+            ),
+            (
+                json!({"oneOf": [{"type": "string"}, {"type": "number"}]}),
+                json!("ok"),
+                json!(true),
+            ),
+            // Overlapping oneOf needs exact completion validation, not anyOf coercion.
+            (
+                json!({"oneOf": [{"type": "integer"}, {"type": "number", "minimum": 0}]}),
+                json!(-1),
+                json!(1),
+            ),
+            (
+                json!({"type": ["string", "null"]}),
+                json!(null),
+                json!(false),
+            ),
+            (
+                json!({"allOf": [{"minimum": 2}, {"maximum": 4}]}),
+                json!(3),
+                json!(1),
+            ),
+            (
+                json!({"type": "string", "minLength": 2, "maxLength": 4, "pattern": "^[a-z]+$"}),
+                json!("abc"),
+                json!("ABC"),
+            ),
+            (
+                json!({"const": {"literal": {"$ref": "this is data"}}}),
+                json!({"literal": {"$ref": "this is data"}}),
+                json!({}),
+            ),
+            (
+                json!({"type": "array", "uniqueItems": true}),
+                json!([1, 2]),
+                json!([1, 1]),
+            ),
+            (
+                json!({"type": "array", "contains": {"const": 1}}),
+                json!([0, 1]),
+                json!([0]),
+            ),
+            (json!({"not": {"type": "null"}}), json!("ok"), json!(null)),
+            (
+                json!({"if": {"type": "string"}, "then": {"minLength": 2}, "else": {"const": 0}}),
+                json!("ok"),
+                json!(1),
+            ),
+            (
+                json!({"type": "object", "patternProperties": {"^x": {"type": "integer"}}, "additionalProperties": false}),
+                json!({"x1": 1}),
+                json!({"x1": "bad"}),
+            ),
+            (
+                json!({"type": "object", "dependentRequired": {"x": ["y"]}}),
+                json!({"x": 1, "y": 2}),
+                json!({"x": 1}),
+            ),
+            (
+                json!({"type": "object", "properties": {"x": true, "y": false}, "unevaluatedProperties": false}),
+                json!({"x": null}),
+                json!({"y": 1}),
+            ),
+            (
+                json!({"type": "string", "examples": ["ok"], "default": {"$ref": "not a schema"}, "x-app": {"arbitrary": true}}),
+                json!("ok"),
+                json!(0),
+            ),
+        ];
+        for (schema, valid, invalid) in cases {
+            let plan = compiler().compile_tool_plan(
+                &DECLARATIVE_DIALECT, SYNTHETIC_PARAMETERS,
+                &[tool("check", json!({"type": "object", "properties": {"value": schema}, "required": ["value"], "additionalProperties": false}))],
+                ToolChoice::Required, ParallelToolCallPolicy::Disabled, Vec::new(),
+            ).unwrap_or_else(|error| panic!("{schema}: {error}"));
+            let call = |value| json!({"calls": [{"name": "check", "arguments": {"value": value}}]});
+            assert!(
+                accepts(&plan, call(valid)),
+                "valid value rejected for {schema}"
+            );
+            assert!(
+                !accepts(&plan, call(invalid)),
+                "invalid value accepted for {schema}"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_boolean_typeless_recursive_and_scoped_root_schemas() {
+        let cases = [
+            (json!(true), json!({"anything": [null, 1]})),
+            (json!({}), json!({})),
+            (
+                json!({"required": ["undeclared"]}),
+                json!({"undeclared": true}),
+            ),
+            (
+                json!({"anyOf": [{"required": ["x"]}, {"required": ["y"]}]}),
+                json!({"y": 1}),
+            ),
+            (
+                json!({"$defs": {"value": {"type": "integer"}}, "type": "object", "properties": {"x": {"$ref": "#/$defs/value", "minimum": 2}}}),
+                json!({"x": 3}),
+            ),
+            (
+                json!({"type": "object", "properties": {"child": {"anyOf": [{"type": "null"}, {"$ref": "#"}]}}}),
+                json!({"child": {"child": null}}),
+            ),
+            (
+                json!({"$id": "https://example.test/root", "$defs": {"value": {"$anchor": "value", "type": "integer"}}, "properties": {"x": {"$ref": "#value"}}}),
+                json!({"x": 3}),
+            ),
+        ];
+        for (schema, arguments) in cases {
+            let plan = compiler()
+                .compile_tool_plan(
+                    &DECLARATIVE_DIALECT,
+                    SYNTHETIC_PARAMETERS,
+                    &[tool("check", schema.clone())],
+                    ToolChoice::Required,
+                    ParallelToolCallPolicy::Disabled,
+                    Vec::new(),
+                )
+                .unwrap_or_else(|error| panic!("{schema}: {error}"));
+            assert!(
+                accepts(
+                    &plan,
+                    json!({"calls": [{"name": "check", "arguments": arguments}]})
+                ),
+                "{schema}"
+            );
+        }
+        let plan = compiler()
+            .compile_tool_plan(
+                &DECLARATIVE_DIALECT,
+                SYNTHETIC_PARAMETERS,
+                &[tool("never", json!(false))],
+                ToolChoice::Required,
+                ParallelToolCallPolicy::Disabled,
+                Vec::new(),
+            )
+            .unwrap();
+        assert!(!accepts(
+            &plan,
+            json!({"calls": [{"name": "never", "arguments": {}}]})
+        ));
+    }
+
+    #[test]
+    fn completion_validation_survives_parser_forks_and_never_ends_invalid_calls() {
+        use eredu_core::generation::{FinishReason, SemanticEvent};
+        let plan = compiler().compile_tool_plan(
+            &DECLARATIVE_DIALECT, SYNTHETIC_PARAMETERS,
+            &[tool("check", json!({"properties": {"values": {"type": "array", "uniqueItems": true}}, "required": ["values"]}))],
+            ToolChoice::Required, ParallelToolCallPolicy::Disabled, Vec::new(),
+        ).unwrap();
+        let mut parser = plan.create_parser().unwrap();
+        parser
+            .push(r#"{"calls":[{"name":"check","arguments":{"values":[1,"#)
+            .unwrap();
+        parser.take_events();
+        let mut fork = parser.fork().unwrap();
+        assert!(fork.push("1]}}]}").unwrap_err().contains("do not match"));
+        assert!(!fork.events().contains(&SemanticEvent::ToolCallEnd));
+        parser.push("2]}}]}").unwrap();
+        parser.finish(FinishReason::GrammarComplete).unwrap();
+        assert!(parser.events().contains(&SemanticEvent::ToolCallEnd));
     }
 
     #[test]

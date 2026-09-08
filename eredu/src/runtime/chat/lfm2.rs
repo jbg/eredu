@@ -112,6 +112,13 @@ impl Lfm2Dialect {
             }
         }
         grammar.push_str(&builder.rules);
+        grammar.push_str(r#"python_value: PY_SINGLE_STRING | PY_DOUBLE_STRING | PY_NUMBER | "True" | "False" | "None" | "true" | "false" | "null" | python_any_mapping | python_any_array
+python_any_mapping: "{" (python_pair (", " python_pair)*)? "}"
+python_pair: (PY_SINGLE_STRING | PY_DOUBLE_STRING) ": " python_value
+python_any_array: "[" (python_value (", " python_value)*)? "]"
+python_any_arguments: (python_argument (", " python_argument)*)?
+python_argument: /[a-zA-Z_][a-zA-Z0-9_]*/ "=" python_value
+"#);
         grammar.push_str(
             r#"PY_INTEGER: /-?(0|[1-9][0-9]*)/
 PY_NUMBER: /-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?/
@@ -320,13 +327,18 @@ impl PythonGrammarBuilder {
             Some("number") => Ok("PY_NUMBER".into()),
             Some("boolean") => Ok("(\"True\" | \"False\" | \"true\" | \"false\")".into()),
             Some("null") => Ok("(\"None\" | \"null\")".into()),
-            other => Err(format!(
-                "LFM2 grammar received unsupported schema type {other:?}"
-            )),
+            _ => Ok("python_value".into()),
         }
     }
 
     fn object_rule(&mut self, schema: &Value, surface: ObjectSurface) -> Result<String, String> {
+        if !crate::runtime::chat::tool_schema::has_simple_properties(schema) {
+            return Ok(match surface {
+                ObjectSurface::Arguments => "python_any_arguments",
+                ObjectSurface::Mapping => "python_any_mapping",
+            }
+            .into());
+        }
         let object_rule = self.rule_name(match surface {
             ObjectSurface::Arguments => "python_arguments",
             ObjectSurface::Mapping => "python_mapping",
@@ -391,16 +403,15 @@ impl PythonGrammarBuilder {
 
     fn array_rule(&mut self, schema: &Value) -> Result<String, String> {
         let rule = self.rule_name("python_array");
-        let item = self.schema_rule(
-            schema
-                .get("items")
-                .expect("validated array schemas contain items"),
-        )?;
+        let item = self.schema_rule(schema.get("items").unwrap_or(&Value::Bool(true)))?;
         let minimum = schema.get("minItems").and_then(Value::as_u64).unwrap_or(0) as usize;
         let maximum = schema
             .get("maxItems")
             .and_then(Value::as_u64)
             .map(|value| value as usize);
+        if minimum > 4096 || maximum.is_some_and(|max| minimum > max || max > 4096) {
+            return Ok("python_any_array".into());
+        }
         let items = if maximum == Some(0) {
             String::new()
         } else if minimum == 0 {
@@ -661,10 +672,10 @@ impl Lfm2Parser {
                 }
                 ParserState::AfterCall => {
                     if current == ',' {
-                        sink.end_tool_call();
+                        sink.end_tool_call()?;
                         ParserState::CallSeparator
                     } else if current == ']' {
-                        sink.end_tool_call();
+                        sink.end_tool_call()?;
                         ParserState::AfterList
                     } else if current.is_whitespace() {
                         ParserState::AfterCall
@@ -1201,6 +1212,39 @@ mod tests {
         }
         assert!(pending.is_empty());
         Ok(())
+    }
+
+    #[test]
+    fn general_schemas_keep_python_syntax_and_validate_completed_calls() {
+        let tools = [tool(
+            "check",
+            json!({
+                "count": {"type": "integer", "minimum": 2},
+                "items": {"type": "array", "uniqueItems": true},
+                "value": {"type": ["string", "null"]}
+            }),
+            &["count", "items", "value"],
+        )];
+        let plan = plan(
+            &tools,
+            ToolChoice::Required,
+            ParallelToolCallPolicy::Disabled,
+        );
+        let valid =
+            format!("{TOOL_CALL_START}[check(count=2, items=[1, 2], value=None)]{TOOL_CALL_END}");
+        assert!(accepts(&plan, &valid));
+        let mut parser = plan.create_parser().unwrap();
+        parser.push(&valid).unwrap();
+        parser.finish(FinishReason::GrammarComplete).unwrap();
+        assert!(parser.events().contains(&SemanticEvent::ToolCallEnd));
+        for invalid in [
+            valid.replace("count=2", "count=1"),
+            valid.replace("[1, 2]", "[1, 1]"),
+        ] {
+            let mut parser = plan.create_parser().unwrap();
+            assert!(parser.push(&invalid).is_err());
+            assert!(!parser.events().contains(&SemanticEvent::ToolCallEnd));
+        }
     }
 
     #[test]

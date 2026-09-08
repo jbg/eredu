@@ -38,20 +38,30 @@ response plan; callers do not receive dialect parser or grammar state.
 
 Every preparation validates the entire tool envelope before model execution.
 Function names must be unique, 1–64 bytes long, and contain ASCII letters,
-digits, `_`, or `-`. Parameters must resolve to an object schema.
+digits, `_`, or `-`. Parameters accept JSON Schema objects or Boolean schemas,
+including numeric bounds, `anyOf`, `oneOf`, `allOf`, nullable type arrays,
+recursive references, and application annotations. An explicit top-level `type`
+is optional; the tool wire protocols still carry argument objects. The original
+schema is passed to the checkpoint template unchanged.
 
-The supported subset includes:
+Schema validity is checked with the `jsonschema` validator. Referenced resources
+must be included in the schema (for example, in `$defs`); preparation does not
+fetch remote resources or read referenced files. Malformed schemas and unresolved
+references fail before rendering.
 
-- nested objects and arrays;
-- required and optional properties;
-- string, number, integer, boolean, and null values;
-- enums; and
-- local, non-recursive `$ref` values.
+The decoder applies argument constraints when its grammar engine can compile
+them. Otherwise, it constrains the tool envelope, function names, call limits,
+and argument syntax. Every completed argument object is validated against the
+original schema before `ToolCallEnd` is emitted. This also preserves exact
+`oneOf` semantics when alternatives overlap. Invalid arguments produce a semantic
+generation error; previously streamed argument fragments remain provisional.
+Applications should execute a call only after receiving `ToolCallEnd`.
 
-External or recursive references, unsupported composition keywords, malformed
-bounds, and undeclared additional fields fail during preparation. Tool schemas
-are compiled per request, so independent requests on one loaded model can use
-different tools without sharing mutable parser state.
+Non-JSON protocols retain their spelling requirements, such as Python argument
+identifiers and tagged-parameter delimiters. Schema acceptance cannot make a
+checkpoint template or wire format represent every possible argument value.
+Schemas and validators are request-specific; parser forks share immutable
+validators and keep independent argument buffers.
 
 ## Generation APIs
 
@@ -132,9 +142,11 @@ profile when their observable byte protocol is equivalent.
 
 Qwen3.6 and Qwen3.8 calls contain a tagged function name and one repeated
 `<parameter=name>` block per top-level argument. String values are raw text;
-all other schema types are JSON encoded. Eredu retains the request's resolved
+all other schema types are JSON encoded. Eredu retains the request's
 schemas in the parser plan so ambiguous text such as `true` becomes either the
 JSON string `"true"` or boolean `true` according to the selected parameter.
+For unions that allow strings and other values, valid JSON is interpreted first,
+with raw text used when it does not match the parameter schema.
 Arguments are emitted to applications as one canonical JSON object. Unknown or
 duplicate parameters, wrong types, unsafe names, incomplete tags, and raw
 strings containing the unescaped closing delimiter fail closed. Historical

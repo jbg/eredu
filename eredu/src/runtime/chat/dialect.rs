@@ -712,8 +712,10 @@ impl DeclarativeDialectSpec {
                 let mut argument_rules = String::new();
                 for (index, tool) in tools.into_iter().enumerate() {
                     encoding.name_constraint.validate(&tool.name)?;
-                    let schema = serde_json::to_string(&tool.parameters)
-                        .expect("JSON schema values serialize");
+                    let schema = serde_json::to_string(
+                        &crate::runtime::chat::tool_schema::arguments_schema(&tool.parameters, "")?,
+                    )
+                    .expect("JSON schema values serialize");
                     alternatives.push(if let Some(call_id) = encoding.call_id {
                         format!(
                             "{} {} {} /[0-9]+/ {} named_arguments_{index}",
@@ -901,12 +903,7 @@ fn tagged_parameters_grammar(
     let mut tool_rules = Vec::with_capacity(tools.len());
     let mut next_value = 0usize;
     for (tool_index, tool) in tools.iter().enumerate() {
-        let properties = tool
-            .parameters
-            .get("properties")
-            .and_then(Value::as_object)
-            .cloned()
-            .unwrap_or_default();
+        let properties = tagged_properties(&tool.parameters);
         let required = tool
             .parameters
             .get("required")
@@ -922,22 +919,21 @@ fn tagged_parameters_grammar(
             next_value += 1;
             let mut value_consumes_suffix = false;
             match tagged_value_kind(&schema)? {
+                TaggedValueKind::RawStringOrJson => {
+                    rules.push_str(&format!(
+                        "{value_rule}[lazy]: /(?s:.)*/ {}\n",
+                        literal(encoding.parameter_suffix)
+                    ));
+                    value_consumes_suffix = true;
+                }
                 TaggedValueKind::RawString => {
                     if let Some(values) = schema.get("enum").and_then(Value::as_array) {
                         let alternatives = values
                             .iter()
-                            .map(|value| {
-                                let value = value.as_str().ok_or_else(|| {
-                                    "tagged string enum contains a non-string value".to_owned()
-                                })?;
-                                if value.contains(encoding.parameter_suffix) {
-                                    return Err(format!(
-                                        "tagged string enum value for {name:?} contains the parameter closing delimiter"
-                                    ));
-                                }
-                                Ok(literal(value))
-                            })
-                            .collect::<Result<Vec<_>, _>>()?;
+                            .filter_map(Value::as_str)
+                            .filter(|value| !value.contains(encoding.parameter_suffix))
+                            .map(literal)
+                            .collect::<Vec<_>>();
                         rules.push_str(&format!("{value_rule}: {}\n", alternatives.join(" | ")));
                     } else {
                         rules.push_str(&format!(
@@ -967,7 +963,20 @@ fn tagged_parameters_grammar(
             ));
             parameter_rules.push((name, parameter_rule));
         }
-        let sequence = tagged_parameter_sequence(&parameter_rules, &required, 0);
+        let sequence =
+            if !crate::runtime::chat::tool_schema::has_simple_properties(&tool.parameters) {
+                let name = format!("tagged_any_parameter_{tool_index}");
+                let value = format!("tagged_any_value_{tool_index}");
+                rules.push_str(&format!(
+                    "{name}: {} /[^<>\\r\\n]+/ {} {value}\n{value}[lazy]: /(?s:.)*/ {}\n",
+                    literal(encoding.parameter_prefix),
+                    literal(encoding.parameter_name_suffix),
+                    literal(encoding.parameter_suffix),
+                ));
+                format!("{name}*")
+            } else {
+                tagged_parameter_sequence(&parameter_rules, &required, 0)
+            };
         let tool_rule = format!("tagged_tool_{tool_index}");
         rules.push_str(&format!(
             "{tool_rule}: {} {} {} {sequence} {}\n",
@@ -1003,6 +1012,7 @@ fn tagged_parameter_sequence(
 enum TaggedValueKind {
     RawString,
     Json,
+    RawStringOrJson,
 }
 
 fn tagged_value_kind(schema: &Value) -> Result<TaggedValueKind, String> {
@@ -1015,11 +1025,11 @@ fn tagged_value_kind(schema: &Value) -> Result<TaggedValueKind, String> {
             return Ok(TaggedValueKind::RawString);
         }
         if strings != 0 {
-            return Err(
-                "tagged parameters cannot disambiguate enums mixing string and non-string values"
-                    .into(),
-            );
+            return Ok(TaggedValueKind::RawStringOrJson);
         }
+    }
+    if schema.get("type").and_then(Value::as_str).is_none() {
+        return Ok(TaggedValueKind::RawStringOrJson);
     }
     Ok(TaggedValueKind::Json)
 }
@@ -1043,16 +1053,38 @@ struct TaggedToolSchema {
     required: BTreeSet<String>,
 }
 
+fn tagged_properties(root: &Value) -> serde_json::Map<String, Value> {
+    // Resolve simple local references only for the raw-string/JSON wire choice.
+    // Validation always uses the complete original schema and its proper scopes.
+    fn resolve(schema: &Value, root: &Value, depth: usize) -> Value {
+        if depth >= 64 {
+            return schema.clone();
+        }
+        if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+            if let Some(target) = reference
+                .strip_prefix('#')
+                .and_then(|pointer| root.pointer(pointer))
+            {
+                return resolve(target, root, depth + 1);
+            }
+        }
+        schema.clone()
+    }
+    let object = resolve(root, root, 0);
+    object
+        .get("properties")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|properties| properties.iter())
+        .map(|(name, schema)| (name.clone(), resolve(schema, root, 0)))
+        .collect()
+}
+
 fn tagged_tool_catalog(tools: &[Value]) -> Result<BTreeMap<String, TaggedToolSchema>, String> {
     parse_tools(tools)?
         .into_iter()
         .map(|tool| {
-            let parameters = tool
-                .parameters
-                .get("properties")
-                .and_then(Value::as_object)
-                .cloned()
-                .unwrap_or_default()
+            let parameters = tagged_properties(&tool.parameters)
                 .into_iter()
                 .map(|(name, schema)| {
                     validate_tagged_parameter_name(&name)?;
@@ -1081,65 +1113,10 @@ fn tagged_tool_catalog(tools: &[Value]) -> Result<BTreeMap<String, TaggedToolSch
 }
 
 fn tagged_value_matches_schema(value: &Value, schema: &Value) -> bool {
-    if schema
-        .get("enum")
-        .and_then(Value::as_array)
-        .is_some_and(|values| !values.contains(value))
-    {
-        return false;
-    }
-    match schema.get("type").and_then(Value::as_str) {
-        Some("string") => value.is_string(),
-        Some("number") => value.is_number(),
-        Some("integer") => value.as_i64().is_some() || value.as_u64().is_some(),
-        Some("boolean") => value.is_boolean(),
-        Some("null") => value.is_null(),
-        Some("array") => {
-            let Some(values) = value.as_array() else {
-                return false;
-            };
-            let minimum = schema.get("minItems").and_then(Value::as_u64).unwrap_or(0) as usize;
-            let maximum = schema
-                .get("maxItems")
-                .and_then(Value::as_u64)
-                .map(|maximum| maximum as usize);
-            values.len() >= minimum
-                && maximum.is_none_or(|maximum| values.len() <= maximum)
-                && schema.get("items").is_none_or(|item| {
-                    values
-                        .iter()
-                        .all(|value| tagged_value_matches_schema(value, item))
-                })
-        }
-        Some("object") => {
-            let Some(object) = value.as_object() else {
-                return false;
-            };
-            let properties = schema.get("properties").and_then(Value::as_object);
-            schema
-                .get("required")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(Value::as_str)
-                .all(|name| object.contains_key(name))
-                && object.iter().all(|(name, value)| {
-                    if let Some(property) = properties.and_then(|properties| properties.get(name)) {
-                        tagged_value_matches_schema(value, property)
-                    } else {
-                        match schema.get("additionalProperties") {
-                            Some(Value::Bool(false)) => false,
-                            Some(additional) if additional.is_object() => {
-                                tagged_value_matches_schema(value, additional)
-                            }
-                            _ => true,
-                        }
-                    }
-                })
-        }
-        None => true,
-        _ => false,
-    }
+    // References may be rooted in the complete tool schema. The sink validates
+    // those with the correct scope once the argument object is complete.
+    crate::runtime::chat::tool_schema::compile(schema)
+        .map_or(true, |validator| validator.is_valid(value))
 }
 
 fn literal(text: &str) -> String {
@@ -1225,7 +1202,7 @@ fn structural_object_grammar(
     let alternatives = tools
         .iter()
         .map(|tool| {
-            let arguments = builder.schema_rule(&tool.parameters)?;
+            let arguments = builder.object_rule(&tool.parameters)?;
             Ok(format!(
                 "{} {} {arguments}",
                 resolver.resolve(encoding.name_prefix)?,
@@ -1234,7 +1211,13 @@ fn structural_object_grammar(
         })
         .collect::<Result<Vec<_>, String>>()?;
     let mut grammar = format!("structural_call: {}\n", alternatives.join(" | "));
+    let any_string = builder.schema_rule(&serde_json::json!({"type": "string"}))?;
     grammar.push_str(&builder.rules);
+    grammar.push_str(&format!(r#"structural_value: {any_string} | STRUCTURAL_NUMBER | "true" | "false" | "null" | structural_any_object | structural_any_array
+structural_any_object: "{{" (structural_pair ("," structural_pair)*)? "}}"
+structural_pair: /[^{{}}\[\],:\s<>][^{{}}\[\],:<>]*/ ":" structural_value
+structural_any_array: "[" (structural_value ("," structural_value)*)? "]"
+"#));
     grammar.push_str("STRUCTURAL_INTEGER: /-?(0|[1-9][0-9]*)/\n");
     grammar.push_str("STRUCTURAL_NUMBER: /-?(0|[1-9][0-9]*)(\\.[0-9]+)?([eE][+-]?[0-9]+)?/\n");
     grammar.push_str("STRUCTURAL_STRING_CHARACTER: /[^<]/\n");
@@ -1306,13 +1289,14 @@ impl<'a> StructuralGrammarBuilder<'a> {
             Some("number") => Ok("STRUCTURAL_NUMBER".into()),
             Some("boolean") => Ok("(\"true\" | \"false\")".into()),
             Some("null") => Ok("\"null\"".into()),
-            other => Err(format!(
-                "structural-object grammar received unsupported schema type {other:?}"
-            )),
+            _ => Ok("structural_value".into()),
         }
     }
 
     fn object_rule(&mut self, schema: &Value) -> Result<String, String> {
+        if !crate::runtime::chat::tool_schema::has_simple_properties(schema) {
+            return Ok("structural_any_object".into());
+        }
         let object_rule = self.rule_name("structural_object");
         let first_rule = self.rule_name("structural_first");
         let properties = schema
@@ -1394,16 +1378,15 @@ impl<'a> StructuralGrammarBuilder<'a> {
 
     fn array_rule(&mut self, schema: &Value) -> Result<String, String> {
         let rule = self.rule_name("structural_array");
-        let item = self.schema_rule(
-            schema
-                .get("items")
-                .expect("validated array schemas contain items"),
-        )?;
+        let item = self.schema_rule(schema.get("items").unwrap_or(&Value::Bool(true)))?;
         let minimum = schema.get("minItems").and_then(Value::as_u64).unwrap_or(0) as usize;
         let maximum = schema
             .get("maxItems")
             .and_then(Value::as_u64)
             .map(|value| value as usize);
+        if minimum > 4096 || maximum.is_some_and(|max| minimum > max || max > 4096) {
+            return Ok("structural_any_array".into());
+        }
         let items = repeated_rule(&item, "\",\"", minimum, maximum);
         self.rules
             .push_str(&format!("{rule}: \"[\" {items} \"]\"\n"));
@@ -2113,15 +2096,6 @@ impl DeclarativeParser {
                     };
                     let parameter = self.pending[..position].to_owned();
                     validate_tagged_parameter_name(&parameter)?;
-                    let schema = self
-                        .tagged_tools
-                        .get(tool)
-                        .expect("selected tagged tool has a schema");
-                    if !schema.parameters.contains_key(&parameter) {
-                        return Err(format!(
-                            "tagged tool {tool:?} has no parameter {parameter:?}"
-                        ));
-                    }
                     if arguments.contains_key(&parameter) {
                         return Err(format!(
                             "tagged tool {tool:?} repeats parameter {parameter:?}"
@@ -2153,9 +2127,16 @@ impl DeclarativeParser {
                         .tagged_tools
                         .get(tool)
                         .expect("selected tagged tool has a schema")
-                        .parameters[parameter];
+                        .parameters
+                        .get(parameter)
+                        .unwrap_or(&Value::Bool(true));
                     let value = match tagged_value_kind(schema)? {
                         TaggedValueKind::RawString => Value::String(raw.to_owned()),
+                        TaggedValueKind::RawStringOrJson => {
+                            serde_json::from_str(raw).ok()
+                                .filter(|value| tagged_value_matches_schema(value, schema))
+                                .unwrap_or_else(|| Value::String(raw.to_owned()))
+                        }
                         TaggedValueKind::Json => serde_json::from_str(raw).map_err(|error| {
                             format!(
                                 "tagged tool {tool:?} parameter {parameter:?} contains invalid JSON: {error}"
@@ -2235,7 +2216,7 @@ impl DeclarativeParser {
                         if !self.consume_exact(&expected)? {
                             return Ok(());
                         }
-                        sink.end_tool_call();
+                        sink.end_tool_call()?;
                         self.state = if self.spec.output.prefix.is_empty()
                             && self.spec.call_separator.is_empty()
                         {
@@ -2250,7 +2231,7 @@ impl DeclarativeParser {
                         if !self.consume_exact(&expected)? {
                             return Ok(());
                         }
-                        sink.end_tool_call();
+                        sink.end_tool_call()?;
                         self.state = if self.spec.output.prefix.is_empty()
                             && self.spec.call_separator.is_empty()
                         {
@@ -2263,7 +2244,7 @@ impl DeclarativeParser {
                         if !self.consume_exact(self.spec.call.suffix)? {
                             return Ok(());
                         }
-                        sink.end_tool_call();
+                        sink.end_tool_call()?;
                         self.state = if self.spec.output.prefix.is_empty()
                             && self.spec.call_separator.is_empty()
                         {
@@ -2276,7 +2257,7 @@ impl DeclarativeParser {
                         if !self.consume_exact(self.spec.call.suffix)? {
                             return Ok(());
                         }
-                        sink.end_tool_call();
+                        sink.end_tool_call()?;
                         self.state = if self.spec.output.prefix.is_empty()
                             && self.spec.call_separator.is_empty()
                         {
@@ -2299,11 +2280,11 @@ impl DeclarativeParser {
                             return Ok(());
                         }
                         if self.pending.starts_with(']') {
-                            sink.end_tool_call();
+                            sink.end_tool_call()?;
                             self.pending.drain(..1);
                             self.state = DeclarativeParserState::ToolSuffix;
                         } else if self.consume_exact(self.spec.call_separator)? {
-                            sink.end_tool_call();
+                            sink.end_tool_call()?;
                             self.state = DeclarativeParserState::ListItemOrEnd { allow_end: false };
                         } else {
                             return Ok(());
@@ -3453,6 +3434,74 @@ mod tests {
         }
         assert!(pending.is_empty(), "split {split} left incomplete UTF-8");
         Ok(())
+    }
+
+    #[test]
+    fn structural_arguments_support_compound_object_schemas() {
+        let tools = [
+            json!({"type": "function", "function": {"name": "check", "parameters": {
+                "allOf": [{"required": ["value"]}, {"properties": {"value": {"type": "array", "uniqueItems": true}}}]
+            }}}),
+        ];
+        let plan = ConstraintCompiler::synthetic_for_tests()
+            .compile_tool_plan(
+                &DECLARATIVE_DIALECT,
+                DialectParameters::Declarative(&STRUCTURAL_CHANNEL_OBJECT_SPEC),
+                &tools,
+                ToolChoice::Required,
+                ParallelToolCallPolicy::Disabled,
+                Vec::new(),
+            )
+            .unwrap();
+        let output = "<|tool_call>call:check{value:[1,2]}<tool_call|><|tool_response>";
+        assert!(accepts(
+            &plan,
+            output.strip_suffix("<|tool_response>").unwrap()
+        ));
+        let mut parser = plan.create_parser().unwrap();
+        parser.push(output).unwrap();
+        parser.finish(FinishReason::GrammarComplete).unwrap();
+        assert!(parser.events().contains(&SemanticEvent::ToolCallEnd));
+        let mut parser = plan.create_parser().unwrap();
+        assert!(parser.push(&output.replace("[1,2]", "[1,1]")).is_err());
+        assert!(!parser.events().contains(&SemanticEvent::ToolCallEnd));
+    }
+
+    #[test]
+    fn tagged_parameters_accept_nullable_unions_and_validate_constraints() {
+        let tools = [
+            json!({"type": "function", "function": {"name": "check", "parameters": {
+                "properties": {
+                    "count": {"type": "integer", "minimum": 2},
+                    "value": {"type": ["string", "null"]}
+                }, "required": ["count", "value"], "additionalProperties": false
+            }}}),
+        ];
+        let plan = ConstraintCompiler::synthetic_for_tests()
+            .compile_tool_plan(
+                &DECLARATIVE_DIALECT,
+                DialectParameters::Declarative(
+                    &crate::runtime::chat::QWEN_TAGGED_TOOL_SPEC_NO_REASONING,
+                ),
+                &tools,
+                ToolChoice::Required,
+                ParallelToolCallPolicy::Disabled,
+                vec![250],
+            )
+            .unwrap();
+        for value in ["null", "plain text"] {
+            let valid = format!("<tool_call>\n<function=check>\n<parameter=count>\n2\n</parameter>\n<parameter=value>\n{value}\n</parameter>\n</function>\n</tool_call>");
+            assert!(accepts(&plan, &valid));
+            for split in 0..=valid.len() {
+                let mut parser = plan.create_parser().unwrap();
+                push_at_byte_split(&mut parser, &valid, split);
+                parser.finish(FinishReason::GrammarComplete).unwrap();
+                assert!(parser.events().contains(&SemanticEvent::ToolCallEnd));
+            }
+            let mut parser = plan.create_parser().unwrap();
+            assert!(parser.push(&valid.replace("\n2\n", "\n1\n")).is_err());
+            assert!(!parser.events().contains(&SemanticEvent::ToolCallEnd));
+        }
     }
 
     #[test]

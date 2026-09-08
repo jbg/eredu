@@ -140,6 +140,7 @@ thiserror = "2"
 serde_json = "1"
 sha2.workspace = true
 llguidance = { version = "1.8.0", default-features = false, features = ["ahash", "lark"] }
+jsonschema = { version = "0.52.0", default-features = false }
 
 [dev-dependencies]
 anyhow = "1"

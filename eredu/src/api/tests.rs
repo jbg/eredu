@@ -3264,7 +3264,7 @@ fn synthetic_profile_compiles_request_tools_before_rendering() {
                     "type": "object",
                     "properties": {
                         "query": {
-                            "oneOf": [{"type": "string"}, {"type": "number"}]
+                            "oneOf": "not an array"
                         }
                     }
                 }
@@ -3285,7 +3285,7 @@ fn synthetic_profile_compiles_request_tools_before_rendering() {
     .unwrap_err();
     assert!(matches!(
         error,
-        TextModelError::ToolConstraint(ref message) if message.contains("unsupported schema composition")
+        TextModelError::ToolConstraint(ref message) if message.contains("tools[0].function.parameters")
     ));
 }
 
