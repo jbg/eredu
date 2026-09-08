@@ -467,7 +467,8 @@ struct HybridConfigSource {
     num_experts_per_tok: i32,
     #[serde(default = "default_num_experts")]
     num_experts: i32,
-    #[serde(default)]
+    // Released Qwen3.5 MoE configs omit this field but normalize selected experts.
+    #[serde(default = "default_true")]
     norm_topk_prob: bool,
     #[serde(default)]
     layer_types: Vec<LayerPolicySource>,
@@ -1494,6 +1495,27 @@ mod tests {
         let conditional = model_args_from_config_value(&conditional).unwrap();
         assert_eq!(conditional.text.variant, HybridVariant::Qwen35Moe);
         assert!(conditional.vision.is_some());
+    }
+
+    #[test]
+    fn omitted_expert_normalization_uses_the_released_routing_policy() {
+        for model_type in ["qwen3_next", "qwen3_5_moe_text", "qwen3_5_moe"] {
+            for explicit in [None, Some(true), Some(false)] {
+                let mut value = text_config(model_type);
+                if let Some(normalize) = explicit {
+                    value["norm_topk_prob"] = json!(normalize);
+                }
+                if model_type == "qwen3_5_moe" {
+                    value = json!({"model_type": model_type, "text_config": value});
+                }
+                let config = model_args_from_config_value(&value).unwrap().text;
+                assert_eq!(
+                    config.routing_spec().unwrap().normalize_selected(),
+                    explicit.unwrap_or(true),
+                    "{model_type}, norm_topk_prob={explicit:?}"
+                );
+            }
+        }
     }
 
     #[test]

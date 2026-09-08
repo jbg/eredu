@@ -292,3 +292,88 @@ fn block_fp8_dense_and_grouped_scale_block_boundaries() {
         );
     }
 }
+
+#[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
+#[test]
+fn mixed_fp8_projections_match_independent_block_scaled_reference() {
+    fn decode(bits: u8) -> f32 {
+        let exponent = (bits >> 3) & 15;
+        let mantissa = bits & 7;
+        let magnitude = if exponent == 0 {
+            f32::from(mantissa) * 2.0_f32.powi(-9)
+        } else {
+            (1.0 + f32::from(mantissa) / 8.0) * 2.0_f32.powi(i32::from(exponent) - 7)
+        };
+        if bits & 128 != 0 {
+            -magnitude
+        } else {
+            magnitude
+        }
+    }
+    let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+    let stream = context.stream();
+    let (in_dim, out_dim, groups) = (257_usize, 130_usize, 3_usize);
+    let codes = (0_u8..127).chain(128..255).collect::<Vec<_>>();
+    let weights = (0..groups * out_dim * in_dim)
+        .map(|i| codes[(i * 73 + i / in_dim * 11) % codes.len()])
+        .collect::<Vec<_>>();
+    let scales = (0..groups * 2 * 3)
+        .map(|i| ((i % 7 + 1) as f32) / 128.0)
+        .collect::<Vec<_>>();
+    let weight = Array::from_slice(&weights, &[groups as i32, out_dim as i32, in_dim as i32]);
+    let scale = Array::from_slice(&scales, &[groups as i32, 2, 3])
+        .as_dtype(Dtype::Bfloat16, stream)
+        .unwrap();
+    // Both sides of the Metal tiled/scalar dispatch boundary. Each activation
+    // block includes 448, so its dynamic scale is exactly one and a scalar
+    // reference can use the original representable values without quantizing.
+    for rows in [1_usize, 8, 9] {
+        let input = (0..rows * in_dim)
+            .map(|i| {
+                if (i % in_dim) % 128 == 0 {
+                    448.0
+                } else {
+                    decode(codes[(i * 37) % codes.len()])
+                }
+            })
+            .collect::<Vec<_>>();
+        let ids = (0..rows)
+            .map(|i| ((i * 2 + 1) % groups) as u32)
+            .collect::<Vec<_>>();
+        let input_array = Array::from_slice(&input, &[rows as i32, in_dim as i32]);
+        let ids_array = Array::from_slice(&ids, &[rows as i32]);
+        for grouped in [false, true] {
+            let output = if grouped {
+                grouped_linear(&input_array, &weight, &scale, &ids_array, stream).unwrap()
+            } else {
+                linear(
+                    &input_array,
+                    &weight.try_index_device(0, stream).unwrap(),
+                    &scale.try_index_device(0, stream).unwrap(),
+                    stream,
+                )
+                .unwrap()
+            };
+            let output = output.evaluated().unwrap();
+            for row in 0..rows {
+                let group = if grouped { ids[row] as usize } else { 0 };
+                for col in 0..out_dim {
+                    let mut expected = 0.0_f64;
+                    let mut magnitude = 0.0_f64;
+                    for k in 0..in_dim {
+                        let term = f64::from(input[row * in_dim + k])
+                            * f64::from(decode(weights[(group * out_dim + col) * in_dim + k]))
+                            * f64::from(scales[(group * 2 + col / 128) * 3 + k / 128]);
+                        expected += term;
+                        magnitude += term.abs();
+                    }
+                    let actual = f64::from(output.as_slice::<f32>()[row * out_dim + col]);
+                    assert!(
+                        (actual - expected).abs() <= 2e-6 * magnitude.max(1.0),
+                        "rows={rows}, grouped={grouped}, row={row}, col={col}: {actual} != {expected}"
+                    );
+                }
+            }
+        }
+    }
+}
