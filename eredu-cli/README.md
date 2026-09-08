@@ -28,6 +28,13 @@ eredu --model /path/to/model --device cpu \
   "Tell me a short story."
 ```
 
+Generation settings, including repetition, frequency, and presence penalties,
+use values from the checkpoint's `generation_config.json` when supplied there.
+Only explicit command-line arguments override those values. For example,
+`--presence-penalty 0` disables a checkpoint's presence penalty, and
+`--repeat-penalty 1` disables its repetition penalty. Use `--verbose` to see
+the effective settings.
+
 On supported CUDA hosts, disabling the default features and enabling `cuda`
 replaces the default Metal/Accelerate backend selection instead of combining
 native backends.

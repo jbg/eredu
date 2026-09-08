@@ -327,21 +327,21 @@ struct Cli {
     #[arg(long, default_value_t = 0.1, value_name = "FLOAT")]
     mirostat_eta: f32,
 
-    /// Penalty for repeating a token. One disables the penalty.
-    #[arg(long, default_value_t = 1.0, value_name = "FLOAT")]
-    repeat_penalty: f32,
+    /// Penalty for repeating a token. Defaults to the checkpoint, then 1 (disabled).
+    #[arg(long, value_name = "FLOAT")]
+    repeat_penalty: Option<f32>,
 
-    /// Number of generated tokens considered for repetition penalties; -1 means all.
-    #[arg(long, default_value_t = 64, value_name = "TOKENS")]
-    repeat_last_n: i32,
+    /// Penalty history length. Defaults to the checkpoint, then 64; -1 means all.
+    #[arg(long, value_name = "TOKENS")]
+    repeat_last_n: Option<i32>,
 
-    /// Penalty proportional to the number of times a token was generated.
-    #[arg(long, default_value_t = 0.0, value_name = "FLOAT")]
-    frequency_penalty: f32,
+    /// Penalty per token occurrence. Defaults to the checkpoint, then 0 (disabled).
+    #[arg(long, value_name = "FLOAT")]
+    frequency_penalty: Option<f32>,
 
-    /// Penalty applied once when a token has already been generated.
-    #[arg(long, default_value_t = 0.0, value_name = "FLOAT")]
-    presence_penalty: f32,
+    /// Penalty applied once per generated token type. Defaults to the checkpoint, then 0 (disabled).
+    #[arg(long, value_name = "FLOAT")]
+    presence_penalty: Option<f32>,
 
     /// Random seed used when temperature is non-zero.
     #[arg(long, default_value_t = 0)]
@@ -469,6 +469,23 @@ struct Cli {
     /// Write stable structured execution telemetry to this JSON file.
     #[arg(long, value_name = "PATH")]
     telemetry_json: Option<PathBuf>,
+}
+
+impl Cli {
+    fn generation_overrides(&self) -> GenerationConfigOverrides {
+        GenerationConfigOverrides {
+            temperature: self.temperature,
+            top_k: self.top_k,
+            top_p: self.top_p,
+            min_p: self.min_p,
+            repetition_penalty: self.repeat_penalty,
+            repeat_last_n: self.repeat_last_n,
+            frequency_penalty: self.frequency_penalty,
+            presence_penalty: self.presence_penalty,
+            max_new_tokens: self.max_tokens,
+            ..GenerationConfigOverrides::default()
+        }
+    }
 }
 
 const AUTOMATIC_OVERRIDE_ARGUMENTS: &[&str] = &[
@@ -2226,18 +2243,8 @@ fn main() -> Result<()> {
     }
     .with_context(|| format!("failed to load model from {}", model_path.display()))?;
     let (mut model, mut drafting) = planned.into_parts();
-    let mut resolved_generation = model.resolve_generation_config(GenerationConfigOverrides {
-        temperature: args.temperature,
-        top_k: args.top_k,
-        top_p: args.top_p,
-        min_p: args.min_p,
-        repetition_penalty: Some(args.repeat_penalty),
-        repeat_last_n: Some(args.repeat_last_n),
-        frequency_penalty: Some(args.frequency_penalty),
-        presence_penalty: Some(args.presence_penalty),
-        max_new_tokens: args.max_tokens,
-        ..GenerationConfigOverrides::default()
-    })?;
+    let generation_overrides = args.generation_overrides();
+    let mut resolved_generation = model.resolve_generation_config(generation_overrides)?;
     let temperature = resolved_generation.temperature;
     let top_k = resolved_generation.top_k;
     let top_p = resolved_generation.top_p;
@@ -2254,8 +2261,12 @@ fn main() -> Result<()> {
             "Eredu defaults plus CLI overrides"
         };
         eprintln!(
-            "generation_config: do_sample={}, temperature={temperature}, top_k={top_k}, top_p={top_p}, min_p={min_p}, max_tokens={max_tokens} ({source})",
-            resolved_generation.do_sample
+            "generation_config: do_sample={}, temperature={temperature}, top_k={top_k}, top_p={top_p}, min_p={min_p}, repetition_penalty={}, repeat_last_n={}, frequency_penalty={}, presence_penalty={}, max_tokens={max_tokens} ({source})",
+            resolved_generation.do_sample,
+            resolved_generation.repetition_penalty,
+            resolved_generation.repeat_last_n,
+            resolved_generation.frequency_penalty,
+            resolved_generation.presence_penalty,
         );
     }
     model.synchronize()?;
@@ -2387,16 +2398,8 @@ fn main() -> Result<()> {
     if let Some(prepared) = &prepared_chat {
         let settings = PreparedChatGenerationSettings {
             overrides: GenerationConfigOverrides {
-                temperature: Some(temperature),
-                top_k: Some(top_k),
-                top_p: Some(top_p),
-                min_p: Some(min_p),
-                repetition_penalty: Some(args.repeat_penalty),
-                repeat_last_n: Some(args.repeat_last_n),
-                frequency_penalty: Some(args.frequency_penalty),
-                presence_penalty: Some(args.presence_penalty),
                 max_new_tokens: Some(max_tokens),
-                ..GenerationConfigOverrides::default()
+                ..generation_overrides
             },
             seed: args.seed,
         };
@@ -2903,13 +2906,22 @@ fn validate_args(args: &Cli) -> Result<()> {
     if !args.mirostat_eta.is_finite() || args.mirostat_eta <= 0.0 {
         bail!("--mirostat-eta must be a finite number greater than zero");
     }
-    if !args.repeat_penalty.is_finite() || args.repeat_penalty <= 0.0 {
+    if args
+        .repeat_penalty
+        .is_some_and(|value| !value.is_finite() || value <= 0.0)
+    {
         bail!("--repeat-penalty must be a finite number greater than zero");
     }
-    if args.repeat_last_n < -1 {
+    if args.repeat_last_n.is_some_and(|value| value < -1) {
         bail!("--repeat-last-n must be -1 or greater");
     }
-    if !args.frequency_penalty.is_finite() || !args.presence_penalty.is_finite() {
+    if args
+        .frequency_penalty
+        .is_some_and(|value| !value.is_finite())
+        || args
+            .presence_penalty
+            .is_some_and(|value| !value.is_finite())
+    {
         bail!("frequency and presence penalties must be finite numbers");
     }
     requested_load_quantization(args)?;
@@ -4320,11 +4332,154 @@ mod tests {
     #[test]
     fn leaves_generation_options_unspecified_for_checkpoint_defaults() {
         let args = Cli::try_parse_from(["eredu", "--model", "model-id", "prompt"]).unwrap();
-        assert_eq!(args.temperature, None);
-        assert_eq!(args.top_k, None);
-        assert_eq!(args.top_p, None);
-        assert_eq!(args.min_p, None);
-        assert_eq!(args.max_tokens, None);
+        assert_eq!(
+            args.generation_overrides(),
+            eredu_core::GenerationConfigOverrides::default()
+        );
+        let resolved =
+            eredu_core::resolve_generation_config(None, args.generation_overrides()).unwrap();
+        assert_eq!(resolved.repetition_penalty, 1.0);
+        assert_eq!(resolved.repeat_last_n, 64);
+        assert_eq!(resolved.frequency_penalty, 0.0);
+        assert_eq!(resolved.presence_penalty, 0.0);
+    }
+
+    #[test]
+    fn generation_arguments_override_only_explicit_checkpoint_settings() {
+        use eredu_core::{CheckpointGenerationConfig, ResolvedGenerationConfig};
+
+        let checkpoint: CheckpointGenerationConfig = serde_json::from_value(serde_json::json!({
+            "do_sample": true, "temperature": 1.2, "top_k": 23, "top_p": 0.85,
+            "min_p": 0.1, "repetition_penalty": 1.3, "repeat_last_n": 129,
+            "frequency_penalty": 0.4, "presence_penalty": 1.5, "max_new_tokens": 1024
+        }))
+        .unwrap();
+        let inherited = ResolvedGenerationConfig {
+            do_sample: true,
+            temperature: 1.2,
+            top_k: 23,
+            top_p: 0.85,
+            min_p: 0.1,
+            repetition_penalty: 1.3,
+            repeat_last_n: 129,
+            frequency_penalty: 0.4,
+            presence_penalty: 1.5,
+            max_new_tokens: Some(1024),
+        };
+        let cases = [
+            (None, inherited),
+            (
+                Some("--temperature=0"),
+                ResolvedGenerationConfig {
+                    do_sample: false,
+                    temperature: 0.0,
+                    ..inherited
+                },
+            ),
+            (
+                Some("--top-k=0"),
+                ResolvedGenerationConfig {
+                    top_k: 0,
+                    ..inherited
+                },
+            ),
+            (
+                Some("--top-p=1"),
+                ResolvedGenerationConfig {
+                    top_p: 1.0,
+                    ..inherited
+                },
+            ),
+            (
+                Some("--min-p=0"),
+                ResolvedGenerationConfig {
+                    min_p: 0.0,
+                    ..inherited
+                },
+            ),
+            (
+                Some("--repeat-penalty=1"),
+                ResolvedGenerationConfig {
+                    repetition_penalty: 1.0,
+                    ..inherited
+                },
+            ),
+            (
+                Some("--repeat-last-n=0"),
+                ResolvedGenerationConfig {
+                    repeat_last_n: 0,
+                    ..inherited
+                },
+            ),
+            (
+                Some("--frequency-penalty=0"),
+                ResolvedGenerationConfig {
+                    frequency_penalty: 0.0,
+                    ..inherited
+                },
+            ),
+            (
+                Some("--presence-penalty=0"),
+                ResolvedGenerationConfig {
+                    presence_penalty: 0.0,
+                    ..inherited
+                },
+            ),
+            (
+                Some("--max-tokens=512"),
+                ResolvedGenerationConfig {
+                    max_new_tokens: Some(512),
+                    ..inherited
+                },
+            ),
+        ];
+        for raw in [false, true] {
+            for (flag, expected) in cases {
+                let mut command = vec!["eredu", "--model", "model-id", "prompt"];
+                if raw {
+                    command.push("--raw");
+                }
+                command.extend(flag);
+                let args = Cli::try_parse_from(command).unwrap();
+                validate_args(&args).unwrap();
+                let resolved = eredu_core::resolve_generation_config(
+                    Some(&checkpoint),
+                    args.generation_overrides(),
+                )
+                .unwrap();
+                assert_eq!(resolved, expected, "raw={raw}, flag={flag:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn validates_explicit_generation_penalties() {
+        for flag in [
+            "--repeat-penalty=0",
+            "--repeat-penalty=NaN",
+            "--repeat-penalty=inf",
+            "--repeat-last-n=-2",
+            "--frequency-penalty=NaN",
+            "--frequency-penalty=inf",
+            "--presence-penalty=NaN",
+            "--presence-penalty=inf",
+        ] {
+            let args =
+                Cli::try_parse_from(["eredu", "--model", "model-id", flag, "prompt"]).unwrap();
+            assert!(validate_args(&args).is_err(), "{flag}");
+        }
+        let args = Cli::try_parse_from([
+            "eredu",
+            "--model",
+            "model-id",
+            "--repeat-penalty=1.5",
+            "--repeat-last-n=-1",
+            "--frequency-penalty=-0.5",
+            "--presence-penalty=-0.5",
+            "prompt",
+        ])
+        .unwrap();
+        validate_args(&args).unwrap();
     }
 
     #[test]
