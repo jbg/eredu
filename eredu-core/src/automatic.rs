@@ -686,6 +686,72 @@ pub trait AutomaticPlanningBackend {
     ) -> Result<BoundedResidencyRequirement, AutomaticPlanningError>;
 }
 
+// One planning call owns one inspection. Admission and bounded geometry are
+// facts about an exact candidate, so feedback and final selection can consume
+// the same results without probing that candidate a second time.
+struct PlanningValidation<'a, B> {
+    backend: &'a B,
+    admissions: std::cell::RefCell<
+        Vec<(
+            ExecutionPlan,
+            Result<CandidateAdmission, AutomaticPlanningError>,
+        )>,
+    >,
+    bounds: std::cell::RefCell<
+        Vec<(
+            ExecutionPlan,
+            Result<BoundedResidencyRequirement, AutomaticPlanningError>,
+        )>,
+    >,
+}
+
+impl<B: AutomaticPlanningBackend> AutomaticPlanningBackend for PlanningValidation<'_, B> {
+    type Inspection = B::Inspection;
+
+    fn backend_id(&self) -> crate::execution::BackendId {
+        self.backend.backend_id()
+    }
+
+    fn discover_hardware(&self) -> Result<HardwareProfile, AutomaticPlanningError> {
+        self.backend.discover_hardware()
+    }
+
+    fn inspect_resources(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<(ModelResourceProfile, Self::Inspection), AutomaticPlanningError> {
+        self.backend.inspect_resources(path)
+    }
+
+    fn admit_candidate(
+        &self,
+        inspection: &Self::Inspection,
+        plan: &ExecutionPlan,
+    ) -> Result<CandidateAdmission, AutomaticPlanningError> {
+        let mut admissions = self.admissions.borrow_mut();
+        if let Some((_, admission)) = admissions.iter().find(|(candidate, _)| candidate == plan) {
+            return admission.clone();
+        }
+        let admission = self.backend.admit_candidate(inspection, plan);
+        admissions.push((plan.clone(), admission.clone()));
+        admission
+    }
+
+    fn bounded_residency_requirement(
+        &self,
+        inspection: &Self::Inspection,
+        plan: &ExecutionPlan,
+    ) -> Result<BoundedResidencyRequirement, AutomaticPlanningError> {
+        let mut bounds = self.bounds.borrow_mut();
+        if let Some((_, bound)) = bounds.iter().find(|(candidate, _)| candidate == plan) {
+            return bound.clone();
+        }
+        let bound = self.backend.bounded_residency_requirement(inspection, plan);
+        bounds.push((plan.clone(), bound.clone()));
+        bound
+    }
+}
+
 /// A portable report paired with the one artifact inspection used by every probe.
 pub struct RetainedAutomaticPlan<I> {
     report: ExecutionPlanReport,
@@ -1218,6 +1284,11 @@ impl AutomaticPlanner {
         ) -> Result<ExecutionPlan, AutomaticPlanningError>,
     ) -> Result<RetainedAutomaticPlan<B::Inspection>, AutomaticPlanningError> {
         validate_request(request, &self.policy)?;
+        let backend = &PlanningValidation {
+            backend,
+            admissions: Default::default(),
+            bounds: Default::default(),
+        };
         let backend_id = backend.backend_id();
         if request.device.backend != backend_id {
             return Err(AutomaticPlanningError::Invalid(format!(
@@ -2110,7 +2181,7 @@ mod tests {
     }
 
     #[test]
-    fn automatic_planning_retains_one_inspection_and_exactly_reprobes_the_final_plan() {
+    fn automatic_planning_validates_each_exact_candidate_once_and_retains_the_final_proof() {
         let backend = RetainedPlanningBackend {
             inner: MockPlanningBackend {
                 model_bytes: 10 << 30,
@@ -2127,6 +2198,15 @@ mod tests {
             .plan_retained(&backend, &request)
             .unwrap();
         assert_eq!(backend.inspections.get(), 1);
+        for candidates in [&backend.admissions, &backend.bounded_probes] {
+            let candidates = candidates.borrow();
+            for (index, candidate) in candidates.iter().enumerate() {
+                assert!(
+                    !candidates[..index].contains(candidate),
+                    "candidate was validated twice: {candidate:?}"
+                );
+            }
+        }
         assert_eq!(
             backend.admissions.borrow().last(),
             Some(&retained.report().plan)

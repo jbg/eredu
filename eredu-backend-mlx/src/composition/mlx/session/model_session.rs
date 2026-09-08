@@ -531,8 +531,8 @@ pub struct MlxModelSession {
     authority: RefCell<SessionAuthority>,
     floating_state_dtype_bytes: std::num::NonZeroU8,
     capabilities: eredu_core::SessionCapabilities,
-    capture_discovery: Option<eredu_core::capture::CaptureDiscovery>,
-    intervention_discovery: Option<eredu_core::intervention::InterventionDiscovery>,
+    capture_discovery: Option<eredu_architectures::prepared_sources::PreparedModelDiscovery>,
+    intervention_session_identity: String,
     state_residency: CacheResidencyPolicy,
 }
 
@@ -588,11 +588,8 @@ impl MlxModelSession {
         let processor = model.take_processor();
         let distributed = model.take_distributed();
         let capture_discovery = model.take_capture_discovery();
-        let mut intervention_discovery = model.take_intervention_discovery();
-        if let Some(discovery) = &mut intervention_discovery {
-            discovery.session_identity =
-                Some(eredu_core::intervention::new_intervention_session_identity());
-        }
+        let intervention_session_identity =
+            eredu_core::intervention::new_intervention_session_identity();
         let (executable, target) = model.into_execution_parts();
         #[cfg(test)]
         crate::tests::support::path_instrumentation::session_reset_attempt();
@@ -616,7 +613,7 @@ impl MlxModelSession {
             floating_state_dtype_bytes,
             capabilities: realized_capabilities,
             capture_discovery,
-            intervention_discovery,
+            intervention_session_identity,
             state_residency,
         };
         session.reset()?;
@@ -1285,15 +1282,15 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
         runtime: &ModelRuntime<Self>,
     ) -> Result<eredu_core::intervention::InterventionDiscovery, eredu_core::capture::CaptureError>
     {
-        runtime
-            .session()
-            .intervention_discovery
-            .clone()
-            .ok_or_else(|| {
-                eredu_core::capture::CaptureError::Unsupported(
-                    "session has no retained intervention catalog".into(),
-                )
-            })
+        let session = runtime.session();
+        let prepared = session.capture_discovery.as_ref().ok_or_else(|| {
+            eredu_core::capture::CaptureError::Unsupported(
+                "session has no retained intervention catalog".into(),
+            )
+        })?;
+        let mut discovery = prepared.intervention(&super::intervention::mechanisms())?;
+        discovery.session_identity = Some(session.intervention_session_identity.clone());
+        Ok(discovery)
     }
 
     fn validate_text_interventions(
@@ -1339,11 +1336,16 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
     fn capture_discovery(
         runtime: &ModelRuntime<Self>,
     ) -> Result<eredu_core::capture::CaptureDiscovery, eredu_core::capture::CaptureError> {
-        runtime.session().capture_discovery.clone().ok_or_else(|| {
-            eredu_core::capture::CaptureError::Unsupported(
-                "session has no retained capture catalog".into(),
-            )
-        })
+        runtime
+            .session()
+            .capture_discovery
+            .as_ref()
+            .ok_or_else(|| {
+                eredu_core::capture::CaptureError::Unsupported(
+                    "session has no retained capture catalog".into(),
+                )
+            })?
+            .capture()
     }
 
     fn configure_text_capture(

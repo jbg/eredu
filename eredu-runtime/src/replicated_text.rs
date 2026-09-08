@@ -4248,6 +4248,178 @@ mod tests {
     }
 
     #[test]
+    fn bank_members_share_task_validation_and_reject_unadmitted_member_sources() {
+        use eredu_checkpoint::recipe::{DerivedWeightRecipe, RecipeDtype, RecipeMetadata};
+        use eredu_checkpoint::store::TensorSelection;
+
+        let selected = select_replicated_text_realization(
+            &requirements(),
+            &request(LayerWeightResidency::FullyResident),
+            &capabilities(),
+        )
+        .unwrap();
+        let mut task = selected.materialization_tasks()[0].clone();
+        task.physical_sources[0] = ReplicatedTextPhysicalSource::new(
+            "blk.0.ffn.weight",
+            "blk.0.ffn.weight",
+            "/checkpoint/model.safetensors",
+            "blk.0.ffn.weight",
+            SourceTensorEncoding::Safetensors(StoredDtype::F16),
+            8192,
+        )
+        .unwrap();
+        let shared = crate::AddressableBankTask::new(task).unwrap();
+        let metadata = RecipeMetadata {
+            shape: vec![1, 64],
+            dtype: RecipeDtype::F16,
+            byte_len: 128,
+        };
+        let mut members = Vec::new();
+        for member in 0..64 {
+            let parameter = crate::AddressableBankParameter::from_shared_task(
+                "weight",
+                shared.clone(),
+                DerivedWeightRecipe::source(
+                    "blk.0.ffn.weight",
+                    TensorSelection::Range {
+                        axis: 0,
+                        start: member,
+                        end: member + 1,
+                    },
+                ),
+                metadata.clone(),
+                metadata.byte_len(),
+                None,
+            )
+            .unwrap();
+            assert!(std::ptr::eq(parameter.task(), shared.task()));
+            assert!(std::ptr::eq(parameter.clone().task(), shared.task()));
+            members.push(
+                crate::AddressableBankMember::new(
+                    crate::ParameterBankKey::new(0, member),
+                    crate::AddressableBankMemberPlacement::new(
+                        crate::ExecutionGroupId::new("decoder").unwrap(),
+                        0,
+                        "model.layers.0",
+                        crate::AddressableBankDistribution::ExpertParallel,
+                    )
+                    .unwrap(),
+                    [parameter],
+                )
+                .unwrap(),
+            );
+        }
+        struct Source {
+            physical: ReplicatedTextPhysicalSource,
+            metadata_reads: std::sync::atomic::AtomicUsize,
+            provenance_reads: std::sync::atomic::AtomicUsize,
+            corrupt: bool,
+        }
+        impl eredu_checkpoint::store::CheckpointSource for Source {
+            fn source_keys(&self) -> Vec<String> {
+                vec![self.physical.catalog_key().to_owned()]
+            }
+            fn source_metadata(
+                &self,
+                key: &str,
+            ) -> Result<eredu_checkpoint::store::TensorMetadata, eredu_checkpoint::store::StoreError>
+            {
+                self.metadata_reads
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(eredu_checkpoint::store::TensorMetadata {
+                    name: key.to_owned(),
+                    logical_shape: vec![64, 64],
+                    physical_shape: vec![64, 64],
+                    stored_dtype: StoredDtype::F16,
+                    encoded_byte_len: if self.corrupt { 1 } else { 8192 },
+                    backing_shard: Some(self.physical.shard().to_owned()),
+                })
+            }
+            fn source_provenance(
+                &self,
+                key: &str,
+            ) -> Result<
+                eredu_checkpoint::store::TensorSourceProvenance,
+                eredu_checkpoint::store::StoreError,
+            > {
+                self.provenance_reads
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(eredu_checkpoint::store::TensorSourceProvenance {
+                    catalog_key: key.to_owned(),
+                    physical_tensor: self.physical.tensor().to_owned(),
+                    output: self.physical.output().to_owned(),
+                    backing_shard: Some(self.physical.shard().to_owned()),
+                    source_encoding: self.physical.source_encoding().clone(),
+                })
+            }
+            fn acquire_lease(
+                &self,
+                _: eredu_checkpoint::store::TensorReadRequest,
+            ) -> Result<eredu_checkpoint::store::CheckpointLease, eredu_checkpoint::store::StoreError>
+            {
+                panic!("cold binding read payloads")
+            }
+            fn source_diagnostics(
+                &self,
+            ) -> Result<
+                eredu_checkpoint::store::WeightStoreDiagnostics,
+                eredu_checkpoint::store::StoreError,
+            > {
+                unreachable!()
+            }
+        }
+        let mut source = Source {
+            physical: shared.task().physical_sources()[0].clone(),
+            metadata_reads: Default::default(),
+            provenance_reads: Default::default(),
+            corrupt: false,
+        };
+        let plans = crate::plan_addressable_bank_bindings(
+            &members,
+            &source,
+            |_, _, _| -> Result<DerivedWeightRecipe, String> {
+                panic!("dense binding requested FP4 lowering")
+            },
+        )
+        .unwrap();
+        assert_eq!(plans.len(), 64);
+        assert_eq!(
+            source
+                .provenance_reads
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            source
+                .metadata_reads
+                .load(std::sync::atomic::Ordering::Relaxed),
+            65
+        );
+        source.corrupt = true;
+        assert!(crate::plan_addressable_bank_bindings(
+            &members,
+            &source,
+            |_, _, _| -> Result<DerivedWeightRecipe, String> { unreachable!() }
+        )
+        .is_err());
+        let invalid = crate::AddressableBankParameter::from_shared_task(
+            "weight",
+            shared,
+            DerivedWeightRecipe::source("unadmitted.weight", TensorSelection::Full),
+            metadata.clone(),
+            metadata.byte_len(),
+            None,
+        );
+        assert!(matches!(
+            invalid,
+            Err(crate::AddressableBankMemberError::InvalidParameter { .. })
+        ));
+        let mut corrupt = selected.materialization_tasks()[0].clone();
+        corrupt.source_encoding = SourceTensorEncoding::Safetensors(StoredDtype::F32);
+        assert!(crate::AddressableBankTask::new(corrupt).is_err());
+    }
+
+    #[test]
     fn exact_tasks_are_the_authority_for_direct_derived_and_transform_sources() {
         use eredu_checkpoint::recipe::{DerivedWeightRecipe, RecipeDtype, RecipeMetadata};
 

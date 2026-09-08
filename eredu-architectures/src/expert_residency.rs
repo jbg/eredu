@@ -1614,6 +1614,7 @@ impl ExpertResidencyUnit {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ExpertResidencyCatalog {
     units: Vec<ExpertResidencyUnit>,
+    unit_indices: BTreeMap<ParameterBankKey, usize>,
 }
 
 impl ExpertResidencyCatalog {
@@ -1625,15 +1626,18 @@ impl ExpertResidencyCatalog {
         if units.is_empty() {
             return Err(ExpertResidencyCatalogError::EmptyCatalog);
         }
-        let mut identities = BTreeSet::new();
-        for unit in &units {
-            if !identities.insert(unit.identity) {
+        let mut unit_indices = BTreeMap::new();
+        for (index, unit) in units.iter().enumerate() {
+            if unit_indices.insert(unit.identity, index).is_some() {
                 return Err(ExpertResidencyCatalogError::DuplicateIdentity(
                     unit.identity,
                 ));
             }
         }
-        Ok(Self { units })
+        Ok(Self {
+            units,
+            unit_indices,
+        })
     }
 
     /// Returns the deterministic architecture order of resident expert units.
@@ -1643,7 +1647,9 @@ impl ExpertResidencyCatalog {
 
     /// Returns one atomic unit by its architecture-translated bank identity.
     pub fn unit(&self, identity: ParameterBankKey) -> Option<&ExpertResidencyUnit> {
-        self.units.iter().find(|unit| unit.identity == identity)
+        self.unit_indices
+            .get(&identity)
+            .map(|index| &self.units[*index])
     }
 
     /// Returns every canonical parameter assigned to addressable storage.

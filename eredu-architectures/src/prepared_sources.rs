@@ -15,8 +15,7 @@ use eredu_checkpoint::{
 };
 use eredu_core::{
     artifact::{
-        fingerprint_filesystem_artifact, fingerprint_safetensors_artifact, ArtifactError,
-        ArtifactFile, ArtifactIdentity, GgufCompanionRole,
+        ArtifactError, ArtifactFile, ArtifactIdentity, DeferredArtifactIdentity, GgufCompanionRole,
     },
     ArtifactFormat, ModelArtifact, ModelPreparationPlan,
 };
@@ -91,7 +90,7 @@ pub struct PreparedModelSources {
 
 /// Exact source roles released only by consuming their paired total selection.
 pub struct PreparedModelSourceGraph {
-    source_identity: ArtifactIdentity,
+    source_identity: DeferredArtifactIdentity,
     execution_identity: String,
     format: ArtifactFormat,
     architecture: ArtifactArchitecturePlan,
@@ -103,6 +102,50 @@ pub struct PreparedModelSourceGraph {
     extension: Option<SharedCheckpointSource>,
     resolutions: PreparedSourceResolutions,
     source_metadata: BTreeMap<String, TensorMetadata>,
+}
+
+/// Retained discovery declarations; content hashing happens only on discovery demand.
+#[derive(Debug, Clone)]
+pub struct PreparedModelDiscovery {
+    identity: DeferredArtifactIdentity,
+    catalog: eredu_core::ObservationCatalog,
+    support: eredu_core::ObservationSupportReport,
+    intervention_points: Vec<eredu_core::intervention::InterventionPoint>,
+}
+
+impl PreparedModelDiscovery {
+    /// Resolves the exact content identity for a caller using capture features.
+    pub fn capture(
+        &self,
+    ) -> Result<eredu_core::capture::CaptureDiscovery, eredu_core::capture::CaptureError> {
+        Ok(eredu_core::capture::CaptureDiscovery {
+            artifact_identity: self
+                .identity
+                .resolve()
+                .map_err(|error| eredu_core::capture::CaptureError::Invalid(error.to_string()))?
+                .to_string(),
+            catalog: self.catalog.clone(),
+            support: self.support.clone(),
+        })
+    }
+
+    /// Combines retained semantic points with current native intervention facts.
+    pub fn intervention(
+        &self,
+        mechanisms: &eredu_core::intervention::InterventionMechanisms,
+    ) -> Result<eredu_core::intervention::InterventionDiscovery, eredu_core::capture::CaptureError>
+    {
+        Ok(eredu_runtime::inspection::intervention_support(
+            self.intervention_points.clone(),
+            &self.capture()?,
+            mechanisms,
+        ))
+    }
+
+    /// Whether exact content identity has been requested for this source graph.
+    pub fn identity_is_resolved(&self) -> bool {
+        self.identity.is_resolved()
+    }
 }
 
 impl PreparedModelSources {
@@ -126,11 +169,11 @@ impl PreparedModelSources {
 
     /// Projects catalog semantics from the retained architecture and combines them
     /// with side-effect-free backend capture facts for this exact selection.
-    pub fn capture_discovery(
+    pub fn prepare_discovery(
         &self,
         mechanisms: eredu_core::ObservationMechanisms,
         capture: eredu_core::capture::CaptureCapabilities,
-    ) -> eredu_core::capture::CaptureDiscovery {
+    ) -> PreparedModelDiscovery {
         let catalog = self.architecture().architecture_descriptor().observations;
         let mut support = eredu_runtime::inspection::observation_support(
             &catalog,
@@ -145,11 +188,21 @@ impl PreparedModelSources {
             },
         );
         support.capture = capture;
-        eredu_core::capture::CaptureDiscovery {
-            artifact_identity: self.source_identity().to_string(),
+        PreparedModelDiscovery {
+            identity: self.graph.source_identity().clone(),
             catalog,
             support,
+            intervention_points: self.architecture().intervention_points(),
         }
+    }
+
+    /// Resolves exact model identity for explicitly requested capture discovery.
+    pub fn capture_discovery(
+        &self,
+        mechanisms: eredu_core::ObservationMechanisms,
+        capture: eredu_core::capture::CaptureCapabilities,
+    ) -> Result<eredu_core::capture::CaptureDiscovery, eredu_core::capture::CaptureError> {
+        self.prepare_discovery(mechanisms, capture).capture()
     }
 
     /// Consumes the authoritative pairing immediately before typed execution dispatch.
@@ -168,9 +221,9 @@ impl PreparedModelSources {
         &self.graph
     }
 
-    /// Content-exact identity of the complete admitted physical source graph.
-    pub const fn source_identity(&self) -> ArtifactIdentity {
-        self.graph.source_identity()
+    /// Computes and retains the exact source identity when explicitly requested.
+    pub fn source_identity(&self) -> Result<ArtifactIdentity, Arc<ArtifactError>> {
+        self.graph.source_identity().resolve()
     }
 
     /// Architecture identity retained by the selected neutral execution requirements.
@@ -237,9 +290,9 @@ impl PreparedModelSources {
 }
 
 impl PreparedModelSourceGraph {
-    /// Content-exact identity of the complete admitted physical source graph.
-    pub const fn source_identity(&self) -> ArtifactIdentity {
-        self.source_identity
+    /// Deferred identity of the complete admitted physical source graph.
+    pub const fn source_identity(&self) -> &DeferredArtifactIdentity {
+        &self.source_identity
     }
 
     /// Architecture identity retained by the selected neutral execution requirements.
@@ -449,9 +502,9 @@ pub fn prepare_model_sources(
 fn source_graph_identity(
     inspection: &eredu_core::ArtifactInspection<ArtifactArchitecturePlan>,
     execution_identity: &str,
-) -> Result<ArtifactIdentity, ArtifactError> {
+) -> Result<DeferredArtifactIdentity, ArtifactError> {
     match inspection.format() {
-        ArtifactFormat::SafeTensors => fingerprint_safetensors_artifact(
+        ArtifactFormat::SafeTensors => DeferredArtifactIdentity::safetensors(
             execution_identity,
             inspection.safetensors_shards().ok_or_else(|| {
                 ArtifactError::InvalidArtifact(
@@ -487,7 +540,7 @@ fn source_graph_identity(
                     )
                 }));
             }
-            fingerprint_filesystem_artifact(execution_identity, files)
+            DeferredArtifactIdentity::filesystem(execution_identity, files)
         }
         _ => Err(ArtifactError::InvalidArtifact(
             "unsupported artifact format in prepared source identity".into(),
@@ -496,7 +549,7 @@ fn source_graph_identity(
 }
 
 fn prepare_safetensors_sources(
-    source_identity: ArtifactIdentity,
+    source_identity: DeferredArtifactIdentity,
     execution_identity: String,
     architecture: ArtifactArchitecturePlan,
     prediction_extension: Option<PredictionExtensionPlan>,
@@ -566,7 +619,7 @@ fn prepare_safetensors_sources(
 }
 
 fn prepare_gguf_sources(
-    source_identity: ArtifactIdentity,
+    source_identity: DeferredArtifactIdentity,
     execution_identity: String,
     architecture: ArtifactArchitecturePlan,
     validated: eredu_core::ValidatedGguf,

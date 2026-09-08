@@ -87,53 +87,85 @@ pub enum ArtifactFingerprintError {
     },
 }
 
-/// Reads stable exact-content fingerprints for filesystem artifact members.
-///
-/// Every pinned file is read twice with metadata checks before, between, and
-/// after the passes. A result is returned only when both complete content
-/// digests and all observable file identity facts agree.
+/// Admitted filesystem members whose payload fingerprint can be requested later.
+/// Construction records metadata without reading payloads or retaining open files.
+#[derive(Debug)]
+pub struct ArtifactFingerprintSource {
+    files: Vec<AdmittedArtifactFile>,
+}
+
+#[derive(Debug)]
+struct AdmittedArtifactFile {
+    member: ArtifactFile,
+    admitted: StableFileMetadata,
+}
+
+impl ArtifactFingerprintSource {
+    /// Records original file identities and cheap change-detection facts.
+    pub fn new(
+        files: impl IntoIterator<Item = ArtifactFile>,
+    ) -> Result<Self, ArtifactFingerprintError> {
+        let files = files
+            .into_iter()
+            .map(|member| {
+                let file = File::open(member.path())
+                    .map_err(|source| io_error("open", member.path(), source))?;
+                let admitted = StableFileMetadata::read(member.path(), &file)?;
+                Ok(AdmittedArtifactFile { member, admitted })
+            })
+            .collect::<Result<_, ArtifactFingerprintError>>()?;
+        Ok(Self { files })
+    }
+
+    /// Reads each complete file once, rejecting changes since admission.
+    pub fn fingerprint(&self) -> Result<Vec<ArtifactMemberFingerprint>, ArtifactFingerprintError> {
+        self.files
+            .iter()
+            .map(|pinned| {
+                let path = pinned.member.path();
+                let file = File::open(path).map_err(|source| io_error("open", path, source))?;
+                let fingerprint =
+                    fingerprint_open_file_with_hook(path, &file, pinned.admitted, || {})?;
+                Ok(ArtifactMemberFingerprint {
+                    logical_role: pinned.member.logical_role.clone(),
+                    length: fingerprint.length,
+                    digest: fingerprint.digest,
+                })
+            })
+            .collect()
+    }
+}
+
+/// Reads content fingerprints with one sequential pass per file.
+/// Metadata checks before and after the pass detect observable file changes.
 pub fn fingerprint_artifact_files(
     files: impl IntoIterator<Item = ArtifactFile>,
 ) -> Result<Vec<ArtifactMemberFingerprint>, ArtifactFingerprintError> {
-    files
-        .into_iter()
-        .map(|member| {
-            let mut file = File::open(member.path())
-                .map_err(|source| io_error("open", &member.path, source))?;
-            let fingerprint = fingerprint_open_file(member.path(), &mut file)?;
-            Ok(ArtifactMemberFingerprint {
-                logical_role: member.logical_role,
-                length: fingerprint.length,
-                digest: fingerprint.digest,
-            })
-        })
-        .collect()
-}
-
-pub(crate) fn fingerprint_open_file(
-    path: &Path,
-    file: &mut File,
-) -> Result<FileContentFingerprint, ArtifactFingerprintError> {
-    fingerprint_open_file_with_hook(path, file, || {})
+    ArtifactFingerprintSource::new(files)?.fingerprint()
 }
 
 fn fingerprint_open_file_with_hook(
     path: &Path,
-    file: &mut File,
-    after_first_pass: impl FnOnce(),
+    file: &File,
+    admitted: StableFileMetadata,
+    after_pass: impl FnOnce(),
 ) -> Result<FileContentFingerprint, ArtifactFingerprintError> {
     let before = StableFileMetadata::read(path, file)?;
-    let first = digest_pass(path, file)?;
-    after_first_pass();
-    let between = StableFileMetadata::read(path, file)?;
-    let second = digest_pass(path, file)?;
+    if before != admitted {
+        return Err(ArtifactFingerprintError::Changed {
+            path: path.to_owned(),
+        });
+    }
+    let mut reader = file;
+    let fingerprint = digest_pass(path, &mut reader)?;
+    after_pass();
     let after = StableFileMetadata::read(path, file)?;
-    if before != between || between != after || first != second || first.length != before.length {
+    if before != after || fingerprint.length != before.length {
         return Err(ArtifactFingerprintError::Changed {
             path: path.to_path_buf(),
         });
     }
-    Ok(first)
+    Ok(fingerprint)
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -197,7 +229,7 @@ impl StableFileMetadata {
 
 fn digest_pass(
     path: &Path,
-    file: &mut File,
+    file: &mut (impl Read + Seek),
 ) -> Result<FileContentFingerprint, ArtifactFingerprintError> {
     file.seek(SeekFrom::Start(0))
         .map_err(|source| io_error("seek", path, source))?;
@@ -239,23 +271,78 @@ mod tests {
     use std::io::Write as _;
 
     #[test]
-    fn double_pass_rejects_same_length_change_with_restored_metadata() {
+    fn digest_reads_each_byte_in_one_pass() {
+        struct Counted {
+            cursor: std::io::Cursor<Vec<u8>>,
+            bytes: usize,
+            seeks: usize,
+        }
+        impl Read for Counted {
+            fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+                let count = self.cursor.read(output)?;
+                self.bytes += count;
+                Ok(count)
+            }
+        }
+        impl Seek for Counted {
+            fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+                self.seeks += 1;
+                self.cursor.seek(position)
+            }
+        }
+        let payload = vec![37; 2 * 1024 * 1024 + 7];
+        let expected: [u8; 32] = Sha256::digest(&payload).into();
+        let mut input = Counted {
+            cursor: std::io::Cursor::new(payload),
+            bytes: 0,
+            seeks: 0,
+        };
+        let fingerprint = digest_pass(Path::new("counted"), &mut input).unwrap();
+        assert_eq!(fingerprint.digest, expected);
+        assert_eq!(fingerprint.length as usize, input.bytes);
+        assert_eq!(input.bytes, input.cursor.get_ref().len());
+        assert_eq!(input.seeks, 1);
+    }
+
+    #[test]
+    fn deferred_source_rejects_replaced_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("member");
+        std::fs::write(&path, b"original").unwrap();
+        let source = ArtifactFingerprintSource::new([ArtifactFile::new("weights", &path)]).unwrap();
+        let replacement = directory.path().join("replacement");
+        std::fs::write(&replacement, b"different file contents").unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+        assert!(matches!(
+            source.fingerprint(),
+            Err(ArtifactFingerprintError::Changed { .. })
+        ));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn metadata_check_rejects_same_length_change_with_restored_mtime() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("member");
         std::fs::write(&path, b"first-content").unwrap();
         let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
-        let mut admitted = File::open(&path).unwrap();
-        let result = fingerprint_open_file_with_hook(&path, &mut admitted, || {
-            let mut attacker = File::options()
-                .write(true)
-                .truncate(true)
-                .open(&path)
-                .unwrap();
-            attacker.write_all(b"other-content").unwrap();
-            attacker
-                .set_times(std::fs::FileTimes::new().set_modified(modified))
-                .unwrap();
-        });
+        let admitted = File::open(&path).unwrap();
+        let result = fingerprint_open_file_with_hook(
+            &path,
+            &admitted,
+            StableFileMetadata::read(&path, &admitted).unwrap(),
+            || {
+                let mut attacker = File::options()
+                    .write(true)
+                    .truncate(true)
+                    .open(&path)
+                    .unwrap();
+                attacker.write_all(b"other-content").unwrap();
+                attacker
+                    .set_times(std::fs::FileTimes::new().set_modified(modified))
+                    .unwrap();
+            },
+        );
         assert!(matches!(
             result,
             Err(ArtifactFingerprintError::Changed { .. })

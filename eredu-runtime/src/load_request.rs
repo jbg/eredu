@@ -111,7 +111,7 @@ impl ParallelLoadRequest {
 }
 
 /// Failure while validating or lowering a normalized cold-load request.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 #[non_exhaustive]
 pub enum NormalizedLoadRequestError {
     /// A prepared source must have a positive reader-cache bound.

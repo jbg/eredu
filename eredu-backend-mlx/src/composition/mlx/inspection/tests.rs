@@ -282,56 +282,71 @@ fn bounded_capture_preserves_native_generation_tokens_and_rng_progression() {
     let mut results = Vec::new();
     for captured in [false, true] {
         let backend = crate::native::backend(stream, stream);
-        let model =
+        let prepared =
             eredu_core::load_model(&backend, root.path(), MlxLoadRequest::default()).unwrap();
-        let mut runtime = ModelRuntime::from_prepared(backend, model).unwrap();
-        let discovery =
-            <crate::backend::MlxBackend as TextGenerationBackend>::capture_discovery(&runtime)
-                .unwrap();
-        let report = inspect_model(root.path(), MlxInspectionOptions::default()).unwrap();
-        assert_eq!(
-            discovery.support.capture,
-            report.observation_support.unwrap().capture
+        let (mut model, capabilities) = prepared.into_parts();
+        let discovery_probe = model.take_capture_discovery().unwrap();
+        assert!(
+            !discovery_probe.identity_is_resolved(),
+            "ordinary loading must not hash weights"
         );
-        let limits = CaptureUsage {
-            captures: 1000,
-            retained_bytes: 1_000_000_000,
-            host_bytes: 10_000_000,
-            encoded_bytes: 10_000_000,
+        let model = eredu_core::PreparedModel::new(
+            model.with_capture_discovery(discovery_probe.clone()),
+            capabilities,
+        );
+        let mut runtime = ModelRuntime::from_prepared(backend, model).unwrap();
+        let plan = if captured {
+            let discovery =
+                <crate::backend::MlxBackend as TextGenerationBackend>::capture_discovery(&runtime)
+                    .unwrap();
+            let report = inspect_model(root.path(), MlxInspectionOptions::default()).unwrap();
+            assert_eq!(
+                discovery.support.capture,
+                report.observation_support.unwrap().capture
+            );
+            let limits = CaptureUsage {
+                captures: 1000,
+                retained_bytes: 1_000_000_000,
+                host_bytes: 10_000_000,
+                encoded_bytes: 10_000_000,
+            };
+            let plan = CapturePlan {
+                schema_version: 1,
+                selections: discovery
+                    .catalog
+                    .points
+                    .iter()
+                    .enumerate()
+                    .map(|(i, p)| CaptureSelection {
+                        id: format!("summary-{i}"),
+                        path: p.path.clone(),
+                        schedule: CaptureSchedule::default(),
+                        slices: vec![],
+                        transform: CaptureTransform::Summary,
+                    })
+                    .collect(),
+                limits: CaptureLimits {
+                    per_step: limits,
+                    cumulative: limits,
+                    physical_native_bytes: None,
+                    on_limit: CaptureLimitPolicy::Fail,
+                },
+            }
+            .admit(
+                &discovery.catalog,
+                &discovery.support,
+                &discovery.support.capture,
+                CaptureRequestShape {
+                    batch: 1,
+                    prompt_tokens: 2,
+                    max_predictions: 4,
+                },
+            )
+            .unwrap();
+            Some(plan)
+        } else {
+            None
         };
-        let plan = CapturePlan {
-            schema_version: 1,
-            selections: discovery
-                .catalog
-                .points
-                .iter()
-                .enumerate()
-                .map(|(i, p)| CaptureSelection {
-                    id: format!("summary-{i}"),
-                    path: p.path.clone(),
-                    schedule: CaptureSchedule::default(),
-                    slices: vec![],
-                    transform: CaptureTransform::Summary,
-                })
-                .collect(),
-            limits: CaptureLimits {
-                per_step: limits,
-                cumulative: limits,
-                physical_native_bytes: None,
-                on_limit: CaptureLimitPolicy::Fail,
-            },
-        }
-        .admit(
-            &discovery.catalog,
-            &discovery.support,
-            &discovery.support.capture,
-            CaptureRequestShape {
-                batch: 1,
-                prompt_tokens: 2,
-                max_predictions: 4,
-            },
-        )
-        .unwrap();
         let mut generator = ControlledTextGeneration::new(
             &mut runtime,
             vec![1, 2],
@@ -339,7 +354,7 @@ fn bounded_capture_preserves_native_generation_tokens_and_rng_progression() {
             Unconstrained,
         )
         .unwrap();
-        if captured {
+        if let Some(plan) = plan.as_ref() {
             generator.enable_capture(plan.clone()).unwrap();
         }
         let mut tokens = Vec::new();
@@ -354,6 +369,7 @@ fn bounded_capture_preserves_native_generation_tokens_and_rng_progression() {
                 }
             }
         }
+        assert_eq!(discovery_probe.identity_is_resolved(), captured);
         drop(generator);
         runtime.parts_mut().1.reset().unwrap();
         let mut following = ControlledTextGeneration::new(
@@ -374,7 +390,7 @@ fn bounded_capture_preserves_native_generation_tokens_and_rng_progression() {
                 Unconstrained,
             )
             .unwrap();
-            early_drop.enable_capture(plan).unwrap();
+            early_drop.enable_capture(plan.unwrap()).unwrap();
             assert_eq!(early_drop.next().unwrap().unwrap().token_id(), tokens[0]);
             // Leave a completed host capture batch unconsumed. Dropping the
             // ordinary generator must settle retained native completion authority.

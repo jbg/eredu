@@ -8,7 +8,7 @@ use eredu_checkpoint::{
     LinearFormat, SourceTensorEncoding, StoredDtype, WeightQuantization,
 };
 use eredu_core::{
-    artifact::{fingerprint_safetensors_artifact, ArtifactIdentity},
+    artifact::{ArtifactIdentity, DeferredArtifactIdentity},
     ParallelRankTopology, QuantizationRequest, RealtimeSampling, RealtimeSpeechConfig,
 };
 use eredu_nn::{DistributedNeuralBackend, NeuralBackend, Tensor};
@@ -704,7 +704,7 @@ impl MoshiWeightLoweringSummary {
 pub struct PreparedMoshiRealtimeSource {
     selected: PreparedMoshiRealtime,
     source: SharedCheckpointSource,
-    artifact_identity: ArtifactIdentity,
+    artifact_identity: DeferredArtifactIdentity,
     lowering: MoshiWeightLoweringSummary,
 }
 
@@ -720,8 +720,15 @@ impl PreparedMoshiRealtimeSource {
     }
 
     /// Content-exact identity under the architecture-selected Moshi domain.
-    pub const fn artifact_identity(&self) -> ArtifactIdentity {
-        self.artifact_identity
+    pub fn artifact_identity(
+        &self,
+    ) -> Result<ArtifactIdentity, std::sync::Arc<eredu_core::artifact::ArtifactError>> {
+        self.artifact_identity.resolve()
+    }
+
+    /// Shares the pending identity without initiating payload reads.
+    pub fn deferred_artifact_identity(&self) -> DeferredArtifactIdentity {
+        self.artifact_identity.clone()
     }
 
     /// Neutral reduction of all admitted weight lowerings.
@@ -735,7 +742,7 @@ impl PreparedMoshiRealtimeSource {
     ) -> (
         PreparedMoshiRealtime,
         SharedCheckpointSource,
-        ArtifactIdentity,
+        DeferredArtifactIdentity,
         MoshiWeightLoweringSummary,
     ) {
         (
@@ -757,7 +764,8 @@ impl PreparedMoshiRealtimeSource {
     ) -> Result<Self, MoshiRealtimeSourceError> {
         validate_store_metadata(&selected, source.as_ref())
             .map_err(MoshiRealtimeSourceError::Source)?;
-        let artifact_identity = reference_source_contract_identity(source.as_ref())?;
+        let artifact_identity =
+            DeferredArtifactIdentity::ready(reference_source_contract_identity(source.as_ref())?);
         let lowering = selected_moshi_lowering_summary(selected.selected())?;
         Ok(Self {
             selected,
@@ -1143,8 +1151,8 @@ pub fn select_moshi_realtime(
 
 /// Opens and validates the exact source selected for one Moshi realization.
 ///
-/// Selection remains header-only. This handoff performs content fingerprinting and source-cache
-/// construction once, after selection and before a concrete backend can allocate native state.
+/// Selection remains header-only. This handoff pins sources and constructs their caches;
+/// content fingerprinting remains deferred until an identity consumer requests it.
 pub fn prepare_selected_moshi_realtime_source(
     selected: PreparedMoshiRealtime,
 ) -> Result<PreparedMoshiRealtimeSource, MoshiRealtimeSourceError> {
@@ -1152,7 +1160,7 @@ pub fn prepare_selected_moshi_realtime_source(
         .admitted_shards()
         .cloned()
         .ok_or(MoshiRealtimeSourceError::MissingAdmittedShards)?;
-    let artifact_identity = fingerprint_safetensors_artifact(
+    let artifact_identity = DeferredArtifactIdentity::safetensors(
         selected.source_config().effective_model_type().as_str(),
         &shards,
     )?;

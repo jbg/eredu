@@ -2072,6 +2072,12 @@ fn assert_prepared_generation_and_speculative_conformance() {
         })
         .unwrap();
     assert_eq!(observed_output, output);
+    assert!(
+        trace
+            .iter()
+            .all(|record| record.artifact_identity.is_none()),
+        "trace-only generation must not request a checkpoint content identity"
+    );
     let observed_semantics: Vec<_> = trace
         .iter()
         .filter_map(|record| match &record.event {

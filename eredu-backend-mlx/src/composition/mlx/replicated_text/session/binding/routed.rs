@@ -92,9 +92,9 @@ pub(super) fn shard_addressable_members(
                     )
                     .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
                     let companions = parameter.quantization_companions().cloned();
-                    eredu_runtime::AddressableBankParameter::new(
+                    eredu_runtime::AddressableBankParameter::from_shared_task(
                         parameter.binding_name(),
-                        parameter.task().clone(),
+                        parameter.shared_task().clone(),
                         recipe,
                         metadata,
                         selected_bytes,

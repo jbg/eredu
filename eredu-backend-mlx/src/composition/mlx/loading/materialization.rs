@@ -17,17 +17,13 @@ pub(crate) fn materialize_model_plan(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<MlxModel, Error> {
-    let capture_discovery = sources.capture_discovery(
+    let capture_discovery = sources.prepare_discovery(
         eredu_core::ObservationMechanisms {
             activation_tensors: true,
             routing_tensors: true,
             floating_to_f32: true,
         },
         super::super::session::bounded_capture::capabilities(),
-    );
-    let intervention_discovery = sources.intervention_discovery(
-        &capture_discovery,
-        &super::super::session::intervention::mechanisms(),
     );
     let target = crate::backend::MlxPreparedTarget::new(stream, distributed.as_ref())?;
     let materialize = |prepared, source: eredu_checkpoint::store::SharedCheckpointSource| {
@@ -130,11 +126,7 @@ pub(crate) fn materialize_model_plan(
         routes,
         MlxExecutableAssembler { target },
     )
-    .map(|model| {
-        model
-            .with_capture_discovery(capture_discovery)
-            .with_intervention_discovery(intervention_discovery)
-    })
+    .map(|model| model.with_capture_discovery(capture_discovery))
     .map_err(|error| match error {
         PreparedExecutionError::Backend(error) => error,
         error => Error::ArchitectureModel(error.to_string()),

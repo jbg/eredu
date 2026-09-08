@@ -91,7 +91,7 @@ pub struct ObservedGenerationRecord {
     pub schema_version: u32,
     /// Unique identity assigned by the facade for this run.
     pub run_id: String,
-    /// Content identity of prepared sources, when the backend exposes it.
+    /// Content identity resolved for capture or intervention; absent for trace-only runs.
     pub artifact_identity: Option<String>,
     /// Identity of the loaded facade session that admitted this request.
     pub session_id: String,
@@ -382,12 +382,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
                 capture: Default::default(),
             };
             let admitted = plan.admit(&catalog, &support, &support.capture, request)?;
-            (
-                admitted,
-                B::capture_discovery(&self.runtime)
-                    .ok()
-                    .map(|d| d.artifact_identity),
-            )
+            (admitted, None)
         } else {
             let discovery = self.capture_discovery()?;
             (

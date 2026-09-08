@@ -40,13 +40,15 @@ fn model(drops: Rc<Cell<usize>>) -> MlxRealtimeExecution {
     let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
     let poisoned = Rc::new(Cell::new(false));
     MlxRealtimeExecution {
-        artifact_identity: eredu_core::artifact::fingerprint_artifact(
-            "recovery fixture",
-            [eredu_core::artifact::ArtifactMemberIdentity::new(
-                "fixture", 0, [0; 32],
-            )],
-        )
-        .unwrap(),
+        artifact_identity: eredu_core::artifact::DeferredArtifactIdentity::ready(
+            eredu_core::artifact::fingerprint_artifact(
+                "recovery fixture",
+                [eredu_core::artifact::ArtifactMemberIdentity::new(
+                    "fixture", 0, [0; 32],
+                )],
+            )
+            .unwrap(),
+        ),
         metadata: LayerwiseModelMetadata::new(
             "recovery fixture",
             None,

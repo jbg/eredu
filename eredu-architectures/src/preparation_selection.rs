@@ -92,7 +92,7 @@ pub trait PreparationMechanismProvider {
 }
 
 /// Structured failure from total cold preparation selection.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 #[non_exhaustive]
 pub enum PreparationSelectionError {
     /// The normalized request is internally contradictory.
@@ -118,13 +118,13 @@ pub enum PreparationSelectionError {
     MissingGroupedOperations(Vec<GroupedOperationRequirement>),
     /// Architecture-owned target/extension projection failed.
     #[error("prediction target projection failed: {0}")]
-    PredictionProjection(#[source] eredu_core::artifact::ArtifactError),
+    PredictionProjection(#[source] std::sync::Arc<eredu_core::artifact::ArtifactError>),
     /// Embedded drafting was requested for an artifact without an extension.
     #[error("embedded drafting requires an admitted prediction extension")]
     MissingPredictionExtension,
     /// Architecture-owned embedded prediction selection failed.
     #[error("embedded prediction selection failed: {0}")]
-    Prediction(#[source] eredu_core::artifact::ArtifactError),
+    Prediction(#[source] std::sync::Arc<eredu_core::artifact::ArtifactError>),
     /// Generic speculative mechanism selection rejected embedded prediction.
     #[error(transparent)]
     Speculative(#[from] SpeculativeSelectionError),
@@ -331,6 +331,48 @@ pub fn select_preparation<P>(
 where
     P: PreparationMechanismProvider,
 {
+    use crate::inspection_validation::{RecordingMechanisms, ValidatedSelection};
+    let validation = inspection
+        .architecture_plan()
+        .validation(inspection.admission_token());
+    let mut selections = validation
+        .selections
+        .lock()
+        .expect("preparation validation poisoned");
+    if let Some(retained) = selections.iter().find(|retained| {
+        retained.request == *request
+            && retained
+                .mechanisms
+                .iter()
+                .all(|facts| facts.matches(mechanisms))
+    }) {
+        return retained.selected.clone();
+    }
+    #[cfg(test)]
+    validation
+        .selection_runs
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let recording = RecordingMechanisms {
+        provider: mechanisms,
+        observations: Default::default(),
+    };
+    let selected = select_preparation_once(inspection, request, &recording);
+    selections.push(ValidatedSelection {
+        request: request.clone(),
+        mechanisms: recording.observations.into_inner(),
+        selected: selected.clone(),
+    });
+    selected
+}
+
+fn select_preparation_once<P>(
+    inspection: &ArtifactInspection<ArtifactArchitecturePlan>,
+    request: &NormalizedLoadRequest,
+    mechanisms: &P,
+) -> Result<SelectedPreparation, PreparationSelectionError>
+where
+    P: PreparationMechanismProvider,
+{
     let validated = request.validate_model_preparation()?;
     if let Some(kind) = inspection
         .architecture_plan()
@@ -357,7 +399,7 @@ where
     let projection = inspection
         .architecture_plan()
         .prediction_target_projection()
-        .map_err(PreparationSelectionError::PredictionProjection)?;
+        .map_err(|error| PreparationSelectionError::PredictionProjection(error.into()))?;
     let discovered_extension = projection.as_ref().map(|(_, extension)| extension.clone());
     let prediction_extension = match request.drafting() {
         DraftingLoadRequest::ArchitectureDefault => discovered_extension,
@@ -382,7 +424,7 @@ where
         .filter(|topology| !topology.is_replicated());
     if let (Some(extension), Some(topology)) = (prediction_extension.as_ref(), parallel) {
         validate_partitioned_prediction_extension(extension, topology)
-            .map_err(PreparationSelectionError::Prediction)?;
+            .map_err(|error| PreparationSelectionError::Prediction(error.into()))?;
     }
     let base = ExecutionClassSelection {
         request,
@@ -570,7 +612,7 @@ where
         Some(limits) => limits,
         None => {
             let capability = prediction_extension_capability(extension)
-                .map_err(PreparationSelectionError::Prediction)?;
+                .map_err(|error| PreparationSelectionError::Prediction(error.into()))?;
             let maximum_sequence_length = capability
                 .capabilities()
                 .effective_max_context
@@ -594,7 +636,7 @@ where
         .drafting()
         .embedded_capacity()
         .map_or_else(|| embedded_prediction_capacity(extension), Ok)
-        .map_err(PreparationSelectionError::Prediction)?;
+        .map_err(|error| PreparationSelectionError::Prediction(error.into()))?;
     // Cold selection is deliberately header-only. The opaque admission token
     // protects the exact artifact pairing and the prepared-source factory later
     // computes the content fingerprint once, before native materialization.
@@ -617,7 +659,7 @@ where
             maximum_draft_tokens,
         ),
     )
-    .map_err(PreparationSelectionError::Prediction)?;
+    .map_err(|error| PreparationSelectionError::Prediction(error.into()))?;
     eredu_runtime::select_speculative_realization(
         contract.requirements(),
         &contract.selection_request(eredu_runtime::SpeculativePlacementRequest::Single),
@@ -638,7 +680,7 @@ fn positive_bound(
 
 fn prediction_error(error: impl std::fmt::Display) -> PreparationSelectionError {
     PreparationSelectionError::Prediction(
-        eredu_core::artifact::ArtifactError::InvalidArchitecturePlan(error.to_string()),
+        eredu_core::artifact::ArtifactError::InvalidArchitecturePlan(error.to_string()).into(),
     )
 }
 
@@ -691,6 +733,7 @@ pub(crate) mod tests {
     pub(crate) struct BoundedIndependentAdapter {
         counters: IndependentCounters,
         failure: IndependentFailure,
+        fp8: bool,
     }
 
     impl BoundedIndependentAdapter {
@@ -738,6 +781,15 @@ pub(crate) mod tests {
 
         fn supports_direct(&self, descriptor: &eredu_runtime::WeightLoweringDescriptor) -> bool {
             use eredu_checkpoint::{LinearFormat, SourceTensorEncoding, StoredDtype};
+            if self.fp8
+                && matches!(
+                    descriptor.source(),
+                    SourceTensorEncoding::Safetensors(StoredDtype::F8E4M3)
+                        | SourceTensorEncoding::RecipeOutput(StoredDtype::F8E4M3)
+                )
+            {
+                return matches!(descriptor.executable(), LinearFormat::E4M3BlockFp8(_));
+            }
             descriptor.executable() == LinearFormat::Dense
                 && matches!(
                     descriptor.source(),
@@ -999,6 +1051,16 @@ pub(crate) mod tests {
         tempfile::TempDir,
         ArtifactInspection<ArtifactArchitecturePlan>,
     ) {
+        inspected_config_layout(config, None)
+    }
+
+    fn inspected_config_layout(
+        config: serde_json::Value,
+        layout: Option<&str>,
+    ) -> (
+        tempfile::TempDir,
+        ArtifactInspection<ArtifactArchitecturePlan>,
+    ) {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(
             root.path().join("config.json"),
@@ -1019,7 +1081,13 @@ pub(crate) mod tests {
             .chain(
                 plan.layout_groups
                     .iter()
-                    .filter_map(|group| group.variants.first())
+                    .filter_map(|group| {
+                        group
+                            .variants
+                            .iter()
+                            .find(|variant| Some(variant.id.as_str()) == layout)
+                            .or_else(|| group.variants.first())
+                    })
                     .flat_map(|variant| variant.tensors.iter()),
             )
             .map(|constraint| {
@@ -1027,9 +1095,18 @@ pub(crate) mod tests {
                     eredu_checkpoint::schema::StoredDtypeConstraint::Exact(
                         eredu_checkpoint::StoredDtype::U8,
                     ) => Dtype::U8,
+                    eredu_checkpoint::schema::StoredDtypeConstraint::Exact(
+                        eredu_checkpoint::StoredDtype::F8E4M3,
+                    ) => Dtype::F8_E4M3,
+                    eredu_checkpoint::schema::StoredDtypeConstraint::Exact(
+                        eredu_checkpoint::StoredDtype::BF16,
+                    ) => Dtype::BF16,
+                    eredu_checkpoint::schema::StoredDtypeConstraint::Exact(
+                        eredu_checkpoint::StoredDtype::F16,
+                    ) => Dtype::F16,
                     _ => Dtype::F32,
                 };
-                let bytes_per_element = if dtype == Dtype::U8 { 1 } else { 4 };
+                let bytes_per_element = dtype.bitsize() / 8;
                 let bytes = vec![0; constraint.shape.iter().product::<usize>() * bytes_per_element];
                 (
                     constraint.key.clone(),
@@ -1197,6 +1274,189 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[ignore = "manual scaling measurement with a full expert count and reduced matrix dimensions"]
+    fn qwen_fp8_expert_validation_scaling() {
+        for experts in [128, 256] {
+            let config = serde_json::json!({
+                "model_type": "qwen3_5_moe",
+                "quantization_config": {
+                    "quant_method": "fp8", "fmt": "e4m3", "activation_scheme": "dynamic",
+                    "weight_block_size": [128, 128], "modules_to_not_convert": ["model.embed_tokens", "lm_head", "mtp.fc"]
+                },
+                "text_config": {
+                    "model_type": "qwen3_5_moe_text", "vocab_size": 64, "hidden_size": 32,
+                    "num_hidden_layers": 40, "num_attention_heads": 4, "num_key_value_heads": 2,
+                    "head_dim": 8, "max_position_embeddings": 128, "linear_conv_kernel_dim": 4,
+                    "linear_key_head_dim": 8, "linear_value_head_dim": 8,
+                    "linear_num_key_heads": 2, "linear_num_value_heads": 4,
+                    "moe_intermediate_size": 128, "shared_expert_intermediate_size": 16,
+                    "num_experts": experts, "num_experts_per_tok": 8, "mtp_num_hidden_layers": 1,
+                    "layer_types": (0..40).map(|layer| if layer % 4 == 3 { "full_attention" } else { "linear_attention" }).collect::<Vec<_>>()
+                }
+            });
+            let started = std::time::Instant::now();
+            let (_root, inspection) = inspected_config_layout(config, Some("independent"));
+            let inspected = started.elapsed();
+            eprintln!("{experts} experts: fixture+inspection={inspected:.3?}");
+            let mechanisms = BoundedIndependentAdapter {
+                fp8: true,
+                ..Default::default()
+            };
+            let request = NormalizedLoadRequest::default();
+            let started = std::time::Instant::now();
+            select_preparation(&inspection, &request, &mechanisms).unwrap();
+            let first = started.elapsed();
+            eprintln!("{experts} experts: first selection={first:.3?}");
+            let started = std::time::Instant::now();
+            let selected = select_preparation(&inspection, &request, &mechanisms).unwrap();
+            let repeated = started.elapsed();
+            let started = std::time::Instant::now();
+            let plan = eredu_core::ModelPreparationPlan::from_retained_admission(
+                inspection,
+                selected.admission(),
+            )
+            .unwrap();
+            crate::prepared_sources::prepare_model_sources(plan, selected).unwrap();
+            eprintln!("40 layers x {experts} FP8 experts: fixture+inspection={inspected:.3?}, first selection={first:.3?}, repeated selection={repeated:.3?}, source preparation={:.3?}", started.elapsed());
+        }
+    }
+
+    #[test]
+    fn expert_projection_shares_complete_tasks_between_members() {
+        let (_root, inspection) = inspected_config_layout(routed_config(), Some("independent"));
+        let requirements = crate::routed_text_requirements(&inspection).unwrap();
+        let selected = select_preparation(
+            &inspection,
+            &NormalizedLoadRequest::default(),
+            &BoundedIndependentAdapter::default(),
+        )
+        .unwrap();
+        let members = crate::routed_text::project_addressable_members(
+            requirements.catalog(),
+            selected.text_realization(),
+        )
+        .unwrap();
+        let mut tasks = std::collections::BTreeMap::new();
+        let mut shared = 0;
+        for parameter in members.iter().flat_map(|member| member.parameters()) {
+            if let Some(previous) = tasks.insert(parameter.task().name(), parameter.task()) {
+                assert!(std::ptr::eq(previous, parameter.task()));
+                shared += 1;
+            }
+        }
+        assert!(
+            shared > 0,
+            "fixture must contain multiple members per target"
+        );
+    }
+
+    #[test]
+    fn validation_is_reused_through_inspection_selection_and_source_preparation() {
+        use std::sync::{atomic::Ordering, Arc};
+
+        for config in [routed_config(), composite_config(), prediction_config()] {
+            let (_root, inspection) = inspected_config(config);
+            let validation = inspection
+                .architecture_plan()
+                .validation(inspection.admission_token());
+            let weak = Arc::downgrade(&validation);
+            let mechanisms = BoundedIndependentAdapter::default();
+            let request = NormalizedLoadRequest::default();
+            let report = crate::inspect_selected_model(
+                inspection.clone(),
+                &request,
+                &mechanisms,
+                eredu_core::MediaFeatureAvailability {
+                    image: false,
+                    audio: false,
+                },
+            );
+            assert!(report.selected().is_some());
+            let selected = select_preparation(&inspection.clone(), &request, &mechanisms).unwrap();
+            assert_eq!(validation.selection_runs.load(Ordering::Relaxed), 1);
+            let plan = eredu_core::ModelPreparationPlan::from_retained_admission(
+                inspection,
+                selected.admission(),
+            )
+            .unwrap();
+            let sources = crate::prepared_sources::prepare_model_sources(plan, selected).unwrap();
+            assert_eq!(validation.selection_runs.load(Ordering::Relaxed), 1);
+            assert!(!sources.graph().source_identity().is_resolved());
+            let discovery = sources.prepare_discovery(Default::default(), Default::default());
+            assert!(!discovery.identity_is_resolved());
+            let captured = discovery.capture().unwrap();
+            assert!(sources.graph().source_identity().is_resolved());
+            assert_eq!(
+                captured.artifact_identity,
+                sources.source_identity().unwrap().to_string()
+            );
+            assert_eq!(
+                sources.execution_identity(),
+                sources
+                    .selected()
+                    .text_realization()
+                    .requirements()
+                    .architecture_identity()
+            );
+            drop(sources);
+            drop(report);
+            drop(validation);
+            assert!(
+                weak.upgrade().is_none(),
+                "retained requirements must not form an ownership cycle"
+            );
+        }
+    }
+
+    #[test]
+    fn validation_reuse_requires_identical_policy_mechanisms_and_artifact_admission() {
+        use std::sync::{atomic::Ordering, Arc};
+
+        let (root, inspection) = inspected_config(routed_config());
+        let request = NormalizedLoadRequest::default();
+        let mechanisms = BoundedIndependentAdapter::default();
+        let validation = inspection
+            .architecture_plan()
+            .validation(inspection.admission_token());
+        select_preparation(&inspection, &request, &mechanisms).unwrap();
+
+        let unsupported = BoundedIndependentAdapter::failing(IndependentFailure::Grouped);
+        for _ in 0..2 {
+            assert!(matches!(
+                select_preparation(&inspection, &request, &unsupported),
+                Err(PreparationSelectionError::MissingGroupedOperations(_))
+            ));
+        }
+        assert_eq!(validation.selection_runs.load(Ordering::Relaxed), 2);
+        select_preparation(&inspection, &request, &mechanisms).unwrap();
+        assert_eq!(validation.selection_runs.load(Ordering::Relaxed), 2);
+
+        let changed = request.clone().with_drafting(DraftingLoadRequest::Disabled);
+        select_preparation(&inspection, &changed, &mechanisms).unwrap();
+        assert_eq!(validation.selection_runs.load(Ordering::Relaxed), 3);
+
+        // Even transplanting a plan into a different inspection cannot reuse
+        // proofs established against the first inspection's tensor catalog.
+        let other = crate::configuration::inspect_artifact(root.path())
+            .unwrap()
+            .map_architecture_plan(|_| inspection.architecture_plan().clone());
+        let other_validation = other
+            .architecture_plan()
+            .validation(other.admission_token());
+        assert!(!Arc::ptr_eq(&validation, &other_validation));
+        select_preparation(&other, &request, &mechanisms).unwrap();
+        assert_eq!(other_validation.selection_runs.load(Ordering::Relaxed), 1);
+
+        let changed_architecture = inspection
+            .clone()
+            .map_architecture_plan(ArtifactArchitecturePlan::without_prediction_extension);
+        let changed_validation = changed_architecture
+            .architecture_plan()
+            .validation(changed_architecture.admission_token());
+        assert!(!Arc::ptr_eq(&validation, &changed_validation));
+    }
+
+    #[test]
     fn contradictory_request_fails_before_backend_facts_are_queried() {
         let (_root, inspection) = inspected_llama();
         let completion = eredu_runtime::CommunicationCompletionPolicy::new(
@@ -1331,7 +1591,7 @@ pub(crate) mod tests {
                     .requirements()
                     .architecture_identity()
             );
-            assert_ne!(sources.source_identity().digest(), [0; 32]);
+            assert_ne!(sources.source_identity().unwrap().digest(), [0; 32]);
             assert!(sources.companions().next().is_none());
             assert_eq!(sources.prediction_extension().is_some(), expects_extension);
             let primary = sources

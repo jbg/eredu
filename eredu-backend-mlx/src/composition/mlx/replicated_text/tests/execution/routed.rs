@@ -4,6 +4,10 @@ fn qwen_hybrid_aliased_fp8_experts_execute_resident_and_addressable() {
 
     let mut config = routed_qwen_hybrid_config();
     config["moe_intermediate_size"] = 128.into();
+    // Each segmented FP8 projection must end on a complete scale block.
+    config["linear_key_head_dim"] = 64.into();
+    config["linear_value_head_dim"] = 32.into();
+    config["shared_expert_intermediate_size"] = 128.into();
     config["quantization_config"] = serde_json::json!({
         "quant_method": "fp8", "fmt": "e4m3", "activation_scheme": "dynamic",
         "weight_block_size": [128, 128],

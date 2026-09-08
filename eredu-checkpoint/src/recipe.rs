@@ -726,6 +726,48 @@ impl DerivedWeightRecipe {
         Ok(rewritten)
     }
 
+    /// Selects every leading-axis member, retaining its singleton axis.
+    ///
+    /// A stack is validated once and each child is visited only for its own
+    /// selection. Repeatedly selecting individual members of a large stack
+    /// would otherwise re-infer and clone the entire bank for every member.
+    pub fn select_bounded_members<C: RecipeCatalog + ?Sized>(
+        &self,
+        catalog: &C,
+    ) -> Result<Vec<Self>, RecipeError> {
+        let metadata = self.infer(catalog)?;
+        let count = metadata.shape.first().copied().ok_or_else(|| {
+            RecipeError::SelectionPushdownUnsupported {
+                operation: "member selection",
+                reason: "a scalar has no leading member axis".into(),
+            }
+        })?;
+        if let Self::Stack { axis: 0, inputs } = self {
+            return inputs
+                .iter()
+                .map(|input| {
+                    let selected = Self::Stack {
+                        axis: 0,
+                        inputs: vec![input.clone()],
+                    };
+                    normalize_bounded_source_ranges(expand_indexed_sources(selected), catalog)
+                })
+                .collect();
+        }
+        (0..count)
+            .map(|member| {
+                self.select_bounded(
+                    catalog,
+                    TensorSelection::Range {
+                        axis: 0,
+                        start: member,
+                        end: member + 1,
+                    },
+                )
+            })
+            .collect()
+    }
+
     /// Selects rows from one matrix while retaining leading singleton axes.
     pub fn select_bounded_matrix_rows<C: RecipeCatalog + ?Sized>(
         &self,
@@ -1953,6 +1995,80 @@ mod tests {
 
     struct Catalog;
     struct Lease;
+
+    #[test]
+    fn stacked_member_selection_reads_metadata_linearly_and_preserves_exact_recipes() {
+        struct CountingCatalog(std::cell::Cell<usize>);
+        impl RecipeCatalog for CountingCatalog {
+            fn tensor_metadata(&self, key: &str) -> Result<TensorMetadata, StoreError> {
+                self.0.set(self.0.get() + 1);
+                Catalog.metadata(key)
+            }
+        }
+        for count in [16, 128, 256] {
+            let catalog = CountingCatalog(std::cell::Cell::new(0));
+            let recipe = DerivedWeightRecipe::Stack {
+                axis: 0,
+                inputs: (0..count)
+                    .map(|member| DerivedWeightRecipe::Concatenate {
+                        axis: 0,
+                        inputs: ["left", "right"]
+                            .into_iter()
+                            .map(|key| {
+                                DerivedWeightRecipe::source(
+                                    key,
+                                    TensorSelection::Range {
+                                        axis: 0,
+                                        start: member % 2,
+                                        end: member % 2 + 1,
+                                    },
+                                )
+                            })
+                            .collect(),
+                    })
+                    .collect(),
+            };
+            let members = recipe.select_bounded_members(&catalog).unwrap();
+            assert!(
+                catalog.0.get() <= count * 4,
+                "metadata visits must scale with source leaves, got {} for {count} members",
+                catalog.0.get()
+            );
+            assert_eq!(members.len(), count);
+            for (member, actual) in members.iter().enumerate() {
+                let expected = recipe
+                    .select_bounded(
+                        &catalog,
+                        TensorSelection::Range {
+                            axis: 0,
+                            start: member,
+                            end: member + 1,
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(*actual, expected);
+            }
+        }
+        let catalog = CountingCatalog(std::cell::Cell::new(0));
+        let malformed = DerivedWeightRecipe::Stack {
+            axis: 0,
+            inputs: vec![
+                DerivedWeightRecipe::source("left", TensorSelection::Full),
+                DerivedWeightRecipe::source(
+                    "right",
+                    TensorSelection::Range {
+                        axis: 0,
+                        start: 0,
+                        end: 1,
+                    },
+                ),
+            ],
+        };
+        assert!(matches!(
+            malformed.select_bounded_members(&catalog),
+            Err(RecipeError::ShapeMismatch)
+        ));
+    }
 
     #[derive(Default)]
     struct BoundedCatalog {

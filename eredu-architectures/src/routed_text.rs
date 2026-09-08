@@ -204,13 +204,14 @@ impl<A> PreparedRoutedTextArchitecture<A> {
         if residency != eredu_runtime::ParameterBankResidency::WithLayer {
             return Err("selected routed bank residency is not with its execution unit".into());
         }
-        let provider = PlannedResidentGatedProduct::new_with_routes(
+        // This prepared architecture already owns validated plan/catalog and route proofs.
+        validate_replicated_plan(&plan).map_err(|error| error.to_string())?;
+        drop(catalog);
+        let provider = PlannedResidentGatedProduct {
             owner_group,
             plan,
-            catalog,
             routes_by_unit,
-        )
-        .map_err(|error| error.to_string())?;
+        };
         eredu_runtime::construct_replicated_text_session_with_execution(
             modules.take_architecture(),
             modules.take_source_architecture(),
@@ -265,7 +266,7 @@ impl<A> PreparedRoutedTextArchitecture<A> {
         let eredu_runtime::ParameterBankResidency::IndependentCache(options) = residency else {
             return Err("selected routed bank residency is not independently addressable".into());
         };
-        let provider = PlannedAddressableGatedProduct::new_with_routes(
+        let provider = PlannedAddressableGatedProduct::from_validated_routes(
             owner_group,
             plan,
             catalog,
@@ -378,8 +379,13 @@ impl<A> PreparedRelu2RoutedTextArchitecture<A> {
         if residency != eredu_runtime::ParameterBankResidency::WithLayer {
             return Err("selected routed bank residency is not with its execution unit".into());
         }
-        let provider = PlannedResidentRelu2::new(owner_group, plan, catalog, routes_per_token)
-            .map_err(|error| error.to_string())?;
+        validate_replicated_plan(&plan).map_err(|error| error.to_string())?;
+        drop(catalog);
+        let provider = PlannedResidentRelu2 {
+            owner_group,
+            plan,
+            routes_per_token,
+        };
         eredu_runtime::construct_replicated_text_session_with_execution(
             modules.take_architecture(),
             modules.take_source_architecture(),
@@ -434,7 +440,8 @@ impl<A> PreparedRelu2RoutedTextArchitecture<A> {
         let eredu_runtime::ParameterBankResidency::IndependentCache(options) = residency else {
             return Err("selected routed bank residency is not independently addressable".into());
         };
-        let provider = PlannedAddressableRelu2::new(
+        let routes_by_unit = uniform_routes_by_unit(&plan, routes_per_token);
+        let provider = PlannedAddressableRelu2::from_validated_routes(
             owner_group,
             plan,
             catalog,
@@ -442,7 +449,7 @@ impl<A> PreparedRelu2RoutedTextArchitecture<A> {
             bank,
             movement,
             options,
-            routes_per_token,
+            routes_by_unit,
         )
         .map_err(|error| error.to_string())?;
         eredu_runtime::construct_replicated_text_session_with_execution(
@@ -469,21 +476,25 @@ pub enum RoutedTextPreparationError {
     Invalid(String),
 }
 
-fn selected_member_geometry(
-    unit: &crate::ExpertResidencyUnit,
-    selected: &eredu_runtime::SelectedReplicatedTextRealization,
-) -> Result<(u64, u64), String> {
-    let selected_tasks = eredu_runtime::replicated_text_materialization_tasks(selected)
-        .map_err(|error| error.to_string())?;
-    let mut tasks = BTreeMap::new();
-    for task in selected_tasks {
+fn index_materialization_tasks(
+    tasks: &[eredu_runtime::ReplicatedTextMaterializationTask],
+) -> BTreeMap<&str, &eredu_runtime::ReplicatedTextMaterializationTask> {
+    let mut indexed = BTreeMap::new();
+    for task in tasks {
         for companion in task.output_companions() {
             if let Some(exact) = companion.materialization_task() {
-                tasks.insert(companion.name().to_owned(), exact.clone());
+                indexed.insert(companion.name(), exact);
             }
         }
-        tasks.insert(task.name().to_owned(), task);
+        indexed.insert(task.name(), task);
     }
+    indexed
+}
+
+fn selected_member_geometry(
+    unit: &crate::ExpertResidencyUnit,
+    tasks: &BTreeMap<&str, &eredu_runtime::ReplicatedTextMaterializationTask>,
+) -> Result<(u64, u64), String> {
     let mut source_bytes = 0u64;
     let mut selected_bytes = 0u64;
     for parameter in unit.parameters() {
@@ -564,12 +575,10 @@ pub(crate) fn project_addressable_members_with_tasks(
     selected: &eredu_runtime::SelectedReplicatedTextRealization,
     tasks: &[eredu_runtime::ReplicatedTextMaterializationTask],
 ) -> Result<Vec<eredu_runtime::AddressableBankMember>, RoutedTextPreparationError> {
+    let selected_tasks = index_materialization_tasks(selected.materialization_tasks());
     let mut exact_tasks = BTreeMap::new();
     for task in tasks {
-        if exact_tasks
-            .insert(task.name().to_owned(), task.clone())
-            .is_some()
-        {
+        if exact_tasks.insert(task.name(), task).is_some() {
             return Err(RoutedTextPreparationError::Invalid(format!(
                 "addressable materialization repeats task {:?}",
                 task.name()
@@ -584,10 +593,7 @@ pub(crate) fn project_addressable_members_with_tasks(
             let Some(exact) = companion.materialization_task() else {
                 continue;
             };
-            if exact_tasks
-                .insert(companion.name().to_owned(), exact.clone())
-                .is_some()
-            {
+            if exact_tasks.insert(companion.name(), exact).is_some() {
                 return Err(RoutedTextPreparationError::Invalid(format!(
                     "addressable materialization repeats output {:?}",
                     companion.name()
@@ -595,6 +601,7 @@ pub(crate) fn project_addressable_members_with_tasks(
             }
         }
     }
+    let mut shared_tasks = BTreeMap::new();
     let mut members = Vec::with_capacity(catalog.units().len());
     for unit in catalog.units() {
         if unit.distribution() != crate::ExpertResidencyDistribution::ExpertParallel {
@@ -615,7 +622,7 @@ pub(crate) fn project_addressable_members_with_tasks(
                 unit.parameters().len()
             )));
         }
-        let (source_bytes, _selected_bytes) = selected_member_geometry(unit, selected)
+        let (source_bytes, _selected_bytes) = selected_member_geometry(unit, &selected_tasks)
             .map_err(RoutedTextPreparationError::Invalid)?;
         let mut parameters = Vec::with_capacity(unit.parameters().len());
         for parameter in unit.parameters() {
@@ -625,9 +632,9 @@ pub(crate) fn project_addressable_members_with_tasks(
                     unit.identity()
                 ))
             })?;
-            let mut task = exact_tasks
+            let task = exact_tasks
                 .get(parameter.logical_target())
-                .cloned()
+                .copied()
                 .ok_or_else(|| {
                     RoutedTextPreparationError::Invalid(format!(
                         "addressable target {:?} has no exact materialization task",
@@ -674,86 +681,106 @@ pub(crate) fn project_addressable_members_with_tasks(
                 } else {
                     None
                 };
-            if task.output_companions().is_empty() {
-                if let Some(companions) = companions.as_ref() {
-                    let quantization =
-                        task.executable().weight_quantization().ok_or_else(|| {
-                            RoutedTextPreparationError::Invalid(format!(
-                                "addressable transform target {:?} has no packed format",
-                                task.name()
-                            ))
-                        })?;
-                    let prefix = parameter
-                        .logical_target()
-                        .strip_suffix(parameter.binding_name())
-                        .ok_or_else(|| {
-                            RoutedTextPreparationError::Invalid(format!(
+            let shared_key = (
+                parameter.logical_target(),
+                metadata.shape(),
+                companions.as_ref().map(|bindings| {
+                    (
+                        bindings.scale().to_owned(),
+                        bindings.affine_bias().map(str::to_owned),
+                    )
+                }),
+            );
+            let shared_task = if let Some(shared) = shared_tasks.get(&shared_key) {
+                eredu_runtime::AddressableBankTask::clone(shared)
+            } else {
+                let mut task = task.clone();
+                if task.output_companions().is_empty() {
+                    if let Some(companions) = companions.as_ref() {
+                        let quantization =
+                            task.executable().weight_quantization().ok_or_else(|| {
+                                RoutedTextPreparationError::Invalid(format!(
+                                    "addressable transform target {:?} has no packed format",
+                                    task.name()
+                                ))
+                            })?;
+                        let prefix = parameter
+                            .logical_target()
+                            .strip_suffix(parameter.binding_name())
+                            .ok_or_else(|| {
+                                RoutedTextPreparationError::Invalid(format!(
                                 "addressable target {:?} does not end in its local binding {:?}",
                                 parameter.logical_target(),
                                 parameter.binding_name()
                             ))
-                        })?;
-                    let mut shape = metadata.shape().to_vec();
-                    let columns = shape.last_mut().ok_or_else(|| {
-                        RoutedTextPreparationError::Invalid(
-                            "addressable transform companion has no group axis".into(),
-                        )
-                    })?;
-                    *columns = columns
-                        .checked_div(quantization.group_size() as usize)
-                        .ok_or_else(|| {
+                            })?;
+                        let mut shape = metadata.shape().to_vec();
+                        let columns = shape.last_mut().ok_or_else(|| {
                             RoutedTextPreparationError::Invalid(
-                                "addressable transform companion group geometry is invalid".into(),
+                                "addressable transform companion has no group axis".into(),
                             )
                         })?;
-                    let owner = match task.owner() {
-                        eredu_runtime::ReplicatedTextParameterOwner::ExecutionUnit {
-                            group,
-                            unit,
-                        } => eredu_runtime::ParameterGroupOwner::execution_unit(
-                            eredu_runtime::ExecutionGroupId::new(group.clone()).map_err(
-                                |error| RoutedTextPreparationError::Invalid(error.to_string()),
-                            )?,
-                            *unit,
-                        ),
-                        eredu_runtime::ReplicatedTextParameterOwner::StaticRole(role) => {
-                            eredu_runtime::ParameterGroupOwner::StaticRole(role.clone())
+                        *columns = columns
+                            .checked_div(quantization.group_size() as usize)
+                            .ok_or_else(|| {
+                                RoutedTextPreparationError::Invalid(
+                                    "addressable transform companion group geometry is invalid"
+                                        .into(),
+                                )
+                            })?;
+                        let owner = match task.owner() {
+                            eredu_runtime::ReplicatedTextParameterOwner::ExecutionUnit {
+                                group,
+                                unit,
+                            } => eredu_runtime::ParameterGroupOwner::execution_unit(
+                                eredu_runtime::ExecutionGroupId::new(group.clone()).map_err(
+                                    |error| RoutedTextPreparationError::Invalid(error.to_string()),
+                                )?,
+                                *unit,
+                            ),
+                            eredu_runtime::ReplicatedTextParameterOwner::StaticRole(role) => {
+                                eredu_runtime::ParameterGroupOwner::StaticRole(role.clone())
+                            }
+                            _ => {
+                                return Err(RoutedTextPreparationError::Invalid(
+                                    "addressable transform selected an unsupported owner".into(),
+                                ));
+                            }
+                        };
+                        let mut outputs = vec![eredu_runtime::ReplicatedTextOutputCompanion::new(
+                            format!("{prefix}{}", companions.scale()),
+                            eredu_nn::LinearCompanionRole::Scale,
+                            shape.clone(),
+                            owner.clone(),
+                        )
+                        .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?];
+                        if let Some(biases) = companions.affine_bias() {
+                            outputs.push(
+                                eredu_runtime::ReplicatedTextOutputCompanion::new(
+                                    format!("{prefix}{biases}"),
+                                    eredu_nn::LinearCompanionRole::AffineBias,
+                                    shape,
+                                    owner,
+                                )
+                                .map_err(|error| {
+                                    RoutedTextPreparationError::Invalid(error.to_string())
+                                })?,
+                            );
                         }
-                        _ => {
-                            return Err(RoutedTextPreparationError::Invalid(
-                                "addressable transform selected an unsupported owner".into(),
-                            ));
-                        }
-                    };
-                    let mut outputs = vec![eredu_runtime::ReplicatedTextOutputCompanion::new(
-                        format!("{prefix}{}", companions.scale()),
-                        eredu_nn::LinearCompanionRole::Scale,
-                        shape.clone(),
-                        owner.clone(),
-                    )
-                    .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?];
-                    if let Some(biases) = companions.affine_bias() {
-                        outputs.push(
-                            eredu_runtime::ReplicatedTextOutputCompanion::new(
-                                format!("{prefix}{biases}"),
-                                eredu_nn::LinearCompanionRole::AffineBias,
-                                shape,
-                                owner,
-                            )
-                            .map_err(|error| {
-                                RoutedTextPreparationError::Invalid(error.to_string())
-                            })?,
-                        );
+                        task = task.with_output_companions(outputs).map_err(|error| {
+                            RoutedTextPreparationError::Invalid(error.to_string())
+                        })?;
                     }
-                    task = task
-                        .with_output_companions(outputs)
-                        .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
                 }
-            }
+                let shared = eredu_runtime::AddressableBankTask::new(task)
+                    .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
+                shared_tasks.insert(shared_key, shared.clone());
+                shared
+            };
             parameters.push(
-                eredu_runtime::AddressableBankParameter::new(
+                eredu_runtime::AddressableBankParameter::from_shared_task(
                     parameter.binding_name(),
-                    task,
+                    shared_task,
                     parameter.recipe().clone(),
                     metadata.clone(),
                     selected_bytes,
@@ -2492,9 +2519,10 @@ fn maximum_selected_compact_bytes(
     requirements: &RoutedTextRequirements,
     selected: &eredu_runtime::SelectedReplicatedTextRealization,
 ) -> Result<u64, String> {
+    let tasks = index_materialization_tasks(selected.materialization_tasks());
     let mut by_unit = BTreeMap::<(String, usize), Vec<u64>>::new();
     for unit in requirements.catalog().units() {
-        let (_, selected_bytes) = selected_member_geometry(unit, selected)?;
+        let (_, selected_bytes) = selected_member_geometry(unit, &tasks)?;
         by_unit
             .entry((
                 unit.owner_group().as_str().to_owned(),
@@ -2709,7 +2737,7 @@ fn select_relu2_formats(
 }
 
 /// Failure while deriving routed requirements from an admitted artifact.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 #[non_exhaustive]
 pub enum RoutedTextRequirementsError {
     /// The admitted graph is outside replicated routed text execution.
@@ -2724,6 +2752,17 @@ pub enum RoutedTextRequirementsError {
 ///
 /// Backend support and caller residency policy do not participate in this step.
 pub fn routed_text_requirements(
+    inspection: &eredu_core::ArtifactInspection<crate::processor_plan::ArtifactArchitecturePlan>,
+) -> Result<RoutedTextRequirements, RoutedTextRequirementsError> {
+    inspection
+        .architecture_plan()
+        .validation(inspection.admission_token())
+        .routed
+        .get_or_init(|| derive_routed_text_requirements(inspection))
+        .clone()
+}
+
+fn derive_routed_text_requirements(
     inspection: &eredu_core::ArtifactInspection<crate::processor_plan::ArtifactArchitecturePlan>,
 ) -> Result<RoutedTextRequirements, RoutedTextRequirementsError> {
     let architecture = inspection.architecture_plan();
@@ -3058,12 +3097,21 @@ fn validate_catalog_parameter_topology<O: RoutedGroupedOperationValidation>(
     catalog: &ExpertResidencyCatalog,
     recipe_source: &(impl eredu_checkpoint::recipe::RecipeCatalog + ?Sized),
 ) -> Result<(), RoutedTextRequirementsError> {
+    let requirements = text
+        .parameters()
+        .iter()
+        .map(|parameter| (parameter.name(), parameter))
+        .collect::<BTreeMap<_, _>>();
+    let mut occurrences = BTreeMap::<&str, usize>::new();
+    for parameter in catalog.units().iter().flat_map(|unit| unit.parameters()) {
+        *occurrences.entry(parameter.logical_target()).or_default() += 1;
+    }
+    let mut allowed_sources = BTreeMap::new();
+    let mut member_recipes = BTreeMap::new();
     for unit in catalog.units() {
         for parameter in unit.parameters() {
-            let requirement = text
-                .parameters()
-                .iter()
-                .find(|candidate| candidate.name() == parameter.logical_target())
+            let requirement = requirements
+                .get(parameter.logical_target())
                 .ok_or_else(|| {
                     RoutedTextRequirementsError::Invalid(format!(
                         "bank target {:?} is absent from replicated parameter topology",
@@ -3081,12 +3129,7 @@ fn validate_catalog_parameter_topology<O: RoutedGroupedOperationValidation>(
             let expected_shapes = O::member_parameter_shapes(spec, unit.identity().member())
                 .map_err(|error| RoutedTextRequirementsError::Invalid(error.to_string()))?;
             if let Some(expected_member_shape) = expected_shapes.get(parameter.logical_target()) {
-                let occurrences = catalog
-                    .units()
-                    .iter()
-                    .flat_map(|unit| unit.parameters())
-                    .filter(|candidate| candidate.logical_target() == parameter.logical_target())
-                    .count();
+                let occurrences = occurrences[parameter.logical_target()];
                 let mut expected_logical = expected_member_shape.clone();
                 if occurrences > 1 {
                     let first = expected_logical.first_mut().ok_or_else(|| {
@@ -3166,30 +3209,34 @@ fn validate_catalog_parameter_topology<O: RoutedGroupedOperationValidation>(
                 )));
             }
             let derived = text.derived_recipes().get(parameter.logical_target());
-            let allowed = derived.map_or_else(
-                || {
-                    requirement
-                        .sources()
-                        .iter()
-                        .chain(requirement.aliases())
-                        .cloned()
-                        .collect::<std::collections::BTreeSet<_>>()
-                },
-                |recipe| {
-                    recipe
-                        .source_keys()
-                        .into_iter()
-                        .map(str::to_owned)
-                        .collect()
-                },
-            );
+            let allowed = allowed_sources
+                .entry(parameter.logical_target())
+                .or_insert_with(|| {
+                    derived.map_or_else(
+                        || {
+                            requirement
+                                .sources()
+                                .iter()
+                                .chain(requirement.aliases())
+                                .cloned()
+                                .collect::<std::collections::BTreeSet<_>>()
+                        },
+                        |recipe| {
+                            recipe
+                                .source_keys()
+                                .into_iter()
+                                .map(str::to_owned)
+                                .collect()
+                        },
+                    )
+                });
             let actual = parameter
                 .recipe()
                 .source_keys()
                 .into_iter()
                 .map(str::to_owned)
                 .collect::<std::collections::BTreeSet<_>>();
-            if actual.is_empty() || !actual.is_subset(&allowed) {
+            if actual.is_empty() || !actual.is_subset(allowed) {
                 return Err(RoutedTextRequirementsError::Invalid(format!(
                     "bank target {:?} recipe sources {actual:?} differ from admitted sources {allowed:?}",
                     parameter.logical_target()
@@ -3202,15 +3249,33 @@ fn validate_catalog_parameter_topology<O: RoutedGroupedOperationValidation>(
                 end: member + 1,
             };
             let exact_match = if let Some(recipe) = derived {
-                recipe
-                    .select_bounded(recipe_source, member_selection.clone())
-                    .map_err(|error| {
-                        RoutedTextRequirementsError::Invalid(format!(
-                            "bank target {:?} cannot select admitted member {member}: {error}",
-                            parameter.logical_target()
-                        ))
-                    })?
-                    == *parameter.recipe()
+                let count = occurrences[parameter.logical_target()];
+                if count > 1 {
+                    if !member_recipes.contains_key(parameter.logical_target()) {
+                        let members =
+                            recipe
+                                .select_bounded_members(recipe_source)
+                                .map_err(|error| {
+                                    RoutedTextRequirementsError::Invalid(format!(
+                                        "bank target {:?} cannot select admitted members: {error}",
+                                        parameter.logical_target()
+                                    ))
+                                })?;
+                        member_recipes.insert(parameter.logical_target(), members);
+                    }
+                    member_recipes[parameter.logical_target()].get(member)
+                        == Some(parameter.recipe())
+                } else {
+                    recipe
+                        .select_bounded(recipe_source, member_selection.clone())
+                        .map_err(|error| {
+                            RoutedTextRequirementsError::Invalid(format!(
+                                "bank target {:?} cannot select admitted member {member}: {error}",
+                                parameter.logical_target()
+                            ))
+                        })?
+                        == *parameter.recipe()
+                }
             } else {
                 requirement
                     .sources()
@@ -4463,13 +4528,33 @@ where
             .map_err(|error| RoutedTextExecutionError::Contract(error.to_string()))?;
         validate_routes_by_unit::<O>(&plan, &routes_by_unit)
             .map_err(|error| RoutedTextExecutionError::Contract(error.to_string()))?;
-        validate_catalog::<O, B, Bank>(
-            &owner_group,
-            &plan,
-            &catalog,
-            &selected_member_bytes,
-            &bank,
-        )?;
+        validate_plan_catalog::<O>(&owner_group, &plan, &catalog)
+            .map_err(|error| RoutedTextExecutionError::Contract(error.to_string()))?;
+        Self::from_validated_routes(
+            owner_group,
+            plan,
+            catalog,
+            selected_member_bytes,
+            bank,
+            movement,
+            options,
+            routes_by_unit,
+        )
+    }
+
+    // Called only with the immutable contracts owned by a prepared architecture,
+    // or after the public raw-parts constructor has established the same proofs.
+    fn from_validated_routes(
+        owner_group: eredu_runtime::ExecutionGroupId,
+        plan: ExpertRealizationPlan<O::Spec>,
+        catalog: ExpertResidencyCatalog,
+        selected_member_bytes: BTreeMap<ParameterBankKey, u64>,
+        bank: Bank,
+        movement: Movement,
+        options: eredu_runtime::ParameterBankLoadOptions,
+        routes_by_unit: BTreeMap<usize, usize>,
+    ) -> Result<Self, RoutedTextExecutionError> {
+        validate_catalog_binding::<B, Bank>(&catalog, &selected_member_bytes, &bank)?;
         Ok(Self {
             owner_group,
             plan,
@@ -5133,9 +5218,7 @@ fn validate_replicated_plan<S>(
     Ok(())
 }
 
-fn validate_catalog<O, B, Bank>(
-    owner_group: &eredu_runtime::ExecutionGroupId,
-    plan: &ExpertRealizationPlan<O::Spec>,
+fn validate_catalog_binding<B, Bank>(
     catalog: &ExpertResidencyCatalog,
     selected_member_bytes: &BTreeMap<ParameterBankKey, u64>,
     bank: &Bank,
@@ -5143,10 +5226,7 @@ fn validate_catalog<O, B, Bank>(
 where
     B: GroupedNeuralBackend,
     Bank: AddressableGroupedBank<B>,
-    O: RoutedGroupedOperation<B>,
 {
-    validate_plan_catalog::<O>(owner_group, plan, catalog)
-        .map_err(|error| RoutedTextExecutionError::Contract(error.to_string()))?;
     let addressable_units = catalog
         .units()
         .iter()
@@ -5184,6 +5264,31 @@ fn validate_plan_catalog<O>(
 where
     O: RoutedGroupedOperationValidation,
 {
+    let mut by_request = BTreeMap::<_, Vec<_>>::new();
+    let mut by_owner = BTreeMap::<_, Vec<_>>::new();
+    let mut by_unit = BTreeMap::<_, Vec<_>>::new();
+    for unit in catalog.units() {
+        by_request
+            .entry((
+                unit.owner_group(),
+                unit.identity().unit(),
+                unit.identity().member(),
+            ))
+            .or_default()
+            .push(unit);
+        by_owner
+            .entry((
+                unit.owner_group(),
+                unit.owner_unit(),
+                unit.identity().member(),
+            ))
+            .or_default()
+            .push(unit);
+        by_unit
+            .entry((unit.owner_group(), unit.identity().unit()))
+            .or_default()
+            .push(unit);
+    }
     for ((group, request_unit), spec) in plan.unit_specs() {
         if group != owner_group {
             return Err(RoutedTextRequirementsError::Invalid(format!(
@@ -5200,27 +5305,10 @@ where
             ))
         })?;
         for member in 0..member_count {
-            let mut matches = catalog
-                .units()
-                .iter()
-                .filter(|unit| {
-                    unit.owner_group() == group
-                        && unit.identity().unit() == *request_unit
-                        && unit.identity().member() == member
-                })
-                .collect::<Vec<_>>();
-            if matches.is_empty() {
-                matches = catalog
-                    .units()
-                    .iter()
-                    .filter(|unit| {
-                        unit.owner_group() == group
-                            && unit.owner_unit() == *request_unit
-                            && unit.identity().member() == member
-                    })
-                    .collect();
-            }
-            let [unit] = matches.as_slice() else {
+            let key = (group, *request_unit, member);
+            let matches = by_request.get(&key).or_else(|| by_owner.get(&key));
+            let matches = matches.map(Vec::as_slice).unwrap_or_default();
+            let [unit] = matches else {
                 return Err(RoutedTextRequirementsError::Invalid(format!(
                     "bank catalog must contain one member {member} for {:?}/{request_unit}",
                     group.as_str()
@@ -5266,10 +5354,7 @@ where
                 )));
             }
         }
-        let mut unit_facts = catalog
-            .units()
-            .iter()
-            .filter(|unit| unit.owner_group() == group && unit.identity().unit() == *request_unit);
+        let mut unit_facts = by_unit.get(&(group, *request_unit)).into_iter().flatten();
         if let Some(first) = unit_facts.next() {
             if unit_facts.any(|unit| {
                 unit.unit_path() != first.unit_path()

@@ -460,7 +460,9 @@ where
     E: std::fmt::Debug,
     T: Constraint<E>,
 {
-    issues.extend(validate_catalog(catalog, identity, common, groups, policy));
+    let (validation_issues, selected_layouts) =
+        validate_catalog_layouts(catalog, identity, common, groups, policy);
+    issues.extend(validation_issues);
     if !issues.is_empty() {
         return Err(CheckpointValidation::from_issues(issues));
     }
@@ -478,16 +480,9 @@ where
         select_constraint(constraint);
     }
 
-    for group in groups {
-        if let Some(variant) = group.variants.iter().find(|variant| {
-            variant
-                .discriminator_keys
-                .iter()
-                .all(|key| discriminator_present(catalog, variant, key))
-        }) {
-            for constraint in &variant.tensors {
-                select_constraint(constraint);
-            }
+    for variant in selected_layouts {
+        for constraint in &variant.tensors {
+            select_constraint(constraint);
         }
     }
 
@@ -579,6 +574,24 @@ where
     E: std::fmt::Debug,
     T: Constraint<E>,
 {
+    validate_catalog_layouts(catalog, identity, common, groups, policy).0
+}
+
+fn validate_catalog_layouts<'a, E, T>(
+    catalog: &BTreeMap<String, PhysicalMetadata<E>>,
+    identity: &str,
+    common: &[T],
+    groups: &'a [AlternativeLayoutGroup<T>],
+    policy: &CatalogPolicy,
+) -> (
+    Vec<CheckpointIssue>,
+    Vec<&'a crate::schema::LayoutVariant<T>>,
+)
+where
+    E: std::fmt::Debug,
+    T: Constraint<E>,
+{
+    let mut selected_layouts = Vec::new();
     let mut issues = Vec::new();
     let mut accounted = BTreeSet::new();
     for constraint in common {
@@ -590,19 +603,29 @@ where
         let mut present = Vec::new();
         let mut partial = Vec::new();
         for variant in &group.variants {
-            let count = variant
+            let mut constraints = BTreeMap::new();
+            for constraint in &variant.tensors {
+                constraints.entry(constraint.key()).or_insert(constraint);
+            }
+            let missing = variant
                 .discriminator_keys
                 .iter()
-                .filter(|key| discriminator_present(catalog, variant, key))
-                .count();
+                .filter(|key| {
+                    !constraints.get(key.as_str()).map_or_else(
+                        || catalog.contains_key(key.as_str()),
+                        |constraint| constraint_present(catalog, *constraint),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let count = variant.discriminator_keys.len() - missing.len();
             if count == variant.discriminator_keys.len() {
                 present.push(variant);
             } else if count != 0 {
-                partial.push((variant, count));
+                partial.push((variant, count, missing.first().copied().cloned()));
             }
         }
 
-        for (variant, count) in &partial {
+        for (variant, count, missing) in &partial {
             issues.push(CheckpointIssue {
                 kind: CheckpointIssueKind::ConflictingLayout,
                 detail: format!(
@@ -612,11 +635,7 @@ where
                     variant.id,
                     variant.discriminator_keys.len()
                 ),
-                tensor_name: variant
-                    .discriminator_keys
-                    .iter()
-                    .find(|key| !discriminator_present(catalog, variant, key))
-                    .cloned(),
+                tensor_name: missing.clone(),
                 tensor_type_code: None,
                 metadata_key: None,
             });
@@ -635,7 +654,7 @@ where
                         .collect::<Vec<_>>(),
                     partial
                         .iter()
-                        .map(|(variant, _)| variant.id.as_str())
+                        .map(|(variant, _, _)| variant.id.as_str())
                         .collect::<Vec<_>>()
                 ),
                 tensor_name: present
@@ -684,13 +703,16 @@ where
             });
         }
 
+        if present.len() == 1 && partial.is_empty() {
+            selected_layouts.push(present[0]);
+        }
         for variant in present {
             for constraint in &variant.tensors {
                 account_constraint(&mut accounted, constraint);
                 validate_constraint(catalog, identity, constraint, &mut issues);
             }
         }
-        for (variant, _) in partial {
+        for (variant, _, _) in partial {
             for constraint in &variant.tensors {
                 if constraint_present(catalog, constraint) {
                     account_constraint(&mut accounted, constraint);
@@ -724,7 +746,7 @@ where
             });
         }
     }
-    issues
+    (issues, selected_layouts)
 }
 
 fn constraint_present<E, T: Constraint<E>>(
@@ -734,21 +756,6 @@ fn constraint_present<E, T: Constraint<E>>(
     std::iter::once(constraint.key())
         .chain(constraint.aliases().iter().map(String::as_str))
         .any(|key| catalog.contains_key(key))
-}
-
-fn discriminator_present<E, T: Constraint<E>>(
-    catalog: &BTreeMap<String, PhysicalMetadata<E>>,
-    variant: &crate::schema::LayoutVariant<T>,
-    key: &str,
-) -> bool {
-    variant
-        .tensors
-        .iter()
-        .find(|constraint| constraint.key() == key)
-        .map_or_else(
-            || catalog.contains_key(key),
-            |constraint| constraint_present(catalog, constraint),
-        )
 }
 
 fn account_constraint<E, T: Constraint<E>>(accounted: &mut BTreeSet<String>, constraint: &T) {

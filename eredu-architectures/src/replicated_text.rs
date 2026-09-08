@@ -3492,6 +3492,17 @@ fn safetensors_inspection_recipe_source(
 pub fn replicated_text_requirements(
     inspection: &ArtifactInspection<ArtifactArchitecturePlan>,
 ) -> Result<ReplicatedTextRequirements, ReplicatedTextRequirementsError> {
+    inspection
+        .architecture_plan()
+        .validation(inspection.admission_token())
+        .replicated
+        .get_or_init(|| derive_replicated_text_requirements(inspection))
+        .clone()
+}
+
+fn derive_replicated_text_requirements(
+    inspection: &ArtifactInspection<ArtifactArchitecturePlan>,
+) -> Result<ReplicatedTextRequirements, ReplicatedTextRequirementsError> {
     let plan = inspection.architecture_plan();
     let config = eligible_config(plan)?;
     replicated_text_requirements_for_config(inspection, config)
@@ -4505,13 +4516,18 @@ fn safetensors_parameters(
             }
         }
     }
+    let mut constraints_by_name = BTreeMap::new();
+    for constraint in &constraints {
+        constraints_by_name
+            .entry(constraint.key.as_str())
+            .or_insert(*constraint);
+    }
     let declared_companions = constraints
         .iter()
         .filter_map(|constraint| {
             constraint.linear_companion.as_ref().map(|companion| {
-                let primary = constraints
-                    .iter()
-                    .find(|candidate| candidate.key == companion.primary)
+                let primary = constraints_by_name
+                    .get(companion.primary.as_str())
                     .map(|candidate| {
                         config.canonical_parameter_name(&candidate.key, &candidate.aliases)
                     })
@@ -4532,9 +4548,8 @@ fn safetensors_parameters(
     let linear_shapes = source_linear_shapes
         .into_iter()
         .map(|(name, shape)| {
-            let canonical = constraints
-                .iter()
-                .find(|constraint| constraint.key == name)
+            let canonical = constraints_by_name
+                .get(name.as_str())
                 .map_or(name, |constraint| {
                     config.canonical_parameter_name(&constraint.key, &constraint.aliases)
                 });
@@ -5155,6 +5170,44 @@ fn finish_parameters(
         })
         .map(|parameter| parameter.name().to_owned())
         .collect::<Vec<_>>();
+    let mut companions = BTreeMap::<String, Vec<_>>::new();
+    for primary in &primaries {
+        let prefix = primary.strip_suffix(".weight").unwrap_or(primary);
+        let names = [
+            (
+                format!("{prefix}.scales"),
+                eredu_nn::LinearCompanionRole::Scale,
+            ),
+            (
+                format!("{primary}_scales"),
+                eredu_nn::LinearCompanionRole::Scale,
+            ),
+            (
+                format!("{prefix}.weight_scale_inv"),
+                eredu_nn::LinearCompanionRole::Scale,
+            ),
+            (
+                format!("{primary}_scale_inv"),
+                eredu_nn::LinearCompanionRole::Scale,
+            ),
+            (
+                format!("{prefix}.biases"),
+                eredu_nn::LinearCompanionRole::AffineBias,
+            ),
+            (
+                format!("{primary}_biases"),
+                eredu_nn::LinearCompanionRole::AffineBias,
+            ),
+        ]
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+        for (name, role) in names {
+            companions
+                .entry(name)
+                .or_default()
+                .push((role, primary.clone()));
+        }
+    }
     for parameter in &mut parameters {
         if parameter.role() != ReplicatedTextParameterRole::FormatCompanion {
             continue;
@@ -5162,27 +5215,11 @@ fn finish_parameters(
         if parameter.linear_companion().is_some() {
             continue;
         }
-        let candidates = primaries
-            .iter()
-            .filter_map(|primary| {
-                let prefix = primary.strip_suffix(".weight").unwrap_or(primary);
-                let role = if parameter.name() == format!("{prefix}.scales")
-                    || parameter.name() == format!("{primary}_scales")
-                    || parameter.name() == format!("{prefix}.weight_scale_inv")
-                    || parameter.name() == format!("{primary}_scale_inv")
-                {
-                    Some(eredu_nn::LinearCompanionRole::Scale)
-                } else if parameter.name() == format!("{prefix}.biases")
-                    || parameter.name() == format!("{primary}_biases")
-                {
-                    Some(eredu_nn::LinearCompanionRole::AffineBias)
-                } else {
-                    None
-                };
-                role.map(|role| (role, primary.clone()))
-            })
-            .collect::<Vec<_>>();
-        match candidates.as_slice() {
+        let candidates = companions
+            .get(parameter.name())
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        match candidates {
             [(role, primary)] => {
                 *parameter = parameter
                     .clone()
@@ -5232,7 +5269,7 @@ fn stored_dtype(dtype: &TensorDtype) -> Result<StoredDtype, ReplicatedTextRequir
 }
 
 /// Failure while deriving replicated text requirements from an admitted artifact.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 #[non_exhaustive]
 pub enum ReplicatedTextRequirementsError {
     /// The architecture belongs to a different execution class.
@@ -6583,6 +6620,17 @@ fn composite_routed_requirements(
 pub fn composite_text_requirements(
     inspection: &ArtifactInspection<ArtifactArchitecturePlan>,
 ) -> Result<CompositeTextRequirements, ReplicatedTextRequirementsError> {
+    inspection
+        .architecture_plan()
+        .validation(inspection.admission_token())
+        .composite
+        .get_or_init(|| derive_composite_text_requirements(inspection))
+        .clone()
+}
+
+fn derive_composite_text_requirements(
+    inspection: &ArtifactInspection<ArtifactArchitecturePlan>,
+) -> Result<CompositeTextRequirements, ReplicatedTextRequirementsError> {
     let config = composite_config(inspection.architecture_plan())?.ok_or({
         ReplicatedTextRequirementsError::Ineligible(ReplicatedTextIneligibility::Unrelated)
     })?;
@@ -6641,7 +6689,9 @@ pub fn composite_text_requirements(
         processor,
         execution,
         routed,
-        inspection: inspection.clone(),
+        inspection: inspection
+            .clone()
+            .map_architecture_plan(ArtifactArchitecturePlan::without_validation),
     })
 }
 

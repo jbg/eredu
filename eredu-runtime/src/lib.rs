@@ -163,12 +163,12 @@ pub use expert::{
     reduce_tensor_parallel_expert_output, selected_addressable_parameter_bytes,
     AddressableBankBindingPlan, AddressableBankDistribution, AddressableBankMember,
     AddressableBankMemberError, AddressableBankMemberPlacement, AddressableBankParameter,
-    AddressableBindingTransform, AddressableExpertRouteProvider, AddressableExpertRouteRequest,
-    AddressableGatedProductBank, AddressableGroupedBank, ExpertRouteCombination,
-    ExpertRouteExchange, ExpertRouteTensorMovement, IndexedMovement, ObservedExpertProvider,
-    ObservedExpertProviderError, ParameterBankAcquisition, ResidentExpertProvider,
-    RoutedExpertProvider, RoutedExpertRequest, RoutedExpertTensorParallelOutput,
-    RoutedObservationPoint, TensorParallelRoutedExpertProvider,
+    AddressableBankTask, AddressableBindingTransform, AddressableExpertRouteProvider,
+    AddressableExpertRouteRequest, AddressableGatedProductBank, AddressableGroupedBank,
+    ExpertRouteCombination, ExpertRouteExchange, ExpertRouteTensorMovement, IndexedMovement,
+    ObservedExpertProvider, ObservedExpertProviderError, ParameterBankAcquisition,
+    ResidentExpertProvider, RoutedExpertProvider, RoutedExpertRequest,
+    RoutedExpertTensorParallelOutput, RoutedObservationPoint, TensorParallelRoutedExpertProvider,
 };
 pub use expert::{select_routes_with_observer, select_routes_with_provider};
 pub use generation::{

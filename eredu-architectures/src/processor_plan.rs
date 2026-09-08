@@ -484,6 +484,7 @@ enum NormalizedProcessorPlan {
 /// typed family plan before processor enrichment or materialization.
 #[derive(Debug, Clone)]
 pub struct ArtifactArchitecturePlan {
+    validation: std::sync::Arc<crate::inspection_validation::InspectionValidation>,
     family: ArtifactFamilyPlan,
     media_projector: Option<crate::gguf_companion::GgufMediaProjectorPlan>,
     processor: Option<NormalizedProcessorPlan>,
@@ -491,9 +492,24 @@ pub struct ArtifactArchitecturePlan {
 }
 
 impl ArtifactArchitecturePlan {
+    pub(crate) fn validation(
+        &self,
+        token: eredu_core::artifact::ArtifactAdmissionToken,
+    ) -> std::sync::Arc<crate::inspection_validation::AdmittedValidation> {
+        self.validation.for_admission(token)
+    }
+
+    // Requirements retain their immutable source snapshot, but must not retain
+    // the cache that owns those same requirements (an Arc ownership cycle).
+    pub(crate) fn without_validation(mut self) -> Self {
+        self.validation = Default::default();
+        self
+    }
+
     /// Retains the typed SafeTensors architecture and checkpoint plan from resolution.
     pub(crate) fn from_safetensors_architecture(architecture: SafetensorsArchitecturePlan) -> Self {
         Self {
+            validation: Default::default(),
             family: ArtifactFamilyPlan::Safetensors(architecture),
             media_projector: None,
             processor: None,
@@ -506,6 +522,7 @@ impl ArtifactArchitecturePlan {
         architecture: crate::configuration::GgufArchitecturePlan,
     ) -> Self {
         Self {
+            validation: Default::default(),
             family: ArtifactFamilyPlan::Gguf(architecture),
             media_projector: None,
             processor: None,
@@ -517,12 +534,29 @@ impl ArtifactArchitecturePlan {
         mut self,
         media_projector: Option<crate::gguf_companion::GgufMediaProjectorPlan>,
     ) -> Self {
+        self.validation = Default::default();
         self.media_projector = media_projector;
         self
     }
 
     /// Separates an admitted embedded-prediction artifact from its ordinary target plan.
     pub fn prediction_target_projection(
+        &self,
+    ) -> Result<
+        Option<(Self, crate::configuration::PredictionExtensionPlan)>,
+        eredu_core::artifact::ArtifactError,
+    > {
+        self.validation
+            .projection
+            .get_or_init(|| {
+                self.derive_prediction_target_projection()
+                    .map_err(|error| error.to_string())
+            })
+            .clone()
+            .map_err(eredu_core::artifact::ArtifactError::InvalidArchitecturePlan)
+    }
+
+    fn derive_prediction_target_projection(
         &self,
     ) -> Result<
         Option<(Self, crate::configuration::PredictionExtensionPlan)>,
@@ -536,6 +570,7 @@ impl ArtifactArchitecturePlan {
         };
         Ok(Some((
             Self {
+                validation: Default::default(),
                 family: ArtifactFamilyPlan::Safetensors(family),
                 media_projector: self.media_projector.clone(),
                 processor: self.processor.clone(),
@@ -555,6 +590,7 @@ impl ArtifactArchitecturePlan {
     /// Removes the additive extension after it has been selected and split
     /// into its own exact materialization contract.
     pub fn without_prediction_extension(mut self) -> Self {
+        self.validation = Default::default();
         self.prediction_extension = None;
         self
     }
@@ -564,6 +600,7 @@ impl ArtifactArchitecturePlan {
         mut self,
         tensors: &eredu_core::checkpoint::TensorCatalog,
     ) -> Result<Self, eredu_core::artifact::ArtifactError> {
+        self.validation = Default::default();
         match &mut self.family {
             ArtifactFamilyPlan::Safetensors(plan) => plan.admit_catalog(tensors)?,
             ArtifactFamilyPlan::Gguf(_) => {
@@ -606,6 +643,7 @@ impl ArtifactArchitecturePlan {
             }
             _ => None,
         };
+        self.validation = Default::default();
         self.processor = processor;
         Ok(self)
     }
@@ -651,6 +689,7 @@ impl ArtifactArchitecturePlan {
                 .map(NormalizedProcessorPlan::Qwen),
             _ => None,
         };
+        self.validation = Default::default();
         self.processor = processor;
         Ok(self)
     }
@@ -778,6 +817,7 @@ impl ArtifactArchitecturePlan {
         &mut self,
         ids: GgufSpecialTokenIds,
     ) -> Result<(), ProcessorPlanError> {
+        self.validation = Default::default();
         match ids {
             GgufSpecialTokenIds::Qwen {
                 image_token_id,

@@ -168,12 +168,12 @@ where
         let capacity = inspection
             .architecture_plan()
             .prediction_target_projection()
-            .map_err(PreparationSelectionError::PredictionProjection)?
+            .map_err(|error| PreparationSelectionError::PredictionProjection(error.into()))?
             .map(|(_, extension)| {
                 crate::prediction_extension::embedded_prediction_capacity(&extension)
             })
             .transpose()
-            .map_err(PreparationSelectionError::PredictionProjection)?
+            .map_err(|error| PreparationSelectionError::PredictionProjection(error.into()))?
             .map_or(0, |capacity| capacity.get());
         Ok((capabilities, capacity))
     });

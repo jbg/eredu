@@ -6,7 +6,10 @@
 use crate::checkpoint::{TensorCatalog, TensorDescriptor, TensorDtype, TensorStorage};
 pub use eredu_checkpoint::artifact::ArtifactFile;
 use eredu_checkpoint::{
-    artifact::{fingerprint_artifact_files, ArtifactFingerprintError, ArtifactMemberFingerprint},
+    artifact::{
+        fingerprint_artifact_files, ArtifactFingerprintError, ArtifactFingerprintSource,
+        ArtifactMemberFingerprint,
+    },
     safetensors::SafetensorsShards,
     store::{SharedCheckpointSource, TensorMetadata},
     StoredDtype,
@@ -34,6 +37,100 @@ impl ArtifactIdentity {
     /// Returns the raw SHA-256 digest.
     pub const fn digest(self) -> [u8; 32] {
         self.0
+    }
+}
+
+/// Lazily computed content identity, shared across source views and discovery calls.
+/// File identities and metadata are recorded immediately; payloads are read only by `resolve`.
+#[derive(Debug, Clone)]
+pub struct DeferredArtifactIdentity(Arc<DeferredArtifactIdentityInner>);
+
+#[derive(Debug)]
+struct DeferredArtifactIdentityInner {
+    source: Option<(String, ArtifactFingerprintSource)>,
+    identity: std::sync::OnceLock<Result<ArtifactIdentity, Arc<ArtifactError>>>,
+}
+
+impl DeferredArtifactIdentity {
+    /// Retains filesystem sources without hashing their payloads.
+    pub fn filesystem(
+        domain: impl Into<String>,
+        files: impl IntoIterator<Item = ArtifactFile>,
+    ) -> Result<Self, ArtifactError> {
+        let domain = domain.into();
+        if domain.is_empty() {
+            return Err(ArtifactError::InvalidArtifactIdentity(
+                "artifact identity domain is empty".into(),
+            ));
+        }
+        Ok(Self(Arc::new(DeferredArtifactIdentityInner {
+            source: Some((domain, ArtifactFingerprintSource::new(files)?)),
+            identity: Default::default(),
+        })))
+    }
+
+    /// Retains all admitted SafeTensors shards without reading their payloads.
+    pub fn safetensors(
+        domain: impl Into<String>,
+        shards: &SafetensorsShards,
+    ) -> Result<Self, ArtifactError> {
+        Self::filesystem(
+            domain,
+            shards
+                .logical_payload_paths()
+                .iter()
+                .map(|(role, path)| ArtifactFile::new(role, path)),
+        )
+    }
+
+    /// Retains all admitted GGUF split members without reading their payloads.
+    pub fn gguf(
+        domain: impl Into<String>,
+        checkpoint: &GgufCheckpoint,
+    ) -> Result<Self, ArtifactError> {
+        Self::filesystem(
+            domain,
+            checkpoint.shards().iter().map(|shard| {
+                ArtifactFile::new(format!("split/{:05}", shard.split_no()), shard.path())
+            }),
+        )
+    }
+
+    /// Retains an identity already established by a caller or reference source.
+    pub fn ready(identity: ArtifactIdentity) -> Self {
+        Self(Arc::new(DeferredArtifactIdentityInner {
+            source: None,
+            identity: std::sync::OnceLock::from(Ok(identity)),
+        }))
+    }
+
+    /// Computes the content hash on first demand, retaining successes and failures.
+    pub fn resolve(&self) -> Result<ArtifactIdentity, Arc<ArtifactError>> {
+        self.0
+            .identity
+            .get_or_init(|| {
+                let (domain, source) = self
+                    .0
+                    .source
+                    .as_ref()
+                    .expect("unresolved identity retains sources");
+                source
+                    .fingerprint()
+                    .map_err(ArtifactError::from)
+                    .and_then(|members| {
+                        fingerprint_artifact(
+                            domain,
+                            members.into_iter().map(ArtifactMemberIdentity::from),
+                        )
+                    })
+                    .map_err(Arc::new)
+            })
+            .clone()
+    }
+
+    /// Whether a caller has already requested the content identity.
+    pub fn is_resolved(&self) -> bool {
+        self.0.identity.get().is_some()
     }
 }
 
@@ -1414,6 +1511,46 @@ mod tests {
     use super::*;
     use eredu_gguf::{GgmlType, MetadataArray, TensorInput, Writer};
     use std::io::Write;
+
+    #[test]
+    fn content_identity_is_deferred_shared_and_resolved_only_once() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("weights");
+        std::fs::write(&path, b"original weights").unwrap();
+        let deferred =
+            DeferredArtifactIdentity::filesystem("model", [ArtifactFile::new("weights", &path)])
+                .unwrap();
+        let clone = deferred.clone();
+        assert!(!deferred.is_resolved());
+        let expected =
+            fingerprint_filesystem_artifact("model", [ArtifactFile::new("weights", &path)])
+                .unwrap();
+        assert_eq!(deferred.resolve().unwrap(), expected);
+        assert!(clone.is_resolved());
+        // A second consumer needs neither the filesystem nor another hashing pass.
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(clone.resolve().unwrap(), expected);
+    }
+
+    #[test]
+    fn deferred_identity_rejects_changed_sources_and_retains_the_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("weights");
+        std::fs::write(&path, b"original").unwrap();
+        let deferred =
+            DeferredArtifactIdentity::filesystem("model", [ArtifactFile::new("weights", &path)])
+                .unwrap();
+        std::fs::write(&path, b"changed weights").unwrap();
+        let error = deferred.resolve().unwrap_err();
+        assert!(matches!(
+            error.as_ref(),
+            ArtifactError::ArtifactFingerprint(ArtifactFingerprintError::Changed { .. })
+        ));
+        assert!(Arc::ptr_eq(
+            &error,
+            &deferred.clone().resolve().unwrap_err()
+        ));
+    }
 
     #[test]
     fn artifact_identity_rejects_empty_and_duplicate_layouts() {

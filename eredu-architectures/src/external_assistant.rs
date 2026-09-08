@@ -22,10 +22,7 @@ use eredu_checkpoint::{
     LinearFormat, WeightQuantization,
 };
 use eredu_core::{
-    artifact::{
-        fingerprint_gguf_artifact, fingerprint_safetensors_artifact, ArtifactError,
-        ArtifactIdentity,
-    },
+    artifact::{ArtifactError, ArtifactIdentity, DeferredArtifactIdentity},
     checkpoint::TensorCatalog,
     ArtifactFormat, LoadingProtocol, ModelConfiguration, ModelConfigurationResolver,
     ParallelRankTopology, ResolvedModelConfiguration, TokenizerCompatibilityProof,
@@ -900,7 +897,7 @@ pub(crate) struct SelectedExternalAssistant<A: ExternalAssistantArchitecture> {
 /// Exact neutral source role paired with one selected external assistant.
 pub struct PreparedExternalAssistantSource<A: ExternalAssistantArchitecture> {
     checkpoint: ExternalAssistantCheckpoint,
-    artifact_identity: ArtifactIdentity,
+    artifact_identity: DeferredArtifactIdentity,
     source: eredu_checkpoint::store::SharedCheckpointSource,
     source_config: A::Config,
     config: A::Config,
@@ -913,9 +910,9 @@ impl<A: ExternalAssistantArchitecture> PreparedExternalAssistantSource<A> {
         &self.checkpoint
     }
 
-    /// Content-exact identity computed immediately before backend handoff.
-    pub const fn artifact_identity(&self) -> ArtifactIdentity {
-        self.artifact_identity
+    /// Resolves the content-exact identity only when a caller needs it.
+    pub fn artifact_identity(&self) -> Result<ArtifactIdentity, std::sync::Arc<ArtifactError>> {
+        self.artifact_identity.resolve()
     }
 
     /// Selected executable configuration paired with this source.
@@ -929,7 +926,7 @@ impl<A: ExternalAssistantArchitecture> PreparedExternalAssistantSource<A> {
     ) -> (
         eredu_checkpoint::store::SharedCheckpointSource,
         ExternalAssistantCheckpoint,
-        ArtifactIdentity,
+        DeferredArtifactIdentity,
         A::Config,
         A::Config,
         Vec<ReplicatedTextMaterializationTask>,
@@ -962,10 +959,13 @@ impl<A: ExternalAssistantArchitecture> SelectedExternalAssistant<A> {
         let retained_checkpoint = checkpoint.clone();
         let artifact_identity = match &checkpoint {
             ExternalAssistantCheckpoint::SafeTensors { shards, .. } => {
-                fingerprint_safetensors_artifact("eredu.external-assistant.safetensors.v1", shards)?
+                DeferredArtifactIdentity::safetensors(
+                    "eredu.external-assistant.safetensors.v1",
+                    shards,
+                )?
             }
             ExternalAssistantCheckpoint::Gguf { checkpoint, .. } => {
-                fingerprint_gguf_artifact("eredu.external-assistant.gguf.v1", checkpoint)?
+                DeferredArtifactIdentity::gguf("eredu.external-assistant.gguf.v1", checkpoint)?
             }
         };
         let source = match checkpoint {
@@ -2622,7 +2622,7 @@ mod tests {
         ) -> Result<Self::Output<A>, Self::Error> {
             let model_type = A::configuration_model_type(prepared.config()).to_owned();
             let checkpoint = prepared.checkpoint().clone();
-            let artifact_identity = prepared.artifact_identity();
+            let artifact_identity = prepared.artifact_identity().unwrap();
             Ok(InspectedPreparation {
                 checkpoint,
                 artifact_identity,

@@ -541,6 +541,47 @@ partitioned-dense, partitioned-routed, and partitioned-composite execution.
 Concrete backends consume the selected branch through a typed static
 dispatcher; they do not mirror the sum or rebuild any request.
 
+Architecture inspection retains validation results with the immutable architecture
+and the exact core admission token. Clones share the target projection and the
+replicated, routed, or composite requirements, including expert topology, recipe
+geometry, and source ownership proofs. A new admission or semantic enrichment
+uses a separate set of results. Preparation retains both successful selections and
+rejections for each normalized request and the actual neutral mechanism facts
+consulted by that selection; changed backend facts require a new selection. These
+results are local to the admitted artifact's lifetime, not a filesystem or global
+model cache. Retained composite source snapshots do not own their enclosing
+validation storage, avoiding ownership cycles.
+
+Automatic planning retains each exact candidate's admission and bounded geometry
+through feedback and final selection. Loading reuses the architecture's selected
+proofs. Prepared expert providers consume the validated catalog and route contract;
+their native bank binding checks remain a separate validation of newly materialized
+resources. Public constructors accepting raw plan/catalog parts still establish
+those proofs themselves. Expert identities, parameter targets, companion names,
+and layout discriminators use indexes, and selecting all members of a stacked
+expert recipe traverses the stack once. Checkpoint resolution consumes the layout
+selected by catalog validation instead of repeating discriminator validation.
+Runtime-owned `AddressableBankTask` retains an immutable validated materialization
+task and its source index. Expert members share that proof and validate only their
+own recipe sources and geometry; they do not clone or validate a whole bank task
+per member. Architecture projection indexes selected tasks once per projection.
+Source-store binding checks provenance once per shared task for that handoff;
+unchanged member recipes reuse their inferred metadata, while transformed recipes
+require new inference.
+
+Exact checkpoint content identity is demand-driven. `eredu-checkpoint` records
+file identity, size and change metadata without retaining per-shard file handles;
+when requested it hashes each admitted file in one sequential pass, checking
+metadata before and after reading. `eredu-core::DeferredArtifactIdentity` shares
+and caches that result or failure. Model, external-assistant and Moshi source
+preparation retain the pending identity without reading payloads for hashing.
+Architecture-owned discovery declarations carry it through native construction;
+explicit capture/intervention discovery resolves it on demand. Ordinary generation
+and trace-only requests do not resolve it. Backend adapters retain these neutral
+declarations and never reconstruct source membership or fingerprint files.
+Tensor loading reads selected ranges in execution order, so it is independent of
+the optional whole-file hashing pass, which also covers headers and unused bytes.
+
 After selection, `PreparedModelSources` is the sole architecture-aware
 SafeTensors/GGUF source factory for model loading. It opens every admitted
 physical source once, retains exact resolutions and metadata, composes typed

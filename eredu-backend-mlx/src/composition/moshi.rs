@@ -11,7 +11,7 @@ use std::{
 use eredu_architectures::moshi::MoshiConfig;
 use eredu_architectures::moshi::{self};
 use eredu_checkpoint::store::{CheckpointSource, SharedCheckpointSource};
-use eredu_core::artifact::ArtifactIdentity;
+use eredu_core::artifact::{ArtifactIdentity, DeferredArtifactIdentity};
 use eredu_nn::Parameterized;
 use eredu_runtime::{
     construct_realtime_model, ConstructedRealtimeExecution, DenseDiskStreamReport,
@@ -485,7 +485,7 @@ where
 /// erases only the concrete MLX traversal and resource mechanisms needed by
 /// that handle.
 pub struct MlxRealtimeExecution {
-    artifact_identity: ArtifactIdentity,
+    artifact_identity: DeferredArtifactIdentity,
     metadata: LayerwiseModelMetadata,
     payload: Rc<OrdinaryRetirement<RealtimeExecutionPayload>>,
     poisoned: Rc<Cell<bool>>,
@@ -651,8 +651,10 @@ impl MlxRealtimeExecution {
     }
 
     /// Identity of the checkpoint payload bound to these mechanisms.
-    pub fn artifact_identity(&self) -> &ArtifactIdentity {
-        &self.artifact_identity
+    pub fn artifact_identity(
+        &self,
+    ) -> Result<ArtifactIdentity, std::sync::Arc<eredu_core::artifact::ArtifactError>> {
+        self.artifact_identity.resolve()
     }
 
     /// Executes one neutral prepared decision traversal on selected construction.
@@ -704,7 +706,7 @@ impl MlxRealtimeExecution {
 }
 
 struct SelectedMoshiRealtimeMechanismVisitor {
-    artifact_identity: ArtifactIdentity,
+    artifact_identity: DeferredArtifactIdentity,
     transform: Option<eredu_checkpoint::WeightQuantization>,
     target_quantization: Option<eredu_checkpoint::WeightQuantization>,
     effective_model_type: String,
@@ -866,7 +868,7 @@ pub fn materialize_selected(
         .selected()
         .parallel()
         .map(|parallel| parallel.communication().clone());
-    let artifact_identity = prepared.artifact_identity();
+    let artifact_identity = prepared.deferred_artifact_identity();
     let lowering = prepared.lowering();
     let store = Arc::clone(prepared.source());
     let transform = lowering.transform();

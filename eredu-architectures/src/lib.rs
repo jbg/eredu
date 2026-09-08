@@ -48,6 +48,7 @@ mod gguf_catalog;
 pub use gguf_catalog::GgufTensorCatalog;
 /// Backend-neutral family and checkpoint admission for sibling GGUF projectors.
 pub mod gguf_companion;
+mod inspection_validation;
 mod linear_format;
 /// Backend-neutral prepared-media admission and workspace plans.
 pub mod media_plan;
