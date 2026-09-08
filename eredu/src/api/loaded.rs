@@ -180,7 +180,7 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
     where
         F: FnMut(SemanticEvent),
     {
-        self.generate_prepared_chat_captured(request, None)
+        self.generate_prepared_chat_captured(request, None, std::time::Instant::now())
     }
 
     pub(super) fn generate_prepared_chat_captured<'a, F>(
@@ -191,6 +191,7 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
             Option<eredu_core::intervention::AdmittedInterventionPlan>,
             &'a mut dyn FnMut(Option<u32>, Option<eredu_core::capture::CapturedStep>, f64),
         )>,
+        generation_started: std::time::Instant,
     ) -> Result<PreparedChatGenerationOutput, PreparedChatError<B::Error>>
     where
         F: FnMut(SemanticEvent),
@@ -206,10 +207,12 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
             on_event(SemanticEvent::Finished {
                 reason: FinishReason::Cancelled,
             });
-            return Ok(PreparedChatGenerationOutput {
-                token_ids: Vec::new(),
-                finish_reason: FinishReason::Cancelled,
-            });
+            return Ok(PreparedChatGenerationOutput::new(
+                Vec::new(),
+                FinishReason::Cancelled,
+                eredu_core::GenerationTiming::default(),
+                (),
+            ));
         }
 
         let prepared_chat = input.prepared_chat();
@@ -266,6 +269,8 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
             generator,
             on_token,
             capture_enabled,
+            generation_started,
+            time_to_first_token: None,
         };
         let (token_ids, finish_reason) = drive_committed_generation_cancellable(
             &mut source,
@@ -276,10 +281,12 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
             &mut on_event,
         )
         .map_err(map_committed_generation_error)?;
-        Ok(PreparedChatGenerationOutput {
+        Ok(PreparedChatGenerationOutput::new(
             token_ids,
             finish_reason,
-        })
+            eredu_core::GenerationTiming::new(source.time_to_first_token),
+            (),
+        ))
     }
 
     /// Reports fail-closed speculative support for this backend model session.
@@ -304,6 +311,7 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
         B: SpeculativeGenerationBackend,
         F: FnMut(SemanticEvent),
     {
+        let driver = eredu_runtime::RunSpeculativeGeneration::new(request.options.scheduler);
         let PreparedChatSpeculativeGenerationRequest {
             input,
             drafting,
@@ -335,7 +343,7 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
                 )],
                 self.tokenizer_fingerprint,
             ),
-            eredu_runtime::RunSpeculativeGeneration::new(options.scheduler),
+            driver,
         )
         .map_err(PreparedChatSpeculativeError::Backend)?;
         let request: Result<[SpeculativeGenerationOutput; 1], _> =
@@ -361,10 +369,11 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
     where
         B: SpeculativeGenerationBackend,
     {
+        let driver = eredu_runtime::RunSpeculativeGeneration::new(request.scheduler);
         let PreparedChatSpeculativeBatchRequest {
             drafting,
             lanes,
-            scheduler,
+            scheduler: _,
         } = request;
         // Validate every lane before preparing any backend prompt or execution.
         let generations = lanes
@@ -397,7 +406,7 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
                 prepared_lanes,
                 self.tokenizer_fingerprint,
             ),
-            eredu_runtime::RunSpeculativeGeneration::new(scheduler),
+            driver,
         )
         .map_err(PreparedChatSpeculativeError::Backend)
     }

@@ -2322,6 +2322,27 @@ decode-and-sample operations. The backend owns logits, sampler state,
 randomness, and token handles. Portable generation code owns token budgets,
 stop and EOS precedence, cancellation, grammar state, and semantic events.
 
+`eredu-core` owns the common `GenerationOutput<S>` terminal contract: committed
+token ids, finish reason, `GenerationTiming`, and mode-specific statistics.
+`PreparedChatGenerationOutput` is an alias for `GenerationOutput<()>`, used by
+ordinary and observed generation; `SpeculativeGenerationOutput` is an alias for
+`GenerationOutput<SpeculativeStats>`. They share one implementation of output
+accessors. All modes expose TTFT through `output.timing().time_to_first_token()`.
+The facade starts this host clock
+at the generation call, including request preparation; speculative batch lanes
+share the batch-call origin and include time waiting for earlier lanes. Ordinary
+generation records the first constraint-committed, completed token before record
+or semantic delivery. The neutral speculative lifecycle records the first target
+commit before publication, and runtime adds preparation and queueing time.
+Structural tokens, buffered Unicode, stop tokens, and EOS count even without
+visible text. Draft proposals never count, and cancellation with no committed
+tokens returns `None`. This lightweight terminal metric needs no capture plan,
+token journal, device timing, or extra native synchronization.
+`SpeculativeStats::submission_to_first_token()` explicitly retains the
+lane-submission origin. Runtime adds the facade preparation interval when it
+constructs `GenerationTiming`; the output contains no speculative timing policy.
+The CLI consumes this committed-token TTFT directly.
+
 `MultimodalPreparationBackend` accepts portable ordered text, token, image,
 audio, and video inputs and produces the backend's ordinary opaque prompt.
 Image resizing, signal processing, feature extraction, tensor construction,

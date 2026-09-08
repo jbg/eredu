@@ -513,10 +513,12 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
             on_event(SemanticEvent::Finished {
                 reason: FinishReason::Cancelled,
             });
-            Ok(PreparedChatGenerationOutput {
-                token_ids: Vec::new(),
-                finish_reason: FinishReason::Cancelled,
-            })
+            Ok(PreparedChatGenerationOutput::new(
+                Vec::new(),
+                FinishReason::Cancelled,
+                eredu_core::GenerationTiming::default(),
+                (),
+            ))
         } else {
             match B::prepare_text_prompt(self.runtime.backend(), prepared.prompt_token_ids) {
                 Err(error) => Err(PreparedChatError::Backend(error)),
@@ -529,6 +531,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
                         on_event,
                     },
                     Some((prepared.plan, prepared.intervention, &mut on_token)),
+                    started,
                 ),
             }
         };

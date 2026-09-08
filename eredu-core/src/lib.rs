@@ -118,9 +118,9 @@ pub use execution::{
 };
 pub use generation::{
     resolve_generation_config, resolve_optimistic_reuse, CheckpointGenerationConfig, FinishReason,
-    GenerationCancellationToken, GenerationConfigOverrides, GenerationError, GenerationSequence,
-    OptimisticReuseDecision, ResolvedGenerationConfig, SemanticEvent,
-    SpeculativeCancellationDisposition, SpeculativeCommitPlan, SpeculativeConfig,
+    GenerationCancellationToken, GenerationConfigOverrides, GenerationError, GenerationOutput,
+    GenerationSequence, GenerationTiming, OptimisticReuseDecision, ResolvedGenerationConfig,
+    SemanticEvent, SpeculativeCancellationDisposition, SpeculativeCommitPlan, SpeculativeConfig,
     SpeculativeRequestId, SpeculativeRequestLifecycle, SpeculativeRequestStatus, SpeculativeRound,
     SpeculativeSchedulerOptions, SpeculativeTail, TokenCommit, TokenTerminalSignals,
 };

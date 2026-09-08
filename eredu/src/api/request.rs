@@ -111,13 +111,8 @@ pub struct PreparedChatGenerationRequest<'a, B: eredu_core::TextGenerationBacken
 }
 
 /// Terminal metadata returned by ordinary prepared-chat generation.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PreparedChatGenerationOutput {
-    /// Every committed generated tokenizer id; cancellation returns only its prefix.
-    pub token_ids: Vec<u32>,
-    /// Deterministically selected terminal condition.
-    pub finish_reason: FinishReason,
-}
+/// Ordinary and observed generation share the neutral output with no extra statistics.
+pub type PreparedChatGenerationOutput = eredu_core::GenerationOutput;
 
 /// Failure from ordinary prepared-chat generation on backend `E`.
 ///
@@ -499,6 +494,8 @@ where
     pub(super) on_token:
         Option<&'a mut dyn FnMut(Option<u32>, Option<eredu_core::capture::CapturedStep>, f64)>,
     pub(super) capture_enabled: bool,
+    pub(super) generation_started: std::time::Instant,
+    pub(super) time_to_first_token: Option<std::time::Duration>,
 }
 
 impl<B> CommittedTokenSource for BackendGenerationTokenSource<'_, B>
@@ -531,6 +528,9 @@ where
                 return Err(error);
             }
         };
+        if token.is_some() && self.time_to_first_token.is_none() {
+            self.time_to_first_token = Some(self.generation_started.elapsed());
+        }
         if let (Some(token), Some(callback)) = (token, &mut self.on_token) {
             let capture = if self.capture_enabled {
                 self.generator

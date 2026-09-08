@@ -8,6 +8,86 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
+use std::time::Duration;
+
+/// Host timing shared by ordinary, observed, and speculative terminal outputs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GenerationTiming {
+    time_to_first_token: Option<Duration>,
+}
+
+impl GenerationTiming {
+    /// Creates terminal timing from the measured first commitment, if any.
+    pub const fn new(time_to_first_token: Option<Duration>) -> Self {
+        Self {
+            time_to_first_token,
+        }
+    }
+
+    /// Host time from the generation call to the first committed token, before
+    /// synchronous delivery of that token's records or semantic events.
+    ///
+    /// Includes request preparation. Speculative batch lanes share the batch-call
+    /// origin and include queueing. Structural, buffered, stop and EOS tokens
+    /// count even without visible text; draft proposals do not. `None` means no
+    /// token was committed, including cancellation before prefill.
+    pub const fn time_to_first_token(&self) -> Option<Duration> {
+        self.time_to_first_token
+    }
+}
+
+/// Common terminal output for generation, with mode-specific statistics `S`.
+///
+/// Ordinary and observed generation use `()`; speculative generation uses
+/// [`crate::SpeculativeStats`]. Token, termination, and timing semantics share
+/// this implementation in every mode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenerationOutput<S = ()> {
+    /// Every committed generated tokenizer id, including terminal special tokens.
+    /// Cancellation returns only its committed prefix.
+    pub token_ids: Vec<u32>,
+    /// Deterministically selected terminal condition.
+    pub finish_reason: FinishReason,
+    timing: GenerationTiming,
+    stats: S,
+}
+
+impl<S> GenerationOutput<S> {
+    /// Creates a terminal result with shared timing and mode-specific statistics.
+    pub fn new(
+        token_ids: Vec<u32>,
+        finish_reason: FinishReason,
+        timing: GenerationTiming,
+        stats: S,
+    ) -> Self {
+        Self {
+            token_ids,
+            finish_reason,
+            timing,
+            stats,
+        }
+    }
+
+    /// Canonical committed token ids.
+    pub fn token_ids(&self) -> &[u32] {
+        &self.token_ids
+    }
+
+    /// Terminal generation reason.
+    pub const fn finish_reason(&self) -> FinishReason {
+        self.finish_reason
+    }
+
+    /// Timing measured from the generation call, shared by all generation modes.
+    pub const fn timing(&self) -> &GenerationTiming {
+        &self.timing
+    }
+
+    /// Mode-specific statistics, or `()` for ordinary and observed generation.
+    pub const fn stats(&self) -> &S {
+        &self.stats
+    }
+}
 
 /// Why generation reached a terminal state.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]

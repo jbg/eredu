@@ -28,39 +28,8 @@ pub enum SpeculativeDraft<'a, D> {
     Embedded,
 }
 
-/// One backend-independent speculative-generation result.
-pub struct SpeculativeGenerationOutput {
-    /// Canonical emitted token ids, including terminal EOS when emitted.
-    token_ids: Vec<u32>,
-    /// Portable terminal reason selected by the generation lifecycle.
-    finish_reason: FinishReason,
-    /// Portable speculative execution telemetry.
-    stats: SpeculativeStats,
-}
-
-impl SpeculativeGenerationOutput {
-    /// Creates one completed portable result.
-    pub fn new(token_ids: Vec<u32>, finish_reason: FinishReason, stats: SpeculativeStats) -> Self {
-        Self {
-            token_ids,
-            finish_reason,
-            stats,
-        }
-    }
-
-    /// Canonical emitted token ids.
-    pub fn token_ids(&self) -> &[u32] {
-        &self.token_ids
-    }
-    /// Terminal generation reason.
-    pub const fn finish_reason(&self) -> FinishReason {
-        self.finish_reason
-    }
-    /// Portable speculative telemetry.
-    pub const fn stats(&self) -> &SpeculativeStats {
-        &self.stats
-    }
-}
+/// Shared terminal generation output with speculative execution statistics.
+pub type SpeculativeGenerationOutput = crate::generation::GenerationOutput<SpeculativeStats>;
 
 /// Completed speculative requests plus aggregate fair-scheduler telemetry.
 pub struct SpeculativeGenerationBatchOutput {
@@ -432,9 +401,19 @@ pub struct SpeculativeStats {
     cross_request_draft_opportunities: usize,
     /// Wall-clock generation duration.
     elapsed: Duration,
+    /// Time from lane submission to its first committed token.
+    submission_to_first_token: Option<Duration>,
 }
 
 impl SpeculativeStats {
+    /// Host time from lane submission to first commitment, before publication.
+    /// No draft proposal or visible-text event starts this metric. Preparation
+    /// and time queued before submission are included in the terminal output's
+    /// [`crate::GenerationTiming`] instead.
+    pub const fn submission_to_first_token(&self) -> Option<Duration> {
+        self.submission_to_first_token
+    }
+
     /// Selected target/draft placement relationship.
     pub const fn execution_topology(&self) -> SpeculativeExecutionTopology {
         self.execution_topology
@@ -3217,6 +3196,7 @@ where
                 )?;
                 let reason =
                     commit_terminal_token(&mut sequence, &mut sampler, &mut constraint, first)?;
+                let submission_to_first_token = started.elapsed();
                 let cancelled = runtime
                     .publish_candidate(&mut constraint, &mut sequence, &[first])
                     .map_err(SpeculativeDriverError::Output)?;
@@ -3227,16 +3207,24 @@ where
                     target_randomness,
                     reason,
                     cancelled,
+                    submission_to_first_token,
                 ))
             })();
-            let (evaluated_tokens, target_state, target_randomness, reason, cancelled) =
-                match attempt {
-                    Ok(result) => result,
-                    Err(error) => {
-                        executor.restore_checkpoint(cache, &checkpoint, context)?;
-                        return Err(error);
-                    }
-                };
+            let (
+                evaluated_tokens,
+                target_state,
+                target_randomness,
+                reason,
+                cancelled,
+                submission_to_first_token,
+            ) = match attempt {
+                Ok(result) => result,
+                Err(error) => {
+                    executor.restore_checkpoint(cache, &checkpoint, context)?;
+                    return Err(error);
+                }
+            };
+            stats.submission_to_first_token = Some(submission_to_first_token);
             stats.target_tokens = evaluated_tokens;
             stats.scheduler_turns = 1;
             stats.emitted_tokens = 1;

@@ -1,8 +1,8 @@
 //! Backend-neutral speculative request lifecycle and fair scheduling.
 
 use eredu_core::{
-    BoundedCompletion, CompletedSpeculativeSchedule, PreparedSpeculativeLane,
-    SpeculativeConstraint, SpeculativeDriverError, SpeculativeExecutor,
+    BoundedCompletion, CompletedSpeculativeSchedule, GenerationError, GenerationTiming,
+    PreparedSpeculativeLane, SpeculativeConstraint, SpeculativeDriverError, SpeculativeExecutor,
     SpeculativeGenerationBatchOutput, SpeculativeGenerationOutput, SpeculativeGenerationVisitor,
     SpeculativePublisher, SpeculativeRequestTable, SpeculativeSampling,
 };
@@ -126,15 +126,27 @@ where
 /// [`SpeculativeGenerationVisitor`]. This driver alone registers lanes, runs
 /// the fair schedule, observes exact completions, and constructs public
 /// terminal outputs.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct RunSpeculativeGeneration {
     options: eredu_core::generation::SpeculativeSchedulerOptions,
+    started: std::time::Instant,
+}
+
+impl Default for RunSpeculativeGeneration {
+    fn default() -> Self {
+        Self::new(Default::default())
+    }
 }
 
 impl RunSpeculativeGeneration {
     /// Creates a driver with facade-selected scheduling and lookahead controls.
-    pub const fn new(options: eredu_core::generation::SpeculativeSchedulerOptions) -> Self {
-        Self { options }
+    /// Starts the shared request clock; construct before preparing backend inputs
+    /// and resources so terminal TTFT includes that preparation.
+    pub fn new(options: eredu_core::generation::SpeculativeSchedulerOptions) -> Self {
+        Self {
+            options,
+            started: std::time::Instant::now(),
+        }
     }
 }
 
@@ -163,7 +175,9 @@ impl SpeculativeGenerationVisitor for RunSpeculativeGeneration {
             component_timings_collected,
             context,
         )?;
+        let mut preparation_elapsed = Vec::with_capacity(lanes.len());
         for lane in lanes {
+            preparation_elapsed.push(self.started.elapsed());
             scheduler.submit(lane)?;
         }
         scheduler.run()?;
@@ -171,21 +185,27 @@ impl SpeculativeGenerationVisitor for RunSpeculativeGeneration {
         let requests = completed
             .take_requests()
             .into_iter()
-            .map(|request| -> Result<_, SpeculativeDriverError<E::Error>> {
+            .zip(preparation_elapsed)
+            .map(|(request, preparation_elapsed)| {
                 let finish_reason = request.finish_reason().ok_or_else(|| {
                     SpeculativeDriverError::Generation(
-                        eredu_core::generation::GenerationError::MissingSpeculativeFinishReason {
+                        GenerationError::MissingSpeculativeFinishReason {
                             index: request.id().index(),
                         },
                     )
                 })?;
+                let time_to_first_token = request
+                    .stats()
+                    .submission_to_first_token()
+                    .map(|elapsed| preparation_elapsed + elapsed);
                 Ok(SpeculativeGenerationOutput::new(
                     request.token_ids().to_vec(),
                     finish_reason,
+                    GenerationTiming::new(time_to_first_token),
                     request.stats().clone(),
                 ))
             })
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, SpeculativeDriverError<E::Error>>>()?;
         Ok(SpeculativeGenerationBatchOutput::new(
             requests,
             completed.take_scheduler(),

@@ -71,6 +71,8 @@ mod control;
 mod observed_mock;
 #[path = "backend_conformance/templates.rs"]
 mod templates;
+#[path = "backend_conformance/timing.rs"]
+mod timing;
 
 struct TestDirectory(PathBuf);
 
@@ -1140,6 +1142,7 @@ impl SpeculativeGenerationBackend for MockBackend {
                     Vec::new(),
                     FinishReason::MaxTokens,
                     Default::default(),
+                    Default::default(),
                 ));
             }
             _ => {}
@@ -2075,7 +2078,10 @@ fn assert_prepared_generation_and_speculative_conformance() {
             std::ops::ControlFlow::Continue(())
         })
         .unwrap();
-    assert_eq!(observed_output, output);
+    assert_eq!(observed_output.token_ids, output.token_ids);
+    assert_eq!(observed_output.finish_reason, output.finish_reason);
+    assert!(observed_output.timing().time_to_first_token().is_some());
+    assert!(output.timing().time_to_first_token().is_some());
     assert!(
         trace
             .iter()
@@ -2358,7 +2364,10 @@ fn observed_facade_preserves_streaming_unicode_special_tokens_and_eos() {
             std::ops::ControlFlow::Continue(())
         })
         .unwrap();
-    assert_eq!(observed, ordinary);
+    assert_eq!(observed.token_ids, ordinary.token_ids);
+    assert_eq!(observed.finish_reason, ordinary.finish_reason);
+    assert!(observed.timing().time_to_first_token().is_some());
+    assert!(ordinary.timing().time_to_first_token().is_some());
     assert_eq!(observed_events, ordinary_events);
     assert_eq!(captured_steps.len(), 3);
     for step in captured_steps {
@@ -2432,7 +2441,10 @@ fn observed_facade_preserves_streaming_unicode_special_tokens_and_eos() {
             on_event: |_| {},
         })
         .unwrap();
-    assert_eq!(recovered, ordinary);
+    assert_eq!(recovered.token_ids, ordinary.token_ids);
+    assert_eq!(recovered.finish_reason, ordinary.finish_reason);
+    assert!(recovered.timing().time_to_first_token().is_some());
+    assert!(ordinary.timing().time_to_first_token().is_some());
 }
 
 #[test]

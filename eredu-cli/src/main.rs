@@ -2435,11 +2435,6 @@ fn main() -> Result<()> {
                     caller_stop_sequences: &args.stop_sequences,
                     cancellation,
                     on_event: |event| {
-                        if time_to_first_token.is_none()
-                            && !matches!(event, SemanticEvent::Finished { .. })
-                        {
-                            time_to_first_token = Some(generation_started.elapsed());
-                        }
                         if semantic_error.is_none() {
                             semantic_error = write_semantic_event(
                                 &event,
@@ -2458,6 +2453,7 @@ fn main() -> Result<()> {
                 },
             )?;
             output_ids = output.token_ids().to_vec();
+            time_to_first_token = output.timing().time_to_first_token();
             speculative_stats = Some(output.stats().clone());
             prepared_finish_reason = Some(output.finish_reason());
         } else {
@@ -2469,11 +2465,6 @@ fn main() -> Result<()> {
                 caller_stop_sequences: &args.stop_sequences,
                 cancellation,
                 on_event: |event| {
-                    if time_to_first_token.is_none()
-                        && !matches!(event, SemanticEvent::Finished { .. })
-                    {
-                        time_to_first_token = Some(generation_started.elapsed());
-                    }
                     if semantic_error.is_none() {
                         semantic_error = write_semantic_event(
                             &event,
@@ -2490,6 +2481,7 @@ fn main() -> Result<()> {
                     }
                 },
             })?;
+            time_to_first_token = output.timing().time_to_first_token();
             output_ids = output.token_ids;
             prepared_finish_reason = Some(output.finish_reason);
         }

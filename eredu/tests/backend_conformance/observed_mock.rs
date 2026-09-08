@@ -404,7 +404,10 @@ fn intervened_facade_keeps_outcomes_cancellation_failure_and_consumer_lifetimes(
             ControlFlow::Continue(())
         })
         .unwrap();
-    assert_eq!(output, baseline);
+    assert_eq!(output.token_ids, baseline.token_ids);
+    assert_eq!(output.finish_reason, baseline.finish_reason);
+    assert!(output.timing().time_to_first_token().is_some());
+    assert!(baseline.timing().time_to_first_token().is_some());
     assert_eq!(predictions, [0, 1, 2]);
     let empty = model
         .prepare_intervened_chat(&chat, settings, plan(), InterventionPlan::none(), limits)
@@ -424,7 +427,10 @@ fn intervened_facade_keeps_outcomes_cancellation_failure_and_consumer_lifetimes(
             ControlFlow::Continue(())
         })
         .unwrap();
-    assert_eq!(unchanged, baseline);
+    assert_eq!(unchanged.token_ids, baseline.token_ids);
+    assert_eq!(unchanged.finish_reason, baseline.finish_reason);
+    assert!(unchanged.timing().time_to_first_token().is_some());
+    assert!(baseline.timing().time_to_first_token().is_some());
     let mut invalid = intervention_plan(1.0);
     invalid.operations[0].target = "nonexistent".into();
     assert!(model
@@ -470,6 +476,7 @@ fn intervened_facade_keeps_outcomes_cancellation_failure_and_consumer_lifetimes(
             .unwrap();
         assert_eq!(output.finish_reason, FinishReason::Cancelled);
         assert_eq!(output.token_ids.len(), usize::from(!pre_cancel));
+        assert_eq!(output.timing().time_to_first_token().is_some(), !pre_cancel);
     }
     let prepared = model
         .prepare_intervened_chat(&chat, settings, plan(), intervention_plan(1.0), limits)
@@ -488,17 +495,14 @@ fn intervened_facade_keeps_outcomes_cancellation_failure_and_consumer_lifetimes(
     let prepared = model
         .prepare_intervened_chat(&chat, settings, plan(), intervention_plan(1.0), limits)
         .unwrap();
-    assert_eq!(
-        model
-            .generate_observed_chat(
-                prepared,
-                &[],
-                Default::default(),
-                |_| ControlFlow::Continue(())
-            )
-            .unwrap(),
-        baseline
-    );
+    let reused = model
+        .generate_observed_chat(prepared, &[], Default::default(), |_| {
+            ControlFlow::Continue(())
+        })
+        .unwrap();
+    assert_eq!(reused.token_ids, baseline.token_ids);
+    assert_eq!(reused.finish_reason, baseline.finish_reason);
+    assert!(reused.timing().time_to_first_token().is_some());
     let prepared = model
         .prepare_intervened_chat(&chat, settings, plan(), intervention_plan(0.0), limits)
         .unwrap();
