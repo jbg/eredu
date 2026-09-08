@@ -462,7 +462,7 @@ struct Cli {
     #[arg(short, long)]
     verbose: bool,
 
-    /// Print load and generation timing statistics to stderr.
+    /// Report load completion immediately and print generation timing statistics to stderr.
     #[arg(long)]
     timing: bool,
 
@@ -2260,6 +2260,9 @@ fn main() -> Result<()> {
     }
     model.synchronize()?;
     let load_elapsed = load_started.elapsed();
+    if args.verbose || args.timing {
+        eprintln!("model loaded in {:.3} s", load_elapsed.as_secs_f64());
+    }
 
     let tools_requested = args.tools.is_some();
     let tools = args

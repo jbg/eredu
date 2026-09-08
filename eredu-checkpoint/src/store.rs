@@ -8,7 +8,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Mutex, MutexGuard,
+        Arc, Mutex, MutexGuard, Weak,
     },
     time::SystemTime,
 };
@@ -1238,7 +1238,10 @@ struct CachedShard {
     admitted_file: Arc<AdmittedFile>,
     metadata: Metadata,
     payload_offset: usize,
-    full_tensors: Mutex<BTreeMap<String, Arc<[u8]>>>,
+    // Share overlapping leases without retaining a second resident checkpoint.
+    // The Vec indirection releases the payload when its last lease ends, even
+    // while a weak cache entry still retains the small Arc allocation.
+    full_tensors: Mutex<BTreeMap<String, Weak<Vec<u8>>>>,
 }
 
 #[derive(Debug)]
@@ -1376,7 +1379,7 @@ pub struct SafetensorsLease {
     output_shape: Vec<usize>,
     proof: BoundedReadProof,
     shard: Arc<CachedShard>,
-    bytes: Arc<[u8]>,
+    bytes: Arc<Vec<u8>>,
 }
 
 impl EncodedTensorLease for SafetensorsLease {
@@ -1726,19 +1729,19 @@ impl WeightStore for SafetensorsWeightStore {
             .lock()
             .map_err(|_| StoreError::Internal("checkpoint tensor cache is poisoned".into()))?
             .get(&request.key)
-            .cloned();
+            .and_then(Weak::upgrade);
         let complete_tensor =
             read.ranges.len() == 1 && read.ranges[0].start == 0 && read.ranges[0].end == tensor_len;
         let cache_hit = cached.is_some();
         let bytes = match cached {
             Some(bytes) if complete_tensor => bytes,
-            Some(bytes) => Arc::from(copy_safetensors_ranges(
+            Some(bytes) => Arc::new(copy_safetensors_ranges(
                 &request.key,
                 bytes.as_ref(),
                 &read.ranges,
             )?),
             None => {
-                let bytes: Arc<[u8]> = Arc::from(read_safetensors_ranges(
+                let bytes = Arc::new(read_safetensors_ranges(
                     &shard.path,
                     &shard.admitted_file,
                     payload_start,
@@ -1752,7 +1755,7 @@ impl WeightStore for SafetensorsWeightStore {
                         .map_err(|_| {
                             StoreError::Internal("checkpoint tensor cache is poisoned".into())
                         })?
-                        .insert(request.key.clone(), Arc::clone(&bytes));
+                        .insert(request.key.clone(), Arc::downgrade(&bytes));
                 }
                 bytes
             }
@@ -1776,15 +1779,9 @@ impl WeightStore for SafetensorsWeightStore {
                 physical_reads: if cache_hit {
                     0
                 } else {
-                    u64::try_from(read.ranges.len())
-                        .unwrap_or(u64::MAX)
-                        .saturating_mul(2)
+                    u64::try_from(read.ranges.len()).unwrap_or(u64::MAX)
                 },
-                physical_read_bytes: if cache_hit {
-                    0
-                } else {
-                    length.saturating_mul(2)
-                },
+                physical_read_bytes: if cache_hit { 0 } else { length },
             },
             shard,
             bytes,
@@ -2138,7 +2135,7 @@ fn read_safetensors_ranges_with_hook(
     tensor_payload_start: usize,
     ranges: &[Range<usize>],
     telemetry: &SafetensorsReadTelemetry,
-    between_passes: impl FnOnce(),
+    after_read: impl FnOnce(),
 ) -> Result<Vec<u8>, StoreError> {
     let capacity = ranges.iter().try_fold(0usize, |total, range| {
         total
@@ -2148,7 +2145,7 @@ fn read_safetensors_ranges_with_hook(
             })
     })?;
     let mut file = admitted_file.open_validated(path)?;
-    let first = read_safetensors_range_pass(
+    let bytes = read_safetensors_range_pass(
         path,
         &mut file,
         tensor_payload_start,
@@ -2156,24 +2153,9 @@ fn read_safetensors_ranges_with_hook(
         capacity,
         telemetry,
     )?;
+    after_read();
     admitted_file.validate_file(path, &file)?;
-    between_passes();
-    admitted_file.validate_file(path, &file)?;
-    let second = read_safetensors_range_pass(
-        path,
-        &mut file,
-        tensor_payload_start,
-        ranges,
-        capacity,
-        telemetry,
-    )?;
-    admitted_file.validate_file(path, &file)?;
-    if first != second {
-        return Err(StoreError::AdmittedFileChanged {
-            path: path.to_path_buf(),
-        });
-    }
-    Ok(first)
+    Ok(bytes)
 }
 
 fn read_safetensors_range_pass(
@@ -2908,10 +2890,10 @@ mod tests {
             prepared.acquire_lease(request),
             Err(StoreError::AdmittedFileChanged { .. })
         ));
-        assert_eq!(prepared.source_diagnostics().unwrap().physical_reads, 2);
+        assert_eq!(prepared.source_diagnostics().unwrap().physical_reads, 1);
         assert_eq!(
             prepared.source_diagnostics().unwrap().physical_read_bytes,
-            16
+            8
         );
     }
 
@@ -2955,12 +2937,12 @@ mod tests {
             .unwrap();
 
         let diagnostics = store.diagnostics().unwrap();
-        assert_eq!(diagnostics.physical_reads, 4);
-        assert_eq!(diagnostics.physical_read_bytes, 32);
+        assert_eq!(diagnostics.physical_reads, 2);
+        assert_eq!(diagnostics.physical_read_bytes, 16);
         assert_eq!(lease.bounded_read_proof().offset_bytes, 8);
         assert_eq!(lease.bounded_read_proof().length_bytes, 16);
-        assert_eq!(lease.bounded_read_proof().physical_reads, 4);
-        assert_eq!(lease.bounded_read_proof().physical_read_bytes, 32);
+        assert_eq!(lease.bounded_read_proof().physical_reads, 2);
+        assert_eq!(lease.bounded_read_proof().physical_read_bytes, 16);
         assert!(lease.bounded_read_proof().physically_bounded);
         let mut expected = selected[8..16].to_vec();
         expected.extend_from_slice(&selected[32..40]);
@@ -2969,7 +2951,7 @@ mod tests {
     }
 
     #[test]
-    fn one_byte_selection_reads_exactly_that_byte_twice_for_admission() {
+    fn one_byte_selection_reads_exactly_once() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("model.safetensors");
         let payload = (0..=255).collect::<Vec<u8>>();
@@ -2995,11 +2977,54 @@ mod tests {
             .unwrap();
         assert_eq!(lease.encoded_bytes().unwrap(), &[137]);
         assert_eq!(lease.bounded_read_proof().length_bytes, 1);
-        assert_eq!(lease.bounded_read_proof().physical_reads, 2);
-        assert_eq!(lease.bounded_read_proof().physical_read_bytes, 2);
+        assert_eq!(lease.bounded_read_proof().physical_reads, 1);
+        assert_eq!(lease.bounded_read_proof().physical_read_bytes, 1);
+        let diagnostics = store.diagnostics().unwrap();
+        assert_eq!(diagnostics.physical_reads, 1);
+        assert_eq!(diagnostics.physical_read_bytes, 1);
+    }
+
+    #[test]
+    fn full_tensor_buffers_are_shared_only_while_leased() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("model.safetensors");
+        let payload = [1_u8, 2, 3, 4];
+        serialize_to_file(
+            [(
+                "bytes",
+                TensorView::new(Dtype::U8, vec![4], &payload).unwrap(),
+            )],
+            None,
+            &path,
+        )
+        .unwrap();
+        let store = SafetensorsWeightStore::open(&path).unwrap();
+        let request = TensorReadRequest {
+            key: "bytes".into(),
+            selection: TensorSelection::Full,
+            policy: ReadPolicy::RequireBounded,
+        };
+        let first = store.acquire(request.clone()).unwrap();
+        let retained = Arc::downgrade(&first.bytes);
+        let second = store.acquire(request.clone()).unwrap();
+        assert!(Arc::ptr_eq(&first.bytes, &second.bytes));
+        assert_eq!(second.bounded_read_proof().physical_reads, 0);
+        drop(first);
+        assert_eq!(second.encoded_bytes().unwrap(), payload);
+        assert!(retained.upgrade().is_some());
+        drop(second);
+        assert!(
+            retained.upgrade().is_none(),
+            "cached metadata must not retain payloads"
+        );
+        assert_eq!(store.diagnostics().unwrap().currently_cached_shards, 1);
+
+        let reloaded = store.acquire(request).unwrap();
+        assert_eq!(reloaded.encoded_bytes().unwrap(), payload);
+        assert_eq!(reloaded.bounded_read_proof().physical_reads, 1);
         let diagnostics = store.diagnostics().unwrap();
         assert_eq!(diagnostics.physical_reads, 2);
-        assert_eq!(diagnostics.physical_read_bytes, 2);
+        assert_eq!(diagnostics.physical_read_bytes, 8);
     }
 
     #[test]
@@ -3037,7 +3062,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     #[allow(clippy::single_range_in_vec_init)]
-    fn exact_range_admission_rejects_restored_mtime_mutation_between_reads() {
+    fn exact_range_admission_rejects_restored_mtime_mutation_during_read() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("model.safetensors");
         let payload = [1_u8, 2, 3, 4];
@@ -3109,13 +3134,13 @@ mod tests {
             .unwrap();
 
         let diagnostics = store.diagnostics().unwrap();
-        assert_eq!(diagnostics.physical_reads, 2);
-        assert_eq!(diagnostics.physical_read_bytes, 96);
+        assert_eq!(diagnostics.physical_reads, 1);
+        assert_eq!(diagnostics.physical_read_bytes, 48);
         assert!(!lease.bounded_read_proof().physically_bounded);
         assert_eq!(lease.bounded_read_proof().offset_bytes, 0);
         assert_eq!(lease.bounded_read_proof().length_bytes, 48);
-        assert_eq!(lease.bounded_read_proof().physical_reads, 2);
-        assert_eq!(lease.bounded_read_proof().physical_read_bytes, 96);
+        assert_eq!(lease.bounded_read_proof().physical_reads, 1);
+        assert_eq!(lease.bounded_read_proof().physical_read_bytes, 48);
         assert_eq!(lease.encoded_bytes().unwrap(), selected);
 
         let bounded = store
@@ -3130,8 +3155,8 @@ mod tests {
             })
             .unwrap();
         let cached_diagnostics = store.diagnostics().unwrap();
-        assert_eq!(cached_diagnostics.physical_reads, 2);
-        assert_eq!(cached_diagnostics.physical_read_bytes, 96);
+        assert_eq!(cached_diagnostics.physical_reads, 1);
+        assert_eq!(cached_diagnostics.physical_read_bytes, 48);
         let mut expected = selected[8..16].to_vec();
         expected.extend_from_slice(&selected[32..40]);
         assert_eq!(bounded.encoded_bytes().unwrap(), expected);
@@ -3206,8 +3231,8 @@ mod tests {
         assert_eq!(lease.bounded_read_proof().length_bytes, 8);
         let diagnostics = store.diagnostics().unwrap();
         assert_eq!(diagnostics.payload_shard_paths, [first]);
-        assert_eq!(diagnostics.physical_reads, 2);
-        assert_eq!(diagnostics.physical_read_bytes, 16);
+        assert_eq!(diagnostics.physical_reads, 1);
+        assert_eq!(diagnostics.physical_read_bytes, 8);
         assert!(matches!(
             store.acquire(TensorReadRequest {
                 key: "right".into(),

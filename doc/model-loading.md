@@ -199,6 +199,11 @@ format.
 
 ## Accounting and observability
 
+The CLI's `--timing` option reports load completion as soon as weights are ready,
+then prints load and generation timings when generation ends. This separates
+checkpoint loading from the wait for the first token, which includes prompt
+evaluation and any first-use kernel setup. `--verbose` includes these timings too.
+
 Residency reports separate logical device parameter bytes, charged host-buffer
 capacity, disk payload bytes, transfers, cache hits and misses, evictions, and
 in-flight ownership. Expert, dense-stream, and request-cache reports are

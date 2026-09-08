@@ -581,6 +581,12 @@ and trace-only requests do not resolve it. Backend adapters retain these neutral
 declarations and never reconstruct source membership or fingerprint files.
 Tensor loading reads selected ranges in execution order, so it is independent of
 the optional whole-file hashing pass, which also covers headers and unused bytes.
+Each uncached SafeTensors range is read once into an owned buffer, with file
+identity and change metadata checked before and after the read. The shard cache
+weakly shares full-tensor buffers between live leases; it does not retain payload
+copies after their final lease retires. Native materialization retains its source
+leases until completion, then releases those host buffers independently of the
+resident native weights.
 
 After selection, `PreparedModelSources` is the sole architecture-aware
 SafeTensors/GGUF source factory for model loading. It opens every admitted
