@@ -275,9 +275,9 @@ impl eredu_runtime::execution_control::SnapshotTokenController for ConstraintCon
             } => bytes
                 .checked_add(trigger.len() as u64)?
                 .checked_add(pending.len() as u64),
-            // The pinned Matcher has independent deep cloning, but exposes no
-            // complete live parser/lexer storage estimate. Never substitute a
-            // token count or per-step performance delta for that missing cost.
+            // llguidance 1.8.0 supports independent deep cloning, but exposes no
+            // complete live Matcher storage estimate. Regex-table byte estimates
+            // and per-step counters omit parser buffers and caches.
             ConstraintRuntime::Auto { .. } | ConstraintRuntime::Active(_) => None,
         }
     }

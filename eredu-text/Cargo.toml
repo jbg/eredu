@@ -24,7 +24,7 @@ onig = ["tokenizers/onig"]
 workspace = true
 
 [dependencies]
-base64 = "0.22"
+base64 = "0.23"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 minijinja = { version = "2.24", features = ["json", "loader"] }
 minijinja-contrib = { version = "2.24", features = ["pycompat"] }

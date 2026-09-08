@@ -62,7 +62,7 @@ syn = { version = "3", features = ["full"] }
 quote = "1"
 proc-macro2 = "1"
 itertools = "0.15"
-bindgen = "0.72"
+bindgen = "0.73"
 cmake = "0.1"
 tempfile = "3"
 half = "2"

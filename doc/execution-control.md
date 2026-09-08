@@ -248,9 +248,15 @@ is shared by `Arc`. Unknown custom parser/decoder costs fail explicitly. These
 estimates count live logical values and owned bytes, excluding allocator capacity
 and node overhead; `semantic_snapshot_bytes()` reports that component only. The
 forbidden-tool constraint mode also has a known independent-copy estimate. Active
-and automatic grammar modes remain unknown: pinned llguidance 1.7.6 exposes deep
-copying but no complete live parser/lexer storage estimate. Performance counters
-are not substituted for the missing estimate. Declaring tools with `ToolChoice::None`
+and automatic grammar modes remain unknown: llguidance 1.8.0 exposes independent
+deep copying through [`Matcher::deep_clone`](https://github.com/guidance-ai/llguidance/blob/v1.8.0/parser/src/matcher.rs),
+but no complete live matcher storage estimate or conservative continuation-growth
+bound. `Matcher::last_step_stats` reports per-step work, while the lower-level
+[`RegexVec::num_bytes`](https://github.com/guidance-ai/llguidance/blob/v1.8.0/parser/src/earley/regexvec.rs)
+estimates regex tables only. Neither accounts for the full parser state, including
+history buffers and caches, so neither satisfies snapshot admission. The dependency
+uses the compatible `1.8.0` requirement without an exact pin; upgrading it has not
+removed this limitation. Declaring tools with `ToolChoice::None`
 selects the supported forbidden-tool owner on a profile with a tool surface;
 ordinary no-tools requests can still use an active semantic grammar and therefore
 must check support. Adding tools purely to change this capability also changes the
@@ -285,7 +291,8 @@ Metal-enabled MLX build may require GPU access during initialization even when a
 test requests a CPU stream; the CPU-only build is the verified headless route.
 
 Active/automatic llguidance state still needs a complete upstream storage estimate
-to broaden snapshot support; those configurations fail before copying today.
+and a conservative continuation-growth bound to broaden snapshot support; those
+configurations fail before copying today.
 
 Partitioned, speculative, media and realtime execution control, persistent snapshot
 files, cross-process/cross-backend restoration and layer-level pausing remain outside
