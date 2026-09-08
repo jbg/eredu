@@ -179,6 +179,13 @@ impl Tokenizer {
         &self.template_kwargs
     }
 
+    /// Clears compiled chat templates while retaining tokenizer configuration,
+    /// template variables, filters, and functions. Call this when replacing a
+    /// template under an existing model id or named-template identity.
+    pub fn clear_chat_template_cache(&mut self) {
+        self.env.clear_templates();
+    }
+
     /// Loads and wraps a tokenizer from a `tokenizer.json` file.
     pub fn from_file(file: impl AsRef<Path>) -> tokenizers::Result<Self> {
         tokenizers::Tokenizer::from_file(file).map(Self::from_tokenizer)

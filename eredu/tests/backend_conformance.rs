@@ -69,6 +69,8 @@ const MULTIPLE_SPECULATIVE_RESULTS_PROMPT_TOKEN: u32 = u32::MAX - 1;
 mod control;
 #[path = "backend_conformance/observed_mock.rs"]
 mod observed_mock;
+#[path = "backend_conformance/templates.rs"]
+mod templates;
 
 struct TestDirectory(PathBuf);
 

@@ -26,7 +26,7 @@ pub mod runtime;
 // Internal bindings keep implementation paths concise without adding public
 // aliases for contracts owned by dependency crates.
 #[cfg(test)]
-use eredu_architectures::{GgufArchitecture, ModelKind};
+use eredu_architectures::GgufArchitecture;
 #[cfg(feature = "mlx")]
 use eredu_core::{
     AllocatorTelemetry, AutomaticPlanningError, DevicePlan, ExecutionPlan, ExpertCacheTelemetry,

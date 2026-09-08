@@ -22,7 +22,7 @@ pub enum TextModelError {
     /// Tokenizer encoding or decoding failed.
     #[error(transparent)]
     Tokenizer(#[from] Box<dyn std::error::Error + Send + Sync>),
-    /// The loaded checkpoint does not provide a chat template.
+    /// No chat template is attached to the loaded model.
     #[error("the loaded model does not provide a chat template")]
     MissingChatTemplate,
     /// A native tool definition or its generation grammar is invalid.
@@ -124,6 +124,22 @@ impl TextDecoder {
     }
 }
 
+/// Facade-owned text options for the standard model-loading paths.
+#[derive(Debug, Clone, Default)]
+pub struct LoadedTextModelOptions {
+    /// Replaces checkpoint chat-template selection with a caller-supplied Jinja
+    /// template or named-template collection, including application builtins.
+    /// Tokenizer variables, EOS ids, and generation defaults still come from
+    /// the checkpoint. Template selection and rendering are checked by
+    /// [`LoadedModel::prepare_chat`].
+    ///
+    /// `None` uses checkpoint metadata. If it supplies no template, loading
+    /// succeeds and chat preparation returns [`TextModelError::MissingChatTemplate`].
+    /// No model family receives an implicit template. Raw token generation
+    /// remains available.
+    pub chat_template: Option<ModelChatTemplate>,
+}
+
 /// Backend-neutral tokenizer and chat metadata attached to a prepared runtime.
 pub struct LoadedTextModelConfig {
     /// Canonical architecture family reported to clients.
@@ -132,7 +148,7 @@ pub struct LoadedTextModelConfig {
     pub effective_model_type: String,
     /// Model identity supplied to chat-template rendering.
     pub model_id: String,
-    /// Optional checkpoint chat template or named-template collection.
+    /// Optional checkpoint or caller-supplied chat template or named collection.
     pub chat_template: Option<ModelChatTemplate>,
     /// Checkpoint EOS vocabulary ids.
     pub eos_token_ids: Vec<u32>,
@@ -365,6 +381,17 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
     /// Returns whether a chat template is attached to the model.
     pub fn has_chat_template(&self) -> bool {
         self.chat_template.is_some()
+    }
+
+    /// Replaces the template used by subsequent chat preparation and template
+    /// inspection. Existing prepared chats retain their rendered prompt and
+    /// protocol metadata. Validation occurs when the template is used.
+    ///
+    /// `None` disables chat preparation with [`TextModelError::MissingChatTemplate`];
+    /// it does not reload checkpoint metadata or select a fallback.
+    pub fn set_chat_template(&mut self, template: Option<ModelChatTemplate>) {
+        self.tokenizer.clear_chat_template_cache();
+        self.chat_template = template;
     }
 
     /// Returns the configured EOS token ids.

@@ -261,15 +261,23 @@ fn tokenizer_and_text_inspection_are_available_without_mlx() {
         br#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":null,"post_processor":null,"decoder":null,"model":{"type":"WordLevel","vocab":{"<unk>":0,"hello":1},"unk_token":"<unk>"}}"#,
     )
     .unwrap();
-    std::fs::write(directory.join("config.json"), br#"{"model_type":"llama"}"#).unwrap();
+    for model_type in ["llama", "gemma4"] {
+        std::fs::write(
+            directory.join("config.json"),
+            serde_json::json!({"model_type": model_type}).to_string(),
+        )
+        .unwrap();
 
-    assert_eq!(load_tokenizer(&directory).unwrap().get_vocab_size(false), 2);
-    let mut structural = ModelInspectionReport::unverified(&directory, ArtifactFormat::SafeTensors);
-    structural.model_loadability = InspectionReadiness::Ready;
-    structural.requested_load = InspectionReadiness::Ready;
-    let report = inspect_text_model(structural, TextInspectionOptions::default());
-    assert_eq!(report.tokenizer, InspectionReadiness::Ready);
-    assert_eq!(report.text_generation, InspectionReadiness::Ready);
+        assert_eq!(load_tokenizer(&directory).unwrap().get_vocab_size(false), 2);
+        let mut structural =
+            ModelInspectionReport::unverified(&directory, ArtifactFormat::SafeTensors);
+        structural.model_loadability = InspectionReadiness::Ready;
+        structural.requested_load = InspectionReadiness::Ready;
+        let report = inspect_text_model(structural, TextInspectionOptions::default());
+        assert_eq!(report.tokenizer, InspectionReadiness::Ready);
+        assert_eq!(report.text_generation, InspectionReadiness::Ready);
+        assert_eq!(report.chat_template, InspectionReadiness::Missing);
+    }
 
     std::fs::remove_dir_all(directory).unwrap();
 }

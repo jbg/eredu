@@ -18,7 +18,7 @@ use eredu_text::{
 };
 
 use super::{
-    LoadedModel, LoadedTextModelConfig, PlannedModel, PreparedChatError,
+    LoadedModel, LoadedTextModelConfig, LoadedTextModelOptions, PlannedModel, PreparedChatError,
     PreparedChatGenerationOutput, PreparedChatGenerationRequest, PreparedChatGenerationSettings,
     PreparedChatInput, PreparedChatSpeculativeBatchRequest, PreparedChatSpeculativeConstraint,
     PreparedChatSpeculativeError, PreparedChatSpeculativeGenerationRequest, TextDecoderError,
@@ -473,6 +473,10 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
     }
 
     /// Renders and validates one JSON-valued chat for generation.
+    ///
+    /// Returns [`TextModelError::MissingChatTemplate`] when no template is
+    /// attached. Supply one through [`LoadedTextModelOptions`] while loading
+    /// or [`Self::set_chat_template`] before preparing a chat.
     pub fn prepare_chat(
         &mut self,
         request: ChatTemplateRequest,
@@ -507,6 +511,8 @@ where
     /// owns device and queue construction. Generic callers never construct
     /// backend streams, assistants, or backend-specific load options. The
     /// returned [`PlannedModel`] owns the target and complete drafting mode.
+    /// Use [`Self::load_execution_plan_with_text_options`] to override the
+    /// checkpoint chat template.
     pub fn load_execution_plan<F>(
         factory: &F,
         artifact: impl AsRef<Path>,
@@ -518,16 +524,47 @@ where
             DrafterPreparation = eredu_architectures::ExternalAssistantPreparation,
         >,
     {
+        Self::load_execution_plan_with_text_options(
+            factory,
+            artifact,
+            plan,
+            LoadedTextModelOptions::default(),
+        )
+    }
+
+    /// Realizes a complete execution plan with facade-owned text overrides.
+    ///
+    /// The template override is selected before backend realization and is
+    /// used by subsequent chat preparation and template inspection.
+    pub fn load_execution_plan_with_text_options<F>(
+        factory: &F,
+        artifact: impl AsRef<Path>,
+        plan: &eredu_core::ExecutionPlan,
+        text_options: LoadedTextModelOptions,
+    ) -> Result<PlannedModel<B, F::Drafter>, PlannedModelLoadError<B::Error>>
+    where
+        F: eredu_core::ExecutionPlanBackendFactory<
+            Backend = B,
+            DrafterPreparation = eredu_architectures::ExternalAssistantPreparation,
+        >,
+    {
         let artifact = artifact.as_ref();
         let inspection = eredu_architectures::configuration::inspect_artifact(artifact)
             .map_err(LoadedModelLoadError::Artifact)?;
-        Self::load_inspected_execution_plan(factory, inspection, plan)
+        Self::load_inspected_execution_plan_with_text_options(
+            factory,
+            inspection,
+            plan,
+            text_options,
+        )
     }
 
     /// Realizes a plan using the exact artifact inspection retained by the planner.
+    /// Use [`Self::load_inspected_execution_plan_with_text_options`] to override
+    /// the checkpoint chat template.
     pub fn load_inspected_execution_plan<F>(
         factory: &F,
-        mut inspection: eredu_core::ArtifactInspection<
+        inspection: eredu_core::ArtifactInspection<
             eredu_architectures::processor_plan::ArtifactArchitecturePlan,
         >,
         plan: &eredu_core::ExecutionPlan,
@@ -538,8 +575,31 @@ where
             DrafterPreparation = eredu_architectures::ExternalAssistantPreparation,
         >,
     {
-        let (tokenizer, config) =
-            loaded_text_artifact(&inspection).map_err(LoadedModelLoadError::Metadata)?;
+        Self::load_inspected_execution_plan_with_text_options(
+            factory,
+            inspection,
+            plan,
+            LoadedTextModelOptions::default(),
+        )
+    }
+
+    /// Realizes a retained artifact inspection with facade-owned text overrides.
+    pub fn load_inspected_execution_plan_with_text_options<F>(
+        factory: &F,
+        mut inspection: eredu_core::ArtifactInspection<
+            eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+        >,
+        plan: &eredu_core::ExecutionPlan,
+        text_options: LoadedTextModelOptions,
+    ) -> Result<PlannedModel<B, F::Drafter>, PlannedModelLoadError<B::Error>>
+    where
+        F: eredu_core::ExecutionPlanBackendFactory<
+            Backend = B,
+            DrafterPreparation = eredu_architectures::ExternalAssistantPreparation,
+        >,
+    {
+        let (tokenizer, config) = loaded_text_artifact(&inspection, text_options)
+            .map_err(LoadedModelLoadError::Metadata)?;
         bind_gguf_special_token_ids(&mut inspection, &tokenizer)
             .map_err(LoadedModelLoadError::Metadata)?;
         let target_tokenizer_fingerprint =
@@ -592,6 +652,8 @@ where
     ///
     /// The returned report is the exact portable plan used to realize the
     /// backend and remains suitable for persistence and execution telemetry.
+    /// Use [`Self::plan_and_load_with_text_options`] to override the checkpoint
+    /// chat template.
     #[allow(clippy::type_complexity)]
     pub fn plan_and_load<F>(
         factory: &F,
@@ -611,9 +673,46 @@ where
                 >,
             >,
     {
+        Self::plan_and_load_with_text_options(
+            factory,
+            planner,
+            request,
+            LoadedTextModelOptions::default(),
+        )
+    }
+
+    /// Plans and loads a complete model session with facade-owned text overrides.
+    ///
+    /// Text options apply to the loaded target without changing the execution
+    /// plan or its retained artifact inspection.
+    #[allow(clippy::type_complexity)]
+    pub fn plan_and_load_with_text_options<F>(
+        factory: &F,
+        planner: &eredu_core::AutomaticPlanner,
+        request: &eredu_core::AutomaticPlanRequest,
+        text_options: LoadedTextModelOptions,
+    ) -> Result<
+        (PlannedModel<B, F::Drafter>, eredu_core::ExecutionPlanReport),
+        PlannedModelLoadError<B::Error>,
+    >
+    where
+        F: eredu_core::ExecutionPlanBackendFactory<
+                Backend = B,
+                DrafterPreparation = eredu_architectures::ExternalAssistantPreparation,
+            > + eredu_core::AutomaticPlanningBackend<
+                Inspection = eredu_core::ArtifactInspection<
+                    eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+                >,
+            >,
+    {
         let retained = planner.plan_retained(factory, request)?;
         let (report, inspection) = retained.into_parts();
-        let model = Self::load_inspected_execution_plan(factory, inspection, &report.plan)?;
+        let model = Self::load_inspected_execution_plan_with_text_options(
+            factory,
+            inspection,
+            &report.plan,
+            text_options,
+        )?;
         Ok((model, report))
     }
 
@@ -622,14 +721,30 @@ where
     /// The backend already owns device placement, execution queues, transfer
     /// queues, and optional communication. Artifact inspection occurs exactly
     /// once and is shared by portable metadata assembly and backend planning.
+    /// Use [`Self::load_with_text_options`] to override the checkpoint chat template.
     pub fn load(
         backend: B,
         artifact: impl AsRef<Path>,
         options: B::LoadOptions,
     ) -> Result<Self, LoadedModelLoadError<B::Error>> {
+        Self::load_with_text_options(
+            backend,
+            artifact,
+            options,
+            LoadedTextModelOptions::default(),
+        )
+    }
+
+    /// Loads an artifact on an existing backend with facade-owned text overrides.
+    pub fn load_with_text_options(
+        backend: B,
+        artifact: impl AsRef<Path>,
+        options: B::LoadOptions,
+        text_options: LoadedTextModelOptions,
+    ) -> Result<Self, LoadedModelLoadError<B::Error>> {
         let artifact = artifact.as_ref();
         let inspection = eredu_architectures::configuration::inspect_artifact(artifact)?;
-        let (tokenizer, config) = loaded_text_artifact(&inspection)?;
+        let (tokenizer, config) = loaded_text_artifact(&inspection, text_options)?;
         Self::from_inspected(backend, inspection, options, tokenizer, config)
     }
 
@@ -713,6 +828,7 @@ fn loaded_text_artifact(
     inspection: &eredu_core::ArtifactInspection<
         eredu_architectures::processor_plan::ArtifactArchitecturePlan,
     >,
+    text_options: LoadedTextModelOptions,
 ) -> Result<(ChatTokenizer, LoadedTextModelConfig), TextMetadataError> {
     let path = inspection.path();
     let configuration = inspection.configuration();
@@ -740,7 +856,10 @@ fn loaded_text_artifact(
             let tokenizer = load_tokenizer_for_kind(kind, path)?;
             (
                 ChatTokenizer::from_tokenizer(tokenizer),
-                load_chat_template(path, Some(kind))?,
+                match text_options.chat_template {
+                    Some(template) => Some(template),
+                    None => load_chat_template(path)?,
+                },
                 sidecar_eos_token_ids,
                 configuration.effective_model_type().to_owned(),
             )
@@ -753,16 +872,19 @@ fn loaded_text_artifact(
                 .iter()
                 .map(|(key, value)| (key.clone(), value.clone()))
                 .collect::<std::collections::HashMap<_, _>>();
-            let embedded_chat_template = match metadata.get("tokenizer.chat_template") {
-                Some(GgufMetadataValue::String(template)) => {
-                    Some(ModelChatTemplate::Single(template.clone()))
-                }
-                Some(_) => {
-                    return Err(TextMetadataError::GgufTokenizer(
-                        "tokenizer.chat_template must be a string".into(),
-                    ));
-                }
-                None => None,
+            let chat_template = match text_options.chat_template {
+                Some(template) => Some(template),
+                None => match metadata.get("tokenizer.chat_template") {
+                    Some(GgufMetadataValue::String(template)) => {
+                        Some(ModelChatTemplate::Single(template.clone()))
+                    }
+                    Some(_) => {
+                        return Err(TextMetadataError::GgufTokenizer(
+                            "tokenizer.chat_template must be a string".into(),
+                        ));
+                    }
+                    None => load_chat_template(sidecar_dir)?,
+                },
             };
             let GgufTokenizer {
                 tokenizer,
@@ -772,7 +894,7 @@ fn loaded_text_artifact(
             tokenizer.set_template_kwargs(template_kwargs);
             (
                 tokenizer,
-                embedded_chat_template.or(load_chat_template(sidecar_dir, Some(kind))?),
+                chat_template,
                 merge_eos_token_id_sources([sidecar_eos_token_ids, gguf_eos_token_ids(&metadata)?]),
                 path.display().to_string(),
             )

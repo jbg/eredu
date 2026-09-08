@@ -24,7 +24,7 @@ use super::metadata::{
 };
 use super::request::prepare_chat_from_parts;
 use super::tokenizer::{
-    gguf_model_kind, gguf_sidecar_dir, load_chat_template, load_gguf_tokenizer_from_metadata,
+    gguf_sidecar_dir, load_chat_template, load_gguf_tokenizer_from_metadata,
     load_tokenizer_template_kwargs,
 };
 use crate::runtime::chat::{
@@ -92,9 +92,6 @@ fn inspect_safetensors_sidecars(
     path: &Path,
     request: Option<ChatTemplateRequest>,
 ) {
-    let kind = super::tokenizer::read_model_configuration(path)
-        .ok()
-        .map(|configuration| configuration.kind);
     let tokenizer = match load_tokenizer(path) {
         Ok(tokenizer) => {
             report.tokenizer = InspectionReadiness::Ready;
@@ -111,7 +108,7 @@ fn inspect_safetensors_sidecars(
             None
         }
     };
-    let template = match load_chat_template(path, kind) {
+    let template = match load_chat_template(path) {
         Ok(Some(template)) => {
             report.chat_template = InspectionReadiness::Ready;
             Some(template)
@@ -190,12 +187,7 @@ fn inspect_gguf_sidecars(
         }
         None => None,
     };
-    let kind = gguf_model_kind(metadata).ok().flatten();
-    let template = embedded.or_else(|| {
-        load_chat_template(gguf_sidecar_dir(path), kind)
-            .ok()
-            .flatten()
-    });
+    let template = embedded.or_else(|| load_chat_template(gguf_sidecar_dir(path)).ok().flatten());
     if template.is_some() {
         report.chat_template = InspectionReadiness::Ready;
     } else if report.chat_template != InspectionReadiness::Invalid {

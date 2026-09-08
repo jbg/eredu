@@ -70,6 +70,38 @@ generation sessions, snapshots, and branches keep their backend parameter too.
 Low-level token generation returns `B::Token`; use `eredu_core::TokenOutput` to
 obtain its vocabulary ID.
 
+Applications can supply their own builtin or custom Jinja chat template through
+`LoadedTextModelOptions`:
+
+```rust,ignore
+use eredu::api::LoadedTextModelOptions;
+
+let text_options = LoadedTextModelOptions {
+    chat_template: Some(application_template.into()),
+};
+let planned = LoadedModel::load_execution_plan_with_text_options(
+    &factory, "/path/to/model", &plan, text_options,
+)?;
+```
+
+The same options are accepted by `plan_and_load_with_text_options`,
+`load_inspected_execution_plan_with_text_options`, and `load_with_text_options`.
+Templates may be a single Jinja string or an `eredu_text::tokenizer::ModelChatTemplate::Named`
+collection. The override takes precedence over checkpoint templates and retains
+the checkpoint's tokenizer variables, EOS ids, and generation defaults.
+`model.set_chat_template(Some(template))` replaces the template for subsequent
+preparation; already prepared chats keep their prompt and protocol metadata.
+
+With default text options, loading uses checkpoint templates. When the
+checkpoint provides no template, loading still succeeds, raw
+token generation remains available, and `prepare_chat` returns
+`TextModelError::MissingChatTemplate`. This applies to every model family,
+including Gemma 4; Eredu does not supply implicit templates.
+Supply an explicit template before preparing chat. Calling
+`set_chat_template(None)` disables chat preparation without selecting a fallback.
+Custom templates use the same rendering and protocol checks as checkpoint
+templates; supplying one does not by itself enable native tools or reasoning.
+
 Realtime speech uses `eredu::api::realtime::PreparedRealtimeModel<M>` and
 `eredu_runtime::RealtimeSessionScheduler`. For MLX,
 `eredu_backend_mlx::create_realtime_execution` loads an architecture-prepared

@@ -113,7 +113,7 @@ pub fn chat_template_kwargs(model_dir: impl AsRef<Path>) -> Result<Vec<String>, 
                     "tokenizer.chat_template must be a string".into(),
                 ));
             }
-            None => load_chat_template(sidecar_dir, gguf_model_kind(&metadata)?)?,
+            None => load_chat_template(sidecar_dir)?,
         };
         let mut template_kwargs = gguf_tokenizer::template_kwargs(&metadata)
             .map_err(|error| TextMetadataError::GgufTokenizer(error.to_string()))?;
@@ -124,9 +124,8 @@ pub fn chat_template_kwargs(model_dir: impl AsRef<Path>) -> Result<Vec<String>, 
             template_kwargs,
         )
     } else {
-        let kind = read_model_configuration(submitted_path)?.kind;
         (
-            load_chat_template(submitted_path, Some(kind))?,
+            load_chat_template(submitted_path)?,
             submitted_path.display().to_string(),
             load_tokenizer_template_kwargs(submitted_path)?,
         )
@@ -200,7 +199,6 @@ pub(crate) fn load_gguf_tokenizer_from_metadata(
 
 pub(crate) fn load_chat_template(
     model_dir: &Path,
-    kind: Option<ModelKind>,
 ) -> Result<Option<ModelChatTemplate>, TextMetadataError> {
     let config_path = model_dir.join("tokenizer_config.json");
     if config_path.exists() {
@@ -216,27 +214,7 @@ pub(crate) fn load_chat_template(
         )?)));
     }
 
-    if kind == Some(ModelKind::Gemma4) {
-        return Ok(Some(ModelChatTemplate::Single(
-            GEMMA4_TEXT_TEMPLATE.to_string(),
-        )));
-    }
-
     Ok(None)
-}
-
-pub(crate) fn gguf_model_kind(
-    metadata: &std::collections::HashMap<String, GgufMetadataValue>,
-) -> Result<Option<ModelKind>, TextMetadataError> {
-    match metadata.get("general.architecture") {
-        Some(GgufMetadataValue::String(architecture)) => Ok(Some(
-            eredu_architectures::GgufArchitecture::resolve(architecture)?.model_kind(),
-        )),
-        Some(_) => Err(TextMetadataError::GgufTokenizer(
-            "general.architecture must be a string".into(),
-        )),
-        None => Ok(None),
-    }
 }
 
 pub(crate) fn load_tokenizer_template_kwargs(
@@ -258,11 +236,6 @@ pub(crate) fn load_tokenizer_template_kwargs(
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect())
 }
-
-const GEMMA4_TEXT_TEMPLATE: &str = r#"<bos>{% for message in messages %}{% set role = 'model' if message['role'] == 'assistant' else message['role'] %}<|turn>{{ role }}
-{% if message['content'] is string %}{{ message['content'] }}{% else %}{% for content in message['content'] %}{% if content['type'] == 'text' %}{{ content['text'] }}{% elif content['type'] == 'image' %}<|image>{% elif content['type'] == 'audio' %}<|audio>{% endif %}{% endfor %}{% endif %}<turn|>
-{% endfor %}{% if add_generation_prompt %}<|turn>model
-{% endif %}"#;
 
 #[cfg(test)]
 mod vocabulary_fingerprint_tests {

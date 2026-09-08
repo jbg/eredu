@@ -2132,6 +2132,23 @@ different plan. Each selected target carries an opaque core-owned identity;
 into the runtime, and external drafting realization rejects a runtime produced
 from any other target even when both targets implement the same plan.
 
+The loading APIs' `*_with_text_options` variants accept facade-owned `LoadedTextModelOptions`,
+as do retained-inspection and direct backend loading. A caller-supplied single
+or named chat template supersedes checkpoint template selection before native
+realization, while tokenizer variables, EOS ids, and generation defaults remain
+checkpoint-derived. These options stay outside the core execution plan and
+backend load policy. `LoadedModel::set_chat_template` replaces the template used
+by future preparation and loaded-model template inspection, clearing compiled
+templates through the neutral `eredu-text` cache utility. Existing prepared
+chats retain their prompt and protocol metadata. All supplied templates pass
+through the ordinary facade-owned rendering and protocol-recognition path.
+Without an override, templates come only from checkpoint metadata or sidecar
+files. No model family, including Gemma 4, receives an implicit template.
+A model with no template still loads for raw token generation,
+but chat preparation returns `TextModelError::MissingChatTemplate`; the facade
+does not invent a generic prompt format. Clearing the template with the setter
+also produces that error without reloading metadata or invoking a fallback.
+
 External assistants cross that factory boundary as an architecture-owned
 `ExternalAssistantPreparationPlan`. Architecture inspection fixes the
 assistant family, normalized configuration, checkpoint format, and strict

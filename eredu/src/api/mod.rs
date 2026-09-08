@@ -48,7 +48,8 @@ pub use observed::{
 };
 
 pub use portable::{
-    LoadedModel, LoadedTextModelConfig, PlannedModel, TextDecoder, TextDecoderError, TextModelError,
+    LoadedModel, LoadedTextModelConfig, LoadedTextModelOptions, PlannedModel, TextDecoder,
+    TextDecoderError, TextModelError,
 };
 
 /// Portable failure reported by prepared-chat constraint state.
