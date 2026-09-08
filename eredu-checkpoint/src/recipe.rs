@@ -239,6 +239,14 @@ impl EncodedRecipeRead {
         self.batch.tensors()
     }
 
+    /// Fills multiple final recipe outputs with a shared shard-ordered read pass.
+    pub fn read_many_into(reads: Vec<Self>, outputs: &mut [&mut [u8]]) -> Result<(), StoreError> {
+        crate::store::EncodedReadBatch::read_many_into(
+            reads.into_iter().map(|read| read.batch).collect(),
+            outputs,
+        )
+    }
+
     /// Fills the caller's final output allocation in recipe order.
     pub fn read_into(self, output: &mut [u8]) -> Result<(), StoreError> {
         self.batch.read_into(output)

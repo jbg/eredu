@@ -613,25 +613,37 @@ resident native weights.
 
 For byte-preserving leading-axis joins, checkpoint recipes can instead compile
 an exact encoded read batch. The batch retains admitted metadata and file
-identities, groups reads by shard and offset, and coalesces adjacent source and
-destination spans. It owns no payload buffer or shard-cache lease. Prepared and
+identities and groups reads by shard and offset. Adjacent file ranges use
+vectored reads into disjoint destination slices, including reordered expert
+ranges and separate parameter allocations. Physical reads are bounded to
+64 MiB and 1024 buffers; consecutive chunks continue without another seek.
+Short reads and interruptions advance within those slices without staging. The
+batch owns no payload buffer or shard-cache lease. Prepared and
 restricted source views preserve catalog and authorization checks for this path;
 file identity is checked once before and after each shard's batch of reads.
 Recipe inference reuses the immutable source's retained result, or uses batch
 metadata for custom sources without an immutable catalog. Unsupported transforms,
 partial selections, and source encodings retain the ordinary materializer.
 
-On CPU and Metal, MLX materialization allocates the final contiguous array first
-and supplies its writable bytes to that neutral read batch. The safe native
-initializer owns an exclusive, zero-initialized allocation until all reads
-succeed, then publishes an immutable array. Apple unified memory lets the GPU
+The runtime owns a portable allocation-group budget of 1 GiB and 64 parameters;
+an oversized single parameter stands alone. MLX module binding and resident-unit
+loading retain each recipe's direct/fallback preparation decision and combine
+compatible reads within those groups, opening and checking each participating
+shard once per group. Aliases reuse their owner without another read.
+
+On CPU and Metal, MLX materialization allocates the group's final contiguous
+arrays first and supplies their writable bytes to the neutral read batches. The
+safe native initializer owns exclusive, zero-initialized allocations until all
+reads succeed, then publishes immutable arrays together. Error or unwind drops
+the whole unfinished group. Native completion recovery retains initialized
+inputs before any stream copy or submission. Apple unified memory lets the GPU
 use that same allocation. Expert stacking and gate/up concatenation require no
 per-expert native arrays or checkpoint-sized staging copy on this path. The
 optimization follows each selected binding's recipe, so it neither changes
 residency selection nor eagerly reads otherwise nonresident banks. Native
 allocation and pointer access remain inside `safemlx`/`safemlx-sys`; checkpoint
-code only receives a bounded mutable byte slice. CUDA retains its existing
-materialization and transfer path.
+code only receives bounded, disjoint mutable byte slices. CUDA retains its
+existing materialization and transfer path.
 
 After selection, `PreparedModelSources` is the sole architecture-aware
 SafeTensors/GGUF source factory for model loading. It opens every admitted

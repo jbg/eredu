@@ -18,6 +18,36 @@ use crate::{
     WeightBindingPlan, WeightLoweringKind,
 };
 
+/// Portable bound on a group of final parameter allocations during loading.
+/// A single parameter larger than the byte target is admitted alone; splitting
+/// a parameter's physical reads is a separate checkpoint mechanism.
+#[derive(Debug, Default)]
+pub struct ParameterBatchBudget {
+    bytes: u64,
+    parameters: usize,
+}
+
+impl ParameterBatchBudget {
+    /// Adds a parameter if the group remains within 1 GiB and 64 parameters,
+    /// or if this is the group's first (possibly oversized) parameter.
+    pub fn try_push(&mut self, bytes: u64) -> bool {
+        const MAX_BYTES: u64 = 1 << 30;
+        const MAX_PARAMETERS: usize = 64;
+        if self.parameters != 0
+            && (self.parameters == MAX_PARAMETERS
+                || self
+                    .bytes
+                    .checked_add(bytes)
+                    .is_none_or(|total| total > MAX_BYTES))
+        {
+            return false;
+        }
+        self.bytes = self.bytes.saturating_add(bytes);
+        self.parameters += 1;
+        true
+    }
+}
+
 /// One logical parameter target and the exact recipe that produces it.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct PlannedBinding {
@@ -1328,4 +1358,26 @@ where
     /// Backend-native realization or binding failed.
     #[error("backend parameter operation failed: {0}")]
     Backend(E),
+}
+
+#[cfg(test)]
+mod batch_budget_tests {
+    use super::ParameterBatchBudget;
+
+    #[test]
+    fn batches_bound_bytes_and_parameter_count_without_rejecting_large_parameters() {
+        let mut bytes = ParameterBatchBudget::default();
+        assert!(bytes.try_push((1 << 30) - 1));
+        assert!(bytes.try_push(1));
+        assert!(!bytes.try_push(1));
+        let mut count = ParameterBatchBudget::default();
+        for _ in 0..64 {
+            assert!(count.try_push(1));
+        }
+        assert!(!count.try_push(1));
+        let mut oversized = ParameterBatchBudget::default();
+        assert!(oversized.try_push(u64::MAX));
+        assert!(!oversized.try_push(1));
+        assert!(!oversized.try_push(0));
+    }
 }

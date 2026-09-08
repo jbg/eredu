@@ -17,6 +17,142 @@ use crate::backend::runtime::checkpoint::store::{
     MlxParameterMaterializationContext, PendingWeightMaterialization, WeightMaterialization,
 };
 
+/// A byte-preserving recipe admitted for direct initialization of native storage.
+pub(crate) struct DirectRecipeRead {
+    shape: Vec<i32>,
+    dtype: Dtype,
+    read: eredu_checkpoint::recipe::EncodedRecipeRead,
+}
+
+impl DirectRecipeRead {
+    pub(crate) fn prepare(
+        recipe: &DerivedWeightRecipe,
+        source: &dyn CheckpointSource,
+    ) -> Result<Option<Self>, WeightRecipeError> {
+        #[cfg(feature = "cuda")]
+        {
+            let _ = (recipe, source);
+            Ok(None)
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let Some(read) = recipe.prepare_encoded_read(source)? else {
+                return Ok(None);
+            };
+            if let Some(source) = read.sources().first() {
+                super::store::safetensors_dtype(&source.name, &source.stored_dtype)?;
+            }
+            let mut shape = read
+                .output()
+                .shape
+                .iter()
+                .map(|dimension| usize_to_i32(*dimension, "direct recipe output shape"))
+                .collect::<Result<Vec<_>, _>>()?;
+            let dtype = mlx_dtype(&read.output().dtype)?;
+            if read.output().dtype == RecipeDtype::F4 {
+                let last = shape
+                    .last_mut()
+                    .filter(|last| **last % 2 == 0)
+                    .ok_or(WeightRecipeError::InvalidMxFp4LogicalShape)?;
+                *last /= 2;
+            }
+            Ok(Some(Self { shape, dtype, read }))
+        }
+    }
+
+    pub(crate) fn materialize_many(reads: Vec<Self>) -> Result<Vec<Array>, WeightRecipeError> {
+        let (specifications, reads): (Vec<_>, Vec<_>) = reads
+            .into_iter()
+            .map(|value| ((value.shape, value.dtype), value.read))
+            .unzip();
+        let specifications = specifications
+            .iter()
+            .map(|(shape, dtype)| (shape.as_slice(), *dtype))
+            .collect::<Vec<_>>();
+        Array::try_init_many_with(&specifications, |outputs| {
+            eredu_checkpoint::recipe::EncodedRecipeRead::read_many_into(reads, outputs)
+                .map_err(WeightRecipeError::CheckpointStore)
+        })
+    }
+}
+
+/// One compatible group, or one binding requiring the ordinary materializer.
+pub(crate) enum BindingReadBatch<'a> {
+    Direct {
+        bindings: Vec<&'a eredu_runtime::WeightBinding>,
+        reads: Vec<DirectRecipeRead>,
+    },
+    Ordinary(&'a eredu_runtime::WeightBinding),
+}
+
+/// Plans all reads without allocating weights; allocation is bounded per group.
+pub(crate) fn plan_binding_reads<'a>(
+    source: &dyn CheckpointSource,
+    bindings: impl IntoIterator<Item = &'a eredu_runtime::WeightBinding>,
+) -> Result<Vec<BindingReadBatch<'a>>, WeightRecipeError> {
+    let mut batches = Vec::new();
+    let mut group = Vec::new();
+    let mut reads = Vec::new();
+    let mut budget = eredu_runtime::ParameterBatchBudget::default();
+    for binding in bindings {
+        let direct_source;
+        let recipe = if let Some(recipe) = binding.recipe() {
+            recipe
+        } else {
+            direct_source = binding.source_recipe();
+            &direct_source
+        };
+        let read = DirectRecipeRead::prepare(recipe, source)?;
+        if read.is_none() || !budget.try_push(binding.expected_bytes()) {
+            if !group.is_empty() {
+                batches.push(BindingReadBatch::Direct {
+                    bindings: std::mem::take(&mut group),
+                    reads: std::mem::take(&mut reads),
+                });
+            }
+            budget = Default::default();
+            if read.is_some() {
+                let admitted = budget.try_push(binding.expected_bytes());
+                debug_assert!(admitted);
+            }
+        }
+        if let Some(read) = read {
+            group.push(binding);
+            reads.push(read);
+        } else {
+            batches.push(BindingReadBatch::Ordinary(binding));
+        }
+    }
+    if !group.is_empty() {
+        batches.push(BindingReadBatch::Direct {
+            bindings: group,
+            reads,
+        });
+    }
+    Ok(batches)
+}
+
+/// Materializes a recipe already classified as requiring the ordinary path.
+/// Keeping that decision avoids preparing its encoded read a second time.
+pub(crate) fn prepare_ordinary_recipe(
+    recipe: &DerivedWeightRecipe,
+    store: &dyn CheckpointSource,
+    context: &MlxParameterMaterializationContext,
+    borrow_sources: bool,
+) -> Result<PendingWeightRecipe, WeightRecipeError> {
+    recipe.infer(store)?;
+    let mut sources = Vec::new();
+    let source_stream = context.source_stream();
+    let output =
+        recipe.materialize_inner(store, source_stream, &mut sources, borrow_sources, context)?;
+    // Derived recipe outputs are immutable and may be reused across forwards.
+    // Detach gathers/transposes into their final row-major representation
+    // once here so consumers do not silently repack a full weight on every
+    // kernel invocation.
+    let output = contiguous(output, false, source_stream)?;
+    Ok(PendingWeightRecipe { output, sources })
+}
+
 /// Converts an MLX scalar type into the backend-neutral recipe representation.
 pub fn recipe_dtype_from_mlx(value: Dtype) -> RecipeDtype {
     match value {
@@ -315,49 +451,16 @@ impl MlxWeightRecipeExt for DerivedWeightRecipe {
         context: &MlxParameterMaterializationContext,
         borrow_sources: bool,
     ) -> Result<PendingWeightRecipe, WeightRecipeError> {
-        // On CPU and unified-memory Metal, the allocation filled by checkpoint
-        // I/O is already suitable for execution. Recipes own the layout plan;
-        // the native wrapper owns allocation and publication of immutable data.
-        #[cfg(not(feature = "cuda"))]
-        if let Some(read) = self.prepare_encoded_read(store)? {
-            // Byte-preserving joins already proved a single common dtype.
-            if let Some(source) = read.sources().first() {
-                super::store::safetensors_dtype(&source.name, &source.stored_dtype)?;
-            }
-            let mut shape = read
-                .output()
-                .shape
-                .iter()
-                .map(|dimension| usize_to_i32(*dimension, "direct recipe output shape"))
-                .collect::<Result<Vec<_>, _>>()?;
-            let dtype = mlx_dtype(&read.output().dtype)?;
-            if read.output().dtype == RecipeDtype::F4 {
-                let last = shape
-                    .last_mut()
-                    .filter(|last| **last % 2 == 0)
-                    .ok_or(WeightRecipeError::InvalidMxFp4LogicalShape)?;
-                *last /= 2;
-            }
-            let output = Array::try_init_with(&shape, dtype, |bytes| {
-                read.read_into(bytes)
-                    .map_err(WeightRecipeError::CheckpointStore)
-            })?;
+        if let Some(read) = DirectRecipeRead::prepare(self, store)? {
+            let output = DirectRecipeRead::materialize_many(vec![read])?
+                .pop()
+                .expect("one output");
             return Ok(PendingWeightRecipe {
                 output,
                 sources: Vec::new(),
             });
         }
-        self.infer(store)?;
-        let mut sources = Vec::new();
-        let source_stream = context.source_stream();
-        let output =
-            self.materialize_inner(store, source_stream, &mut sources, borrow_sources, context)?;
-        // Derived recipe outputs are immutable and may be reused across forwards.
-        // Detach gathers/transposes into their final row-major representation
-        // once here so consumers do not silently repack a full weight on every
-        // kernel invocation.
-        let output = contiguous(output, false, source_stream)?;
-        Ok(PendingWeightRecipe { output, sources })
+        prepare_ordinary_recipe(self, store, context, borrow_sources)
     }
 
     fn materialize_inner(

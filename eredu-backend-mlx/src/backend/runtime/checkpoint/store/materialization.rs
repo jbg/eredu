@@ -233,6 +233,14 @@ impl WeightMaterialization {
         Ok(sources)
     }
 
+    /// Retains each prepared output before preparing another fallible operation.
+    pub(crate) fn retain_output(&mut self, output: Array) {
+        Rc::get_mut(self.retained.retention_mut())
+            .expect("unpublished owner")
+            .outputs
+            .push(output);
+    }
+
     pub(crate) fn submit_outputs(
         mut self,
         outputs: Vec<Array>,
@@ -240,6 +248,12 @@ impl WeightMaterialization {
         Rc::get_mut(self.retained.retention_mut())
             .expect("unpublished owner")
             .outputs = outputs;
+        self.submit_prepared_outputs()
+    }
+
+    pub(crate) fn submit_prepared_outputs(
+        mut self,
+    ) -> Result<Self, CheckpointMaterializationError> {
         let result = async_eval_with_event(self.outputs().iter());
         self.retained.seal();
         if result.is_err() {
@@ -345,6 +359,14 @@ impl WeightMaterialization {
         let output = self.output().clone();
         self.finish()?;
         Ok(output)
+    }
+
+    /// Completes one submission containing several independently owned weights.
+    pub(crate) fn synchronize_many(self) -> Result<Vec<Array>, CheckpointMaterializationError> {
+        self.wait()?;
+        let outputs = self.outputs().to_vec();
+        self.finish()?;
+        Ok(outputs)
     }
 
     pub(crate) fn finish(mut self) -> Result<(), CheckpointMaterializationError> {

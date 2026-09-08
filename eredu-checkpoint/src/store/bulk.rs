@@ -1,6 +1,10 @@
 //! Exact encoded reads into storage owned by the materializer.
 
 use super::*;
+use std::io::{self, IoSliceMut};
+
+const MAX_READ_BYTES: usize = 64 * 1024 * 1024;
+const MAX_READ_BUFFERS: usize = 1024;
 
 struct ReadSpan {
     file: Range<u64>,
@@ -15,8 +19,9 @@ struct ReadShard {
 /// An admitted, metadata-only batch of full encoded tensor reads.
 ///
 /// Tensor bytes are placed consecutively in the requested order. File reads
-/// are ordered by shard and offset, and adjacent file/destination ranges are
-/// coalesced. This owns no payload buffer and pins no shard-cache entry.
+/// are ordered by shard and offset, and adjacent file ranges are read together
+/// even when their destinations are disjoint. This owns no payload buffer and
+/// pins no shard-cache entry.
 pub struct EncodedReadBatch {
     tensors: Vec<TensorMetadata>,
     shards: BTreeMap<PathBuf, ReadShard>,
@@ -43,40 +48,187 @@ impl EncodedReadBatch {
         self.read_into_with_hook(destination, || {})
     }
 
+    /// Fills several independent final allocations in shard/offset order.
+    /// Adjacent file ranges use vectored reads even when their destinations
+    /// belong to different tensors or occur in a different memory order.
+    /// No payload staging is allocated. All destination lengths are checked
+    /// before the first read; callers must discard every output on failure.
+    pub fn read_many_into(
+        batches: Vec<Self>,
+        destinations: &mut [&mut [u8]],
+    ) -> Result<(), StoreError> {
+        Self::read_many_with_hook(batches, destinations, || {})
+    }
+
     fn read_into_with_hook(
         self,
         destination: &mut [u8],
+        after_shard: impl FnMut(),
+    ) -> Result<(), StoreError> {
+        Self::read_many_with_hook(vec![self], &mut [destination], after_shard)
+    }
+
+    fn read_many_with_hook(
+        batches: Vec<Self>,
+        destinations: &mut [&mut [u8]],
         mut after_shard: impl FnMut(),
     ) -> Result<(), StoreError> {
-        if destination.len() != self.byte_len {
+        if batches.len() != destinations.len()
+            || batches
+                .iter()
+                .zip(destinations.iter())
+                .any(|(batch, dest)| batch.byte_len != dest.len())
+        {
             return Err(StoreError::Internal(
-                "encoded read destination has the wrong length".into(),
+                "encoded read destinations have the wrong lengths".into(),
             ));
         }
-        for (path, shard) in self.shards {
-            let mut file = shard.admitted.open_validated(&path)?;
-            for span in shard.spans {
-                file.seek(SeekFrom::Start(span.file.start))
-                    .map_err(|error| io_error(&path, error))?;
-                file.read_exact(&mut destination[span.destination.clone()])
-                    .map_err(|error| io_error(&path, error))?;
-                self.telemetry
-                    .physical_reads
-                    .fetch_add(1, Ordering::Relaxed);
-                self.telemetry
-                    .physical_read_bytes
-                    .fetch_add(span.destination.len() as u64, Ordering::Relaxed);
+        // A distinct store keeps its own counters and read admission, even if
+        // another store happens to name the same filesystem path.
+        let mut sources = BTreeMap::new();
+        let mut group_indices = BTreeMap::<(PathBuf, usize), usize>::new();
+        let mut groups = Vec::<DestinationShard<'_>>::new();
+        for (batch, destination) in batches.into_iter().zip(destinations.iter_mut()) {
+            let source_index = Arc::as_ptr(&batch.telemetry) as usize;
+            // Retain even empty batches' source identities until grouping ends.
+            sources
+                .entry(source_index)
+                .or_insert_with(|| Arc::clone(&batch.telemetry));
+            let mut spans = Vec::new();
+            for (path, shard) in batch.shards {
+                let index = *group_indices
+                    .entry((path.clone(), source_index))
+                    .or_insert_with(|| {
+                        let index = groups.len();
+                        groups.push(DestinationShard {
+                            path,
+                            admitted: Arc::clone(&shard.admitted),
+                            spans: Vec::new(),
+                            telemetry: Arc::clone(&batch.telemetry),
+                            cache: Arc::clone(&batch.cache),
+                        });
+                        index
+                    });
+                if !Arc::ptr_eq(&groups[index].admitted, &shard.admitted)
+                    && groups[index].admitted.identity != shard.admitted.identity
+                {
+                    return Err(StoreError::AdmittedFileChanged {
+                        path: groups[index].path.clone(),
+                    });
+                }
+                spans.extend(shard.spans.into_iter().map(|span| (index, span)));
             }
-            self.cache
+            // Split each allocation in destination order to obtain disjoint
+            // mutable borrows, then rearrange those borrows into file order.
+            spans.sort_unstable_by_key(|(_, span)| span.destination.start);
+            let mut remaining = &mut **destination;
+            let mut position = 0;
+            for (index, span) in spans {
+                let (_, tail) = remaining.split_at_mut(span.destination.start - position);
+                let (bytes, tail) = tail.split_at_mut(span.destination.len());
+                remaining = tail;
+                position = span.destination.end;
+                let mut offset = span.file.start;
+                for bytes in bytes.chunks_mut(MAX_READ_BYTES) {
+                    let end = offset + bytes.len() as u64;
+                    groups[index].spans.push(DestinationSpan {
+                        file: offset..end,
+                        bytes,
+                    });
+                    offset = end;
+                }
+            }
+        }
+        groups.sort_by(|left, right| left.path.cmp(&right.path));
+        for mut group in groups {
+            group.spans.sort_unstable_by_key(|span| span.file.start);
+            let mut file = group.admitted.open_validated(&group.path)?;
+            read_destination_spans(&mut file, group.spans, &group.telemetry)
+                .map_err(|error| io_error(&group.path, error))?;
+            group
+                .cache
                 .lock()
                 .map_err(|_| StoreError::Internal("checkpoint shard cache is poisoned".into()))?
                 .payloads
-                .insert(path.clone());
+                .insert(group.path.clone());
             after_shard();
-            shard.admitted.validate_file(&path, &file)?;
+            group.admitted.validate_file(&group.path, &file)?;
         }
         Ok(())
     }
+}
+
+struct DestinationSpan<'a> {
+    file: Range<u64>,
+    bytes: &'a mut [u8],
+}
+
+struct DestinationShard<'a> {
+    path: PathBuf,
+    admitted: Arc<AdmittedFile>,
+    spans: Vec<DestinationSpan<'a>>,
+    telemetry: Arc<SafetensorsReadTelemetry>,
+    cache: Arc<Mutex<CacheState>>,
+}
+
+fn read_destination_spans(
+    reader: &mut (impl Read + Seek),
+    spans: Vec<DestinationSpan<'_>>,
+    telemetry: &SafetensorsReadTelemetry,
+) -> io::Result<()> {
+    let mut spans = spans.into_iter().peekable();
+    let mut position = None;
+    let mut buffers = Vec::with_capacity(MAX_READ_BUFFERS);
+    while let Some(first) = spans.next() {
+        let start = first.file.start;
+        let mut end = first.file.end;
+        let mut bytes = first.bytes.len();
+        buffers.push(IoSliceMut::new(first.bytes));
+        while let Some(next) = spans.peek() {
+            if next.file.start != end
+                || buffers.len() == MAX_READ_BUFFERS
+                || bytes + next.bytes.len() > MAX_READ_BYTES
+            {
+                break;
+            }
+            let next = spans.next().expect("peeked span");
+            bytes += next.bytes.len();
+            end = next.file.end;
+            buffers.push(IoSliceMut::new(next.bytes));
+        }
+        if position != Some(start) {
+            reader.seek(SeekFrom::Start(start))?;
+        }
+        read_exact_vectored(reader, &mut buffers, telemetry)?;
+        position = Some(end);
+        buffers.clear();
+    }
+    Ok(())
+}
+
+fn read_exact_vectored(
+    reader: &mut impl Read,
+    buffers: &mut [IoSliceMut<'_>],
+    telemetry: &SafetensorsReadTelemetry,
+) -> io::Result<()> {
+    let mut remaining = buffers.iter().map(|buffer| buffer.len()).sum::<usize>();
+    let mut buffers = buffers;
+    while remaining != 0 {
+        let count = match reader.read_vectored(buffers) {
+            Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
+            Ok(count) if count <= remaining => count,
+            Ok(_) => return Err(io::ErrorKind::InvalidData.into()),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        telemetry.physical_reads.fetch_add(1, Ordering::Relaxed);
+        telemetry
+            .physical_read_bytes
+            .fetch_add(count as u64, Ordering::Relaxed);
+        remaining -= count;
+        IoSliceMut::advance_slices(&mut buffers, count);
+    }
+    Ok(())
 }
 
 pub(super) fn provenance(metadata: &TensorMetadata) -> TensorSourceProvenance {
@@ -233,6 +385,196 @@ mod tests {
         )
         .unwrap();
         (directory, source)
+    }
+
+    #[test]
+    fn vectored_reads_scatter_into_reversed_and_separate_allocations() {
+        let (_directory, source) = fixture();
+        let mut first = [0; 16];
+        let mut second = [0; 16];
+        let batches = [["b", "c"], ["d", "a"]].map(|keys| {
+            source
+                .prepare_encoded_read(&keys.map(String::from))
+                .unwrap()
+                .unwrap()
+        });
+        EncodedReadBatch::read_many_into(batches.into(), &mut [&mut first, &mut second]).unwrap();
+        assert_eq!(first, [vec![2; 8], vec![3; 8]].concat().as_slice());
+        assert_eq!(second, [vec![4; 8], vec![1; 8]].concat().as_slice());
+        let diagnostics = source.source_diagnostics().unwrap();
+        #[cfg(unix)]
+        assert_eq!(
+            diagnostics.physical_reads, 2,
+            "one read per shard across both allocations"
+        );
+        assert_eq!(diagnostics.physical_read_bytes, 32);
+        assert_eq!(diagnostics.currently_cached_shards, 0);
+    }
+
+    #[test]
+    fn every_destination_is_checked_before_any_output_is_written() {
+        let (_directory, source) = fixture();
+        for wrong_count in [false, true] {
+            let batches =
+                ["a", "b"].map(|key| source.prepare_encoded_read(&[key.into()]).unwrap().unwrap());
+            let mut first = [99; 8];
+            let mut second = [99; 7];
+            let mut outputs = vec![first.as_mut_slice()];
+            if !wrong_count {
+                outputs.push(second.as_mut_slice());
+            }
+            assert!(EncodedReadBatch::read_many_into(batches.into(), &mut outputs).is_err());
+            assert_eq!(first, [99; 8]);
+            assert_eq!(second, [99; 7]);
+        }
+        assert_eq!(source.source_diagnostics().unwrap().physical_reads, 0);
+    }
+
+    #[test]
+    fn grouped_reads_retain_each_sources_admission_and_telemetry() {
+        let (directory, a) = fixture();
+        let b = SafetensorsWeightStore::open(directory.path()).unwrap();
+        let sources = [&a as &dyn CheckpointSource, &b];
+        let batches =
+            sources.map(|source| source.prepare_encoded_read(&["a".into()]).unwrap().unwrap());
+        let mut first = [0; 8];
+        let mut second = [0; 8];
+        EncodedReadBatch::read_many_into(batches.into(), &mut [&mut first, &mut second]).unwrap();
+        assert_eq!(first, [1; 8]);
+        assert_eq!(second, [1; 8]);
+        for source in sources {
+            assert_eq!(source.source_diagnostics().unwrap().physical_read_bytes, 8);
+        }
+    }
+
+    struct ShortReader {
+        cursor: io::Cursor<Vec<u8>>,
+        limit: usize,
+        interrupt: bool,
+        requests: Vec<(usize, usize)>,
+        seeks: usize,
+    }
+
+    impl Read for ShortReader {
+        fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+            self.read_vectored(&mut [IoSliceMut::new(bytes)])
+        }
+        fn read_vectored(&mut self, buffers: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
+            if std::mem::take(&mut self.interrupt) {
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            self.requests.push((
+                buffers.len(),
+                buffers.iter().map(|buffer| buffer.len()).sum(),
+            ));
+            let mut total = 0;
+            for buffer in buffers {
+                let length = buffer.len().min(self.limit - total);
+                total += self.cursor.read(&mut buffer[..length])?;
+                if total == self.limit {
+                    break;
+                }
+            }
+            Ok(total)
+        }
+    }
+    impl Seek for ShortReader {
+        fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+            self.seeks += 1;
+            self.cursor.seek(position)
+        }
+    }
+    fn reader(bytes: Vec<u8>, limit: usize) -> ShortReader {
+        ShortReader {
+            cursor: io::Cursor::new(bytes),
+            limit,
+            interrupt: false,
+            requests: Vec::new(),
+            seeks: 0,
+        }
+    }
+
+    #[test]
+    fn short_reads_and_interrupts_preserve_scatter_order_and_report_eof() {
+        let telemetry = SafetensorsReadTelemetry::default();
+        let mut input = reader((0..10).collect(), 3);
+        input.interrupt = true;
+        let mut first = [0; 4];
+        let mut second = [0; 6];
+        read_exact_vectored(
+            &mut input,
+            &mut [IoSliceMut::new(&mut first), IoSliceMut::new(&mut second)],
+            &telemetry,
+        )
+        .unwrap();
+        assert_eq!(first, [0, 1, 2, 3]);
+        assert_eq!(second, [4, 5, 6, 7, 8, 9]);
+        assert_eq!(telemetry.physical_reads.load(Ordering::Relaxed), 4);
+        assert_eq!(telemetry.physical_read_bytes.load(Ordering::Relaxed), 10);
+        let error = read_exact_vectored(&mut input, &mut [IoSliceMut::new(&mut first)], &telemetry)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn vectored_reads_support_the_scalar_read_fallback() {
+        struct Scalar(io::Cursor<Vec<u8>>);
+        impl Read for Scalar {
+            fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+                self.0.read(bytes)
+            }
+        }
+        let mut input = Scalar(io::Cursor::new(vec![1, 2, 3, 4]));
+        let mut first = [0; 2];
+        let mut second = [0; 2];
+        let telemetry = SafetensorsReadTelemetry::default();
+        read_exact_vectored(
+            &mut input,
+            &mut [IoSliceMut::new(&mut first), IoSliceMut::new(&mut second)],
+            &telemetry,
+        )
+        .unwrap();
+        assert_eq!(first, [1, 2]);
+        assert_eq!(second, [3, 4]);
+        assert_eq!(telemetry.physical_reads.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn bounded_vectors_continue_without_seeking_and_skip_unselected_gaps() {
+        let count = MAX_READ_BUFFERS + 1;
+        let mut input = reader(vec![7; count], usize::MAX);
+        let mut output = vec![0; count];
+        let spans = output
+            .chunks_mut(1)
+            .enumerate()
+            .map(|(index, bytes)| DestinationSpan {
+                file: index as u64..index as u64 + 1,
+                bytes,
+            })
+            .collect();
+        let telemetry = SafetensorsReadTelemetry::default();
+        read_destination_spans(&mut input, spans, &telemetry).unwrap();
+        assert_eq!(output, vec![7; count]);
+        assert_eq!(
+            input.requests,
+            [(MAX_READ_BUFFERS, MAX_READ_BUFFERS), (1, 1)]
+        );
+        assert_eq!(input.seeks, 1);
+
+        let mut input = reader(vec![10, 11, 12, 13, 14, 15], usize::MAX);
+        let mut output = [0; 3];
+        let spans = output
+            .chunks_mut(1)
+            .zip([0..1, 3..4, 3..4])
+            .map(|(bytes, file)| DestinationSpan { file, bytes })
+            .collect();
+        read_destination_spans(&mut input, spans, &telemetry).unwrap();
+        assert_eq!(output, [10, 13, 13]);
+        assert_eq!(
+            input.seeks, 3,
+            "gaps and repeated sources need independent positions"
+        );
+        assert_eq!(input.requests, [(1, 1); 3]);
     }
 
     #[test]

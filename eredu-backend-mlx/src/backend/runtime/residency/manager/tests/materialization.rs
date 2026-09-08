@@ -340,3 +340,29 @@ fn direct_disk_to_device_does_not_create_a_host_copy() {
         8
     );
 }
+
+#[cfg(not(feature = "cuda"))]
+#[test]
+fn resident_units_batch_direct_reads_across_reordered_parameters() {
+    let (_dir, store) = fixture_store();
+    let manager = manager(
+        Arc::clone(&store),
+        OffloadConfig::new(Some(24), Some(0), 1).unwrap(),
+        [spec("resident", 24, ResidencyPolicy::Pinned, MemoryTier::Device)],
+        [unit("resident", [
+            binding("first", "c", TensorSelection::Full, 8),
+            binding("second", "a", TensorSelection::Full, 8),
+            binding("third", "b", TensorSelection::Full, 8),
+        ])],
+    );
+    manager.initialize().unwrap();
+    let lease = manager.acquire(&id("resident"), MemoryTier::Device).unwrap();
+    for (name, expected) in [("first", [5, 6]), ("second", [1, 2]), ("third", [3, 4])] {
+        assert_eq!(lease.device_value(name).unwrap().evaluated().unwrap().as_slice::<i32>(), expected);
+    }
+    let diagnostics = store.source_diagnostics().unwrap();
+    #[cfg(unix)]
+    assert_eq!(diagnostics.physical_reads, 1);
+    assert_eq!(diagnostics.physical_read_bytes, 24, "the unselected matrix is not read");
+    assert_eq!(diagnostics.currently_cached_shards, 0);
+}

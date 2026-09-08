@@ -215,8 +215,8 @@ pub use parameter::{
     build_exact_replicated_text_bindings, build_module_binding_plan, materialize_bindings,
     materialize_selected_bindings, preflight_bindings, select_bindings, BindingPlan,
     BindingPlanError, MaterializedUnit, ModuleBindingPlan, ModuleBindingPlanError,
-    ParameterBindingTarget, ParameterOrchestrationError, PlannedBinding, RecipeBindingError,
-    SelectedBindingPlan,
+    ParameterBatchBudget, ParameterBindingTarget, ParameterOrchestrationError, PlannedBinding,
+    RecipeBindingError, SelectedBindingPlan,
 };
 pub use partition::{
     validate_boundary_tensor_count, ArchitectureBoundary, ArchitectureBoundaryError,

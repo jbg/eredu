@@ -56,6 +56,94 @@ mod direct_init_tests {
     use crate::{Device, DeviceType};
 
     #[test]
+    fn group_initializer_publishes_the_same_allocations_with_mixed_types() {
+        let mut addresses = Vec::new();
+        let values = Array::try_init_many_with(
+            &[
+                (&[4], Dtype::Uint8),
+                (&[2], Dtype::Float32),
+                (&[0], Dtype::Int32),
+            ],
+            |outputs| {
+                assert_eq!(
+                    outputs
+                        .iter()
+                        .map(|output| output.len())
+                        .collect::<Vec<_>>(),
+                    [4, 8, 0]
+                );
+                assert!(outputs
+                    .iter()
+                    .all(|output| output.iter().all(|byte| *byte == 0)));
+                addresses = outputs.iter().map(|output| output.as_ptr()).collect();
+                outputs[0].copy_from_slice(&[1, 2, 3, 4]);
+                outputs[1].copy_from_slice(
+                    &[1.5f32, -2.0]
+                        .into_iter()
+                        .flat_map(f32::to_ne_bytes)
+                        .collect::<Vec<_>>(),
+                );
+                Ok::<_, crate::error::Exception>(())
+            },
+        )
+        .unwrap();
+        assert_ne!(addresses[0], addresses[1]);
+        for (value, address) in values.iter().zip(addresses).take(2) {
+            assert_eq!(
+                value.evaluated().unwrap().to_native_bytes().len(),
+                value.nbytes()
+            );
+            let evaluated = value.evaluated().unwrap();
+            let actual = if value.dtype() == Dtype::Uint8 {
+                evaluated.as_slice::<u8>().as_ptr()
+            } else {
+                evaluated.as_slice::<f32>().as_ptr().cast()
+            };
+            assert_eq!(actual, address);
+        }
+        assert_eq!(
+            values[0].evaluated().unwrap().as_slice::<u8>(),
+            [1, 2, 3, 4]
+        );
+        assert_eq!(
+            values[1].evaluated().unwrap().as_slice::<f32>(),
+            [1.5, -2.0]
+        );
+        assert_eq!(values[2].size(), 0);
+    }
+
+    #[test]
+    fn group_initializer_discards_partial_results_on_error_or_unwind() {
+        let specs = [(&[2][..], Dtype::Uint8), (&[3][..], Dtype::Uint8)];
+        let result = Array::try_init_many_with(&specs, |outputs| {
+            outputs[0].fill(7);
+            Err(crate::error::Exception::custom("second read failed"))
+        });
+        assert!(result.is_err());
+        let result = std::panic::catch_unwind(|| {
+            Array::try_init_many_with(&specs, |outputs| -> Result<(), crate::error::Exception> {
+                outputs[0].fill(7);
+                panic!("initializer unwound");
+            })
+        });
+        assert!(result.is_err());
+        let mut called = false;
+        let result =
+            Array::try_init_many_with(&[(&[2], Dtype::Uint8), (&[-1], Dtype::Uint8)], |_| {
+                called = true;
+                Ok::<_, crate::error::Exception>(())
+            });
+        assert!(result.is_err());
+        assert!(!called);
+        assert!(Array::try_init_many_with(&[], |outputs| {
+            assert!(outputs.is_empty());
+            Ok::<_, crate::error::Exception>(())
+        })
+        .unwrap()
+        .is_empty());
+    }
+
+    #[test]
     fn initializer_writes_the_final_native_allocation() {
         let mut initialized_at = std::ptr::null();
         let value = Array::try_init_with(&[4], Dtype::Uint8, |bytes| {
@@ -304,6 +392,53 @@ impl Array {
         dtype: Dtype,
         initialize: impl FnOnce(&mut [u8]) -> std::result::Result<(), E>,
     ) -> std::result::Result<Self, E> {
+        let (value, data, len) = Self::allocate_host_initializer(shape, dtype)?;
+        // SAFETY: allocation initialized the checked extent. The exclusively
+        // owned array is not exposed until the callback's borrow has ended.
+        let bytes = if len == 0 {
+            &mut []
+        } else {
+            unsafe { std::slice::from_raw_parts_mut(data.cast::<u8>(), len) }
+        };
+        initialize(bytes)?;
+        Ok(value)
+    }
+
+    /// Initializes several final CPU or shared Metal allocations together.
+    ///
+    /// The callback receives disjoint, zero-initialized buffers in specification
+    /// order. No array is published until it succeeds for the complete group.
+    /// Failure or unwinding releases all allocations, including partial output.
+    pub fn try_init_many_with<E: From<crate::error::Exception>>(
+        specifications: &[(&[i32], Dtype)],
+        initialize: impl FnOnce(&mut [&mut [u8]]) -> std::result::Result<(), E>,
+    ) -> std::result::Result<Vec<Self>, E> {
+        let allocations = specifications
+            .iter()
+            .map(|(shape, dtype)| Self::allocate_host_initializer(shape, *dtype))
+            .collect::<crate::error::Result<Vec<_>>>()?;
+        let mut buffers = allocations
+            .iter()
+            .map(|(_, data, len)| {
+                // SAFETY: every checked allocation is initialized and exclusively
+                // owned here. Live allocations are disjoint; their arrays remain
+                // retained and inaccessible throughout the callback.
+                if *len == 0 {
+                    &mut [][..]
+                } else {
+                    unsafe { std::slice::from_raw_parts_mut(data.cast::<u8>(), *len) }
+                }
+            })
+            .collect::<Vec<_>>();
+        initialize(&mut buffers)?;
+        drop(buffers);
+        Ok(allocations.into_iter().map(|(array, _, _)| array).collect())
+    }
+
+    fn allocate_host_initializer(
+        shape: &[i32],
+        dtype: Dtype,
+    ) -> crate::error::Result<(Self, *mut c_void, usize)> {
         let len = checked_elements(shape)?
             .checked_mul(dtype_byte_width(dtype))
             .filter(|len| *len <= isize::MAX as usize)
@@ -323,16 +458,7 @@ impl Array {
                 )
             })?
         };
-        // SAFETY: native construction initializes the entire checked extent.
-        // `value` is exclusively owned and cannot be shared until this callback
-        // returns. The callback's borrow cannot outlive this allocation.
-        let bytes = if len == 0 {
-            &mut []
-        } else {
-            unsafe { std::slice::from_raw_parts_mut(data.cast::<u8>(), len) }
-        };
-        initialize(bytes)?;
-        Ok(value)
+        Ok((value, data, len))
     }
 
     /// Copies a checked typed slice into a new MLX array.

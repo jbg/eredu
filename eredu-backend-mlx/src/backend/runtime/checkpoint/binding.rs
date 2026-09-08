@@ -17,7 +17,8 @@ use safemlx::{Array, Stream};
 use crate::{
     backend::nn::shared::{neutral_parameter_refs, MlxNeuralBackend},
     backend::runtime::checkpoint::recipe::{
-        recipe_dtype_from_mlx, MlxWeightRecipeExt, WeightRecipeError,
+        plan_binding_reads, recipe_dtype_from_mlx, BindingReadBatch, DirectRecipeRead,
+        WeightRecipeError,
     },
     backend::runtime::checkpoint::store::{
         MlxParameterMaterializationContext, WeightMaterialization,
@@ -173,7 +174,7 @@ where
     .map_err(|error| ModuleBindingError::BindingPlan(error.to_string()))
 }
 
-/// Materializes a complete binding unit with a fixed two-completion window.
+/// Materializes a complete binding unit with at most two pending allocation groups.
 ///
 /// The canonical neutral preflight completes before any payload lease or MLX
 /// operation; publication remains atomic in the caller's module binder.
@@ -188,21 +189,61 @@ pub fn materialize_module_bindings(
     let mut arrays = BTreeMap::new();
     let mut pending = VecDeque::with_capacity(MODEL_LOAD_MATERIALIZATION_BUFFERS);
     let context = MlxParameterMaterializationContext::new(source_stream, execution_stream);
-    for binding in plan.owners() {
-        let materialization = loop {
-            match submit_module_binding(store, binding, source_stream, execution_stream, &context) {
-                Ok(materialization) => break materialization,
-                Err(error) if !pending.is_empty() && is_shard_cache_capacity_error(&error) => {
-                    finish_module_binding(&mut pending, &mut arrays)?;
+    for batch in plan_binding_reads(store, plan.owners())? {
+        let (names, materialization) = match batch {
+            BindingReadBatch::Direct { bindings, reads } => {
+                let inputs = DirectRecipeRead::materialize_many(reads)?;
+                let mut prepared = WeightMaterialization::prepare_retained(inputs, Vec::new())?;
+                for index in 0..prepared.inputs().len() {
+                    let input = &prepared.inputs()[index];
+                    let output = if source_stream == execution_stream {
+                        input.clone()
+                    } else {
+                        input
+                            .copy(execution_stream)
+                            .map_err(WeightRecipeError::from)?
+                    };
+                    prepared.retain_output(output);
                 }
-                Err(error) => return Err(error),
+                let names = bindings
+                    .iter()
+                    .map(|binding| {
+                        (
+                            binding.name().to_owned(),
+                            binding.checkpoint_key().to_owned(),
+                        )
+                    })
+                    .collect();
+                (names, prepared.submit_prepared_outputs()?)
+            }
+            BindingReadBatch::Ordinary(binding) => {
+                let materialization = loop {
+                    match submit_module_binding(
+                        store,
+                        binding,
+                        source_stream,
+                        execution_stream,
+                        &context,
+                    ) {
+                        Ok(materialization) => break materialization,
+                        Err(error)
+                            if !pending.is_empty() && is_shard_cache_capacity_error(&error) =>
+                        {
+                            finish_module_binding(&mut pending, &mut arrays)?;
+                        }
+                        Err(error) => return Err(error),
+                    }
+                };
+                (
+                    vec![(
+                        binding.name().to_owned(),
+                        binding.checkpoint_key().to_owned(),
+                    )],
+                    materialization,
+                )
             }
         };
-        pending.push_back((
-            binding.name().to_string(),
-            binding.checkpoint_key().to_string(),
-            materialization,
-        ));
+        pending.push_back((names, materialization));
         if pending.len() == MODEL_LOAD_MATERIALIZATION_BUFFERS {
             finish_module_binding(&mut pending, &mut arrays)?;
         }
@@ -228,7 +269,7 @@ fn submit_module_binding(
     context: &MlxParameterMaterializationContext,
 ) -> Result<WeightMaterialization, ModuleBindingError> {
     if let Some(recipe) = binding.recipe() {
-        let pending = recipe.prepare_materialization(store, context)?;
+        let pending = super::recipe::prepare_ordinary_recipe(recipe, store, context, false)?;
         let (source, sources) = pending.into_parts();
         let prepared = WeightMaterialization::prepare_retained(vec![source], sources)?;
         let output = if source_stream == execution_stream {
@@ -251,22 +292,29 @@ fn submit_module_binding(
     }
 }
 
-type PendingModuleBinding = (String, String, WeightMaterialization);
+type PendingModuleBinding = (Vec<(String, String)>, WeightMaterialization);
 
 fn finish_module_binding(
     pending: &mut VecDeque<PendingModuleBinding>,
     arrays: &mut BTreeMap<String, Array>,
 ) -> Result<(), ModuleBindingError> {
-    let (name, checkpoint_key, materialization) = pending
+    let (names, materialization) = pending
         .pop_front()
         .expect("non-empty model-loading window has a front");
-    let value = materialization.synchronize()?;
-    if arrays.insert(name.clone(), value).is_some() {
-        return Err(ModuleBindingError::DuplicateCheckpointBinding {
-            checkpoint_key,
-            first: name.clone(),
-            second: name,
-        });
+    let values = materialization.synchronize_many()?;
+    assert_eq!(
+        names.len(),
+        values.len(),
+        "one initialized array per planned parameter"
+    );
+    for ((name, checkpoint_key), value) in names.into_iter().zip(values) {
+        if arrays.insert(name.clone(), value).is_some() {
+            return Err(ModuleBindingError::DuplicateCheckpointBinding {
+                checkpoint_key,
+                first: name.clone(),
+                second: name,
+            });
+        }
     }
     Ok(())
 }

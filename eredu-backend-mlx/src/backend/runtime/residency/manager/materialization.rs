@@ -1,6 +1,9 @@
 //! Checkpoint materialization, host transfer, and capacity accounting.
 
 use super::*;
+use crate::backend::runtime::checkpoint::recipe::{
+    plan_binding_reads, BindingReadBatch, DirectRecipeRead,
+};
 use crate::backend::submission_recovery::{Recovery, Retention, Status};
 
 struct HostMaterialization {
@@ -209,21 +212,57 @@ pub(super) fn prepare_from_disk(
 ) -> Result<PreparedResidentArrays, ResidencyError> {
     let mut arrays = shared.clone();
     retained.retained_arrays.extend(shared.values().cloned());
-    for binding in bindings {
-        if arrays.contains_key(binding.name()) {
-            continue;
-        }
+    let batches = plan_binding_reads(
+        store,
+        bindings
+            .iter()
+            .filter(|binding| !shared.contains_key(binding.name())),
+    )
+    .map_err(|source| ResidencyError::Recipe {
+        binding: "<parameter batch>".into(),
+        source,
+    })?;
+    for batch in batches {
+        let binding = match batch {
+            BindingReadBatch::Direct { bindings, reads } => {
+                let inputs = DirectRecipeRead::materialize_many(reads).map_err(|source| {
+                    ResidencyError::Recipe {
+                        binding: "<parameter batch>".into(),
+                        source,
+                    }
+                })?;
+                // Arm the enclosing recovery owner before any stream operation.
+                retained.retained_arrays.extend(inputs.iter().cloned());
+                for (binding, input) in bindings.into_iter().zip(inputs) {
+                    let output = if source_stream == execution_stream {
+                        input
+                    } else {
+                        input
+                            .copy(execution_stream)
+                            .map_err(|source| ResidencyError::Recipe {
+                                binding: binding.name().to_owned(),
+                                source: WeightRecipeError::Mlx(source),
+                            })?
+                    };
+                    retained.retained_arrays.push(output.clone());
+                    arrays.insert(binding.name().to_owned(), output);
+                }
+                continue;
+            }
+            BindingReadBatch::Ordinary(binding) => binding,
+        };
         let mut retried_after_capacity = false;
         loop {
             let prepared = (|| match binding.recipe() {
                 Some(recipe) => {
                     let pending =
-                        recipe
-                            .prepare_materialization(store, context)
-                            .map_err(|source| ResidencyError::Recipe {
-                                binding: binding.name().to_owned(),
-                                source,
-                            })?;
+                        crate::backend::runtime::checkpoint::recipe::prepare_ordinary_recipe(
+                            recipe, store, context, false,
+                        )
+                        .map_err(|source| ResidencyError::Recipe {
+                            binding: binding.name().to_owned(),
+                            source,
+                        })?;
                     let (host, sources) = pending.into_parts();
                     retained.sources.extend(sources);
                     retained.retained_arrays.push(host.clone());
