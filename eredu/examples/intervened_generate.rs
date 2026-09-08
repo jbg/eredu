@@ -79,6 +79,7 @@ fn main() -> anyhow::Result<()> {
             ..Default::default()
         },
         seed: 42,
+        ..Default::default()
     };
     let chat = model.prepare_chat(ChatTemplateRequest {
         messages: vec![serde_json::json!({"role": "user", "content": prompt})],

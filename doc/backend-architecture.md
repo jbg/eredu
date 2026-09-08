@@ -2987,6 +2987,33 @@ sampling. The chosen backend owns the corresponding logits, random state, and
 adaptive sampler state, so applications do not fall back to a native tensor
 loop for alternate sampling policies.
 
+The canonical facade exposes this choice as
+`PreparedChatGenerationSettings::strategy` (also re-exporting `TextSamplingStrategy`
+from `eredu::api`). Standard sampling remains the default. Mirostat validates finite,
+positive tau, eta, and effective temperature after checkpoint defaults and request
+overrides are resolved; `do_sample = false` therefore cannot select Mirostat. It
+retains the resolved seed and penalties, replacing top-k, top-p, and min-p. The
+facade's vocabulary and tool masks apply before sampling, so adaptive updates use
+the resulting constrained distribution. Ordinary, observed, intervened, and
+controlled generation share this resolution. Prepared speculative requests reject
+Mirostat with a typed facade error before backend work, including mixed batches;
+the MLX prepared speculative adapter also rejects it for direct trait callers.
+
+```rust,ignore
+use eredu::api::{PreparedChatGenerationSettings, TextSamplingStrategy};
+use eredu_core::GenerationConfigOverrides;
+
+let settings = PreparedChatGenerationSettings {
+    overrides: GenerationConfigOverrides {
+        do_sample: Some(true),
+        temperature: Some(0.8),
+        ..Default::default()
+    },
+    strategy: TextSamplingStrategy::MirostatV2 { tau: 5.0, eta: 0.1 },
+    seed: 42,
+};
+```
+
 ## Implementing another backend
 
 A new backend should:

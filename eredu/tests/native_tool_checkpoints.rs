@@ -99,6 +99,7 @@ fn smoke_with_plan(environment: &str, expected_profile_prefix: &str, plan: Execu
                     ..Default::default()
                 },
                 seed: 0,
+                ..Default::default()
             },
             caller_stop_sequences: &[],
             cancellation: eredu_core::GenerationCancellationToken::new(),

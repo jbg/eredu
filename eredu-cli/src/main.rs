@@ -317,6 +317,7 @@ struct Cli {
     min_p: Option<f32>,
 
     /// Use adaptive Mirostat V2 sampling instead of top-k, top-p, and min-p.
+    /// Supports ordinary constrained chat; unavailable with speculative drafting.
     #[arg(long)]
     mirostat_v2: bool,
 
@@ -2398,9 +2399,6 @@ fn main() -> Result<()> {
     }
     .with_lookahead(!args.disable_speculative_lookahead);
     let mut prepared_finish_reason = None;
-    if prepared_chat.is_some() && args.mirostat_v2 {
-        bail!("Mirostat V2 is not represented by the portable prepared-chat sampling contract");
-    }
     if let Some(prepared) = &prepared_chat {
         let settings = PreparedChatGenerationSettings {
             overrides: GenerationConfigOverrides {
@@ -2408,6 +2406,14 @@ fn main() -> Result<()> {
                 ..generation_overrides
             },
             seed: args.seed,
+            strategy: if args.mirostat_v2 {
+                eredu::api::TextSamplingStrategy::MirostatV2 {
+                    tau: args.mirostat_tau,
+                    eta: args.mirostat_eta,
+                }
+            } else {
+                eredu::api::TextSamplingStrategy::Standard
+            },
         };
         let mut semantic_error = None;
         if drafting.is_enabled() {

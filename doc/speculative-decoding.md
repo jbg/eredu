@@ -138,9 +138,14 @@ Promotion requires:
 
 External Gemma assistants and the portable history-derived sampler satisfy
 these rules. Embedded predictors whose commit advances target-owned state do
-not use same-request optimistic lookahead. Mirostat V2 remains available
-through the lower-level backend-generic sampling API; it is not part of the
-portable prepared-chat sampling schema.
+not use same-request optimistic lookahead. `PreparedChatGenerationSettings::strategy`
+selects standard or Mirostat V2 sampling for ordinary prepared chat. Prepared
+speculative generation currently rejects Mirostat V2 with
+`PreparedChatSpeculativeError::UnsupportedSamplingStrategy`, even with lookahead
+disabled. Single requests and every lane of a batch are validated before backend
+prompt preparation or execution; the adapter never substitutes standard sampling.
+The lower-level backend-generic speculative sampler still supports Mirostat V2
+without exact optimistic promotion.
 
 `SpeculativeSchedulerOptions::with_lookahead(false)` disables only the optional
 branch; the same drafting, verification, acceptance, cache commit, callback,

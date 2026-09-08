@@ -29,6 +29,14 @@ use std::collections::HashMap;
 pub struct PreparedChatGenerationSettings {
     /// Typed overrides layered over checkpoint-declared generation settings.
     pub overrides: GenerationConfigOverrides,
+    /// Sampling strategy; defaults to [`eredu_core::TextSamplingStrategy::Standard`].
+    ///
+    /// Mirostat V2 requires a positive effective temperature after checkpoint
+    /// defaults and overrides are resolved. It retains penalties and replaces
+    /// top-k, top-p, and min-p. Vocabulary and tool constraints filter logits
+    /// before sampling; adaptive state tracks the constrained distribution.
+    /// Prepared speculative generation rejects Mirostat V2 before backend work.
+    pub strategy: eredu_core::TextSamplingStrategy,
     /// Deterministic root seed used by the selected backend for stochastic sampling.
     pub seed: u64,
 }
@@ -170,6 +178,9 @@ impl Default for PreparedChatSpeculativeGenerationOptions {
 /// Failure while the facade prepares or a backend executes speculative chat.
 #[derive(Debug, thiserror::Error)]
 pub enum PreparedChatSpeculativeError<E: std::error::Error + Send + Sync + 'static> {
+    /// The prepared speculative path cannot preserve the requested sampler state.
+    #[error("prepared-chat speculative generation does not support sampling strategy {0:?}; use ordinary prepared-chat generation")]
+    UnsupportedSamplingStrategy(eredu_core::TextSamplingStrategy),
     /// The selected backend failed prompt preparation or speculative execution.
     #[error("selected backend failed prepared-chat speculative generation: {0}")]
     Backend(#[source] E),

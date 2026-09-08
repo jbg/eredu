@@ -202,6 +202,7 @@ fn native_facade(device: LocalDevice, text: bool) {
         // Fixed fixture seed keeps later unconstrained draws in printable tokens;
         // byte-fragment choices above are intentional and checked separately.
         seed: 17,
+        ..Default::default()
     };
     let trace = TraceLimits {
         per_record_bytes: 16384,
@@ -332,6 +333,7 @@ fn native_text_matches_ordinary_sampling_with_checkpoint_defaults_and_padded_log
                 ..Default::default()
             },
             seed: 827,
+            ..Default::default()
         };
         let trace = TraceLimits {
             per_record_bytes: 16384,

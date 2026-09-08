@@ -31,6 +31,7 @@ fn setup() -> (
             ..Default::default()
         },
         seed: 17,
+        ..Default::default()
     };
     (model, chat, settings, first)
 }

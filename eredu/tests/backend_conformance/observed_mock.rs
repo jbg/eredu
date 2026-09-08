@@ -357,6 +357,7 @@ fn intervened_facade_keeps_outcomes_cancellation_failure_and_consumer_lifetimes(
             ..Default::default()
         },
         seed: 19,
+        ..Default::default()
     };
     let limits = TraceLimits {
         per_record_bytes: 65536,

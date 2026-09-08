@@ -104,6 +104,7 @@ fn main() -> anyhow::Result<()> {
                 ..Default::default()
             },
             seed: 42,
+            ..Default::default()
         },
         plan,
         TraceLimits {

@@ -604,6 +604,13 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
     {
         let drafting = request.take_drafting();
         let lanes = request.take_lanes();
+        for lane in &lanes {
+            if lane.generation().strategy() != eredu_core::TextSamplingStrategy::Standard {
+                return Err(Error::Speculative(
+                    "prepared speculative generation does not support Mirostat V2; use ordinary text generation".into(),
+                ));
+            }
+        }
         match drafting {
             SpeculativeDraft::External(drafter) => {
                 self.generate_speculative_batch_with_external_draft(drafter, lanes, visitor)

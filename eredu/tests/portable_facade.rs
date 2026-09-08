@@ -13,12 +13,26 @@ use eredu_core::{
 use eredu_text::tokenizer::Tokenizer as ChatTokenizer;
 use tokenizers::{models::wordlevel::WordLevel, AddedToken, Tokenizer};
 
+#[path = "portable_facade/sampling.rs"]
+mod sampling;
+
+#[derive(Default)]
+struct BackendCalls {
+    configs: Vec<TextGenerationConfig>,
+    filters: Vec<TokenFilter>,
+    prompts: usize,
+    speculative: usize,
+}
+
+#[derive(Default)]
 struct MockBackend {
     logits: Vec<f32>,
+    calls: std::rc::Rc<std::cell::RefCell<BackendCalls>>,
 }
 
 impl MockBackend {
     fn sample(&self, filter: &TokenFilter) -> Result<MockToken, MockError> {
+        self.calls.borrow_mut().filters.push(filter.clone());
         let allowed = filter
             .allowed_mask_for(self.logits.len())
             .map_err(|_| MockError)?;
@@ -152,13 +166,15 @@ impl TextGenerationBackend for MockBackend {
     type TextCompletion = Complete;
 
     fn start_text_generation(
-        _: &Self,
-        _: TextGenerationConfig,
+        backend: &Self,
+        config: TextGenerationConfig,
     ) -> Result<Self::TextGenerationState, Self::Error> {
+        backend.calls.borrow_mut().configs.push(config);
         Ok(())
     }
 
-    fn prepare_text_prompt(_: &Self, ids: Vec<u32>) -> Result<Self::Prompt, Self::Error> {
+    fn prepare_text_prompt(backend: &Self, ids: Vec<u32>) -> Result<Self::Prompt, Self::Error> {
+        backend.calls.borrow_mut().prompts += 1;
         Ok(ids)
     }
 
@@ -194,6 +210,7 @@ fn loaded_model_generates_without_an_mlx_dependency() {
     let runtime = ModelRuntime::prepare(
         MockBackend {
             logits: vec![0.0, 1.0, 100.0, 200.0],
+            ..Default::default()
         },
         (),
     )
@@ -283,6 +300,19 @@ fn tokenizer_and_text_inspection_are_available_without_mlx() {
 }
 
 fn sparse_vocabulary_model(logits: Vec<f32>) -> LoadedModel<MockBackend> {
+    sparse_vocabulary_model_with_backend(
+        MockBackend {
+            logits,
+            ..Default::default()
+        },
+        None,
+    )
+}
+
+fn sparse_vocabulary_model_with_backend(
+    backend: MockBackend,
+    checkpoint_generation_config: Option<eredu_core::generation::CheckpointGenerationConfig>,
+) -> LoadedModel<MockBackend> {
     let words = WordLevel::builder()
         .vocab(
             [
@@ -303,7 +333,7 @@ fn sparse_vocabulary_model(logits: Vec<f32>) -> LoadedModel<MockBackend> {
         .add_special_tokens([AddedToken::from("<|im_end|>", true).normalized(false)])
         .unwrap();
     LoadedModel::from_runtime(
-        ModelRuntime::prepare(MockBackend { logits }, ()).unwrap(),
+        ModelRuntime::prepare(backend, ()).unwrap(),
         ChatTokenizer::from_tokenizer(tokenizer),
         LoadedTextModelConfig {
             model_family: ModelKind::Qwen2,
@@ -313,7 +343,7 @@ fn sparse_vocabulary_model(logits: Vec<f32>) -> LoadedModel<MockBackend> {
                 include_str!("fixtures/chat_templates/qwen2.5-7b-instruct-acbd9653.jinja").into(),
             ),
             eos_token_ids: vec![5],
-            checkpoint_generation_config: None,
+            checkpoint_generation_config,
         },
     )
 }
@@ -353,7 +383,11 @@ fn ordinary_and_semantic_generation_exclude_holes_and_padded_logits() {
         let semantic = model
             .generate_prepared_chat(PreparedChatGenerationRequest {
                 input: PreparedChatInput::rendered_prompt(&chat),
-                settings: PreparedChatGenerationSettings { overrides, seed: 0 },
+                settings: PreparedChatGenerationSettings {
+                    overrides,
+                    seed: 0,
+                    ..Default::default()
+                },
                 caller_stop_sequences: &[],
                 cancellation: Default::default(),
                 on_event: |_| {},
@@ -382,6 +416,7 @@ fn ordinary_generation_fails_if_no_mapped_id_is_executable() {
         ModelRuntime::prepare(
             MockBackend {
                 logits: vec![100.0, 200.0],
+                ..Default::default()
             },
             (),
         )

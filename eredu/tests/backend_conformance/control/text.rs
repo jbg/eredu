@@ -30,6 +30,7 @@ fn text_setup() -> (
             ..Default::default()
         },
         seed: 17,
+        ..Default::default()
     };
     (model, chat, settings, first)
 }
@@ -411,6 +412,7 @@ fn text_sampling_and_forcing_exclude_sparse_and_padded_ids() {
                 ..Default::default()
             },
             seed: 17,
+            ..Default::default()
         },
         0,
     );

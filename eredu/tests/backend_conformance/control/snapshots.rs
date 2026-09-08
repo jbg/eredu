@@ -190,6 +190,7 @@ fn snapshot_setup() -> (
                 ..Default::default()
             },
             seed: 17,
+            ..Default::default()
         },
         first,
     )

@@ -1305,6 +1305,9 @@ pub enum TextSamplingStrategy {
     #[default]
     Standard,
     /// Adapt the surprise cutoff toward `tau` bits at rate `eta`.
+    ///
+    /// Requires positive temperature. Retains penalties and replaces top-k,
+    /// top-p, and min-p; vocabulary filters apply before this strategy.
     MirostatV2 {
         /// Target surprise in bits.
         tau: f32,
@@ -1329,13 +1332,18 @@ impl TextGenerationConfig {
         self
     }
 
-    /// Selects adaptive Mirostat V2 sampling.
+    /// Selects adaptive Mirostat V2 sampling, requiring positive temperature.
     pub fn with_mirostat_v2(mut self, tau: f32, eta: f32) -> Result<Self, GenerationError> {
         if !tau.is_finite() || tau <= 0.0 {
             return Err(GenerationError::InvalidMirostatTau(tau));
         }
         if !eta.is_finite() || eta <= 0.0 {
             return Err(GenerationError::InvalidMirostatEta(eta));
+        }
+        if !self.sampling.temperature.is_finite() || self.sampling.temperature <= 0.0 {
+            return Err(GenerationError::InvalidMirostatTemperature(
+                self.sampling.temperature,
+            ));
         }
         self.strategy = TextSamplingStrategy::MirostatV2 { tau, eta };
         Ok(self)
@@ -2249,6 +2257,19 @@ mod tests {
         assert!(matches!(
             TextGenerationConfig::new(sampling).with_mirostat_v2(5.0, f32::NAN),
             Err(GenerationError::InvalidMirostatEta(value)) if value.is_nan()
+        ));
+        let greedy = crate::generation::resolve_generation_config(
+            None,
+            crate::generation::GenerationConfigOverrides {
+                do_sample: Some(false),
+                temperature: Some(0.8),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            TextGenerationConfig::new(greedy).with_mirostat_v2(5.0, 0.1),
+            Err(GenerationError::InvalidMirostatTemperature(0.0))
         ));
     }
 

@@ -133,6 +133,7 @@ pub fn run_example(
             ..Default::default()
         },
         seed: 42,
+        ..Default::default()
     };
     let trace = TraceLimits {
         per_record_bytes: 64 << 10,

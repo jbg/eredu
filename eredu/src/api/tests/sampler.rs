@@ -547,6 +547,33 @@ fn constrained_sampler_advertises_only_wrapped_exact_promotion() {
 }
 
 #[test]
+fn mirostat_adapts_to_the_tool_constrained_distribution_once_per_token() {
+    let plan = synthetic_plan(ToolChoice::Required);
+    let policy = MirostatV2Sampler::new(4.0, 0.2).unwrap();
+    let mut sampler = constrained_sampler(policy.clone(), &plan).unwrap();
+    let independent = constrained_sampler(policy, &plan).unwrap();
+    for (index, expected) in [b'{', b'"'].into_iter().enumerate() {
+        let mut logits = vec![-100.0; SYNTHETIC_VOCAB_SIZE];
+        logits[b'x' as usize] = 1000.0; // Dominant but forbidden by the tool grammar.
+        logits[expected as usize] = 10.0;
+        let selected =
+            Sampler::<TestSamplingBackend>::sample(&mut sampler, &logits, 0.8, Some(&mut ()), &())
+                .unwrap();
+        assert_eq!(selected, u32::from(expected));
+        assert_eq!(sampler.policy().generated_tokens().len(), index + 1);
+        // The permitted token has probability one after masking. Each commit
+        // therefore adds eta * tau; forbidden mass must not affect surprise.
+        assert!((sampler.policy().mu() - (8.0 + 0.8 * (index + 1) as f32)).abs() < 1e-5);
+    }
+    assert_eq!(
+        sampler.policy().generated_tokens(),
+        &[u32::from(b'{'), u32::from(b'"')]
+    );
+    assert_eq!(independent.policy().mu(), 8.0);
+    assert!(independent.policy().generated_tokens().is_empty());
+}
+
+#[test]
 fn none_masks_and_rejects_the_tool_call_trigger() {
     let context = &();
     let plan = synthetic_plan(ToolChoice::None);

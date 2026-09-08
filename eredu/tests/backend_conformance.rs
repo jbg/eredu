@@ -2038,6 +2038,7 @@ fn assert_prepared_generation_and_speculative_conformance() {
                     ..Default::default()
                 },
                 seed: 7,
+                ..Default::default()
             },
             caller_stop_sequences: &[],
             cancellation: Default::default(),
@@ -2056,6 +2057,7 @@ fn assert_prepared_generation_and_speculative_conformance() {
                     ..Default::default()
                 },
                 seed: 7,
+                ..Default::default()
             },
             eredu_core::capture::CapturePlan::none(),
             eredu::api::TraceLimits {
@@ -2117,6 +2119,7 @@ fn assert_prepared_generation_and_speculative_conformance() {
                     ..Default::default()
                 },
                 seed: 7,
+                ..Default::default()
             },
             eredu_core::capture::CapturePlan::none(),
             eredu::api::TraceLimits {
@@ -2183,6 +2186,7 @@ fn assert_prepared_generation_and_speculative_conformance() {
                     ..Default::default()
                 },
                 seed: 9,
+                ..Default::default()
             },
             caller_stop_sequences: &[],
             cancellation: Default::default(),
@@ -2299,6 +2303,7 @@ fn observed_facade_preserves_streaming_unicode_special_tokens_and_eos() {
             ..Default::default()
         },
         seed: 17,
+        ..Default::default()
     };
     let mut ordinary_events = Vec::new();
     let ordinary = model

@@ -940,6 +940,9 @@ pub enum GenerationError {
     /// Mirostat V2 adaptation rate is non-finite or non-positive.
     #[error("Mirostat V2 eta must be finite and positive, got {0}")]
     InvalidMirostatEta(f32),
+    /// Mirostat V2 requires a finite, strictly positive effective temperature.
+    #[error("Mirostat V2 requires a finite temperature greater than zero, got {0}")]
+    InvalidMirostatTemperature(f32),
     /// Top-k is negative.
     #[error("top_k must be non-negative, got {0}")]
     InvalidTopK(i32),

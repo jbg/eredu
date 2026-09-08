@@ -146,10 +146,30 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
             .max_new_tokens
             .and_then(NonZeroUsize::new)
             .unwrap_or_else(|| NonZeroUsize::new(256).expect("256 is non-zero"));
-        Ok((
-            eredu_core::TextGenerationConfig::new(resolved).with_seed(settings.seed),
-            max_tokens,
-        ))
+        let config = eredu_core::TextGenerationConfig::new(resolved).with_seed(settings.seed);
+        let config = match settings.strategy {
+            eredu_core::TextSamplingStrategy::Standard => config,
+            eredu_core::TextSamplingStrategy::MirostatV2 { tau, eta } => {
+                config.with_mirostat_v2(tau, eta)?
+            }
+        };
+        Ok((config, max_tokens))
+    }
+
+    fn resolve_speculative_generation_settings(
+        &self,
+        settings: PreparedChatGenerationSettings,
+    ) -> Result<
+        (eredu_core::TextGenerationConfig, NonZeroUsize),
+        PreparedChatSpeculativeError<B::Error>,
+    > {
+        let resolved = self.resolve_text_generation_settings(settings)?;
+        if settings.strategy != eredu_core::TextSamplingStrategy::Standard {
+            return Err(PreparedChatSpeculativeError::UnsupportedSamplingStrategy(
+                settings.strategy,
+            ));
+        }
+        Ok(resolved)
     }
 
     /// Generates one constrained semantic response through the selected backend.
@@ -293,9 +313,10 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
             cancellation,
             on_event,
         } = request;
+        let generation = self.resolve_speculative_generation_settings(settings)?;
         let (prompt, generation, config, constraint, semantic) = self.prepare_speculative_chat(
             input,
-            settings,
+            generation,
             options.max_draft_tokens,
             caller_stop_sequences,
         )?;
@@ -345,12 +366,17 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
             lanes,
             scheduler,
         } = request;
+        // Validate every lane before preparing any backend prompt or execution.
+        let generations = lanes
+            .iter()
+            .map(|lane| self.resolve_speculative_generation_settings(lane.settings))
+            .collect::<Result<Vec<_>, _>>()?;
         let mut prepared_lanes = Vec::with_capacity(lanes.len());
-        for lane in lanes {
+        for (lane, generation) in lanes.into_iter().zip(generations) {
             let (prompt, generation, config, constraint, semantic) = self
                 .prepare_speculative_chat(
                     lane.input,
-                    lane.settings,
+                    generation,
                     lane.max_draft_tokens,
                     lane.caller_stop_sequences,
                 )?;
@@ -380,7 +406,7 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
     fn prepare_speculative_chat(
         &self,
         input: PreparedChatInput<'_, B>,
-        settings: PreparedChatGenerationSettings,
+        generation: (eredu_core::TextGenerationConfig, NonZeroUsize),
         max_draft_tokens: NonZeroUsize,
         caller_stop_sequences: &[String],
     ) -> Result<
@@ -418,7 +444,7 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
         )
         .map_err(|error| PreparedChatSpeculativeError::Semantic(error.to_string()))?;
         let eos_token_ids = prepared_chat.eos_token_ids().to_vec();
-        let (generation, max_tokens) = self.resolve_text_generation_settings(settings)?;
+        let (generation, max_tokens) = generation;
         let temperature = generation.sampling().temperature;
         let prompt = match input {
             PreparedChatInput::RenderedPrompt(prepared_chat) => {
