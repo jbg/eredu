@@ -63,7 +63,7 @@ impl Lfm2Dialect {
         let (_, maximum) = tool_call_bounds(tool_choice, parallel_tool_calls, tools)?;
         let tools = parse_tools(tools)?;
         for tool in &tools {
-            validate_identifier(&tool.name, "tool function name")?;
+            validate_function_name(&tool.name)?;
             for name in tool
                 .parameters
                 .get("properties")
@@ -272,12 +272,14 @@ fn repeated_rule(item: &str, separator: &str, minimum: usize, maximum: Option<us
 }
 
 fn validate_identifier(name: &str, kind: &str) -> Result<(), String> {
+    // Check the lexical spelling only. LFM2 templates render argument keys
+    // verbatim as name=value, including Python keywords. These keys become
+    // JSON object members; the calls are never executed as Python.
     let mut characters = name.chars();
     let valid = characters
         .next()
         .is_some_and(|character| character == '_' || character.is_ascii_alphabetic())
-        && characters.all(|character| character == '_' || character.is_ascii_alphanumeric())
-        && !PYTHON_KEYWORDS.contains(&name);
+        && characters.all(|character| character == '_' || character.is_ascii_alphanumeric());
     if valid {
         Ok(())
     } else {
@@ -285,6 +287,16 @@ fn validate_identifier(name: &str, kind: &str) -> Result<(), String> {
             "LFM2 {kind} {name:?} is not a valid Python identifier"
         ))
     }
+}
+
+fn validate_function_name(name: &str) -> Result<(), String> {
+    validate_identifier(name, "tool function name")?;
+    if PYTHON_KEYWORDS.contains(&name) {
+        return Err(format!(
+            "LFM2 tool function name {name:?} is not a valid Python identifier"
+        ));
+    }
+    Ok(())
 }
 
 const PYTHON_KEYWORDS: &[&str] = &[
@@ -598,7 +610,7 @@ impl Lfm2Parser {
                 }
                 ParserState::CallName(mut name) => {
                     if current == '(' {
-                        validate_identifier(&name, "tool function name")?;
+                        validate_function_name(&name)?;
                         let id = format!("call_{}", sink.next_tool_index());
                         sink.start_tool_call(id, name);
                         sink.tool_arguments("{");
@@ -1328,6 +1340,89 @@ mod tests {
     }
 
     #[test]
+    fn python_keyword_arguments_preserve_names_and_values_at_every_byte_split() {
+        let properties = super::PYTHON_KEYWORDS
+            .iter()
+            .map(|&name| (name.into(), json!({"type": "boolean"})))
+            .collect::<serde_json::Map<_, _>>();
+        let expected = properties
+            .keys()
+            .map(|name| (name.clone(), json!(true)))
+            .collect::<serde_json::Map<_, _>>();
+        let arguments = properties
+            .keys()
+            .map(|name| format!("{name}=True"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let plan = plan(
+            &[tool(
+                "delegate",
+                Value::Object(properties),
+                super::PYTHON_KEYWORDS,
+            )],
+            ToolChoice::Required,
+            ParallelToolCallPolicy::Disabled,
+        );
+        let output = format!("{TOOL_CALL_START}[delegate({arguments})]{TOOL_CALL_END}");
+        assert!(accepts(&plan, &output));
+        for split in 0..=output.len() {
+            let mut parser = plan.create_parser().unwrap();
+            push_at_byte_split(&mut parser, &output, split).unwrap();
+            parser.finish(FinishReason::GrammarComplete).unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(&joined_arguments(parser.events(), 0)).unwrap(),
+                Value::Object(expected.clone()),
+                "byte split {split}"
+            );
+            assert!(parser.events().contains(&SemanticEvent::ToolCallEnd));
+            assert_eq!(joined_text(parser.events()), "");
+        }
+    }
+
+    #[test]
+    fn keyword_arguments_still_reject_malformed_calls_and_invalid_schemas() {
+        let plan = plan(
+            &[tool(
+                "delegate",
+                json!({"async": {"type": "boolean", "const": true}}),
+                &["async"],
+            )],
+            ToolChoice::Required,
+            ParallelToolCallPolicy::Disabled,
+        );
+        let valid = format!("{TOOL_CALL_START}[delegate(async=True)]{TOOL_CALL_END}");
+        assert!(accepts(&plan, &valid));
+        let mut parser = plan.create_parser().unwrap();
+        parser.push(&valid).unwrap();
+        parser.finish(FinishReason::GrammarComplete).unwrap();
+
+        // `const` uses the permissive surface grammar; completed arguments
+        // must still pass JSON Schema validation before ToolCallEnd is emitted.
+        let invalid_const = valid.replace("True", "False");
+        assert!(accepts(&plan, &invalid_const));
+        for call in [
+            "delegate(async=False)",
+            "delegate(async='True')",
+            "delegate()",
+            "delegate(async=True, extra=1)",
+            "delegate(async=True, async=False)",
+            "delegate(async=await)",
+            "delegate(async=True,)",
+            "delegate(async=[True,])",
+            "delegate(async=True}",
+            "delegate(async=True",
+        ] {
+            let output = format!("{TOOL_CALL_START}[{call}]{TOOL_CALL_END}");
+            let mut parser = plan.create_parser().unwrap();
+            assert!(parser.push(&output).is_err(), "{call}");
+            assert!(
+                !parser.events().contains(&SemanticEvent::ToolCallEnd),
+                "{call}"
+            );
+        }
+    }
+
+    #[test]
     fn invalid_python_identifiers_are_rejected_before_sampling() {
         for invalid in [
             tool("not-valid", json!({}), &[]),
@@ -1349,6 +1444,42 @@ mod tests {
                 )
                 .unwrap_err();
             assert!(error.contains("valid Python identifier"), "{error}");
+        }
+
+        // Feeding calls directly exercises parser name validation independently
+        // of declared properties or additional-property schema validation.
+        let mut open_tool = tool("delegate", json!({}), &[]);
+        open_tool["function"]["parameters"]["additionalProperties"] = json!(true);
+        let plan = plan(
+            &[open_tool],
+            ToolChoice::Required,
+            ParallelToolCallPolicy::Disabled,
+        );
+        for name in [
+            "",
+            "not-valid",
+            "1arg",
+            "has space",
+            "a.b",
+            "a=b",
+            "a()",
+            "é",
+        ] {
+            let error = ConstraintCompiler::synthetic_for_tests()
+                .compile_tool_plan(
+                    &LFM2_DIALECT,
+                    parameters(),
+                    &[tool("delegate", json!({(name): {"type": "boolean"}}), &[])],
+                    ToolChoice::Required,
+                    ParallelToolCallPolicy::Disabled,
+                    (1..=STRUCTURAL_TOKENS.len() as u32).collect(),
+                )
+                .unwrap_err();
+            assert!(error.contains("valid Python identifier"), "{error}");
+            let output = format!("{TOOL_CALL_START}[delegate({name}=True)]{TOOL_CALL_END}");
+            let mut parser = plan.create_parser().unwrap();
+            assert!(parser.push(&output).is_err(), "{name:?}");
+            assert!(!parser.events().contains(&SemanticEvent::ToolCallEnd));
         }
     }
 

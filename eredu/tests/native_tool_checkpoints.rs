@@ -35,32 +35,57 @@ fn accelerator_plan() -> ExecutionPlan {
 }
 
 fn smoke_with_plan(environment: &str, expected_profile_prefix: &str, plan: ExecutionPlan) {
+    smoke_with_tool(
+        environment,
+        expected_profile_prefix,
+        plan,
+        json!({
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "description": "Look up one integer.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"value": {"type": "integer", "enum": [7]}},
+                    "required": ["value"],
+                    "additionalProperties": false
+                }
+            }
+        }),
+        json!({"value": 7}),
+    );
+}
+
+fn smoke_with_tool(
+    environment: &str,
+    expected_profile_prefix: &str,
+    plan: ExecutionPlan,
+    tool: serde_json::Value,
+    expected_arguments: serde_json::Value,
+) {
+    let tool_name = tool["function"]["name"].as_str().unwrap().to_owned();
     let path = std::env::var(environment)
         .unwrap_or_else(|_| panic!("{environment} must name a local checkpoint"));
     let planned = LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &path, &plan)
         .unwrap_or_else(|error| panic!("failed to load {environment}={path:?}: {error}"));
     let (mut model, _) = planned.into_parts();
+    // Tool declarations must also prepare for an ordinary text request.
+    model
+        .prepare_chat(ChatTemplateRequest {
+            messages: vec![json!({"role": "user", "content": "Hello."})],
+            tools: vec![tool.clone()],
+            tool_choice: ToolChoice::Auto,
+            add_generation_prompt: true,
+            ..Default::default()
+        })
+        .unwrap();
     let prepared = model
         .prepare_chat(ChatTemplateRequest {
             messages: vec![json!({
                 "role": "user",
-                "content": "Call lookup exactly once with {\"value\":7}. Do not answer with text."
+                "content": format!("Call {tool_name} exactly once with {expected_arguments}. Do not answer with text.")
             })],
-            tools: vec![json!({
-                "type": "function",
-                "function": {
-                    "name": "lookup",
-                    "description": "Look up one integer.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "value": {"type": "integer", "enum": [7]}
-                        },
-                        "required": ["value"],
-                        "additionalProperties": false
-                    }
-                }
-            })],
+            tools: vec![tool],
             // Automatic selection deliberately exercises activation when a
             // trigger begins or ends within a tokenizer token.
             tool_choice: ToolChoice::Auto,
@@ -158,7 +183,7 @@ fn smoke_with_plan(environment: &str, expected_profile_prefix: &str, plan: Execu
         "{environment} emitted an empty call id"
     );
     assert_eq!(
-        starts[0].2, "lookup",
+        starts[0].2, &tool_name,
         "{environment} selected the wrong constrained tool"
     );
     assert_eq!(
@@ -192,8 +217,7 @@ fn smoke_with_plan(environment: &str, expected_profile_prefix: &str, plan: Execu
         )
     });
     assert_eq!(
-        arguments,
-        json!({"value": 7}),
+        arguments, expected_arguments,
         "{environment} emitted the wrong semantic arguments; decoded={decoded:?}"
     );
 
@@ -264,6 +288,30 @@ fn mistral_real_checkpoint_native_tool_smoke() {
 #[ignore = "requires EREDU_LFM2_TOOL_CHECKPOINT and an MLX Metal device"]
 fn lfm2_real_checkpoint_native_tool_smoke() {
     smoke("EREDU_LFM2_TOOL_CHECKPOINT", "lfm2.");
+}
+
+#[test]
+#[ignore = "requires EREDU_LFM2_TOOL_CHECKPOINT and an MLX Metal device"]
+fn lfm2_real_checkpoint_optional_keyword_argument_smoke() {
+    smoke_with_tool(
+        "EREDU_LFM2_TOOL_CHECKPOINT",
+        "lfm2.",
+        accelerator_plan(),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "delegate",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "instructions": {"type": "string"},
+                        "async": {"type": "boolean", "default": false}
+                    }
+                }
+            }
+        }),
+        json!({"instructions": "Summarize.", "async": true}),
+    );
 }
 
 #[test]

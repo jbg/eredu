@@ -75,6 +75,8 @@ const LFM2_CLASSIC_FIXTURE_WITH_TERMINATOR: &str =
     include_str!("../../tests/fixtures/chat_templates/lfm2-classic-b3afba27.jinja");
 const LFM25_8B_FIXTURE_WITH_TERMINATOR: &str =
     include_str!("../../tests/fixtures/chat_templates/lfm2.5-8b-a1b-5673e0de.jinja");
+const LFM25_12B_FIXTURE: &str =
+    include_str!("../../tests/fixtures/chat_templates/lfm2.5-1.2b-instruct-ba551d58.jinja");
 const LFM25_VL_FIXTURE_WITH_TERMINATOR: &str =
     include_str!("../../tests/fixtures/chat_templates/lfm2.5-vl-450m-fc6221ca.jinja");
 const DEEPSEEK_V3_TOOL_FIXTURE: &str =
@@ -1985,6 +1987,110 @@ fn lfm2_without_tools_generates_text_and_stops_at_message_end() {
                 assert_eq!(text, answer);
             }
         }
+    }
+}
+
+#[test]
+fn lfm2_optional_keyword_arguments_prepare_parse_and_render_history() {
+    let compiler = Ok(ConstraintCompiler::synthetic_for_tests());
+    let mut tokenizer = lfm2_chat_tokenizer(252);
+    let mut request = ChatTemplateRequest {
+        messages: vec![json!({"role": "user", "content": "Hello."})],
+        tools: vec![json!({
+            "type": "function",
+            "function": {
+                "name": "delegate",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "instructions": {"type": "string"},
+                        "async": {"type": "boolean", "default": false}
+                    }
+                }
+            }
+        })],
+        tool_choice: ToolChoice::Auto,
+        add_generation_prompt: true,
+        ..ChatTemplateRequest::default()
+    };
+    let prepared = prepare_chat_from_parts(
+        &mut tokenizer,
+        ModelChatTemplate::Single(LFM25_12B_FIXTURE.into()),
+        "LiquidAI/LFM2.5-1.2B-Instruct",
+        &[254],
+        Some(&compiler),
+        request.clone(),
+    )
+    .unwrap();
+    assert!(matches!(
+        prepared.native_tool_support(),
+        NativeToolSupport::Supported
+    ));
+    assert_eq!(
+        prepared.format_profile_identity(),
+        Some("lfm2.python-tools.v1")
+    );
+    let rendered_tools = prepared
+        .rendered_prompt()
+        .split_once("List of tools: ")
+        .unwrap()
+        .1
+        .split_once("<|im_end|>")
+        .unwrap()
+        .0;
+    assert_eq!(
+        serde_json::from_str::<Vec<serde_json::Value>>(rendered_tools).unwrap(),
+        request.tools
+    );
+    let plan = prepared.tool_runtime_plan().unwrap();
+    let mut text_parser = plan.create_parser().unwrap();
+    text_parser.push("Hello!<|im_end|>").unwrap();
+    text_parser.finish(FinishReason::StopSequence).unwrap();
+    let text = text_parser
+        .events()
+        .iter()
+        .filter_map(|event| match event {
+            SemanticEvent::TextDelta(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<String>();
+    assert_eq!(text, "Hello!");
+    // The default does not make an optional argument required or insert it.
+    for (call, expected) in [
+        ("delegate()", json!({})),
+        ("delegate(async=True)", json!({"async": true})),
+    ] {
+        let output = format!("<|tool_call_start|>[{call}]<|tool_call_end|>");
+        assert!(plan_accepts(plan, &output));
+        let mut parser = plan.create_parser().unwrap();
+        for character in output.chars() {
+            parser.push(&character.to_string()).unwrap();
+        }
+        parser.finish(FinishReason::GrammarComplete).unwrap();
+        let arguments: serde_json::Value =
+            serde_json::from_str(&tool_argument_events(parser.events())[0]).unwrap();
+        assert_eq!(arguments, expected);
+        assert!(parser.events().contains(&SemanticEvent::ToolCallEnd));
+        request.messages = vec![
+            json!({"role": "user", "content": "Delegate."}),
+            json!({"role": "assistant", "content": "", "tool_calls": [{
+                "type": "function",
+                "function": {"name": "delegate", "arguments": arguments}
+            }]}),
+            json!({"role": "tool", "content": "Done."}),
+        ];
+        let history = prepare_chat_from_parts(
+            &mut tokenizer,
+            ModelChatTemplate::Single(LFM25_12B_FIXTURE.into()),
+            "LiquidAI/LFM2.5-1.2B-Instruct",
+            &[254],
+            Some(&compiler),
+            request.clone(),
+        )
+        .unwrap();
+        assert!(history.rendered_prompt().contains(&format!(
+            "<|im_start|>assistant\n{output}<|im_end|>\n<|im_start|>tool\nDone.<|im_end|>\n"
+        )));
     }
 }
 

@@ -57,9 +57,12 @@ original schema before `ToolCallEnd` is emitted. This also preserves exact
 generation error; previously streamed argument fragments remain provisional.
 Applications should execute a call only after receiving `ToolCallEnd`.
 
-Non-JSON protocols retain their spelling requirements, such as Python argument
-identifiers and tagged-parameter delimiters. Schema acceptance cannot make a
-checkpoint template or wire format represent every possible argument value.
+Non-JSON protocols retain their spelling requirements, such as identifier-shaped
+argument names and tagged-parameter delimiters. LFM2 argument names use
+`[A-Za-z_][A-Za-z0-9_]*` and may be Python keywords, including `async`, `class`,
+and `from`. These names are preserved as JSON object keys; calls are not executed
+as Python. Schema acceptance cannot make a checkpoint template or wire format
+represent every possible argument value.
 Schemas and validators are request-specific; parser forks share immutable
 validators and keep independent argument buffers.
 
