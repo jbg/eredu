@@ -6,15 +6,14 @@ use std::{
     str::FromStr,
 };
 
-use minijinja::{
-    value::{Kwargs, Value},
-    Environment, Template,
-};
+use minijinja::{Environment, Template};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tokenizers::Encoding;
 
 use crate::error::Error;
+
+mod json;
 
 const DEFAULT_CHAT_TEMPLATE_NAME: &str = "default";
 const TOOL_USE_CHAT_TEMPLATE_NAME: &str = "tool_use";
@@ -158,7 +157,7 @@ impl Tokenizer {
     pub fn from_tokenizer(tokenizer: tokenizers::Tokenizer) -> Self {
         let mut env = Environment::new();
         env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
-        env.add_filter("tojson", hugging_face_tojson);
+        env.add_filter("tojson", json::tojson);
         Self {
             inner: tokenizer,
             env,
@@ -269,19 +268,6 @@ impl Tokenizer {
             },
         )
     }
-}
-
-/// Hugging Face templates commonly pass Python `json.dumps` compatibility
-/// arguments. MiniJinja already emits compact JSON with deterministic object
-/// ordering, but its built-in filter rejects those otherwise redundant kwargs.
-fn hugging_face_tojson(
-    value: &Value,
-    indent: Option<Value>,
-    kwargs: Kwargs,
-) -> Result<Value, minijinja::Error> {
-    let _: Option<Value> = kwargs.get("separators")?;
-    let _: Option<bool> = kwargs.get("sort_keys")?;
-    minijinja::filters::tojson(value, indent, kwargs)
 }
 
 impl Deref for Tokenizer {

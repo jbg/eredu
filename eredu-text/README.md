@@ -17,6 +17,12 @@ The portable pure-Rust `fancy-regex` tokenizer engine is always available, so
 enable Oniguruma (which the tokenizer selects when both engines are present)
 and the fast SentencePiece-compatible path.
 
+Chat rendering preserves JSON object insertion order. Its `tojson` filter uses
+Hugging Face's Python JSON defaults, including spaces after commas and colons,
+literal Unicode, and no HTML escaping. Templates can override `ensure_ascii`,
+`indent`, `separators`, and `sort_keys`. These details affect prompt tokens and
+model behavior, particularly when tool schemas are rendered into the prompt.
+
 ## License
 
 Licensed under either Apache-2.0 or MIT.

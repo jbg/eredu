@@ -507,7 +507,7 @@ fn production_kimi_template_renders_parallel_tools_and_selects_native_dialect() 
     ));
     assert!(prepared.rendered_prompt().contains(concat!(
         "<|tool_call_begin|>functions.lookup:0",
-        "<|tool_call_argument_begin|>{\"value\":1}<|tool_call_end|>"
+        "<|tool_call_argument_begin|>{\"value\": 1}<|tool_call_end|>"
     )));
     assert!(prepared.rendered_prompt().contains(
         "<|tool_call_begin|>functions.lookup:1<|tool_call_argument_begin|>{\"value\":2}"
@@ -753,7 +753,7 @@ fn production_qwen_profile_renders_history_generation_prompt_and_dynamic_tokens(
                 .ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"));
         }
         assert!(prepared.rendered_prompt().contains(
-            "<tool_call>\n{\"name\": \"lookup\", \"arguments\": {\"value\":1}}\n</tool_call>"
+            "<tool_call>\n{\"name\": \"lookup\", \"arguments\": {\"value\": 1}}\n</tool_call>"
         ));
         assert!(prepared
             .rendered_prompt()
@@ -1064,10 +1064,9 @@ fn production_mistral_json_list_templates_render_golden_tool_history_and_prompts
         json!({"role": "user", "content": "again"}),
     ];
     let available_tools = concat!(
-        r#"[{"type": "function", "function": {"description": "Look up one integer.", "#,
-        r#""name": "lookup", "parameters": {"additionalProperties":false,"properties":{"value":"#,
-        r#"{"description":"The integer to look up.","type":"integer"}},"required":["value"],"#,
-        r#""type":"object"}}}]"#,
+        r#"[{"type": "function", "function": {"name": "lookup", "description": "Look up one integer.", "#,
+        r#""parameters": {"type": "object", "properties": {"value": {"type": "integer", "#,
+        r#""description": "The integer to look up."}}, "required": ["value"], "additionalProperties": false}}}]"#,
     );
     let cases = [
         (
@@ -1075,7 +1074,7 @@ fn production_mistral_json_list_templates_render_golden_tool_history_and_prompts
             "mistral.json-list-tools.v1",
             concat!(
                 "<s>[INST] first[/INST]",
-                r#"[TOOL_CALLS] [{"arguments":{"value":1},"name":"lookup", "id": "abc123456"}]</s>"#,
+                r#"[TOOL_CALLS] [{"name": "lookup", "arguments": {"value": 1}, "id": "abc123456"}]</s>"#,
                 r#"[TOOL_RESULTS] {"content": {"result":1}, "call_id": "abc123456"}[/TOOL_RESULTS]"#,
                 " done</s>",
                 "[AVAILABLE_TOOLS] ",
@@ -1089,7 +1088,7 @@ fn production_mistral_json_list_templates_render_golden_tool_history_and_prompts
             "mistral.json-list-tools.compact.v1",
             concat!(
                 "<s>[INST]first[/INST]",
-                r#"[TOOL_CALLS][{"arguments":{"value":1},"name":"lookup", "id": "abc123456"}]</s>"#,
+                r#"[TOOL_CALLS][{"name": "lookup", "arguments": {"value": 1}, "id": "abc123456"}]</s>"#,
                 r#"[TOOL_RESULTS]{"content": {"result":1}, "call_id": "abc123456"}[/TOOL_RESULTS]"#,
                 "done</s>",
                 "[AVAILABLE_TOOLS]",
@@ -1165,24 +1164,24 @@ fn production_meta_llama_templates_render_golden_tool_history_and_prompts() {
     ];
     let available_tool = concat!(
         "{\n",
+        "    \"type\": \"function\",\n",
         "    \"function\": {\n",
-        "        \"description\": \"Look up one integer.\",\n",
         "        \"name\": \"lookup\",\n",
+        "        \"description\": \"Look up one integer.\",\n",
         "        \"parameters\": {\n",
-        "            \"additionalProperties\": false,\n",
+        "            \"type\": \"object\",\n",
         "            \"properties\": {\n",
         "                \"value\": {\n",
-        "                    \"description\": \"The integer to look up.\",\n",
-        "                    \"type\": \"integer\"\n",
+        "                    \"type\": \"integer\",\n",
+        "                    \"description\": \"The integer to look up.\"\n",
         "                }\n",
         "            },\n",
         "            \"required\": [\n",
         "                \"value\"\n",
         "            ],\n",
-        "            \"type\": \"object\"\n",
+        "            \"additionalProperties\": false\n",
         "        }\n",
-        "    },\n",
-        "    \"type\": \"function\"\n",
+        "    }\n",
         "}",
     );
     let llama3_golden = format!(
@@ -1197,7 +1196,7 @@ fn production_meta_llama_templates_render_golden_tool_history_and_prompts() {
             "argument name and its value}}.Do not use variables.\n\n",
             "{}\n\nfirst<|eot_id|>",
             "<|start_header_id|>assistant<|end_header_id|>\n\n",
-            "{{\"name\": \"lookup\", \"parameters\": {{\"value\":1}}}}<|eot_id|>",
+            "{{\"name\": \"lookup\", \"parameters\": {{\"value\": 1}}}}<|eot_id|>",
             "<|start_header_id|>ipython<|end_header_id|>\n\n",
             "\"{{\\\"result\\\":\\\"Bogotá\\\"}}\"<|eot_id|>",
             "<|start_header_id|>user<|end_header_id|>\n\nagain<|eot_id|>",
@@ -1343,7 +1342,7 @@ fn production_meta_llama_templates_render_golden_tool_history_and_prompts() {
             "{}\n\nfirst<|eot|>",
             "<|header_start|>assistant<|header_end|>\n\n",
             "<|python_start|><|python_end|>",
-            "{{\"name\": \"lookup\", \"parameters\": {{\"value\":1}}}}<|eot|>",
+            "{{\"name\": \"lookup\", \"parameters\": {{\"value\": 1}}}}<|eot|>",
             "<|header_start|>ipython<|header_end|>\n\n",
             "\"{{\\\"result\\\":\\\"Bogotá\\\"}}\"<|eot|>",
             "<|header_start|>user<|header_end|>\n\nagain<|eot|>",
@@ -1470,11 +1469,11 @@ fn production_nemotron_renders_golden_parallel_history_and_prompt() {
         concat!(
             "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n",
             "Be brief.\n\n<AVAILABLE_TOOLS>[",
-            r#"{"description":"Look up one integer.","name":"lookup","parameters":{"additionalProperties":false,"properties":{"value":{"description":"The integer to look up.","type":"integer"}},"required":["value"],"type":"object"}}"#,
+            r#"{"name": "lookup", "description": "Look up one integer.", "parameters": {"type": "object", "properties": {"value": {"type": "integer", "description": "The integer to look up."}}, "required": ["value"], "additionalProperties": false}}"#,
             "]</AVAILABLE_TOOLS><|eot_id|>",
             "<|start_header_id|>user<|end_header_id|>\n\nfirst<|eot_id|>",
             "<|start_header_id|>assistant<|end_header_id|>\n\n<TOOLCALL>[",
-            r#"{"name": "lookup", "arguments": {"value":1}}, {"name": "lookup", "arguments": {"value":2}}"#,
+            r#"{"name": "lookup", "arguments": {"value": 1}}, {"name": "lookup", "arguments": {"value": 2}}"#,
             "]</TOOLCALL><|eot_id|>",
             "<|start_header_id|>user<|end_header_id|>\n\n",
             r#"<TOOL_RESPONSE>[{"result":"Bogotá"}]</TOOL_RESPONSE>"#,
@@ -1627,7 +1626,7 @@ fn production_nemotron_v2_covers_reasoning_constraints_and_streaming() {
                 "<SPECIAL_10>System\nBe brief.\n\n",
                 "You can use the following tools to assist the user if required:\n",
                 "<AVAILABLE_TOOLS>[",
-                r#"{"description":"Look up text.","name":"lookup","parameters":{"additionalProperties":false,"properties":{"query":{"type":"string"}},"required":["query"],"type":"object"}}"#,
+                r#"{"name": "lookup", "description": "Look up text.", "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"], "additionalProperties": false}}"#,
                 "]</AVAILABLE_TOOLS>\n\n",
                 "If you decide to call any tool(s), use the following format:\n",
                 r#"<TOOLCALL>[{{"name": "tool_name1", "arguments": "tool_args1"}}, {{"name": "tool_name2", "arguments": "tool_args2"}}]</TOOLCALL>"#,
@@ -1637,7 +1636,7 @@ fn production_nemotron_v2_covers_reasoning_constraints_and_streaming() {
                 "correct tool calls if any errors are found, or just respond to the user.\n",
                 "<SPECIAL_11>User\nfirst\n",
                 "<SPECIAL_11>Assistant\nworking\n\n<TOOLCALL>[",
-                r#"{"name": "lookup", "arguments": {"query":"Bogotá"}}, "#,
+                r#"{"name": "lookup", "arguments": {"query": "Bogotá"}}, "#,
                 r#"{"name": "lookup", "arguments": {"query":"a \"quote\""}}"#,
                 "]</TOOLCALL>\n<SPECIAL_12>\n",
                 "<SPECIAL_11>User\n<TOOL_RESPONSE>[",
@@ -1892,7 +1891,7 @@ fn production_gpt_oss_template_renders_harmony_history_and_runtime_profile() {
         "<|start|>user<|message|>Look it up.<|end|>",
         "<|start|>assistant<|channel|>analysis<|message|>Need the lookup result.<|end|>",
         "<|start|>assistant to=functions.lookup<|channel|>commentary json",
-        "<|message|>{\"value\":7}<|call|>",
+        "<|message|>{\"value\": 7}<|call|>",
         "<|start|>functions.lookup to=assistant<|channel|>commentary<|message|>",
         "\"{\\\"result\\\":\\\"Bogotá\\\"}\"<|end|>",
         "<|start|>user<|message|>Now summarize.<|end|>",
@@ -2035,7 +2034,7 @@ fn production_lfm2_templates_render_tools_prior_calls_and_results() {
     .unwrap();
 
     assert!(current.rendered_prompt().contains("List of tools: ["));
-    assert!(current.rendered_prompt().contains("\"name\":\"lookup\""));
+    assert!(current.rendered_prompt().contains("\"name\": \"lookup\""));
     assert!(current.rendered_prompt().contains(concat!(
         "<|im_start|>assistant\n",
         "<|tool_call_start|>[lookup(value=7)]<|tool_call_end|>",
@@ -2127,9 +2126,9 @@ fn production_deepseek_templates_render_tools_history_and_exact_generation_promp
             "deepseek.structural-json-tools.v1",
             31,
             [
-                0xa0, 0x3b, 0xd6, 0x32, 0x50, 0xe4, 0xd0, 0x15, 0x32, 0x7d, 0xc8, 0x54, 0x68, 0x6b,
-                0x34, 0x89, 0xcd, 0x1f, 0x3b, 0x38, 0x29, 0x57, 0xdd, 0x92, 0x99, 0xb7, 0x7f, 0x00,
-                0xe7, 0xdd, 0x21, 0x3c,
+                0x5b, 0xc9, 0xad, 0x0c, 0xba, 0xe2, 0xd4, 0x43, 0xd5, 0xb0, 0x2b, 0x14, 0x2f, 0xd9,
+                0x61, 0x3c, 0xe4, 0x18, 0xbf, 0x08, 0xa9, 0x9c, 0xcd, 0x38, 0xcd, 0x83, 0x05, 0x8a,
+                0x92, 0xba, 0xb7, 0xab,
             ],
         ),
         (
@@ -2137,9 +2136,9 @@ fn production_deepseek_templates_render_tools_history_and_exact_generation_promp
             "deepseek.structural-json-tools.v2",
             41,
             [
-                0x76, 0x4c, 0x69, 0x2b, 0x69, 0x47, 0xc4, 0xcc, 0x9a, 0x15, 0xf8, 0x14, 0xc1, 0xc9,
-                0x66, 0x18, 0xff, 0x91, 0x71, 0x29, 0xea, 0xdf, 0x7d, 0xf2, 0x2d, 0x95, 0xc7, 0x40,
-                0x64, 0xee, 0xd5, 0x85,
+                0x06, 0x91, 0x5b, 0x6f, 0x1a, 0xb6, 0x69, 0x08, 0x10, 0x1f, 0x96, 0x46, 0xfb, 0x39,
+                0x26, 0xc4, 0x2a, 0x6a, 0xd8, 0x8c, 0x89, 0xef, 0xc2, 0x80, 0xce, 0xe4, 0x2e, 0xa3,
+                0xe5, 0x76, 0x1b, 0xda,
             ],
         ),
     ] {
@@ -2179,7 +2178,7 @@ fn production_deepseek_templates_render_tools_history_and_exact_generation_promp
         );
         assert_eq!(prepared.profile_stop_sequences(), ["<｜end▁of▁sentence｜>"]);
         assert!(prepared.rendered_prompt().contains("lookup"));
-        assert!(prepared.rendered_prompt().contains("{\"value\":7}"));
+        assert!(prepared.rendered_prompt().contains("{\"value\": 7}"));
         assert!(prepared.rendered_prompt().contains("Bogotá"));
     }
 
@@ -2189,9 +2188,9 @@ fn production_deepseek_templates_render_tools_history_and_exact_generation_promp
             "deepseek.structural-json-tools.v1",
             "",
             [
-                0x46, 0xf0, 0xed, 0x06, 0x01, 0x25, 0x07, 0x5c, 0x56, 0x06, 0x9a, 0x84, 0x3b, 0x8b,
-                0xd7, 0x35, 0x8f, 0x6e, 0xb9, 0xa4, 0x45, 0x2f, 0xb3, 0x93, 0x98, 0x5d, 0x4e, 0xad,
-                0xba, 0xab, 0xf9, 0x56,
+                0xe8, 0xf4, 0x54, 0x14, 0xf7, 0x70, 0x84, 0x8a, 0x73, 0xbf, 0x5d, 0x2f, 0xc3, 0xe1,
+                0x9f, 0x62, 0x44, 0xf6, 0xac, 0xc9, 0xf5, 0xa6, 0x86, 0x51, 0x86, 0x05, 0x67, 0xea,
+                0xd2, 0xf1, 0x0b, 0x41,
             ],
         ),
         (
@@ -2199,9 +2198,9 @@ fn production_deepseek_templates_render_tools_history_and_exact_generation_promp
             "deepseek.structural-json-tools.v2",
             "\n  <｜Assistant｜>\n    </think>\n",
             [
-                0x74, 0x80, 0x75, 0x7f, 0x81, 0xa5, 0x3b, 0xae, 0x1f, 0x51, 0x44, 0x51, 0xe3, 0x90,
-                0xb1, 0x39, 0x72, 0xb8, 0x44, 0xa3, 0xb1, 0x68, 0xf3, 0xf8, 0x21, 0x1a, 0xbf, 0x85,
-                0xc0, 0xe4, 0x75, 0xf8,
+                0x9e, 0x2e, 0xfa, 0xcf, 0x3f, 0x78, 0xdc, 0xae, 0x14, 0x46, 0xb7, 0xae, 0x13, 0x8c,
+                0x80, 0xfc, 0xfc, 0x25, 0x13, 0x38, 0x39, 0xae, 0x2c, 0x6d, 0x2e, 0x18, 0x42, 0x32,
+                0xef, 0xd8, 0x98, 0x5c,
             ],
         ),
     ] {

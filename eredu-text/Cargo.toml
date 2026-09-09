@@ -26,10 +26,10 @@ workspace = true
 [dependencies]
 base64 = "0.23"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
-minijinja = { version = "2.24", features = ["json", "loader"] }
+minijinja = { version = "2.24", features = ["json", "loader", "preserve_order"] }
 minijinja-contrib = { version = "2.24", features = ["pycompat"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
 sha2.workspace = true
 thiserror = "2"
 tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }

@@ -1,0 +1,440 @@
+[
+  {
+    "name": "defaults_preserve_nested_order",
+    "value": {
+      "zeta": [
+        {
+          "second": "café ☃ 😀 <tag> & 'quoted'",
+          "first": [
+            true,
+            false,
+            null,
+            {},
+            []
+          ]
+        }
+      ],
+      "alpha": {
+        "b": 2,
+        "a": 1
+      }
+    },
+    "template": "{{ tools[0] | tojson }}",
+    "expected": "{\"zeta\": [{\"second\": \"café ☃ 😀 <tag> & 'quoted'\", \"first\": [true, false, null, {}, []]}], \"alpha\": {\"b\": 2, \"a\": 1}}"
+  },
+  {
+    "name": "explicit_default_options",
+    "value": {
+      "zeta": [
+        {
+          "second": "café ☃ 😀 <tag> & 'quoted'",
+          "first": [
+            true,
+            false,
+            null,
+            {},
+            []
+          ]
+        }
+      ],
+      "alpha": {
+        "b": 2,
+        "a": 1
+      }
+    },
+    "template": "{{ tools[0] | tojson(ensure_ascii=false, indent=none, separators=none, sort_keys=false) }}",
+    "expected": "{\"zeta\": [{\"second\": \"café ☃ 😀 <tag> & 'quoted'\", \"first\": [true, false, null, {}, []]}], \"alpha\": {\"b\": 2, \"a\": 1}}"
+  },
+  {
+    "name": "recursive_sort",
+    "value": {
+      "zeta": [
+        {
+          "second": "café ☃ 😀 <tag> & 'quoted'",
+          "first": [
+            true,
+            false,
+            null,
+            {},
+            []
+          ]
+        }
+      ],
+      "alpha": {
+        "b": 2,
+        "a": 1
+      }
+    },
+    "template": "{{ tools[0] | tojson(sort_keys=true) }}",
+    "expected": "{\"alpha\": {\"a\": 1, \"b\": 2}, \"zeta\": [{\"first\": [true, false, null, {}, []], \"second\": \"café ☃ 😀 <tag> & 'quoted'\"}]}"
+  },
+  {
+    "name": "compact_sorted",
+    "value": {
+      "zeta": [
+        {
+          "second": "café ☃ 😀 <tag> & 'quoted'",
+          "first": [
+            true,
+            false,
+            null,
+            {},
+            []
+          ]
+        }
+      ],
+      "alpha": {
+        "b": 2,
+        "a": 1
+      }
+    },
+    "template": "{{ tools[0] | tojson(sort_keys=true, separators=(\",\", \":\")) }}",
+    "expected": "{\"alpha\":{\"a\":1,\"b\":2},\"zeta\":[{\"first\":[true,false,null,{},[]],\"second\":\"café ☃ 😀 <tag> & 'quoted'\"}]}"
+  },
+  {
+    "name": "custom_separators",
+    "value": {
+      "zeta": [
+        {
+          "second": "café ☃ 😀 <tag> & 'quoted'",
+          "first": [
+            true,
+            false,
+            null,
+            {},
+            []
+          ]
+        }
+      ],
+      "alpha": {
+        "b": 2,
+        "a": 1
+      }
+    },
+    "template": "{{ tools[0] | tojson(separators=(\"; \", \" => \")) }}",
+    "expected": "{\"zeta\" => [{\"second\" => \"café ☃ 😀 <tag> & 'quoted'\"; \"first\" => [true; false; null; {}; []]}]; \"alpha\" => {\"b\" => 2; \"a\" => 1}}"
+  },
+  {
+    "name": "indent_two",
+    "value": {
+      "zeta": [
+        {
+          "second": "café ☃ 😀 <tag> & 'quoted'",
+          "first": [
+            true,
+            false,
+            null,
+            {},
+            []
+          ]
+        }
+      ],
+      "alpha": {
+        "b": 2,
+        "a": 1
+      }
+    },
+    "template": "{{ tools[0] | tojson(indent=2) }}",
+    "expected": "{\n  \"zeta\": [\n    {\n      \"second\": \"café ☃ 😀 <tag> & 'quoted'\",\n      \"first\": [\n        true,\n        false,\n        null,\n        {},\n        []\n      ]\n    }\n  ],\n  \"alpha\": {\n    \"b\": 2,\n    \"a\": 1\n  }\n}"
+  },
+  {
+    "name": "indent_zero",
+    "value": {
+      "zeta": [
+        {
+          "second": "café ☃ 😀 <tag> & 'quoted'",
+          "first": [
+            true,
+            false,
+            null,
+            {},
+            []
+          ]
+        }
+      ],
+      "alpha": {
+        "b": 2,
+        "a": 1
+      }
+    },
+    "template": "{{ tools[0] | tojson(indent=0) }}",
+    "expected": "{\n\"zeta\": [\n{\n\"second\": \"café ☃ 😀 <tag> & 'quoted'\",\n\"first\": [\ntrue,\nfalse,\nnull,\n{},\n[]\n]\n}\n],\n\"alpha\": {\n\"b\": 2,\n\"a\": 1\n}\n}"
+  },
+  {
+    "name": "indent_negative",
+    "value": {
+      "zeta": [
+        {
+          "second": "café ☃ 😀 <tag> & 'quoted'",
+          "first": [
+            true,
+            false,
+            null,
+            {},
+            []
+          ]
+        }
+      ],
+      "alpha": {
+        "b": 2,
+        "a": 1
+      }
+    },
+    "template": "{{ tools[0] | tojson(indent=-2) }}",
+    "expected": "{\n\"zeta\": [\n{\n\"second\": \"café ☃ 😀 <tag> & 'quoted'\",\n\"first\": [\ntrue,\nfalse,\nnull,\n{},\n[]\n]\n}\n],\n\"alpha\": {\n\"b\": 2,\n\"a\": 1\n}\n}"
+  },
+  {
+    "name": "indent_false",
+    "value": {
+      "zeta": [
+        {
+          "second": "café ☃ 😀 <tag> & 'quoted'",
+          "first": [
+            true,
+            false,
+            null,
+            {},
+            []
+          ]
+        }
+      ],
+      "alpha": {
+        "b": 2,
+        "a": 1
+      }
+    },
+    "template": "{{ tools[0] | tojson(indent=false) }}",
+    "expected": "{\n\"zeta\": [\n{\n\"second\": \"café ☃ 😀 <tag> & 'quoted'\",\n\"first\": [\ntrue,\nfalse,\nnull,\n{},\n[]\n]\n}\n],\n\"alpha\": {\n\"b\": 2,\n\"a\": 1\n}\n}"
+  },
+  {
+    "name": "indent_true",
+    "value": {
+      "zeta": [
+        {
+          "second": "café ☃ 😀 <tag> & 'quoted'",
+          "first": [
+            true,
+            false,
+            null,
+            {},
+            []
+          ]
+        }
+      ],
+      "alpha": {
+        "b": 2,
+        "a": 1
+      }
+    },
+    "template": "{{ tools[0] | tojson(indent=true) }}",
+    "expected": "{\n \"zeta\": [\n  {\n   \"second\": \"café ☃ 😀 <tag> & 'quoted'\",\n   \"first\": [\n    true,\n    false,\n    null,\n    {},\n    []\n   ]\n  }\n ],\n \"alpha\": {\n  \"b\": 2,\n  \"a\": 1\n }\n}"
+  },
+  {
+    "name": "indent_empty",
+    "value": {
+      "zeta": [
+        {
+          "second": "café ☃ 😀 <tag> & 'quoted'",
+          "first": [
+            true,
+            false,
+            null,
+            {},
+            []
+          ]
+        }
+      ],
+      "alpha": {
+        "b": 2,
+        "a": 1
+      }
+    },
+    "template": "{{ tools[0] | tojson(indent=\"\") }}",
+    "expected": "{\n\"zeta\": [\n{\n\"second\": \"café ☃ 😀 <tag> & 'quoted'\",\n\"first\": [\ntrue,\nfalse,\nnull,\n{},\n[]\n]\n}\n],\n\"alpha\": {\n\"b\": 2,\n\"a\": 1\n}\n}"
+  },
+  {
+    "name": "indent_tabs",
+    "value": {
+      "zeta": [
+        {
+          "second": "café ☃ 😀 <tag> & 'quoted'",
+          "first": [
+            true,
+            false,
+            null,
+            {},
+            []
+          ]
+        }
+      ],
+      "alpha": {
+        "b": 2,
+        "a": 1
+      }
+    },
+    "template": "{{ tools[0] | tojson(indent=\"\\t\") }}",
+    "expected": "{\n\t\"zeta\": [\n\t\t{\n\t\t\t\"second\": \"café ☃ 😀 <tag> & 'quoted'\",\n\t\t\t\"first\": [\n\t\t\t\ttrue,\n\t\t\t\tfalse,\n\t\t\t\tnull,\n\t\t\t\t{},\n\t\t\t\t[]\n\t\t\t]\n\t\t}\n\t],\n\t\"alpha\": {\n\t\t\"b\": 2,\n\t\t\"a\": 1\n\t}\n}"
+  },
+  {
+    "name": "indent_unicode",
+    "value": {
+      "zeta": [
+        {
+          "second": "café ☃ 😀 <tag> & 'quoted'",
+          "first": [
+            true,
+            false,
+            null,
+            {},
+            []
+          ]
+        }
+      ],
+      "alpha": {
+        "b": 2,
+        "a": 1
+      }
+    },
+    "template": "{{ tools[0] | tojson(indent=\"→\") }}",
+    "expected": "{\n→\"zeta\": [\n→→{\n→→→\"second\": \"café ☃ 😀 <tag> & 'quoted'\",\n→→→\"first\": [\n→→→→true,\n→→→→false,\n→→→→null,\n→→→→{},\n→→→→[]\n→→→]\n→→}\n→],\n→\"alpha\": {\n→→\"b\": 2,\n→→\"a\": 1\n→}\n}"
+  },
+  {
+    "name": "indent_custom_separators",
+    "value": {
+      "zeta": [
+        {
+          "second": "café ☃ 😀 <tag> & 'quoted'",
+          "first": [
+            true,
+            false,
+            null,
+            {},
+            []
+          ]
+        }
+      ],
+      "alpha": {
+        "b": 2,
+        "a": 1
+      }
+    },
+    "template": "{{ tools[0] | tojson(indent=2, separators=(\", \", \" : \")) }}",
+    "expected": "{\n  \"zeta\" : [\n    {\n      \"second\" : \"café ☃ 😀 <tag> & 'quoted'\", \n      \"first\" : [\n        true, \n        false, \n        null, \n        {}, \n        []\n      ]\n    }\n  ], \n  \"alpha\" : {\n    \"b\" : 2, \n    \"a\" : 1\n  }\n}"
+  },
+  {
+    "name": "ascii_unicode_and_del",
+    "value": {
+      "é": "é😀  \n\\\"\u0000"
+    },
+    "template": "{{ tools[0] | tojson(ensure_ascii=true) }}",
+    "expected": "{\"\\u00e9\": \"\\u00e9\\ud83d\\ude00\\u007f\\u2028\\u2029\\n\\\\\\\"\\u0000\"}"
+  },
+  {
+    "name": "unicode_and_del",
+    "value": {
+      "é": "é😀  \n\\\"\u0000"
+    },
+    "template": "{{ tools[0] | tojson }}",
+    "expected": "{\"é\": \"é😀  \\n\\\\\\\"\\u0000\"}"
+  },
+  {
+    "name": "punctuation_in_strings",
+    "value": {
+      "value": "comma,colon:brace{} \\\" next,:"
+    },
+    "template": "{{ tools[0] | tojson(indent=2) }}",
+    "expected": "{\n  \"value\": \"comma,colon:brace{} \\\\\\\" next,:\"\n}"
+  },
+  {
+    "name": "positional_options",
+    "value": {
+      "zeta": [
+        {
+          "second": "café ☃ 😀 <tag> & 'quoted'",
+          "first": [
+            true,
+            false,
+            null,
+            {},
+            []
+          ]
+        }
+      ],
+      "alpha": {
+        "b": 2,
+        "a": 1
+      }
+    },
+    "template": "{{ tools[0] | tojson(true, 1, (\",\", \":\"), true) }}",
+    "expected": "{\n \"alpha\":{\n  \"a\":1,\n  \"b\":2\n },\n \"zeta\":[\n  {\n   \"first\":[\n    true,\n    false,\n    null,\n    {},\n    []\n   ],\n   \"second\":\"caf\\u00e9 \\u2603 \\ud83d\\ude00 <tag> & 'quoted'\"\n  }\n ]\n}"
+  },
+  {
+    "name": "mixed_options",
+    "value": {
+      "zeta": [
+        {
+          "second": "café ☃ 😀 <tag> & 'quoted'",
+          "first": [
+            true,
+            false,
+            null,
+            {},
+            []
+          ]
+        }
+      ],
+      "alpha": {
+        "b": 2,
+        "a": 1
+      }
+    },
+    "template": "{{ tools[0] | tojson(false, sort_keys=true, indent=2) }}",
+    "expected": "{\n  \"alpha\": {\n    \"a\": 1,\n    \"b\": 2\n  },\n  \"zeta\": [\n    {\n      \"first\": [\n        true,\n        false,\n        null,\n        {},\n        []\n      ],\n      \"second\": \"café ☃ 😀 <tag> & 'quoted'\"\n    }\n  ]\n}"
+  },
+  {
+    "name": "empty_objects",
+    "value": {
+      "z": {},
+      "a": []
+    },
+    "template": "{{ tools[0] | tojson(indent=2) }}",
+    "expected": "{\n  \"z\": {},\n  \"a\": []\n}"
+  },
+  {
+    "name": "scalar_string",
+    "value": "<|tool_call_start|> café & 'x'",
+    "template": "{{ tools[0] | tojson }}",
+    "expected": "\"<|tool_call_start|> café & 'x'\""
+  },
+  {
+    "name": "scalar_null",
+    "value": null,
+    "template": "{{ tools[0] | tojson }}",
+    "expected": "null"
+  },
+  {
+    "name": "scalar_boolean",
+    "value": true,
+    "template": "{{ tools[0] | tojson }}",
+    "expected": "true"
+  },
+  {
+    "name": "numbers",
+    "value": [
+      0,
+      -7,
+      1.0,
+      -0.0,
+      0.0001,
+      1e-05,
+      1000000000000000.0,
+      1e+16,
+      1e+20,
+      1.2345678901234567,
+      1e-100,
+      1e+100
+    ],
+    "template": "{{ tools[0] | tojson }}",
+    "expected": "[0, -7, 1.0, -0.0, 0.0001, 1e-05, 1000000000000000.0, 1e+16, 1e+20, 1.2345678901234567, 1e-100, 1e+100]"
+  }
+]
