@@ -18,6 +18,21 @@ pub enum SpeculativeControlError {
     /// A snapshot does not belong to this run.
     #[error("snapshot does not belong to this controlled speculative run")]
     IncompatibleSnapshot,
+    /// An inactive branch slot belongs to another scope or has been released.
+    #[error("branch does not belong to this controlled speculative session")]
+    IncompatibleBranch,
+    /// A prospective control request violates its portable policy.
+    #[error("invalid speculative control: {0}")]
+    Invalid(&'static str),
+    /// Forced ID is outside the canonical tokenizer domain.
+    #[error("forced token {0} is outside the canonical vocabulary")]
+    InvalidToken(u32),
+    /// The current grammar forbids this canonical token.
+    #[error("forced token {0} conflicts with the active constraints")]
+    ForbiddenToken(u32),
+    /// An uncommitted choice must be cleared before replacement.
+    #[error("a forced token is already pending")]
+    PendingToken,
     /// Capture configuration or bounded collection failed.
     #[error(transparent)]
     Capture(#[from] crate::capture::CaptureError),
@@ -63,6 +78,18 @@ pub struct SpeculativeControlSnapshot<E: SpeculativeExecutor, S: SpeculativeSamp
     draft_randomness: Option<S::DraftRandomness>,
     lifecycle: SpeculativeRequestLifecycle,
     stats: SpeculativeStats,
+    config: SpeculativeConfig,
+}
+
+impl<E: SpeculativeExecutor, S: SpeculativeSampling, C> SpeculativeControlSnapshot<E, S, C> {
+    /// Canonical prefix retained by this immutable state.
+    pub fn token_ids(&self) -> &[u32] {
+        self.sequence.tokens()
+    }
+    /// Lifecycle retained with the prefix.
+    pub fn status(&self) -> SpeculativeRequestStatus {
+        self.lifecycle.status()
+    }
 }
 
 impl<E, S, C, P> SpeculativeRequest<'_, E, S, C, P>
@@ -75,6 +102,50 @@ where
     /// Mutable sampler access for draining shared control observations.
     pub fn sampler_mut(&mut self) -> &mut S {
         self.runtime.sampler_mut()
+    }
+
+    /// Shared portable facts for prospective sampling admission.
+    pub fn control_sampling_facts(&self) -> Option<(f32, bool, bool)> {
+        Some((
+            self.config.temperature,
+            self.sampler().control_requires_positive_temperature()?,
+            self.target_randomness.is_some() && self.draft_randomness.is_some(),
+        ))
+    }
+
+    /// Installs a previously validated prospective temperature and optional seed.
+    pub fn control_override_sampling<'a>(
+        &mut self,
+        temperature: f32,
+        reseed: Option<u64>,
+        context: S::Context<'a>,
+    ) -> Result<(), SpeculativeControlError>
+    where
+        S: 'a,
+    {
+        self.validate_control_edit()?;
+        if let Some(seed) = reseed {
+            let seed = S::control_seed(seed, context)?;
+            // A seed supplied while greedy is retained for a later stochastic switch.
+            let randomness = S::initialize_randomness(Some(seed), 1.0, context)
+                .map_err(SpeculativeControlError::backend)?;
+            self.target_randomness = randomness.target;
+            self.draft_randomness = randomness.draft;
+        }
+        self.config.temperature = temperature;
+        Ok(())
+    }
+
+    /// Validates a choice before any model work, using the canonical constraint owner.
+    pub fn control_force_next(
+        &mut self,
+        token: u32,
+        vocabulary: usize,
+    ) -> Result<(), SpeculativeControlError> {
+        self.validate_control_edit()?;
+        let position = self.sequence().tokens().len();
+        self.sampler_mut()
+            .control_force_next(token, vocabulary, position)
     }
 
     /// Canonical proposals, including the block retained during verification.
@@ -115,6 +186,15 @@ where
         }
         if !self.is_control_boundary() {
             return Err(SpeculativeControlError::NotQuiescent);
+        }
+        Ok(())
+    }
+
+    /// Requires a healthy, nonterminal canonical boundary for a prospective edit.
+    pub fn validate_control_edit(&self) -> Result<(), SpeculativeControlError> {
+        self.check_control_boundary()?;
+        if self.lifecycle.is_terminal() {
+            return Err(SpeculativeControlError::Invalid("generation is terminal"));
         }
         Ok(())
     }
@@ -177,6 +257,7 @@ where
             )?
             .checked_add(self.runtime.constraint().control_snapshot_bytes()?)?
             .checked_add(self.sequence().snapshot_storage_bytes()?)?
+            .checked_add((self.config.eos_token_ids.len() as u64).checked_mul(4)?)?
             .checked_add(
                 (self.stats.accept_lens().len() as u64)
                     .checked_mul(std::mem::size_of::<usize>() as u64)?,
@@ -217,6 +298,7 @@ where
             draft_randomness: self.draft_randomness.clone(),
             lifecycle: self.lifecycle.clone(),
             stats: self.stats.clone(),
+            config: self.config.clone(),
         })
     }
 
@@ -253,6 +335,7 @@ where
         self.draft_randomness = draft_randomness;
         self.lifecycle = snapshot.lifecycle.clone();
         self.stats = snapshot.stats.clone();
+        self.config = snapshot.config.clone();
         Ok(())
     }
 }
@@ -294,4 +377,13 @@ pub enum SpeculativeCaptureRole {
     Target,
     /// Canonical or optimistic draft proposal.
     Draft,
+}
+
+/// Prospective tensor edits admitted for one model's speculative prediction rows.
+#[derive(Debug, Clone)]
+pub struct SpeculativeInterventionPlan {
+    /// Target or draft logits; roles never share an implicit edit.
+    pub role: SpeculativeCaptureRole,
+    /// Existing bounded intervention contract, including evidence and scheduling.
+    pub plan: crate::intervention::AdmittedInterventionPlan,
 }

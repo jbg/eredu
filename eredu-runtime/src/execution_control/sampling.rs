@@ -69,7 +69,8 @@ pub enum SamplingOverrideError<E: std::error::Error + 'static> {
     Backend(#[source] E),
 }
 
-fn validate<E: std::error::Error + 'static>(
+/// Shared prospective-temperature and RNG admission for ordinary and speculative runs.
+pub fn validate_sampling_override<E: std::error::Error + 'static>(
     facts: SamplingStateFacts,
     request: SamplingOverride,
 ) -> Result<ValidatedSamplingOverride, SamplingOverrideError<E>> {
@@ -122,7 +123,7 @@ pub fn apply_prepared_sampling_override<B: TextSamplingControlBackend>(
             "loaded execution does not support sampling overrides",
         ));
     }
-    let action = validate(B::sampling_control_facts(state), request)?;
+    let action = validate_sampling_override(B::sampling_control_facts(state), request)?;
     B::install_sampling_override(runtime, state, action).map_err(SamplingOverrideError::Backend)?;
     Ok(B::sampling_control_facts(state))
 }
@@ -134,7 +135,7 @@ mod tests {
         facts: SamplingStateFacts,
         request: SamplingOverride,
     ) -> Result<ValidatedSamplingOverride, SamplingOverrideError<std::io::Error>> {
-        validate(facts, request)
+        validate_sampling_override(facts, request)
     }
     #[test]
     fn temperature_changes_preserve_rng_and_adaptation_unless_reseeding_is_explicit() {

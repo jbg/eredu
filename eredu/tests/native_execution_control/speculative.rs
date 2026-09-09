@@ -41,6 +41,19 @@ fn artifacts() -> (Fixture, Fixture) {
     ignore = "run with --no-default-features --features mlx for CPU-only native initialization"
 )]
 fn native_controlled_speculation_captures_draft_and_target_and_replays_isolated_snapshots() {
+    native_speculative_control(false);
+}
+
+#[test]
+#[cfg_attr(
+    feature = "metal",
+    ignore = "run with --no-default-features --features mlx for CPU-only initialization"
+)]
+fn native_speculative_forks_force_tokens_and_apply_independent_target_and_draft_tensor_edits() {
+    native_speculative_control(true);
+}
+
+fn native_speculative_control(experiment: bool) {
     let (target, draft) = artifacts();
     let plan = ExecutionPlan::fully_resident(local_device_plan(LocalDevice::Cpu).unwrap())
         .with_required_session_capabilities(SessionCapabilities::new(true, true, true))
@@ -75,7 +88,7 @@ fn native_controlled_speculation_captures_draft_and_target_and_replays_isolated_
         ..Default::default()
     };
     let usage = CaptureUsage {
-        captures: 128,
+        captures: if experiment { 512 } else { 128 },
         retained_bytes: 16 << 20,
         host_bytes: 16 << 20,
         encoded_bytes: 16 << 20,
@@ -99,6 +112,48 @@ fn native_controlled_speculation_captures_draft_and_target_and_replays_isolated_
     let capture = model
         .prepare_speculative_capture(settings, capture)
         .unwrap();
+    let edits = if experiment {
+        use eredu_core::intervention::*;
+        let discovery = model.speculative_intervention_discovery().unwrap();
+        assert!(discovery
+            .points
+            .iter()
+            .all(|p| p.path == eredu_core::MODEL_LOGITS_OBSERVATION_PATH));
+        [
+            (SpeculativeCaptureRole::Target, 12),
+            (SpeculativeCaptureRole::Draft, 11),
+        ]
+        .into_iter()
+        .map(|(role, token)| {
+            let mut values = vec![0.0; 64];
+            values[token] = 50.0;
+            model
+                .prepare_speculative_intervention(
+                    &capture,
+                    role,
+                    InterventionPlan {
+                        schema_version: INTERVENTION_SCHEMA_VERSION,
+                        operations: vec![InterventionOperation {
+                            id: format!("prefer-{token}"),
+                            target: eredu_core::MODEL_LOGITS_OBSERVATION_PATH.into(),
+                            schedule: Default::default(),
+                            slices: vec![],
+                            action: InterventionAction::Replace {
+                                tensor: InterventionTensor {
+                                    shape: vec![1, 1, 64],
+                                    values: InterventionValues::Float32(values),
+                                },
+                            },
+                            evidence: InterventionEvidence::Preview { max_elements: 64 },
+                        }],
+                    },
+                )
+                .unwrap()
+        })
+        .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     // An entire controlled run, including replay, uses retained prepared resources.
     std::fs::remove_file(target.0.join("model.safetensors")).unwrap();
     std::fs::remove_file(draft.0.join("model.safetensors")).unwrap();
@@ -118,15 +173,22 @@ fn native_controlled_speculation_captures_draft_and_target_and_replays_isolated_
             ControlledSpeculativeOptions {
                 capture: Some(capture),
                 snapshots: Some(SnapshotLimits {
-                    max_snapshots: 1,
-                    max_branches: 0,
+                    max_snapshots: 3,
+                    max_branches: 2,
                     retained_bytes: 64 << 20,
                     cumulative_copy_bytes: 256 << 20,
                 }),
                 ..Default::default()
             },
             |session| {
+                if experiment {
+                    session.intervene(edits.clone())?;
+                }
                 let first = session.step()?.unwrap();
+                if experiment {
+                    assert_eq!(first.committed_token_ids, [12]);
+                    session.intervene(Vec::new())?;
+                }
                 captures.extend(first.captures);
                 assert!(
                     session.can_snapshot(),
@@ -146,6 +208,66 @@ fn native_controlled_speculation_captures_draft_and_target_and_replays_isolated_
                         session.restore(&saved)?;
                     }
                 }
+                if experiment {
+                    let original = session.token_ids().to_vec();
+                    let original_sampling = session.sampling_state();
+                    let child = session.fork(&saved)?;
+                    session.exchange(&child)?;
+                    session.override_sampling(SamplingOverride {
+                        temperature: Some(0.0),
+                        reseed: Some(123),
+                    })?;
+                    session.intervene(edits.clone())?;
+                    assert!(session
+                        .intervene(vec![edits[0].clone(), edits[0].clone()])
+                        .is_err());
+                    session.force_next_token(10)?;
+                    let changed = session.snapshot()?;
+                    let mut child_replays = Vec::new();
+                    let mut rejected = false;
+                    for pass in 0..2 {
+                        let mut tokens = Vec::new();
+                        let mut forced = 0;
+                        while let Some(step) = session.step()? {
+                            forced += usize::from(step.forced_token == Some(10));
+                            rejected |= step.verification.as_ref().is_some_and(|v| {
+                                v.dispositions
+                                    .contains(&SpeculativeProposalDisposition::Rejected)
+                            });
+                            tokens.extend(step.committed_token_ids);
+                            captures.extend(step.captures);
+                        }
+                        assert_eq!(forced, 1);
+                        assert_eq!(tokens[0], 10);
+                        assert!(tokens[1..].iter().all(|id| *id == 12));
+                        child_replays.push(tokens);
+                        if pass == 0 {
+                            session.restore(&changed)?;
+                        }
+                    }
+                    assert!(
+                        rejected,
+                        "independent draft edit must be rejected by the target edit"
+                    );
+                    assert_eq!(child_replays[0], child_replays[1]);
+                    session.exchange(&child)?;
+                    assert_eq!(session.run_id(), 0);
+                    assert_eq!(session.token_ids(), original);
+                    assert_eq!(session.sampling_state(), original_sampling);
+                    session.restore(&saved)?;
+                    let mut unedited = Vec::new();
+                    while let Some(step) = session.step()? {
+                        unedited.extend(step.committed_token_ids);
+                        assert!(step
+                            .captures
+                            .iter()
+                            .all(|c| c.capture.interventions.is_empty()));
+                        captures.extend(step.captures);
+                    }
+                    assert_eq!(unedited, replays[0]);
+                    session.release_snapshot(&changed)?;
+                    session.release_branch(&child)?;
+                }
                 Ok(())
             },
         )
@@ -163,6 +285,21 @@ fn native_controlled_speculation_captures_draft_and_target_and_replays_isolated_
     assert!(captures
         .iter()
         .all(|c| c.capture.records.iter().all(|r| r.payload.is_some())));
+    if experiment {
+        use eredu_core::intervention::InterventionOutcome;
+        for role in [
+            SpeculativeCaptureRole::Target,
+            SpeculativeCaptureRole::Draft,
+        ] {
+            assert!(captures.iter().any(|capture| capture.role == role
+                && capture.capture.interventions.iter().any(|record| matches!(
+                    record.outcome,
+                    InterventionOutcome::Applied
+                ) && !record
+                    .evidence
+                    .is_empty())));
+        }
+    }
     assert!(captures
         .windows(2)
         .all(|pair| pair[0].capture.cumulative_usage.captures

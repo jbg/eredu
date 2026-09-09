@@ -1,5 +1,6 @@
 //! Backend-neutral causal-model and token-sampling contracts.
 
+use crate::execution_control::TokenChoiceController;
 use eredu_core::{
     generation::ResolvedGenerationConfig, SpeculativeTokenFilterController, TokenFilter,
     TokenFilterController,
@@ -210,6 +211,31 @@ impl Default for PenaltyConfig {
 
 /// Sampling policy suitable for lossless speculative decoding.
 pub trait SpeculativeSampler<B: SamplingBackend> {
+    /// Whether prospective sampling is supported, and whether zero temperature is forbidden.
+    fn control_requires_positive_temperature(&self) -> Option<bool> {
+        None
+    }
+    /// Stages a canonical one-token restriction through the ordinary constraint policy.
+    fn control_force_next(
+        &mut self,
+        _token: u32,
+        _domain: TokenDomain,
+        _position: usize,
+    ) -> Result<(), eredu_core::speculative::SpeculativeControlError> {
+        Err(
+            eredu_core::speculative::SpeculativeControlError::Unsupported(
+                "sampler has no token forcing",
+            ),
+        )
+    }
+    /// Removes an uncommitted forced choice.
+    fn control_clear_forced(&mut self) -> bool {
+        false
+    }
+    /// Current pending canonical choice.
+    fn control_pending_forced(&self) -> Option<u32> {
+        None
+    }
     /// Complete bytes retained by a clone with isolated mutable sampling state.
     fn control_snapshot_bytes(&self) -> Option<u64> {
         None
@@ -286,12 +312,12 @@ pub trait Sampler<B: SamplingBackend> {
 /// Grammar-aware wrapper around a backend-neutral sampling policy.
 pub struct ConstrainedSampler<S, C> {
     policy: S,
-    controller: C,
+    controller: TokenChoiceController<C>,
 }
 
 struct ConstraintCheckpoint<S, C> {
     policy: S,
-    controller: C,
+    controller: TokenChoiceController<C>,
 }
 
 impl<S: Clone, C: Clone> Clone for ConstrainedSampler<S, C> {
@@ -303,10 +329,13 @@ impl<S: Clone, C: Clone> Clone for ConstrainedSampler<S, C> {
     }
 }
 
-impl<S, C> ConstrainedSampler<S, C> {
+impl<S, C: TokenFilterController> ConstrainedSampler<S, C> {
     /// Wraps a policy with a portable canonical constraint controller.
     pub fn new(policy: S, controller: C) -> Self {
-        Self { policy, controller }
+        Self {
+            policy,
+            controller: TokenChoiceController::new(controller, TokenDomain::new(0)),
+        }
     }
 
     /// Returns the wrapped policy.
@@ -315,13 +344,13 @@ impl<S, C> ConstrainedSampler<S, C> {
     }
 
     /// Returns the portable constraint controller.
-    pub const fn controller(&self) -> &C {
-        &self.controller
+    pub fn controller(&self) -> &C {
+        self.controller.inner()
     }
 
     /// Returns the portable constraint controller mutably.
     pub fn controller_mut(&mut self) -> &mut C {
-        &mut self.controller
+        self.controller.inner_mut()
     }
 }
 
@@ -340,6 +369,39 @@ where
     S: SpeculativeSampler<B> + Clone,
     C: SpeculativeTokenFilterController,
 {
+    fn control_requires_positive_temperature(&self) -> Option<bool> {
+        self.policy.control_requires_positive_temperature()
+    }
+    fn control_force_next(
+        &mut self,
+        token: u32,
+        domain: TokenDomain,
+        position: usize,
+    ) -> Result<(), eredu_core::speculative::SpeculativeControlError> {
+        use crate::execution_control::TokenChoiceError;
+        use eredu_core::speculative::SpeculativeControlError;
+        self.controller
+            .force_at(token, domain, position)
+            .map_err(|error| match error {
+                TokenChoiceError::InvalidToken(token) => {
+                    SpeculativeControlError::InvalidToken(token)
+                }
+                TokenChoiceError::Forbidden(token) => {
+                    SpeculativeControlError::ForbiddenToken(token)
+                }
+                TokenChoiceError::AlreadyPending => SpeculativeControlError::PendingToken,
+                TokenChoiceError::Constraint(error) => SpeculativeControlError::backend(error),
+                TokenChoiceError::UnexpectedCommit { .. } => {
+                    SpeculativeControlError::Invalid("inconsistent forced choice")
+                }
+            })
+    }
+    fn control_clear_forced(&mut self) -> bool {
+        self.controller.clear_forced()
+    }
+    fn control_pending_forced(&self) -> Option<u32> {
+        self.controller.pending_forced()
+    }
     fn control_snapshot_bytes(&self) -> Option<u64> {
         self.policy
             .control_snapshot_bytes()?
@@ -449,6 +511,9 @@ where
 pub struct DefaultSampler;
 
 impl<B: SamplingBackend> SpeculativeSampler<B> for DefaultSampler {
+    fn control_requires_positive_temperature(&self) -> Option<bool> {
+        Some(false)
+    }
     fn uses_checkpoint_defaults(&self) -> bool {
         true
     }
@@ -626,6 +691,9 @@ impl GenerationSampler {
 }
 
 impl<B: SamplingBackend> SpeculativeSampler<B> for GenerationSampler {
+    fn control_requires_positive_temperature(&self) -> Option<bool> {
+        Some(false)
+    }
     fn supports_exact_optimistic_promotion(&self) -> bool {
         true
     }
@@ -812,6 +880,9 @@ impl<B: SamplingBackend> Sampler<B> for MirostatV2Sampler {
 }
 
 impl<B: SamplingBackend> SpeculativeSampler<B> for MirostatV2Sampler {
+    fn control_requires_positive_temperature(&self) -> Option<bool> {
+        Some(true)
+    }
     fn process_logits(
         &mut self,
         logits: &B::Logits,

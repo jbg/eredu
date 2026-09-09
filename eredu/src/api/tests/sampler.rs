@@ -895,3 +895,51 @@ fn text_controller_excludes_dominant_padding_before_sampling_and_after_snapshot(
         TokenFilter::allowed(vec![true, false, true]).unwrap()
     );
 }
+
+#[test]
+fn speculative_forcing_uses_the_shared_grammar_and_only_restricts_its_absolute_position() {
+    let plan = synthetic_plan(ToolChoice::Required);
+    let mut sampler = constrained_sampler(GenerationSampler::new().top_k(1), &plan).unwrap();
+    let domain = TokenDomain::new(SYNTHETIC_VOCAB_SIZE);
+    assert!(
+        SpeculativeSampler::<TestSamplingBackend>::control_force_next(
+            &mut sampler,
+            u32::MAX,
+            domain,
+            0
+        )
+        .is_err()
+    );
+    assert!(
+        SpeculativeSampler::<TestSamplingBackend>::control_force_next(
+            &mut sampler,
+            u32::from(b'x'),
+            domain,
+            0
+        )
+        .is_err()
+    );
+    SpeculativeSampler::<TestSamplingBackend>::control_force_next(
+        &mut sampler,
+        u32::from(b'{'),
+        domain,
+        0,
+    )
+    .unwrap();
+    let mut optimistic = sampler.clone();
+    let mut values = vec![-100.0; SYNTHETIC_VOCAB_SIZE];
+    values[b'x' as usize] = 100.0;
+    values[b'"' as usize] = 10.0;
+    let first = process_logits(&mut optimistic, &values, &[]);
+    assert_eq!(sample_processed(&optimistic, &first), u32::from(b'{'));
+    // Draft history advances without committing the canonical controller.
+    let next = process_logits(&mut optimistic, &values, &[u32::from(b'{')]);
+    assert_eq!(sample_processed(&optimistic, &next), u32::from(b'"'));
+    assert!(SpeculativeSampler::<TestSamplingBackend>::control_pending_forced(&sampler).is_some());
+    commit_token(&mut sampler, &first, u32::from(b'{'));
+    assert!(SpeculativeSampler::<TestSamplingBackend>::control_pending_forced(&sampler).is_none());
+    assert!(
+        SpeculativeSampler::<TestSamplingBackend>::control_pending_forced(&optimistic).is_some()
+    );
+    assert!(SpeculativeSampler::<TestSamplingBackend>::control_clear_forced(&mut optimistic));
+}

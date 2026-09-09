@@ -211,3 +211,12 @@ require complete canonical state and explicit resource limits; see
 [execution control](execution-control.md#controlled-speculative-generation) and
 [the Inspector integration guide](lm-inspector-execution-control.md#ttft-and-speculative-inspection).
 There is no separate controlled acceptance or sampling algorithm.
+
+Controlled sessions also support serial `fork`/`exchange` at exact canonical
+boundaries, prospective token forcing and temperature/reseed changes. Target and
+draft logits can have separate admitted tensor interventions; their evidence includes
+rejected proposals. All paths retain the shared scheduler and acceptance algorithm.
+See [controlled speculation](execution-control.md#controlled-speculative-generation)
+for scope-wide accounting, supported hooks and snapshot requirements, and the
+[Inspector workflow](lm-inspector-execution-control.md#speculative-forks-and-prospective-interventions)
+for branch journal reconciliation.

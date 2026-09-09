@@ -11,7 +11,10 @@ use eredu_core::{
     speculative::{SpeculativeControlError, SpeculativeControlSnapshot, SpeculativeProposalView},
 };
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, rc::Rc, sync::Arc, time::Duration};
+
+mod branch;
+pub use branch::*;
 
 /// Explicit resource limits for controlled speculative inspection.
 #[derive(Debug, Clone)]
@@ -80,7 +83,10 @@ pub struct ControlledSpeculativeStep {
     pub schema_version: u32,
     /// Monotone delivery sequence, never rewound.
     pub sequence: u64,
-    /// Restoration epoch, incremented after each successful restore.
+    /// Logical run currently installed in this scope.
+    #[serde(default)]
+    pub run_id: u64,
+    /// Restoration epoch, incremented after each successful restore or exchange.
     pub epoch: u64,
     /// Scheduler status after this action.
     pub status: SpeculativeRequestStatus,
@@ -91,6 +97,12 @@ pub struct ControlledSpeculativeStep {
     pub verification: Option<SpeculativeVerificationRecord>,
     /// Newly committed tokens; proposals are excluded.
     pub committed_token_ids: Vec<u32>,
+    /// Forced canonical token consumed by this action, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forced_token: Option<u32>,
+    /// Effective prospective sampling policy after this action.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sampling: Option<crate::execution_control::SamplingStateFacts>,
     /// Bounded raw-logit captures, including tentative draft and target rows.
     pub captures: Vec<eredu_core::speculative::SpeculativePredictionCapture>,
     /// Active time to the first committed target token, before its callbacks.
@@ -126,6 +138,44 @@ pub trait ControlledSpeculativeSession {
     fn token_ids(&self) -> &[u32];
     /// Active TTFT, unaffected by pauses, snapshots or inspection work.
     fn timing(&self) -> GenerationTiming;
+    /// Identity of the active logical run; zero identifies the root.
+    fn run_id(&self) -> u64;
+    /// Creates an inactive isolated child from a snapshot in this scope.
+    fn fork(
+        &mut self,
+        snapshot: &SpeculativeSnapshotHandle,
+    ) -> Result<SpeculativeBranchHandle, SpeculativeControlError>;
+    /// Serial copy-based exchange; the handle then retains the previously active run.
+    fn exchange(
+        &mut self,
+        branch: &SpeculativeBranchHandle,
+    ) -> Result<SpeculativeBranchInfo, SpeculativeControlError>;
+    /// Prefix and identity currently retained in an inactive branch slot.
+    fn branch_info(
+        &self,
+        branch: &SpeculativeBranchHandle,
+    ) -> Result<SpeculativeBranchInfo, SpeculativeControlError>;
+    /// Releases an inactive branch slot without refunding copying or observation.
+    fn release_branch(
+        &mut self,
+        branch: &SpeculativeBranchHandle,
+    ) -> Result<(), SpeculativeControlError>;
+    /// Current native sampling compatibility, or None for unsupported samplers.
+    fn sampling_state(&self) -> Option<crate::execution_control::SamplingStateFacts>;
+    /// Validates and installs a prospective temperature/reseed at a settled boundary.
+    fn override_sampling(
+        &mut self,
+        request: crate::execution_control::SamplingOverride,
+    ) -> Result<crate::execution_control::SamplingStateFacts, SpeculativeControlError>;
+    /// Stages one canonical token for the next target decision.
+    fn force_next_token(&mut self, token: u32) -> Result<(), SpeculativeControlError>;
+    /// Clears a staged choice at a settled boundary.
+    fn clear_forced_token(&mut self) -> Result<bool, SpeculativeControlError>;
+    /// Replaces future role-specific tensor edits; an empty list removes them.
+    fn intervene(
+        &mut self,
+        plans: Vec<eredu_core::speculative::SpeculativeInterventionPlan>,
+    ) -> Result<(), SpeculativeControlError>;
     /// Current restore epoch.
     fn epoch(&self) -> u64;
     /// Performs one action; `None` means the request is already terminal.
@@ -155,6 +205,7 @@ pub trait ControlledSpeculativeSession {
 
 struct Saved<E: SpeculativeExecutor, S: SpeculativeSampling, C> {
     state: SpeculativeControlSnapshot<E, S, C>,
+    run_id: u64,
     estimate: SnapshotEstimate,
     _reservation: SnapshotReservation,
 }
@@ -170,7 +221,10 @@ where
     lane: Option<PreparedSpeculativeLane<'a, E, S, C, P>>,
     id: Option<SpeculativeRequestId>,
     owner: Arc<()>,
-    snapshots: BTreeMap<u64, Saved<E, S, C>>,
+    snapshots: BTreeMap<u64, Rc<Saved<E, S, C>>>,
+    branches: BTreeMap<u64, branch::Branch<E, S, C>>,
+    next_branch: u64,
+    run_id: u64,
     next_snapshot: u64,
     budget: Option<SnapshotBudget>,
     trace: TraceBudget,
@@ -179,6 +233,8 @@ where
     preparation: Duration,
     timing: GenerationTiming,
     failed: bool,
+    vocabulary: usize,
+    intervention_discovery: Option<eredu_core::intervention::InterventionDiscovery>,
 }
 
 impl<'a, E, S, C, P> Session<'a, E, S, C, P>
@@ -204,11 +260,58 @@ where
         }
         Ok(())
     }
+    fn save_state(
+        &self,
+        kind: SnapshotResourceKind,
+    ) -> Result<Rc<Saved<E, S, C>>, SpeculativeControlError> {
+        self.healthy()?;
+        let request = self
+            .request()
+            .ok_or(SpeculativeControlError::NotQuiescent)?;
+        if !request.is_control_boundary() {
+            return Err(SpeculativeControlError::NotQuiescent);
+        }
+        let budget = self
+            .budget
+            .as_ref()
+            .ok_or(SpeculativeControlError::Unsupported(
+                "snapshot limits were not supplied",
+            ))?;
+        let estimate = request
+            .control_snapshot_estimate(self.scheduler.executor)
+            .ok_or(ExecutionControlError::UnknownEstimate)?;
+        // Include the scope's saved-state envelope and conservative map-node
+        // storage as well as the core/native snapshot payload.
+        let overhead = (std::mem::size_of::<Saved<E, S, C>>() as u64)
+            .checked_add(256)
+            .ok_or(ExecutionControlError::Overflow)?;
+        let estimate = SnapshotEstimate {
+            retained_bytes: estimate
+                .retained_bytes
+                .checked_add(overhead)
+                .ok_or(ExecutionControlError::Overflow)?,
+            copy_bytes: estimate
+                .copy_bytes
+                .checked_add(overhead)
+                .ok_or(ExecutionControlError::Overflow)?,
+        };
+        let reservation = budget.reserve(kind, Some(estimate))?;
+        let state = request.control_snapshot(self.scheduler.executor, self.scheduler.context)?;
+        Ok(Rc::new(Saved {
+            state,
+            run_id: self.run_id,
+            estimate,
+            _reservation: reservation,
+        }))
+    }
     fn step_inner(&mut self) -> Result<Option<ControlledSpeculativeStep>, SpeculativeControlError> {
         self.healthy()?;
         if self.id.is_some() && self.scheduler.is_finished() {
             return Ok(None);
         }
+        let forced = self
+            .request()
+            .and_then(|r| r.sampler().control_pending_forced());
         let before = self.request().map(|r| {
             (
                 r.sequence().tokens().len(),
@@ -289,9 +392,12 @@ where
             schema_version: 1,
             sequence: self.sequence,
             epoch: self.epoch,
+            run_id: self.run_id,
             status: request.status(),
             drafted: if was_prefill { None } else { drafted },
             verification,
+            forced_token: forced.filter(|_| !committed.is_empty()),
+            sampling: self.sampling_state(),
             committed_token_ids: committed,
             captures: Vec::new(),
             timing: self.timing,
@@ -329,6 +435,129 @@ where
     }
     fn timing(&self) -> GenerationTiming {
         self.timing
+    }
+    fn run_id(&self) -> u64 {
+        self.run_id
+    }
+    fn fork(
+        &mut self,
+        snapshot: &SpeculativeSnapshotHandle,
+    ) -> Result<SpeculativeBranchHandle, SpeculativeControlError> {
+        self.fork_inner(snapshot)
+    }
+    fn exchange(
+        &mut self,
+        branch: &SpeculativeBranchHandle,
+    ) -> Result<SpeculativeBranchInfo, SpeculativeControlError> {
+        self.exchange_inner(branch)
+    }
+    fn branch_info(
+        &self,
+        branch: &SpeculativeBranchHandle,
+    ) -> Result<SpeculativeBranchInfo, SpeculativeControlError> {
+        self.branch_info_inner(branch)
+    }
+    fn release_branch(
+        &mut self,
+        branch: &SpeculativeBranchHandle,
+    ) -> Result<(), SpeculativeControlError> {
+        self.owned_branch(branch)?;
+        self.branches.remove(&branch.id);
+        Ok(())
+    }
+    fn sampling_state(&self) -> Option<crate::execution_control::SamplingStateFacts> {
+        let (temperature, requires_positive_temperature, has_rng) =
+            self.request()?.control_sampling_facts()?;
+        Some(crate::execution_control::SamplingStateFacts {
+            temperature,
+            requires_positive_temperature,
+            has_rng,
+        })
+    }
+    fn override_sampling(
+        &mut self,
+        request: crate::execution_control::SamplingOverride,
+    ) -> Result<crate::execution_control::SamplingStateFacts, SpeculativeControlError> {
+        self.healthy()?;
+        let facts = self
+            .sampling_state()
+            .ok_or(SpeculativeControlError::Unsupported(
+                "sampler has no prospective sampling control",
+            ))?;
+        let action = crate::execution_control::validate_sampling_override::<
+            eredu_core::BackendFailure,
+        >(facts, request)
+        .map_err(|e| match e {
+            crate::execution_control::SamplingOverrideError::Invalid(reason) => {
+                SpeculativeControlError::Invalid(reason)
+            }
+            crate::execution_control::SamplingOverrideError::Backend(e) => {
+                SpeculativeControlError::backend(e)
+            }
+        })?;
+        self.scheduler
+            .requests
+            .request_mut(self.id.ok_or(SpeculativeControlError::NotQuiescent)?)
+            .expect("submitted request")
+            .control_override_sampling(
+                action.temperature(),
+                action.reseed(),
+                self.scheduler.context,
+            )?;
+        Ok(self.sampling_state().expect("supported sampler"))
+    }
+    fn force_next_token(&mut self, token: u32) -> Result<(), SpeculativeControlError> {
+        self.healthy()?;
+        self.scheduler
+            .requests
+            .request_mut(self.id.ok_or(SpeculativeControlError::NotQuiescent)?)
+            .expect("submitted request")
+            .control_force_next(token, self.vocabulary)
+    }
+    fn clear_forced_token(&mut self) -> Result<bool, SpeculativeControlError> {
+        self.healthy()?;
+        let request = self
+            .scheduler
+            .requests
+            .request_mut(self.id.ok_or(SpeculativeControlError::NotQuiescent)?)
+            .expect("submitted request");
+        request.validate_control_edit()?;
+        Ok(request.sampler_mut().control_clear_forced())
+    }
+    fn intervene(
+        &mut self,
+        plans: Vec<eredu_core::speculative::SpeculativeInterventionPlan>,
+    ) -> Result<(), SpeculativeControlError> {
+        self.healthy()?;
+        if !plans.is_empty() {
+            let discovery = self.intervention_discovery.as_ref().ok_or(
+                SpeculativeControlError::Unsupported(
+                    "loaded execution has no speculative intervention discovery",
+                ),
+            )?;
+            for plan in &plans {
+                let checked = plan.plan.plan().clone().admit(
+                    discovery,
+                    plan.plan.request(),
+                    plan.plan.session_id(),
+                )?;
+                if checked.identity() != plan.plan.identity() {
+                    return Err(SpeculativeControlError::Invalid(
+                        "intervention belongs to another loaded source or session",
+                    ));
+                }
+            }
+        }
+        if let Some(lane) = self.lane.as_mut() {
+            return lane.runtime_mut().sampler_mut().control_intervene(plans);
+        }
+        let request = self
+            .scheduler
+            .requests
+            .request_mut(self.id.ok_or(SpeculativeControlError::NotQuiescent)?)
+            .expect("submitted request");
+        request.validate_control_edit()?;
+        request.sampler_mut().control_intervene(plans)
     }
     fn epoch(&self) -> u64 {
         self.epoch
@@ -407,53 +636,14 @@ where
         })
     }
     fn snapshot(&mut self) -> Result<SpeculativeSnapshotHandle, SpeculativeControlError> {
-        self.healthy()?;
-        let request = self
-            .request()
-            .ok_or(SpeculativeControlError::NotQuiescent)?;
-        if !request.is_control_boundary() {
-            return Err(SpeculativeControlError::NotQuiescent);
-        }
-        let budget = self
-            .budget
-            .as_ref()
-            .ok_or(SpeculativeControlError::Unsupported(
-                "snapshot limits were not supplied",
-            ))?;
-        let estimate = request
-            .control_snapshot_estimate(self.scheduler.executor)
-            .ok_or(ExecutionControlError::UnknownEstimate)?;
-        // Include the scope's saved-state envelope and conservative map-node
-        // storage as well as the core/native snapshot payload.
-        let overhead = (std::mem::size_of::<Saved<E, S, C>>() as u64)
-            .checked_add(256)
-            .ok_or(ExecutionControlError::Overflow)?;
-        let estimate = SnapshotEstimate {
-            retained_bytes: estimate
-                .retained_bytes
-                .checked_add(overhead)
-                .ok_or(ExecutionControlError::Overflow)?,
-            copy_bytes: estimate
-                .copy_bytes
-                .checked_add(overhead)
-                .ok_or(ExecutionControlError::Overflow)?,
-        };
         let next = self
             .next_snapshot
             .checked_add(1)
             .ok_or(ExecutionControlError::Overflow)?;
-        let reservation = budget.reserve(SnapshotResourceKind::Snapshot, Some(estimate))?;
-        let state = request.control_snapshot(self.scheduler.executor, self.scheduler.context)?;
+        let saved = self.save_state(SnapshotResourceKind::Snapshot)?;
         let id = self.next_snapshot;
         self.next_snapshot = next;
-        self.snapshots.insert(
-            id,
-            Saved {
-                state,
-                estimate,
-                _reservation: reservation,
-            },
-        );
+        self.snapshots.insert(id, saved);
         Ok(SpeculativeSnapshotHandle {
             owner: Arc::clone(&self.owner),
             id,
@@ -465,6 +655,9 @@ where
     ) -> Result<(), SpeculativeControlError> {
         self.healthy()?;
         self.owned(handle)?;
+        if self.snapshots[&handle.id].run_id != self.run_id {
+            return Err(SpeculativeControlError::IncompatibleSnapshot);
+        }
         let epoch = self
             .epoch
             .checked_add(1)
@@ -519,6 +712,8 @@ pub struct DriveControlledSpeculation<'f, F> {
     options: ControlledSpeculativeOptions,
     drive: F,
     failure: &'f mut Option<SpeculativeControlError>,
+    vocabulary: usize,
+    intervention_discovery: Option<eredu_core::intervention::InterventionDiscovery>,
 }
 impl<'f, F> DriveControlledSpeculation<'f, F> {
     /// Starts active preparation timing before facade and backend preparation.
@@ -533,7 +728,24 @@ impl<'f, F> DriveControlledSpeculation<'f, F> {
             options,
             drive,
             failure,
+            vocabulary: 0,
+            intervention_discovery: None,
         }
+    }
+}
+impl<F> DriveControlledSpeculation<'_, F> {
+    /// Retains exact loaded capabilities for re-admission of prospective edits.
+    pub fn with_intervention_discovery(
+        mut self,
+        discovery: Option<eredu_core::intervention::InterventionDiscovery>,
+    ) -> Self {
+        self.intervention_discovery = discovery;
+        self
+    }
+    /// Supplies the canonical tokenizer ID ceiling; the sampler also checks its active grammar.
+    pub fn with_vocabulary(mut self, vocabulary: usize) -> Self {
+        self.vocabulary = vocabulary;
+        self
     }
 }
 impl<F> SpeculativeGenerationVisitor for DriveControlledSpeculation<'_, F>
@@ -583,6 +795,9 @@ where
                 id: None,
                 owner: Arc::new(()),
                 snapshots: BTreeMap::new(),
+                branches: BTreeMap::new(),
+                next_branch: 1,
+                run_id: 0,
                 next_snapshot: 0,
                 budget: self.options.snapshots.map(SnapshotBudget::new),
                 trace: TraceBudget::new(self.options.trace_limits),
@@ -591,6 +806,8 @@ where
                 preparation: self.run.started.elapsed(),
                 timing: GenerationTiming::default(),
                 failed: false,
+                vocabulary: self.vocabulary,
+                intervention_discovery: self.intervention_discovery,
             };
             (self.drive)(&mut session)?;
             session.healthy()?;

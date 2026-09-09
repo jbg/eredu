@@ -87,6 +87,35 @@ impl InterventionRun {
 }
 
 impl CaptureSession {
+    /// Selects an already admitted plan between drained prediction steps. Used
+    /// when speculative target/draft rows or isolated branches share one ledger.
+    /// No observation budget or completed evidence is reset by a role switch.
+    pub fn select_prediction_interventions(
+        &mut self,
+        plan: Option<AdmittedInterventionPlan>,
+        estimator: std::sync::Arc<dyn InterventionEstimator>,
+    ) -> Result<(), CaptureError> {
+        if !self.checkpoint_ready || self.records.is_some() {
+            return Err(CaptureError::Invalid(
+                "intervention selection requires a drained successful step".into(),
+            ));
+        }
+        if plan
+            .as_ref()
+            .is_some_and(|plan| plan.request() != self.plan.request())
+        {
+            return Err(CaptureError::Invalid(
+                "capture and intervention request geometry differs".into(),
+            ));
+        }
+        self.interventions = plan.filter(|p| !p.is_empty()).map(|plan| InterventionRun {
+            plan,
+            records: None,
+            routing_pending: None,
+            estimator,
+        });
+        Ok(())
+    }
     /// Installs an immutable intervention plan before the first step. Both plans
     /// share one ledger; capture-none budgets must still allow outcome metadata.
     pub fn enable_interventions(

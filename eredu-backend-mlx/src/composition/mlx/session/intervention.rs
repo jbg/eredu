@@ -36,7 +36,7 @@ pub(crate) fn mechanisms() -> InterventionMechanisms {
 }
 
 /// Cold MLX bounds: the same estimator is used at admission and before execution.
-pub(super) struct NativeInterventionEstimator;
+pub(crate) struct NativeInterventionEstimator;
 impl InterventionEstimator for NativeInterventionEstimator {
     fn validate_geometry(
         &self,

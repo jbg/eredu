@@ -1007,9 +1007,43 @@ impl SpeculativeExecutor for MockSpeculativeExecutor {
 }
 
 #[derive(Clone)]
-struct MockSpeculativeSampling;
+struct MockSpeculativeSampling {
+    forced: Option<(u32, usize)>,
+}
 
 impl SpeculativeSampling for MockSpeculativeSampling {
+    fn control_requires_positive_temperature(&self) -> Option<bool> {
+        Some(false)
+    }
+    fn control_seed<'a>(
+        _: u64,
+        _: (),
+    ) -> Result<(), eredu_core::speculative::SpeculativeControlError>
+    where
+        Self: 'a,
+    {
+        Ok(())
+    }
+    fn control_force_next(
+        &mut self,
+        token: u32,
+        vocabulary: usize,
+        position: usize,
+    ) -> Result<(), eredu_core::speculative::SpeculativeControlError> {
+        if token as usize >= vocabulary || self.forced.is_some() {
+            return Err(eredu_core::speculative::SpeculativeControlError::Invalid(
+                "invalid or already pending token",
+            ));
+        }
+        self.forced = Some((token, position));
+        Ok(())
+    }
+    fn control_clear_forced(&mut self) -> bool {
+        self.forced.take().is_some()
+    }
+    fn control_pending_forced(&self) -> Option<u32> {
+        self.forced.map(|p| p.0)
+    }
     fn control_snapshot_bytes(&self, _: Option<&()>, _: Option<&()>) -> Option<u64> {
         Some(0)
     }
@@ -1079,14 +1113,17 @@ impl SpeculativeSampling for MockSpeculativeSampling {
         &mut self,
         logits: &Self::Logits,
         _: f32,
-        _: &[u32],
+        history: &[u32],
         _: SamplingPlacement,
         _: Self::Context<'a>,
     ) -> Result<Self::Distribution, Self::Error>
     where
         Self: 'a,
     {
-        Ok(*logits)
+        Ok(self
+            .forced
+            .filter(|p| p.1 == history.len())
+            .map_or(*logits, |p| p.0))
     }
 
     fn sample<'a>(
@@ -1150,6 +1187,7 @@ impl SpeculativeSampling for MockSpeculativeSampling {
     where
         Self: 'a,
     {
+        self.forced = None;
         Ok(())
     }
 }
@@ -1198,7 +1236,7 @@ impl SpeculativeGenerationBackend for MockBackend {
                 lane.take_prompt(),
                 config,
                 SpeculativeOutputRuntime::new(
-                    MockSpeculativeSampling,
+                    MockSpeculativeSampling { forced: None },
                     sequence,
                     SpeculativeSemanticConstraint::semantic(lane.take_semantic()),
                     SpeculativeCallbackPublisher::semantic(lane.take_on_event()),

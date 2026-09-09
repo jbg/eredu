@@ -5,6 +5,7 @@ use super::*;
 pub struct MlxSpeculativeSampling<S> {
     inner: S,
     capture: Option<std::rc::Rc<std::cell::RefCell<LogitCapture>>>,
+    interventions: Vec<eredu_core::speculative::SpeculativeInterventionPlan>,
 }
 
 impl<S> MlxSpeculativeSampling<S> {
@@ -13,6 +14,7 @@ impl<S> MlxSpeculativeSampling<S> {
         Self {
             inner,
             capture: None,
+            interventions: Vec::new(),
         }
     }
 
@@ -44,6 +46,34 @@ where
         Self: 'a;
     type Error = Exception;
 
+    fn control_requires_positive_temperature(&self) -> Option<bool> {
+        self.inner.control_requires_positive_temperature()
+    }
+    fn control_seed<'a>(
+        seed: u64,
+        _: Self::Context<'a>,
+    ) -> Result<Self::Seed, eredu_core::speculative::SpeculativeControlError>
+    where
+        Self: 'a,
+    {
+        safemlx::random::key(seed)
+            .map_err(eredu_core::speculative::SpeculativeControlError::backend)
+    }
+    fn control_force_next(
+        &mut self,
+        token: u32,
+        vocabulary: usize,
+        position: usize,
+    ) -> Result<(), eredu_core::speculative::SpeculativeControlError> {
+        self.inner
+            .control_force_next(token, eredu_runtime::TokenDomain::new(vocabulary), position)
+    }
+    fn control_clear_forced(&mut self) -> bool {
+        self.inner.control_clear_forced()
+    }
+    fn control_pending_forced(&self) -> Option<u32> {
+        self.inner.control_pending_forced()
+    }
     fn control_snapshot_bytes(
         &self,
         target: Option<&RandomState>,
@@ -55,6 +85,11 @@ where
                 .checked_add(array.nbytes() as u64)?
                 .checked_add(4096)?;
         }
+        for plan in &self.interventions {
+            bytes = bytes.checked_add(
+                eredu_runtime::execution_control::admitted_intervention_storage_bytes(&plan.plan)?,
+            )?;
+        }
         bytes.checked_add(std::mem::size_of::<Self>() as u64)
     }
 
@@ -62,10 +97,6 @@ where
         &mut self,
         plan: eredu_core::capture::AdmittedCapturePlan,
     ) -> Result<(), eredu_core::capture::CaptureError> {
-        if plan.is_empty() {
-            self.capture = None;
-            return Ok(());
-        }
         validate_control_capture(&plan)?;
         self.capture = Some(std::rc::Rc::new(std::cell::RefCell::new(LogitCapture {
             session: eredu_runtime::capture::CaptureSession::new(plan),
@@ -80,6 +111,46 @@ where
         self.capture.as_ref().map_or_else(Vec::new, |capture| {
             std::mem::take(&mut capture.borrow_mut().records)
         })
+    }
+
+    fn control_intervene(
+        &mut self,
+        plans: Vec<eredu_core::speculative::SpeculativeInterventionPlan>,
+    ) -> Result<(), eredu_core::speculative::SpeculativeControlError> {
+        use eredu_core::speculative::SpeculativeControlError;
+        if plans.len() > 2 || (plans.len() == 2 && plans[0].role == plans[1].role) {
+            return Err(SpeculativeControlError::Invalid(
+                "supply at most one intervention plan for each model role",
+            ));
+        }
+        if !plans.is_empty() {
+            let capture = self
+                .capture
+                .as_ref()
+                .ok_or(SpeculativeControlError::Invalid(
+                    "tensor interventions require an explicit capture/evidence budget",
+                ))?
+                .borrow();
+            for plan in &plans {
+                if plan
+                    .plan
+                    .points()
+                    .iter()
+                    .any(|point| point.path != eredu_core::MODEL_LOGITS_OBSERVATION_PATH)
+                {
+                    return Err(SpeculativeControlError::Unsupported(
+                        "speculative tensor edits currently support model.logits only",
+                    ));
+                }
+                eredu_runtime::intervention::preflight(
+                    capture.session.plan(),
+                    &plan.plan,
+                    &crate::composition::mlx::session::intervention::NativeInterventionEstimator,
+                )?;
+            }
+        }
+        self.interventions = plans;
+        Ok(())
     }
 
     fn supports_exact_optimistic_promotion(&self) -> bool {
@@ -165,17 +236,28 @@ where
     where
         Self: 'a,
     {
-        if let Some(capture) = &self.capture {
+        let role = match placement {
+            SamplingPlacement::Target => eredu_core::speculative::SpeculativeCaptureRole::Target,
+            SamplingPlacement::Draft => eredu_core::speculative::SpeculativeCaptureRole::Draft,
+            _ => return Err(Exception::custom("unsupported speculative sampling role")),
+        };
+        let effective = if let Some(capture) = &self.capture {
             capture.borrow_mut().observe(
                 logits,
                 history.len() as u64,
                 placement,
+                self.interventions
+                    .iter()
+                    .find(|p| p.role == role)
+                    .map(|p| &p.plan),
                 sampling_stream(placement, context)?,
-            )?;
-        }
+            )?
+        } else {
+            None
+        };
         SpeculativeSampler::<MlxSamplingBackend>::process_logits(
             &mut self.inner,
-            &MlxTensor::from_array(logits.clone()),
+            &MlxTensor::from_array(effective.unwrap_or_else(|| logits.clone())),
             temperature,
             history,
             sampling_stream(placement, context)?,
@@ -362,8 +444,9 @@ impl LogitCapture {
         logits: &Array,
         position: u64,
         placement: SamplingPlacement,
+        intervention: Option<&eredu_core::intervention::AdmittedInterventionPlan>,
         stream: &Stream,
-    ) -> Result<(), Exception> {
+    ) -> Result<Option<Array>, Exception> {
         use eredu_core::{
             capture::CapturePhase,
             speculative::{SpeculativeCaptureRole, SpeculativePredictionCapture},
@@ -383,6 +466,14 @@ impl LogitCapture {
             CapturePhase::Decode
         };
         self.session
+            .select_prediction_interventions(
+                intervention.cloned(),
+                std::sync::Arc::new(
+                    crate::composition::mlx::session::intervention::NativeInterventionEstimator,
+                ),
+            )
+            .map_err(|e| Exception::custom(e.to_string()))?;
+        self.session
             .begin_step(phase, position)
             .map_err(|e| Exception::custom(e.to_string()))?;
         // Sampling receives one vocabulary row. Normalize only its logical shape
@@ -399,6 +490,17 @@ impl LogitCapture {
                 &tensor,
             )
             .map_err(|e| Exception::custom(e.to_string()))?;
+        let effective = self
+            .session
+            .intervene(
+                &mut backend,
+                eredu_core::MODEL_LOGITS_OBSERVATION_PATH,
+                &tensor,
+            )
+            .map_err(|e| Exception::custom(e.to_string()))?;
+        self.session
+            .finish_interventions()
+            .map_err(|e| Exception::custom(e.to_string()))?;
         if let Some(capture) = self.session.take_step() {
             self.records.push(SpeculativePredictionCapture {
                 role,
@@ -406,7 +508,9 @@ impl LogitCapture {
                 capture,
             });
         }
-        Ok(())
+        effective
+            .map(|value| value.into_array().reshape(logits.shape(), stream))
+            .transpose()
     }
 }
 

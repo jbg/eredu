@@ -14,7 +14,7 @@ pub use checkpoint::{
 pub struct CaptureSession {
     // Identity is deliberately not serialized or copied into child sessions.
     owner: std::sync::Arc<()>,
-    checkpoint_ready: bool,
+    pub(crate) checkpoint_ready: bool,
     has_step: bool,
     pub(crate) plan: AdmittedCapturePlan,
     pub(crate) ledger: CaptureLedger,

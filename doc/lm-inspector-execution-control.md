@@ -237,3 +237,49 @@ raw target/draft logits; other layer paths need explicit speculative attribution
 These are capability limitations, not reasons to switch to a separate generation
 implementation. See [execution control](execution-control.md#controlled-speculative-generation)
 for the complete boundary and exception list.
+
+### Speculative forks and prospective interventions
+
+Keep opaque branch handles on the same worker as snapshot handles. After prefill,
+create a snapshot at a canonical boundary and call `session.fork(&snapshot)`.
+`session.exchange(&branch)` activates that child and stores the previous run in the
+same slot. Record the returned run ID and canonical prefix before advancing it;
+route the request's semantic callback to that active run's journal. Each step also
+carries `run_id`, monotone `sequence` and `epoch`. Restore snapshots only into their
+own logical run. Forking from another run's snapshot in the same scope is allowed.
+
+```rust,ignore
+let snapshot = session.snapshot()?;
+let child = session.fork(&snapshot)?;
+let active = session.exchange(&child)?;
+// Reconcile the Inspector's selected journal with active.run_id/token_ids.
+session.override_sampling(SamplingOverride {
+    temperature: Some(0.7), reseed: Some(42),
+})?;
+session.force_next_token(alternative_token)?;
+while let Some(step) = session.step()? {
+    // Visualize step.drafted, step.verification and step.captures for step.run_id.
+}
+session.exchange(&child)?; // The parent resumes from where it was paused.
+session.release_branch(&child)?;
+```
+
+For tensor experiments, prepare one-row capture admission and separate admitted
+plans for `SpeculativeCaptureRole::Target` and `Draft` with
+`model.prepare_speculative_intervention(&capture, role, plan)`. Pass the capture
+admission in `ControlledSpeculativeOptions`, then install those plans using
+`session.intervene(vec![target_plan, draft_plan])` before prefill or at a canonical
+boundary. Omitted roles have no edits. Ordinary `InterventionPlan` schedules and
+slices use absolute generated positions and a `[1, 1, vocabulary]` prediction row.
+Raw captures remain before-edit observations; each prediction's intervention
+records contain applied/inactive outcomes and bounded before/after evidence.
+
+MLX supports logits edits using the existing native activation primitives. Layer
+and routing edits need architecture observer hooks with speculative attribution,
+so discovery omits them. Branch exchange uses bounded exact state copies; ensure
+copy limits cover both sides of each switch. Capture, trace and TTFT remain scoped
+to the shared request, and neither switching nor restoring replenishes budgets.
+The external Gemma CPU regression forces a child token, applies conflicting target
+and draft logits, observes rejection, replays the edited child, then verifies the
+unedited parent still reproduces its original suffix after checkpoint files have
+been removed.

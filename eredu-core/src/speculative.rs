@@ -236,6 +236,25 @@ pub trait SpeculativeGenerationBackend: TextGenerationBackend {
     /// Reports fail-closed speculative support for the selected model session.
     fn speculative_capability(runtime: &ModelRuntime<Self>) -> SpeculativeCapability;
 
+    /// Genuine mutable hooks with explicit speculative attribution.
+    fn speculative_intervention_discovery(
+        _runtime: &ModelRuntime<Self>,
+    ) -> Result<crate::intervention::InterventionDiscovery, crate::capture::CaptureError> {
+        Err(crate::capture::CaptureError::Unsupported(
+            "backend has no speculative tensor interventions".into(),
+        ))
+    }
+    /// Validates edit geometry, exact loaded capabilities and evidence budgets.
+    fn validate_speculative_interventions(
+        _runtime: &ModelRuntime<Self>,
+        _capture: &crate::capture::AdmittedCapturePlan,
+        _plan: &crate::intervention::AdmittedInterventionPlan,
+    ) -> Result<(), crate::capture::CaptureError> {
+        Err(crate::capture::CaptureError::Unsupported(
+            "backend has no speculative tensor interventions".into(),
+        ))
+    }
+
     /// Validates speculative observation support without allocating or executing.
     /// Ordinary capture support does not imply attribution for speculative phases.
     fn validate_speculative_capture(
@@ -1027,6 +1046,54 @@ pub trait SpeculativeGenerationVisitor {
 /// accept-or-replace algorithm. Core owns when those mechanisms run, which
 /// token is selected, and when tentative sampler state is promoted.
 pub trait SpeculativeSampling: Clone {
+    /// Installs immutable role-specific plans, preserving the shared capture ledger.
+    fn control_intervene(
+        &mut self,
+        plans: Vec<SpeculativeInterventionPlan>,
+    ) -> Result<(), SpeculativeControlError> {
+        if plans.is_empty() {
+            Ok(())
+        } else {
+            Err(SpeculativeControlError::Unsupported(
+                "sampler has no speculative tensor interventions",
+            ))
+        }
+    }
+    /// Whether prospective temperature changes are supported and require a positive value.
+    fn control_requires_positive_temperature(&self) -> Option<bool> {
+        None
+    }
+    /// Creates an explicit seed without drawing from the current streams.
+    fn control_seed<'a>(
+        _seed: u64,
+        _context: Self::Context<'a>,
+    ) -> Result<Self::Seed, SpeculativeControlError>
+    where
+        Self: 'a,
+    {
+        Err(SpeculativeControlError::Unsupported(
+            "sampler has no explicit reseeding",
+        ))
+    }
+    /// Stages a single canonical decision; tentative clones retain its absolute position.
+    fn control_force_next(
+        &mut self,
+        _token: u32,
+        _vocabulary: usize,
+        _position: usize,
+    ) -> Result<(), SpeculativeControlError> {
+        Err(SpeculativeControlError::Unsupported(
+            "sampler has no token forcing",
+        ))
+    }
+    /// Clears an uncommitted choice without advancing state.
+    fn control_clear_forced(&mut self) -> bool {
+        false
+    }
+    /// Canonical choice waiting for target commitment.
+    fn control_pending_forced(&self) -> Option<u32> {
+        None
+    }
     /// Raw model logits.
     type Logits;
     /// Processed distribution retained for verification.

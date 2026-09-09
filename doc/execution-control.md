@@ -74,10 +74,54 @@ rows, and every sampled draft proposal, including rejected work. It reuses the
 ordinary bounded transformations (including top candidates, summaries and slices)
 and one shared cumulative ledger. Other layer activation paths reject explicitly:
 they need draft/verification attribution in the architecture observer adapter.
-Speculative forcing, prospective sampler overrides and isolated branch handles
-are not exposed by this scope; do not infer those capabilities from ordinary
-controlled sessions. Initial speculative snapshots additionally need a portable
-copy contract for backend-owned prefill input.
+At a canonical boundary, `fork(&snapshot)` creates an inactive branch slot and
+`exchange(&branch)` swaps its logical run with the active run. `run_id()` and the
+step record's `run_id` identify the active run; `branch_info()` describes the
+inactive prefix. Forks may originate from any snapshot in the same scope, but
+`restore()` accepts only snapshots of the active logical run. `release_branch()`
+releases inactive retention. Returning from the scope returns the active run's
+output and releases all inactive branches. Cancellation ends the whole scope.
+
+Fork creation shares the immutable saved payload. Exchange uses the existing
+exact snapshot/restore mechanisms, without forward execution, loading weights or
+replaying semantic events. Unlike ordinary zero-copy exchange, speculative exchange
+copies the outgoing and incoming states. The shared `SnapshotBudget` reserves both
+copies before installation, including actual state growth. Branch slots consume
+`max_branches`; a source snapshot retained by a branch still consumes its snapshot
+reservation until its last reference is released. Unknown costs and budget failures
+reject an exchange before installation. Native restoration failures fence the scope.
+Timing, delivery sequence/epoch, trace and capture budgets belong to the whole
+scope and never rewind or multiply when branches are created. TTFT continues to
+describe the first token of the common request, including the inherited prefix.
+
+`force_next_token(id)` uses the ordinary `TokenChoiceController` to validate the
+canonical tokenizer domain and active grammar before restricting just that absolute
+prediction. Tentative draft histories do not consume the choice; target commitment
+consumes it once through the existing acceptance, sampling and semantic path. Step
+records identify a consumed `forced_token`. `clear_forced_token()` removes a pending
+choice. `override_sampling(SamplingOverride)` shares ordinary temperature/RNG
+validation; temperature changes retain both speculative streams, explicit reseeding
+replaces both, and adaptive sampling rejects zero temperature. Snapshots preserve
+pending choices, temperature, RNG, adaptation, and immutable edit plans. Edits and
+sampling changes reject retained proposals, in-flight verification and terminal runs.
+
+Use `speculative_intervention_discovery()` and
+`prepare_speculative_intervention(&capture, role, plan)` to admit tensor edits, then
+`session.intervene(plans)` to replace future plans. Supply at most one plan per
+`Target`/`Draft` role; an empty list removes future edits. Plans can also be installed
+before the first `step()`. Pass the capture admission in controlled options even
+for evidence-only edits. MLX supports the existing activation operations at
+`model.logits`: zero, scale, mask, replace, add and logit masking. It observes raw
+values, applies the shared intervention engine, then invokes ordinary constrained
+sampling. Evidence is attributed by model role and absolute prediction position,
+including tentative/rejected work, and charges the same cumulative ledger across
+replays and sibling branches. Admission is rechecked against the exact loaded
+source/session; unsupported layer/routing hooks are absent from discovery rather
+than pretending to support speculative attribution.
+
+Initial speculative snapshots still need a portable copy contract for backend-owned
+prefill input. Embedded prediction forks remain unavailable wherever their complete
+snapshot costs or isolation contracts are unavailable.
 
 ## Feature development rule
 

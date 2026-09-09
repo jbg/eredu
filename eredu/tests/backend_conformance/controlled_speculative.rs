@@ -354,3 +354,119 @@ fn snapshot_handles_are_run_scoped_and_failed_admission_does_not_advance() {
             .unwrap();
     }
 }
+
+#[test]
+fn speculative_forks_isolate_choices_sampling_and_semantics_and_reject_foreign_handles() {
+    let (mut model, chat, settings) = setup();
+    let mut opts = options();
+    opts.snapshots.as_mut().unwrap().max_branches = 1;
+    let mut foreign = None;
+    let events = std::cell::RefCell::new(Vec::new());
+    for pass in 0..2 {
+        model
+            .with_controlled_text_speculative(
+                PreparedChatSpeculativeGenerationRequest {
+                    input: PreparedChatInput::prepared_backend_input(&chat, vec![0]),
+                    drafting: SpeculativeDraft::Embedded,
+                    settings,
+                    options: Default::default(),
+                    caller_stop_sequences: &[],
+                    cancellation: Default::default(),
+                    on_event: |event| events.borrow_mut().push(event),
+                },
+                opts.clone(),
+                |session| {
+                    session.step()?;
+                    if pass == 1 {
+                        assert!(matches!(
+                            session.exchange(foreign.as_ref().unwrap()),
+                            Err(SpeculativeControlError::IncompatibleBranch)
+                        ));
+                        return Ok(());
+                    }
+                    let root = session.snapshot()?;
+                    let child = session.fork(&root)?;
+                    foreign = Some(child.clone());
+                    assert_eq!(session.run_id(), 0);
+                    assert_eq!(session.snapshot_usage().branches, 1);
+                    let before = session.snapshot_usage();
+                    assert!(session.fork(&root).is_err());
+                    assert_eq!(session.snapshot_usage(), before);
+                    while session.step()?.is_some() {}
+                    let original = session.token_ids().to_vec();
+                    let facts = session.sampling_state().unwrap();
+                    session.exchange(&child)?;
+                    assert_ne!(session.run_id(), 0);
+                    assert!(matches!(
+                        session.restore(&root),
+                        Err(SpeculativeControlError::IncompatibleSnapshot)
+                    ));
+                    assert_eq!(session.token_ids(), [7]);
+                    let unchanged = session.sampling_state();
+                    assert!(session
+                        .override_sampling(eredu::api::SamplingOverride {
+                            temperature: Some(-1.0),
+                            reseed: None
+                        })
+                        .is_err());
+                    assert_eq!(session.sampling_state(), unchanged);
+                    session.override_sampling(eredu::api::SamplingOverride {
+                        temperature: Some(0.7),
+                        reseed: Some(42),
+                    })?;
+                    assert!(session.force_next_token(u32::MAX).is_err());
+                    session.force_next_token(12)?;
+                    assert!(session.force_next_token(11).is_err());
+                    let forced = session.snapshot()?;
+                    let baseline_usage = session.snapshot_usage();
+                    let mut replay = Vec::new();
+                    let mut semantic_replays = Vec::new();
+                    for pass in 0..2 {
+                        let first_event = events.borrow().len();
+                        let mut committed = Vec::new();
+                        let mut forced_count = 0;
+                        while let Some(step) = session.step()? {
+                            assert_eq!(step.run_id, session.run_id());
+                            forced_count += usize::from(step.forced_token == Some(12));
+                            committed.extend(step.committed_token_ids);
+                            if step.status == Status::ReadyToSubmitVerification {
+                                assert!(matches!(
+                                    session.force_next_token(11),
+                                    Err(SpeculativeControlError::NotQuiescent)
+                                ));
+                                assert!(matches!(
+                                    session.exchange(&child),
+                                    Err(SpeculativeControlError::NotQuiescent)
+                                ));
+                            }
+                        }
+                        assert_eq!(forced_count, 1);
+                        assert_eq!(committed[0], 12);
+                        replay.push(committed);
+                        semantic_replays.push(events.borrow()[first_event..].to_vec());
+                        if pass == 0 {
+                            session.restore(&forced)?;
+                        }
+                    }
+                    assert_eq!(replay[0], replay[1]);
+                    assert_eq!(semantic_replays[0], semantic_replays[1]);
+                    assert!(
+                        session.snapshot_usage().cumulative_copy_bytes
+                            > baseline_usage.cumulative_copy_bytes
+                    );
+                    session.exchange(&child)?;
+                    assert_eq!(session.run_id(), 0);
+                    assert_eq!(session.token_ids(), original);
+                    assert_eq!(session.sampling_state(), Some(facts));
+                    assert_eq!(session.branch_info(&child)?.token_ids[1], 12);
+                    session.release_snapshot(&forced)?;
+                    session.release_snapshot(&root)?;
+                    session.release_branch(&child)?;
+                    assert_eq!(session.snapshot_usage().branches, 0);
+                    assert_eq!(session.snapshot_usage().retained_bytes, 0);
+                    Ok(())
+                },
+            )
+            .unwrap();
+    }
+}

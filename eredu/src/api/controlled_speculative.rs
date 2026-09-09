@@ -3,15 +3,16 @@
 use super::request::PreparedGenerationMode;
 use super::{LoadedModel, PreparedChatSpeculativeError, PreparedChatSpeculativeGenerationRequest};
 pub use eredu_core::speculative::{
-    SpeculativeCaptureRole, SpeculativeControlError, SpeculativePredictionCapture,
-    SpeculativeProposalView,
+    SpeculativeCaptureRole, SpeculativeControlError, SpeculativeInterventionPlan,
+    SpeculativePredictionCapture, SpeculativeProposalView,
 };
 use eredu_core::{
     generation::SemanticEvent, SpeculativeGenerationBackend, SpeculativeGenerationOutput,
 };
 pub use eredu_runtime::speculative::{
     ControlledSpeculativeOptions, ControlledSpeculativeSession, ControlledSpeculativeStep,
-    SpeculativeProposalDisposition, SpeculativeSnapshotHandle, SpeculativeVerificationRecord,
+    SpeculativeBranchHandle, SpeculativeBranchInfo, SpeculativeProposalDisposition,
+    SpeculativeSnapshotHandle, SpeculativeVerificationRecord,
 };
 
 /// Preparation or controlled speculative execution failure, with neutral causes.
@@ -46,6 +47,28 @@ impl<B: SpeculativeGenerationBackend> LoadedModel<B> {
         )?;
         B::validate_speculative_capture(&self.runtime, &plan)?;
         Ok(plan)
+    }
+
+    /// Genuine mutable points with speculative phase attribution for this session.
+    pub fn speculative_intervention_discovery(
+        &self,
+    ) -> Result<eredu_core::intervention::InterventionDiscovery, eredu_core::capture::CaptureError>
+    {
+        B::speculative_intervention_discovery(&self.runtime)
+    }
+
+    /// Admits a target- or draft-specific edit under the existing capture budget.
+    /// Supply the same capture plan in controlled options, even for evidence-only runs.
+    pub fn prepare_speculative_intervention(
+        &self,
+        capture: &eredu_core::capture::AdmittedCapturePlan,
+        role: SpeculativeCaptureRole,
+        plan: eredu_core::intervention::InterventionPlan,
+    ) -> Result<SpeculativeInterventionPlan, eredu_core::capture::CaptureError> {
+        let discovery = self.speculative_intervention_discovery()?;
+        let plan = plan.admit(&discovery, capture.request(), &self.session_identity)?;
+        B::validate_speculative_interventions(&self.runtime, capture, &plan)?;
+        Ok(SpeculativeInterventionPlan { role, plan })
     }
 
     /// Lends a controlled speculative chat to an Inspector or worker command loop.
@@ -125,7 +148,16 @@ impl<B: SpeculativeGenerationBackend> LoadedModel<B> {
             options,
             drive,
             &mut failure,
-        );
+        )
+        .with_vocabulary(
+            self.tokenizer
+                .get_vocab(true)
+                .values()
+                .copied()
+                .max()
+                .map_or(0, |id| id as usize + 1),
+        )
+        .with_intervention_discovery(B::speculative_intervention_discovery(&self.runtime).ok());
         if let Some(plan) = capture.as_ref() {
             if plan.request().prompt_tokens != 1 || plan.request().batch != 1 {
                 return Err(SpeculativeControlError::Capture(eredu_core::capture::CaptureError::Invalid(

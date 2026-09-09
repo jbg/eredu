@@ -330,6 +330,32 @@ impl<'world> SpeculativeGenerationBackend for MlxBackend<'world> {
         <Self as eredu_core::TextGenerationBackend>::validate_text_capture(runtime, plan)
     }
 
+    fn speculative_intervention_discovery(
+        runtime: &ModelRuntime<Self>,
+    ) -> Result<eredu_core::intervention::InterventionDiscovery, eredu_core::capture::CaptureError>
+    {
+        let mut discovery =
+            <Self as eredu_core::TextGenerationBackend>::intervention_discovery(runtime)?;
+        discovery
+            .points
+            .retain(|point| point.path == eredu_core::MODEL_LOGITS_OBSERVATION_PATH);
+        Ok(discovery)
+    }
+    fn validate_speculative_interventions(
+        runtime: &ModelRuntime<Self>,
+        capture: &eredu_core::capture::AdmittedCapturePlan,
+        plan: &eredu_core::intervention::AdmittedInterventionPlan,
+    ) -> Result<(), eredu_core::capture::CaptureError> {
+        Self::validate_speculative_capture(runtime, capture)?;
+        let discovery = Self::speculative_intervention_discovery(runtime)?;
+        eredu_runtime::intervention::validate_session(
+            capture,
+            plan,
+            &discovery,
+            &super::session::intervention::NativeInterventionEstimator,
+        )
+    }
+
     fn with_speculative_execution<C, V>(
         runtime: &mut ModelRuntime<Self>,
         request: SpeculativeGenerationBatchRequest<'_, Self, Self::Drafter, C>,

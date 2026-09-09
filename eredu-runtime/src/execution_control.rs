@@ -8,8 +8,8 @@ mod sampling;
 mod snapshot;
 pub use choice::{TokenChoiceController, TokenChoiceError};
 pub use sampling::{
-    apply_prepared_sampling_override, apply_sampling_override, SamplingOverride,
-    SamplingOverrideError, SamplingStateFacts, TextSamplingControlBackend,
+    apply_prepared_sampling_override, apply_sampling_override, validate_sampling_override,
+    SamplingOverride, SamplingOverrideError, SamplingStateFacts, TextSamplingControlBackend,
     ValidatedSamplingOverride,
 };
 
@@ -313,3 +313,15 @@ mod tests;
 
 mod trace;
 pub use trace::{TraceBudget, TraceLimits};
+
+/// Complete logical host storage of the supported immutable intervention DTO.
+pub fn admitted_intervention_storage_bytes(
+    plan: &eredu_core::intervention::AdmittedInterventionPlan,
+) -> Option<u64> {
+    storage::heap_bytes(plan.plan())?
+        .checked_add(storage::heap_bytes(plan.points())?)?
+        .checked_add(plan.identity().len() as u64)?
+        .checked_add(plan.artifact_identity().len() as u64)?
+        .checked_add(plan.session_id().len() as u64)?
+        .checked_add(std::mem::size_of_val(plan) as u64)
+}

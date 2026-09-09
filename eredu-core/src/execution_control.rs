@@ -236,6 +236,8 @@ pub enum SnapshotResourceKind {
     Branch,
     /// Provisional replacement during restoration; no additional persistent object.
     Restore,
+    /// Retained copy within an existing branch slot, without another visible handle.
+    BranchCopy,
 }
 
 /// Observed logical snapshot accounting, separate from capture/transport limits.

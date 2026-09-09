@@ -61,6 +61,9 @@ impl MlxTextSampler {
 }
 
 impl SpeculativeSampler<MlxSamplingBackend> for MlxTextSampler {
+    fn control_requires_positive_temperature(&self) -> Option<bool> {
+        Some(matches!(self, Self::MirostatV2(_)))
+    }
     fn control_snapshot_bytes(&self) -> Option<u64> {
         let history = match self {
             Self::Standard(sampler) => sampler.generated_tokens(),

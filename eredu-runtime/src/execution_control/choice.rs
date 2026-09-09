@@ -39,6 +39,7 @@ pub struct TokenChoiceController<C> {
     domain: TokenDomain,
     pending: Option<u32>,
     last_forced: bool,
+    pending_position: Option<usize>,
 }
 
 impl<C: TokenFilterController> TokenChoiceController<C> {
@@ -49,6 +50,7 @@ impl<C: TokenFilterController> TokenChoiceController<C> {
             domain,
             pending: None,
             last_forced: false,
+            pending_position: None,
         }
     }
     /// Stages a choice after checking vocabulary and the current active grammar.
@@ -68,6 +70,26 @@ impl<C: TokenFilterController> TokenChoiceController<C> {
         self.pending = Some(token);
         Ok(())
     }
+    /// Stages the same one-token choice at a speculative absolute position.
+    pub fn force_at(
+        &mut self,
+        token: u32,
+        domain: TokenDomain,
+        position: usize,
+    ) -> Result<(), TokenChoiceError<C::Error>> {
+        let previous = self.domain;
+        self.domain = domain;
+        if let Err(error) = self.force_next(token) {
+            self.domain = previous;
+            return Err(error);
+        }
+        self.pending_position = Some(position);
+        Ok(())
+    }
+    /// Borrows the underlying canonical constraint owner.
+    pub fn inner_mut(&mut self) -> &mut C {
+        &mut self.inner
+    }
     /// Removes an uncommitted choice without changing history or randomness.
     pub fn clear_forced(&mut self) -> bool {
         self.pending.take().is_some()
@@ -83,6 +105,20 @@ impl<C: TokenFilterController> TokenChoiceController<C> {
     /// Read-only access to the original canonical grammar owner.
     pub fn inner(&self) -> &C {
         &self.inner
+    }
+    fn restrict(
+        &self,
+        filter: TokenFilter,
+        token: u32,
+    ) -> Result<TokenFilter, TokenChoiceError<C::Error>> {
+        let mut allowed = vec![
+            false;
+            filter
+                .allowed_mask()
+                .map_or(self.domain.cardinality(), <[bool]>::len)
+        ];
+        allowed[token as usize] = true;
+        Ok(TokenFilter::allowed(allowed).expect("one canonical candidate is allowed"))
     }
     fn check_filter(filter: &TokenFilter, token: u32) -> Result<(), TokenChoiceError<C::Error>> {
         if !filter.allows(token) {
@@ -103,14 +139,7 @@ impl<C: TokenFilterController> TokenFilterController for TokenChoiceController<C
             return Ok(filter);
         };
         Self::check_filter(&filter, token)?;
-        let mut allowed = vec![
-            false;
-            filter
-                .allowed_mask()
-                .map_or(self.domain.cardinality(), <[bool]>::len)
-        ];
-        allowed[token as usize] = true;
-        Ok(TokenFilter::allowed(allowed).expect("one canonical candidate is allowed"))
+        self.restrict(filter, token)
     }
     fn commit_token(&mut self, token: u32) -> Result<(), Self::Error> {
         if let Some(expected) = self.pending {
@@ -145,7 +174,51 @@ impl<C: SnapshotTokenController> SnapshotTokenController for TokenChoiceControll
             domain: self.domain,
             pending: self.pending,
             last_forced: self.last_forced,
+            pending_position: self.pending_position,
         })
+    }
+}
+
+impl<C: eredu_core::SpeculativeTokenFilterController> eredu_core::SpeculativeTokenFilterController
+    for TokenChoiceController<C>
+{
+    fn control_snapshot_bytes(&self) -> Option<u64> {
+        self.inner
+            .control_snapshot_bytes()?
+            .checked_add(std::mem::size_of::<Self>() as u64)
+    }
+    fn filter_at(&self, history: &[u32]) -> Result<TokenFilter, Self::Error> {
+        let filter = self
+            .inner
+            .filter_at(history)
+            .map_err(TokenChoiceError::Constraint)?;
+        if let (Some(token), Some(position)) = (self.pending, self.pending_position) {
+            if history.len() == position {
+                Self::check_filter(&filter, token)?;
+                return self.restrict(filter, token);
+            }
+            if let Some(&actual) = history.get(position) {
+                if actual != token {
+                    return Err(TokenChoiceError::UnexpectedCommit {
+                        expected: token,
+                        actual,
+                    });
+                }
+            }
+        }
+        Ok(filter)
+    }
+    fn prefix_is_complete(&self, history: &[u32]) -> Result<bool, Self::Error> {
+        if let (Some(expected), Some(position)) = (self.pending, self.pending_position) {
+            if let Some(&actual) = history.get(position) {
+                if actual != expected {
+                    return Err(TokenChoiceError::UnexpectedCommit { expected, actual });
+                }
+            }
+        }
+        self.inner
+            .prefix_is_complete(history)
+            .map_err(TokenChoiceError::Constraint)
     }
 }
 

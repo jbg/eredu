@@ -2604,6 +2604,25 @@ configured, ordered intermediate-layer captures and exact fused block capacity
 through that typed handoff. Ordinary final hidden state is never substituted
 for the declared capture.
 
+Controlled speculative forks reuse the core's exact canonical snapshot contract.
+Runtime owns scope-local branch handles, logical run identity, bounded serial
+exchange and non-rewindable accounting. Immutable source snapshots may be shared;
+activation copies through the same backend snapshot/restore mechanism. Anonymous
+retained branch copies share `SnapshotBudget` without allocating extra user-visible
+snapshot or branch counts. No backend schedules child runs or replays the prompt.
+
+Prospective token restrictions use runtime's ordinary `TokenChoiceController`,
+including grammar checks and absolute speculative positions. Ordinary and speculative
+samplers share temperature/RNG validation. Core snapshots retain configuration,
+choice, both RNG streams and semantic state; the native adapter supplies only seed
+construction and existing sampling primitives. Tensor-edit discovery is a distinct
+speculative capability, re-admitted against the loaded source/session. MLX initially
+exposes prediction-row logits for each model role and uses the shared `CaptureSession`
+and intervention engine for transforms, evidence and cumulative budgets. Selecting
+a role's immutable plan between drained rows never resets that ledger. Additional
+layer/routing hooks require architecture-owned speculative attribution before they
+can appear as supported in discovery.
+
 ## Scheduling and cancellation
 
 The core state machines own queued, prepared, submitted, committed, failed,
