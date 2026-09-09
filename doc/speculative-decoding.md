@@ -199,3 +199,15 @@ or waiting for verification.
 These timings are diagnostic. In particular, time inside the in-flight
 verification interval can include host scheduling of assistant work and should
 not be interpreted as target kernel time.
+
+
+## Inspector and controlled sessions
+
+Use the facade's `with_controlled_chat_speculative` or
+`with_controlled_text_speculative` to drive this same scheduler explicitly from a
+worker command loop. Controlled step records expose tentative proposals, target
+acceptance/rejection, optimistic work and bounded prediction captures. Snapshots
+require complete canonical state and explicit resource limits; see
+[execution control](execution-control.md#controlled-speculative-generation) and
+[the Inspector integration guide](lm-inspector-execution-control.md#ttft-and-speculative-inspection).
+There is no separate controlled acceptance or sampling algorithm.

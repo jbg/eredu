@@ -293,6 +293,12 @@ impl TokenFilterController for PreparedChatSpeculativeConstraint {
 }
 
 impl eredu_core::SpeculativeTokenFilterController for PreparedChatSpeculativeConstraint {
+    fn control_snapshot_bytes(&self) -> Option<u64> {
+        eredu_runtime::execution_control::SnapshotTokenController::snapshot_storage_bytes(
+            &self.controller,
+        )
+    }
+
     fn filter_at(&self, history: &[u32]) -> Result<TokenFilter, Self::Error> {
         self.controller.filter_at(history)
     }
@@ -370,6 +376,15 @@ impl PreparedChatSemanticState {
 }
 
 impl SpeculativeSemanticState for PreparedChatSemanticState {
+    fn control_snapshot_bytes(&self) -> Option<u64> {
+        use crate::runtime::generation::storage::SnapshotStorage;
+        self.pipeline
+            .snapshot_storage_bytes()?
+            .checked_add(self.token_ids.heap_bytes()?)?
+            .checked_add(self.events.heap_bytes()?)?
+            .checked_add(std::mem::size_of::<Self>() as u64)
+    }
+
     fn fork_box(&self) -> Result<Box<dyn SpeculativeSemanticState>, SpeculativeOutputError> {
         let pipeline = self
             .pipeline

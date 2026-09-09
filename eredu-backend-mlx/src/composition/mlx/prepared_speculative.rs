@@ -322,6 +322,14 @@ impl<'world> SpeculativeGenerationBackend for MlxBackend<'world> {
         runtime.session().speculative_capability()
     }
 
+    fn validate_speculative_capture(
+        runtime: &ModelRuntime<Self>,
+        plan: &eredu_core::capture::AdmittedCapturePlan,
+    ) -> Result<(), eredu_core::capture::CaptureError> {
+        super::speculative::validate_control_capture(plan)?;
+        <Self as eredu_core::TextGenerationBackend>::validate_text_capture(runtime, plan)
+    }
+
     fn with_speculative_execution<C, V>(
         runtime: &mut ModelRuntime<Self>,
         request: SpeculativeGenerationBatchRequest<'_, Self, Self::Drafter, C>,

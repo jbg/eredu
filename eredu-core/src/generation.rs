@@ -11,7 +11,7 @@ use std::sync::{
 use std::time::Duration;
 
 /// Host timing shared by ordinary, observed, and speculative terminal outputs.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GenerationTiming {
     time_to_first_token: Option<Duration>,
 }
@@ -30,7 +30,10 @@ impl GenerationTiming {
     /// Includes request preparation. Speculative batch lanes share the batch-call
     /// origin and include queueing. Structural, buffered, stop and EOS tokens
     /// count even without visible text; draft proposals do not. `None` means no
-    /// token was committed, including cancellation before prefill.
+    /// token was committed, including cancellation before prefill. Controlled
+    /// sessions count active preparation and advancement only, excluding caller
+    /// pauses, inspection and synchronous record delivery. Timing belongs to
+    /// the run and is not rewound when a snapshot is restored.
     pub const fn time_to_first_token(&self) -> Option<Duration> {
         self.time_to_first_token
     }

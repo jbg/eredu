@@ -582,3 +582,57 @@ fn controlled_choices_use_sparse_tokenizer_ids_instead_of_entry_count() {
     session.step(|_| ControlFlow::Continue(())).unwrap();
     assert_eq!(session.token_ids(), [64, eos]);
 }
+
+#[test]
+fn ttft_counts_active_work_excludes_pauses_and_is_visible_before_token_delivery() {
+    use std::time::{Duration, Instant};
+    let (mut model, chat, settings, _) = setup();
+    let prepared = model
+        .prepare_observed_chat(&chat, settings, CapturePlan::none(), limits())
+        .unwrap();
+    let wall = Instant::now();
+    let mut session = model
+        .start_controlled_chat(prepared, &[], Default::default(), |_| {
+            std::thread::sleep(Duration::from_millis(40));
+            ControlFlow::Continue(())
+        })
+        .unwrap();
+    assert_eq!(session.timing().time_to_first_token(), None);
+    session.pause(|_| ControlFlow::Continue(())).unwrap();
+    std::thread::sleep(Duration::from_millis(60));
+    let mut first = None;
+    session
+        .step(|record| {
+            if matches!(
+                record.generation.event,
+                ObservedGenerationEvent::Token { .. }
+            ) {
+                first = Some(record.timing);
+                std::thread::sleep(Duration::from_millis(40));
+            }
+            ControlFlow::Continue(())
+        })
+        .unwrap();
+    let timing = session.timing();
+    assert_eq!(first, Some(timing));
+    assert!(
+        wall.elapsed()
+            .saturating_sub(timing.time_to_first_token().unwrap())
+            >= Duration::from_millis(140)
+    );
+}
+
+#[test]
+fn cancelled_controlled_session_has_no_ttft() {
+    let (mut model, chat, settings, _) = setup();
+    let prepared = model
+        .prepare_observed_chat(&chat, settings, CapturePlan::none(), limits())
+        .unwrap();
+    let mut session = model
+        .start_controlled_chat(prepared, &[], Default::default(), |_| {
+            ControlFlow::Continue(())
+        })
+        .unwrap();
+    session.cancel(|_| ControlFlow::Continue(())).unwrap();
+    assert_eq!(session.timing().time_to_first_token(), None);
+}

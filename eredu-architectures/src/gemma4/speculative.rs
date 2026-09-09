@@ -126,6 +126,42 @@ where
         target_output::<M>(logits, capture)
     }
 
+    fn control_cache_estimate(
+        cache: &Self::Cache,
+    ) -> Option<eredu_core::execution_control::SnapshotEstimate> {
+        let native = M::control_cache_estimate(cache.native())?;
+        let host = cache.control_metadata_bytes()?;
+        Some(eredu_core::execution_control::SnapshotEstimate {
+            retained_bytes: native.retained_bytes.checked_add(host)?,
+            copy_bytes: native.copy_bytes.checked_add(host)?,
+        })
+    }
+    fn control_tensor_bytes(tensor: &Self::Tensor) -> Option<u64> {
+        M::control_tensor_bytes(tensor)
+    }
+    fn control_copy_tensor<'a>(
+        tensor: &Self::Tensor,
+        placement: ExternalAssistantTensorPlacement,
+        context: Self::Context<'a>,
+    ) -> Result<Self::Tensor, Self::Error> {
+        M::control_copy_tensor(tensor, placement, context)
+    }
+    fn control_checkpoint<'a>(
+        cache: &Self::Cache,
+        context: Self::Context<'a>,
+    ) -> Result<Self::CacheCheckpoint, Self::Error> {
+        M::control_checkpoint(cache.native(), context).map(|native| cache.checkpoint(native))
+    }
+    fn control_restore<'a>(
+        cache: &mut Self::Cache,
+        saved: &Self::CacheCheckpoint,
+        context: Self::Context<'a>,
+    ) -> Result<(), Self::Error> {
+        M::control_restore(cache.native_mut(), saved.native(), context)?;
+        cache.restore_semantics(saved);
+        Ok(())
+    }
+
     fn checkpoint(cache: &Self::Cache) -> Result<Self::CacheCheckpoint, Self::Error> {
         M::checkpoint_native(cache.native()).map(|native| cache.checkpoint(native))
     }
@@ -350,6 +386,30 @@ pub struct ExternalTargetState<T> {
     cache_len: i32,
 }
 
+impl<T: Clone> ExternalTargetState<T> {
+    fn map<E>(&self, mut f: impl FnMut(&T) -> Result<T, E>) -> Result<Self, E> {
+        Ok(Self {
+            hidden: f(&self.hidden)?,
+            shared_kv: self
+                .shared_kv
+                .iter()
+                .map(|(key, (k, v))| Ok((*key, (f(k)?, f(v)?))))
+                .collect::<Result<_, E>>()?,
+            cache_len: self.cache_len,
+        })
+    }
+    fn tensor_bytes(&self, mut f: impl FnMut(&T) -> Option<u64>) -> Option<u64> {
+        let mut bytes = (std::mem::size_of::<Self>() as u64).checked_add(f(&self.hidden)?)?;
+        for (k, v) in self.shared_kv.values() {
+            bytes = bytes
+                .checked_add(f(k)?)?
+                .checked_add(f(v)?)?
+                .checked_add(256)?;
+        }
+        Some(bytes)
+    }
+}
+
 /// Retained target verification output and its exact input tokens.
 pub struct ExternalVerification<T> {
     output: ExternalTargetOutput<T>,
@@ -388,6 +448,42 @@ pub trait ExternalMechanisms: 'static {
     type Telemetry: eredu_core::SpeculativeTelemetry;
     /// Native mechanism failure.
     type Error: std::error::Error + Send + Sync + 'static;
+
+    /// Known bound for an isolated reusable target-cache checkpoint.
+    fn control_cache_estimate(
+        _cache: &Self::Cache,
+    ) -> Option<eredu_core::execution_control::SnapshotEstimate> {
+        None
+    }
+    /// Complete conservative logical tensor-copy bound.
+    fn control_tensor_bytes(_tensor: &Self::Tensor) -> Option<u64> {
+        None
+    }
+    /// Isolated native checkpoint, available only with a known control estimate.
+    fn control_checkpoint<'a>(
+        cache: &Self::Cache,
+        context: Self::Context<'a>,
+    ) -> Result<Self::CacheCheckpoint, Self::Error> {
+        let _ = context;
+        Self::checkpoint(cache)
+    }
+    /// Atomic isolated native restoration; never consumes saved state.
+    fn control_restore<'a>(
+        cache: &mut Self::Cache,
+        saved: &Self::CacheCheckpoint,
+        context: Self::Context<'a>,
+    ) -> Result<(), Self::Error> {
+        Self::restore_checkpoint(cache, saved, context)
+    }
+    /// Copies one immutable seed tensor after budget admission.
+    fn control_copy_tensor<'a>(
+        tensor: &Self::Tensor,
+        placement: ExternalAssistantTensorPlacement,
+        context: Self::Context<'a>,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = (placement, context);
+        Ok(tensor.clone())
+    }
 
     /// Maximum proposal count admitted by the assistant artifact.
     fn max_proposals(assistant: &Self::Assistant) -> usize;
@@ -632,6 +728,46 @@ impl<M: ExternalMechanisms> SpeculativeExecutor for ExternalExecutor<'_, M> {
     type Completion = M::Completion;
     type Telemetry = M::Telemetry;
     type Error = M::Error;
+
+    fn control_snapshot_estimate(
+        &self,
+        cache: &Self::Cache,
+        state: &Self::TargetState,
+    ) -> Option<eredu_core::execution_control::SnapshotEstimate> {
+        let native = M::control_cache_estimate(cache)?;
+        let seed = state.tensor_bytes(M::control_tensor_bytes)?;
+        Some(eredu_core::execution_control::SnapshotEstimate {
+            retained_bytes: native.retained_bytes.checked_add(seed)?,
+            copy_bytes: native.copy_bytes.checked_add(seed)?,
+        })
+    }
+    fn control_snapshot<'a>(
+        &self,
+        cache: &Self::Cache,
+        state: &Self::TargetState,
+        context: Self::Context<'a>,
+    ) -> Result<Option<(Self::CacheCheckpoint, Self::TargetState)>, Self::Error> {
+        if self.control_snapshot_estimate(cache, state).is_none() {
+            return Ok(None);
+        }
+        let state = state.map(|t| {
+            M::control_copy_tensor(t, ExternalAssistantTensorPlacement::Target, context)
+        })?;
+        Ok(Some((M::control_checkpoint(cache, context)?, state)))
+    }
+    fn restore_control_snapshot<'a>(
+        &mut self,
+        cache: &mut Self::Cache,
+        saved: &Self::CacheCheckpoint,
+        state: &Self::TargetState,
+        context: Self::Context<'a>,
+    ) -> Result<Option<Self::TargetState>, Self::Error> {
+        let state = state.map(|t| {
+            M::control_copy_tensor(t, ExternalAssistantTensorPlacement::Target, context)
+        })?;
+        M::control_restore(cache, saved, context)?;
+        Ok(Some(state))
+    }
 
     fn max_proposals(&self) -> usize {
         M::max_proposals(self.assistant)

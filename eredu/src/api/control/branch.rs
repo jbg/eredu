@@ -243,6 +243,8 @@ impl<B: TextSnapshotBackend + TextSamplingControlBackend> ControlledGenerationSe
                             prompt_length: self.delivery.prompt_length,
                             prompt_token_ids: std::sync::Arc::clone(&snapshot.prompt_token_ids),
                             started: Instant::now(),
+                            preparation_elapsed: std::time::Duration::ZERO,
+                            timing: GenerationTiming::default(),
                             closed: false,
                             failure: None,
                             semantic_prefix: snapshot.semantic_prefix.clone(),

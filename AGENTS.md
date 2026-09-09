@@ -142,6 +142,21 @@ it.
   traits, plans, or reports first, then implemented by the backend and wired in
   composition.
 
+## Controlled inference parity
+
+New inference functionality must also work through controlled sessions by default.
+Keep request preparation, sampling, speculation, commitment, decoding, termination,
+metrics and bounded observation in shared drivers; controlled sessions supply
+explicit advancement and state ownership rather than a second inference engine.
+Add behavioral conformance coverage comparing controlled and uninterrupted runs.
+
+An exception needs a concrete state, completion, attribution or resource-accounting
+reason, exposed through capabilities or a typed rejection and documented in
+`doc/execution-control.md`. Do not silently omit a feature or report support based
+only on a lower-level primitive. Tentative speculative proposals must remain
+separate from committed output, and snapshots must preserve all mutable state
+without refunding observation, transport or copy budgets.
+
 ## How to enforce these rules
 
 Prefer semantic enforcement that survives refactors:

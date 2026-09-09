@@ -82,7 +82,13 @@ fn write_weights(root: &Path) {
     )
     .unwrap();
     let resolved = eredu_architectures::configuration::resolve_model_config(&config).unwrap();
-    let checkpoint = resolved.architecture.checkpoint();
+    write_tensor_plan(root, resolved.architecture.checkpoint());
+}
+
+fn write_tensor_plan(
+    root: &Path,
+    checkpoint: &eredu_checkpoint::schema::SafetensorsCheckpointPlan,
+) {
     let mut data = vec![];
     let mut header = serde_json::Map::new();
     for tensor in checkpoint.common_tensors.iter().chain(
@@ -385,3 +391,6 @@ fn native_text_matches_ordinary_sampling_with_checkpoint_defaults_and_padded_log
         model.reset().unwrap();
     }
 }
+
+#[path = "native_execution_control/speculative.rs"]
+mod speculative;

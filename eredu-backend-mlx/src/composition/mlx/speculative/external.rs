@@ -120,6 +120,46 @@ where
             .map_err(|error| Exception::custom(error.to_string()))
     }
 
+    fn control_cache_estimate(
+        cache: &Self::NativeCache,
+    ) -> Option<eredu_core::execution_control::SnapshotEstimate> {
+        cache.control_estimate()
+    }
+    fn control_tensor_bytes(tensor: &Self::Tensor) -> Option<u64> {
+        (tensor.as_array().nbytes() as u64)
+            .checked_mul(2)?
+            .checked_add(4096)
+    }
+    fn control_checkpoint<'a>(
+        cache: &Self::NativeCache,
+        context: Self::Context<'a>,
+    ) -> Result<Self::NativeCacheCheckpoint, Self::Error> {
+        cache.control_copy(context.target())
+    }
+    fn control_restore<'a>(
+        cache: &mut Self::NativeCache,
+        saved: &Self::NativeCacheCheckpoint,
+        context: Self::Context<'a>,
+    ) -> Result<(), Self::Error> {
+        let replacement = saved.control_copy(context.target())?;
+        *cache = replacement;
+        Ok(())
+    }
+    fn control_copy_tensor<'a>(
+        tensor: &Self::Tensor,
+        placement: ExternalAssistantTensorPlacement,
+        context: Self::Context<'a>,
+    ) -> Result<Self::Tensor, Self::Error> {
+        safemlx::transforms::async_eval_with_event([tensor.as_array()])?.synchronize()?;
+        let stream = match placement {
+            ExternalAssistantTensorPlacement::Target => context.target(),
+            ExternalAssistantTensorPlacement::Draft => context.draft(),
+        };
+        let copy = tensor.as_array().copy(stream)?;
+        safemlx::transforms::async_eval_with_event([&copy])?.synchronize()?;
+        Ok(MlxTensor::from_array(copy))
+    }
+
     fn checkpoint_native(
         cache: &Self::NativeCache,
     ) -> Result<Self::NativeCacheCheckpoint, Self::Error> {

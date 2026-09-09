@@ -45,6 +45,7 @@ pub use completion::MlxSpeculativeCompletion;
 pub use execution_streams::SpeculativeExecutionStreams;
 #[cfg(test)]
 use sampling::array_probability_at;
+pub(crate) use sampling::validate_control_capture;
 pub use sampling::MlxSpeculativeSampling;
 
 #[cfg(test)]

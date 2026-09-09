@@ -33,7 +33,7 @@ pub(crate) fn capabilities() -> CaptureCapabilities {
         max_histogram_bins: 128,
         physical_native_limit: false,
         conditions: vec![
-            "Ordinary committed text execution on one rank; no speculative, media, or partitioned capture".into(),
+            "Ordinary text activations on one rank; controlled speculation supports model.logits only; no media or partitioned capture".into(),
             "Logical capture storage is bounded; inference allocations and native private allocator/workspace are excluded".into(),
             "Transforms execute synchronously; no native views or lazy capture graphs are queued".into(),
             "Statistics use F32 inputs and native chunk reductions with F64 aggregation; raw integer IDs remain exact".into(),
@@ -42,8 +42,8 @@ pub(crate) fn capabilities() -> CaptureCapabilities {
     }
 }
 
-pub(super) struct NativeCapture<'a> {
-    pub(super) stream: &'a Stream,
+pub(in crate::composition::mlx) struct NativeCapture<'a> {
+    pub(in crate::composition::mlx) stream: &'a Stream,
 }
 
 /// Includes a conservative logical allowance for source/contiguous backing, all

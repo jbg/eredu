@@ -8,6 +8,84 @@ mode; active and automatic llguidance grammar modes explicitly reject snapshots.
 See the [LM Inspector integration guide](lm-inspector-execution-control.md) and
 the runnable [controlled generation example](../eredu/examples/controlled_generate.rs).
 
+## Timing
+
+`ControlledGenerationSession::timing()` and every `ControlledGenerationRecord`
+return the shared `GenerationTiming`. TTFT includes active request preparation and
+the first completed token advance, measured before capture delivery or semantic
+callbacks. Time between calls, including pauses and snapshot/inspection work, is
+excluded. Inference-time capture transformations remain part of active execution.
+EOS, structural and buffered tokens count even if no text is visible; cancellation
+before commitment returns `None`. Restoring a snapshot never rewinds run timing.
+A new ordinary branch measures its first new commitment separately.
+
+## Controlled speculative generation
+
+`with_controlled_chat_speculative` and `with_controlled_text_speculative` accept
+the existing speculative request plus `ControlledSpeculativeOptions` and a worker
+closure receiving `&mut dyn ControlledSpeculativeSession`. The backend lends its
+prepared execution resources for that scope. No prefill or token sampling occurs
+until `step`; between calls the worker can wait for Inspector commands. Returning
+from the closure cancels and settles unfinished work through the existing scheduler.
+The same request settings, grammar, token validity, stopping rules and semantic
+callback apply as in uninterrupted speculation.
+
+A step performs one scheduler action: prefill, draft a block, submit verification,
+draft optimistically, poll, or resolve verification. A verification commits an
+entire accepted prefix and replacement/bonus atomically. It cannot be exposed as
+independently restorable single-token steps while the native cache is ahead.
+`ControlledSpeculativeStep` reports new proposals separately from committed IDs,
+per-proposal accepted/rejected/discarded dispositions, and optimistic prefix,
+reuse, bonus consumption and discard counts. Capture records identify the target
+or drafter and absolute generated-token prediction position. A UI can animate a
+block's individual proposals without treating tentative tokens as conversation
+history. `sequence` is monotone; `epoch` increments after restoration.
+
+The returned output and session expose active TTFT, including facade/backend
+preparation and target prefill but excluding time in the Inspector command loop.
+Draft proposals do not establish TTFT. Timing and trace usage do not rewind.
+`trace_limits` bound step records through the same JSON counter as ordinary
+controlled generation. The request's semantic callback retains its existing
+synchronous publication contract and is a separate consumer channel.
+
+Supply snapshot limits before entering the scope. `snapshot_support()` explains
+availability; `snapshot()`, `restore()` and `release_snapshot()` manage opaque
+session-local handles. Snapshots preserve cache, assistant seed/context, sequence,
+sampler, RNG, grammar/decoder and adaptive statistics. Restoration neither runs a
+forward pass nor replays tokens. Handles cannot cross runs. Failed and cancelled
+runs cannot be revived; normally completed runs can restore an earlier snapshot.
+Copies are reserved before allocation, and cumulative copy/trace/capture costs
+are never refunded. Snapshots currently require a canonical boundary after prefill
+with no retained proposal block or in-flight verification.
+
+MLX supports reusable external Gemma 4 and Muse Glimmer/DFlash checkpoints when
+the target storage, sampler and semantic state provide complete isolated-copy
+estimates. Embedded prediction executors still reject snapshots: their typed
+prediction-local caches do not yet expose complete isolated-copy costs through
+executor erasure. Ordinary active llguidance constraints also remain unsupported
+for snapshots because their storage cost is unknown. These limitations do not
+prevent controlled speculative stepping or proposal observation.
+
+For captures, call `prepare_speculative_capture(settings, plan)` and pass its
+admitted plan in `ControlledSpeculativeOptions::capture`. Each observation is one
+vocabulary row, including prefill; ordinary whole-prompt admission is rejected.
+The MLX implementation supports `model.logits` for target prefill, reached verifier
+rows, and every sampled draft proposal, including rejected work. It reuses the
+ordinary bounded transformations (including top candidates, summaries and slices)
+and one shared cumulative ledger. Other layer activation paths reject explicitly:
+they need draft/verification attribution in the architecture observer adapter.
+Speculative forcing, prospective sampler overrides and isolated branch handles
+are not exposed by this scope; do not infer those capabilities from ordinary
+controlled sessions. Initial speculative snapshots additionally need a portable
+copy contract for backend-owned prefill input.
+
+## Feature development rule
+
+New inference functionality must support controlled sessions through the shared
+driver. Add controlled/uninterrupted behavioral coverage. Exceptions need an
+explicit capability or typed rejection with a concrete completion, state,
+attribution or accounting reason recorded here and in the Inspector guide.
+
 ## State owners and boundary
 
 | State | Existing owner | Required snapshot treatment |

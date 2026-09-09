@@ -61,6 +61,16 @@ impl MlxTextSampler {
 }
 
 impl SpeculativeSampler<MlxSamplingBackend> for MlxTextSampler {
+    fn control_snapshot_bytes(&self) -> Option<u64> {
+        let history = match self {
+            Self::Standard(sampler) => sampler.generated_tokens(),
+            Self::MirostatV2(sampler) => sampler.generated_tokens(),
+        };
+        (history.len() as u64)
+            .checked_mul(4)?
+            .checked_add(std::mem::size_of::<Self>() as u64)
+    }
+
     fn supports_exact_optimistic_promotion(&self) -> bool {
         match self {
             Self::Standard(sampler) => {

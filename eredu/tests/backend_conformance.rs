@@ -67,6 +67,8 @@ const MULTIPLE_SPECULATIVE_RESULTS_PROMPT_TOKEN: u32 = u32::MAX - 1;
 
 #[path = "backend_conformance/control.rs"]
 mod control;
+#[path = "backend_conformance/controlled_speculative.rs"]
+mod controlled_speculative;
 #[path = "backend_conformance/observed_mock.rs"]
 mod observed_mock;
 #[path = "backend_conformance/templates.rs"]
@@ -866,9 +868,41 @@ impl ExecutionPlanBackendFactory for MockBackend {
 
 struct MockDrafter;
 
-struct MockSpeculativeExecutor;
+struct MockSpeculativeExecutor {
+    reject_second: bool,
+}
+const CONTROL_REJECTION_PROMPT_TOKEN: u32 = u32::MAX - 32;
 
 impl SpeculativeExecutor for MockSpeculativeExecutor {
+    fn control_snapshot_estimate(
+        &self,
+        _: &usize,
+        _: &(),
+    ) -> Option<eredu_core::execution_control::SnapshotEstimate> {
+        Some(eredu_core::execution_control::SnapshotEstimate {
+            retained_bytes: 8,
+            copy_bytes: 8,
+        })
+    }
+    fn control_snapshot<'a>(
+        &self,
+        cache: &usize,
+        _: &(),
+        _: (),
+    ) -> Result<Option<(usize, ())>, MockError> {
+        Ok(Some((*cache, ())))
+    }
+    fn restore_control_snapshot<'a>(
+        &mut self,
+        cache: &mut usize,
+        saved: &usize,
+        _: &(),
+        _: (),
+    ) -> Result<Option<()>, MockError> {
+        *cache = *saved;
+        Ok(Some(()))
+    }
+
     type Input = Vec<u32>;
     type Cache = usize;
     type TargetState = ();
@@ -882,7 +916,11 @@ impl SpeculativeExecutor for MockSpeculativeExecutor {
     type Error = MockError;
 
     fn max_proposals(&self) -> usize {
-        1
+        if self.reject_second {
+            3
+        } else {
+            1
+        }
     }
 
     fn prefill<'a>(
@@ -936,7 +974,11 @@ impl SpeculativeExecutor for MockSpeculativeExecutor {
     ) -> Result<Submission<Self::Verification, Self::Completion>, Self::Error> {
         *cache += input_tokens.len();
         Ok(Submission {
-            output: vec![11, 17],
+            output: if self.reject_second {
+                vec![11, 12, 17, 17]
+            } else {
+                vec![11, 17]
+            },
             completion: Done,
         })
     }
@@ -968,6 +1010,10 @@ impl SpeculativeExecutor for MockSpeculativeExecutor {
 struct MockSpeculativeSampling;
 
 impl SpeculativeSampling for MockSpeculativeSampling {
+    fn control_snapshot_bytes(&self, _: Option<&()>, _: Option<&()>) -> Option<u64> {
+        Some(0)
+    }
+
     type Logits = u32;
     type Distribution = u32;
     type Seed = ();
@@ -1163,7 +1209,9 @@ impl SpeculativeGenerationBackend for MockBackend {
         }
         let mut output = visitor
             .run(
-                &mut MockSpeculativeExecutor,
+                &mut MockSpeculativeExecutor {
+                    reject_second: result_cardinality == Some(CONTROL_REJECTION_PROMPT_TOKEN),
+                },
                 prepared,
                 eredu_core::SpeculativeExecutionTopology::Single,
                 false,

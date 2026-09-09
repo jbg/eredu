@@ -7,6 +7,9 @@ use eredu_core::{
     SpeculativePublisher, SpeculativeRequestTable, SpeculativeSampling,
 };
 
+mod control;
+pub use control::*;
+
 /// Neutral owner of speculative request registration and fair scheduling.
 pub struct SpeculativeScheduler<'a, E, S, C, P>
 where
@@ -181,34 +184,43 @@ impl SpeculativeGenerationVisitor for RunSpeculativeGeneration {
             scheduler.submit(lane)?;
         }
         scheduler.run()?;
-        let mut completed = scheduler.finish()?;
-        let requests = completed
-            .take_requests()
-            .into_iter()
-            .zip(preparation_elapsed)
-            .map(|(request, preparation_elapsed)| {
-                let finish_reason = request.finish_reason().ok_or_else(|| {
-                    SpeculativeDriverError::Generation(
-                        GenerationError::MissingSpeculativeFinishReason {
-                            index: request.id().index(),
-                        },
-                    )
-                })?;
-                let time_to_first_token = request
+        let completed = scheduler.finish()?;
+        completed_output(completed, |request| {
+            GenerationTiming::new(
+                request
                     .stats()
                     .submission_to_first_token()
-                    .map(|elapsed| preparation_elapsed + elapsed);
-                Ok(SpeculativeGenerationOutput::new(
-                    request.token_ids().to_vec(),
-                    finish_reason,
-                    GenerationTiming::new(time_to_first_token),
-                    request.stats().clone(),
-                ))
-            })
-            .collect::<Result<Vec<_>, SpeculativeDriverError<E::Error>>>()?;
-        Ok(SpeculativeGenerationBatchOutput::new(
-            requests,
-            completed.take_scheduler(),
-        ))
+                    .map(|elapsed| preparation_elapsed[request.id().index()] + elapsed),
+            )
+        })
     }
+}
+
+fn completed_output<S, E: std::error::Error + 'static>(
+    mut completed: CompletedSpeculativeSchedule<S>,
+    timing: impl Fn(&eredu_core::CompletedSpeculativeRequest<S>) -> GenerationTiming,
+) -> Result<SpeculativeGenerationBatchOutput, SpeculativeDriverError<E>> {
+    let requests = completed
+        .take_requests()
+        .into_iter()
+        .map(|request| {
+            let reason = request.finish_reason().ok_or_else(|| {
+                SpeculativeDriverError::Generation(
+                    GenerationError::MissingSpeculativeFinishReason {
+                        index: request.id().index(),
+                    },
+                )
+            })?;
+            Ok(SpeculativeGenerationOutput::new(
+                request.token_ids().to_vec(),
+                reason,
+                timing(&request),
+                request.stats().clone(),
+            ))
+        })
+        .collect::<Result<Vec<_>, SpeculativeDriverError<E>>>()?;
+    Ok(SpeculativeGenerationBatchOutput::new(
+        requests,
+        completed.take_scheduler(),
+    ))
 }

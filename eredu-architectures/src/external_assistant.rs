@@ -165,6 +165,15 @@ impl<C> ExternalAssistantCache<C> {
             .map_err(|error| error.to_string())
     }
 
+    /// Heap and envelope storage copied with a native checkpoint.
+    pub fn control_metadata_bytes(&self) -> Option<u64> {
+        (std::mem::size_of::<ExternalAssistantCacheCheckpoint<C>>() as u64).checked_add(
+            self.prepared_input
+                .as_ref()
+                .map_or(0, |id| id.as_str().len() as u64),
+        )
+    }
+
     /// Wraps one opaque native checkpoint in the exact semantic cache boundary.
     pub fn checkpoint<N>(&self, native: N) -> ExternalAssistantCacheCheckpoint<N> {
         ExternalAssistantCacheCheckpoint {
@@ -542,6 +551,42 @@ pub trait ExternalAssistantExecutionMechanisms<A: ExternalAssistantArchitecture>
     type Telemetry: eredu_core::SpeculativeTelemetry;
     /// Native mechanism failure.
     type Error: std::error::Error + Send + Sync + 'static;
+
+    /// Known bound for an isolated reusable target-cache checkpoint.
+    fn control_cache_estimate(
+        _cache: &Self::NativeCache,
+    ) -> Option<eredu_core::execution_control::SnapshotEstimate> {
+        None
+    }
+    /// Complete conservative logical tensor-copy bound.
+    fn control_tensor_bytes(_tensor: &Self::Tensor) -> Option<u64> {
+        None
+    }
+    /// Isolated native checkpoint, available only with a known control estimate.
+    fn control_checkpoint<'a>(
+        cache: &Self::NativeCache,
+        context: Self::Context<'a>,
+    ) -> Result<Self::NativeCacheCheckpoint, Self::Error> {
+        let _ = context;
+        Self::checkpoint_native(cache)
+    }
+    /// Atomic isolated native restoration; never consumes saved state.
+    fn control_restore<'a>(
+        cache: &mut Self::NativeCache,
+        saved: &Self::NativeCacheCheckpoint,
+        context: Self::Context<'a>,
+    ) -> Result<(), Self::Error> {
+        Self::restore_checkpoint_native(cache, saved, context)
+    }
+    /// Copies one immutable seed tensor after budget admission.
+    fn control_copy_tensor<'a>(
+        tensor: &Self::Tensor,
+        placement: ExternalAssistantTensorPlacement,
+        context: Self::Context<'a>,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = (placement, context);
+        Ok(tensor.clone())
+    }
 
     /// Borrows the exact normalized assistant configuration.
     fn config(assistant: &Self::Assistant) -> &A::Config;

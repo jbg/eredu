@@ -19,6 +19,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod control;
+pub use control::*;
+
 /// Draft-model source selected for one speculative-generation request.
 #[non_exhaustive]
 pub enum SpeculativeDraft<'a, D> {
@@ -232,6 +235,21 @@ pub trait SpeculativeGenerationBackend: TextGenerationBackend {
 
     /// Reports fail-closed speculative support for the selected model session.
     fn speculative_capability(runtime: &ModelRuntime<Self>) -> SpeculativeCapability;
+
+    /// Validates speculative observation support without allocating or executing.
+    /// Ordinary capture support does not imply attribution for speculative phases.
+    fn validate_speculative_capture(
+        _runtime: &ModelRuntime<Self>,
+        plan: &crate::capture::AdmittedCapturePlan,
+    ) -> Result<(), crate::capture::CaptureError> {
+        if plan.is_empty() {
+            Ok(())
+        } else {
+            Err(crate::capture::CaptureError::Unsupported(
+                "backend has no bounded speculative capture".into(),
+            ))
+        }
+    }
 
     /// Prepares native execution resources and lends them to neutral orchestration.
     fn with_speculative_execution<C, V>(
@@ -718,6 +736,39 @@ pub trait SpeculativeExecutor {
     /// Structured backend error.
     type Error: std::error::Error + Send + Sync + 'static;
 
+    /// Complete bound for a durable canonical cache and assistant seed snapshot.
+    /// Transaction rollback markers alone are insufficient for reusable snapshots.
+    fn control_snapshot_estimate(
+        &self,
+        _cache: &Self::Cache,
+        _state: &Self::TargetState,
+    ) -> Option<crate::execution_control::SnapshotEstimate> {
+        None
+    }
+
+    /// Copies an immutable, reusable checkpoint with independently restorable state.
+    #[allow(clippy::type_complexity)]
+    fn control_snapshot<'a>(
+        &self,
+        _cache: &Self::Cache,
+        _state: &Self::TargetState,
+        _context: Self::Context<'a>,
+    ) -> Result<Option<(Self::CacheCheckpoint, Self::TargetState)>, Self::Error> {
+        Ok(None)
+    }
+
+    /// Atomically restores cache and returns an isolated assistant seed. The saved
+    /// checkpoint remains reusable. Must settle copying before returning.
+    fn restore_control_snapshot<'a>(
+        &mut self,
+        _cache: &mut Self::Cache,
+        _checkpoint: &Self::CacheCheckpoint,
+        _state: &Self::TargetState,
+        _context: Self::Context<'a>,
+    ) -> Result<Option<Self::TargetState>, Self::Error> {
+        Ok(None)
+    }
+
     /// Maximum proposals supported in one verification transaction.
     fn max_proposals(&self) -> usize {
         usize::MAX
@@ -926,6 +977,11 @@ where
     pub fn take_config(&mut self) -> SpeculativeConfig {
         self.config.take().expect("prepared config already taken")
     }
+    /// Borrows canonical output controls before submitting a prepared lane.
+    pub fn runtime_mut(&mut self) -> &mut SpeculativeOutputRuntime<S, C, P> {
+        self.runtime.as_mut().expect("lane runtime already taken")
+    }
+
     /// Takes portable output state exactly once.
     pub fn take_runtime(&mut self) -> SpeculativeOutputRuntime<S, C, P> {
         self.runtime.take().expect("prepared runtime already taken")
@@ -989,6 +1045,37 @@ pub trait SpeculativeSampling: Clone {
         Self: 'a;
     /// Structured backend error.
     type Error: std::error::Error + Send + Sync + 'static;
+
+    /// Installs explicitly admitted raw-logit capture before any generation. Clones
+    /// must share non-rewindable capture accounting, never duplicate its allowance.
+    fn enable_control_capture(
+        &mut self,
+        plan: crate::capture::AdmittedCapturePlan,
+    ) -> Result<(), crate::capture::CaptureError> {
+        if plan.plan().selections.is_empty() {
+            Ok(())
+        } else {
+            Err(crate::capture::CaptureError::Unsupported(
+                "speculative raw-logit capture is unavailable for this sampler".into(),
+            ))
+        }
+    }
+
+    /// Drains completed captures from the last scheduler action, including
+    /// tentative target rows and failed draft proposals. No native values escape.
+    fn take_control_captures(&mut self) -> Vec<SpeculativePredictionCapture> {
+        Vec::new()
+    }
+
+    /// Complete conservative bytes for cloning this sampler and both RNG streams.
+    /// Return unknown unless clones isolate mutable native state.
+    fn control_snapshot_bytes(
+        &self,
+        _target: Option<&Self::RandomState>,
+        _draft: Option<&Self::DraftRandomness>,
+    ) -> Option<u64> {
+        None
+    }
 
     /// Whether cloned sampler state is safe for optimistic promotion.
     fn supports_exact_optimistic_promotion(&self) -> bool {
@@ -1441,6 +1528,11 @@ impl SpeculativeOutputError {
 
 /// Transactional semantic state paired with committed token sequencing.
 pub trait SpeculativeConstraint: Sized {
+    /// Complete conservative bytes retained by a fork, or unknown.
+    fn control_snapshot_bytes(&self) -> Option<u64> {
+        None
+    }
+
     /// Forks state for tentative verification.
     fn fork(&self) -> Result<Self, SpeculativeOutputError>;
     /// Stages one token and reports a matched stop condition.
@@ -1476,6 +1568,11 @@ pub trait SpeculativePublisher<C> {
 /// This interface owns decoded semantic events and never exposes a backend
 /// tensor, stream, completion, or error type.
 pub trait SpeculativeSemanticState {
+    /// Complete conservative bytes retained by a semantic fork, or unknown.
+    fn control_snapshot_bytes(&self) -> Option<u64> {
+        None
+    }
+
     /// Forks the exact committed prefix for tentative verification.
     fn fork_box(&self) -> Result<Box<dyn SpeculativeSemanticState>, SpeculativeOutputError>;
     /// Stages one token and reports whether a stop sequence matched.
@@ -1506,6 +1603,13 @@ impl SpeculativeSemanticConstraint {
 }
 
 impl SpeculativeConstraint for SpeculativeSemanticConstraint {
+    fn control_snapshot_bytes(&self) -> Option<u64> {
+        match &self.state {
+            Some(state) => state.control_snapshot_bytes(),
+            None => Some(0),
+        }
+    }
+
     fn fork(&self) -> Result<Self, SpeculativeOutputError> {
         Ok(Self {
             state: self
@@ -2525,6 +2629,7 @@ where
     C: SpeculativeConstraint,
     P: SpeculativePublisher<C>,
 {
+    control_identity: Arc<()>,
     id: SpeculativeRequestId,
     cache: &'cache mut E::Cache,
     config: SpeculativeConfig,
@@ -3243,6 +3348,7 @@ where
             };
             self.stats.turns += 1;
             self.requests.push(SpeculativeRequest {
+                control_identity: Arc::new(()),
                 id,
                 cache,
                 config,
@@ -3259,6 +3365,7 @@ where
             return Ok(id);
         };
         self.requests.push(SpeculativeRequest {
+            control_identity: Arc::new(()),
             id,
             cache,
             config,

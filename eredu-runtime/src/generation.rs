@@ -210,6 +210,11 @@ impl Default for PenaltyConfig {
 
 /// Sampling policy suitable for lossless speculative decoding.
 pub trait SpeculativeSampler<B: SamplingBackend> {
+    /// Complete bytes retained by a clone with isolated mutable sampling state.
+    fn control_snapshot_bytes(&self) -> Option<u64> {
+        None
+    }
+
     /// Whether loaded checkpoint defaults should wrap this policy.
     fn uses_checkpoint_defaults(&self) -> bool {
         false
@@ -335,6 +340,13 @@ where
     S: SpeculativeSampler<B> + Clone,
     C: SpeculativeTokenFilterController,
 {
+    fn control_snapshot_bytes(&self) -> Option<u64> {
+        self.policy
+            .control_snapshot_bytes()?
+            .checked_add(self.controller.control_snapshot_bytes()?)?
+            .checked_add(std::mem::size_of::<Self>() as u64)
+    }
+
     fn supports_exact_optimistic_promotion(&self) -> bool {
         self.policy.supports_exact_optimistic_promotion()
     }

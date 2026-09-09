@@ -380,6 +380,25 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
         F: FnMut(SemanticEvent),
     {
         let driver = eredu_runtime::RunSpeculativeGeneration::new(request.options.scheduler);
+        self.generate_prepared_speculative_with(request, mode, driver)
+    }
+
+    pub(super) fn generate_prepared_speculative_with<'a, F, V>(
+        &mut self,
+        request: PreparedChatSpeculativeGenerationRequest<
+            'a,
+            B,
+            <B as SpeculativeGenerationBackend>::Drafter,
+            F,
+        >,
+        mode: PreparedGenerationMode,
+        driver: V,
+    ) -> Result<SpeculativeGenerationOutput, PreparedChatSpeculativeError>
+    where
+        B: SpeculativeGenerationBackend,
+        F: FnMut(SemanticEvent),
+        V: eredu_core::SpeculativeGenerationVisitor,
+    {
         let PreparedChatSpeculativeGenerationRequest {
             input,
             drafting,

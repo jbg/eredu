@@ -310,3 +310,6 @@ impl Drop for ReservationLease {
 
 #[cfg(test)]
 mod tests;
+
+mod trace;
+pub use trace::{TraceBudget, TraceLimits};

@@ -180,6 +180,30 @@ The generic `LoadedModel<B>` exposes these controls and snapshots without
 exposing native handles or duplicating their policy. Reusable host/native continuation
 checks live in `eredu-evaluation::execution_control`, used only as validation
 tooling, with native forward/reload probes and source-preserving copy failures.
+Controlled speculative generation uses a scoped `SpeculativeGenerationVisitor`
+over the same `SpeculativeScheduler` and core request transactions as uninterrupted
+speculation. Backend resources remain borrowed inside the controlling worker
+closure. Runtime exposes scheduler phases and host proposal/verification records;
+it does not duplicate proposal acceptance, residual sampling, cache rollback or
+semantic publication. Facade request preflight and terminal-output construction
+are shared with uninterrupted generation. All inspected paths use runtime's
+`TraceBudget` bounded JSON counter.
+
+Core speculative snapshot contracts preserve exact request identity, canonical
+sequence, constraint/parser, sampler, both RNG streams, lifecycle and adaptive
+statistics. Runtime reserves known snapshot costs and owns opaque handles and
+monotone restoration epochs. Architecture external-assistant adapters preserve
+seed tensor topology and cache identity; MLX supplies isolated native copies and
+completion. Transaction rollback markers alone never imply reusable snapshot
+support. Capture owners are shared across tentative sampler clones and restores,
+so budgets cannot be multiplied or refunded. MLX raw prediction capture uses the
+same bounded collector as ordinary generation, with target/draft roles attached
+by the sampling boundary. Other activations require explicit phase attribution.
+
+Every new inference feature must support controlled advancement through these
+shared owners, or expose and document a concrete capability limitation. Tests
+compare controlled and uninterrupted behavior, not repository layout.
+
 Facade branch construction derives finite decoder/parser/history growth and pairs
 it with runtime's native growth facts before reserving retention. Its child stream
 starts with explicit parent metadata and the delivered canonical/semantic prefix;

@@ -1,4 +1,4 @@
-# LM Inspector: ordinary execution control
+# LM Inspector: execution control
 
 Keep native models and sessions on one owning worker. Send pause/cancel requests
 through `GenerationControlHandle`; send step, resume, snapshot, restore and branch
@@ -194,5 +194,46 @@ future mutable growth. They may substantially over-reserve for long tokenizer
 continuations and do not cap physical allocator workspaces. Unknown costs reject
 admission. Copy failures consume their admitted copying allowance while releasing
 unretained state; healthy source snapshots remain reusable. Paged/compressed native
-state, partitioned/speculative/media/realtime control, persistent snapshots,
+state, partitioned/media/realtime control, persistent snapshots,
 cross-process/backend restoration and layer-level pauses are unsupported.
+
+
+## TTFT and speculative inspection
+
+Read `session.timing().time_to_first_token()` or the `timing` field on controlled
+records. These use active generation time, excluding UI pauses and time between
+steps. Do not start a separate wall clock around the command loop. The metric
+counts the first committed token even when decoding buffers it; `None` means no
+commitment. Restoration does not reset it.
+
+Keep speculative resources on the same owning worker, using
+`model.with_controlled_chat_speculative(request, options, |session| { ... })`
+(or `with_controlled_text_speculative` for literal text). Inside that closure,
+wait for worker commands and call `session.step()` once per requested scheduler
+action. Iterate until `None` for uninterrupted completion; returning early cancels
+and settles the native work. The existing request's semantic callback still emits
+only target-committed conversation events.
+
+Render `step.drafted` as tentative tokens. `step.verification.dispositions` gives
+accepted, rejected and discarded results for the original proposal block. Its
+committed IDs include the target replacement or bonus, which may not appear among
+the proposals. Preserve optimistic `assumed_prefix` and reuse/discard counts in
+the timeline. Associate captures by target/draft role, position and step sequence;
+a draft capture is not evidence that the token was accepted. The step is a whole
+scheduler action, and target commitment is atomic per block.
+
+Use `prepare_speculative_capture(settings, plan)` for one-row `model.logits`
+admission. Pass explicitly bounded `trace_limits`, that optional capture admission,
+and snapshot limits in `ControlledSpeculativeOptions`. `snapshot_support()` gives
+a reason when unavailable. Retain opaque handles in the worker, restore only at a
+canonical boundary, then reconcile the UI with `session.token_ids()` and its new
+`epoch`. Keep prior timeline records distinguished by epoch. Release unneeded
+handles with `release_snapshot`; restoration does not replenish any budget.
+
+Current native snapshots cover external Gemma 4 and Muse Glimmer/DFlash with
+supported isolated target state and known semantic costs. Embedded prediction
+snapshots await complete prediction-cache isolation/size contracts. Captures cover
+raw target/draft logits; other layer paths need explicit speculative attribution.
+These are capability limitations, not reasons to switch to a separate generation
+implementation. See [execution control](execution-control.md#controlled-speculative-generation)
+for the complete boundary and exception list.

@@ -123,6 +123,12 @@ addressable_bank_telemetry!(MlxAddressableGated);
 addressable_bank_telemetry!(MlxAddressableRelu2);
 
 pub(super) trait ErasedPredictionTargetState: std::any::Any {
+    fn control_estimate(&self) -> Option<eredu_core::execution_control::SnapshotEstimate>;
+    fn control_copy(
+        &self,
+        stream: &Stream,
+    ) -> Result<Box<dyn ErasedPredictionTargetState>, Exception>;
+
     fn deep_clone_box(&self) -> Result<Box<dyn ErasedPredictionTargetState>, Exception>;
     fn restore_box(
         &mut self,
@@ -138,6 +144,16 @@ impl<S> ErasedPredictionTargetState for S
 where
     S: MlxStateMechanisms + 'static,
 {
+    fn control_estimate(&self) -> Option<eredu_core::execution_control::SnapshotEstimate> {
+        self.isolated_snapshot_estimate()
+    }
+    fn control_copy(
+        &self,
+        stream: &Stream,
+    ) -> Result<Box<dyn ErasedPredictionTargetState>, Exception> {
+        self.isolated_snapshot(stream)
+            .map(|state| Box::new(state) as Box<dyn ErasedPredictionTargetState>)
+    }
     fn deep_clone_box(&self) -> Result<Box<dyn ErasedPredictionTargetState>, Exception> {
         self.deep_checkpoint()
             .map(|state| Box::new(state) as Box<dyn ErasedPredictionTargetState>)
@@ -176,6 +192,19 @@ where
 pub(crate) struct MlxPredictionTargetState(Option<Box<dyn ErasedPredictionTargetState>>);
 
 impl MlxPredictionTargetState {
+    pub(crate) fn control_estimate(
+        &self,
+    ) -> Option<eredu_core::execution_control::SnapshotEstimate> {
+        self.0.as_ref()?.control_estimate()
+    }
+    pub(crate) fn control_copy(&self, stream: &Stream) -> Result<Self, Exception> {
+        self.0
+            .as_ref()
+            .ok_or_else(|| Exception::custom("prediction target state is active"))?
+            .control_copy(stream)
+            .map(|state| Self(Some(state)))
+    }
+
     pub(crate) fn new<S: MlxStateMechanisms + 'static>(state: S) -> Self {
         Self(Some(Box::new(state)))
     }

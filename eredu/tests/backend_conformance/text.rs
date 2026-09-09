@@ -77,6 +77,22 @@ fn generate<F: FnMut(SemanticEvent)>(
             assert_eq!(lanes.len(), 1);
             terminal(lanes.remove(0))
         }
+        3 => terminal(model.with_controlled_text_speculative(
+            PreparedChatSpeculativeGenerationRequest {
+                input,
+                drafting: SpeculativeDraft::Embedded,
+                settings,
+                options: Default::default(),
+                caller_stop_sequences: stops,
+                cancellation,
+                on_event,
+            },
+            Default::default(),
+            |session| {
+                while session.step()?.is_some() {}
+                Ok(())
+            },
+        )?),
         _ => unreachable!(),
     })
 }
@@ -120,7 +136,7 @@ fn output_model(method: usize, pieces: [&str; 2]) -> (LoadedModel<MockBackend>, 
 
 #[test]
 fn unrecognized_text_preserves_prompt_unicode_literal_protocol_and_cross_token_stops() {
-    for method in 0..3 {
+    for method in 0..4 {
         for backend_input in [false, true] {
             for unicode in [false, true] {
                 for stop in [false, true] {
@@ -202,7 +218,7 @@ fn unrecognized_text_preserves_prompt_unicode_literal_protocol_and_cross_token_s
 
 #[test]
 fn text_ttft_counts_invisible_eos_and_stop_tokens_and_excludes_pre_cancellation() {
-    for method in 0..3 {
+    for method in 0..4 {
         for eos in [false, true] {
             for pre_cancel in [false, true] {
                 let mut model = unicode_model_with_template(eos.then_some(5), 64, TEMPLATE);
@@ -261,7 +277,7 @@ fn text_ttft_counts_invisible_eos_and_stop_tokens_and_excludes_pre_cancellation(
 
 #[test]
 fn text_generation_rejects_native_tools_and_requires_unparsed_thinking_opt_in() {
-    for method in 0..3 {
+    for method in 0..4 {
         for template in [TEMPLATE, QWEN_TEMPLATE] {
             let mut model = unicode_model_with_template(None, 64, template);
             for choice in [ToolChoice::None, ToolChoice::Auto, ToolChoice::Required] {

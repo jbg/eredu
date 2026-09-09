@@ -37,16 +37,8 @@ pub(super) fn new_identity(kind: &str) -> String {
     )
 }
 
-/// Limits on the entire JSON trace, including prompt, decoded text, provenance,
-/// capture data, and terminal records. Independent of capture storage/transfer bounds.
-/// Measures compact JSON, excluding application framing or additional encoding.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TraceLimits {
-    /// Maximum UTF-8 JSON bytes in one record.
-    pub per_record_bytes: u64,
-    /// Maximum sum of UTF-8 JSON record lengths for the run.
-    pub total_bytes: u64,
-}
+pub(super) use eredu_runtime::execution_control::TraceBudget;
+pub use eredu_runtime::execution_control::TraceLimits;
 
 /// Prepared prompt and capture admission. Dropping this value submits no work.
 /// Generation consumes it, preventing accidental reuse with different settings.
@@ -251,54 +243,6 @@ impl<F: FnMut(ObservedGenerationRecord) -> ControlFlow<()>> Delivery<F> {
     }
 }
 
-/// Shared compact-JSON transport accounting. This owner is never snapshotted.
-pub(super) struct TraceBudget {
-    limits: TraceLimits,
-    emitted_bytes: u64,
-}
-impl TraceBudget {
-    pub(super) fn new(limits: TraceLimits) -> Self {
-        Self {
-            limits,
-            emitted_bytes: 0,
-        }
-    }
-    pub(super) fn emitted_bytes(&self) -> u64 {
-        self.emitted_bytes
-    }
-    pub(super) fn charge(&mut self, record: &impl Serialize) -> Result<(), CaptureError> {
-        let remaining = self.limits.total_bytes.saturating_sub(self.emitted_bytes);
-        let mut sink = TraceCounter {
-            used: 0,
-            limit: remaining.min(self.limits.per_record_bytes),
-        };
-        serde_json::to_writer(&mut sink, record).map_err(|_| CaptureError::Limit {
-            budget: CaptureBudget::Encoded,
-            cumulative: remaining < self.limits.per_record_bytes,
-        })?;
-        self.emitted_bytes += sink.used;
-        Ok(())
-    }
-}
-
-struct TraceCounter {
-    used: u64,
-    limit: u64,
-}
-impl std::io::Write for TraceCounter {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.used = self
-            .used
-            .checked_add(bytes.len() as u64)
-            .filter(|n| *n <= self.limit)
-            .ok_or_else(|| std::io::Error::other("trace byte limit"))?;
-        Ok(bytes.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
 impl<B: TextGenerationBackend> LoadedModel<B> {
     /// Returns genuine mutable points and actual loaded-session support.
     pub fn intervention_discovery(&self) -> Result<InterventionDiscovery, CaptureError> {
@@ -349,27 +293,11 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
         B::capture_discovery(&self.runtime)
     }
 
-    /// Tokenizes with this model, resolves ordinary settings/EOS semantics, and
-    /// admits capture against the loaded session before any execution is submitted.
-    pub fn prepare_observed_chat(
+    pub(super) fn admit_capture(
         &self,
-        chat: &PreparedChat,
-        settings: PreparedChatGenerationSettings,
         plan: CapturePlan,
-        trace_limits: TraceLimits,
-    ) -> Result<PreparedObservedGeneration, PreparedChatError> {
-        let (config, max_tokens) = self.resolve_text_generation_settings(settings)?;
-        let prompt_token_ids = self
-            .tokenizer
-            .encode(chat.rendered_prompt(), false)
-            .map_err(TextDecoderError::Tokenizer)?
-            .get_ids()
-            .to_vec();
-        let request = CaptureRequestShape {
-            batch: 1,
-            prompt_tokens: prompt_token_ids.len() as u64,
-            max_predictions: max_tokens.get() as u64,
-        };
+        request: CaptureRequestShape,
+    ) -> Result<(AdmittedCapturePlan, Option<String>), PreparedChatError> {
         let (admitted, artifact_identity) = if plan.selections.is_empty() {
             let catalog = eredu_core::ObservationCatalog {
                 schema_version: eredu_core::DISCOVERY_SCHEMA_VERSION,
@@ -396,6 +324,31 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
             )
         };
         B::validate_text_capture(&self.runtime, &admitted)?;
+        Ok((admitted, artifact_identity))
+    }
+
+    /// Tokenizes with this model, resolves ordinary settings/EOS semantics, and
+    /// admits capture against the loaded session before any execution is submitted.
+    pub fn prepare_observed_chat(
+        &self,
+        chat: &PreparedChat,
+        settings: PreparedChatGenerationSettings,
+        plan: CapturePlan,
+        trace_limits: TraceLimits,
+    ) -> Result<PreparedObservedGeneration, PreparedChatError> {
+        let (config, max_tokens) = self.resolve_text_generation_settings(settings)?;
+        let prompt_token_ids = self
+            .tokenizer
+            .encode(chat.rendered_prompt(), false)
+            .map_err(TextDecoderError::Tokenizer)?
+            .get_ids()
+            .to_vec();
+        let request = CaptureRequestShape {
+            batch: 1,
+            prompt_tokens: prompt_token_ids.len() as u64,
+            max_predictions: max_tokens.get() as u64,
+        };
+        let (admitted, artifact_identity) = self.admit_capture(plan, request)?;
         if trace_limits.per_record_bytes == 0 || trace_limits.total_bytes == 0 {
             return Err(CaptureError::Invalid("trace byte limits must be positive".into()).into());
         }

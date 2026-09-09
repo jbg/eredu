@@ -35,6 +35,8 @@ pub use tokenizer::{chat_template_kwargs, load_tokenizer, TextMetadataError};
 
 mod capability;
 mod control;
+mod controlled_speculative;
+pub use controlled_speculative::*;
 mod inspection;
 mod loaded;
 mod observed;

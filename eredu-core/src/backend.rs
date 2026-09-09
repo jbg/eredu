@@ -1520,6 +1520,11 @@ pub trait TokenFilterController {
 /// durable controller state must not change until [`TokenFilterController::commit_token`]
 /// is called for a target-accepted token.
 pub trait SpeculativeTokenFilterController: TokenFilterController + Clone {
+    /// Complete bytes retained by an isolated clone, or unknown.
+    fn control_snapshot_bytes(&self) -> Option<u64> {
+        None
+    }
+
     /// Returns the filter at `history` without committing its uncommitted suffix.
     ///
     /// `history` contains the controller's durable prefix followed by zero or

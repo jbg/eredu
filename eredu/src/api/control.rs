@@ -44,6 +44,9 @@ pub struct ControlledGenerationRecord {
     pub sequence: u64,
     /// Monotone restoration epoch; zero before any restore.
     pub epoch: u64,
+    /// Active time to first commitment; absent until a token commits.
+    #[serde(default)]
+    pub timing: GenerationTiming,
     /// Existing source/session/plan attribution and ordinary event semantics.
     pub generation: ObservedGenerationRecord,
 }
@@ -138,6 +141,8 @@ struct Delivery {
     prompt_length: u64,
     prompt_token_ids: std::sync::Arc<[u32]>,
     started: Instant,
+    preparation_elapsed: std::time::Duration,
+    timing: GenerationTiming,
     closed: bool,
     failure: Option<CaptureError>,
     semantic_prefix: Vec<SemanticEvent>,
@@ -155,6 +160,7 @@ impl Delivery {
             schema_version: EXECUTION_CONTROL_SCHEMA_VERSION,
             sequence: self.sequence,
             epoch: self.epoch,
+            timing: self.timing,
             generation: ObservedGenerationRecord {
                 event,
                 ..self.template.clone()
@@ -243,6 +249,14 @@ impl<B: TextGenerationBackend, F: FnMut(ControlledGenerationRecord) -> ControlFl
     fn next_token(&mut self) -> Result<Option<u32>, Self::Error> {
         let started = Instant::now();
         let result = self.state.advance(self.driver);
+        if matches!(&result, Ok(Some(_))) {
+            let mut delivery = self.delivery.borrow_mut();
+            let delivery = &mut delivery.0;
+            if delivery.timing.time_to_first_token().is_none() {
+                delivery.timing =
+                    GenerationTiming::new(Some(delivery.preparation_elapsed + started.elapsed()));
+            }
+        }
         let capture = self.state.take_completed_step(self.driver);
         let token = match result {
             Ok(token) => token.map(|token| token.token_id()),
@@ -293,7 +307,13 @@ pub struct ControlledGenerationSession<'a, B: TextGenerationBackend> {
 }
 
 impl<B: TextGenerationBackend> ControlledGenerationSession<'_, B> {
-    /// Current lifecycle, including native completion and record delivery.
+    /// Active preparation and execution through first commitment, before capture
+    /// delivery. Pauses and inspections are excluded; restoration never rewinds it.
+    pub fn timing(&self) -> GenerationTiming {
+        self.delivery.timing
+    }
+
+    /// Returns the current lifecycle state.
     pub fn status(&self) -> GenerationStatus {
         self.lifecycle.status()
     }
@@ -756,6 +776,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
         mut emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
         mode: OutputMode,
     ) -> Result<ControlledGenerationSession<'a, B>, ControlledGenerationError> {
+        let preparation_started = Instant::now();
         if prepared.session_identity != self.session_identity {
             return Err(CaptureError::Invalid(
                 "prepared request belongs to another loaded session".into(),
@@ -855,6 +876,8 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
             prompt_length: prepared.prompt_token_ids.len() as u64,
             prompt_token_ids: prepared.prompt_token_ids.clone().into(),
             started: Instant::now(),
+            preparation_elapsed: std::time::Duration::ZERO,
+            timing: GenerationTiming::default(),
             closed: false,
             failure: None,
             semantic_prefix: Vec::new(),
@@ -880,6 +903,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
             Some(plan) => driver.enable_interventions(&mut state, prepared.plan, plan)?,
             None => driver.enable_capture(&mut state, prepared.plan)?,
         }
+        delivery.preparation_elapsed = preparation_started.elapsed();
         delivery.send(started, &mut emit);
         if let Some(error) = delivery.failure.take() {
             return Err(error.into());
