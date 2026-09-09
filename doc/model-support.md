@@ -94,6 +94,12 @@ Qwen2 vision-language and Qwen2 MoE checkpoints are not accepted by the Qwen2
 text adapter. A model that needs custom Python code or uses an unregistered
 tensor layout is not implicitly compatible.
 
+Qwen text checkpoints may declare an explicit `layer_types` schedule. Qwen3
+dense and MoE require full attention in every layer; Qwen2 also supports explicit
+full/sliding schedules. The schedule must match the decoder depth. Transformers 5
+`rope_parameters` is normalized alongside legacy `rope_theta` and `rope_scaling`;
+conflicting declarations and unsupported rotary policies are rejected.
+
 ## Checkpoint formats
 
 ### SafeTensors directories

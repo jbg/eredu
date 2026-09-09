@@ -35,7 +35,9 @@ fn neutral_qwen_forward_executes_on_mlx() {
         "model_type":"qwen3","hidden_size":16,"num_hidden_layers":1,
         "intermediate_size":32,"num_attention_heads":4,"num_key_value_heads":2,
         "head_dim":4,"rms_norm_eps":1e-6,"vocab_size":32,
-        "max_position_embeddings":64,"rope_theta":1000000.0,"tie_word_embeddings":true
+        "max_position_embeddings":64,"tie_word_embeddings":true,
+        "layer_types":["full_attention"],
+        "rope_parameters":{"rope_type":"default","rope_theta":5000000.0}
     }))
     .unwrap();
     let execution = mlx_execution();

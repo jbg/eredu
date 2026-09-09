@@ -4253,7 +4253,9 @@ fn shared_decoder_runs_qwen2_and_qwen3_without_mlx() {
             "rms_norm_eps": 0.00001,
             "vocab_size": 32,
             "max_position_embeddings": 128,
-            "tie_word_embeddings": false
+            "tie_word_embeddings": false,
+            "layer_types": ["full_attention", "full_attention"],
+            "rope_parameters": {"rope_type": "default", "rope_theta": 5_000_000}
         });
         if model_type == "qwen3_moe" {
             config["intermediate_size"] = 0.into();
@@ -4265,6 +4267,7 @@ fn shared_decoder_runs_qwen2_and_qwen3_without_mlx() {
             config["use_sliding_window"] = true.into();
             config["sliding_window"] = 4.into();
             config["max_window_layers"] = 1.into();
+            config["layer_types"] = serde_json::json!(["full_attention", "sliding_attention"]);
         }
         let args = qwen::model_args_from_config_value(&config).unwrap();
         let layout = qwen::state_layout(&args).unwrap();

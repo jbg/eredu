@@ -142,6 +142,7 @@ struct ModelArgsSource {
     head_dim: i32,
     tie_word_embeddings: bool,
     rope_scaling: Option<HashMap<String, RopeValue>>,
+    rope_parameters: Option<HashMap<String, RopeValue>>,
     #[serde(default = "default_hidden_act")]
     hidden_act: String,
     #[serde(default)]
@@ -306,6 +307,7 @@ pub fn model_args_from_text_config_value(
 ) -> Result<ModelArgs, ConfigError> {
     validate_execution_fields(value)?;
     let mut source: ModelArgsSource = serde_json::from_value(value.clone())?;
+    normalize_hf_rope(value, &mut source)?;
     let variant = match context {
         TextConfigContext::Standalone => match source.model_type.as_deref() {
             Some("qwen2") => QwenVariant::Qwen2,
@@ -399,28 +401,50 @@ fn hf_attention_schedule(
             .as_bool()
             .ok_or_else(|| invalid("use_sliding_window must be boolean"))?,
     };
-    if variant != QwenVariant::Qwen2 {
-        if enabled {
-            return Err(invalid(
-                "Qwen3 does not use Qwen2 sliding-window configuration",
-            ));
+    if variant != QwenVariant::Qwen2 && enabled {
+        return Err(invalid(
+            "Qwen3 does not use Qwen2 sliding-window configuration",
+        ));
+    }
+    // Transformers serializes even the default all-full schedule. An explicit
+    // schedule is authoritative; the legacy window fields only supply defaults.
+    if let Some(declared) = value.get("layer_types").filter(|value| !value.is_null()) {
+        let declared = declared
+            .as_array()
+            .ok_or_else(|| invalid("layer_types must be an array of attention types"))?;
+        if declared.len() != layers {
+            return Err(invalid(format!(
+                "layer_types has {} entries for {layers} layers",
+                declared.len()
+            )));
         }
-        return LayerSchedule::all_full(layers).map_err(|error| invalid(error.to_string()));
+        let policies = declared
+            .iter()
+            .enumerate()
+            .map(|(layer, kind)| match kind.as_str() {
+                Some("full_attention") => Ok(AttentionPolicy::Full),
+                Some("sliding_attention") if variant != QwenVariant::Qwen2 => {
+                    Err(invalid("Qwen3 requires full attention in every layer"))
+                }
+                Some("sliding_attention") if !enabled => Err(invalid(
+                    "sliding_attention requires use_sliding_window=true",
+                )),
+                Some("sliding_attention") => hf_sliding_policy(value),
+                _ => Err(invalid(format!("unsupported layer_types[{layer}]: {kind}"))),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        return LayerSchedule::new(layers, policies).map_err(|error| invalid(error.to_string()));
     }
     if !enabled {
         return LayerSchedule::all_full(layers).map_err(|error| invalid(error.to_string()));
     }
-    let window = required_positive_u32(value, "sliding_window")?;
-    if window > i32::MAX as u32 {
-        return Err(invalid(format!("sliding_window exceeds i32: {window}")));
-    }
+    let sliding = hf_sliding_policy(value)?;
     let first = required_nonnegative_usize(value, "max_window_layers")?;
     if first >= layers {
         return Err(invalid(format!(
             "max_window_layers must leave at least one sliding layer, got {first} for {layers} layers"
         )));
     }
-    let sliding = AttentionPolicy::sliding(window).map_err(|error| invalid(error.to_string()))?;
     LayerSchedule::new(
         layers,
         (0..layers)
@@ -434,6 +458,61 @@ fn hf_attention_schedule(
             .collect(),
     )
     .map_err(|error| invalid(error.to_string()))
+}
+
+fn hf_sliding_policy(value: &Value) -> Result<AttentionPolicy, ConfigError> {
+    let window = required_positive_u32(value, "sliding_window")?;
+    if window > i32::MAX as u32 {
+        return Err(invalid(format!("sliding_window exceeds i32: {window}")));
+    }
+    AttentionPolicy::sliding(window).map_err(|error| invalid(error.to_string()))
+}
+
+fn normalize_hf_rope(value: &Value, source: &mut ModelArgsSource) -> Result<(), ConfigError> {
+    let Some(mut parameters) = source.rope_parameters.take() else {
+        return Ok(());
+    };
+    // Transformers 5 groups the base and scaling policy in rope_parameters.
+    // Normalize it once into the same contract used by older checkpoints.
+    validate_execution_fields(&value["rope_parameters"])?;
+    if parameters.contains_key("rope_theta") {
+        let theta = rope_number(&parameters, "rope_theta")
+            .filter(|theta| *theta > 0.0)
+            .ok_or_else(|| {
+                invalid("rope_parameters.rope_theta must be a finite positive number")
+            })?;
+        if value.get("rope_theta").is_some() && source.rope_theta != theta {
+            return Err(invalid(
+                "rope_theta and rope_parameters.rope_theta disagree",
+            ));
+        }
+        source.rope_theta = theta;
+        parameters.remove("rope_theta");
+    }
+    parameters.remove("partial_rotary_factor");
+    parameters.remove("rope_interleaved");
+    if !parameters.contains_key("type") && !parameters.contains_key("rope_type") {
+        parameters.insert("rope_type".into(), RopeValue::String("default".into()));
+    }
+    let canonical = |mut scaling: HashMap<String, RopeValue>| -> Result<_, ConfigError> {
+        validate_rope_scaling(Some(&scaling))?;
+        if let Some(kind) = scaling.remove("type") {
+            scaling.entry("rope_type".into()).or_insert(kind);
+        }
+        if scaling == HashMap::from([("rope_type".into(), RopeValue::String("default".into()))]) {
+            Ok(None)
+        } else {
+            Ok(Some(scaling))
+        }
+    };
+    let parameters = canonical(parameters)?;
+    if let Some(legacy) = source.rope_scaling.take() {
+        if canonical(legacy)? != parameters {
+            return Err(invalid("rope_scaling and rope_parameters disagree"));
+        }
+    }
+    source.rope_scaling = parameters;
+    Ok(())
 }
 
 /// Parses normalized Qwen arguments from pure GGUF catalog metadata.
@@ -766,7 +845,6 @@ fn validate_model_args(args: &ModelArgs) -> Result<(), ConfigError> {
 
 fn validate_execution_fields(value: &Value) -> Result<(), ConfigError> {
     for field in [
-        "layer_types",
         "sliding_window_pattern",
         "attention_type",
         "use_qk_norm",
@@ -1067,6 +1145,153 @@ mod tests {
         assert!(!qwen2.attention_bias(AttentionProjection::Output));
         assert_eq!(qwen2.query_key_norm_epsilon(), None);
         assert_eq!(qwen3.query_key_norm_epsilon(), Some(0.000001));
+    }
+
+    #[test]
+    fn explicit_full_attention_layers_preserve_qwen3_execution_and_cache_identity() {
+        let mut value = base("qwen3");
+        value["num_hidden_layers"] = Value::from(36);
+        value["use_sliding_window"] = Value::Bool(false);
+        value["sliding_window"] = Value::Null;
+        value["max_window_layers"] = Value::from(36);
+        let implicit = model_args_from_config_value(&value).unwrap();
+        value["layer_types"] = serde_json::json!(vec!["full_attention"; 36]);
+        let explicit = model_args_from_config_value(&value).unwrap();
+        assert_eq!(explicit.attention_schedule, implicit.attention_schedule);
+        assert_eq!(
+            explicit.architecture_fingerprint(),
+            implicit.architecture_fingerprint()
+        );
+        assert_eq!(
+            crate::qwen::state_layout(&explicit).unwrap(),
+            crate::qwen::state_layout(&implicit).unwrap()
+        );
+    }
+
+    #[test]
+    fn transformers5_rope_parameters_preserve_qwen3_rotary_base() {
+        let mut value = base("qwen3");
+        value.as_object_mut().unwrap().remove("rope_theta");
+        value["rope_parameters"] = serde_json::json!({
+            "rope_type": "default", "rope_theta": 5_000_000
+        });
+        let args = model_args_from_config_value(&value).unwrap();
+        assert_eq!(args.rotary_spec(4).base, 5_000_000.0);
+        value.as_object_mut().unwrap().remove("rope_parameters");
+        value["rope_theta"] = Value::from(5_000_000);
+        let legacy = model_args_from_config_value(&value).unwrap();
+        assert_eq!(
+            args.architecture_fingerprint(),
+            legacy.architecture_fingerprint()
+        );
+    }
+
+    #[test]
+    fn explicit_qwen2_schedule_overrides_legacy_layer_order() {
+        let mut value = base("qwen2");
+        value["use_sliding_window"] = Value::Bool(true);
+        value["sliding_window"] = Value::from(32);
+        value["max_window_layers"] = Value::from(1);
+        value["layer_types"] =
+            serde_json::json!(["sliding_attention", "full_attention", "sliding_attention"]);
+        let args = model_args_from_config_value(&value).unwrap();
+        assert_eq!(
+            args.attention_schedule.iter().copied().collect::<Vec<_>>(),
+            vec![
+                AttentionPolicy::sliding(32).unwrap(),
+                AttentionPolicy::Full,
+                AttentionPolicy::sliding(32).unwrap(),
+            ]
+        );
+        value["use_sliding_window"] = Value::Bool(false);
+        assert!(model_args_from_config_value(&value).is_err());
+        value["use_sliding_window"] = Value::Bool(true);
+        value["sliding_window"] = Value::Null;
+        assert!(model_args_from_config_value(&value).is_err());
+    }
+
+    #[test]
+    fn explicit_layer_types_validate_length_spelling_and_supported_attention() {
+        let mut value = base("qwen3");
+        for declared in [
+            serde_json::json!([]),
+            serde_json::json!(["full_attention"]),
+            serde_json::json!(vec!["full_attention"; 4]),
+            serde_json::json!("full_attention"),
+            serde_json::json!({}),
+            serde_json::json!(["full_attention", 1, "full_attention"]),
+            serde_json::json!(["full_attention", "linear_attention", "full_attention"]),
+            serde_json::json!(["full_attention", "sliding_attention", "full_attention"]),
+        ] {
+            value["layer_types"] = declared.clone();
+            assert!(model_args_from_config_value(&value).is_err(), "{declared}");
+        }
+        value["layer_types"] = Value::Null;
+        let args = model_args_from_config_value(&value).unwrap();
+        assert!(args
+            .attention_schedule
+            .iter()
+            .all(|policy| *policy == AttentionPolicy::Full));
+    }
+
+    #[test]
+    fn transformers5_scaled_rope_matches_legacy_execution_and_cache_identity() {
+        for scaling in [
+            serde_json::json!({"rope_type": "linear", "factor": 2.0}),
+            serde_json::json!({"rope_type": "yarn", "factor": 4.0, "original_max_position_embeddings": 128}),
+        ] {
+            let mut value = base("qwen3");
+            value["rope_scaling"] = scaling.clone();
+            let legacy = model_args_from_config_value(&value).unwrap();
+            value.as_object_mut().unwrap().remove("rope_scaling");
+            value["rope_parameters"] = scaling.clone();
+            value["rope_parameters"]["rope_theta"] = value["rope_theta"].clone();
+            let modern = model_args_from_config_value(&value).unwrap();
+            assert_eq!(modern.rotary_spec(4).base, legacy.rotary_spec(4).base);
+            assert_eq!(
+                modern.rotary_spec(4).algorithm,
+                legacy.rotary_spec(4).algorithm
+            );
+            assert_eq!(
+                modern.architecture_fingerprint(),
+                legacy.architecture_fingerprint()
+            );
+            value["rope_scaling"] = scaling;
+            assert!(model_args_from_config_value(&value).is_ok());
+            value["rope_scaling"]["factor"] = Value::from(8.0);
+            assert!(model_args_from_config_value(&value).is_err());
+        }
+    }
+
+    #[test]
+    fn transformers5_rope_rejects_invalid_conflicting_and_unsupported_policy() {
+        for parameters in [
+            serde_json::json!(42),
+            serde_json::json!([]),
+            serde_json::json!({"rope_theta": 0}),
+            serde_json::json!({"rope_theta": -1}),
+            serde_json::json!({"rope_theta": "invalid"}),
+            serde_json::json!({"rope_type": "dynamic", "factor": 2}),
+            serde_json::json!({"rope_type": "linear"}),
+            serde_json::json!({"rope_type": "linear", "factor": -1}),
+            serde_json::json!({"rope_type": "default", "type": "linear"}),
+            serde_json::json!({"partial_rotary_factor": 0.5}),
+            serde_json::json!({"rope_interleaved": true}),
+            serde_json::json!({"full_attention": {"rope_type": "default"}}),
+        ] {
+            let mut value = base("qwen3");
+            value["rope_parameters"] = parameters.clone();
+            assert!(
+                model_args_from_config_value(&value).is_err(),
+                "{parameters}"
+            );
+        }
+        let mut value = base("qwen3");
+        value["rope_parameters"] = serde_json::json!({"rope_theta": 5_000_000});
+        assert!(model_args_from_config_value(&value)
+            .unwrap_err()
+            .to_string()
+            .contains("disagree"));
     }
 
     #[test]
