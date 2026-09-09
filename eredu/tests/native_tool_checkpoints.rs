@@ -18,7 +18,7 @@ fn profile_requires_structural_tool_tokens(identity: &str) -> bool {
     identity.starts_with("google.gemma4.")
         || identity.starts_with("openai.gpt-oss.")
         || identity.starts_with("mistral.")
-        || identity.starts_with("liquid.lfm2")
+        || identity.starts_with("lfm2.")
         || identity.starts_with("deepseek.")
         || identity.starts_with("meta.llama-4.")
 }
@@ -263,7 +263,7 @@ fn mistral_real_checkpoint_native_tool_smoke() {
 #[test]
 #[ignore = "requires EREDU_LFM2_TOOL_CHECKPOINT and an MLX Metal device"]
 fn lfm2_real_checkpoint_native_tool_smoke() {
-    smoke("EREDU_LFM2_TOOL_CHECKPOINT", "liquid.lfm2");
+    smoke("EREDU_LFM2_TOOL_CHECKPOINT", "lfm2.");
 }
 
 #[test]

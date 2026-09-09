@@ -807,12 +807,11 @@ impl GrammarState {
             .matcher
             .tok_env()
             .map_err(|error| format!("failed to inspect grammar tokenizer: {error}"))?;
-        let tokens = token_env.tokenize_bytes(bytes);
+        let tokens = token_env.tokenize_bytes_special(bytes);
         let trie = token_env.tok_trie();
-        let round_trip = tokens
-            .iter()
-            .flat_map(|&token| trie.token(token).iter().copied())
-            .collect::<Vec<_>>();
+        // Activation uses decoded output bytes. Structural tokens retain their
+        // IDs, but the trie's internal special-token marker is not output text.
+        let round_trip = trie.decode(&tokens);
         if round_trip != bytes {
             return Err("grammar tokenizer could not represent activation bytes exactly".into());
         }
@@ -847,7 +846,16 @@ impl GrammarState {
             .map_err(|error| format!("failed to inspect grammar tokenizer: {error}"))?;
         let trie = token_env.tok_trie();
         Ok((0..trie.vocab_size() as TokenId)
-            .map(|token| trie.token(token).to_vec())
+            .map(|token| {
+                // Match triggers in the same byte domain as decoded output;
+                // otherwise a structural token appears to start one byte late.
+                // Keep absent vocabulary slots empty.
+                let bytes = trie.token(token);
+                bytes
+                    .strip_prefix(&[llguidance::toktrie::TokTrie::SPECIAL_TOKEN_MARKER])
+                    .unwrap_or(bytes)
+                    .to_vec()
+            })
             .collect())
     }
 }
@@ -1018,6 +1026,152 @@ mod tests {
 
     fn compiler() -> ConstraintCompiler {
         ConstraintCompiler::synthetic_for_tests()
+    }
+
+    fn activation_tokenizer(markers: &[&str], special: bool) -> super::ChatTokenizer {
+        use tokenizers::{decoders::byte_level::ByteLevel, models::bpe::BPE, AddedToken};
+
+        let vocabulary = (b'!'..=b'~')
+            .map(|byte| (byte as char).to_string())
+            .chain(["Ġ".to_owned()])
+            .enumerate()
+            .map(|(id, spelling)| (spelling, id as u32))
+            .collect::<tokenizers::models::bpe::Vocab>();
+        let model = BPE::builder()
+            .vocab_and_merges(vocabulary, Vec::new())
+            .build()
+            .unwrap();
+        let mut tokenizer = tokenizers::Tokenizer::new(model);
+        tokenizer.with_pre_tokenizer(Some(ByteLevel::new(false, false, false)));
+        tokenizer.with_decoder(Some(ByteLevel::default()));
+        tokenizer
+            .add_tokens(
+                markers
+                    .iter()
+                    .map(|&marker| AddedToken::from(marker, special).normalized(false)),
+            )
+            .unwrap();
+        super::ChatTokenizer::from_tokenizer(tokenizer)
+    }
+
+    #[test]
+    fn lfm_auto_activation_preserves_added_token_identity() {
+        use crate::runtime::chat::lfm2::{LFM2_DIALECT, LFM2_PARAMETERS};
+
+        let markers = ["<|tool_call_start|>", "<|tool_call_end|>", "<|im_end|>"];
+        // LFM's tool markers are added tokens with special=false. Exercise
+        // special=true too: the grammar trie treats both as structural tokens.
+        for special in [false, true] {
+            let tokenizer = activation_tokenizer(&markers, special);
+            let ids = markers
+                .iter()
+                .map(|marker| tokenizer.token_to_id(marker).unwrap())
+                .collect::<Vec<_>>();
+            let compiler = ConstraintCompiler::from_tokenizer(&tokenizer, &[ids[2]]).unwrap();
+            let tools = [tool(
+                "ping",
+                json!({"type": "object", "additionalProperties": false}),
+            )];
+            let plan = compiler
+                .compile_tool_plan(
+                    &LFM2_DIALECT,
+                    DialectParameters::Custom(&LFM2_PARAMETERS),
+                    &tools,
+                    ToolChoice::Auto,
+                    ParallelToolCallPolicy::Disabled,
+                    ids.clone(),
+                )
+                .unwrap();
+            for preamble in ["", "hello"] {
+                let mut controller =
+                    super::ConstraintController::from_generation_plan(&plan).unwrap();
+                for &token in tokenizer.encode(preamble, false).unwrap().get_ids() {
+                    controller.commit(token).unwrap();
+                }
+                assert!(!controller.constraint_is_active());
+                let marker = tokenizer.encode(markers[0], false).unwrap();
+                assert_eq!(marker.get_ids(), &[ids[0]]);
+                // Filtering examines the marker even before it is sampled.
+                let history = tokenizer
+                    .encode(preamble, false)
+                    .unwrap()
+                    .get_ids()
+                    .to_vec();
+                assert!(controller.filter_at(&history).unwrap().allows(ids[0]));
+                controller.commit(ids[0]).unwrap();
+                assert!(controller.constraint_is_active());
+                assert!(!controller
+                    .valid_token_ids()
+                    .unwrap()
+                    .unwrap()
+                    .contains(&ids[1]));
+                for &token in tokenizer.encode("[ping()]", false).unwrap().get_ids() {
+                    controller.commit(token).unwrap();
+                }
+                controller.commit(ids[1]).unwrap();
+                assert!(controller.grammar_is_complete().unwrap());
+            }
+
+            let forbidden = compiler
+                .compile_tool_plan(
+                    &LFM2_DIALECT,
+                    DialectParameters::Custom(&LFM2_PARAMETERS),
+                    &tools,
+                    ToolChoice::None,
+                    ParallelToolCallPolicy::Disabled,
+                    ids.clone(),
+                )
+                .unwrap();
+            let mut controller =
+                super::ConstraintController::from_generation_plan(&forbidden).unwrap();
+            assert!(!controller.filter_at(&[]).unwrap().allows(ids[0]));
+            assert!(controller.commit(ids[0]).is_err());
+        }
+    }
+
+    #[test]
+    fn auto_activation_spanning_special_token_and_text_preserves_exact_bytes() {
+        const SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
+            output: ExactEnvelope {
+                prefix: "<|tool|> ",
+                suffix: "",
+            },
+            auto_activation_trigger: Some("<|tool|> "),
+            required_structural_tokens: &["<|tool|>"],
+            ..SYNTHETIC_SPEC
+        };
+        let tokenizer = activation_tokenizer(&["<|tool|>", "<|end|>"], true);
+        let marker = tokenizer.token_to_id("<|tool|>").unwrap();
+        let eos = tokenizer.token_to_id("<|end|>").unwrap();
+        let compiler = ConstraintCompiler::from_tokenizer(&tokenizer, &[eos]).unwrap();
+        let plan = compiler
+            .compile_tool_plan(
+                &DECLARATIVE_DIALECT,
+                DialectParameters::Declarative(&SPEC),
+                &[tool(
+                    "ping",
+                    json!({"type": "object", "additionalProperties": false}),
+                )],
+                ToolChoice::Auto,
+                ParallelToolCallPolicy::Disabled,
+                vec![marker],
+            )
+            .unwrap();
+        let mut controller = super::ConstraintController::from_generation_plan(&plan).unwrap();
+        controller.commit(marker).unwrap();
+        assert!(!controller.constraint_is_active());
+        let space = tokenizer.encode(" ", false).unwrap().get_ids()[0];
+        assert!(controller.filter_at(&[marker]).unwrap().allows(space));
+        controller.commit(space).unwrap();
+        assert!(controller.constraint_is_active());
+        for &token in tokenizer
+            .encode(r#"[{"name":"ping","arguments":{}}]"#, false)
+            .unwrap()
+            .get_ids()
+        {
+            controller.commit(token).unwrap();
+        }
+        assert!(controller.grammar_is_complete().unwrap());
     }
 
     fn tool(name: &str, parameters: serde_json::Value) -> serde_json::Value {

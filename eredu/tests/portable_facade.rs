@@ -264,6 +264,132 @@ fn loaded_model_generates_without_an_mlx_dependency() {
 }
 
 #[test]
+#[ignore = "requires EREDU_LFM2_TOOL_CHECKPOINT; tokenizer/template only, no native backend"]
+fn lfm_checkpoint_native_tool_activation_with_portable_backend() {
+    use eredu::api::{
+        PreparedChatGenerationRequest, PreparedChatGenerationSettings, PreparedChatInput,
+    };
+    use eredu::runtime::chat::{ChatTemplateRequest, ParallelToolCallPolicy, ToolChoice};
+    use eredu_core::{FinishReason, SemanticEvent};
+    use serde_json::json;
+
+    let path = std::path::PathBuf::from(std::env::var("EREDU_LFM2_TOOL_CHECKPOINT").unwrap());
+    let mut tokenizer = ChatTokenizer::from_tokenizer(load_tokenizer(&path).unwrap());
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(path.join("tokenizer_config.json")).unwrap())
+            .unwrap();
+    tokenizer.set_template_kwargs(serde_json::Map::from_iter([(
+        "bos_token".into(),
+        metadata["bos_token"].clone(),
+    )]));
+    let start = tokenizer.token_to_id("<|tool_call_start|>").unwrap();
+    let eos = tokenizer.token_to_id("<|im_end|>").unwrap();
+    let extent = eredu_text::tokenizer::token_id_vocabulary(&tokenizer)
+        .last_key_value()
+        .map(|(&id, _)| id as usize + 1)
+        .unwrap();
+    let mut logits = vec![0.0; extent];
+    // Make the decision to call a tool deterministic while exercising the
+    // facade's real activation filter and all subsequent grammar masks.
+    logits[start as usize] = 1.0;
+    let runtime = ModelRuntime::prepare(
+        MockBackend {
+            logits,
+            ..Default::default()
+        },
+        (),
+    )
+    .unwrap();
+    let mut model = LoadedModel::from_runtime(
+        runtime,
+        tokenizer,
+        LoadedTextModelConfig {
+            model_family: ModelKind::Lfm2,
+            effective_model_type: "lfm2".into(),
+            model_id: path.display().to_string(),
+            chat_template: Some(
+                std::fs::read_to_string(path.join("chat_template.jinja"))
+                    .unwrap()
+                    .into(),
+            ),
+            eos_token_ids: vec![eos],
+            checkpoint_generation_config: None,
+        },
+    );
+    let prepared = model
+        .prepare_chat(ChatTemplateRequest {
+            messages: vec![json!({"role": "user", "content": "Look up value 7."})],
+            tools: vec![json!({"type": "function", "function": {
+                "name": "lookup",
+                "parameters": {
+                    "type": "object", "properties": {"value": {"type": "integer", "enum": [7]}},
+                    "required": ["value"], "additionalProperties": false
+                }
+            }})],
+            tool_choice: ToolChoice::Auto,
+            parallel_tool_calls: ParallelToolCallPolicy::Disabled,
+            add_generation_prompt: true,
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(
+        prepared.format_profile_identity(),
+        Some("lfm2.python-tools.v1")
+    );
+    let mut events = Vec::new();
+    let output = model
+        .generate_prepared_chat(PreparedChatGenerationRequest {
+            input: PreparedChatInput::rendered_prompt(&prepared),
+            settings: PreparedChatGenerationSettings {
+                overrides: GenerationConfigOverrides {
+                    max_new_tokens: Some(64),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            caller_stop_sequences: &[],
+            cancellation: Default::default(),
+            on_event: |event| events.push(event),
+        })
+        .unwrap();
+    assert_eq!(output.token_ids.first(), Some(&start));
+    assert!(matches!(
+        output.finish_reason,
+        FinishReason::GrammarComplete | FinishReason::StopSequence
+    ));
+    assert!(
+        matches!(events.first(), Some(SemanticEvent::ToolCallStart { index: 0, name, .. }) if name == "lookup")
+    );
+    let arguments = events
+        .iter()
+        .filter_map(|event| match event {
+            SemanticEvent::ToolArgumentsDelta {
+                index: 0,
+                json_fragment,
+            } => Some(json_fragment.as_str()),
+            _ => None,
+        })
+        .collect::<String>();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&arguments).unwrap(),
+        json!({"value": 7})
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, SemanticEvent::ToolCallEnd))
+            .count(),
+        1
+    );
+    assert_eq!(
+        events.last(),
+        Some(&SemanticEvent::Finished {
+            reason: output.finish_reason
+        })
+    );
+}
+
+#[test]
 fn automatic_planning_documents_are_available_without_mlx() {
     let request = AutomaticPlanRequest::new(
         "model",
