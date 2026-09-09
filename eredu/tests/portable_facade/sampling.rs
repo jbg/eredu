@@ -322,8 +322,7 @@ fn speculative_mirostat_preserves_single_and_mixed_batch_settings() {
                     cancellation: Default::default(),
                     on_event: |_| panic!("mock backend must not emit events"),
                 })
-                .err()
-                .expect("mock backend returns its sentinel error");
+                .expect_err("mock backend returns its sentinel error");
             assert!(matches!(error, PreparedChatSpeculativeError::Backend(_)));
             let error = model
                 .generate_prepared_chat_speculative_batch(PreparedChatSpeculativeBatchRequest {
@@ -406,8 +405,7 @@ fn assert_invalid_speculative_settings(
                     cancellation: Default::default(),
                     on_event: |_| panic!("invalid settings must not emit events"),
                 })
-                .err()
-                .expect("invalid settings must fail");
+                .expect_err("invalid settings must fail");
             let PreparedChatSpeculativeError::Generation(error) = error else {
                 panic!("expected portable generation error: {error}");
             };

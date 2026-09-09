@@ -552,7 +552,7 @@ fn mirostat_adapts_to_the_tool_constrained_distribution_once_per_token() {
     let policy = MirostatV2Sampler::new(4.0, 0.2).unwrap();
     let mut sampler = constrained_sampler(policy.clone(), &plan).unwrap();
     let independent = constrained_sampler(policy, &plan).unwrap();
-    for (index, expected) in [b'{', b'"'].into_iter().enumerate() {
+    for (index, expected) in b"{\"".iter().copied().enumerate() {
         let mut logits = vec![-100.0; SYNTHETIC_VOCAB_SIZE];
         logits[b'x' as usize] = 1000.0; // Dominant but forbidden by the tool grammar.
         logits[expected as usize] = 10.0;

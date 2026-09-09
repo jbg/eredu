@@ -958,14 +958,17 @@ impl MoshiRealtimeArchitectureVisitor<ReferenceBackend, ReferenceState> for Cons
         );
 
         let incarnation = sessions.request_state(request).unwrap().incarnation();
-        let released = sessions
-            .release(request)
-            .map_err(|error| error.to_string())?;
+        let mut released = Some(
+            sessions
+                .release(request)
+                .map_err(|error| error.to_string())?,
+        );
         assert!(sessions.request_state(request).is_none());
         let resumed_request = RequestId::new(8);
         sessions
-            .resume(resumed_request, released)
+            .resume(resumed_request, &mut released)
             .map_err(|error| error.to_string())?;
+        assert!(released.is_none());
         assert_eq!(
             sessions
                 .request_state(resumed_request)
@@ -1848,40 +1851,34 @@ impl ArtifactSourceCounters {
 }
 
 struct IndependentArtifactSource {
-    inner: MemoryWeightStore,
-    metadata: Mutex<TensorMetadata>,
+    inner: Mutex<MemoryWeightStore>,
     counters: Arc<ArtifactSourceCounters>,
 }
 
 impl IndependentArtifactSource {
     fn new(counters: Arc<ArtifactSourceCounters>) -> Self {
-        let bytes = [1.0_f32, 2.0]
-            .into_iter()
-            .flat_map(f32::to_le_bytes)
-            .collect::<Vec<_>>();
-        let inner = MemoryWeightStore::from_safetensors([(
-            "weight".into(),
-            safetensors::Dtype::F32,
-            vec![2],
-            bytes,
-        )])
-        .unwrap();
         Self {
-            inner,
-            metadata: Mutex::new(TensorMetadata {
-                name: "weight".into(),
-                logical_shape: vec![2],
-                physical_shape: vec![2],
-                stored_dtype: StoredDtype::F32,
-                encoded_byte_len: 8,
-                backing_shard: None,
-            }),
+            inner: Mutex::new(Self::weights(vec![2])),
             counters,
         }
     }
 
-    fn replace_metadata(&self, metadata: TensorMetadata) {
-        *self.metadata.lock().unwrap() = metadata;
+    fn weights(shape: Vec<usize>) -> MemoryWeightStore {
+        let bytes = [1.0_f32, 2.0]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        MemoryWeightStore::from_safetensors([(
+            "weight".into(),
+            safetensors::Dtype::F32,
+            shape,
+            bytes,
+        )])
+        .unwrap()
+    }
+
+    fn replace_shape(&self, shape: Vec<usize>) {
+        *self.inner.lock().unwrap() = Self::weights(shape);
     }
 }
 
@@ -1892,19 +1889,16 @@ impl CheckpointSource for IndependentArtifactSource {
 
     fn source_metadata(&self, key: &str) -> Result<TensorMetadata, StoreError> {
         self.counters.metadata_reads.fetch_add(1, Ordering::SeqCst);
-        if key != "weight" {
-            return Err(StoreError::UnknownTensor { key: key.into() });
-        }
-        Ok(self.metadata.lock().unwrap().clone())
+        self.inner.lock().unwrap().source_metadata(key)
     }
 
     fn acquire_lease(&self, request: TensorReadRequest) -> Result<CheckpointLease, StoreError> {
         self.counters.payload_reads.fetch_add(1, Ordering::SeqCst);
-        self.inner.acquire_lease(request)
+        self.inner.lock().unwrap().acquire_lease(request)
     }
 
     fn source_diagnostics(&self) -> Result<WeightStoreDiagnostics, StoreError> {
-        self.inner.source_diagnostics()
+        self.inner.lock().unwrap().source_diagnostics()
     }
 
     fn source_provenance(
@@ -2242,23 +2236,28 @@ impl BoundedIndependentAdapter {
         assert_eq!(counters.payload_reads.load(Ordering::SeqCst), 0);
         assert_eq!(reference_trace().parameter_materializations, 0);
 
-        let mut substituted = metadata.clone();
-        substituted.logical_shape = vec![1, 2];
-        source.replace_metadata(substituted);
+        // Preparation pins the catalog once; deferred acquisition validates
+        // the returned lease before the backend can materialize it.
+        source.replace_shape(vec![1, 2]);
         counters.reset();
         clear_reference_trace();
+        assert_eq!(prepared.source_metadata("weight").unwrap(), metadata);
         let binding = WeightBinding::new("weight", "weight", selection.clone(), 4).unwrap();
-        assert!(materialize_bindings::<ReferenceBackend>(
-            &prepared,
-            std::slice::from_ref(&binding),
-            &()
-        )
-        .is_err());
-        assert!(counters.metadata_reads.load(Ordering::SeqCst) > 0);
-        assert_eq!(counters.payload_reads.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            materialize_bindings::<ReferenceBackend>(
+                &prepared,
+                std::slice::from_ref(&binding),
+                &()
+            ),
+            Err(eredu_runtime::ParameterOrchestrationError::Store(
+                StoreError::PreparedCatalogMismatch { key }
+            )) if key == "weight"
+        ));
+        assert_eq!(counters.metadata_reads.load(Ordering::SeqCst), 0);
+        assert_eq!(counters.payload_reads.load(Ordering::SeqCst), 1);
         assert_eq!(reference_trace().parameter_materializations, 0);
 
-        source.replace_metadata(metadata);
+        source.replace_shape(metadata.logical_shape);
         counters.reset();
         clear_reference_trace();
         let materialized = materialize_bindings::<ReferenceBackend>(&prepared, &[binding], &())

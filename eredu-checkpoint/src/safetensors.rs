@@ -66,14 +66,14 @@ impl SafetensorsShards {
             return Self::discover_directory(path);
         }
         let payload = canonicalize(path)?;
-        Ok(Self {
+        Self {
             payload_paths: vec![payload.clone()],
             logical_payload_paths: BTreeMap::from([("weights".into(), payload)]),
             tensor_locations: None,
             admissions: BTreeMap::new(),
             recipes: Arc::default(),
         }
-        .admit()?)
+        .admit()
     }
 
     fn discover_directory(root: &Path) -> Result<Self, SafetensorsShardError> {
@@ -81,14 +81,14 @@ impl SafetensorsShards {
         let index_path = root.join("model.safetensors.index.json");
         if !index_path.exists() {
             let payload = admit_payload(&root.join("model.safetensors"), &access_root)?;
-            return Ok(Self {
+            return Self {
                 payload_paths: vec![payload.clone()],
                 logical_payload_paths: BTreeMap::from([("weights".into(), payload)]),
                 tensor_locations: None,
                 admissions: BTreeMap::new(),
                 recipes: Arc::default(),
             }
-            .admit()?);
+            .admit();
         }
 
         let raw =
@@ -126,14 +126,14 @@ impl SafetensorsShards {
             };
             tensor_locations.insert(tensor, payload);
         }
-        Ok(Self {
+        Self {
             payload_paths: payload_paths.into_iter().collect(),
             logical_payload_paths,
             tensor_locations: Some(tensor_locations),
             admissions: BTreeMap::new(),
             recipes: Arc::default(),
         }
-        .admit()?)
+        .admit()
     }
 
     fn admit(mut self) -> Result<Self, SafetensorsShardError> {
