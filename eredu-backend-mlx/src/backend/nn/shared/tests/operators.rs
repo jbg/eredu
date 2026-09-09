@@ -73,6 +73,92 @@ fn mlx_portable_causal_geometry_preserves_inclusive_distance() {
 }
 
 #[test]
+fn mlx_attention_preserves_output_dtype_and_mask_semantics() {
+    let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+    let stream = execution.stream();
+    for (query_dtype, key_dtype, value_dtype, output_dtype) in [
+        (
+            Dtype::Bfloat16,
+            Dtype::Bfloat16,
+            Dtype::Bfloat16,
+            Dtype::Bfloat16,
+        ),
+        (
+            Dtype::Float16,
+            Dtype::Float16,
+            Dtype::Float16,
+            Dtype::Float16,
+        ),
+        (
+            Dtype::Float32,
+            Dtype::Float32,
+            Dtype::Float32,
+            Dtype::Float32,
+        ),
+        (
+            Dtype::Bfloat16,
+            Dtype::Float32,
+            Dtype::Bfloat16,
+            Dtype::Float32,
+        ),
+        (
+            Dtype::Bfloat16,
+            Dtype::Bfloat16,
+            Dtype::Float32,
+            Dtype::Float32,
+        ),
+    ] {
+        let tensor = |data: &[f32], shape: &[i32], dtype| {
+            MlxTensor::from_array(
+                Array::from_slice(data, shape)
+                    .as_dtype(dtype, stream)
+                    .unwrap(),
+            )
+        };
+        let queries = tensor(&[0.0; 4], &[1, 2, 2, 1], query_dtype);
+        let keys = tensor(&[0.0; 4], &[1, 1, 4, 1], key_dtype);
+        let values = tensor(&[4.0, 8.0, 16.0, 32.0], &[1, 1, 4, 1], value_dtype);
+        // Two committed keys plus a bidirectional proposal block, with the
+        // oldest committed key falling outside the second query's window.
+        let additive = tensor(
+            &[0.0, 0.0, 0.0, 0.0, f32::NEG_INFINITY, 0.0, 0.0, 0.0],
+            &[1, 1, 2, 4],
+            Dtype::Float32,
+        );
+        let boolean = MlxTensor::from_array(Array::from_slice(
+            &[true, true, true, true, false, true, true, true],
+            &[1, 1, 2, 4],
+        ));
+        let bias = tensor(&[0.0, 0.0, 0.0, 2.0_f32.ln()], &[4], Dtype::Float32);
+        for (mask, expected) in [
+            (Some(&additive), [15.0, 56.0 / 3.0, 15.0, 56.0 / 3.0]),
+            (Some(&boolean), [15.0, 56.0 / 3.0, 15.0, 56.0 / 3.0]),
+            (Some(&bias), [92.0 / 5.0; 4]),
+            (None, [15.0; 4]),
+        ] {
+            let output = MlxNeuralBackend::attention(
+                queries.clone(),
+                keys.clone(),
+                values.clone(),
+                1.0,
+                mask,
+                stream,
+            )
+            .unwrap();
+            assert_eq!(output.as_array().dtype(), output_dtype);
+            assert_eq!(output.shape(), [1, 2, 2, 1]);
+            let output = output.as_array().as_dtype(Dtype::Float32, stream).unwrap();
+            let tolerance = match output_dtype {
+                Dtype::Bfloat16 => 0.15,
+                Dtype::Float16 => 0.02,
+                _ => 1e-5,
+            };
+            close(&MlxTensor::from_array(output), &expected, tolerance);
+        }
+    }
+}
+
+#[test]
 #[ignore = "explicit MLX dtype regression; run outside the sandbox"]
 fn mlx_weighted_rms_norm_preserves_bfloat16_input_dtype() {
     let execution = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));

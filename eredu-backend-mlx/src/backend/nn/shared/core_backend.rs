@@ -549,12 +549,31 @@ impl NeuralBackend for MlxNeuralBackend {
         mask: Option<&MlxTensor>,
         context: &Stream,
     ) -> Result<MlxTensor, ComputeError> {
+        // MLX requires additive masks to promote to the Q/K/V output dtype.
+        // Keep boolean masks boolean: casting them would change their meaning.
+        let mask = mask
+            .map(|mask| {
+                let mask = mask.as_array();
+                if mask.dtype() == Dtype::Bool {
+                    Ok(mask.clone())
+                } else {
+                    let dtype = Dtype::from_promoting_types(
+                        Dtype::from_promoting_types(
+                            queries.as_array().dtype(),
+                            keys.as_array().dtype(),
+                        ),
+                        values.as_array().dtype(),
+                    );
+                    compute(mask.as_dtype(dtype, context))
+                }
+            })
+            .transpose()?;
         compute_tensor(safemlx::fast::scaled_dot_product_attention(
             queries.into_array(),
             keys.into_array(),
             values.into_array(),
             scale,
-            mask.map(|mask| ScaledDotProductAttentionMask::Array(mask.as_array())),
+            mask.as_ref().map(ScaledDotProductAttentionMask::Array),
             None,
             context,
         ))
