@@ -137,7 +137,7 @@ fn paged_full_attention_matches_contiguous_causal_attention() {
         .update_and_fetch(keys.clone(), values.clone(), stream)
         .unwrap();
     let paged = cache
-        .paged_attention(&queries, 2.0f32.sqrt().recip(), None, None, stream)
+        .paged_attention(&queries, 2.0f32.sqrt().recip(), None, None, None, stream)
         .unwrap()
         .unwrap();
     let reference = safemlx::fast::scaled_dot_product_attention(
@@ -177,7 +177,7 @@ fn paged_attention_preserves_learned_sink_normalization() {
         .update_and_fetch(keys.clone(), values.clone(), stream)
         .unwrap();
     let paged = cache
-        .paged_attention(&queries, 1.0, None, Some(&sinks), stream)
+        .paged_attention(&queries, 1.0, None, Some(&sinks), None, stream)
         .unwrap()
         .unwrap();
     let reference = safemlx::fast::scaled_dot_product_attention(
@@ -195,4 +195,63 @@ fn paged_attention_preserves_learned_sink_normalization() {
         .all_close(&reference, 1e-5, 1e-5, None, stream)
         .unwrap()
         .item::<bool>(stream));
+}
+
+#[test]
+#[ignore = "requires MLX runtime execution"]
+fn paged_score_softcap_matches_scalar_masked_gqa_through_chunked_prefill() {
+    let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+    let stream = context.stream();
+    for window in [None, Some(2)] {
+        for sink in [None, Some(0.5f32)] {
+            let manager = CacheResidencyManager::new(paged_options(true)).unwrap();
+            let mut cache = PagedKeyValueCache::new(manager, 0, window).unwrap();
+            let sinks = sink.map(|s| Array::from_slice(&[s, s], &[2]));
+            for (start, end) in [(0usize, 3usize), (3, 5)] {
+                let count = end - start;
+                let keys = Array::from_slice(
+                    &(start..end).map(|i| i as f32 * 3.0).collect::<Vec<_>>(),
+                    &[1, 1, count as i32, 1],
+                );
+                let values = Array::from_slice(
+                    &(start..end)
+                        .map(|i| (i + 1) as f32 * 2.0)
+                        .collect::<Vec<_>>(),
+                    &[1, 1, count as i32, 1],
+                );
+                cache.update_for_attention(keys, values, stream).unwrap();
+                let queries = Array::from_slice(
+                    &[vec![1.0f32; count], vec![2.0f32; count]].concat(),
+                    &[1, 2, count as i32, 1],
+                );
+                let actual = cache
+                    .paged_attention(&queries, 1.0, None, sinks.as_ref(), Some(1.0), stream)
+                    .unwrap()
+                    .unwrap();
+                let mut expected = Vec::new();
+                for head in [1.0f32, 2.0] {
+                    for query in start..end {
+                        let first = window.map_or(0, |w| (query + 1).saturating_sub(w as usize));
+                        let weights = (first..=query)
+                            .map(|k| (head * k as f32 * 3.0).tanh().exp())
+                            .collect::<Vec<_>>();
+                        let denominator = weights.iter().sum::<f32>() + sink.map_or(0.0, f32::exp);
+                        expected.push(
+                            weights
+                                .iter()
+                                .enumerate()
+                                .map(|(i, w)| w * (first + i + 1) as f32 * 2.0)
+                                .sum::<f32>()
+                                / denominator,
+                        );
+                    }
+                }
+                let expected = Array::from_slice(&expected, &[1, 2, count as i32, 1]);
+                assert!(actual
+                    .all_close(&expected, 1e-5, 1e-5, None, stream)
+                    .unwrap()
+                    .item::<bool>(stream));
+            }
+        }
+    }
 }

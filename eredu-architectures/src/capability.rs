@@ -59,7 +59,7 @@ fn context_from_rope(
                         kind: ObservationKind::Exact,
                         source: "validated model configuration".into(),
                     },
-                ))
+                ));
             }
             None => None,
         };
@@ -393,7 +393,7 @@ fn neutral_deepseek_v4_spec(args: &crate::deepseek::V4Args) -> Result<Spec, Capa
                     detail: format!(
                         "DeepSeek-V4 layer {layer} is not key-only attention with optional pooling state"
                     ),
-                })
+                });
             }
         };
         let layer_window = match attention {
@@ -402,7 +402,7 @@ fn neutral_deepseek_v4_spec(args: &crate::deepseek::V4Args) -> Result<Spec, Capa
                 return Err(CapabilityError::InvalidConfiguration {
                     field: "state_layout",
                     detail: format!("DeepSeek-V4 layer {layer} has unbounded attention state"),
-                })
+                });
             }
         };
         if window.is_some_and(|window| window != layer_window) {
@@ -1264,4 +1264,12 @@ mod tests {
                 .layers()
         );
     }
+}
+
+/// Derives Gemma 2 context and mixed full/sliding KV residency from its schedule.
+pub fn gemma2(args: &crate::gemma2::ModelArgs) -> Result<CapabilityEstimate, CapabilityError> {
+    Ok(finish(
+        "gemma2".into(),
+        llama_spec(args.dense_config(), false)?,
+    ))
 }

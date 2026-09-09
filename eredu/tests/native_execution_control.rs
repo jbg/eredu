@@ -184,7 +184,7 @@ fn native_metal_facade_restores_and_forks_sampled_partial_text() {
 }
 
 fn native_facade(device: LocalDevice, text: bool) {
-    native_facade_with_family(device, text, false);
+    native_facade_with_family(device, text, "qwen2");
 }
 
 #[test]
@@ -193,14 +193,12 @@ fn native_facade(device: LocalDevice, text: bool) {
     ignore = "run with --no-default-features --features mlx for CPU-only native initialization"
 )]
 fn nanbeige_controlled_snapshots_restore_and_fork_all_loop_caches() {
-    native_facade_with_family(LocalDevice::Cpu, true, true);
+    native_facade_with_family(LocalDevice::Cpu, true, "nanbeige");
 }
 
-fn native_facade_with_family(device: LocalDevice, text: bool, nanbeige: bool) {
+fn native_facade_with_family(device: LocalDevice, text: bool, family: &str) {
     let root = fixture(true);
-    if nanbeige {
-        use_nanbeige_weights(&root.0);
-    }
+    use_family_weights(&root.0, family);
     if text {
         std::fs::write(
             root.0.join("chat_template.jinja"),
@@ -332,7 +330,7 @@ fn complete_controlled_example_verifies_native_capture_restore_and_modified_bran
     ignore = "run with --no-default-features --features mlx for CPU-only native initialization"
 )]
 fn native_text_matches_ordinary_sampling_with_checkpoint_defaults_and_padded_logits() {
-    text_matches_ordinary_sampling(false);
+    text_matches_ordinary_sampling("qwen2");
 }
 
 #[test]
@@ -341,12 +339,12 @@ fn native_text_matches_ordinary_sampling_with_checkpoint_defaults_and_padded_log
     ignore = "run with --no-default-features --features mlx for CPU-only native initialization"
 )]
 fn nanbeige_controlled_text_matches_uninterrupted_generation() {
-    text_matches_ordinary_sampling(true);
+    text_matches_ordinary_sampling("nanbeige");
 }
 
-fn text_matches_ordinary_sampling(nanbeige: bool) {
+fn text_matches_ordinary_sampling(family: &str) {
     text_matches_ordinary_sampling_with_policy(
-        nanbeige,
+        family,
         eredu_core::ResidencyPlan::FullyResident,
         eredu_core::WeightTransformationPlan::PreserveCheckpoint,
     );
@@ -378,20 +376,18 @@ fn nanbeige_controlled_host_and_disk_residency_with_affine_transforms() {
                 group_size: 32,
             },
         ] {
-            text_matches_ordinary_sampling_with_policy(true, residency.clone(), transform);
+            text_matches_ordinary_sampling_with_policy("nanbeige", residency.clone(), transform);
         }
     }
 }
 
 fn text_matches_ordinary_sampling_with_policy(
-    nanbeige: bool,
+    family: &str,
     residency: eredu_core::ResidencyPlan,
     transformation: eredu_core::WeightTransformationPlan,
 ) {
     let root = fixture(false);
-    if nanbeige {
-        use_nanbeige_weights(&root.0);
-    }
+    use_family_weights(&root.0, family);
     // Keep the checkpoint's 64 logits positions but only 32 mapped tokenizer IDs.
     let path = root.0.join("tokenizer.json");
     let mut tokenizer: serde_json::Value =
@@ -487,3 +483,68 @@ fn text_matches_ordinary_sampling_with_policy(
 
 #[path = "native_execution_control/speculative.rs"]
 mod speculative;
+
+fn use_family_weights(root: &Path, family: &str) {
+    match family {
+        "qwen2" => {}
+        "nanbeige" => use_nanbeige_weights(root),
+        "gemma2" => {
+            let config = serde_json::json!({"model_type":"gemma2", "hidden_size":32,
+                "num_hidden_layers":4, "intermediate_size":64, "num_attention_heads":4,
+                "num_key_value_heads":2, "head_dim":8, "rms_norm_eps":0.00001, "vocab_size":64,
+                "eos_token_id":63, "max_position_embeddings":1024, "tie_word_embeddings":true,
+                "query_pre_attn_scalar":7, "sliding_window":2,
+                "attn_logit_softcapping":0.3, "final_logit_softcapping":0.7});
+            std::fs::write(
+                root.join("config.json"),
+                serde_json::to_vec(&config).unwrap(),
+            )
+            .unwrap();
+            let resolved =
+                eredu_architectures::configuration::resolve_model_config(&config).unwrap();
+            write_tensor_plan(root, resolved.architecture.checkpoint());
+        }
+        _ => panic!("unknown fixture family {family}"),
+    }
+}
+
+#[test]
+#[cfg_attr(
+    feature = "metal",
+    ignore = "run with --no-default-features --features mlx"
+)]
+fn gemma2_controlled_snapshots_restore_and_fork_mixed_caches() {
+    native_facade_with_family(LocalDevice::Cpu, true, "gemma2");
+}
+
+#[test]
+#[cfg_attr(
+    feature = "metal",
+    ignore = "run with --no-default-features --features mlx"
+)]
+fn gemma2_controlled_resident_host_disk_and_transforms_match_uninterrupted() {
+    for residency in [
+        eredu_core::ResidencyPlan::FullyResident,
+        eredu_core::ResidencyPlan::LayerwiseHost {
+            device_layer_window: 1,
+            device_budget_bytes: Some(8 << 20),
+            host_budget_bytes: Some(8 << 20),
+        },
+        eredu_core::ResidencyPlan::DenseDiskStream {
+            device_budget_bytes: 8 << 20,
+            host_budget_bytes: 8 << 20,
+            host_lookahead: 1,
+            background_queue: 1,
+        },
+    ] {
+        for transform in [
+            eredu_core::WeightTransformationPlan::PreserveCheckpoint,
+            eredu_core::WeightTransformationPlan::Affine {
+                bits: 4,
+                group_size: 32,
+            },
+        ] {
+            text_matches_ordinary_sampling_with_policy("gemma2", residency.clone(), transform);
+        }
+    }
+}

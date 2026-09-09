@@ -182,14 +182,44 @@ def run_sequence(
 ) -> ReferenceRun:
     tokens = torch.tensor([input_ids], dtype=torch.long, device=device)
     attention_mask = torch.ones_like(tokens)
+    # A bounded hybrid cache cannot infer absolute positions from its retained
+    # sliding history. Reserve the entire probe and advance positions explicitly.
+    hybrid = (
+        getattr(getattr(model, "generation_config", None), "cache_implementation", None)
+        == "hybrid"
+    )
+    past_key_values = None
+    if hybrid:
+        from transformers import HybridCache
+
+        past_key_values = HybridCache(
+            config=model.config,
+            max_batch_size=1,
+            # Transformers 4.48's sliding update rotates on the final allocated
+            # slot. A spare slot keeps short probes below that storage boundary.
+            max_cache_len=len(input_ids) + len(fed_ids) + 1,
+            device=device,
+            dtype=model.dtype,
+        )
+
+    def position_arguments(start, count):
+        if not hybrid:
+            return {}
+        return {"cache_position": torch.arange(start, start + count, device=device)}
+
     timer = Timer(torch, device)
     timer.start()
     if prefill_mode == "full":
-        outputs = model(input_ids=tokens, attention_mask=attention_mask, use_cache=True)
+        outputs = model(
+            input_ids=tokens,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            use_cache=True,
+            **position_arguments(0, len(input_ids)),
+        )
     elif prefill_mode == "tokenwise":
         attention_mask = torch.empty((1, 0), dtype=torch.long, device=device)
-        past_key_values = None
-        for token_id in input_ids:
+        for position, token_id in enumerate(input_ids):
             token = torch.tensor([[token_id]], dtype=torch.long, device=device)
             attention_mask = torch.cat(
                 (
@@ -203,6 +233,7 @@ def run_sequence(
                 attention_mask=attention_mask,
                 past_key_values=past_key_values,
                 use_cache=True,
+                **position_arguments(position, 1),
             )
             past_key_values = outputs.past_key_values
     else:
@@ -216,7 +247,7 @@ def run_sequence(
     decode_rows = []
     decode_timings = []
 
-    for token_id in fed_ids:
+    for position, token_id in enumerate(fed_ids, start=len(input_ids)):
         token = torch.tensor([[token_id]], dtype=torch.long, device=device)
         attention_mask = torch.cat(
             (attention_mask, torch.ones((1, 1), dtype=attention_mask.dtype, device=device)),
@@ -229,6 +260,7 @@ def run_sequence(
             attention_mask=attention_mask,
             past_key_values=past_key_values,
             use_cache=True,
+            **position_arguments(position, 1),
         )
         decode_timings.append(timer.finish())
         current = outputs.logits[:, -1, :]

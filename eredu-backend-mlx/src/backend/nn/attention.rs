@@ -216,6 +216,36 @@ pub fn sliding_window_prefill_attention(
     sinks: Option<&Array>,
     stream: &Stream,
 ) -> Result<Array, Exception> {
+    sliding_window_prefill_attention_with_softcap(
+        queries,
+        keys,
+        values,
+        scale,
+        window_size,
+        query_position_offset,
+        batch,
+        seq_len,
+        sinks,
+        None,
+        stream,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Runs bounded sliding attention with an optional pre-mask score cap.
+pub fn sliding_window_prefill_attention_with_softcap(
+    queries: Array,
+    keys: Array,
+    values: Array,
+    scale: f32,
+    window_size: i32,
+    query_position_offset: i32,
+    batch: i32,
+    seq_len: i32,
+    sinks: Option<&Array>,
+    softcap: Option<f32>,
+    stream: &Stream,
+) -> Result<Array, Exception> {
     if window_size <= 0 {
         return Err(Exception::custom(
             "sliding attention window must be positive",
@@ -241,7 +271,7 @@ pub fn sliding_window_prefill_attention(
         ));
     }
 
-    if query_position_offset == 0 && seq_len <= window_size {
+    if softcap.is_none() && query_position_offset == 0 && seq_len <= window_size {
         return safemlx::fast::scaled_dot_product_attention(
             queries,
             keys,
@@ -276,13 +306,14 @@ pub fn sliding_window_prefill_attention(
             None,
             stream,
         )?;
-        chunks.push(safemlx::fast::scaled_dot_product_attention(
-            query_chunk,
-            key_chunk,
-            value_chunk,
+        chunks.push(attention_with_softcap(
+            &query_chunk,
+            &key_chunk,
+            &value_chunk,
             scale,
-            Some(ScaledDotProductAttentionMask::Array(&mask)),
+            Some(&mask),
             sinks,
+            softcap,
             stream,
         )?);
         start = end;
@@ -296,3 +327,94 @@ pub fn sliding_window_prefill_attention(
 
 #[cfg(test)]
 mod tests;
+
+/// Scaled attention with an optional score transform, before masks and sink logits.
+#[allow(clippy::too_many_arguments)]
+pub fn attention_with_softcap(
+    queries: &Array,
+    keys: &Array,
+    values: &Array,
+    scale: f32,
+    mask: Option<&Array>,
+    sinks: Option<&Array>,
+    softcap: Option<f32>,
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    let Some(cap) = softcap else {
+        return safemlx::fast::scaled_dot_product_attention(
+            queries,
+            keys,
+            values,
+            scale,
+            mask.map(ScaledDotProductAttentionMask::Array),
+            sinks,
+            stream,
+        );
+    };
+    if !cap.is_finite() || cap <= 0.0 {
+        return Err(Exception::custom(
+            "attention score cap must be positive and finite",
+        ));
+    }
+    if queries.ndim() != 4
+        || keys.ndim() != 4
+        || values.ndim() != 4
+        || keys.dim(1) <= 0
+        || queries.dim(1) <= 0
+        || queries.dim(1) % keys.dim(1) != 0
+        || queries.dim(0) != keys.dim(0)
+        || queries.dim(0) != values.dim(0)
+        || keys.dim(1) != values.dim(1)
+        || keys.dim(2) != values.dim(2)
+        || queries.dim(3) != keys.dim(3)
+    {
+        return Err(Exception::custom(
+            "incompatible soft-capped attention geometry",
+        ));
+    }
+    let batch = queries.dim(0);
+    let heads = queries.dim(1);
+    let kv_heads = keys.dim(1);
+    let tokens = keys.dim(2);
+    let repeat = heads / kv_heads;
+    let expand = |x: &Array| -> Result<Array, Exception> {
+        safemlx::ops::broadcast_to(
+            &x.reshape(&[batch, kv_heads, 1, tokens, x.dim(3)], stream)?,
+            &[batch, kv_heads, repeat, tokens, x.dim(3)],
+            stream,
+        )?
+        .reshape(&[batch, heads, tokens, x.dim(3)], stream)
+    };
+    let keys = expand(keys)?.as_dtype(safemlx::Dtype::Float32, stream)?;
+    let values = expand(values)?;
+    let mut scores = safemlx::ops::matmul(
+        &queries.as_dtype(safemlx::Dtype::Float32, stream)?,
+        &keys.swap_axes(-1, -2, stream)?,
+        stream,
+    )?;
+    scores = safemlx::ops::tanh(
+        &scores.multiply(Array::from_f32(scale / cap), stream)?,
+        stream,
+    )?
+    .multiply(Array::from_f32(cap), stream)?;
+    if let Some(mask) = mask {
+        scores = if mask.dtype() == safemlx::Dtype::Bool {
+            safemlx::ops::r#where(mask, &scores, &Array::from_f32(f32::NEG_INFINITY), stream)?
+        } else {
+            scores.add(mask, stream)?
+        };
+    }
+    if let Some(sinks) = sinks {
+        let sinks = safemlx::ops::broadcast_to(
+            &sinks.reshape(&[1, heads, 1, 1], stream)?,
+            &[batch, heads, queries.dim(2), 1],
+            stream,
+        )?;
+        scores = concatenate_axis(&[&scores, &sinks], -1, stream)?;
+    }
+    let probabilities = safemlx::ops::softmax_axis(&scores, -1, true, stream)?;
+    let probabilities = probabilities
+        .try_index_device((.., .., .., ..tokens), stream)?
+        .as_dtype(queries.dtype(), stream)?;
+    safemlx::ops::matmul(&probabilities, &values, stream)
+}

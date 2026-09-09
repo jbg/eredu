@@ -36,9 +36,10 @@ where
         scale: f32,
         mask: Option<&Array>,
         sinks: Option<&Array>,
+        softcap: Option<f32>,
         stream: &Stream,
     ) -> Result<Option<Array>, Exception> {
-        T::paged_attention(self, queries, scale, mask, sinks, stream)
+        T::paged_attention(self, queries, scale, mask, sinks, softcap, stream)
     }
 
     fn update_for_attention(
@@ -275,11 +276,14 @@ impl KeyValueCache for LiveKeyValueCache {
         scale: f32,
         mask: Option<&Array>,
         sinks: Option<&Array>,
+        softcap: Option<f32>,
         stream: &Stream,
     ) -> Result<Option<Array>, Exception> {
         match self {
             Self::Resident(_) => Ok(None),
-            Self::Paged(cache) => cache.paged_attention(queries, scale, mask, sinks, stream),
+            Self::Paged(cache) => {
+                cache.paged_attention(queries, scale, mask, sinks, softcap, stream)
+            }
         }
     }
 
@@ -623,7 +627,7 @@ impl PagedKeyValueCache {
                 _ => {
                     return Err(Exception::custom(
                         "paged key/value cache found an incompatible block representation",
-                    ))
+                    ));
                 }
             };
             safemlx::transforms::async_eval_with_event([&keys, &values])?.synchronize()?;
@@ -987,7 +991,7 @@ impl PagedKeyValueCache {
                 _ => {
                     return Err(Exception::custom(
                         "paged key/value cache found an incompatible block representation",
-                    ))
+                    ));
                 }
             }
         }
@@ -1069,6 +1073,7 @@ impl KeyValueCache for PagedKeyValueCache {
         scale: f32,
         mask: Option<&Array>,
         sinks: Option<&Array>,
+        softcap: Option<f32>,
         stream: &Stream,
     ) -> Result<Option<Array>, Exception> {
         if self.key_only {
@@ -1102,6 +1107,7 @@ impl KeyValueCache for PagedKeyValueCache {
             self.offset,
             stream,
         )?;
+        accumulator.set_softcap(softcap)?;
         let mut scanned_blocks = 0u64;
         let mut scanned_bytes = 0u64;
         let mut scratch = 0u64;
@@ -1116,7 +1122,7 @@ impl KeyValueCache for PagedKeyValueCache {
                 _ => {
                     return Err(Exception::custom(
                         "paged key/value cache found an incompatible block representation",
-                    ))
+                    ));
                 }
             };
             let block = KeyValueAttentionBlock::unleased(id.start, id.end, keys, values);

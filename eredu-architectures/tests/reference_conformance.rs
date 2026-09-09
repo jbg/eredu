@@ -57,6 +57,7 @@ fn conformance_replicated_families_formats_and_materialization() {
         "lfm2",
         "llama",
         "nanbeige",
+        "gemma2",
         "nemotron_h",
         "qwen2",
         "qwen3",

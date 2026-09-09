@@ -343,6 +343,9 @@ impl GroupedNeuralBackend for MlxNeuralBackend {
 macro_rules! impl_attention_cache {
     ($type:ty) => {
         impl AttentionCache<MlxTensor> for $type {
+            fn uses_blockwise_attention(&self) -> bool {
+                KeyValueCache::is_paged(self)
+            }
             fn offset(&self) -> i32 {
                 KeyValueCache::offset(self)
             }
@@ -375,19 +378,19 @@ macro_rules! impl_attention_cache {
                     request.scale,
                     request.mask.map(MlxTensor::as_array),
                     request.sinks.map(MlxTensor::as_array),
+                    request.softcap,
                     context,
                 ))? {
                     return Ok(MlxTensor::from_array(output));
                 }
-                compute_tensor(safemlx::fast::scaled_dot_product_attention(
+                compute_tensor(crate::backend::nn::attention::attention_with_softcap(
                     request.queries.as_array(),
                     request.keys.as_array(),
                     request.values.as_array(),
                     request.scale,
-                    request
-                        .mask
-                        .map(|mask| ScaledDotProductAttentionMask::Array(mask.as_array())),
+                    request.mask.map(MlxTensor::as_array),
                     request.sinks.map(MlxTensor::as_array),
+                    request.softcap,
                     context,
                 ))
             }

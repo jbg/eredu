@@ -43,6 +43,7 @@ impl ArtifactArchitecturePlan {
         if let Some(plan) = self.safetensors_architecture() {
             match plan.model() {
                 SafetensorsModelConfig::Llama(c) => families::dense(&mut graph, c, None),
+                SafetensorsModelConfig::Gemma2(c) => families::dense(&mut graph, c, None),
                 SafetensorsModelConfig::Qwen(c) => families::qwen(&mut graph, c),
                 SafetensorsModelConfig::GptOss(c) => families::gpt_oss(&mut graph, c),
                 SafetensorsModelConfig::QwenHybrid(c) => families::qwen_hybrid(&mut graph, c),
@@ -51,6 +52,7 @@ impl ArtifactArchitecturePlan {
         } else if let Some(plan) = self.gguf_plan() {
             match plan.model() {
                 GgufModelConfig::Llama(c) => families::dense(&mut graph, c, None),
+                GgufModelConfig::Gemma2(c) => families::dense(&mut graph, c, None),
                 GgufModelConfig::Nanbeige(c) => families::nanbeige(&mut graph, c),
                 GgufModelConfig::Qwen(c) => families::qwen(&mut graph, c),
                 GgufModelConfig::GptOss(c) => families::gpt_oss(&mut graph, c),

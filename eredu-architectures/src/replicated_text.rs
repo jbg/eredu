@@ -850,6 +850,36 @@ where
     validate_store_handoff(&requirements, store.as_ref())
         .map_err(ReplicatedTextDispatchError::Architecture)?;
     match eligible {
+        EligibleConfig::Gemma2(args) => {
+            visitor.construction_started();
+            let capability_estimate = crate::capability::gemma2(args)
+                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+            let effective_model_type = "gemma2".to_owned();
+            let source_architecture = selected_uses_transform(&selected)
+                .then(|| crate::gemma2::LayeredModel::<B>::new(args.clone(), context))
+                .transpose()
+                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+            let args = selected_gemma2_args(args, &selected)
+                .map_err(ReplicatedTextDispatchError::Architecture)?;
+            let prompt_cache_architecture_identity =
+                crate::gemma2::prompt_cache_architecture_fingerprint(&args);
+            let architecture = crate::gemma2::LayeredModel::<B>::new(args, context)
+                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+            let prepared = prepare_architecture_handoff::<B, S, _>(
+                architecture,
+                source_architecture,
+                requirements,
+                selected,
+                capability_estimate,
+                effective_model_type,
+                prompt_cache_architecture_identity,
+                context,
+            )
+            .map_err(ReplicatedTextDispatchError::Architecture)?;
+            visitor
+                .visit(prepared, store)
+                .map_err(ReplicatedTextDispatchError::Backend)
+        }
         EligibleConfig::Llama(args) => {
             visitor.construction_started();
             let capability_estimate = crate::capability::llama(args)
@@ -1175,6 +1205,18 @@ fn requirement_linear_formats(
         .collect()
 }
 
+pub(crate) fn selected_gemma2_args(
+    args: &crate::gemma2::ModelArgs,
+    selected: &SelectedReplicatedTextRealization,
+) -> Result<crate::gemma2::ModelArgs, String> {
+    let formats = selected_formats(selected);
+    if formats.is_empty() {
+        Ok(args.clone())
+    } else {
+        crate::gemma2::with_checkpoint_formats(args, formats)
+    }
+}
+
 pub(crate) fn selected_llama_args(
     args: &crate::llama::ModelArgs,
     selected: &SelectedReplicatedTextRealization,
@@ -1208,6 +1250,18 @@ pub(crate) fn source_nanbeige_args(
         Ok(args.clone())
     } else {
         crate::nanbeige::with_checkpoint_formats(args, formats)
+    }
+}
+
+pub(crate) fn source_gemma2_args(
+    args: &crate::gemma2::ModelArgs,
+    selected: &SelectedReplicatedTextRealization,
+) -> Result<crate::gemma2::ModelArgs, String> {
+    let formats = requirement_formats(selected.requirements());
+    if formats.is_empty() {
+        Ok(args.clone())
+    } else {
+        crate::gemma2::with_checkpoint_formats(args, formats)
     }
 }
 
@@ -1578,7 +1632,8 @@ where
                 .visit(prepared, store)
                 .map_err(ReplicatedTextDispatchError::Backend)
         }
-        EligibleConfig::Llama(_)
+        EligibleConfig::Gemma2(_)
+        | EligibleConfig::Llama(_)
         | EligibleConfig::Nanbeige(_)
         | EligibleConfig::Qwen(_)
         | EligibleConfig::GptOss(_)
@@ -1930,7 +1985,10 @@ where
     let eligible = eligible_config(plan)?;
     if matches!(
         eligible,
-        EligibleConfig::Llama(_) | EligibleConfig::Nanbeige(_) | EligibleConfig::Qwen(_)
+        EligibleConfig::Gemma2(_)
+            | EligibleConfig::Llama(_)
+            | EligibleConfig::Nanbeige(_)
+            | EligibleConfig::Qwen(_)
     ) {
         visit_replicated_text_architecture(plan, selected, store, context, visitor)
     } else {
@@ -1962,7 +2020,10 @@ where
     let eligible = eligible_config(plan)?;
     let ordinary = matches!(
         eligible,
-        EligibleConfig::Llama(_) | EligibleConfig::Nanbeige(_) | EligibleConfig::Qwen(_)
+        EligibleConfig::Gemma2(_)
+            | EligibleConfig::Llama(_)
+            | EligibleConfig::Nanbeige(_)
+            | EligibleConfig::Qwen(_)
     );
     match (ordinary, selected.state().access()) {
         (true, ReplicatedTextStateAccess::KeyValue) => visit_replicated_text_architecture(
@@ -2129,6 +2190,7 @@ where
 
 enum EligibleConfig<'a> {
     Llama(&'a crate::llama::ModelArgs),
+    Gemma2(&'a crate::gemma2::ModelArgs),
     Nanbeige(&'a crate::nanbeige::ModelArgs),
     Qwen(&'a crate::qwen::ModelArgs),
     Lfm2(&'a crate::lfm2::ModelArgs),
@@ -2159,6 +2221,7 @@ impl EligibleConfig<'_> {
         };
         match self {
             Self::Nanbeige(args) => standard(args.dense_config().hidden_size),
+            Self::Gemma2(args) => standard(args.dense_config().hidden_size),
             Self::Llama(args) => standard(args.hidden_size),
             Self::Qwen(args) => standard(args.hidden_size),
             Self::Lfm2(args) => standard(args.hidden_size),
@@ -2254,7 +2317,7 @@ impl EligibleConfig<'_> {
             Ok(())
         };
         match self {
-            Self::Llama(_) => {}
+            Self::Gemma2(_) | Self::Llama(_) => {}
             Self::Nanbeige(args) => extend(crate::decoder::repeated::recipes(
                 source,
                 "model",
@@ -2404,6 +2467,7 @@ impl EligibleConfig<'_> {
     fn architecture_identity(&self) -> String {
         match self {
             Self::Nanbeige(args) => crate::nanbeige::prompt_cache_architecture_fingerprint(args),
+            Self::Gemma2(args) => crate::gemma2::prompt_cache_architecture_fingerprint(args),
             Self::Llama(args) => crate::llama::prompt_cache_architecture_fingerprint(args),
             Self::Qwen(args) => crate::qwen::prompt_cache_architecture_fingerprint(args),
             Self::Lfm2(args) => crate::lfm2::prompt_cache_architecture_fingerprint(args),
@@ -2510,7 +2574,8 @@ impl EligibleConfig<'_> {
             Self::NemotronH(_) => name.ends_with(".mamba.conv1d.weight"),
             Self::QwenHybrid(_) => name.ends_with(".linear_attn.conv1d.weight"),
             Self::QwenCompositeHybrid(_) => name.ends_with(".linear_attn.conv1d.weight"),
-            Self::Llama(_)
+            Self::Gemma2(_)
+            | Self::Llama(_)
             | Self::Nanbeige(_)
             | Self::Qwen(_)
             | Self::GptOss(_)
@@ -2559,6 +2624,7 @@ impl EligibleConfig<'_> {
 
     fn operators(&self) -> NeuralOperatorCapabilities {
         match self {
+            Self::Gemma2(args) => crate::decoder::operator_requirements(*args),
             Self::Llama(_)
             | Self::Nanbeige(_)
             | Self::Qwen(_)
@@ -2603,9 +2669,11 @@ impl EligibleConfig<'_> {
 
     fn execution_group(&self) -> &'static str {
         match self {
-            Self::Llama(_) | Self::Nanbeige(_) | Self::Qwen(_) | Self::GptOss(_) => {
-                crate::decoder::TEXT_DECODER_EXECUTION_GROUP
-            }
+            Self::Gemma2(_)
+            | Self::Llama(_)
+            | Self::Nanbeige(_)
+            | Self::Qwen(_)
+            | Self::GptOss(_) => crate::decoder::TEXT_DECODER_EXECUTION_GROUP,
             Self::Lfm2(_) | Self::KimiLinear(_) | Self::NemotronH(_) | Self::QwenHybrid(_) => {
                 crate::decoder::TARGET_EXECUTION_GROUP
             }
@@ -2629,6 +2697,7 @@ impl EligibleConfig<'_> {
     fn unit_count(&self) -> Result<usize, String> {
         let count = match self {
             Self::Nanbeige(args) => args.state_layer_count() as i32,
+            Self::Gemma2(args) => args.dense_config().num_hidden_layers,
             Self::Llama(args) => args.num_hidden_layers,
             Self::Qwen(args) => args.num_hidden_layers,
             Self::Lfm2(args) => args.num_hidden_layers,
@@ -2698,6 +2767,9 @@ impl EligibleConfig<'_> {
             Self::Nanbeige(args) => {
                 crate::nanbeige::state_layout(args).map_err(|error| error.to_string())
             }
+            Self::Gemma2(args) => {
+                crate::gemma2::state_layout(*args).map_err(|error| error.to_string())
+            }
             Self::Llama(args) => {
                 crate::llama::state_layout(*args).map_err(|error| error.to_string())
             }
@@ -2747,6 +2819,7 @@ impl EligibleConfig<'_> {
     fn native_format(&self, name: &str) -> LinearFormat {
         match self {
             Self::Nanbeige(args) => args.weight_quantization_for(name),
+            Self::Gemma2(args) => args.weight_quantization_for(name),
             Self::Llama(args) => args.weight_quantization_for(name),
             Self::Qwen(args) => args.weight_quantization_for(name),
             Self::Lfm2(args) => args.weight_quantization_for(name),
@@ -2847,6 +2920,7 @@ impl EligibleConfig<'_> {
     fn linear_parameter_shapes(&self) -> Result<BTreeMap<String, Vec<usize>>, String> {
         match self {
             Self::Nanbeige(args) => decoder_linear_parameter_shapes(*args),
+            Self::Gemma2(args) => decoder_linear_parameter_shapes(*args),
             Self::Llama(args) => decoder_linear_parameter_shapes(*args),
             Self::Qwen(args) => {
                 let mut shapes = decoder_linear_parameter_shapes(*args)?;
@@ -3059,6 +3133,7 @@ impl EligibleConfig<'_> {
     fn parameter_root(&self) -> &str {
         match self {
             Self::Nanbeige(args) => crate::decoder::Config::parameter_root(*args),
+            Self::Gemma2(args) => crate::decoder::Config::parameter_root(*args),
             Self::Llama(args) => crate::decoder::Config::parameter_root(*args),
             Self::Qwen(args) => crate::decoder::Config::parameter_root(*args),
             Self::Lfm2(_) | Self::KimiLinear(_) | Self::QwenHybrid(_) => "model",
@@ -3075,6 +3150,7 @@ impl EligibleConfig<'_> {
     fn tied_embeddings(&self) -> bool {
         match self {
             Self::Nanbeige(args) => crate::decoder::Config::tie_word_embeddings(*args),
+            Self::Gemma2(args) => crate::decoder::Config::tie_word_embeddings(*args),
             Self::Llama(args) => crate::decoder::Config::tie_word_embeddings(*args),
             Self::Qwen(args) => crate::decoder::Config::tie_word_embeddings(*args),
             Self::Lfm2(args) => args.tie_word_embeddings,
@@ -3095,6 +3171,10 @@ impl EligibleConfig<'_> {
     fn embedding_shape(&self) -> Result<Vec<usize>, String> {
         let (vocabulary, hidden) = match self {
             Self::Nanbeige(args) => (
+                args.dense_config().vocab_size,
+                args.dense_config().hidden_size,
+            ),
+            Self::Gemma2(args) => (
                 args.dense_config().vocab_size,
                 args.dense_config().hidden_size,
             ),
@@ -3127,6 +3207,7 @@ impl EligibleConfig<'_> {
     ) -> ReplicatedTextParameterRole {
         match self {
             Self::Nanbeige(args) => decoder_parameter_role(*args, name, companion, linear_shapes),
+            Self::Gemma2(args) => decoder_parameter_role(*args, name, companion, linear_shapes),
             Self::Llama(args) => decoder_parameter_role(*args, name, companion, linear_shapes),
             Self::Qwen(args) => decoder_parameter_role(*args, name, companion, linear_shapes),
             Self::GptOss(args) => decoder_parameter_role(*args, name, companion, linear_shapes),
@@ -3149,7 +3230,8 @@ impl EligibleConfig<'_> {
     fn embedding_name(&self) -> String {
         match self {
             Self::NemotronH(_) => "model.embeddings.weight".into(),
-            Self::Llama(_)
+            Self::Gemma2(_)
+            | Self::Llama(_)
             | Self::Nanbeige(_)
             | Self::Qwen(_)
             | Self::Lfm2(_)
@@ -4408,6 +4490,7 @@ fn safetensors_eligible_config(
     match architecture.model() {
         SafetensorsModelConfig::Nanbeige(args) => Ok(EligibleConfig::Nanbeige(args)),
         SafetensorsModelConfig::Llama(args) => Ok(EligibleConfig::Llama(args)),
+        SafetensorsModelConfig::Gemma2(args) => Ok(EligibleConfig::Gemma2(args)),
         SafetensorsModelConfig::Qwen(args) if !args.is_moe() => Ok(EligibleConfig::Qwen(args)),
         SafetensorsModelConfig::Qwen(_) => Err(ReplicatedTextIneligibility::Routed),
         SafetensorsModelConfig::QwenHybrid(args) if args.vision.is_some() => {
@@ -4467,6 +4550,7 @@ fn gguf_eligible_config(
 ) -> Result<EligibleConfig<'_>, ReplicatedTextIneligibility> {
     match architecture.model() {
         GgufModelConfig::Llama(args) => Ok(EligibleConfig::Llama(args)),
+        GgufModelConfig::Gemma2(args) => Ok(EligibleConfig::Gemma2(args)),
         GgufModelConfig::Nanbeige(args) => Ok(EligibleConfig::Nanbeige(args)),
         GgufModelConfig::Qwen(args)
             if matches!(
@@ -4537,7 +4621,8 @@ fn ordinary_eligible_config(
     plan: &ArtifactArchitecturePlan,
 ) -> Result<EligibleConfig<'_>, ReplicatedTextIneligibility> {
     match eligible_config(plan)? {
-        config @ (EligibleConfig::Llama(_)
+        config @ (EligibleConfig::Gemma2(_)
+        | EligibleConfig::Llama(_)
         | EligibleConfig::Nanbeige(_)
         | EligibleConfig::Qwen(_)) => Ok(config),
         EligibleConfig::Lfm2(_)

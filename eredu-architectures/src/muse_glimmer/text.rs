@@ -262,6 +262,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Attention<B> 
                 let (keys, values) = cache.update_for_attention(keys, values, context)?;
                 cache.attention(
                     AttentionRequest {
+                        softcap: None,
                         queries,
                         keys,
                         values,
@@ -274,6 +275,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Attention<B> 
             }
             None => B::attention_with_sinks(
                 AttentionRequest {
+                    softcap: None,
                     queries,
                     keys,
                     values,

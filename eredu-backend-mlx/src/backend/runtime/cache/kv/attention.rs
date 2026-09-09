@@ -29,6 +29,7 @@ pub struct BlockwiseAttentionAccumulator {
     queries: Array,
     output_dtype: Dtype,
     scale: f32,
+    softcap: Option<f32>,
     explicit_mask: Option<Array>,
     query_start: i64,
     sliding_window: Option<i32>,
@@ -82,6 +83,7 @@ impl BlockwiseAttentionAccumulator {
             queries: queries.as_dtype(Dtype::Float32, stream)?,
             output_dtype: queries.dtype(),
             scale,
+            softcap: None,
             explicit_mask: explicit_mask.cloned(),
             query_start,
             sliding_window,
@@ -96,6 +98,22 @@ impl BlockwiseAttentionAccumulator {
             running_sum: None,
             accumulator: None,
         })
+    }
+
+    /// Sets the score transform used by every scanned block before masking.
+    pub fn set_softcap(&mut self, cap: Option<f32>) -> Result<(), Exception> {
+        if self.running_max.is_some() {
+            return Err(Exception::custom(
+                "attention score policy cannot change after accumulation starts",
+            ));
+        }
+        if cap.is_some_and(|c| !c.is_finite() || c <= 0.0) {
+            return Err(Exception::custom(
+                "attention score cap must be positive and finite",
+            ));
+        }
+        self.softcap = cap;
+        Ok(())
     }
 
     pub fn accumulate(
@@ -174,6 +192,13 @@ impl BlockwiseAttentionAccumulator {
             &keys.swap_axes(-1, -2, stream)?,
             stream,
         )?;
+        if let Some(cap) = self.softcap {
+            scores = safemlx::ops::tanh(
+                &scores.multiply(Array::from_f32(cap.recip()), stream)?,
+                stream,
+            )?
+            .multiply(Array::from_f32(cap), stream)?;
+        }
         if let Some(bias) = additive_bias {
             scores = scores.add(bias, stream)?;
         }

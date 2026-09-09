@@ -77,11 +77,16 @@ impl KeyValueCache for MlxKeyValueLayerState {
         scale: f32,
         mask: Option<&Array>,
         sinks: Option<&Array>,
+        softcap: Option<f32>,
         stream: &Stream,
     ) -> Result<Option<Array>, Exception> {
         match self {
-            Self::Device(cache) => cache.paged_attention(queries, scale, mask, sinks, stream),
-            Self::Paged(cache) => cache.paged_attention(queries, scale, mask, sinks, stream),
+            Self::Device(cache) => {
+                cache.paged_attention(queries, scale, mask, sinks, softcap, stream)
+            }
+            Self::Paged(cache) => {
+                cache.paged_attention(queries, scale, mask, sinks, softcap, stream)
+            }
         }
     }
 

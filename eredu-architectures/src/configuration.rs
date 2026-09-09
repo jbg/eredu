@@ -213,6 +213,8 @@ pub enum ModelKind {
     KimiLinear,
     /// Llama-compatible dense decoders, including Mistral.
     Llama,
+    /// Gemma 2 dense decoder.
+    Gemma2,
     /// Nanbeige dense shared-weight repeated decoder.
     Nanbeige,
     /// Meta Muse-Glimmer multimodal decoder.
@@ -258,7 +260,7 @@ impl<'de> Deserialize<'de> for ModelKind {
 
 impl ModelKind {
     /// Every architecture family implemented by this crate.
-    pub const ALL: [Self; 18] = [
+    pub const ALL: [Self; 19] = [
         Self::DeepSeekV3,
         Self::DeepSeekV4,
         Self::Gemma4,
@@ -266,6 +268,7 @@ impl ModelKind {
         Self::Inkling,
         Self::KimiLinear,
         Self::Llama,
+        Self::Gemma2,
         Self::Nanbeige,
         Self::MuseGlimmer,
         Self::Lfm2,
@@ -289,6 +292,7 @@ impl ModelKind {
             Self::Inkling => "inkling",
             Self::KimiLinear => "kimi_linear",
             Self::Llama => "llama",
+            Self::Gemma2 => "gemma2",
             Self::Nanbeige => "nanbeige",
             Self::MuseGlimmer => "muse_glimmer",
             Self::Lfm2 => "lfm2",
@@ -337,6 +341,7 @@ impl ModelKind {
             "kimi_linear" => Ok(Self::KimiLinear),
             "llama" | "mistral" => Ok(Self::Llama),
             "nanbeige" => Ok(Self::Nanbeige),
+            "gemma2" => Ok(Self::Gemma2),
             "muse_glimmer" | "muse_glimmer_text" => Ok(Self::MuseGlimmer),
             "lfm2" | "lfm2_moe" => Ok(Self::Lfm2),
             "nemotron_h" => Ok(Self::NemotronH),
@@ -370,6 +375,8 @@ pub enum GgufArchitecture {
     Gemma4,
     /// `llama`.
     Llama,
+    /// Gemma 2 dense decoder.
+    Gemma2,
     /// `nanbeige`.
     Nanbeige,
     /// `mistral`.
@@ -415,6 +422,7 @@ impl GgufArchitecture {
             "llama" => Ok(Self::Llama),
             "mistral" => Ok(Self::Mistral),
             "nanbeige" => Ok(Self::Nanbeige),
+            "gemma2" => Ok(Self::Gemma2),
             "muse-glimmer" => Ok(Self::MuseGlimmer),
             "lfm2" => Ok(Self::Lfm2),
             "lfm2moe" => Ok(Self::Lfm2Moe),
@@ -443,6 +451,7 @@ impl GgufArchitecture {
             Self::Gemma4 => ModelKind::Gemma4,
             Self::Llama | Self::Mistral => ModelKind::Llama,
             Self::Nanbeige => ModelKind::Nanbeige,
+            Self::Gemma2 => ModelKind::Gemma2,
             Self::MuseGlimmer => ModelKind::MuseGlimmer,
             Self::Lfm2 | Self::Lfm2Moe => ModelKind::Lfm2,
             Self::NemotronH | Self::NemotronHMoe => ModelKind::NemotronH,
@@ -465,6 +474,7 @@ impl GgufArchitecture {
             Self::Inkling => "inkling",
             Self::Gemma4 => "gemma4",
             Self::Llama => "llama",
+            Self::Gemma2 => "gemma2",
             Self::Mistral => "mistral",
             Self::Nanbeige => "nanbeige",
             Self::MuseGlimmer => "muse-glimmer",
@@ -636,6 +646,8 @@ pub enum SafetensorsModelConfig {
     KimiLinear(crate::kimi_linear::ModelArgs),
     /// Llama-compatible family geometry.
     Llama(crate::llama::ModelArgs),
+    /// Gemma 2 geometry and equations.
+    Gemma2(crate::gemma2::ModelArgs),
     /// Nanbeige physical blocks and logical loop policy.
     Nanbeige(crate::nanbeige::ModelArgs),
     /// Muse-Glimmer family geometry.
@@ -683,6 +695,8 @@ pub enum GgufModelConfig {
     Lfm2(crate::lfm2::ModelArgs),
     /// Llama-compatible family geometry.
     Llama(crate::llama::ModelArgs),
+    /// Gemma 2 geometry and equations.
+    Gemma2(crate::gemma2::ModelArgs),
     /// Nanbeige physical blocks and repetition policy.
     Nanbeige(crate::nanbeige::ModelArgs),
     /// Muse-Glimmer family geometry.
@@ -705,7 +719,7 @@ impl SafetensorsModelConfig {
             Self::GptOss(args) => args.num_local_experts > 0,
             Self::Inkling(args) => args.text_config.n_routed_experts > 0,
             Self::KimiLinear(args) => args.num_experts > 0,
-            Self::Llama(_) | Self::Nanbeige(_) | Self::Moshi(_) => false,
+            Self::Gemma2(_) | Self::Llama(_) | Self::Nanbeige(_) | Self::Moshi(_) => false,
             Self::MuseGlimmer(args) => args.num_experts > 0,
             Self::Lfm2(args) => args.num_experts > 0,
             Self::NemotronH(args) => args.n_routed_experts > 0,
@@ -727,7 +741,7 @@ impl GgufModelConfig {
             Self::Inkling(args) => args.text_config.n_routed_experts > 0,
             Self::KimiLinear(args) => args.num_experts > 0,
             Self::Lfm2(args) => args.num_experts > 0,
-            Self::Llama(_) | Self::Nanbeige(_) => false,
+            Self::Gemma2(_) | Self::Llama(_) | Self::Nanbeige(_) => false,
             Self::MuseGlimmer(args) => args.num_experts > 0,
             Self::NemotronH(args) => args.n_routed_experts > 0,
             Self::Qwen(args) => args.num_experts > 0,
@@ -1289,6 +1303,9 @@ fn resolve_safetensors_architecture(
         ModelKind::KimiLinear => crate::kimi_linear::model_args_from_config_value(json)
             .map(SafetensorsModelConfig::KimiLinear)
             .map_err(|error| invalid_configuration(kind, error)),
+        ModelKind::Gemma2 => crate::gemma2::model_args_from_config_value(json)
+            .map(SafetensorsModelConfig::Gemma2)
+            .map_err(|error| invalid_configuration(kind, error)),
         ModelKind::Llama => crate::llama::model_args_from_config_value(json)
             .map(SafetensorsModelConfig::Llama)
             .map_err(|error| invalid_configuration(kind, error)),
@@ -1339,6 +1356,8 @@ fn resolve_safetensors_architecture(
         SafetensorsModelConfig::Inkling(args) => crate::inkling::safetensors_plan(args)
             .map_err(|error| invalid_configuration(kind, error))?,
         SafetensorsModelConfig::KimiLinear(args) => crate::kimi_linear::safetensors_plan(args)
+            .map_err(|error| invalid_configuration(kind, error))?,
+        SafetensorsModelConfig::Gemma2(args) => crate::gemma2::safetensors_plan(args)
             .map_err(|error| invalid_configuration(kind, error))?,
         SafetensorsModelConfig::Llama(args) => crate::llama::safetensors_plan(args)
             .map_err(|error| invalid_configuration(kind, error))?,

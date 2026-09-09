@@ -85,6 +85,9 @@ use eredu_runtime::{
 };
 use safetensors::tensor::Dtype;
 
+#[path = "reference_numeric/gemma2.rs"]
+mod gemma2;
+
 #[path = "reference_numeric/nanbeige.rs"]
 mod nanbeige;
 
@@ -2074,6 +2077,7 @@ impl EmbeddingOperator<NumericTensor> for NumericEmbedding {
 #[derive(Debug, Clone)]
 struct NumericNorm {
     weight: NumericTensor,
+    offset: f32,
     metadata: ParameterMetadata,
     epsilon: f32,
 }
@@ -2119,7 +2123,8 @@ impl NormalizationOperator<NumericTensor> for NumericNorm {
                 + self.epsilon)
                 .sqrt();
             for index in 0..dimensions {
-                output_row[index] = input_row[index] / rms * self.weight.data[index];
+                output_row[index] =
+                    input_row[index] / rms * (self.weight.data[index] + self.offset);
             }
         }
         Ok(output)
@@ -4360,17 +4365,16 @@ impl NeuralBackend for NumericBackend {
         spec.validate()?;
         let dimensions = spec.dimensions;
         let epsilon = spec.epsilon;
-        let (weight, metadata) = match spec.scale {
+        let (weight, metadata, offset) = match spec.scale {
             NormalizationScale::Learned(weight) => {
                 let value = local_parameter(&weight, vec![dimensions], true, context)?;
                 let metadata = ParameterMetadata::from_spec(&weight, weight.trainable);
-                (value, metadata)
+                (value, metadata, 0.0)
             }
             NormalizationScale::LearnedOffset { weight, offset } => {
-                let value = local_parameter(&weight, vec![dimensions], false, context)?
-                    .map(|value| value + offset);
+                let value = local_parameter(&weight, vec![dimensions], false, context)?;
                 let metadata = ParameterMetadata::from_spec(&weight, weight.trainable);
-                (value, metadata)
+                (value, metadata, offset)
             }
             NormalizationScale::Unit => {
                 let parameter =
@@ -4378,11 +4382,13 @@ impl NeuralBackend for NumericBackend {
                 (
                     NumericTensor::new(vec![dimensions], vec![1.0; dimensions as usize]),
                     ParameterMetadata::from_spec(&parameter, false),
+                    0.0,
                 )
             }
         };
         Ok(NumericNorm {
             weight,
+            offset,
             metadata,
             epsilon,
         })
@@ -4780,13 +4786,14 @@ impl NeuralBackend for NumericBackend {
         _: &NumericContext,
     ) -> Result<NumericTensor, Error> {
         request.validate()?;
-        attention_with_sinks(
+        attention_with_softcap(
             &request.queries,
             &request.keys,
             &request.values,
             request.scale,
             request.mask,
             request.sinks,
+            request.softcap,
         )
     }
 
@@ -4802,7 +4809,7 @@ impl NeuralBackend for NumericBackend {
             .set(context.sliding_attention_calls.get() + 1);
         let batch = request.queries.shape[0];
         let sequence = request.queries.shape[2];
-        let attended = attention_with_sinks_windowed(
+        let attended = attention_with_softcap_windowed(
             &request.queries,
             &request.keys,
             &request.values,
@@ -4810,6 +4817,7 @@ impl NeuralBackend for NumericBackend {
             request.sinks,
             window,
             position_offset,
+            request.softcap,
         )?;
         attended
             .transpose_axes(&[0, 2, 1, 3], context)?
@@ -5307,7 +5315,19 @@ fn attention_with_sinks(
     mask: Option<&NumericTensor>,
     sinks: Option<&NumericTensor>,
 ) -> Result<NumericTensor, Error> {
-    if sinks.is_none() {
+    attention_with_softcap(queries, keys, values, scale, mask, sinks, None)
+}
+
+fn attention_with_softcap(
+    queries: &NumericTensor,
+    keys: &NumericTensor,
+    values: &NumericTensor,
+    scale: f32,
+    mask: Option<&NumericTensor>,
+    sinks: Option<&NumericTensor>,
+    softcap: Option<f32>,
+) -> Result<NumericTensor, Error> {
+    if sinks.is_none() && softcap.is_none() {
         return attention(queries, keys, values, scale, mask, None, 0);
     }
     if queries.shape.len() != 4
@@ -5327,8 +5347,7 @@ fn attention_with_sinks(
     let query_tokens = queries.shape[2] as usize;
     let key_tokens = keys.shape[2] as usize;
     let dimensions = queries.shape[3] as usize;
-    let sinks = sinks.unwrap();
-    if sinks.shape != [heads as i32]
+    if sinks.is_some_and(|sinks| sinks.shape != [heads as i32])
         || mask.is_some_and(|mask| mask.shape != [query_tokens as i32, key_tokens as i32])
     {
         return Err(Error::backend(
@@ -5344,17 +5363,20 @@ fn attention_with_sinks(
                 let mut scores = (0..key_tokens)
                     .map(|key| {
                         let key_base = ((b * key_heads + key_head) * key_tokens + key) * dimensions;
-                        (0..dimensions)
+                        let score = (0..dimensions)
                             .map(|dimension| {
                                 queries.data[query_base + dimension]
                                     * keys.data[key_base + dimension]
                             })
                             .sum::<f32>()
-                            * scale
+                            * scale;
+                        softcap.map_or(score, |cap| cap * (score / cap).tanh())
                             + mask.map_or(0.0, |mask| mask.data[query * key_tokens + key])
                     })
                     .collect::<Vec<_>>();
-                scores.push(sinks.data[head]);
+                if let Some(sinks) = sinks {
+                    scores.push(sinks.data[head]);
+                }
                 let maximum = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
                 let weights = scores
                     .iter()
@@ -5387,6 +5409,28 @@ fn attention_with_sinks_windowed(
     window: i32,
     query_offset: i32,
 ) -> Result<NumericTensor, Error> {
+    attention_with_softcap_windowed(
+        queries,
+        keys,
+        values,
+        scale,
+        sinks,
+        window,
+        query_offset,
+        None,
+    )
+}
+
+fn attention_with_softcap_windowed(
+    queries: &NumericTensor,
+    keys: &NumericTensor,
+    values: &NumericTensor,
+    scale: f32,
+    sinks: Option<&NumericTensor>,
+    window: i32,
+    query_offset: i32,
+    softcap: Option<f32>,
+) -> Result<NumericTensor, Error> {
     if window <= 0 || queries.shape.len() != 4 || keys.shape.len() != 4 {
         return Err(Error::backend(
             "numeric sliding sink-attention geometry mismatch",
@@ -5411,7 +5455,7 @@ fn attention_with_sinks_windowed(
             }
         }
     }
-    attention_with_sinks(queries, keys, values, scale, Some(&mask), sinks)
+    attention_with_softcap(queries, keys, values, scale, Some(&mask), sinks, softcap)
 }
 
 fn pooled_attention(
@@ -6880,6 +6924,29 @@ impl AttentionCache<NumericTensor> for NumericCache {
     ) -> Result<NumericTensor, Error> {
         request.validate()?;
         let query_offset = self.offset - request.queries.shape[2];
+        if let Some(cap) = request.softcap {
+            return match self.window {
+                Some(window) => attention_with_softcap_windowed(
+                    &request.queries,
+                    &request.keys,
+                    &request.values,
+                    request.scale,
+                    request.sinks,
+                    window,
+                    query_offset,
+                    Some(cap),
+                ),
+                None => attention_with_softcap(
+                    &request.queries,
+                    &request.keys,
+                    &request.values,
+                    request.scale,
+                    request.mask,
+                    request.sinks,
+                    Some(cap),
+                ),
+            };
+        }
         match request.sinks {
             Some(sinks) if self.window.is_some() => attention_with_sinks_windowed(
                 &request.queries,
@@ -8383,6 +8450,7 @@ fn sink_aware_request_matches_cached_full_and_sliding_scalar_references() {
 
     let uncached = NumericBackend::attention_with_sinks(
         AttentionRequest {
+            softcap: None,
             queries: queries.clone(),
             keys: keys.clone(),
             values: values.clone(),
@@ -8406,6 +8474,7 @@ fn sink_aware_request_matches_cached_full_and_sliding_scalar_references() {
     let cached = full
         .attention(
             AttentionRequest {
+                softcap: None,
                 queries: queries.clone(),
                 keys: cached_keys,
                 values: cached_values,
@@ -8420,6 +8489,7 @@ fn sink_aware_request_matches_cached_full_and_sliding_scalar_references() {
 
     let sliding = NumericBackend::sliding_window_attention_with_sinks(
         AttentionRequest {
+            softcap: None,
             queries,
             keys,
             values,
@@ -8440,6 +8510,7 @@ fn sink_aware_request_matches_cached_full_and_sliding_scalar_references() {
 
     let malformed_sinks = NumericTensor::zeros(vec![2]);
     let malformed = AttentionRequest {
+        softcap: None,
         queries: NumericTensor::zeros(vec![1, 1, 1, 1]),
         keys: NumericTensor::zeros(vec![1, 1, 1, 1]),
         values: NumericTensor::zeros(vec![1, 1, 1, 1]),
@@ -22553,6 +22624,7 @@ pub(crate) fn run_reference_conformance_replicated_safetensors_families(
     let mut cases = vec![
         config("llama", false),
         nanbeige::tiny_config(false),
+        gemma2::tiny_config(),
         config("qwen2", false),
         config("qwen3", false),
         serde_json::json!({
@@ -22588,7 +22660,7 @@ pub(crate) fn run_reference_conformance_replicated_safetensors_families(
 pub(crate) fn reference_conformance_replicated_safetensors_families() {
     assert_eq!(
         run_reference_conformance_replicated_safetensors_families().len(),
-        10
+        11
     );
 }
 

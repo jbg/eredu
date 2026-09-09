@@ -3022,6 +3022,8 @@ pub struct AttentionRequest<'a, T> {
     pub values: T,
     /// Positive finite score scale.
     pub scale: f32,
+    /// Optional positive tanh cap applied to scaled scores before masking.
+    pub softcap: Option<f32>,
     /// Optional additive or boolean attention mask.
     pub mask: Option<&'a T>,
     /// Optional learned sink logit for every query head.
@@ -3048,6 +3050,9 @@ impl<T: Tensor> AttentionRequest<'_, T> {
             || values[3] <= 0
             || !self.scale.is_finite()
             || self.scale <= 0.0
+            || self
+                .softcap
+                .is_some_and(|cap| !cap.is_finite() || cap <= 0.0)
         {
             return Err(Error::backend(format!(
                 "invalid attention request geometry queries={queries:?} keys={keys:?} values={values:?} scale={}",
@@ -3069,6 +3074,10 @@ impl<T: Tensor> AttentionRequest<'_, T> {
 
 /// Backend-native key/value cache operations required by attention.
 pub trait AttentionCache<T: Tensor> {
+    /// Whether attention must scan cache-owned history instead of the returned tensors.
+    fn uses_blockwise_attention(&self) -> bool {
+        false
+    }
     /// Current absolute sequence offset.
     fn offset(&self) -> i32;
     /// Maximum retained history for a sliding cache.
@@ -3419,8 +3428,10 @@ impl NeuralOperatorCapabilities {
     pub const MULTI_AXIS_ROTARY_EMBEDDINGS: Self = Self(1 << 37);
     /// Masked vocabulary output projection.
     pub const MASKED_OUTPUT_PROJECTION: Self = Self(1 << 38);
+    /// Tanh-capped attention scores across contiguous, sliding and paged execution.
+    pub const ATTENTION_SOFTCAP: Self = Self(1 << 39);
     /// Every currently declared optional operation.
-    pub const ALL: Self = Self((1 << 39) - 1);
+    pub const ALL: Self = Self((1 << 40) - 1);
 
     /// Returns the union of two capability sets.
     pub const fn union(self, other: Self) -> Self {
@@ -3435,6 +3446,10 @@ impl NeuralOperatorCapabilities {
     /// Returns stable names for every required capability absent from this set.
     pub fn missing_capability_names(self, required: Self) -> Vec<&'static str> {
         const NAMES: &[(NeuralOperatorCapabilities, &str)] = &[
+            (
+                NeuralOperatorCapabilities::ATTENTION_SOFTCAP,
+                "attention_softcap",
+            ),
             (
                 NeuralOperatorCapabilities::GELU_APPROXIMATE,
                 "gelu_approximate",
@@ -3834,6 +3849,11 @@ pub trait NeuralBackend: Sized + 'static {
         context: &<Self::Tensor as Tensor>::Context,
     ) -> Result<Self::Tensor, Error> {
         request.validate()?;
+        if request.softcap.is_some() {
+            return Err(Error::backend(
+                "attention score soft-capping is not implemented by this backend",
+            ));
+        }
         if request.sinks.is_some() {
             return Err(Error::backend(
                 "attention sinks are not implemented by this backend",
@@ -3856,6 +3876,11 @@ pub trait NeuralBackend: Sized + 'static {
         context: &<Self::Tensor as Tensor>::Context,
     ) -> Result<Self::Tensor, Error> {
         request.validate()?;
+        if request.softcap.is_some() {
+            return Err(Error::backend(
+                "attention score soft-capping is not implemented by this backend",
+            ));
+        }
         if request.sinks.is_some() {
             return Err(Error::backend(
                 "sliding-window attention sinks are not implemented by this backend",

@@ -63,6 +63,7 @@ pub trait KeyValueCache {
         _scale: f32,
         _mask: Option<&Array>,
         _sinks: Option<&Array>,
+        _softcap: Option<f32>,
         _stream: &Stream,
     ) -> Result<Option<Array>, Exception> {
         Ok(None)

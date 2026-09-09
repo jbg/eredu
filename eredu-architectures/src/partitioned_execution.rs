@@ -396,7 +396,7 @@ where
                         _ => {
                             return Err(eredu_nn::Error::backend(
                                 "routed composite expert group and collective schedule differ",
-                            ))
+                            ));
                         }
                     };
                 participate_inactive_routed_wave(
@@ -973,7 +973,7 @@ where
             None => {
                 return Err(eredu_nn::Error::backend(
                     "composite request referenced an unknown execution group",
-                ))
+                ));
             }
         };
         Ok(active)
@@ -1825,7 +1825,7 @@ where
                     "composite publication output shape {:?} differs from selected {:?}",
                     output.shape(),
                     expected,
-                )))
+                )));
             }
             None => self.allocator.tensor_placeholder(
                 &expected,
@@ -5727,6 +5727,10 @@ fn direct_partitioned_state_layout(
         | (None, Some(crate::configuration::GgufModelConfig::Nanbeige(args))) => {
             dense_decoder_partitioned_state_layout(args, rank).map(Some)
         }
+        (Some(crate::configuration::SafetensorsModelConfig::Gemma2(args)), None)
+        | (None, Some(crate::configuration::GgufModelConfig::Gemma2(args))) => {
+            dense_decoder_partitioned_state_layout(args, rank).map(Some)
+        }
         (Some(crate::configuration::SafetensorsModelConfig::Llama(args)), None)
         | (None, Some(crate::configuration::GgufModelConfig::Llama(args))) => {
             dense_decoder_partitioned_state_layout(args, rank).map(Some)
@@ -6251,7 +6255,7 @@ fn pipeline_routes(
                         eredu_runtime::BoundaryTensorDtype::Uint32 => TensorDtype::U32,
                         eredu_runtime::BoundaryTensorDtype::Int32 => TensorDtype::I32,
                         _ => {
-                            return Err("pipeline boundary uses an unsupported scalar dtype".into())
+                            return Err("pipeline boundary uses an unsupported scalar dtype".into());
                         }
                     };
                     let shape = symbolic
@@ -6284,7 +6288,7 @@ fn pipeline_routes(
                                     _ => {
                                         return Err(
                                             "unsupported symbolic boundary dimension".to_owned()
-                                        )
+                                        );
                                     }
                                 })
                             },
@@ -8099,6 +8103,39 @@ where
                 estimate,
             )
         }
+        (Some(crate::configuration::SafetensorsModelConfig::Gemma2(args)), None)
+        | (None, Some(crate::configuration::GgufModelConfig::Gemma2(args))) => {
+            let source_args = selected
+                .base()
+                .parameters()
+                .iter()
+                .any(|parameter| {
+                    matches!(
+                        parameter.lowering(),
+                        eredu_runtime::WeightLoweringKind::Transform
+                            | eredu_runtime::WeightLoweringKind::DerivedTransform
+                    )
+                })
+                .then(|| crate::replicated_text::source_gemma2_args(args, selected.base()))
+                .transpose()
+                .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
+            let selected_args = crate::replicated_text::selected_gemma2_args(args, selected.base())
+                .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
+            let capability_estimate =
+                crate::capability::gemma2(&selected_args).map_err(|error| {
+                    DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
+                })?;
+            prepare_dense_decoder_partition::<B, S, _, crate::decoder::DenseBlockFactory, V>(
+                "gemma2".to_owned(),
+                selected_args,
+                source_args,
+                selected,
+                store,
+                context,
+                visitor,
+                capability_estimate,
+            )
+        }
         (Some(crate::configuration::SafetensorsModelConfig::Llama(args)), None)
         | (None, Some(crate::configuration::GgufModelConfig::Llama(args))) => {
             let source_args = selected
@@ -9182,7 +9219,9 @@ pub fn is_supported_dense_decoder_partition(plan: &ArtifactArchitecturePlan) -> 
         plan.safetensors_architecture().map(|plan| plan.model()),
         plan.gguf_plan().map(|plan| plan.model()),
     ) {
-        (Some(crate::configuration::SafetensorsModelConfig::Llama(_)), None)
+        (Some(crate::configuration::SafetensorsModelConfig::Gemma2(_)), None)
+        | (None, Some(crate::configuration::GgufModelConfig::Gemma2(_)))
+        | (Some(crate::configuration::SafetensorsModelConfig::Llama(_)), None)
         | (None, Some(crate::configuration::GgufModelConfig::Llama(_)))
         | (Some(crate::configuration::SafetensorsModelConfig::Nanbeige(_)), None)
         | (None, Some(crate::configuration::GgufModelConfig::Nanbeige(_))) => true,
@@ -10746,9 +10785,14 @@ pub fn dense_decoder_partitioned_production_route(
     let llama_compatible = matches!(
         models,
         (
-            Some(crate::configuration::SafetensorsModelConfig::Llama(_)),
+            Some(crate::configuration::SafetensorsModelConfig::Gemma2(_)),
             None
-        ) | (None, Some(crate::configuration::GgufModelConfig::Llama(_)))
+        ) | (None, Some(crate::configuration::GgufModelConfig::Gemma2(_)))
+            | (
+                Some(crate::configuration::SafetensorsModelConfig::Llama(_)),
+                None
+            )
+            | (None, Some(crate::configuration::GgufModelConfig::Llama(_)))
             | (
                 Some(crate::configuration::SafetensorsModelConfig::Nanbeige(_)),
                 None

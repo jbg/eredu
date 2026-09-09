@@ -72,6 +72,7 @@ projector.
 | DeepSeek-V3 / R1 | text | yes | `deepseek2` | compressed MLA, dense-to-MoE schedules, native block FP8 |
 | DeepSeek-V4 | text | yes | `deepseek4` | mHC compressed sparse attention, routed/shared experts, native FP8 and mixed FP4; SafeTensors embedded MTP and fused DSpark; base GGUF target only |
 | GPT-OSS | text | yes | `gpt-oss` | Harmony chat, scheduled attention, native MXFP4 experts |
+| Gemma 2 | text | yes | `gemma2` | alternating sliding/full GQA, four RMSNorms, GELU and attention/output soft caps; [validation status](gemma2-validation.md) |
 | Gemma 4 | text, image, video, audio | yes | `gemma4` + projector | dense and MoE variants, shared-KV and media towers |
 | Gemma 4 assistant | text draft model | yes | `gemma4_assistant` | external multi-token prediction |
 | Kimi Linear | text | yes | `kimi-linear` | KDA/MLA hybrid layers, dense and routed/shared experts |

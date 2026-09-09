@@ -165,3 +165,41 @@ fn indexed_attention_shares_softmax_with_sink() {
     let expected = (1.0f32.exp() + 3.0 * 3.0f32.exp()) / denominator;
     assert!((output.as_slice::<f32>()[0] - expected).abs() < 1e-5);
 }
+
+#[test]
+#[ignore = "requires MLX runtime execution"]
+fn score_softcap_precedes_boolean_and_additive_masks_and_preserves_sinks() {
+    let ctx = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+    let stream = ctx.stream();
+    let queries = Array::from_slice(&[1.0f32, 2.0], &[1, 2, 1, 1]);
+    let keys = Array::from_slice(&[0.0f32, 3.0, 100.0], &[1, 1, 3, 1]);
+    let values = Array::from_slice(&[2.0f32, 4.0, 10000.0], &[1, 1, 3, 1]);
+    let sinks = Array::from_slice(&[0.5f32, 0.5], &[2]);
+    let expected = (0..2)
+        .map(|head| {
+            let p = ((head + 1) as f32 * 3.0).tanh().exp();
+            (2.0 + 4.0 * p) / (1.0 + p + 0.5f32.exp())
+        })
+        .collect::<Vec<_>>();
+    let expected = Array::from_slice(&expected, &[1, 2, 1, 1]);
+    for mask in [
+        Array::from_slice(&[true, true, false], &[1, 3]),
+        Array::from_slice(&[0.0f32, 0.0, f32::NEG_INFINITY], &[1, 3]),
+    ] {
+        let actual = super::attention_with_softcap(
+            &queries,
+            &keys,
+            &values,
+            1.0,
+            Some(&mask),
+            Some(&sinks),
+            Some(1.0),
+            stream,
+        )
+        .unwrap();
+        assert!(actual
+            .all_close(&expected, 1e-5, 1e-5, None, stream)
+            .unwrap()
+            .item::<bool>(stream));
+    }
+}

@@ -278,12 +278,12 @@ impl MlxHybridLayerState {
             (Some(_), Some(placement)) => {
                 return Err(Exception::custom(format!(
                     "MLX hybrid attention does not support selected placement {placement:?} at layer {layer}"
-                )))
+                )));
             }
             (None, Some(_)) | (Some(_), None) => {
                 return Err(Exception::custom(format!(
                     "selected hybrid attention contract differs from the layout at layer {layer}"
-                )))
+                )));
             }
         };
         Ok(Self {
@@ -361,6 +361,14 @@ impl RuntimeStateComponents<MlxNeuralBackend> for MlxHybridLayerState {
 }
 
 impl AttentionCache<MlxTensor> for MlxHybridLayerState {
+    fn uses_blockwise_attention(&self) -> bool {
+        match self.attention.as_ref() {
+            Some(MlxHybridAttentionState::KeyValue(cache)) => {
+                AttentionCache::uses_blockwise_attention(cache)
+            }
+            _ => false,
+        }
+    }
     fn offset(&self) -> i32 {
         self.position()
     }
@@ -384,7 +392,7 @@ impl AttentionCache<MlxTensor> for MlxHybridLayerState {
                 _ => {
                     return Err(ComputeError::backend(
                         "layer has no key/value attention cache",
-                    ))
+                    ));
                 }
             },
             keys,
@@ -404,7 +412,7 @@ impl AttentionCache<MlxTensor> for MlxHybridLayerState {
                 _ => {
                     return Err(ComputeError::backend(
                         "layer has no key/value attention cache",
-                    ))
+                    ));
                 }
             },
             request,
@@ -851,7 +859,7 @@ impl MlxHybridState {
                 _ => {
                     return Err(Exception::custom(
                         "hybrid state checkpoint attention policy changed",
-                    ))
+                    ));
                 }
             }
             current.fixed.clone_from(&previous.fixed);

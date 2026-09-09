@@ -128,6 +128,8 @@ pub mod muse_glimmer;
 
 /// DeepSeek V3/R1 and V4 compressed-attention decoder family.
 pub mod deepseek;
+/// Gemma 2 dense text architecture.
+pub mod gemma2;
 /// Neutral Gemma 4 family implementation.
 pub mod gemma4;
 

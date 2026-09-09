@@ -2084,6 +2084,20 @@ sliding-window attention uses its separately specified token-count window.
 MLX and scalar reference mechanisms consume the shared geometry while retaining
 their own dtype, layout, reduction, and kernel implementations.
 
+The shared dense decoder also admits architecture-owned RMS scale offsets,
+post-attention and post-feed-forward normalization, embedding scaling and output
+soft caps. These policies run identically in resident, bounded and partitioned
+execution; post-sublayer normalization follows TP reduction. Gemma 2 supplies
+these policies and its SafeTensors/GGUF contracts without native dependencies.
+
+`AttentionRequest::softcap` is a neutral positive score cap applied after score
+scaling and before masking and softmax. Backends advertise
+`ATTENTION_SOFTCAP` only when contiguous, sliding and paged attention implement
+it. Paged caches retain the request policy through every block recurrence.
+`AttentionCache::uses_blockwise_attention` declares when returned update tensors
+exclude retained history, so the portable decoder routes chunked sliding
+prefill through cache-owned attention. Neither capability identifies a family.
+
 A backend owns runtime-specific resources and computation:
 
 - tensors, neural operators, queues or streams, random state, and sampling math;

@@ -166,6 +166,34 @@ pub trait Config: 'static {
     fn head_dim(&self) -> i32;
     /// RMSNorm epsilon.
     fn rms_norm_epsilon(&self) -> f32;
+    /// Offset added to learned RMS normalization scales.
+    fn normalization_offset(&self) -> f32 {
+        0.0
+    }
+    /// Optional normalization after attention, before its residual addition.
+    fn attention_output_normalization(&self, _layer: usize) -> Option<String> {
+        None
+    }
+    /// Optional normalization after feed-forward, before its residual addition.
+    fn feed_forward_output_normalization(&self, _layer: usize) -> Option<String> {
+        None
+    }
+    /// Multiplier applied once to input token embeddings.
+    fn embedding_scale(&self) -> f32 {
+        1.0
+    }
+    /// Optional positive tanh cap on final vocabulary logits.
+    fn output_softcap(&self) -> Option<f32> {
+        None
+    }
+    /// Scale applied to attention scores before any soft cap.
+    fn attention_scale(&self) -> f32 {
+        (self.head_dim() as f32).sqrt().recip()
+    }
+    /// Optional positive tanh cap on attention scores before masking.
+    fn attention_softcap(&self) -> Option<f32> {
+        None
+    }
     /// Vocabulary size.
     fn vocabulary_size(&self) -> i32;
     /// Whether one attention projection owns a learned bias.
@@ -204,6 +232,28 @@ pub trait Config: 'static {
     fn rotary_enabled(&self) -> bool {
         true
     }
+}
+
+/// Additional neural mechanisms selected by shared decoder equation policy.
+pub(crate) fn operator_requirements(config: &impl Config) -> eredu_nn::NeuralOperatorCapabilities {
+    use eredu_nn::{GatedProductActivation, NeuralOperatorCapabilities as Caps};
+    let mut required = Caps::NONE;
+    if config.learned_attention_sinks() {
+        required = required.union(Caps::ATTENTION_SINKS);
+    }
+    if config.output_softcap().is_some() {
+        required = required.union(Caps::TANH);
+    }
+    if config.attention_softcap().is_some() {
+        required = required.union(Caps::ATTENTION_SOFTCAP);
+    }
+    if config
+        .gated_product_policy()
+        .is_some_and(|p| matches!(p.activation(), GatedProductActivation::GeluApproximate))
+    {
+        required = required.union(Caps::GELU_APPROXIMATE);
+    }
+    required
 }
 
 /// Configuration that can derive one tensor-parallel local block without
@@ -586,12 +636,12 @@ impl<C: Config> LocalGeometry<C> {
             (true, Some(_)) => {
                 return Err(ParallelPlanError::InvalidTensor(
                     "tied decoder output has a separate vocabulary range".into(),
-                ))
+                ));
             }
             (false, None) => {
                 return Err(ParallelPlanError::InvalidTensor(
                     "untied decoder output has no vocabulary range".into(),
-                ))
+                ));
             }
         }
         let expected = StateLayout::new(
@@ -675,7 +725,7 @@ fn vocabulary_range(
             placement => {
                 return Err(ParallelPlanError::InvalidTensor(format!(
                     "vocabulary member {target} has non-row placement {placement:?}"
-                )))
+                )));
             }
         };
         if tensor.global_shape().first().copied() != Some(global_vocabulary) {
@@ -859,6 +909,9 @@ pub struct Attention<B: NeuralBackend> {
     /// Inverse square-root head scaling.
     #[parameter(skip)]
     pub scale: f32,
+    /// Optional score cap applied before masking and softmax.
+    #[parameter(skip)]
+    pub softcap: Option<f32>,
     /// Split or fused query/key/value projections.
     pub input_projection: AttentionInputProjection<B>,
     /// Output projection.
@@ -981,6 +1034,7 @@ impl<B: NeuralBackend> Attention<B> {
             query_heads,
             key_value_heads,
             scale: (head_dim as f32).sqrt().recip(),
+            softcap: None,
             input_projection: AttentionInputProjection::Split { query, key, value },
             output,
             sinks: None,
@@ -1094,7 +1148,8 @@ impl<B: NeuralBackend> Attention<B> {
         Ok(Self {
             query_heads,
             key_value_heads,
-            scale: (head as f32).sqrt().recip(),
+            scale: config.attention_scale(),
+            softcap: config.attention_softcap(),
             input_projection,
             output: linear(
                 fields.attention_output,
@@ -1281,12 +1336,14 @@ impl<B: NeuralBackend> Attention<B> {
             None => (keys, values),
         };
         let sinks = self.sinks.as_ref().map(Parameter::as_ref);
-        if let Some(window) = self
-            .sliding_window
-            .filter(|_| allow_sliding_prefill && sequence > 1)
-        {
+        if let Some(window) = self.sliding_window.filter(|_| {
+            allow_sliding_prefill
+                && sequence > 1
+                && !cache.as_ref().is_some_and(|c| c.uses_blockwise_attention())
+        }) {
             return B::sliding_window_attention_with_sinks(
                 AttentionRequest {
+                    softcap: self.softcap,
                     queries,
                     keys,
                     values,
@@ -1300,6 +1357,7 @@ impl<B: NeuralBackend> Attention<B> {
             );
         }
         let request = AttentionRequest {
+            softcap: self.softcap,
             queries,
             keys,
             values,
@@ -1587,6 +1645,10 @@ pub struct TransformerBlock<B: NeuralBackend, F = Mlp<B>> {
     pub input_norm: B::Normalization,
     /// Pre-MLP RMSNorm.
     pub post_attention_norm: B::Normalization,
+    /// Optional post-attention normalization before residual addition.
+    pub attention_output_norm: Option<B::Normalization>,
+    /// Optional post-feed-forward normalization before residual addition.
+    pub feed_forward_output_norm: Option<B::Normalization>,
     /// Optional normalization of the completed block output.
     pub output_norm: Option<B::Normalization>,
 }
@@ -1599,7 +1661,28 @@ impl<B: NeuralBackend> TransformerBlock<B, Mlp<B>> {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
         let fields = config.block_parameter_fields().validate()?;
+        let norm = |name: String| {
+            B::normalization(
+                NormalizationConstructionSpec {
+                    dimensions: config.hidden_size(),
+                    epsilon: config.rms_norm_epsilon(),
+                    scale: normalization_scale(
+                        ParameterSpec::trainable(name).map_err(Error::backend)?,
+                        config.normalization_offset(),
+                    ),
+                },
+                context,
+            )
+        };
         Ok(Self {
+            attention_output_norm: config
+                .attention_output_normalization(layer)
+                .map(&norm)
+                .transpose()?,
+            feed_forward_output_norm: config
+                .feed_forward_output_normalization(layer)
+                .map(&norm)
+                .transpose()?,
             output_norm: config
                 .block_output_normalization(layer)
                 .map(|name| {
@@ -1615,32 +1698,16 @@ impl<B: NeuralBackend> TransformerBlock<B, Mlp<B>> {
                 .transpose()?,
             self_attention: Attention::new(config, layer, context)?,
             mlp: Mlp::new(config, layer, context)?,
-            input_norm: B::normalization(
-                NormalizationConstructionSpec::learned(
-                    config.hidden_size(),
-                    config.rms_norm_epsilon(),
-                    ParameterSpec::trainable(format!(
-                        "{}.layers.{layer}.{}.weight",
-                        config.parameter_root(),
-                        fields.input_norm
-                    ))
-                    .map_err(Error::backend)?,
-                ),
-                context,
-            )?,
-            post_attention_norm: B::normalization(
-                NormalizationConstructionSpec::learned(
-                    config.hidden_size(),
-                    config.rms_norm_epsilon(),
-                    ParameterSpec::trainable(format!(
-                        "{}.layers.{layer}.{}.weight",
-                        config.parameter_root(),
-                        fields.post_attention_norm
-                    ))
-                    .map_err(Error::backend)?,
-                ),
-                context,
-            )?,
+            input_norm: norm(format!(
+                "{}.layers.{layer}.{}.weight",
+                config.parameter_root(),
+                fields.input_norm
+            ))?,
+            post_attention_norm: norm(format!(
+                "{}.layers.{layer}.{}.weight",
+                config.parameter_root(),
+                fields.post_attention_norm
+            ))?,
         })
     }
 }
@@ -1677,9 +1744,17 @@ where
             },
             context,
         )?;
+        let attention = match &mut self.attention_output_norm {
+            Some(norm) => norm.forward(&attention, context)?,
+            None => attention,
+        };
         let hidden = input.hidden.add(&attention, context)?;
         let normalized = self.post_attention_norm.forward(&hidden, context)?;
         let mlp = self.mlp.forward_feed_forward(&normalized, context)?;
+        let mlp = match &mut self.feed_forward_output_norm {
+            Some(norm) => norm.forward(&mlp, context)?,
+            None => mlp,
+        };
         self.normalize_output(hidden.add(&mlp, context)?, context)
     }
 
@@ -1705,9 +1780,17 @@ where
             },
             context,
         )?;
+        let attention = match &mut self.attention_output_norm {
+            Some(norm) => norm.forward(&attention, context)?,
+            None => attention,
+        };
         let hidden = input.hidden.add(&attention, context)?;
         let normalized = self.post_attention_norm.forward(&hidden, context)?;
         let mlp = feed_forward(&mut self.mlp, &normalized, context)?;
+        let mlp = match &mut self.feed_forward_output_norm {
+            Some(norm) => norm.forward(&mlp, context)?,
+            None => mlp,
+        };
         self.normalize_output(hidden.add(&mlp, context)?, context)
     }
 
@@ -1733,11 +1816,19 @@ where
             parallel,
             context,
         )?;
+        let attention = match &mut self.attention_output_norm {
+            Some(norm) => norm.forward(&attention, context)?,
+            None => attention,
+        };
         let hidden = input.hidden.add(&attention, context)?;
         let normalized = self.post_attention_norm.forward(&hidden, context)?;
         let mlp = self
             .mlp
             .forward_feed_forward_parallel(&normalized, parallel, context)?;
+        let mlp = match &mut self.feed_forward_output_norm {
+            Some(norm) => norm.forward(&mlp, context)?,
+            None => mlp,
+        };
         self.normalize_output(hidden.add(&mlp, context)?, context)
     }
 
@@ -1765,9 +1856,17 @@ where
             parallel,
             context,
         )?;
+        let attention = match &mut self.attention_output_norm {
+            Some(norm) => norm.forward(&attention, context)?,
+            None => attention,
+        };
         let hidden = input.hidden.add(&attention, context)?;
         let normalized = self.post_attention_norm.forward(&hidden, context)?;
         let mlp = feed_forward(&mut self.mlp, &normalized, context)?;
+        let mlp = match &mut self.feed_forward_output_norm {
+            Some(norm) => norm.forward(&mlp, context)?,
+            None => mlp,
+        };
         self.normalize_output(hidden.add(&mlp, context)?, context)
     }
 }
@@ -1904,6 +2003,25 @@ pub fn block_common_parallel_parameter_groups<B: NeuralBackend, F>(
             norm,
             |_, _| Ok(MemberSharding::Replicated),
         )?);
+    }
+    for (name, norm) in [
+        (
+            config.attention_output_normalization(layer),
+            &block.attention_output_norm,
+        ),
+        (
+            config.feed_forward_output_normalization(layer),
+            &block.feed_forward_output_norm,
+        ),
+    ] {
+        if let (Some(name), Some(norm)) = (name, norm) {
+            groups.push(module_parameter_group::<B::Tensor, _>(
+                name.trim_end_matches(".weight"),
+                ParameterRole::Replicated,
+                norm,
+                |_, _| Ok(MemberSharding::Replicated),
+            )?);
+        }
     }
     groups.extend([input_norm, post_attention_norm]);
     Ok(groups)
@@ -2250,7 +2368,14 @@ pub fn dense_parameter_description(
             )],
         )?;
         let mut unit_groups = vec![attention];
-        if let Some(name) = config.block_output_normalization(layer) {
+        for name in [
+            config.block_output_normalization(layer),
+            config.attention_output_normalization(layer),
+            config.feed_forward_output_normalization(layer),
+        ]
+        .into_iter()
+        .flatten()
+        {
             unit_groups.push(ParameterGroupSpec::new(
                 name.trim_end_matches(".weight"),
                 ParameterRole::Replicated,
@@ -2510,12 +2635,12 @@ impl<B: NeuralBackend> StaticModules<B> {
             (true, Some(_)) => {
                 return Err(Error::backend(
                     "tied decoder output must not declare separate vocabulary ownership",
-                ))
+                ));
             }
             (false, None) => {
                 return Err(Error::backend(
                     "untied decoder output is missing vocabulary ownership",
-                ))
+                ));
             }
             (false, Some(range)) => {
                 range.validate_global_rows(spec.vocabulary)?;
@@ -2558,7 +2683,7 @@ impl<B: NeuralBackend> StaticModules<B> {
                 vocabulary: config.vocabulary_size(),
                 hidden_size: config.hidden_size(),
                 normalization_epsilon: config.rms_norm_epsilon(),
-                normalization_offset: 0.0,
+                normalization_offset: config.normalization_offset(),
                 embedding_quantization: config.weight_quantization(&embedding_name),
                 head_format: config.weight_quantization("lm_head.weight").into(),
                 tied_head: config.tie_word_embeddings(),
@@ -2586,7 +2711,7 @@ impl<B: NeuralBackend> StaticModules<B> {
                 vocabulary: config.vocabulary_size(),
                 hidden_size: config.hidden_size(),
                 normalization_epsilon: config.rms_norm_epsilon(),
-                normalization_offset: 0.0,
+                normalization_offset: config.normalization_offset(),
                 embedding_quantization: config.weight_quantization(&embedding_name),
                 head_format: config.weight_quantization("lm_head.weight").into(),
                 tied_head: config.tie_word_embeddings(),
@@ -3033,12 +3158,18 @@ where
         .owns_output()
         .then(|| {
             B::normalization(
-                NormalizationConstructionSpec::learned(
-                    config.hidden_size(),
-                    config.rms_norm_epsilon(),
-                    ParameterSpec::trainable(format!("{}.norm.weight", config.parameter_root()))
+                NormalizationConstructionSpec {
+                    dimensions: config.hidden_size(),
+                    epsilon: config.rms_norm_epsilon(),
+                    scale: normalization_scale(
+                        ParameterSpec::trainable(format!(
+                            "{}.norm.weight",
+                            config.parameter_root()
+                        ))
                         .map_err(Error::backend)?,
-                ),
+                        config.normalization_offset(),
+                    ),
+                },
                 context,
             )
         })
@@ -3087,6 +3218,10 @@ where
     ) -> Result<Self, Error> {
         args.validate_config()?;
         P::validate(&args)?;
+        crate::operator_requirements::require::<B>(
+            "shared decoder equations",
+            operator_requirements(&args),
+        )?;
         args.validate_partition_parameters(parameters)?;
         if parameters.graph() != partition.graph()
             || parameters.unit_layout() != partition.unit_layout()
@@ -3379,7 +3514,7 @@ where
                 Error::backend("decoder partition does not own final normalization")
             })?;
         let hidden = norm.forward(hidden, context)?;
-        match (parallel, self.static_modules.lm_head.as_mut()) {
+        let logits = match (parallel, self.static_modules.lm_head.as_mut()) {
             (Some(parallel), Some(head)) => {
                 B::vocabulary_parallel_project(head, &hidden, parallel, context)
             }
@@ -3398,7 +3533,8 @@ where
                 .as_mut()
                 .ok_or_else(|| Error::backend("tied decoder output partition has no embedding"))?
                 .as_linear(&hidden, context),
-        }
+        }?;
+        softcap_logits(logits, self.args.output_softcap(), context)
     }
 }
 
@@ -3551,6 +3687,7 @@ where
             .as_mut()
             .ok_or_else(|| Error::backend("decoder partition does not own input embedding"))?
             .forward(input.tokens, context)?;
+        let hidden = scale_token_embeddings(hidden, self.args.embedding_scale(), context)?;
         Self::begin_hidden(
             hidden,
             input.mask,
@@ -3652,6 +3789,7 @@ where
             parallel,
             context,
         )?;
+        let hidden = scale_token_embeddings(hidden, self.args.embedding_scale(), context)?;
         Self::begin_hidden(
             hidden,
             input.mask,
@@ -3844,12 +3982,17 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
         let hidden = match input {
-            LayeredPartitionInput::Tokens(tokens) => self
-                .static_modules
-                .embeddings
-                .as_mut()
-                .ok_or_else(|| Error::backend("decoder partition does not own input embedding"))?
-                .forward(tokens, context)?,
+            LayeredPartitionInput::Tokens(tokens) => {
+                let hidden = self
+                    .static_modules
+                    .embeddings
+                    .as_mut()
+                    .ok_or_else(|| {
+                        Error::backend("decoder partition does not own input embedding")
+                    })?
+                    .forward(tokens, context)?;
+                scale_token_embeddings(hidden, self.args.embedding_scale(), context)?
+            }
             LayeredPartitionInput::Hidden { hidden, .. } => hidden,
         };
         Self::begin_hidden(hidden, mask, state, expected, first_state_ordinal, context)
@@ -3866,15 +4009,18 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
         let hidden = match input {
-            LayeredPartitionInput::Tokens(tokens) => B::vocabulary_parallel_lookup(
-                self.static_modules.embeddings.as_mut().ok_or_else(|| {
-                    Error::backend("decoder partition does not own input embedding")
-                })?,
-                tokens,
-                EmbeddingLookupPolicy::Strict,
-                parallel,
-                context,
-            )?,
+            LayeredPartitionInput::Tokens(tokens) => {
+                let hidden = B::vocabulary_parallel_lookup(
+                    self.static_modules.embeddings.as_mut().ok_or_else(|| {
+                        Error::backend("decoder partition does not own input embedding")
+                    })?,
+                    tokens,
+                    EmbeddingLookupPolicy::Strict,
+                    parallel,
+                    context,
+                )?;
+                scale_token_embeddings(hidden, self.args.embedding_scale(), context)?
+            }
             LayeredPartitionInput::Hidden { hidden, .. } => hidden,
         };
         Self::begin_hidden(hidden, mask, state, expected, first_state_ordinal, context)
@@ -3947,12 +4093,10 @@ where
     pub fn new(args: C, context: &<B::Tensor as Tensor>::Context) -> Result<Self, Error> {
         args.validate_config()?;
         P::validate(&args)?;
-        if args.learned_attention_sinks() {
-            crate::operator_requirements::require::<B>(
-                "shared decoder attention sinks",
-                eredu_nn::NeuralOperatorCapabilities::ATTENTION_SINKS,
-            )?;
-        }
+        crate::operator_requirements::require::<B>(
+            "shared decoder equations",
+            operator_requirements(&args),
+        )?;
         let static_modules = StaticModules::new(&args, context)?;
         Ok(Self {
             args,
@@ -3973,12 +4117,10 @@ where
     {
         args.validate_config()?;
         P::validate(&args)?;
-        if args.learned_attention_sinks() {
-            crate::operator_requirements::require::<B>(
-                "shared decoder attention sinks",
-                eredu_nn::NeuralOperatorCapabilities::ATTENTION_SINKS,
-            )?;
-        }
+        crate::operator_requirements::require::<B>(
+            "shared decoder equations",
+            operator_requirements(&args),
+        )?;
         geometry.validate_for(&args).map_err(Error::backend)?;
         let static_modules = StaticModules::new_parallel(&args, &geometry, context)?;
         Ok(Self {
@@ -4108,7 +4250,8 @@ where
     {
         let hidden = match input {
             LayeredPartitionInput::Tokens(tokens) => {
-                self.static_modules.embeddings.forward(tokens, context)?
+                let hidden = self.static_modules.embeddings.forward(tokens, context)?;
+                scale_token_embeddings(hidden, self.args.embedding_scale(), context)?
             }
             LayeredPartitionInput::Hidden { hidden, .. } => hidden,
         };
@@ -4141,13 +4284,16 @@ where
         S::LayerState: AttentionCache<B::Tensor>,
     {
         let hidden = match input {
-            LayeredPartitionInput::Tokens(tokens) => B::vocabulary_parallel_lookup(
-                &mut self.static_modules.embeddings,
-                tokens,
-                EmbeddingLookupPolicy::Strict,
-                parallel,
-                context,
-            )?,
+            LayeredPartitionInput::Tokens(tokens) => {
+                let hidden = B::vocabulary_parallel_lookup(
+                    &mut self.static_modules.embeddings,
+                    tokens,
+                    EmbeddingLookupPolicy::Strict,
+                    parallel,
+                    context,
+                )?;
+                scale_token_embeddings(hidden, self.args.embedding_scale(), context)?
+            }
             LayeredPartitionInput::Hidden { hidden, .. } => hidden,
         };
         self.begin_embedded_with_layout_at(
@@ -4383,10 +4529,11 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
         let hidden = self.static_modules.norm.forward(hidden, context)?;
-        match &mut self.static_modules.lm_head {
+        let logits = match &mut self.static_modules.lm_head {
             Some(head) => head.forward(&hidden, context),
             None => self.static_modules.embeddings.as_linear(&hidden, context),
-        }
+        }?;
+        softcap_logits(logits, self.args.output_softcap(), context)
     }
 
     /// Applies rank-local normalization and vocabulary-parallel projection for
@@ -4401,7 +4548,7 @@ where
         B: eredu_nn::DistributedNeuralBackend,
     {
         let hidden = self.static_modules.norm.forward(hidden, context)?;
-        match &mut self.static_modules.lm_head {
+        let logits = match &mut self.static_modules.lm_head {
             Some(head) => B::vocabulary_parallel_project(head, &hidden, parallel, context),
             None => B::vocabulary_parallel_embedding_project(
                 &mut self.static_modules.embeddings,
@@ -4409,7 +4556,8 @@ where
                 parallel,
                 context,
             ),
-        }
+        }?;
+        softcap_logits(logits, self.args.output_softcap(), context)
     }
 }
 
@@ -4618,6 +4766,7 @@ where
             .static_modules
             .embeddings
             .forward(input.tokens, context)?;
+        let hidden = scale_token_embeddings(hidden, self.args.embedding_scale(), context)?;
         self.begin_embedded(hidden, input.mask, state, context)
     }
 
@@ -4714,6 +4863,7 @@ where
             parallel,
             context,
         )?;
+        let hidden = scale_token_embeddings(hidden, self.args.embedding_scale(), context)?;
         self.begin_embedded_with_layout(hidden, input.mask, state, &expected, context)
     }
 
@@ -4919,5 +5069,39 @@ where
                 )
             },
         )
+    }
+}
+
+fn scale_token_embeddings<T: Tensor>(
+    embeddings: T,
+    scale: f32,
+    context: &T::Context,
+) -> Result<T, Error> {
+    if scale == 1.0 {
+        Ok(embeddings)
+    } else {
+        embeddings.multiply_scalar(scale, context)
+    }
+}
+
+fn softcap_logits<T: Tensor>(
+    logits: T,
+    cap: Option<f32>,
+    context: &T::Context,
+) -> Result<T, Error> {
+    match cap {
+        Some(cap) => logits
+            .multiply_scalar(cap.recip(), context)?
+            .tanh(context)?
+            .multiply_scalar(cap, context),
+        None => Ok(logits),
+    }
+}
+
+fn normalization_scale(weight: ParameterSpec, offset: f32) -> eredu_nn::NormalizationScale {
+    if offset == 0.0 {
+        eredu_nn::NormalizationScale::Learned(weight)
+    } else {
+        eredu_nn::NormalizationScale::LearnedOffset { weight, offset }
     }
 }

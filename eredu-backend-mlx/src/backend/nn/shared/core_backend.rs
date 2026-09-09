@@ -535,7 +535,7 @@ impl NeuralBackend for MlxNeuralBackend {
             _ => {
                 return Err(ComputeError::backend(
                     "unsupported grouped gated-product activation",
-                ))
+                ));
             }
         };
         compute_tensor(gate.multiply(up, context))
@@ -851,15 +851,14 @@ impl NeuralBackend for MlxNeuralBackend {
         context: &Stream,
     ) -> Result<MlxTensor, ComputeError> {
         request.validate()?;
-        compute_tensor(safemlx::fast::scaled_dot_product_attention(
-            request.queries.as_array().clone(),
-            request.keys.as_array().clone(),
-            request.values.as_array().clone(),
+        compute_tensor(common::attention::attention_with_softcap(
+            request.queries.as_array(),
+            request.keys.as_array(),
+            request.values.as_array(),
             request.scale,
-            request
-                .mask
-                .map(|mask| ScaledDotProductAttentionMask::Array(mask.as_array())),
+            request.mask.map(MlxTensor::as_array),
             request.sinks.map(MlxTensor::as_array),
+            request.softcap,
             context,
         ))
     }
@@ -873,18 +872,21 @@ impl NeuralBackend for MlxNeuralBackend {
         request.validate()?;
         let batch = request.queries.dim(0);
         let sequence = request.queries.dim(2);
-        compute_tensor(common::attention::sliding_window_prefill_attention(
-            request.queries.as_array().clone(),
-            request.keys.as_array().clone(),
-            request.values.as_array().clone(),
-            request.scale,
-            window,
-            position_offset,
-            batch,
-            sequence,
-            request.sinks.map(MlxTensor::as_array),
-            context,
-        ))
+        compute_tensor(
+            common::attention::sliding_window_prefill_attention_with_softcap(
+                request.queries.as_array().clone(),
+                request.keys.as_array().clone(),
+                request.values.as_array().clone(),
+                request.scale,
+                window,
+                position_offset,
+                batch,
+                sequence,
+                request.sinks.map(MlxTensor::as_array),
+                request.softcap,
+                context,
+            ),
+        )
     }
 
     fn rms_norm_without_weight(

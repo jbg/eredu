@@ -54,6 +54,14 @@ pub(super) fn dense<C: Config>(g: &mut Builder, c: &C, moe_policy: Option<MoeAtt
             PositionalEncoding::None
         });
         g.get_mut(&op).attention = Some(a);
+        post_sublayer_norm(
+            g,
+            &block,
+            &op,
+            &join,
+            c.attention_output_normalization(i),
+            width,
+        );
         let (ff, output) = g.sublayer(
             &block,
             &join,
@@ -62,6 +70,14 @@ pub(super) fn dense<C: Config>(g: &mut Builder, c: &C, moe_policy: Option<MoeAtt
             &format!("{path}.{}", fields.feed_forward),
             width,
             ArchitectureNodeKind::FeedForward,
+        );
+        post_sublayer_norm(
+            g,
+            &block,
+            &ff,
+            &output,
+            c.feed_forward_output_normalization(i),
+            width,
         );
         if let Some(attributes) = &moe_policy {
             let point = c.routed_observation_point(&path, i);
@@ -364,7 +380,8 @@ pub(super) fn remaining_safetensors(g: &mut Builder, c: &SafetensorsModelConfig)
             media(g, "vision");
         }
         SafetensorsModelConfig::Moshi(c) => moshi(g, c),
-        SafetensorsModelConfig::Llama(_)
+        SafetensorsModelConfig::Gemma2(_)
+        | SafetensorsModelConfig::Llama(_)
         | SafetensorsModelConfig::Qwen(_)
         | SafetensorsModelConfig::GptOss(_)
         | SafetensorsModelConfig::QwenHybrid(_) => unreachable!("handled by caller"),
@@ -398,7 +415,8 @@ pub(super) fn remaining_gguf(g: &mut Builder, c: &GgufModelConfig) {
         GgufModelConfig::Gemma4(c) => gemma(g, c),
         GgufModelConfig::MuseGlimmer(c) => muse(g, c),
         GgufModelConfig::Inkling(c) => inkling(g, c),
-        GgufModelConfig::Llama(_)
+        GgufModelConfig::Gemma2(_)
+        | GgufModelConfig::Llama(_)
         | GgufModelConfig::Nanbeige(_)
         | GgufModelConfig::Qwen(_)
         | GgufModelConfig::GptOss(_)
@@ -1093,4 +1111,29 @@ fn moshi(g: &mut Builder, c: &crate::moshi::MoshiConfig) {
         "Model prefill/decode discovery does not describe realtime frame observation identities"
             .into(),
     ]);
+}
+
+fn post_sublayer_norm(
+    g: &mut Builder,
+    block: &str,
+    op: &str,
+    join: &str,
+    name: Option<String>,
+    width: usize,
+) {
+    if let Some(name) = name {
+        let id = format!("{op}.post_norm");
+        g.node(
+            &id,
+            ArchitectureNodeKind::Normalization,
+            Some(block),
+            Some(name.trim_end_matches(".weight")),
+            Some(width),
+        );
+        g.descriptor.edges.retain(|edge| {
+            !(edge.from == op && edge.to == join && edge.kind == ArchitectureEdgeKind::Data)
+        });
+        g.edge(op, &id, ArchitectureEdgeKind::Data);
+        g.edge(&id, join, ArchitectureEdgeKind::Data);
+    }
 }

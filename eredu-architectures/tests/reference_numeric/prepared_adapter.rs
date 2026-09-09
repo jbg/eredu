@@ -244,7 +244,11 @@ pub(super) fn payload_fixture_config(
                 .into_iter()
                 .map(|x| i32::try_from(x).unwrap())
                 .collect::<Vec<_>>();
-            let mut value = parameter(&spec, dimensions, name.contains("norm"));
+            let mut value = parameter(
+                &spec,
+                dimensions,
+                name.contains("norm") && config["model_type"] != "gemma2",
+            );
             if name == "lm_head.weight" {
                 value = value.map(|value| value * head_scale);
             }

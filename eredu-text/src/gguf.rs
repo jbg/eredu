@@ -71,7 +71,9 @@ pub fn from_metadata(
         .unwrap_or_default();
 
     let mut tokenizer = match (architecture, model_type) {
-        ("gemma4" | "gemma4_assistant" | "gemma4-assistant", _) => build_gemma(tokens, metadata)?,
+        ("gemma2" | "gemma4" | "gemma4_assistant" | "gemma4-assistant", _) => {
+            build_gemma(tokens, metadata)?
+        }
         ("llama", _) => build_llama(tokens, metadata)?,
         (_, "llama") => build_llama(tokens, metadata)?,
         (_, "gpt2") => build_gpt(tokens, metadata)?,
@@ -730,14 +732,16 @@ mod tests {
 
     #[test]
     fn builds_gemma_unigram_tokenizer() {
-        let metadata = sentencepiece_metadata("gemma4");
-        let loaded = from_metadata(&metadata).unwrap().unwrap();
-        let encoding = loaded.tokenizer.encode("hi", false).unwrap();
-        assert_eq!(encoding.get_ids(), &[5]);
-        assert_eq!(
-            loaded.tokenizer.decode(encoding.get_ids(), false).unwrap(),
-            "hi"
-        );
+        for family in ["gemma2", "gemma4"] {
+            let metadata = sentencepiece_metadata(family);
+            let loaded = from_metadata(&metadata).unwrap().unwrap();
+            let encoding = loaded.tokenizer.encode("hi", false).unwrap();
+            assert_eq!(encoding.get_ids(), &[5]);
+            assert_eq!(
+                loaded.tokenizer.decode(encoding.get_ids(), false).unwrap(),
+                "hi"
+            );
+        }
     }
 
     #[test]
