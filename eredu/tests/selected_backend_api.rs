@@ -2,9 +2,7 @@ use eredu::api::realtime::{
     RealtimeInputFrame, RealtimePreparationPlan, RealtimeSampling, RequestId, SchedulerLimits,
     SessionCapabilities,
 };
-use eredu::api::{
-    inspect_local_model, LocalBackendError, LocalInspectionOptions, LocalLoadOptions,
-};
+use eredu::api::{inspect_local_model, LocalInspectionOptions, LocalLoadOptions};
 use eredu_backend_mlx::{backend::MlxBackend, MlxBackendFactory};
 use eredu_core::{DevicePlan, ExecutionPlan, QuantizationRequest};
 
@@ -108,7 +106,7 @@ fn operate_selected_realtime_backend(
     }
     let session = scheduler.release(request)?;
     let _ = session.committed_batch();
-    scheduler.resume(request, session)?;
+    scheduler.resume(request, &mut Some(session))?;
     scheduler.finish(request)?;
     Ok(())
 }
@@ -145,10 +143,11 @@ fn selected_load_policy_is_facade_owned_and_portable() {
 
 #[test]
 fn selected_inspection_is_total_for_missing_artifacts() {
-    let result: Result<eredu_core::ModelInspectionReport, LocalBackendError> = inspect_local_model(
-        "/path/that/does/not/exist/eredu-selected-backend-api",
-        LocalInspectionOptions::default(),
-    );
+    let result: Result<eredu_core::ModelInspectionReport, eredu_core::BackendFailure> =
+        inspect_local_model(
+            "/path/that/does/not/exist/eredu-selected-backend-api",
+            LocalInspectionOptions::default(),
+        );
     let report = result.unwrap();
     assert_eq!(report.container, eredu_core::InspectionReadiness::Missing);
 }

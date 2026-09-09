@@ -5,7 +5,6 @@ use eredu::{
     runtime::chat::ChatTemplateRequest,
 };
 use eredu_backend_mlx::{backend::MlxBackend, MlxBackendFactory};
-use eredu_core::TokenOutput as _;
 use eredu_core::{ExecutionPlan, GenerationConfigOverrides, TextGenerationConfig};
 
 fn generate(

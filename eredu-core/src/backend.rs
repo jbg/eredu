@@ -1,10 +1,12 @@
 //! High-level contract implemented once per execution backend.
 
 mod continuation;
+mod failure;
 pub use continuation::{
     TextContinuationBoundary, TextContinuationError, TextContinuationIdentity, TextDriverIdentity,
     TextGenerationContinuation, TextGenerationDriver,
 };
+pub use failure::{BackendFailure, BackendFailureKind};
 
 use serde::{Deserialize, Serialize};
 use std::{fmt::Debug, path::Path};
@@ -1278,6 +1280,30 @@ where
     }
 }
 
+impl<B: TextGenerationBackend> ModelRuntime<B> {
+    /// Settles prior work and clears request state while retaining the loaded model.
+    ///
+    /// Success establishes a fresh session for the next request. Model identity,
+    /// admitted capabilities, placement and retained drafting target proof are
+    /// preserved. Failure does not establish that the session can be reused.
+    pub fn reset(&mut self) -> Result<(), BackendFailure> {
+        self.synchronize()?;
+        B::reset_session(&self.backend, &mut self.session)
+    }
+
+    /// Waits for this session's submitted work, including abandoned generation.
+    ///
+    /// Success establishes that no work or submission authority remains pending
+    /// and the session is healthy. It preserves request state. An error is not
+    /// completion evidence; the backend must retain any unresolved resources.
+    /// Allocator caches and process-wide memory reclamation are outside this
+    /// contract.
+    pub fn synchronize(&self) -> Result<(), BackendFailure> {
+        self.admission.validate(self.session.capabilities())?;
+        B::synchronize_session(&self.backend, &self.session)
+    }
+}
+
 impl<B: ModelLoadingBackend> ModelRuntime<B> {
     /// Loads an artifact and creates its sole session on `backend`.
     pub fn load(
@@ -1529,6 +1555,8 @@ impl TokenFilterController for FixedTokenFilter {
 /// The contract deliberately combines model execution and sampling. Core does
 /// not see logits or ask a backend to implement tensor primitives. The token,
 /// sampling state, cache state, and exact completion remain backend-owned.
+/// Lifecycle hooks return the common [`BackendFailure`]; preserve the original
+/// error as its source and classify only from known facts, not diagnostic text.
 pub trait TextGenerationBackend: BackendProvider {
     /// Opaque prepared prompt, including any backend-owned multimodal values.
     type Prompt;
@@ -1538,6 +1566,27 @@ pub trait TextGenerationBackend: BackendProvider {
     type TextGenerationState;
     /// Exact completion retaining model execution and token sampling.
     type TextCompletion: Completion<Error = Self::Error>;
+
+    /// Clears all request-dependent session state after successful synchronization.
+    ///
+    /// On success, subsequent generation must behave as on a fresh session with
+    /// the same model, prompt and generation configuration. Preserve the loaded
+    /// parameters, model identity, selected placement and admitted capabilities.
+    /// Any work submitted by reset itself must be settled before success. Never
+    /// clear an unresolved submission lease or silently recover a poisoned session.
+    /// Stateless backends must explicitly implement this as a no-op.
+    fn reset_session(backend: &Self, session: &mut Self::Session) -> Result<(), BackendFailure>;
+
+    /// Establishes settled, healthy session work without changing request state.
+    ///
+    /// Wait for all work associated with this session, including loading,
+    /// transfers and work retained after cancellation or iterator drop. Return
+    /// success only when no pending submission authority remains and the session
+    /// is reusable. A live detached continuation/submission may be rejected as
+    /// busy. Errors must preserve ownership of unresolved native resources and
+    /// must not be treated as completion. Synchronous backends must explicitly
+    /// implement the corresponding idle/health check, or a no-op when always idle.
+    fn synchronize_session(backend: &Self, session: &Self::Session) -> Result<(), BackendFailure>;
 
     /// Exact support for serial, completed-token control on this loaded session.
     /// Backends opt in only for verified ordinary single-sequence execution.
@@ -2055,7 +2104,9 @@ where
 /// Every yielded token handle may be fed into the following decode without
 /// first reading its id on the host. The preceding completion resolves before
 /// that state-mutating decode is submitted, and dropping the iterator waits
-/// for every still-retained submission.
+/// for every still-retained submission. Drop cannot report settlement errors;
+/// use [`ModelRuntime::synchronize`] to establish successful settlement before
+/// reuse or eviction, and [`ModelRuntime::reset`] for fresh request state.
 pub struct TextGeneration<'a, B: TextGenerationBackend> {
     runtime: &'a mut ModelRuntime<B>,
     inner: TextGenerationMachine<B, FixedTokenFilter>,
@@ -2576,6 +2627,15 @@ mod tests {
     }
 
     impl TextGenerationBackend for Mock {
+        fn reset_session(_: &Self, session: &mut Self::Session) -> Result<(), BackendFailure> {
+            session.tokens.clear();
+            Ok(())
+        }
+
+        fn synchronize_session(_: &Self, _: &Self::Session) -> Result<(), BackendFailure> {
+            Ok(())
+        }
+
         type Prompt = Vec<u32>;
         type Token = u32;
         type TextGenerationState = (u32, u64);
@@ -2806,6 +2866,21 @@ mod tests {
         fn is_complete(&mut self) -> Result<bool, Self::Error> {
             Ok(self.committed == self.tokens.len())
         }
+    }
+
+    #[test]
+    fn lifecycle_preserves_selected_target_and_loaded_parameters() {
+        let prepared = Mock.prepare_model(10).unwrap();
+        let mut runtime =
+            ModelRuntime::from_prepared_execution_plan_target(Mock, prepared, 42).unwrap();
+        let capabilities = runtime.capabilities();
+        assert_eq!(runtime.prefill(vec![1, 2]).unwrap().output, 12);
+        runtime.synchronize().unwrap();
+        assert_eq!(runtime.decode(3).unwrap().output, 13);
+        runtime.reset().unwrap();
+        assert_eq!(runtime.execution_plan_target_id(), Some(42));
+        assert_eq!(runtime.capabilities(), capabilities);
+        assert_eq!(runtime.prefill(vec![1, 2]).unwrap().output, 12);
     }
 
     #[test]

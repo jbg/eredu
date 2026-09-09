@@ -4,7 +4,6 @@ use eredu::api::{
     default_local_device, local_device_plan, reset_local_allocator_peak, LoadedModel,
 };
 use eredu_backend_mlx::{backend::MlxBackend, MlxBackendFactory};
-use eredu_core::TokenOutput as _;
 use eredu_core::{
     ExecutionPlan, GenerationConfigOverrides, TextGenerationConfig, WeightTransformationPlan,
 };

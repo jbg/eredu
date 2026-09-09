@@ -306,7 +306,7 @@ fn no_default_facade_selects_runs_and_resumes_realtime_with_reference_mechanisms
     let released = scheduler.release(request).unwrap();
     assert_eq!(released.committed_batch().unwrap().get(), 1);
     let resumed = RequestId::new(42);
-    scheduler.resume(resumed, released).unwrap();
+    scheduler.resume(resumed, &mut Some(released)).unwrap();
     assert_eq!(
         scheduler
             .request_state(resumed)

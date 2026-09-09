@@ -695,7 +695,7 @@ fn moshi_mlx_scheduler_transaction_rollback_release_resume() {
         1
     );
     let released = scheduler.release(request).unwrap();
-    scheduler.resume(request, released).unwrap();
+    scheduler.resume(request, &mut Some(released)).unwrap();
 
     drive_selected_frame(
         &mut model,
@@ -715,7 +715,7 @@ fn moshi_mlx_scheduler_transaction_rollback_release_resume() {
         2
     );
     let released = scheduler.release(request).unwrap();
-    scheduler.resume(request, released).unwrap();
+    scheduler.resume(request, &mut Some(released)).unwrap();
 
     scheduler
         .enqueue(request, RealtimeInputFrame::new(1, vec![-1]))

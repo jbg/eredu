@@ -297,8 +297,8 @@ pub use realtime_session::{
     RealtimeHistoryGeneration, RealtimeModelOwnerIdentity, RealtimeModelSessionIdentity,
     RealtimeSamplingReplacementError, RealtimeSamplingUpdateError, RealtimeSessionBranch,
     RealtimeSessionError, RealtimeSessionExecutionError, RealtimeSessionIncarnation,
-    RealtimeSessionResumeError, RealtimeSessionScheduler, RealtimeSessionState,
-    RealtimeSessionTransactionError, ReleasedRealtimeSession,
+    RealtimeSessionScheduler, RealtimeSessionState, RealtimeSessionTransactionError,
+    ReleasedRealtimeSession,
 };
 pub use replicated_session::{
     construct_replicated_text_session, construct_replicated_text_session_with_execution,

@@ -25,7 +25,6 @@ use eredu::{
     },
 };
 use eredu_backend_mlx::MlxBackendFactory;
-use eredu_core::TokenOutput as _;
 use eredu_core::{
     residency::CacheEvictionPolicy, speculative::SpeculativeStats, speculative_decoding_telemetry,
     AutomaticPlanRequest, AutomaticPlanner, DeviceCapabilities, DevicePlan, DraftPlacementPlan,

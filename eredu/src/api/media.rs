@@ -10,7 +10,7 @@ use crate::runtime::chat::PreparedChat;
 
 /// Failure while preparing portable media for a selected backend session.
 #[derive(Debug, thiserror::Error)]
-pub enum MultimodalPreparationError<E: std::error::Error + Send + Sync + 'static> {
+pub enum MultimodalPreparationError {
     /// Decoded media or rendered-placeholder composition was invalid.
     #[error(transparent)]
     Request(#[from] MediaRequestError),
@@ -19,7 +19,7 @@ pub enum MultimodalPreparationError<E: std::error::Error + Send + Sync + 'static
     Text(#[from] TextModelError),
     /// The selected backend could not preprocess the request.
     #[error("selected backend failed multimodal preparation: {0}")]
-    Backend(#[source] E),
+    Backend(#[source] eredu_core::BackendFailure),
 }
 
 impl<B: MultimodalPreparationBackend> LoadedModel<B> {
@@ -27,14 +27,14 @@ impl<B: MultimodalPreparationBackend> LoadedModel<B> {
     pub fn prepare_multimodal_input(
         &self,
         request: &MultimodalRequest,
-    ) -> Result<B::Prompt, MultimodalPreparationError<B::Error>> {
+    ) -> Result<B::Prompt, MultimodalPreparationError> {
         let tokenized = request.tokenize(|text| self.encode(text, false))?;
         B::prepare_multimodal_input(&self.runtime, &tokenized, &mut |text| {
             self.encode(text, false)
         })
         .map_err(|error| match error {
             MultimodalPreparationFailure::Backend(error) => {
-                MultimodalPreparationError::Backend(error)
+                MultimodalPreparationError::Backend(eredu_core::BackendFailure::from_error(error))
             }
             MultimodalPreparationFailure::Text(error) => MultimodalPreparationError::Text(error),
         })
@@ -45,7 +45,7 @@ impl<B: MultimodalPreparationBackend> LoadedModel<B> {
         &self,
         prepared_chat: &PreparedChat,
         bindings: &[MediaBinding],
-    ) -> Result<B::Prompt, MultimodalPreparationError<B::Error>> {
+    ) -> Result<B::Prompt, MultimodalPreparationError> {
         let request = MultimodalRequest::from_chat(prepared_chat.rendered_prompt(), bindings)?;
         self.prepare_multimodal_input(&request)
     }

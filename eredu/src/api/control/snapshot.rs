@@ -99,12 +99,12 @@ impl<B: TextGenerationBackend> ControlledGenerationSession<'_, B> {
 impl<B: TextSnapshotBackend> ControlledGenerationSession<'_, B> {
     pub(super) fn snapshot_result<T>(
         &mut self,
-        result: Result<T, ControlledGenerationError<B::Error>>,
-    ) -> Result<T, ControlledGenerationError<B::Error>> {
+        result: Result<T, ControlledGenerationError>,
+    ) -> Result<T, ControlledGenerationError> {
         if matches!(
             &result,
             Err(ControlledGenerationError::Snapshot(
-                eredu_runtime::execution_control::TextSnapshotError::Backend(_)
+                eredu_runtime::execution_control::TextSnapshotError::<eredu_core::BackendFailure>::Backend(_)
             ))
         ) && !matches!(
             B::estimate_native_text_state(self.driver.runtime(), None),
@@ -122,7 +122,7 @@ impl<B: TextSnapshotBackend> ControlledGenerationSession<'_, B> {
     pub fn enable_snapshots(
         &mut self,
         limits: SnapshotLimits,
-    ) -> Result<(), ControlledGenerationError<B::Error>> {
+    ) -> Result<(), ControlledGenerationError> {
         self.lifecycle.checkpoint()?;
         if self.snapshot_budget.is_some() {
             return Err(
@@ -145,13 +145,13 @@ impl<B: TextSnapshotBackend> ControlledGenerationSession<'_, B> {
         let boundary = self.state.boundary(&mut self.driver)?;
         let (runtime, state, pending) = boundary.parts();
         B::estimate_native_text_state(runtime, None)
-            .map_err(eredu_runtime::execution_control::TextSnapshotError::Backend)?
+            .map_err(|error| eredu_runtime::execution_control::TextSnapshotError::<eredu_core::BackendFailure>::Backend(eredu_core::BackendFailure::from_error(error)))?
             .ok_or(ExecutionControlError::UnknownEstimate)?;
         B::estimate_sampling_state(runtime, B::sampling_state(state))
-            .map_err(eredu_runtime::execution_control::TextSnapshotError::Backend)?
+            .map_err(|error| eredu_runtime::execution_control::TextSnapshotError::<eredu_core::BackendFailure>::Backend(eredu_core::BackendFailure::from_error(error)))?
             .ok_or(ExecutionControlError::UnknownEstimate)?;
         B::estimate_pending_input(runtime, pending)
-            .map_err(eredu_runtime::execution_control::TextSnapshotError::Backend)?
+            .map_err(|error| eredu_runtime::execution_control::TextSnapshotError::<eredu_core::BackendFailure>::Backend(eredu_core::BackendFailure::from_error(error)))?
             .ok_or(ExecutionControlError::UnknownEstimate)?;
         drop(boundary);
         self.snapshot_budget = Some(SnapshotBudget::new(limits));
@@ -160,7 +160,7 @@ impl<B: TextSnapshotBackend> ControlledGenerationSession<'_, B> {
 
     pub(super) fn require_snapshot_budget(
         &self,
-    ) -> Result<SnapshotBudget, ControlledGenerationError<B::Error>> {
+    ) -> Result<SnapshotBudget, ControlledGenerationError> {
         self.snapshot_budget.clone().ok_or_else(|| {
             CaptureError::Invalid("configure snapshot limits before retaining state".into()).into()
         })
@@ -171,7 +171,7 @@ impl<B: TextSnapshotBackend> ControlledGenerationSession<'_, B> {
     pub fn snapshot(
         &mut self,
         emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
-    ) -> Result<ControlledGenerationSnapshot<B>, ControlledGenerationError<B::Error>> {
+    ) -> Result<ControlledGenerationSnapshot<B>, ControlledGenerationError> {
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.snapshot_inner(emit))) {
             Ok(result) => self.snapshot_result(result),
             Err(payload) => {
@@ -184,7 +184,7 @@ impl<B: TextSnapshotBackend> ControlledGenerationSession<'_, B> {
     fn snapshot_inner(
         &mut self,
         mut emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
-    ) -> Result<ControlledGenerationSnapshot<B>, ControlledGenerationError<B::Error>> {
+    ) -> Result<ControlledGenerationSnapshot<B>, ControlledGenerationError> {
         if self.delivery.control.cancellation().is_cancelled() {
             return Err(
                 CaptureError::Invalid("cancelled generation cannot be snapshotted".into()).into(),
@@ -236,10 +236,9 @@ impl<B: TextSnapshotBackend> ControlledGenerationSession<'_, B> {
             &budget,
             Some(host_bytes),
         )?;
-        let pipeline = self
-            .pipeline
-            .fork()
-            .map_err(eredu_runtime::execution_control::TextSnapshotError::Host)?;
+        let pipeline = self.pipeline.fork().map_err(
+            eredu_runtime::execution_control::TextSnapshotError::<eredu_core::BackendFailure>::Host,
+        )?;
         let cursor = self.cursor.clone();
         metadata.retained_bytes = continuation.retained_bytes();
         let snapshot = ControlledGenerationSnapshot {
@@ -288,7 +287,7 @@ impl<B: TextSnapshotBackend> ControlledGenerationSession<'_, B> {
         &mut self,
         snapshot: &ControlledGenerationSnapshot<B>,
         emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
-    ) -> Result<(), ControlledGenerationError<B::Error>> {
+    ) -> Result<(), ControlledGenerationError> {
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.restore_inner(snapshot, emit)
         })) {
@@ -304,7 +303,7 @@ impl<B: TextSnapshotBackend> ControlledGenerationSession<'_, B> {
         &mut self,
         snapshot: &ControlledGenerationSnapshot<B>,
         mut emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
-    ) -> Result<(), ControlledGenerationError<B::Error>> {
+    ) -> Result<(), ControlledGenerationError> {
         if self.delivery.control.cancellation().is_cancelled() {
             return Err(
                 CaptureError::Invalid("cancelled generation cannot be restored".into()).into(),
@@ -316,9 +315,10 @@ impl<B: TextSnapshotBackend> ControlledGenerationSession<'_, B> {
             || snapshot.metadata.tokenizer_identity != self.tokenizer_identity
             || snapshot.metadata.configuration_identity != self.delivery.configuration_identity
         {
-            return Err(
-                eredu_runtime::execution_control::TextSnapshotError::IncompatibleRun.into(),
-            );
+            return Err(eredu_runtime::execution_control::TextSnapshotError::<
+                eredu_core::BackendFailure,
+            >::IncompatibleRun
+                .into());
         }
         let budget = self.require_snapshot_budget()?;
         let (pipeline, cursor, semantic_prefix) = snapshot.continuation.restore_with(

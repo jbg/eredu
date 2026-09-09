@@ -6,7 +6,7 @@ use eredu_core::generation::{
     ResolvedGenerationConfig,
 };
 use eredu_core::{
-    ModelRuntime, RealizedDrafting, TextGeneration, TextGenerationBackend, TextGenerationConfig,
+    ModelRuntime, RealizedDrafting, TextGenerationBackend, TextGenerationConfig, TokenOutput,
 };
 use eredu_text::tokenizer::{ModelChatTemplate, Tokenizer as ChatTokenizer};
 
@@ -28,6 +28,52 @@ pub enum TextModelError {
     /// A native tool definition or its generation grammar is invalid.
     #[error("native tool constraint error: {0}")]
     ToolConstraint(String),
+}
+
+/// Asynchronous token generation with backend-independent errors.
+pub struct TextGeneration<'a, B: TextGenerationBackend> {
+    inner: eredu_core::TextGeneration<'a, B>,
+}
+
+impl<B: TextGenerationBackend> Iterator for TextGeneration<'_, B> {
+    type Item = Result<GeneratedToken<B>, eredu_core::BackendFailure>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(|result| {
+            result
+                .map(|inner| GeneratedToken { inner })
+                .map_err(eredu_core::BackendFailure::from_error)
+        })
+    }
+}
+
+/// Backend-owned token whose host observation has a portable error boundary.
+pub struct GeneratedToken<B: TextGenerationBackend> {
+    inner: B::Token,
+}
+
+impl<B: TextGenerationBackend> Clone for GeneratedToken<B> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+impl<B: TextGenerationBackend> GeneratedToken<B> {
+    /// Observes the generated ID, preserving any backend failure as its source.
+    pub fn token_id(&self) -> Result<u32, eredu_core::BackendFailure> {
+        self.inner
+            .token_id()
+            .map_err(eredu_core::BackendFailure::from_error)
+    }
+}
+
+impl<B: TextGenerationBackend> TokenOutput for GeneratedToken<B> {
+    type Error = eredu_core::BackendFailure;
+    fn token_id(&self) -> Result<u32, Self::Error> {
+        self.token_id()
+    }
 }
 
 /// Failure while incrementally decoding tokenizer output.
@@ -264,6 +310,30 @@ impl<B: TextGenerationBackend, D> PlannedModel<B, D> {
 }
 
 impl<B: TextGenerationBackend> LoadedModel<B> {
+    /// Settles prior work and clears request state for a fresh request.
+    ///
+    /// Retains loaded weights, tokenizer, model identity and execution placement.
+    /// Success guarantees fresh-session behavior for the next generation with
+    /// the same prompt and configuration. An error does not establish safe reuse.
+    /// Failures use the same [`eredu_core::BackendFailure`] for every backend.
+    pub fn reset(&mut self) -> Result<(), eredu_core::BackendFailure> {
+        self.runtime.reset()
+    }
+
+    /// Waits for this model's submitted work without clearing request state.
+    ///
+    /// Call after generation or cancellation to establish successful settlement
+    /// before reuse or eviction with `drop(model)`. Dropping a generation iterator
+    /// waits for retained work but cannot report errors; this operation can.
+    /// Success means the session is healthy and has no pending submission
+    /// authority. Failure leaves unresolved resources under backend ownership.
+    /// This does not flush allocator caches or promise process-wide memory release.
+    /// Inspect [`eredu_core::BackendFailure::kind`] for portable error handling;
+    /// the original backend detail remains available through its error source.
+    pub fn synchronize(&self) -> Result<(), eredu_core::BackendFailure> {
+        self.runtime.synchronize()
+    }
+
     /// Combines any prepared backend runtime with portable tokenizer metadata.
     pub fn from_runtime(
         runtime: ModelRuntime<B>,
@@ -360,17 +430,20 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
     /// Starts asynchronous text generation from tokenizer ids.
     /// Only IDs with a consistent mapping in this model's tokenizer may be
     /// sampled, even when the model's output vocabulary is padded or sparse.
+    /// Use [`Self::reset`] to establish fresh request state when reusing a model.
     pub fn generate_tokens(
         &mut self,
         prompt_token_ids: Vec<u32>,
         config: TextGenerationConfig,
-    ) -> Result<TextGeneration<'_, B>, B::Error> {
-        TextGeneration::with_token_filter(
+    ) -> Result<TextGeneration<'_, B>, eredu_core::BackendFailure> {
+        eredu_core::TextGeneration::with_token_filter(
             &mut self.runtime,
             prompt_token_ids,
             config,
             (*self.token_validity).clone(),
         )
+        .map(|inner| TextGeneration { inner })
+        .map_err(eredu_core::BackendFailure::from_error)
     }
 
     /// Returns the model id passed to chat-template rendering.

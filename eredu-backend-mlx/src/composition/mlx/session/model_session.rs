@@ -1,4 +1,5 @@
 use super::*;
+use eredu_core::{BackendFailure, BackendFailureKind};
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
@@ -714,6 +715,17 @@ impl MlxModelSession {
             .map_err(|error| Error::ArchitectureModel(error.to_string()))
     }
 
+    fn lifecycle_failure(&self, error: Error) -> BackendFailure {
+        let kind = if self.poison.get() {
+            BackendFailureKind::InvalidSession
+        } else if self.authority.borrow().require_idle().is_err() {
+            BackendFailureKind::Busy
+        } else {
+            BackendFailureKind::Other
+        };
+        BackendFailure::new(kind, error)
+    }
+
     fn ensure_healthy(&self) -> Result<(), Error> {
         if self.poison.get() {
             let message = self.failure.borrow().as_ref().map_or_else(
@@ -1260,6 +1272,33 @@ impl<'a> InspectableBackendSession<MlxBackend<'a>> for MlxModelSession {
 }
 
 impl<'a> TextGenerationBackend for MlxBackend<'a> {
+    fn reset_session(backend: &Self, session: &mut Self::Session) -> Result<(), BackendFailure> {
+        session
+            .validate_backend(backend)
+            .map_err(|error| BackendFailure::new(BackendFailureKind::InvalidSession, error))?;
+        session
+            .reset()
+            .map_err(|error| session.lifecycle_failure(error))
+    }
+
+    fn synchronize_session(backend: &Self, session: &Self::Session) -> Result<(), BackendFailure> {
+        session
+            .validate_backend(backend)
+            .map_err(|error| BackendFailure::new(BackendFailureKind::InvalidSession, error))?;
+        backend
+            .weights_stream()
+            .synchronize()
+            .map_err(|error| BackendFailure::new(BackendFailureKind::Other, error))?;
+        backend
+            .synchronize()
+            .map_err(|error| BackendFailure::new(BackendFailureKind::Other, error))?;
+        // Queue completion alone cannot release session authority or prove that
+        // recovery after a failed/cancelled operation has safely retired.
+        session
+            .ensure_no_submission_in_flight()
+            .map_err(|error| session.lifecycle_failure(error))
+    }
+
     fn text_sampling_control_support(
         runtime: &ModelRuntime<Self>,
     ) -> eredu_core::execution_control::ControlSupport {

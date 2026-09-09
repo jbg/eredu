@@ -114,19 +114,19 @@ pub struct PreparedChatGenerationRequest<'a, B: eredu_core::TextGenerationBacken
 /// Ordinary and observed generation share the neutral output with no extra statistics.
 pub type PreparedChatGenerationOutput = eredu_core::GenerationOutput;
 
-/// Failure from ordinary prepared-chat generation on backend `E`.
+/// Backend-independent failure from ordinary prepared-chat generation.
 ///
-/// Backend failures remain strongly typed all the way to the caller. Portable
-/// tokenizer, constraint, semantic-streaming, and generation-lifecycle
-/// failures have distinct variants and never masquerade as backend errors.
+/// Backend failures retain their original details through a common error source.
+/// Portable tokenizer, constraint, semantic-streaming, and generation-lifecycle
+/// failures have distinct variants.
 #[derive(Debug, thiserror::Error)]
-pub enum PreparedChatError<E: std::error::Error + Send + Sync + 'static> {
+pub enum PreparedChatError {
     /// Capture admission, accounting, or transport bounds rejected the request.
     #[error(transparent)]
     Capture(#[from] eredu_core::capture::CaptureError),
     /// The selected backend failed submission, completion, or token extraction.
     #[error("selected backend failed prepared-chat generation: {0}")]
-    Backend(#[source] E),
+    Backend(#[source] eredu_core::BackendFailure),
     /// Portable constraint construction or advancement failed.
     #[error(transparent)]
     Constraint(#[from] ConstraintError),
@@ -172,13 +172,13 @@ impl Default for PreparedChatSpeculativeGenerationOptions {
 
 /// Failure while the facade prepares or a backend executes speculative chat.
 #[derive(Debug, thiserror::Error)]
-pub enum PreparedChatSpeculativeError<E: std::error::Error + Send + Sync + 'static> {
+pub enum PreparedChatSpeculativeError {
     /// The prepared speculative path cannot preserve the requested sampler state.
     #[error("prepared-chat speculative generation does not support sampling strategy {0:?}; use ordinary prepared-chat generation")]
     UnsupportedSamplingStrategy(eredu_core::TextSamplingStrategy),
     /// The selected backend failed prompt preparation or speculative execution.
     #[error("selected backend failed prepared-chat speculative generation: {0}")]
-    Backend(#[source] E),
+    Backend(#[source] eredu_core::BackendFailure),
     /// Portable generation configuration was invalid.
     #[error(transparent)]
     Generation(#[from] eredu_core::generation::GenerationError),

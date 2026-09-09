@@ -175,6 +175,14 @@ fn sample(
     })
 }
 impl TextGenerationBackend for Host {
+    fn reset_session(_: &Self, session: &mut Self::Session) -> Result<(), BackendFailure> {
+        session.native = NativeState::default();
+        Ok(())
+    }
+    fn synchronize_session(_: &Self, _: &Self::Session) -> Result<(), BackendFailure> {
+        Ok(())
+    }
+
     fn text_sampling_control_support(_: &ModelRuntime<Self>) -> ControlSupport {
         ControlSupport::Supported
     }

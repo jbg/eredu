@@ -112,6 +112,11 @@ it.
 
 ## Feature boundary
 
+- Public application operations, iterators, token observations, and errors must
+  not expose native error types or backend-error type parameters. Translate
+  native failures to the neutral `eredu_core::BackendFailure`, preserving the
+  original error as its source. Backend implementation contracts may retain
+  concrete errors internally; portable policy errors remain typed.
 - Language-model-family definitions and neutral execution live in
   `eredu-architectures`; neural audio codec families live in `eredu-codec`.
   Both must remain available without enabling any concrete backend feature.

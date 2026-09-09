@@ -4,7 +4,6 @@ use eredu::{
     runtime::chat::{ChatTemplateRequest, ToolChoice},
 };
 use eredu_backend_mlx::MlxBackendFactory;
-use eredu_core::TokenOutput as _;
 use eredu_core::{
     capture::*, execution_control::*, ExecutionPlan, GenerationConfigOverrides, SemanticEvent,
     SessionCapabilities,

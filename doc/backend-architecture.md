@@ -257,8 +257,17 @@ snapshots, and branches are the canonical application API for every backend.
 Applications select MLX by importing `eredu_backend_mlx::MlxBackendFactory` and
 passing it to the generic loading methods; inference supplies the backend type.
 Explicit model annotations use `LoadedModel<MlxBackend<'static>>`. The facade
-provides no wrappers or aliases that fix these generic types to MLX. Backend
-errors retain their concrete type in the generic facade error enums.
+provides no wrappers or aliases that fix these generic types to MLX. Application
+errors do not carry backend error type parameters. Loading, media preparation,
+ordinary/speculative/observed generation, control, snapshots and branches retain
+portable operation error variants with `eredu_core::BackendFailure` for native
+failures. Lifecycle and local diagnostics use that same common failure type.
+Token iteration and token-ID observation cross the facade boundary through
+`TextGeneration` and `GeneratedToken`, preserving asynchronous execution and
+completion ownership while translating errors. Realtime generation transactions,
+frame execution and sampling replacement also expose portable failure types.
+Backend implementation traits may retain concrete errors internally; application
+callers do not need to name or match them.
 
 The implementation crate exports composition-owned adapter factories at its
 flat root and makes its reusable `backend` module tree public for backend
@@ -283,21 +292,54 @@ Realtime applications use `PreparedRealtimeModel<M>`,
 and returns the native context and execution mechanism. The generic model
 retains the selected session identity; runtime scheduling retains admission,
 transaction, completion, and host-publication policy.
+Realtime `resume` takes a mutable optional released-session slot. Failure leaves
+the slot untouched and returns a portable `RealtimeSessionError`; success takes
+the state. This preserves retry/disposal ownership without carrying native state
+in the public error type.
 
 Application targets depend on `eredu` for facade operations, their selected
 backend for factories, and the neutral crates whose public values they
 construct. Backend dependencies remain feature-gated. The MLX facade helpers
 provide device-plan creation, process runtime configuration, allocator
-telemetry, and diagnostic benchmarks. MLX-specific reset, synchronization, and
-telemetry methods operate directly on `LoadedModel<MlxBackend<'_>>`.
+telemetry, and diagnostic benchmarks. Rich allocator and residency telemetry
+methods remain specialized on `LoadedModel<MlxBackend<'_>>`.
+Session lifecycle is portable: every `TextGenerationBackend` implements explicit
+`reset_session` and `synchronize_session` hooks, exposed by `ModelRuntime<B>` and
+`LoadedModel<B>` as `reset()` and `synchronize()` with the same non-generic
+`BackendFailure` on every backend. Its portable `BackendFailureKind` distinguishes
+busy authority, invalid/poisoned sessions, identified resource exhaustion,
+unsupported or invalid requests, I/O and other backend failures. The original
+error is retained as a boxed `Send + Sync`
+source, so applications can handle portable kinds and log the complete cause
+chain without importing backend error types. Adapters classify from typed facts
+and session state, never by parsing diagnostic strings; unknown failures remain
+`BackendFailureKind::Other`. These kinds do not establish settlement or safe reuse. Reset first
+synchronizes, then clears request state while preserving loaded parameters,
+admission, placement and retained drafting target identity. Success establishes
+fresh-session behavior for the next request. Synchronization preserves request
+state and succeeds only when all session work has settled, submission authority
+is idle, and the session remains healthy. MLX waits for both weight and execution
+streams and checks its retained recovery/authority state; queue completion alone
+does not rehabilitate a poisoned session. Neither operation uses an implicit
+successful no-op default for backends.
+
+Generic applications can drop a generation iterator after cancellation, call
+`synchronize()` to observe settlement errors, and drop the model for eviction;
+`reset()` establishes fresh state before reuse. Iterator destruction waits for
+retained completions but cannot report errors. A synchronization/reset error is
+not evidence of completion or safe reuse: native resources remain owned until
+safe completion or teardown. Live detached submissions may be rejected as busy.
+These operations do not promise an allocator-cache flush or immediate
+process-wide memory reclamation, so native telemetry is not required for the
+portable reuse/eviction protocol.
 Backend adapters own native resources and outer type erasure, while shared
 replicated-text execution and stateful lifecycle orchestration remain in the
 neutral runtime.
 `LocalLoadOptions` and `LocalInspectionOptions` contain only neutral
 quantization, residency, and session-capability policy, while native
-device-bound contexts are selected only by backend tooling. `LocalBackendError`
-records facade operation context and a diagnostic message without exporting
-native error variants. Portable execution plans remain the application surface
+device-bound contexts are selected only by backend tooling. `BackendFailure`
+retains operation context and the original typed source without exporting native
+error variants in application signatures. Portable execution plans remain the application surface
 for device and topology selection.
 
 Backend-generic sampling policy lives in `eredu-runtime`. Concrete backends

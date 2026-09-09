@@ -80,7 +80,7 @@ impl<B: TextSnapshotBackend + TextSamplingControlBackend> ControlledGenerationSe
         snapshot: &ControlledGenerationSnapshot<B>,
         options: GenerationBranchOptions,
         emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
-    ) -> Result<ControlledGenerationBranch<B>, ControlledGenerationError<B::Error>> {
+    ) -> Result<ControlledGenerationBranch<B>, ControlledGenerationError> {
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.fork_inner(snapshot, options, emit)
         })) {
@@ -97,7 +97,7 @@ impl<B: TextSnapshotBackend + TextSamplingControlBackend> ControlledGenerationSe
         snapshot: &ControlledGenerationSnapshot<B>,
         options: GenerationBranchOptions,
         mut emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
-    ) -> Result<ControlledGenerationBranch<B>, ControlledGenerationError<B::Error>> {
+    ) -> Result<ControlledGenerationBranch<B>, ControlledGenerationError> {
         self.lifecycle.checkpoint()?;
         if self.delivery.control.cancellation().is_cancelled() {
             return Err(CaptureError::Invalid(
@@ -106,7 +106,7 @@ impl<B: TextSnapshotBackend + TextSamplingControlBackend> ControlledGenerationSe
             .into());
         }
         if snapshot.metadata.tokenizer_identity != self.tokenizer_identity {
-            return Err(TextSnapshotError::IncompatibleRun.into());
+            return Err(TextSnapshotError::<eredu_core::BackendFailure>::IncompatibleRun.into());
         }
         let budget = self.require_snapshot_budget()?;
         let max_predictions = snapshot.cursor.max_predictions();
@@ -281,7 +281,7 @@ impl<B: TextSnapshotBackend> ControlledGenerationSession<'_, B> {
         &mut self,
         branch: &mut ControlledGenerationBranch<B>,
         emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
-    ) -> Result<(), ControlledGenerationError<B::Error>> {
+    ) -> Result<(), ControlledGenerationError> {
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.exchange_inner(branch, emit)
         })) {
@@ -307,7 +307,7 @@ impl<B: TextSnapshotBackend> ControlledGenerationSession<'_, B> {
         &mut self,
         branch: &mut ControlledGenerationBranch<B>,
         mut emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
-    ) -> Result<(), ControlledGenerationError<B::Error>> {
+    ) -> Result<(), ControlledGenerationError> {
         branch
             .continuation
             .exchange(&mut self.driver, &mut self.state)?;

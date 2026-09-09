@@ -385,6 +385,22 @@ impl DistributedBackend for MockBackend {
 }
 
 impl TextGenerationBackend for MockBackend {
+    fn reset_session(
+        _: &Self,
+        session: &mut Self::Session,
+    ) -> Result<(), eredu_core::BackendFailure> {
+        session.authority.require_idle()?;
+        Ok(())
+    }
+
+    fn synchronize_session(
+        _: &Self,
+        session: &Self::Session,
+    ) -> Result<(), eredu_core::BackendFailure> {
+        session.authority.require_idle()?;
+        Ok(())
+    }
+
     fn text_sampling_control_support(
         _: &ModelRuntime<Self>,
     ) -> eredu_core::execution_control::ControlSupport {
@@ -525,6 +541,24 @@ impl TextGenerationBackend for MockBackend {
             completion: submission.completion,
         })
     }
+}
+
+#[test]
+fn lifecycle_rejects_unsettled_authority_without_resetting_it() {
+    let mut runtime = ModelRuntime::prepare(MockBackend, ()).unwrap();
+    let pending = runtime.prefill(vec![1, 2]).unwrap();
+    assert_eq!(
+        runtime.synchronize().unwrap_err().kind(),
+        eredu_core::BackendFailureKind::Busy
+    );
+    assert_eq!(
+        runtime.reset().unwrap_err().kind(),
+        eredu_core::BackendFailureKind::Busy
+    );
+    assert!(runtime.session().authority.require_idle().is_err());
+    pending.completion.wait().unwrap();
+    runtime.synchronize().unwrap();
+    runtime.reset().unwrap();
 }
 
 impl MultimodalPreparationBackend for MockBackend {
@@ -2183,6 +2217,22 @@ fn assert_prepared_generation_and_speculative_conformance() {
         })
     );
 
+    let token_config =
+        TextGenerationConfig::new(model.resolve_generation_config(Default::default()).unwrap());
+    let token = model
+        .generate_tokens(vec![0; 999], token_config)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap();
+    let failure = token.token_id().unwrap_err();
+    assert!(matches!(
+        std::error::Error::source(&failure)
+            .unwrap()
+            .downcast_ref::<MockError>(),
+        Some(MockError::Token(999))
+    ));
+
     let error = model
         .generate_prepared_chat(PreparedChatGenerationRequest {
             input: PreparedChatInput::prepared_backend_input(&prepared, vec![0; 999]),
@@ -2201,7 +2251,8 @@ fn assert_prepared_generation_and_speculative_conformance() {
         .unwrap_err();
     assert!(matches!(
         error,
-        PreparedChatError::Backend(MockError::Token(999))
+        PreparedChatError::Backend(ref failure)
+            if matches!(std::error::Error::source(failure).unwrap().downcast_ref::<MockError>(), Some(MockError::Token(999)))
     ));
 
     let (speculative, speculative_events) = speculative_client_code(&mut model, &prepared);
@@ -2399,7 +2450,8 @@ fn observed_facade_preserves_streaming_unicode_special_tokens_and_eos() {
         .unwrap_err();
     assert!(matches!(
         error,
-        PreparedChatError::Backend(MockError::Capture(_))
+        PreparedChatError::Backend(ref failure)
+            if matches!(std::error::Error::source(failure).unwrap().downcast_ref::<MockError>(), Some(MockError::Capture(_)))
     ));
     assert!(failure_records.iter().any(|record| matches!(&record.event,
         eredu::api::ObservedGenerationEvent::CaptureFailure { captures, .. }

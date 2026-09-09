@@ -16,6 +16,9 @@ use tokenizers::{models::wordlevel::WordLevel, AddedToken, Tokenizer};
 #[path = "portable_facade/sampling.rs"]
 mod sampling;
 
+#[path = "portable_facade/lifecycle.rs"]
+mod lifecycle;
+
 #[derive(Default)]
 struct BackendCalls {
     configs: Vec<TextGenerationConfig>,
@@ -160,6 +163,14 @@ impl BackendSession<MockBackend> for MockSession {
 }
 
 impl TextGenerationBackend for MockBackend {
+    fn reset_session(_: &Self, _: &mut Self::Session) -> Result<(), eredu_core::BackendFailure> {
+        Ok(())
+    }
+
+    fn synchronize_session(_: &Self, _: &Self::Session) -> Result<(), eredu_core::BackendFailure> {
+        Ok(())
+    }
+
     type Prompt = Vec<u32>;
     type Token = MockToken;
     type TextGenerationState = ();

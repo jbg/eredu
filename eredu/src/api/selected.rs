@@ -10,63 +10,21 @@ pub fn discover_local_hardware() -> eredu_core::HardwareProfile {
     eredu_backend_mlx::discover_hardware()
 }
 
-/// Failure reported by MLX runtime configuration, inspection, and diagnostics.
-///
-/// The diagnostic message retains the backend's original context. Generic model
-/// loading and generation use their backend-parameterized error types.
-#[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
-#[error("selected local backend failed during {operation}: {message}")]
-pub struct LocalBackendError {
-    operation: &'static str,
-    message: String,
-}
-
-impl LocalBackendError {
-    fn new(operation: &'static str, error: impl std::fmt::Display) -> Self {
-        Self {
-            operation,
-            message: error.to_string(),
-        }
-    }
-
-    /// Facade operation that failed.
-    pub const fn operation(&self) -> &'static str {
-        self.operation
-    }
-
-    /// Backend diagnostic without exposing its native error type.
-    pub fn message(&self) -> &str {
-        &self.message
-    }
-}
+use super::{DevicePlanError, ExpertCacheBenchmarkError};
+use eredu_core::BackendFailure;
 
 impl super::LoadedModel<eredu_backend_mlx::backend::MlxBackend<'_>> {
-    /// Resets this model's session state.
-    pub fn reset(&mut self) -> Result<(), LocalBackendError> {
-        self.runtime
-            .session_mut()
-            .reset()
-            .map_err(|error| LocalBackendError::new("session reset", error))
-    }
-
-    /// Waits for all work submitted by this model.
-    pub fn synchronize(&self) -> Result<(), LocalBackendError> {
-        self.runtime
-            .backend()
-            .synchronize()
-            .map_err(|error| LocalBackendError::new("synchronization", error))
-    }
-
     /// Synchronizes the model and samples allocator counters.
-    pub fn allocator_telemetry(&self) -> Result<crate::AllocatorTelemetry, LocalBackendError> {
-        self.synchronize()?;
+    pub fn allocator_telemetry(&self) -> Result<crate::AllocatorTelemetry, BackendFailure> {
+        self.synchronize()
+            .map_err(|error| BackendFailure::from_error(error).with_operation("synchronization"))?;
         allocator_telemetry()
     }
 
     /// Returns portable sparse expert-cache telemetry when available.
     pub fn expert_cache_telemetry(
         &self,
-    ) -> Result<Option<crate::ExpertCacheTelemetry>, LocalBackendError> {
+    ) -> Result<Option<crate::ExpertCacheTelemetry>, BackendFailure> {
         self.runtime
             .session()
             .parameter_bank_report()
@@ -75,17 +33,19 @@ impl super::LoadedModel<eredu_backend_mlx::backend::MlxBackend<'_>> {
                     .as_ref()
                     .map(eredu_backend_mlx::parameter_bank_telemetry)
             })
-            .map_err(|error| LocalBackendError::new("expert-cache telemetry", error))
+            .map_err(|error| {
+                BackendFailure::from_error(error).with_operation("expert-cache telemetry")
+            })
     }
 
     /// Returns portable weight-residency telemetry when available.
-    pub fn residency_telemetry(
-        &self,
-    ) -> Result<Option<crate::ResidencyTelemetry>, LocalBackendError> {
+    pub fn residency_telemetry(&self) -> Result<Option<crate::ResidencyTelemetry>, BackendFailure> {
         self.runtime
             .session()
             .residency_report()
-            .map_err(|error| LocalBackendError::new("residency telemetry", error))
+            .map_err(|error| {
+                BackendFailure::from_error(error).with_operation("residency telemetry")
+            })
             .map(|report| report.as_ref().map(eredu_runtime::residency_telemetry))
     }
 }
@@ -196,12 +156,12 @@ impl LocalInspectionOptions {
 pub fn inspect_local_model(
     path: impl AsRef<Path>,
     options: LocalInspectionOptions,
-) -> Result<crate::ModelInspectionReport, LocalBackendError> {
+) -> Result<crate::ModelInspectionReport, BackendFailure> {
     eredu_backend_mlx::native::inspect_model(
         path,
         eredu_backend_mlx::native::MlxInspectionOptions::new(options.load().into_backend()),
     )
-    .map_err(|error| LocalBackendError::new("model inspection", error))
+    .map_err(|error| BackendFailure::from_error(error).with_operation("model inspection"))
 }
 
 /// A facade-level device class for the selected local backend.
@@ -221,14 +181,6 @@ pub const fn default_local_device() -> LocalDevice {
     } else {
         LocalDevice::Cpu
     }
-}
-
-/// Failure to map a facade device choice to the selected local backend.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, thiserror::Error)]
-pub enum LocalDevicePlanError {
-    /// This build contains the MLX adapter but no native accelerator family.
-    #[error("no local accelerator family is compiled for this target")]
-    AcceleratorNotCompiled,
 }
 
 /// Process-global configuration for the selected local runtime.
@@ -260,26 +212,28 @@ impl LocalRuntimeConfiguration {
 /// Applies process-global configuration before creating a local model session.
 pub fn configure_local_runtime(
     configuration: &LocalRuntimeConfiguration,
-) -> Result<(), LocalBackendError> {
+) -> Result<(), BackendFailure> {
     #[cfg(all(feature = "metal", target_vendor = "apple"))]
     if let Some(path) = &configuration.accelerator_library_path {
-        eredu_backend_mlx::set_accelerator_library_path(path)
-            .map_err(|error| LocalBackendError::new("runtime configuration", error))?;
+        eredu_backend_mlx::set_accelerator_library_path(path).map_err(|error| {
+            BackendFailure::from_error(error).with_operation("runtime configuration")
+        })?;
     }
     if let Some(bytes) = configuration.allocator_cache_limit {
-        eredu_backend_mlx::set_allocator_cache_limit(bytes)
-            .map_err(|error| LocalBackendError::new("allocator configuration", error))?;
+        eredu_backend_mlx::set_allocator_cache_limit(bytes).map_err(|error| {
+            BackendFailure::from_error(error).with_operation("allocator configuration")
+        })?;
     }
     Ok(())
 }
 
 /// Creates a portable plan device for the selected local backend.
-pub fn local_device_plan(device: LocalDevice) -> Result<crate::DevicePlan, LocalDevicePlanError> {
+pub fn local_device_plan(device: LocalDevice) -> Result<crate::DevicePlan, DevicePlanError> {
     let device = match device {
         LocalDevice::Cpu => "cpu:0".to_owned(),
         LocalDevice::Accelerator(index) => {
-            let family = compiled_accelerator_family()
-                .ok_or(LocalDevicePlanError::AcceleratorNotCompiled)?;
+            let family =
+                compiled_accelerator_family().ok_or(DevicePlanError::AcceleratorNotCompiled)?;
             format!("{family}:{index}")
         }
     };
@@ -298,15 +252,16 @@ const fn compiled_accelerator_family() -> Option<&'static str> {
 }
 
 /// Resets the selected runtime's allocator high-water mark.
-pub fn reset_local_allocator_peak() -> Result<(), LocalBackendError> {
-    eredu_backend_mlx::reset_allocator_peak()
-        .map_err(|error| LocalBackendError::new("allocator peak reset", error))?;
+pub fn reset_local_allocator_peak() -> Result<(), BackendFailure> {
+    eredu_backend_mlx::reset_allocator_peak().map_err(|error| {
+        BackendFailure::from_error(error).with_operation("allocator peak reset")
+    })?;
     Ok(())
 }
 
-fn allocator_telemetry() -> Result<crate::AllocatorTelemetry, LocalBackendError> {
+fn allocator_telemetry() -> Result<crate::AllocatorTelemetry, BackendFailure> {
     let memory = eredu_backend_mlx::allocator_memory()
-        .map_err(|error| LocalBackendError::new("allocator telemetry", error))?;
+        .map_err(|error| BackendFailure::from_error(error).with_operation("allocator telemetry"))?;
     Ok(crate::AllocatorTelemetry {
         peak_bytes: memory.peak_bytes(),
         active_bytes: memory.active_bytes(),
@@ -362,23 +317,6 @@ pub struct LocalExpertCacheBenchmark {
     pub cached_decode: LocalExpertCacheBenchmarkSample,
 }
 
-/// Failure while running the facade-owned expert-cache benchmark workflow.
-#[derive(Debug, thiserror::Error)]
-pub enum LocalExpertCacheBenchmarkError {
-    /// The benchmark needs a non-empty prompt for prefill and cached decode.
-    #[error("expert-cache benchmark requires at least one prompt token")]
-    EmptyPrompt,
-    /// The selected model does not expose sparse expert-cache telemetry.
-    #[error("sparse expert-cache benchmark requires an expert-cache model")]
-    ExpertCacheUnavailable,
-    /// The local rank did not produce logits needed to complete a benchmark phase.
-    #[error("expert-cache benchmark requires logits on the local rank")]
-    LogitsUnavailable,
-    /// The selected backend failed while preparing or executing the benchmark.
-    #[error(transparent)]
-    Backend(#[from] LocalBackendError),
-}
-
 #[derive(Clone, Copy)]
 struct ExpertSnapshot {
     prefill: eredu_backend_mlx::backend::runtime::residency::parameter_bank::BankPassStatistics,
@@ -391,13 +329,15 @@ struct ExpertSnapshot {
 
 fn expert_snapshot(
     model: &super::LoadedModel<eredu_backend_mlx::backend::MlxBackend<'_>>,
-) -> Result<ExpertSnapshot, LocalExpertCacheBenchmarkError> {
+) -> Result<ExpertSnapshot, ExpertCacheBenchmarkError> {
     let report = model
         .runtime
         .session()
         .parameter_bank_report()
-        .map_err(|error| LocalBackendError::new("expert-cache telemetry", error))?
-        .ok_or(LocalExpertCacheBenchmarkError::ExpertCacheUnavailable)?;
+        .map_err(|error| {
+            BackendFailure::from_error(error).with_operation("expert-cache telemetry")
+        })?
+        .ok_or(ExpertCacheBenchmarkError::ExpertCacheUnavailable)?;
     Ok(ExpertSnapshot {
         prefill: *report.bulk(),
         decode: *report.incremental(),
@@ -453,9 +393,9 @@ fn benchmark_sample(
 
 fn validate_expert_cache_benchmark_prompt(
     token_ids: &[u32],
-) -> Result<(), LocalExpertCacheBenchmarkError> {
+) -> Result<(), ExpertCacheBenchmarkError> {
     if token_ids.is_empty() {
-        return Err(LocalExpertCacheBenchmarkError::EmptyPrompt);
+        return Err(ExpertCacheBenchmarkError::EmptyPrompt);
     }
     Ok(())
 }
@@ -464,29 +404,31 @@ fn validate_expert_cache_benchmark_prompt(
 pub fn benchmark_local_expert_cache(
     model: &mut super::LoadedModel<eredu_backend_mlx::backend::MlxBackend<'_>>,
     token_ids: &[u32],
-) -> Result<LocalExpertCacheBenchmark, LocalExpertCacheBenchmarkError> {
+) -> Result<LocalExpertCacheBenchmark, ExpertCacheBenchmarkError> {
     validate_expert_cache_benchmark_prompt(token_ids)?;
     let prompt = <eredu_backend_mlx::backend::MlxBackend as eredu_core::TextGenerationBackend>::prepare_text_prompt(
         model.runtime.backend(),
         token_ids.to_vec(),
     )
-    .map_err(|error| LocalBackendError::new("expert-cache prompt preparation", error))?;
+    .map_err(|error| BackendFailure::from_error(error).with_operation("expert-cache prompt preparation"))?;
 
     let before_cold = expert_snapshot(model)?;
-    model
-        .runtime
-        .session_mut()
-        .reset()
-        .map_err(|error| LocalBackendError::new("expert-cache session reset", error))?;
+    model.runtime.session_mut().reset().map_err(|error| {
+        BackendFailure::from_error(error).with_operation("expert-cache session reset")
+    })?;
     let started = std::time::Instant::now();
     let logits = model
         .runtime
         .prefill(prompt.clone())
-        .map_err(|error| LocalBackendError::new("expert-cache prefill submission", error))?
+        .map_err(|error| {
+            BackendFailure::from_error(error).with_operation("expert-cache prefill submission")
+        })?
         .wait()
-        .map_err(|error| LocalBackendError::new("expert-cache prefill completion", error))?
+        .map_err(|error| {
+            BackendFailure::from_error(error).with_operation("expert-cache prefill completion")
+        })?
         .into_logits()
-        .ok_or(LocalExpertCacheBenchmarkError::LogitsUnavailable)?;
+        .ok_or(ExpertCacheBenchmarkError::LogitsUnavailable)?;
     drop(logits);
     let after_cold = expert_snapshot(model)?;
     let cold_prefill = benchmark_sample(
@@ -496,20 +438,22 @@ pub fn benchmark_local_expert_cache(
         after_cold,
     );
 
-    model
-        .runtime
-        .session_mut()
-        .reset()
-        .map_err(|error| LocalBackendError::new("expert-cache session reset", error))?;
+    model.runtime.session_mut().reset().map_err(|error| {
+        BackendFailure::from_error(error).with_operation("expert-cache session reset")
+    })?;
     let started = std::time::Instant::now();
     let logits = model
         .runtime
         .prefill(prompt)
-        .map_err(|error| LocalBackendError::new("expert-cache prefill submission", error))?
+        .map_err(|error| {
+            BackendFailure::from_error(error).with_operation("expert-cache prefill submission")
+        })?
         .wait()
-        .map_err(|error| LocalBackendError::new("expert-cache prefill completion", error))?
+        .map_err(|error| {
+            BackendFailure::from_error(error).with_operation("expert-cache prefill completion")
+        })?
         .into_logits()
-        .ok_or(LocalExpertCacheBenchmarkError::LogitsUnavailable)?;
+        .ok_or(ExpertCacheBenchmarkError::LogitsUnavailable)?;
     drop(logits);
     let after_repeated = expert_snapshot(model)?;
     let repeated_prefill = benchmark_sample(
@@ -524,13 +468,17 @@ pub fn benchmark_local_expert_cache(
         let (backend, session) = model.runtime.parts_mut();
         session
             .submit_token_decode(backend, token_ids[token_ids.len() - 1])
-            .map_err(|error| LocalBackendError::new("expert-cache decode submission", error))?
+            .map_err(|error| {
+                BackendFailure::from_error(error).with_operation("expert-cache decode submission")
+            })?
     }
     .wait()
-    .map_err(|error| LocalBackendError::new("expert-cache decode completion", error))?;
+    .map_err(|error| {
+        BackendFailure::from_error(error).with_operation("expert-cache decode completion")
+    })?;
     let logits = output
         .into_logits()
-        .ok_or(LocalExpertCacheBenchmarkError::LogitsUnavailable)?;
+        .ok_or(ExpertCacheBenchmarkError::LogitsUnavailable)?;
     drop(logits);
     let after_decode = expert_snapshot(model)?;
     let cached_decode = benchmark_sample(
@@ -551,14 +499,14 @@ pub fn benchmark_local_expert_cache(
 mod tests {
     use super::{
         default_local_device, local_device_plan, validate_expert_cache_benchmark_prompt,
-        LocalDevice, LocalDevicePlanError, LocalExpertCacheBenchmarkError,
+        DevicePlanError, ExpertCacheBenchmarkError, LocalDevice,
     };
 
     #[test]
     fn empty_benchmark_prompt_is_a_facade_input_error() {
         assert!(matches!(
             validate_expert_cache_benchmark_prompt(&[]),
-            Err(LocalExpertCacheBenchmarkError::EmptyPrompt)
+            Err(ExpertCacheBenchmarkError::EmptyPrompt)
         ));
         validate_expert_cache_benchmark_prompt(&[1]).unwrap();
     }
@@ -571,7 +519,7 @@ mod tests {
         } else if cfg!(all(feature = "metal", target_vendor = "apple")) {
             assert_eq!(plan.unwrap().device(), "metal:3");
         } else {
-            assert_eq!(plan, Err(LocalDevicePlanError::AcceleratorNotCompiled));
+            assert_eq!(plan, Err(DevicePlanError::AcceleratorNotCompiled));
         }
     }
 

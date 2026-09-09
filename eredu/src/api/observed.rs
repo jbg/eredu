@@ -317,7 +317,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
         capture: CapturePlan,
         intervention: InterventionPlan,
         trace_limits: TraceLimits,
-    ) -> Result<PreparedObservedGeneration, PreparedChatError<B::Error>> {
+    ) -> Result<PreparedObservedGeneration, PreparedChatError> {
         let mut prepared = self.prepare_observed_chat(chat, settings, capture, trace_limits)?;
         if intervention.schema_version != eredu_core::intervention::INTERVENTION_SCHEMA_VERSION {
             return Err(CaptureError::Invalid("unsupported intervention schema".into()).into());
@@ -357,7 +357,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
         settings: PreparedChatGenerationSettings,
         plan: CapturePlan,
         trace_limits: TraceLimits,
-    ) -> Result<PreparedObservedGeneration, PreparedChatError<B::Error>> {
+    ) -> Result<PreparedObservedGeneration, PreparedChatError> {
         let (config, max_tokens) = self.resolve_text_generation_settings(settings)?;
         let prompt_token_ids = self
             .tokenizer
@@ -424,7 +424,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
         caller_stop_sequences: &[String],
         cancellation: GenerationCancellationToken,
         on_record: F,
-    ) -> Result<PreparedChatGenerationOutput, PreparedChatError<B::Error>>
+    ) -> Result<PreparedChatGenerationOutput, PreparedChatError>
     where
         F: FnMut(ObservedGenerationRecord) -> ControlFlow<()>,
     {
@@ -521,7 +521,9 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
             ))
         } else {
             match B::prepare_text_prompt(self.runtime.backend(), prepared.prompt_token_ids) {
-                Err(error) => Err(PreparedChatError::Backend(error)),
+                Err(error) => Err(PreparedChatError::Backend(
+                    eredu_core::BackendFailure::from_error(error),
+                )),
                 Ok(prompt) => self.generate_prepared_chat_captured(
                     PreparedChatGenerationRequest {
                         input: PreparedChatInput::prepared_backend_input(&prepared.chat, prompt),

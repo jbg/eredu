@@ -13,7 +13,6 @@ use eredu::{
     runtime::chat::{ChatTemplateRequest, PreparedChat},
 };
 use eredu_backend_mlx::MlxBackendFactory;
-use eredu_core::TokenOutput as _;
 use eredu_core::{
     DraftPlacementPlan, DraftingPlan, ExecutionPlan, GenerationCancellationToken,
     GenerationConfigOverrides, TextGenerationConfig,

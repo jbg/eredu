@@ -12,6 +12,7 @@ use super::{
     recovery::{self, Probe, Recovery, Retention, Status},
     SessionAuthority,
 };
+use eredu_core::TextGenerationBackend as _;
 
 struct FakeProbe(Rc<Cell<Status>>);
 impl Probe for FakeProbe {
@@ -370,11 +371,21 @@ fn restored_execution_error_excludes_reuse_until_native_retirement() {
     );
     assert!(!pending.to_string().contains("fenced"));
     assert!(session.reset().is_err());
+    for error in [
+        super::MlxBackend::synchronize_session(&backend, &session).unwrap_err(),
+        super::MlxBackend::reset_session(&backend, &mut session).unwrap_err(),
+    ] {
+        assert_eq!(error.kind(), eredu_core::BackendFailureKind::Busy);
+        assert!(std::error::Error::source(&error)
+            .unwrap()
+            .is::<super::Error>());
+    }
     assert!(session.submit_token_decode(&backend, 2).is_err());
 
     native.set(status(true, false, false));
     recovery::wait_for_retirement(|| session.ensure_no_submission_in_flight().is_ok());
-    session.reset().unwrap();
+    super::MlxBackend::synchronize_session(&backend, &session).unwrap();
+    super::MlxBackend::reset_session(&backend, &mut session).unwrap();
     session
         .submit_token_decode(&backend, 2)
         .unwrap()
@@ -413,6 +424,18 @@ fn restored_execution_error_keeps_late_native_failure_terminal() {
         native.set(status(true, false, false));
         recovery::wait_for_retirement(|| session.test_payload_weak().strong_count() == 1);
         assert!(session.reset().unwrap_err().to_string().contains("fenced"));
+        assert_eq!(
+            super::MlxBackend::synchronize_session(&backend, &session)
+                .unwrap_err()
+                .kind(),
+            eredu_core::BackendFailureKind::InvalidSession,
+        );
+        assert_eq!(
+            super::MlxBackend::reset_session(&backend, &mut session)
+                .unwrap_err()
+                .kind(),
+            eredu_core::BackendFailureKind::InvalidSession,
+        );
         assert!(session.submit_token_decode(&backend, 2).is_err());
     }
 }

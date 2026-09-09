@@ -1,5 +1,6 @@
 //! Backend-neutral realtime session ownership over the singular fair scheduler.
 
+use eredu_core::BackendFailure;
 use std::{
     num::NonZeroUsize,
     sync::atomic::{AtomicU64, Ordering},
@@ -357,13 +358,13 @@ impl<MB, S, R, C> RealtimeSessionBranch<MB, S, R, C> {
 impl<M, S, R, C> SemanticStateTransaction for RealtimeSessionState<M, S, R, C>
 where
     M: SemanticStateTransaction,
-    M::Error: 'static,
+    M::Error: Send + Sync + 'static,
     S: Clone,
     R: Clone,
     C: Completion,
 {
     type Branch = RealtimeSessionBranch<M::Branch, S, R, C>;
-    type Error = RealtimeSessionTransactionError<M::Error, C::Error>;
+    type Error = RealtimeSessionTransactionError;
 
     fn branch(&self) -> Result<Self::Branch, Self::Error> {
         Ok(RealtimeSessionBranch {
@@ -437,7 +438,7 @@ impl<M, S, R, C> ReleasedRealtimeSession<M, S, R, C> {
 pub struct RealtimeSessionScheduler<M, S, R, C, O>
 where
     M: SemanticStateTransaction,
-    M::Error: 'static,
+    M::Error: Send + Sync + 'static,
     S: Clone,
     R: Clone,
     C: Completion,
@@ -450,7 +451,7 @@ where
 impl<M, S, R, C, O> RealtimeSessionScheduler<M, S, R, C, O>
 where
     M: SemanticStateTransaction,
-    M::Error: 'static,
+    M::Error: Send + Sync + 'static,
     S: Clone,
     R: Clone,
     C: Completion,
@@ -496,25 +497,24 @@ where
     }
 
     /// Resumes released state only under the exact selected model identity.
+    /// The caller retains the slot unchanged on failure; success takes its state.
     pub fn resume(
         &mut self,
         request: RequestId,
-        released: ReleasedRealtimeSession<M, S, R, C>,
-    ) -> Result<(), RealtimeSessionResumeError<M, S, R, C>> {
-        if released.state.model != self.model {
-            return Err(RealtimeSessionResumeError {
-                reason: RealtimeSessionError::ModelIdentityMismatch,
-                released: Box::new(released),
-            });
+        released: &mut Option<ReleasedRealtimeSession<M, S, R, C>>,
+    ) -> Result<(), RealtimeSessionError> {
+        let state = released
+            .as_ref()
+            .ok_or(RealtimeSessionError::MissingReleasedState)?;
+        if state.state.model != self.model {
+            return Err(RealtimeSessionError::ModelIdentityMismatch);
         }
-        if let Err(error) = self.scheduler.validate_registration(request) {
-            return Err(RealtimeSessionResumeError {
-                reason: RealtimeSessionError::Scheduler(error),
-                released: Box::new(released),
-            });
-        }
+        self.scheduler.validate_registration(request)?;
         self.scheduler
-            .register(request, released.state)
+            .register(
+                request,
+                released.take().expect("validated released state").state,
+            )
             .expect("prevalidated realtime resumption cannot fail registration");
         Ok(())
     }
@@ -659,12 +659,12 @@ where
     }
 
     /// Atomically replaces sampling only when the request owns no queued or branched work.
-    pub fn replace_sampling<E>(
+    pub fn replace_sampling<E: std::error::Error + Send + Sync + 'static>(
         &mut self,
         request: RequestId,
         sampling: RealtimeSampling,
         realize: impl FnOnce(RealtimeSampling) -> Result<(Vec<S>, Option<R>), E>,
-    ) -> Result<(), RealtimeSamplingUpdateError<E, M::Error, C::Error>> {
+    ) -> Result<(), RealtimeSamplingUpdateError> {
         if self.scheduler.queued_for_request(request) != 0 {
             return Err(RealtimeSamplingReplacementError::QueuedWork);
         }
@@ -672,8 +672,9 @@ where
             .scheduler
             .request_state_mut(request)
             .map_err(RealtimeSamplingReplacementError::Scheduler)?;
-        let (samplers, random) =
-            realize(sampling).map_err(RealtimeSamplingReplacementError::Realization)?;
+        let (samplers, random) = realize(sampling).map_err(|error| {
+            RealtimeSamplingReplacementError::Realization(BackendFailure::from_error(error))
+        })?;
         state
             .generation_mut()
             .replace_sampling(sampling, samplers, random)
@@ -744,6 +745,9 @@ fn allocate_incarnation() -> Result<RealtimeSessionIncarnation, RealtimeSessionE
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum RealtimeSessionError {
+    /// The caller supplied an empty released-state slot.
+    #[error("no released realtime session is available to resume")]
+    MissingReleasedState,
     /// Core scheduler lifecycle failure.
     #[error(transparent)]
     Scheduler(#[from] SchedulerError),
@@ -781,41 +785,6 @@ pub enum RealtimeSessionExecutionError {
     IngressScheduleMismatch,
 }
 
-/// Failed resumption retaining full released state for retry or disposal.
-pub struct RealtimeSessionResumeError<M, S, R, C> {
-    reason: RealtimeSessionError,
-    released: Box<ReleasedRealtimeSession<M, S, R, C>>,
-}
-
-impl<M, S, R, C> RealtimeSessionResumeError<M, S, R, C> {
-    /// Stable reason resumption was rejected.
-    pub const fn reason(&self) -> &RealtimeSessionError {
-        &self.reason
-    }
-
-    /// Recovers the unchanged released state.
-    pub fn into_released(self) -> ReleasedRealtimeSession<M, S, R, C> {
-        *self.released
-    }
-}
-
-impl<M, S, R, C> std::fmt::Debug for RealtimeSessionResumeError<M, S, R, C> {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("RealtimeSessionResumeError")
-            .field("reason", &self.reason)
-            .finish_non_exhaustive()
-    }
-}
-
-impl<M, S, R, C> std::fmt::Display for RealtimeSessionResumeError<M, S, R, C> {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.reason.fmt(formatter)
-    }
-}
-
-impl<M, S, R, C> std::error::Error for RealtimeSessionResumeError<M, S, R, C> {}
-
 #[derive(Debug, thiserror::Error)]
 enum RealtimeSessionSubmissionError<E: std::error::Error> {
     #[error(transparent)]
@@ -826,14 +795,10 @@ enum RealtimeSessionSubmissionError<E: std::error::Error> {
 
 /// Failure while publishing or discarding complete session state.
 #[derive(Debug, thiserror::Error)]
-pub enum RealtimeSessionTransactionError<M, C>
-where
-    M: std::error::Error,
-    C: std::error::Error,
-{
+pub enum RealtimeSessionTransactionError {
     /// Atomic generation-state transaction failed.
     #[error(transparent)]
-    Generation(RealtimeGenerationTransactionError<M, C>),
+    Generation(RealtimeGenerationTransactionError),
     /// An unpublished branch did not retain its exact session identity.
     #[error("realtime session branch identity does not match canonical state")]
     IdentityMismatch,
@@ -844,7 +809,7 @@ where
 
 /// Sampling replacement failure while preserving queued-work ordering.
 #[derive(Debug, thiserror::Error)]
-pub enum RealtimeSamplingReplacementError<E, G> {
+pub enum RealtimeSamplingReplacementError {
     /// Queued frames retain the sampling policy under which they were accepted.
     #[error("cannot replace realtime sampling while frames are queued")]
     QueuedWork,
@@ -853,15 +818,14 @@ pub enum RealtimeSamplingReplacementError<E, G> {
     Scheduler(SchedulerError),
     /// Backend-neutral sampler/RNG realization failed.
     #[error("realtime sampling realization failed")]
-    Realization(E),
+    Realization(#[source] BackendFailure),
     /// New sampler/RNG state did not match generation geometry.
     #[error("realtime generation rejected replacement sampling")]
-    Generation(G),
+    Generation(#[source] RealtimeGenerationTransactionError),
 }
 
 /// Sampling replacement failure specialized to one generation transaction.
-pub type RealtimeSamplingUpdateError<E, M, C> =
-    RealtimeSamplingReplacementError<E, RealtimeGenerationTransactionError<M, C>>;
+pub type RealtimeSamplingUpdateError = RealtimeSamplingReplacementError;
 
 #[cfg(test)]
 mod tests {
@@ -1308,17 +1272,19 @@ mod tests {
         let request = RequestId::new(4);
         let mut first = Sessions::new(identity("a"), limits(1)).unwrap();
         let incarnation = first.register(request, generation()).unwrap();
-        let released = first.release(request).unwrap();
-        assert_eq!(released.incarnation(), incarnation);
+        let mut released = Some(first.release(request).unwrap());
+        assert_eq!(released.as_ref().unwrap().incarnation(), incarnation);
 
         let mut wrong = Sessions::new(identity("b"), limits(1)).unwrap();
-        let error = wrong.resume(request, released).unwrap_err();
+        let error = wrong.resume(request, &mut released).unwrap_err();
+        assert!(matches!(error, RealtimeSessionError::ModelIdentityMismatch));
+        assert_eq!(released.as_ref().unwrap().incarnation(), incarnation);
+        first.resume(request, &mut released).unwrap();
+        assert!(released.is_none());
         assert!(matches!(
-            error.reason(),
-            RealtimeSessionError::ModelIdentityMismatch
+            first.resume(request, &mut released),
+            Err(RealtimeSessionError::MissingReleasedState)
         ));
-        let released = error.into_released();
-        first.resume(request, released).unwrap();
         assert_eq!(
             first.request_state(request).unwrap().incarnation(),
             incarnation

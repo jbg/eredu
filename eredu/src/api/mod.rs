@@ -5,8 +5,12 @@
 //! generation controls, and realtime mechanisms retain their generic parameters;
 //! import a concrete backend factory from its owning crate to select execution.
 //!
-//! Backend implementation traits and their errors are imported from
-//! `eredu-core`, not this facade namespace.
+//! Application errors are backend-independent. Native failures are retained as
+//! sources in `eredu_core::BackendFailure`; backend implementation traits remain
+//! in `eredu-core`.
+
+mod errors;
+pub use errors::{DevicePlanError, ExpertCacheBenchmarkError};
 
 mod media;
 mod metadata;
@@ -49,8 +53,8 @@ pub use observed::{
 };
 
 pub use portable::{
-    LoadedModel, LoadedTextModelConfig, LoadedTextModelOptions, PlannedModel, TextDecoder,
-    TextDecoderError, TextModelError,
+    GeneratedToken, LoadedModel, LoadedTextModelConfig, LoadedTextModelOptions, PlannedModel,
+    TextDecoder, TextDecoderError, TextGeneration, TextModelError,
 };
 
 /// Portable failure reported by prepared-chat constraint state.

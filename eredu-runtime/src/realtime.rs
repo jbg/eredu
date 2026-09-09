@@ -8,6 +8,7 @@ use crate::{
     Sampler, SamplingBackend, SequentialDecisionDriver, SequentialDecisionError,
     SequentialDecisionPlan, SequentialDecisionPlanError, SubmissionBackend,
 };
+use eredu_core::BackendFailure;
 use eredu_core::{
     scheduler::SemanticStateTransaction, Completion, RealtimeFrameScheduleState,
     RealtimeInputFrame, RealtimeSampling, RealtimeScheduleError, RealtimeSpeechConfig,
@@ -62,16 +63,16 @@ pub trait RealtimeFrameTransition<MB, S, R, C> {
 /// Failure while executing or atomically publishing one realtime frame.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
-pub enum RealtimeFrameExecutionError<TransitionError, TransactionError> {
+pub enum RealtimeFrameExecutionError {
     /// Frame ingress or architecture execution failed before publication.
     #[error("realtime frame transition failed")]
-    Transition(#[source] TransitionError),
+    Transition(#[source] BackendFailure),
     /// The returned completion could not be attached to the exact branch.
     #[error(transparent)]
     CompletionAttachment(#[from] RealtimeCompletionAttachmentError),
     /// Exact completion or atomic state publication failed.
     #[error("realtime frame publication failed")]
-    Publication(#[source] TransactionError),
+    Publication(#[source] RealtimeGenerationTransactionError),
 }
 
 /// Failure to attach exact backend completion evidence to a branch.
@@ -86,10 +87,10 @@ pub enum RealtimeCompletionAttachmentError {
 /// Invalid composite branch construction or publication.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
-pub enum RealtimeGenerationTransactionError<ModelError, CompletionError> {
+pub enum RealtimeGenerationTransactionError {
     /// The model/cache transaction could not branch or publish.
     #[error("realtime model-state transaction failed: {0}")]
-    Model(#[source] ModelError),
+    Model(#[source] BackendFailure),
     /// The portable delayed-frame schedule identity did not match.
     #[error(transparent)]
     Schedule(#[from] RealtimeScheduleError),
@@ -109,13 +110,13 @@ pub enum RealtimeGenerationTransactionError<ModelError, CompletionError> {
     CompletionPending,
     /// Exact completion observation or successful waiting failed.
     #[error("realtime generation submission failed: {0}")]
-    Completion(#[source] CompletionError),
+    Completion(#[source] BackendFailure),
 }
 
 impl<M, S, R, C> RealtimeGenerationState<M, S, R, C>
 where
     M: SemanticStateTransaction,
-    M::Error: 'static,
+    M::Error: Send + Sync + 'static,
     C: Completion,
 {
     /// Creates canonical state bound to one exact normalized schedule.
@@ -125,7 +126,7 @@ where
         sampling: RealtimeSampling,
         samplers: Vec<S>,
         random_state: Option<R>,
-    ) -> Result<Self, RealtimeGenerationTransactionError<M::Error, C::Error>> {
+    ) -> Result<Self, RealtimeGenerationTransactionError> {
         Self::from_parts(
             model_state,
             &schedule,
@@ -147,7 +148,7 @@ where
         sampling: RealtimeSampling,
         samplers: Vec<S>,
         random_state: Option<R>,
-    ) -> Result<Self, RealtimeGenerationTransactionError<M::Error, C::Error>> {
+    ) -> Result<Self, RealtimeGenerationTransactionError> {
         schedule_state.validate_schedule(schedule)?;
         validate_sampler_cardinality(schedule, samplers.len())?;
         Ok(Self {
@@ -191,7 +192,7 @@ where
         sampling: RealtimeSampling,
         samplers: Vec<S>,
         random_state: Option<R>,
-    ) -> Result<(), RealtimeGenerationTransactionError<M::Error, C::Error>> {
+    ) -> Result<(), RealtimeGenerationTransactionError> {
         validate_sampler_cardinality(self.schedule_state.schedule(), samplers.len())?;
         self.sampling = sampling;
         self.samplers = samplers;
@@ -201,25 +202,16 @@ where
 
     /// Executes one ingress-dependent transition and publishes every mutable
     /// component only after its exact completion succeeds.
-    #[allow(
-        clippy::type_complexity,
-        reason = "the signature preserves the exact transition, model, and completion error types"
-    )]
     pub fn execute_frame_transition<T>(
         &mut self,
         frame: &RealtimeInputFrame,
         transition: &mut T,
-    ) -> Result<
-        T::Output,
-        RealtimeFrameExecutionError<
-            T::Error,
-            RealtimeGenerationTransactionError<M::Error, C::Error>,
-        >,
-    >
+    ) -> Result<T::Output, RealtimeFrameExecutionError>
     where
         S: Clone,
         R: Clone,
         T: RealtimeFrameTransition<M::Branch, S, R, C>,
+        T::Error: std::error::Error + Send + Sync + 'static,
     {
         let mut branch = SemanticStateTransaction::branch(self)
             .map_err(RealtimeFrameExecutionError::Publication)?;
@@ -229,7 +221,9 @@ where
                 if let Err(discard) = <Self as SemanticStateTransaction>::discard_branch(branch) {
                     return Err(RealtimeFrameExecutionError::Publication(discard));
                 }
-                return Err(RealtimeFrameExecutionError::Transition(error));
+                return Err(RealtimeFrameExecutionError::Transition(
+                    BackendFailure::from_error(error),
+                ));
             }
         };
         if let Err(error) = branch.attach_submission_completion(completion) {
@@ -251,7 +245,7 @@ where
     pub fn commit_submission_branch<B>(
         &mut self,
         branch: RealtimeGenerationBranch<M::Branch, S, R, C>,
-    ) -> Result<(), RealtimeGenerationTransactionError<M::Error, C::Error>>
+    ) -> Result<(), RealtimeGenerationTransactionError>
     where
         B: SubmissionBackend<Completion = C>,
         S: Clone,
@@ -367,17 +361,20 @@ impl<MB, S, R, C> RealtimeGenerationBranch<MB, S, R, C> {
 impl<M, S, R, C> SemanticStateTransaction for RealtimeGenerationState<M, S, R, C>
 where
     M: SemanticStateTransaction,
-    M::Error: 'static,
+    M::Error: Send + Sync + 'static,
     S: Clone,
     R: Clone,
     C: Completion,
 {
     type Branch = RealtimeGenerationBranch<M::Branch, S, R, C>;
-    type Error = RealtimeGenerationTransactionError<M::Error, C::Error>;
+    type Error = RealtimeGenerationTransactionError;
 
     fn branch(&self) -> Result<Self::Branch, Self::Error> {
         Ok(RealtimeGenerationBranch {
-            model_state: self.model_state.branch().map_err(Self::Error::Model)?,
+            model_state: self
+                .model_state
+                .branch()
+                .map_err(|error| Self::Error::Model(BackendFailure::from_error(error)))?,
             schedule_state: self.schedule_state.branch()?,
             sampling: self.sampling,
             samplers: self.samplers.clone(),
@@ -398,7 +395,7 @@ where
 
         let rollback = |model_state, error| match M::discard_branch(model_state) {
             Ok(()) => error,
-            Err(error) => Self::Error::Model(error),
+            Err(error) => Self::Error::Model(BackendFailure::from_error(error)),
         };
         let Some(completion) = completion else {
             return Err(rollback(model_state, Self::Error::MissingCompletion));
@@ -406,14 +403,20 @@ where
         let complete = match completion.is_complete() {
             Ok(complete) => complete,
             Err(error) => {
-                return Err(rollback(model_state, Self::Error::Completion(error)));
+                return Err(rollback(
+                    model_state,
+                    Self::Error::Completion(BackendFailure::from_error(error)),
+                ));
             }
         };
         if !complete {
             return Err(rollback(model_state, Self::Error::CompletionPending));
         }
         if let Err(error) = completion.wait() {
-            return Err(rollback(model_state, Self::Error::Completion(error)));
+            return Err(rollback(
+                model_state,
+                Self::Error::Completion(BackendFailure::from_error(error)),
+            ));
         }
         if let Err(error) = self
             .schedule_state
@@ -429,7 +432,7 @@ where
 
         self.model_state
             .commit_branch(model_state)
-            .map_err(Self::Error::Model)?;
+            .map_err(|error| Self::Error::Model(BackendFailure::from_error(error)))?;
         self.schedule_state.commit_branch(schedule_state)?;
         self.sampling = sampling;
         self.samplers = samplers;
@@ -444,9 +447,10 @@ where
             ..
         } = branch;
         let completion_error = completion.and_then(|completion| completion.wait().err());
-        M::discard_branch(model_state).map_err(Self::Error::Model)?;
+        M::discard_branch(model_state)
+            .map_err(|error| Self::Error::Model(BackendFailure::from_error(error)))?;
         if let Some(error) = completion_error {
-            return Err(Self::Error::Completion(error));
+            return Err(Self::Error::Completion(BackendFailure::from_error(error)));
         }
         Ok(())
     }
@@ -456,10 +460,10 @@ where
     }
 }
 
-fn validate_sampler_cardinality<ModelError, CompletionError>(
+fn validate_sampler_cardinality(
     schedule: &RealtimeSpeechConfig,
     actual: usize,
-) -> Result<(), RealtimeGenerationTransactionError<ModelError, CompletionError>> {
+) -> Result<(), RealtimeGenerationTransactionError> {
     let expected = schedule.depth_audio_codebooks().checked_add(1).ok_or(
         RealtimeGenerationTransactionError::SamplerCardinality {
             expected: usize::MAX,
@@ -958,7 +962,8 @@ mod tests {
                 &RealtimeInputFrame::new(1, vec![9]),
                 &mut FailingTransition,
             ),
-            Err(RealtimeFrameExecutionError::Transition(ModelError))
+            Err(RealtimeFrameExecutionError::Transition(ref failure))
+                if std::error::Error::source(failure).unwrap().is::<ModelError>()
         ));
         assert_eq!(rollbacks.get(), 1);
 

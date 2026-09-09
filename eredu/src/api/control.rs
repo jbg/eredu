@@ -50,28 +50,81 @@ pub struct ControlledGenerationRecord {
 
 /// Typed setup, execution, semantic, lifecycle or bounded delivery failure.
 #[derive(Debug, thiserror::Error)]
-pub enum ControlledGenerationError<E: std::error::Error + Send + Sync + 'static> {
+pub enum ControlledGenerationError {
     /// Existing prepared-chat generation failure.
     #[error(transparent)]
-    Generation(#[from] PreparedChatError<E>),
+    Generation(#[from] PreparedChatError),
     /// Completed-token ownership, execution or completion failure.
     #[error(transparent)]
-    Continuation(#[from] TextContinuationError<E, ControlConstraintError>),
+    Continuation(TextContinuationError<BackendFailure, ControlConstraintError>),
     /// Prospective forced token conflicts with canonical vocabulary or grammar.
     #[error(transparent)]
     Choice(#[from] ControlConstraintError),
     /// Invalid prospective sampling request or failure preparing a new native key.
     #[error(transparent)]
-    Sampling(#[from] SamplingOverrideError<E>),
+    Sampling(SamplingOverrideError<BackendFailure>),
     /// Complete native or host snapshot preparation/compatibility failure.
     #[error(transparent)]
-    Snapshot(#[from] eredu_runtime::execution_control::TextSnapshotError<E>),
+    Snapshot(eredu_runtime::execution_control::TextSnapshotError<BackendFailure>),
     /// Invalid lifecycle transition or resource arithmetic.
     #[error(transparent)]
     Control(#[from] ExecutionControlError),
     /// Unsupported configuration, admission or transport budget failure.
     #[error(transparent)]
     Capture(#[from] CaptureError),
+}
+
+impl<E: std::error::Error + Send + Sync + 'static>
+    From<TextContinuationError<E, ControlConstraintError>> for ControlledGenerationError
+{
+    fn from(error: TextContinuationError<E, ControlConstraintError>) -> Self {
+        Self::Continuation(match error {
+            TextContinuationError::IncompatibleDriver => TextContinuationError::IncompatibleDriver,
+            TextContinuationError::Failed => TextContinuationError::Failed,
+            TextContinuationError::NotQuiescent => TextContinuationError::NotQuiescent,
+            TextContinuationError::Generation(error) => {
+                TextContinuationError::Generation(match error {
+                    ControlledTextGenerationError::Backend(error) => {
+                        ControlledTextGenerationError::Backend(BackendFailure::from_error(error))
+                    }
+                    ControlledTextGenerationError::Controller(error) => {
+                        ControlledTextGenerationError::Controller(error)
+                    }
+                })
+            }
+        })
+    }
+}
+
+impl<E: std::error::Error + Send + Sync + 'static> From<SamplingOverrideError<E>>
+    for ControlledGenerationError
+{
+    fn from(error: SamplingOverrideError<E>) -> Self {
+        Self::Sampling(match error {
+            SamplingOverrideError::Invalid(reason) => SamplingOverrideError::Invalid(reason),
+            SamplingOverrideError::Backend(error) => {
+                SamplingOverrideError::Backend(BackendFailure::from_error(error))
+            }
+        })
+    }
+}
+
+impl<E: std::error::Error + Send + Sync + 'static>
+    From<eredu_runtime::execution_control::TextSnapshotError<E>> for ControlledGenerationError
+{
+    fn from(error: eredu_runtime::execution_control::TextSnapshotError<E>) -> Self {
+        use eredu_runtime::execution_control::TextSnapshotError as S;
+        Self::Snapshot(match error {
+            S::Host(reason) => S::Host(reason),
+            S::Controller(reason) => S::Controller(reason),
+            S::Backend(error) => S::Backend(BackendFailure::from_error(error)),
+            S::Capture(error) => S::Capture(error),
+            S::Control(error) => S::Control(error),
+            S::IncompatibleRun => S::IncompatibleRun,
+            S::InconsistentState => S::InconsistentState,
+            S::Unsupported(reason) => S::Unsupported(reason),
+        })
+    }
 }
 
 struct Delivery {
@@ -303,7 +356,7 @@ impl<B: TextGenerationBackend> ControlledGenerationSession<'_, B> {
         result
     }
 
-    fn validate_choice_boundary(&mut self) -> Result<(), ControlledGenerationError<B::Error>> {
+    fn validate_choice_boundary(&mut self) -> Result<(), ControlledGenerationError> {
         if self.delivery.control.cancellation().is_cancelled() {
             return Err(
                 CaptureError::Invalid("generation cancellation was requested".into()).into(),
@@ -328,10 +381,7 @@ impl<B: TextGenerationBackend> ControlledGenerationSession<'_, B> {
     /// commitment and decoder still execute once. No text is re-tokenized.
     /// This changes only the next decision; replacing a past token requires an
     /// earlier snapshot. Clear an existing choice before replacing it.
-    pub fn force_next_token(
-        &mut self,
-        token: u32,
-    ) -> Result<(), ControlledGenerationError<B::Error>> {
+    pub fn force_next_token(&mut self, token: u32) -> Result<(), ControlledGenerationError> {
         self.validate_choice_boundary()?;
         if self.vocabulary.id_to_token(token).is_none() {
             return Err(TokenChoiceError::InvalidToken(token).into());
@@ -340,7 +390,7 @@ impl<B: TextGenerationBackend> ControlledGenerationSession<'_, B> {
         Ok(())
     }
     /// Removes a pending decision restriction without advancing generation.
-    pub fn clear_forced_token(&mut self) -> Result<bool, ControlledGenerationError<B::Error>> {
+    pub fn clear_forced_token(&mut self) -> Result<bool, ControlledGenerationError> {
         self.validate_choice_boundary()?;
         Ok(self.state.controller_mut().clear_forced())
     }
@@ -361,7 +411,7 @@ impl<B: TextGenerationBackend> ControlledGenerationSession<'_, B> {
             emit,
         );
     }
-    fn delivery_result(&mut self) -> Result<(), ControlledGenerationError<B::Error>> {
+    fn delivery_result(&mut self) -> Result<(), ControlledGenerationError> {
         if let Some(error) = self.delivery.failure.take() {
             self.lifecycle.fail();
             return Err(error.into());
@@ -376,7 +426,7 @@ impl<B: TextGenerationBackend> ControlledGenerationSession<'_, B> {
     pub fn step(
         &mut self,
         emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
-    ) -> Result<GenerationStatus, ControlledGenerationError<B::Error>> {
+    ) -> Result<GenerationStatus, ControlledGenerationError> {
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.step_inner(emit))) {
             Ok(result) => result,
             Err(payload) => {
@@ -389,7 +439,7 @@ impl<B: TextGenerationBackend> ControlledGenerationSession<'_, B> {
     fn step_inner(
         &mut self,
         mut emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
-    ) -> Result<GenerationStatus, ControlledGenerationError<B::Error>> {
+    ) -> Result<GenerationStatus, ControlledGenerationError> {
         let cancelled = self.delivery.control.cancellation().is_cancelled();
         // Validate before touching the cursor, including terminal/error states.
         if cancelled {
@@ -426,9 +476,7 @@ impl<B: TextGenerationBackend> ControlledGenerationSession<'_, B> {
         if let Err(error) = result {
             self.lifecycle.fail();
             let error = match error {
-                CommittedGenerationError::Source(error) => {
-                    ControlledGenerationError::Continuation(error)
-                }
+                CommittedGenerationError::Source(error) => ControlledGenerationError::from(error),
                 CommittedGenerationError::Pipeline(CommittedTokenPipelineError::Decoder(error)) => {
                     PreparedChatError::Tokenizer(error).into()
                 }
@@ -483,7 +531,7 @@ impl<B: TextGenerationBackend> ControlledGenerationSession<'_, B> {
     pub fn pause(
         &mut self,
         emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
-    ) -> Result<(), ControlledGenerationError<B::Error>> {
+    ) -> Result<(), ControlledGenerationError> {
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.pause_inner(emit))) {
             Ok(result) => result,
             Err(payload) => {
@@ -496,7 +544,7 @@ impl<B: TextGenerationBackend> ControlledGenerationSession<'_, B> {
     fn pause_inner(
         &mut self,
         mut emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
-    ) -> Result<(), ControlledGenerationError<B::Error>> {
+    ) -> Result<(), ControlledGenerationError> {
         self.lifecycle.pause()?;
         self.delivery.control.request_pause();
         self.lifecycle_record(&mut emit);
@@ -508,7 +556,7 @@ impl<B: TextGenerationBackend> ControlledGenerationSession<'_, B> {
     pub fn cancel(
         &mut self,
         emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
-    ) -> Result<GenerationStatus, ControlledGenerationError<B::Error>> {
+    ) -> Result<GenerationStatus, ControlledGenerationError> {
         // Validate before changing the persistent cancellation handle.
         self.lifecycle.checkpoint()?;
         if self.status() == GenerationStatus::Completed {
@@ -526,7 +574,7 @@ impl<B: TextGenerationBackend> ControlledGenerationSession<'_, B> {
     pub fn run(
         &mut self,
         mut emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
-    ) -> Result<GenerationStatus, ControlledGenerationError<B::Error>> {
+    ) -> Result<GenerationStatus, ControlledGenerationError> {
         while matches!(
             self.status(),
             GenerationStatus::Prepared | GenerationStatus::Paused
@@ -545,7 +593,7 @@ impl<B: TextGenerationBackend> ControlledGenerationSession<'_, B> {
     pub fn resume(
         &mut self,
         emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
-    ) -> Result<GenerationStatus, ControlledGenerationError<B::Error>> {
+    ) -> Result<GenerationStatus, ControlledGenerationError> {
         self.lifecycle.pause()?;
         self.delivery.control.acknowledge_resume();
         self.run(emit)
@@ -555,9 +603,7 @@ impl<B: TextGenerationBackend> ControlledGenerationSession<'_, B> {
 impl<B: TextSamplingControlBackend> ControlledGenerationSession<'_, B> {
     /// Current temperature and RNG/adaptive compatibility facts at a quiescent
     /// boundary. No sampler or model work occurs.
-    pub fn sampling_state(
-        &mut self,
-    ) -> Result<SamplingStateFacts, ControlledGenerationError<B::Error>> {
+    pub fn sampling_state(&mut self) -> Result<SamplingStateFacts, ControlledGenerationError> {
         self.validate_choice_boundary()?;
         Ok(B::sampling_control_facts(
             self.state.boundary(&mut self.driver)?.parts().1,
@@ -572,7 +618,7 @@ impl<B: TextSamplingControlBackend> ControlledGenerationSession<'_, B> {
         &mut self,
         request: SamplingOverride,
         emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
-    ) -> Result<(), ControlledGenerationError<B::Error>> {
+    ) -> Result<(), ControlledGenerationError> {
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.override_sampling_inner(request, emit)
         })) {
@@ -596,7 +642,7 @@ impl<B: TextSamplingControlBackend> ControlledGenerationSession<'_, B> {
         &mut self,
         request: SamplingOverride,
         mut emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
-    ) -> Result<(), ControlledGenerationError<B::Error>> {
+    ) -> Result<(), ControlledGenerationError> {
         self.validate_choice_boundary()?;
         let before = B::sampling_control_facts(self.state.boundary(&mut self.driver)?.parts().1);
         let after = eredu_runtime::execution_control::apply_sampling_override(
@@ -628,7 +674,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
         caller_stop_sequences: &[String],
         control: GenerationControlHandle,
         emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
-    ) -> Result<ControlledGenerationSession<'a, B>, ControlledGenerationError<B::Error>> {
+    ) -> Result<ControlledGenerationSession<'a, B>, ControlledGenerationError> {
         self.start_controlled_generation(
             prepared,
             caller_stop_sequences,
@@ -692,7 +738,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
         caller_stop_sequences: &[String],
         control: GenerationControlHandle,
         emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
-    ) -> Result<ControlledGenerationSession<'a, B>, ControlledGenerationError<B::Error>> {
+    ) -> Result<ControlledGenerationSession<'a, B>, ControlledGenerationError> {
         self.start_controlled_generation(
             prepared,
             caller_stop_sequences,
@@ -709,7 +755,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
         control: GenerationControlHandle,
         mut emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
         mode: OutputMode,
-    ) -> Result<ControlledGenerationSession<'a, B>, ControlledGenerationError<B::Error>> {
+    ) -> Result<ControlledGenerationSession<'a, B>, ControlledGenerationError> {
         if prepared.session_identity != self.session_identity {
             return Err(CaptureError::Invalid(
                 "prepared request belongs to another loaded session".into(),
@@ -819,7 +865,9 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
             seed: prepared.settings.seed,
         };
         let prompt = B::prepare_text_prompt(self.runtime.backend(), prepared.prompt_token_ids)
-            .map_err(PreparedChatError::Backend)?;
+            .map_err(|error| {
+                PreparedChatError::Backend(eredu_core::BackendFailure::from_error(error))
+            })?;
         let mut driver = TextGenerationDriver::new(&mut self.runtime);
         let mut state = driver
             .start(
