@@ -39,7 +39,7 @@ impl<'a> ParameterVisitorMut<'a, NumericTensor> for FixtureAliases {
 }
 
 #[derive(Default)]
-struct FixturePolicy {
+pub(super) struct FixturePolicy {
     acquired: Vec<usize>,
 }
 impl<U: Parameterized<NumericTensor>> LayerwisePolicy<NumericBackend, U> for FixturePolicy {
@@ -457,6 +457,11 @@ fn nanbeige_official_gguf_layout_matches_safetensors_with_permuted_query_key_row
             )
             .unwrap();
         let gguf = eredu_architectures::configuration::inspect_artifact(&path).unwrap();
+        assert_eq!(
+            gguf.architecture_plan().architecture_descriptor(),
+            safe.architecture_plan().architecture_descriptor(),
+            "source formats expose the same physical layers, passes, sharing and captures"
+        );
         let actual = execute_numeric_replicated_inspection(&gguf, &context, &input, None);
         for (a, e) in actual.outputs.iter().zip(&expected.outputs) {
             assert_tensor_close(a, e, "official GGUF row permutation and repeated cache");

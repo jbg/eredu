@@ -6,8 +6,12 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Current wire schema for architecture and observation discovery.
+/// Current wire schema for observation catalogs and support reports.
 pub const DISCOVERY_SCHEMA_VERSION: u32 = 1;
+
+/// Current architecture descriptor schema, including layer execution groups.
+/// Observation catalogs and support reports retain their independent version.
+pub const ARCHITECTURE_DESCRIPTOR_SCHEMA_VERSION: u32 = 2;
 
 /// Coverage of a descriptor, node, or catalog.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -273,7 +277,9 @@ pub struct ArchitectureNode {
     pub kind: ArchitectureNodeKind,
     /// Containing node, independent of data-flow dependencies.
     pub parent: Option<String>,
-    /// Zero-based physical layer ordinal, if this node is a decoder unit.
+    /// Zero-based logical execution ordinal, if this node is a decoder unit.
+    /// Repeated passes have distinct ordinals; physical layers are declared in
+    /// `ArchitectureDescriptor::layer_groups`.
     pub layer_index: Option<usize>,
     /// Canonical parameter-group identities referenced by this node.
     pub parameter_groups: Vec<String>,
@@ -324,6 +330,57 @@ pub struct ArchitectureParameterGroup {
     pub id: String,
     /// Canonical logical checkpoint module prefix; not a physical source key or activation selector.
     pub canonical_prefix: String,
+    /// Another group's identity whose weights this logical group reuses exactly.
+    /// This is semantic sharing, not a promise of shared native allocations or
+    /// mutable state. Extra operations carry their own parameter groups.
+    /// Absent means no sharing declaration, including in older descriptors.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared_with: Option<String>,
+}
+
+/// Weight reuse within a declared physical layer stack.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LayerWeightSharing {
+    /// Each physical layer is executed once within this group.
+    None,
+    /// Every pass executes the same physical layers with the same block weights.
+    /// Per-pass operations (such as normalization) and mutable state are separate.
+    SharedAcrossPasses,
+}
+
+/// One invocation of a physical layer, with its own graph and capture identity.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ArchitectureLayerExecution {
+    /// Exact decoder node ID; its observation paths select this execution only.
+    pub node_id: String,
+    /// Zero-based physical layer ordinal within the enclosing group.
+    pub physical_layer_index: usize,
+}
+
+/// One complete traversal of a physical layer stack.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ArchitectureExecutionPass {
+    /// Zero-based pass ordinal within the enclosing group.
+    pub index: usize,
+    /// Invocations in forward execution order, one per physical layer.
+    pub executions: Vec<ArchitectureLayerExecution>,
+}
+
+/// A stack that consumers can collapse while retaining individual executions.
+/// This is a presentation of architecture semantics, not a residency or cache unit.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ArchitectureLayerGroup {
+    /// Stable identity within the descriptor; separate from the node namespace.
+    pub id: String,
+    /// Human-readable stack label.
+    pub label: String,
+    /// Number of distinct physical blocks, indexed from zero.
+    pub physical_layer_count: usize,
+    /// Complete passes in forward execution order.
+    pub passes: Vec<ArchitectureExecutionPass>,
+    /// Whether the passes reuse physical block weights.
+    pub weight_sharing: LayerWeightSharing,
 }
 
 /// Backend-independent logical graph from an admitted architecture plan.
@@ -337,6 +394,11 @@ pub struct ArchitectureDescriptor {
     pub edges: Vec<ArchitectureEdge>,
     /// Canonical parameter groups referenced by nodes in this graph.
     pub parameter_groups: Vec<ArchitectureParameterGroup>,
+    /// Physical decoder stacks and their ordered logical executions.
+    /// Empty in older descriptors or when this structure is not described;
+    /// absence does not imply zero layers or a single pass.
+    #[serde(default)]
+    pub layer_groups: Vec<ArchitectureLayerGroup>,
     /// Architecture-declared observation points, independent of execution support.
     pub observations: ObservationCatalog,
     /// Explicit omissions at this scope.

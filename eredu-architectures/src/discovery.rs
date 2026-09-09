@@ -125,10 +125,11 @@ impl Builder {
         Self {
             interventions: vec![],
             descriptor: ArchitectureDescriptor {
-                schema_version: DISCOVERY_SCHEMA_VERSION,
+                schema_version: ARCHITECTURE_DESCRIPTOR_SCHEMA_VERSION,
                 nodes: vec![],
                 edges: vec![],
                 parameter_groups: vec![],
+                layer_groups: vec![],
                 observations: ObservationCatalog {
                     schema_version: DISCOVERY_SCHEMA_VERSION,
                     points: vec![],
@@ -177,6 +178,7 @@ impl Builder {
                     .push(ArchitectureParameterGroup {
                         id: group.clone(),
                         canonical_prefix: prefix.into(),
+                        shared_with: None,
                     });
             }
             groups.push(group);
@@ -325,6 +327,7 @@ impl Builder {
             Some(width),
         );
         self.get_mut(&id).layer_index = Some(index);
+        self.decoder_execution(&id, index);
         self.edge(previous, &id, ArchitectureEdgeKind::Data);
         self.observation(
             &id,
@@ -343,6 +346,71 @@ impl Builder {
             false,
         );
         id
+    }
+
+    /// Ordinary stacks have one physical layer for each logical invocation.
+    fn decoder_execution(&mut self, node: &str, physical_layer_index: usize) {
+        if self.descriptor.layer_groups.is_empty() {
+            self.descriptor.layer_groups.push(ArchitectureLayerGroup {
+                id: "decoder".into(),
+                label: "Decoder".into(),
+                physical_layer_count: 0,
+                passes: vec![ArchitectureExecutionPass {
+                    index: 0,
+                    executions: vec![],
+                }],
+                weight_sharing: LayerWeightSharing::None,
+            });
+        }
+        let group = &mut self.descriptor.layer_groups[0];
+        group.physical_layer_count += 1;
+        group.passes[0].executions.push(ArchitectureLayerExecution {
+            node_id: node.into(),
+            physical_layer_index,
+        });
+    }
+
+    /// Retains invocation identities while projecting a shared stack's lowering.
+    fn repeated_decoder(&mut self, root: &str, physical_layers: usize, passes: usize) {
+        let group = &mut self.descriptor.layer_groups[0];
+        let executions = std::mem::take(&mut group.passes[0].executions);
+        assert_eq!(executions.len(), physical_layers * passes);
+        group.physical_layer_count = physical_layers;
+        group.weight_sharing = if passes > 1 {
+            LayerWeightSharing::SharedAcrossPasses
+        } else {
+            LayerWeightSharing::None
+        };
+        group.passes = executions
+            .chunks(physical_layers)
+            .enumerate()
+            .map(|(index, executions)| ArchitectureExecutionPass {
+                index,
+                executions: executions
+                    .iter()
+                    .enumerate()
+                    .map(
+                        |(physical_layer_index, execution)| ArchitectureLayerExecution {
+                            node_id: execution.node_id.clone(),
+                            physical_layer_index,
+                        },
+                    )
+                    .collect(),
+            })
+            .collect();
+
+        // Use the same exact alias mapping as checkpoint lowering, including
+        // inter-pass normalization. Logical prefixes and capture paths stay intact.
+        for parameters in &mut self.descriptor.parameter_groups {
+            let logical = format!("{}.weight", parameters.canonical_prefix);
+            let source = crate::decoder::repeated::source_name(root, physical_layers, &logical);
+            if source != logical {
+                parameters.shared_with = Some(format!(
+                    "parameters:{}",
+                    source.strip_suffix(".weight").expect("weight module")
+                ));
+            }
+        }
     }
 
     /// One pre-normalized residual sublayer. The bypass is a distinct data-flow edge.

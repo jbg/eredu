@@ -20,6 +20,51 @@ sharing, receptive field, mechanism, recurrence, head dimensions, and positional
 encoding are independent attributes of each layer. Consumers traverse these
 types; they do not match family names or parse checkpoint keys.
 
+Architecture descriptor schema **2** adds `layer_groups` and parameter sharing.
+Observation catalogs and support reports retain schema **1**; their capture
+selectors and admission version are unchanged. Older descriptors deserialize
+with an empty `layer_groups` and absent `shared_with` declarations. Consumers
+must treat that as unknown structure, rather than infer a single pass from the
+number of decoder nodes.
+
+Each `ArchitectureLayerGroup` declares a `physical_layer_count`, ordered
+`passes`, and `weight_sharing`. Each pass has a zero-based `index` and ordered
+`executions`; an execution identifies its `physical_layer_index` and exact
+graph `node_id`. Physical layer indices are local to the group. A pass visits
+each physical layer once. Ordinary decoder stacks have one pass and
+`weight_sharing: "none"`. Repeated stacks declare `"shared_across_passes"`.
+Groups describe decoder stacks; media encoders and other opaque components
+remain represented by their existing nodes and completeness declarations.
+
+For the released Nanbeige 4.2 configuration, the decoder group contains **22
+physical layers, 2 passes, and 44 executions**. LM Inspector can render
+**“22 layers × 2 passes · shared weights”** from these fields, then expand
+`passes[].executions[]` and resolve each `node_id` with `descriptor.node(...)`.
+For example, physical layer `0` appears as `decoder.layers.0` in pass `0`
+and `decoder.layers.22` in pass `1`. Their capture paths are respectively
+`model.layers.0.input` / `.output` and `model.layers.22.input` / `.output`.
+Use those advertised paths to select individual executions, including with
+bounded `CapturePlan` selections. Support must still be joined by exact path.
+For display, add one to pass and physical layer indices; do not change paths.
+
+`ArchitectureNode.layer_index` retains its existing **logical execution**
+ordinal (0–43 for Nanbeige), correcting the original documentation that called
+it physical. Node IDs, logical parameter prefixes, graph edges, and observation
+paths retain their identities. `ArchitectureParameterGroup.shared_with`
+references another parameter-group ID when distinct logical groups reuse the
+same weights. For example, `parameters:model.layers.22.self_attn` shares with
+`parameters:model.layers.0.self_attn`. The inter-pass output normalization
+shares with `parameters:model.norm`; it remains a distinct operation. Nodes
+that already reference the same parameter group, such as tied embedding and
+output weights, continue to do so. An absent `shared_with` means no additional
+sharing declaration, not proof of independent weights.
+
+Weight sharing describes architecture parameters. Each Nanbeige execution has
+independent mutable KV state, and resident execution can materialize replicas
+of the shared checkpoint weights. The group is neither a residency unit nor a
+claim about native allocation sharing. Controlled and uninterrupted capture
+use the same per-execution identities.
+
 Three namespaces have different purposes:
 
 | Field | Meaning |

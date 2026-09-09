@@ -5,6 +5,26 @@ execution drivers. Its physical blocks are expanded into logical invocations
 with exact checkpoint aliases, independent KV state and optional inter-pass
 RMSNorm. No family-specific backend implementation is required.
 
+Cold architecture discovery exposes the released configuration as a decoder
+group with 22 physical layers, two passes and shared weights. Its 44 logical
+execution nodes retain separate input/output capture paths, and explicit
+parameter aliases include the normalization between passes. The portable
+discovery example prints “22 layers × 2 passes · shared weights” and expands
+the group into selectable executions. See [architecture discovery](architecture-discovery.md).
+
+Descriptor coverage includes the pinned released configuration below, one/two/three
+passes, both inter-pass normalization policies, and legacy JSON deserialization.
+The nonzero scalar fixture checks distinct per-pass captures through prefill
+and two cached decode steps, with exact agreement between selected and complete
+captures. The existing GGUF numerical fixture also verifies that SafeTensors
+and GGUF expose identical descriptors. Reproduce with:
+
+```sh
+cargo test -p eredu-architectures --lib discovery::tests
+cargo test -p eredu-architectures --test reference_numeric discovery::
+cargo test -p eredu-architectures --test reference_numeric nanbeige_official_gguf_layout
+```
+
 ## Native tools and reasoning regression from Goose
 
 Investigated against Eredu `7cb5dee5afc4ac50c27aab9993aabc7edffbe879` using

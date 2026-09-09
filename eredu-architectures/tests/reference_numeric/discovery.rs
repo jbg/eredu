@@ -199,18 +199,50 @@ fn nanbeige_discovery_describes_logical_invocations_and_executable_captures() {
             .parameter_groups,
         graph.node("output.norm").unwrap().parameter_groups
     );
+    let group = &graph.layer_groups[0];
+    assert_eq!(group.physical_layer_count, 2);
+    assert_eq!(group.passes.len(), 2);
+    assert_eq!(
+        group.weight_sharing,
+        eredu_core::LayerWeightSharing::SharedAcrossPasses
+    );
+    // Expand the group and select the output of physical layer zero in each pass.
+    // These must remain two distinct observations despite sharing weights.
+    let selected_paths = group
+        .passes
+        .iter()
+        .map(|pass| {
+            let execution = &pass.executions[0];
+            assert_eq!(execution.physical_layer_index, 0);
+            graph.node(&execution.node_id).unwrap().observation_paths[1].clone()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        selected_paths,
+        ["model.layers.0.output", "model.layers.2.output"]
+    );
     let args = eredu_architectures::nanbeige::model_args_from_config_value(&config).unwrap();
     let context = NumericContext::default();
     let model =
         eredu_architectures::nanbeige::LayeredModel::<NumericBackend>::new(args.clone(), &context)
             .unwrap();
-    let mut runtime = LayerwiseRuntime::new(model, RebuildingUnitPolicy::default());
+    let mut runtime = LayerwiseRuntime::new(model, super::nanbeige::FixturePolicy::default());
+    let selected_model =
+        eredu_architectures::nanbeige::LayeredModel::<NumericBackend>::new(args.clone(), &context)
+            .unwrap();
+    let mut selected_runtime =
+        LayerwiseRuntime::new(selected_model, super::nanbeige::FixturePolicy::default());
     let mut state = DeviceState::<NumericBackend, _>::create(
         eredu_architectures::nanbeige::state_layout(&args).unwrap(),
         |_, p| Ok::<_, Error>(NumericHybridLayerState::new(p)),
     )
     .unwrap();
-    for ids in [vec![1, 3, 2], vec![4]] {
+    let mut selected_state = DeviceState::<NumericBackend, _>::create(
+        eredu_architectures::nanbeige::state_layout(&args).unwrap(),
+        |_, p| Ok::<_, Error>(NumericHybridLayerState::new(p)),
+    )
+    .unwrap();
+    for ids in [vec![1, 3, 2], vec![4], vec![2]] {
         let tokens = NumericTensor::token_ids(&ids);
         let mut capture = Capture {
             request: ObservationRequest::all(),
@@ -229,6 +261,45 @@ fn nanbeige_discovery_describes_logical_invocations_and_executable_captures() {
             .unwrap();
         eredu_runtime::observe_model_logits(&mut capture, &logits).unwrap();
         check_captures(&graph, &capture, ids.len());
+        let mut selected = Capture {
+            request: ObservationRequest::selected(
+                selected_paths
+                    .iter()
+                    .cloned()
+                    .map(ObservationSelector::Exact),
+            ),
+            values: BTreeMap::new(),
+        };
+        let selected_logits = selected_runtime
+            .forward_with_observer(
+                decoder::LayeredInput {
+                    tokens: &tokens,
+                    mask: None,
+                },
+                &mut selected_state,
+                &context,
+                &mut selected,
+            )
+            .unwrap();
+        eredu_runtime::observe_model_logits(&mut selected, &selected_logits).unwrap();
+        check_captures(&graph, &selected, ids.len());
+        assert_eq!(selected.values.len(), 2);
+        assert_tensor_exact(
+            &selected_logits,
+            &logits,
+            "capture selection preserves execution",
+        );
+        for path in &selected_paths {
+            assert_tensor_exact(
+                &selected.values[path],
+                &capture.values[path],
+                "expanded execution capture",
+            );
+        }
+        assert_ne!(
+            selected.values[&selected_paths[0]].data, selected.values[&selected_paths[1]].data,
+            "passes over shared weights retain distinct activations"
+        );
     }
 }
 

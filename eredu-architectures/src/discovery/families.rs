@@ -102,6 +102,7 @@ pub(super) fn dense<C: Config>(g: &mut Builder, c: &C, moe_policy: Option<MoeAtt
 
 pub(super) fn nanbeige(g: &mut Builder, c: &crate::nanbeige::ModelArgs) {
     dense(g, c, None);
+    g.repeated_decoder(c.parameter_root(), c.physical_layer_count(), c.num_loops());
 }
 
 pub(super) fn qwen(g: &mut Builder, c: &crate::qwen::ModelArgs) {
@@ -845,6 +846,7 @@ fn components(
     {
         let path = format!("{root}.layers.{index}");
         g.get_mut(&component.id).layer_index = Some(index);
+        g.decoder_execution(&component.id, index);
         g.get_mut(&component.id).output_axes = Some(axes(width));
         g.get_mut(&component.id).completeness = DescriptionCompleteness::Partial(vec!["Block equations, additional normalizations, state sharing, and internal data flow are not expanded".into()]);
         for (boundary, meaning) in [

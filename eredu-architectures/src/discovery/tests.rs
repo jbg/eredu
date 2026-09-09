@@ -27,6 +27,44 @@ fn validate(graph: &ArchitectureDescriptor) {
             assert_eq!(graph.observations.get(path).unwrap().node_id, node.id);
         }
     }
+    for group in &graph.parameter_groups {
+        if let Some(shared) = &group.shared_with {
+            assert_ne!(shared, &group.id);
+            let source = graph
+                .parameter_groups
+                .iter()
+                .find(|g| &g.id == shared)
+                .unwrap();
+            assert!(
+                source.shared_with.is_none(),
+                "sharing points directly to its source"
+            );
+        }
+    }
+    let mut executions = BTreeSet::new();
+    for group in &graph.layer_groups {
+        for (index, pass) in group.passes.iter().enumerate() {
+            assert_eq!(pass.index, index);
+            assert_eq!(pass.executions.len(), group.physical_layer_count);
+            for (physical, execution) in pass.executions.iter().enumerate() {
+                assert_eq!(execution.physical_layer_index, physical);
+                let node = graph.node(&execution.node_id).unwrap();
+                assert_eq!(node.kind, ArchitectureNodeKind::DecoderBlock);
+                assert!(
+                    executions.insert(&node.id),
+                    "execution belongs to exactly one pass"
+                );
+            }
+        }
+    }
+    assert_eq!(
+        executions.len(),
+        graph
+            .nodes
+            .iter()
+            .filter(|n| n.layer_index.is_some())
+            .count()
+    );
     for edge in &graph.edges {
         assert!(ids.contains(edge.from.as_str()));
         assert!(ids.contains(edge.to.as_str()));
@@ -76,6 +114,10 @@ fn dense_graph_has_bypass_edges_tied_parameters_and_only_emitted_points() {
     validate(&graph);
     assert_eq!(graph.completeness, DescriptionCompleteness::Complete);
     assert_eq!(graph.observations.points.len(), 5);
+    let group = &graph.layer_groups[0];
+    assert_eq!(group.physical_layer_count, 2);
+    assert_eq!(group.passes.len(), 1);
+    assert_eq!(group.weight_sharing, LayerWeightSharing::None);
     assert_eq!(
         graph.node("embedding").unwrap().parameter_groups,
         graph.node("output").unwrap().parameter_groups
@@ -105,6 +147,114 @@ fn dense_graph_has_bypass_edges_tied_parameters_and_only_emitted_points() {
             .position,
         ObservationPosition::BeforeIntervention
     );
+}
+
+#[test]
+fn nanbeige_groups_physical_layers_and_passes_without_collapsing_execution_identity() {
+    let published: serde_json::Value = serde_json::from_str(include_str!(
+        "../../tests/fixtures/configs/nanbeige4.2-3b-0e137298.json"
+    ))
+    .unwrap();
+    for passes in [1, 2, 3] {
+        for skip_norm in [false, true] {
+            let mut config = published.clone();
+            config["num_loops"] = passes.into();
+            config["skip_loop_final_norm"] = skip_norm.into();
+            let graph = describe(config);
+            validate(&graph);
+            assert_eq!(graph.schema_version, ARCHITECTURE_DESCRIPTOR_SCHEMA_VERSION);
+            assert_eq!(graph.observations.schema_version, DISCOVERY_SCHEMA_VERSION);
+            assert_eq!(graph.layer_groups.len(), 1);
+            let group = &graph.layer_groups[0];
+            assert_eq!(group.physical_layer_count, 22);
+            assert_eq!(group.passes.len(), passes);
+            assert_eq!(
+                group.weight_sharing,
+                if passes > 1 {
+                    LayerWeightSharing::SharedAcrossPasses
+                } else {
+                    LayerWeightSharing::None
+                }
+            );
+            for pass in &group.passes {
+                for execution in &pass.executions {
+                    let physical = execution.physical_layer_index;
+                    let logical = pass.index * 22 + physical;
+                    let node = graph.node(&execution.node_id).unwrap();
+                    assert_eq!(node.layer_index, Some(logical));
+                    assert_eq!(
+                        node.observation_paths,
+                        [
+                            format!("model.layers.{logical}.input"),
+                            format!("model.layers.{logical}.output"),
+                        ]
+                    );
+                    for suffix in [
+                        "",
+                        ".self_attn",
+                        ".mlp",
+                        ".input_layernorm",
+                        ".post_attention_layernorm",
+                    ] {
+                        let parameters = graph
+                            .parameter_groups
+                            .iter()
+                            .find(|g| {
+                                g.canonical_prefix == format!("model.layers.{logical}{suffix}")
+                            })
+                            .unwrap();
+                        assert_eq!(
+                            parameters.shared_with,
+                            (pass.index > 0)
+                                .then(|| format!("parameters:model.layers.{physical}{suffix}"))
+                        );
+                    }
+                }
+            }
+            for pass in 1..passes {
+                let norm = graph.node(&format!("decoder.layers.{}.output_norm", pass * 22 - 1));
+                if skip_norm {
+                    assert!(norm.is_none());
+                } else {
+                    let parameters = &norm.unwrap().parameter_groups[0];
+                    let parameters = graph
+                        .parameter_groups
+                        .iter()
+                        .find(|g| &g.id == parameters)
+                        .unwrap();
+                    assert_eq!(
+                        parameters.shared_with.as_deref(),
+                        Some("parameters:model.norm")
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn older_descriptors_leave_layer_structure_and_parameter_sharing_undeclared() {
+    let graph = describe(
+        serde_json::from_str(include_str!(
+            "../../tests/fixtures/configs/nanbeige4.2-3b-0e137298.json"
+        ))
+        .unwrap(),
+    );
+    let mut legacy = serde_json::to_value(&graph).unwrap();
+    legacy["schema_version"] = 1.into();
+    legacy.as_object_mut().unwrap().remove("layer_groups");
+    for group in legacy["parameter_groups"].as_array_mut().unwrap() {
+        group.as_object_mut().unwrap().remove("shared_with");
+    }
+    let decoded: ArchitectureDescriptor = serde_json::from_value(legacy).unwrap();
+    assert!(decoded.layer_groups.is_empty());
+    assert!(decoded
+        .parameter_groups
+        .iter()
+        .all(|g| g.shared_with.is_none()));
+    assert_eq!(decoded.nodes, graph.nodes);
+    assert_eq!(decoded.observations, graph.observations);
+    assert_eq!(decoded.schema_version, 1);
 }
 
 #[test]

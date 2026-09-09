@@ -52,12 +52,18 @@ A forced mapped ID outside a shorter model output fails when that output's width
 is available, before sampling. No model-specific padding convention is assumed.
 
 Architecture and capture discovery follows the same ownership boundaries.
-`eredu-core::discovery` owns the versioned logical graph, symbolic axes, declared
-observation catalog, and separate execution-support reports.
+`eredu-core::discovery` owns the versioned logical graph, physical decoder layer
+groups, ordered execution passes, parameter-sharing declarations, symbolic axes,
+declared observation catalog, and separate execution-support reports.
 `ArtifactArchitecturePlan::architecture_descriptor` in `eredu-architectures`
 projects admitted family configurations and existing component/parameter
 declarations. Runtime traversal and routing collectors share typed path
-declarations with discovery. `eredu-runtime` combines phase/conditional
+declarations with discovery. Shared-stack projections retain distinct logical
+execution nodes and capture paths, map them to physical layers and passes, and
+declare exact weight aliases using the same architecture-owned mapping as
+checkpoint lowering. These declarations do not imply shared mutable state or
+native allocations. Architecture descriptor schema 2 is independent of the
+unchanged observation catalog/support schema 1. `eredu-runtime` combines phase/conditional
 requirements with selected session and collector facts; a backend reports only
 native collection/conversion mechanisms. The facade exposes cold discovery and
 enriches ordinary inspection reports. No discovery step requires native
