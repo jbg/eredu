@@ -2174,12 +2174,16 @@ different plan. Each selected target carries an opaque core-owned identity;
 into the runtime, and external drafting realization rejects a runtime produced
 from any other target even when both targets implement the same plan.
 
-The loading APIs' `*_with_text_options` variants accept facade-owned `LoadedTextModelOptions`,
+The loading APIs' `*_with_text_options` variants accept facade-owned `TextModelOptions`,
 as do retained-inspection and direct backend loading. A caller-supplied single
 or named chat template supersedes checkpoint template selection before native
 realization, while tokenizer variables, EOS ids, and generation defaults remain
 checkpoint-derived. These options stay outside the core execution plan and
-backend load policy. `LoadedModel::set_chat_template` replaces the template used
+backend load policy. Pre-load text inspection borrows the `TextModelOptions`
+value intended for loading. Both operations use one facade-owned template
+resolver, with invalid selected metadata reported instead of falling back to
+another source. `TextInspectionOptions` holds only the optional behavioral probe
+request. `LoadedModel::set_chat_template` replaces the template used
 by future preparation and loaded-model template inspection, clearing compiled
 templates through the neutral `eredu-text` cache utility. Existing prepared
 chats retain their prompt and protocol metadata. All supplied templates pass

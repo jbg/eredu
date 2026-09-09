@@ -1,5 +1,8 @@
 use super::*;
-use eredu::api::{LoadedTextModelOptions, TextModelError};
+use eredu::api::{inspect_text_model, TextInspectionOptions, TextModelError, TextModelOptions};
+use eredu_core::{
+    InspectionIssueCode, InspectionReadiness, InspectionSeverity, ModelInspectionReport,
+};
 use eredu_text::tokenizer::ChatTemplateIdentity;
 
 fn request() -> ChatTemplateRequest {
@@ -14,8 +17,8 @@ fn request() -> ChatTemplateRequest {
     }
 }
 
-fn text_options() -> LoadedTextModelOptions {
-    LoadedTextModelOptions {
+fn text_options() -> TextModelOptions {
+    TextModelOptions {
         chat_template: Some(ModelChatTemplate::Named(BTreeMap::from([(
             "default".into(),
             concat!(
@@ -101,6 +104,38 @@ fn standard_loaders_apply_template_override_and_preserve_checkpoint_metadata() {
         assert_eq!(prepared.rendered_prompt(), "<bos>goose:hello|assistant");
         assert_eq!(prepared.generation_prompt(), "|assistant");
     }
+    let options = TextModelOptions {
+        chat_template: Some(
+            concat!(
+                "{% if bos_token != '<bos>' or application_label != 'goose' %}",
+                "{{ raise_exception('template variables were not preserved') }}{% endif %}",
+                "{{ messages[0].content }}",
+            )
+            .into(),
+        ),
+    };
+    let report = inspect_text_model(
+        ModelInspectionReport::unverified(artifact.path(), ArtifactFormat::SafeTensors),
+        &options,
+        TextInspectionOptions {
+            chat_request: Some(request()),
+        },
+    );
+    assert_eq!(report.chat_template, InspectionReadiness::Ready);
+    assert!(
+        report.issues.iter().all(|issue| {
+            issue.code != InspectionIssueCode::MissingChatTemplate
+                && issue.severity != InspectionSeverity::Error
+        }),
+        "{:?}",
+        report.issues
+    );
+    let mut loaded =
+        LoadedModel::load_with_text_options(MockBackend, artifact.path(), (), options).unwrap();
+    assert_eq!(
+        loaded.prepare_chat(request()).unwrap().rendered_prompt(),
+        "hello"
+    );
 }
 
 #[test]
@@ -287,7 +322,7 @@ fn gguf_template_precedence_is_override_then_embedded_then_sidecar() {
             &MockBackend,
             &path,
             &plan,
-            LoadedTextModelOptions {
+            TextModelOptions {
                 chat_template: Some("override".into()),
             },
         )
@@ -319,4 +354,165 @@ fn gguf_template_precedence_is_override_then_embedded_then_sidecar() {
             .rendered_prompt(),
         "embedded"
     );
+}
+
+#[test]
+fn text_inspection_uses_template_overrides_for_both_artifact_formats() {
+    use eredu_gguf::MetadataValue;
+
+    for format in [ArtifactFormat::SafeTensors, ArtifactFormat::Gguf] {
+        for checkpoint_template in [
+            None,
+            Some(serde_json::json!("ordinary chat")),
+            Some(serde_json::json!(42)),
+        ] {
+            let artifact = TestDirectory::new();
+            write_loadable_text_artifact(artifact.path());
+            let tokenizer_path = artifact.path().join("tokenizer.json");
+            let mut tokenizer = Tokenizer::from_file(&tokenizer_path).unwrap();
+            tokenizer.with_pre_tokenizer(Some(Whitespace));
+            tokenizer.with_decoder(Some(ByteLevel::default()));
+            tokenizer
+                .add_special_tokens([AddedToken::from("<|im_end|>", true).normalized(false)])
+                .unwrap();
+            tokenizer.save(&tokenizer_path, false).unwrap();
+            std::fs::write(
+                artifact.path().join("generation_config.json"),
+                serde_json::json!({"eos_token_id": tokenizer.token_to_id("<|im_end|>").unwrap()})
+                    .to_string(),
+            )
+            .unwrap();
+            let path = if format == ArtifactFormat::SafeTensors {
+                std::fs::write(
+                    artifact.path().join("tokenizer_config.json"),
+                    serde_json::json!({"chat_template": checkpoint_template}).to_string(),
+                )
+                .unwrap();
+                artifact.path().to_path_buf()
+            } else {
+                // Both embedded and sidecar templates must be superseded.
+                if checkpoint_template.is_some() {
+                    std::fs::write(
+                        artifact.path().join("chat_template.jinja"),
+                        "ordinary sidecar chat",
+                    )
+                    .unwrap();
+                }
+                write_gguf(
+                    artifact.path(),
+                    checkpoint_template.as_ref().map(|value| {
+                        value.as_str().map_or(MetadataValue::Uint32(42), |text| {
+                            MetadataValue::String(text.into())
+                        })
+                    }),
+                )
+            };
+            let baseline = inspect_text_model(
+                ModelInspectionReport::unverified(&path, format),
+                &TextModelOptions::default(),
+                TextInspectionOptions::default(),
+            );
+            assert_eq!(
+                baseline.chat_template,
+                match &checkpoint_template {
+                    None => InspectionReadiness::Missing,
+                    Some(value) if value.is_string() => InspectionReadiness::Ready,
+                    Some(_) => InspectionReadiness::Invalid,
+                }
+            );
+            assert_ne!(baseline.semantic_streaming, InspectionReadiness::Ready);
+            assert_ne!(baseline.native_tools, InspectionReadiness::Ready);
+
+            for template in [
+                QWEN_TEMPLATE.into(),
+                ModelChatTemplate::Named(BTreeMap::from([
+                    ("default".into(), QWEN_TEMPLATE.into()),
+                    ("tool_use".into(), QWEN_TEMPLATE.into()),
+                ])),
+            ] {
+                let options = TextModelOptions {
+                    chat_template: Some(template),
+                };
+                for chat_request in [None, Some(request())] {
+                    let report = inspect_text_model(
+                        ModelInspectionReport::unverified(&path, format),
+                        &options,
+                        TextInspectionOptions { chat_request },
+                    );
+                    assert_eq!(report.tokenizer, InspectionReadiness::Ready);
+                    assert_eq!(report.chat_template, InspectionReadiness::Ready);
+                    assert_eq!(
+                        report.semantic_streaming,
+                        InspectionReadiness::Ready,
+                        "{:?}",
+                        report.issues
+                    );
+                    assert_eq!(
+                        report.native_tools,
+                        InspectionReadiness::Ready,
+                        "{:?}",
+                        report.issues
+                    );
+                    assert!(
+                        report.issues.iter().all(|issue| {
+                            issue.code == InspectionIssueCode::RequestSpecificValidation
+                        }),
+                        "{:?}",
+                        report.issues
+                    );
+                }
+                let mut loaded =
+                    LoadedModel::load_with_text_options(MockBackend, &path, (), options).unwrap();
+                let prepared = loaded.prepare_chat(request()).unwrap();
+                assert!(matches!(
+                    prepared.semantic_support(),
+                    eredu::runtime::chat::SemanticSupport::Supported
+                ));
+                assert!(prepared.native_tool_support().is_supported());
+            }
+        }
+    }
+}
+
+#[test]
+fn text_inspection_validates_the_override_instead_of_falling_back() {
+    let artifact = TestDirectory::new();
+    write_loadable_text_artifact(artifact.path());
+    std::fs::write(artifact.path().join("chat_template.jinja"), "valid chat").unwrap();
+    let gguf = write_gguf(
+        artifact.path(),
+        Some(eredu_gguf::MetadataValue::String("valid chat".into())),
+    );
+    for (path, format) in [
+        (artifact.path(), ArtifactFormat::SafeTensors),
+        (gguf.as_path(), ArtifactFormat::Gguf),
+    ] {
+        for template in [
+            ModelChatTemplate::Single("{% invalid %}".into()),
+            ModelChatTemplate::Named(BTreeMap::from([("tool_use".into(), QWEN_TEMPLATE.into())])),
+        ] {
+            let options = TextModelOptions {
+                chat_template: Some(template),
+            };
+            let report = inspect_text_model(
+                ModelInspectionReport::unverified(path, format),
+                &options,
+                TextInspectionOptions {
+                    chat_request: Some(request()),
+                },
+            );
+            assert_eq!(report.semantic_streaming, InspectionReadiness::Unsupported);
+            assert_eq!(report.native_tools, InspectionReadiness::Unsupported);
+            assert!(report.issues.iter().any(|issue| {
+                issue.code == InspectionIssueCode::UnsupportedSemanticProtocol
+                    && issue.severity == InspectionSeverity::Error
+            }));
+            let mut loaded =
+                LoadedModel::load_with_text_options(MockBackend, path, (), options).unwrap();
+            assert!(matches!(
+                loaded.prepare_chat(request()),
+                Err(TextModelError::Template(_))
+            ));
+        }
+    }
 }

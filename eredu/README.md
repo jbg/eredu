@@ -71,12 +71,12 @@ Low-level token generation returns `B::Token`; use `eredu_core::TokenOutput` to
 obtain its vocabulary ID.
 
 Applications can supply their own builtin or custom Jinja chat template through
-`LoadedTextModelOptions`:
+`TextModelOptions`:
 
 ```rust,ignore
-use eredu::api::LoadedTextModelOptions;
+use eredu::api::TextModelOptions;
 
-let text_options = LoadedTextModelOptions {
+let text_options = TextModelOptions {
     chat_template: Some(application_template.into()),
 };
 let planned = LoadedModel::load_execution_plan_with_text_options(

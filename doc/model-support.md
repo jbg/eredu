@@ -15,14 +15,15 @@ readiness matters:
 ```rust,no_run
 use eredu::{
     api::{
-        inspect_local_model, inspect_text_model, LocalInspectionOptions,
+        inspect_local_model, inspect_text_model, TextModelOptions, LocalInspectionOptions,
         TextInspectionOptions,
     },
 };
 use eredu_core::InspectionSeverity;
 
 let structural = inspect_local_model("/path/to/model", LocalInspectionOptions::default())?;
-let report = inspect_text_model(structural, TextInspectionOptions::default());
+let text_options = TextModelOptions::default();
+let report = inspect_text_model(structural, &text_options, TextInspectionOptions::default());
 if !report.is_loadable() {
     for issue in report
         .issues
@@ -42,6 +43,15 @@ reconstructs tokenizer, template, and EOS metadata and behaviorally probes
 semantic output and native tools. Neither step creates a backend execution
 queue or loads weight payloads. `is_loadable()` is the fail-closed structural
 result for the selected backend options.
+
+Configure a single or named override once in `TextModelOptions::chat_template`.
+Inspection borrows that options value; pass it to the subsequent
+`LoadedModel::*_with_text_options` load. Both operations use the same template
+resolver: an override takes precedence over embedded GGUF metadata and
+sidecars, while checkpoint tokenizer variables and EOS ids remain in effect.
+Invalid selected template metadata is reported without falling back to another
+source. `TextInspectionOptions::chat_request` supplies the messages, tools, and
+template kwargs to probe before loading.
 
 ## Family matrix
 

@@ -8,21 +8,20 @@ use eredu_core::{
     SpeculativeGenerationBatchOutput, SpeculativeGenerationBatchRequest, SpeculativeGenerationLane,
     SpeculativeGenerationOutput, TokenizerCompatibilityProof,
 };
-use eredu_gguf::MetadataValue as GgufMetadataValue;
 use eredu_text::{
     gguf::GgufTokenizer,
     tokenizer::{
         chat_template_kwargs as inspect_chat_template_kwargs, ChatTemplateIdentity,
-        ModelChatTemplate, Tokenizer as ChatTokenizer,
+        Tokenizer as ChatTokenizer,
     },
 };
 
 use super::{
-    LoadedModel, LoadedTextModelConfig, LoadedTextModelOptions, PlannedModel, PreparedChatError,
+    LoadedModel, LoadedTextModelConfig, PlannedModel, PreparedChatError,
     PreparedChatGenerationOutput, PreparedChatGenerationRequest, PreparedChatGenerationSettings,
     PreparedChatInput, PreparedChatSpeculativeBatchRequest, PreparedChatSpeculativeConstraint,
     PreparedChatSpeculativeError, PreparedChatSpeculativeGenerationRequest, TextDecoderError,
-    TextMetadataError, TextModelError,
+    TextMetadataError, TextModelError, TextModelOptions,
 };
 use crate::runtime::chat::PreparedChat;
 use crate::{
@@ -36,8 +35,8 @@ use crate::{
             PreparedChatSemanticState, PreparedChatSetupError, PreparedChatTokenDecoder,
         },
         tokenizer::{
-            gguf_sidecar_dir, load_chat_template, load_gguf_tokenizer_from_metadata,
-            load_tokenizer_for_kind, load_tokenizer_template_kwargs,
+            gguf_sidecar_dir, load_gguf_tokenizer_from_metadata, load_tokenizer_for_kind,
+            load_tokenizer_template_kwargs, resolve_chat_template,
         },
     },
     runtime::{
@@ -498,7 +497,7 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
     /// Renders and validates one JSON-valued chat for generation.
     ///
     /// Returns [`TextModelError::MissingChatTemplate`] when no template is
-    /// attached. Supply one through [`LoadedTextModelOptions`] while loading
+    /// attached. Supply one through [`TextModelOptions`] while loading
     /// or [`Self::set_chat_template`] before preparing a chat.
     pub fn prepare_chat(
         &mut self,
@@ -551,7 +550,7 @@ where
             factory,
             artifact,
             plan,
-            LoadedTextModelOptions::default(),
+            TextModelOptions::default(),
         )
     }
 
@@ -563,7 +562,7 @@ where
         factory: &F,
         artifact: impl AsRef<Path>,
         plan: &eredu_core::ExecutionPlan,
-        text_options: LoadedTextModelOptions,
+        text_options: TextModelOptions,
     ) -> Result<PlannedModel<B, F::Drafter>, PlannedModelLoadError>
     where
         F: eredu_core::ExecutionPlanBackendFactory<
@@ -602,7 +601,7 @@ where
             factory,
             inspection,
             plan,
-            LoadedTextModelOptions::default(),
+            TextModelOptions::default(),
         )
     }
 
@@ -613,7 +612,7 @@ where
             eredu_architectures::processor_plan::ArtifactArchitecturePlan,
         >,
         plan: &eredu_core::ExecutionPlan,
-        text_options: LoadedTextModelOptions,
+        text_options: TextModelOptions,
     ) -> Result<PlannedModel<B, F::Drafter>, PlannedModelLoadError>
     where
         F: eredu_core::ExecutionPlanBackendFactory<
@@ -697,7 +696,7 @@ where
             factory,
             planner,
             request,
-            LoadedTextModelOptions::default(),
+            TextModelOptions::default(),
         )
     }
 
@@ -710,7 +709,7 @@ where
         factory: &F,
         planner: &eredu_core::AutomaticPlanner,
         request: &eredu_core::AutomaticPlanRequest,
-        text_options: LoadedTextModelOptions,
+        text_options: TextModelOptions,
     ) -> Result<(PlannedModel<B, F::Drafter>, eredu_core::ExecutionPlanReport), PlannedModelLoadError>
     where
         F: eredu_core::ExecutionPlanBackendFactory<
@@ -744,12 +743,7 @@ where
         artifact: impl AsRef<Path>,
         options: B::LoadOptions,
     ) -> Result<Self, LoadedModelLoadError> {
-        Self::load_with_text_options(
-            backend,
-            artifact,
-            options,
-            LoadedTextModelOptions::default(),
-        )
+        Self::load_with_text_options(backend, artifact, options, TextModelOptions::default())
     }
 
     /// Loads an artifact on an existing backend with facade-owned text overrides.
@@ -757,7 +751,7 @@ where
         backend: B,
         artifact: impl AsRef<Path>,
         options: B::LoadOptions,
-        text_options: LoadedTextModelOptions,
+        text_options: TextModelOptions,
     ) -> Result<Self, LoadedModelLoadError> {
         let artifact = artifact.as_ref();
         let inspection = eredu_architectures::configuration::inspect_artifact(artifact)?;
@@ -849,7 +843,7 @@ fn loaded_text_artifact(
     inspection: &eredu_core::ArtifactInspection<
         eredu_architectures::processor_plan::ArtifactArchitecturePlan,
     >,
-    text_options: LoadedTextModelOptions,
+    text_options: TextModelOptions,
 ) -> Result<(ChatTokenizer, LoadedTextModelConfig), TextMetadataError> {
     let path = inspection.path();
     let configuration = inspection.configuration();
@@ -877,10 +871,7 @@ fn loaded_text_artifact(
             let tokenizer = load_tokenizer_for_kind(kind, path)?;
             (
                 ChatTokenizer::from_tokenizer(tokenizer),
-                match text_options.chat_template {
-                    Some(template) => Some(template),
-                    None => load_chat_template(path)?,
-                },
+                resolve_chat_template(path, None, &text_options)?,
                 sidecar_eos_token_ids,
                 configuration.effective_model_type().to_owned(),
             )
@@ -893,20 +884,7 @@ fn loaded_text_artifact(
                 .iter()
                 .map(|(key, value)| (key.clone(), value.clone()))
                 .collect::<std::collections::HashMap<_, _>>();
-            let chat_template = match text_options.chat_template {
-                Some(template) => Some(template),
-                None => match metadata.get("tokenizer.chat_template") {
-                    Some(GgufMetadataValue::String(template)) => {
-                        Some(ModelChatTemplate::Single(template.clone()))
-                    }
-                    Some(_) => {
-                        return Err(TextMetadataError::GgufTokenizer(
-                            "tokenizer.chat_template must be a string".into(),
-                        ));
-                    }
-                    None => load_chat_template(sidecar_dir)?,
-                },
-            };
+            let chat_template = resolve_chat_template(sidecar_dir, Some(&metadata), &text_options)?;
             let GgufTokenizer {
                 tokenizer,
                 template_kwargs,

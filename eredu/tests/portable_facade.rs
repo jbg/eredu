@@ -301,7 +301,11 @@ fn tokenizer_and_text_inspection_are_available_without_mlx() {
             ModelInspectionReport::unverified(&directory, ArtifactFormat::SafeTensors);
         structural.model_loadability = InspectionReadiness::Ready;
         structural.requested_load = InspectionReadiness::Ready;
-        let report = inspect_text_model(structural, TextInspectionOptions::default());
+        let report = inspect_text_model(
+            structural,
+            &eredu::api::TextModelOptions::default(),
+            TextInspectionOptions::default(),
+        );
         assert_eq!(report.tokenizer, InspectionReadiness::Ready);
         assert_eq!(report.text_generation, InspectionReadiness::Ready);
         assert_eq!(report.chat_template, InspectionReadiness::Missing);

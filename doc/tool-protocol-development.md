@@ -88,6 +88,7 @@ required property; it must use a caller-supplied local path and must never
 download a checkpoint.
 
 Before accepting support, pass the structural backend report through
-`inspect_text_model` with the same request in `TextInspectionOptions`, verify
+`inspect_text_model`, borrowing the `TextModelOptions` intended for loading
+and supplying the same request in `TextInspectionOptions`, verify
 that unsupported templates remain ordinary-chat-only, and ensure raw
 generation does not inherit a native-tool capability.

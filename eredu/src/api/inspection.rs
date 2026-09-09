@@ -18,15 +18,15 @@ use eredu_core::{
 use eredu_gguf::MetadataValue as GgufMetadataValue;
 use serde_json::{json, Map, Value};
 
-use super::load_tokenizer;
 use super::metadata::{
     eos_token_ids_from_sidecar_dir, gguf_eos_token_ids, merge_eos_token_id_sources,
 };
 use super::request::prepare_chat_from_parts;
 use super::tokenizer::{
-    gguf_sidecar_dir, load_chat_template, load_gguf_tokenizer_from_metadata,
-    load_tokenizer_template_kwargs,
+    gguf_sidecar_dir, load_gguf_tokenizer_from_metadata, load_tokenizer_template_kwargs,
+    resolve_chat_template,
 };
+use super::{load_tokenizer, TextMetadataError, TextModelOptions};
 use crate::runtime::chat::{
     constraints::ConstraintCompiler, ChatTemplateRequest, NativeToolSupport, PreparedChat,
     SemanticSupport, ToolChoice,
@@ -45,14 +45,17 @@ pub struct TextInspectionOptions {
 ///
 /// This function does not inspect tensor structure or materialize weights. A
 /// selected backend must produce the input report first.
+/// It borrows the text options intended for loading; configure the template
+/// once in that value and pass it to the subsequent `*_with_text_options` load.
 pub fn inspect_text_model(
     mut report: ModelInspectionReport,
+    text_options: &TextModelOptions,
     options: TextInspectionOptions,
 ) -> ModelInspectionReport {
     let path = report.path.clone();
     match report.artifact_format {
         ArtifactFormat::SafeTensors => {
-            inspect_safetensors_sidecars(&mut report, &path, options.chat_request);
+            inspect_safetensors_sidecars(&mut report, &path, text_options, options.chat_request);
         }
         ArtifactFormat::Gguf => match eredu_gguf::Reader::open(&path) {
             Ok(reader) => {
@@ -61,7 +64,13 @@ pub fn inspect_text_model(
                     .iter()
                     .map(|(key, value)| (key.clone(), value.clone()))
                     .collect();
-                inspect_gguf_sidecars(&mut report, &path, &metadata, options.chat_request);
+                inspect_gguf_sidecars(
+                    &mut report,
+                    &path,
+                    &metadata,
+                    text_options,
+                    options.chat_request,
+                );
             }
             Err(error) => {
                 report.tokenizer = InspectionReadiness::Invalid;
@@ -90,6 +99,7 @@ pub fn inspect_text_model(
 fn inspect_safetensors_sidecars(
     report: &mut ModelInspectionReport,
     path: &Path,
+    text_options: &TextModelOptions,
     request: Option<ChatTemplateRequest>,
 ) {
     let tokenizer = match load_tokenizer(path) {
@@ -108,7 +118,7 @@ fn inspect_safetensors_sidecars(
             None
         }
     };
-    let template = match load_chat_template(path) {
+    let template = match resolve_chat_template(path, None, text_options) {
         Ok(Some(template)) => {
             report.chat_template = InspectionReadiness::Ready;
             Some(template)
@@ -148,6 +158,7 @@ fn inspect_gguf_sidecars(
     report: &mut ModelInspectionReport,
     path: &Path,
     metadata: &std::collections::HashMap<String, GgufMetadataValue>,
+    text_options: &TextModelOptions,
     request: Option<ChatTemplateRequest>,
 ) {
     let tokenizer = match load_gguf_tokenizer_from_metadata(path, metadata) {
@@ -168,37 +179,37 @@ fn inspect_gguf_sidecars(
             None
         }
     };
-    let embedded = match metadata.get("tokenizer.chat_template") {
-        Some(GgufMetadataValue::String(template)) => {
-            Some(ModelChatTemplate::Single(template.clone()))
+    let template = match resolve_chat_template(gguf_sidecar_dir(path), Some(metadata), text_options)
+    {
+        Ok(Some(template)) => {
+            report.chat_template = InspectionReadiness::Ready;
+            Some(template)
         }
-        Some(_) => {
+        Ok(None) => {
+            report.chat_template = InspectionReadiness::Missing;
+            report.issue(
+                InspectionIssueCode::MissingChatTemplate,
+                InspectionSeverity::Warning,
+                "GGUF has no embedded chat template and no acceptable sidecar template",
+                Some(path.to_path_buf()),
+            );
+            None
+        }
+        Err(error) => {
             report.chat_template = InspectionReadiness::Invalid;
             report.issues.push(InspectionIssue {
                 code: InspectionIssueCode::MissingChatTemplate,
                 severity: InspectionSeverity::Warning,
-                detail: "GGUF tokenizer.chat_template must be a string".into(),
+                detail: error.to_string(),
                 path: Some(path.to_path_buf()),
-                metadata_key: Some("tokenizer.chat_template".into()),
+                metadata_key: matches!(error, TextMetadataError::GgufTokenizer(_))
+                    .then(|| "tokenizer.chat_template".into()),
                 tensor_name: None,
                 tensor_type_code: None,
             });
             None
         }
-        None => None,
     };
-    let template = embedded.or_else(|| load_chat_template(gguf_sidecar_dir(path)).ok().flatten());
-    if template.is_some() {
-        report.chat_template = InspectionReadiness::Ready;
-    } else if report.chat_template != InspectionReadiness::Invalid {
-        report.chat_template = InspectionReadiness::Missing;
-        report.issue(
-            InspectionIssueCode::MissingChatTemplate,
-            InspectionSeverity::Warning,
-            "GGUF has no embedded chat template and no acceptable sidecar template",
-            Some(path.to_path_buf()),
-        );
-    }
     if let (Some(tokenizer), Some(template)) = (tokenizer, template) {
         let eos = merge_eos_token_id_sources([
             eos_token_ids_from_sidecar_dir(gguf_sidecar_dir(path)).unwrap_or_default(),

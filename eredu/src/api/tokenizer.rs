@@ -12,6 +12,8 @@ use eredu_text::tokenizer::{
 use serde_json::{Map, Value};
 use tokenizers::Tokenizer;
 
+use super::TextModelOptions;
+
 /// Closed generation domain, including holes and added/special tokens. Empty
 /// vocabularies remain closed and fail at the sampler's executable-domain check.
 pub(crate) fn tokenizer_token_filter(tokenizer: &Tokenizer) -> eredu_core::TokenFilter {
@@ -104,17 +106,8 @@ pub fn chat_template_kwargs(model_dir: impl AsRef<Path>) -> Result<Vec<String>, 
     let (template, model_id, tokenizer_template_kwargs) = if is_gguf_file(submitted_path) {
         let metadata = portable_gguf_metadata(submitted_path)?;
         let sidecar_dir = gguf_sidecar_dir(submitted_path);
-        let template = match metadata.get("tokenizer.chat_template") {
-            Some(GgufMetadataValue::String(template)) => {
-                Some(ModelChatTemplate::Single(template.clone()))
-            }
-            Some(_) => {
-                return Err(TextMetadataError::GgufTokenizer(
-                    "tokenizer.chat_template must be a string".into(),
-                ));
-            }
-            None => load_chat_template(sidecar_dir)?,
-        };
+        let template =
+            resolve_chat_template(sidecar_dir, Some(&metadata), &TextModelOptions::default())?;
         let mut template_kwargs = gguf_tokenizer::template_kwargs(&metadata)
             .map_err(|error| TextMetadataError::GgufTokenizer(error.to_string()))?;
         template_kwargs.extend(load_tokenizer_template_kwargs(sidecar_dir)?);
@@ -215,6 +208,27 @@ pub(crate) fn load_chat_template(
     }
 
     Ok(None)
+}
+
+/// Applies the shared inspection/loading precedence: override, embedded GGUF
+/// template, then sidecars. Invalid selected metadata never selects a fallback.
+pub(super) fn resolve_chat_template(
+    sidecar_dir: &Path,
+    gguf_metadata: Option<&std::collections::HashMap<String, GgufMetadataValue>>,
+    options: &TextModelOptions,
+) -> Result<Option<ModelChatTemplate>, TextMetadataError> {
+    if let Some(template) = &options.chat_template {
+        return Ok(Some(template.clone()));
+    }
+    match gguf_metadata.and_then(|metadata| metadata.get("tokenizer.chat_template")) {
+        Some(GgufMetadataValue::String(template)) => {
+            Ok(Some(ModelChatTemplate::Single(template.clone())))
+        }
+        Some(_) => Err(TextMetadataError::GgufTokenizer(
+            "tokenizer.chat_template must be a string".into(),
+        )),
+        None => load_chat_template(sidecar_dir),
+    }
 }
 
 pub(crate) fn load_tokenizer_template_kwargs(

@@ -53,8 +53,8 @@ pub use observed::{
 };
 
 pub use portable::{
-    GeneratedToken, LoadedModel, LoadedTextModelConfig, LoadedTextModelOptions, PlannedModel,
-    TextDecoder, TextDecoderError, TextGeneration, TextModelError,
+    GeneratedToken, LoadedModel, LoadedTextModelConfig, PlannedModel, TextDecoder,
+    TextDecoderError, TextGeneration, TextModelError, TextModelOptions,
 };
 
 /// Portable failure reported by prepared-chat constraint state.

@@ -170,9 +170,12 @@ impl TextDecoder {
     }
 }
 
-/// Facade-owned text options for the standard model-loading paths.
+/// Facade-owned text options shared by pre-load inspection and model loading.
+///
+/// Borrow this value for [`super::inspect_text_model`], then pass it to a
+/// `LoadedModel::*_with_text_options` loading method.
 #[derive(Debug, Clone, Default)]
-pub struct LoadedTextModelOptions {
+pub struct TextModelOptions {
     /// Replaces checkpoint chat-template selection with a caller-supplied Jinja
     /// template or named-template collection, including application builtins.
     /// Tokenizer variables, EOS ids, and generation defaults still come from
