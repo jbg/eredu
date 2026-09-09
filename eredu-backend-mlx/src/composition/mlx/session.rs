@@ -53,7 +53,8 @@ pub use output_completion::{
     MlxModelOutput, MlxSessionCompletion, MlxTextCompletion, MlxTextToken,
 };
 
-use generation::{sample_text_submission, MlxTextSampler};
+use generation::sample_text_submission;
+pub(crate) use generation::MlxTextSampler;
 #[cfg(test)]
 use model_session::model_submission;
 use observation::{observe_tensor, ArrayObserverAdapter, InspectionCollector};

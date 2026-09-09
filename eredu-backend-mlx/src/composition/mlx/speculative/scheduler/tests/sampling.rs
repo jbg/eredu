@@ -156,9 +156,11 @@ fn stochastic_match_and_mismatch_ignore_interleaving_and_branch_slots() {
 }
 
 #[test]
-fn stochastic_request_is_reproducible_across_scheduler_interleavings() {
+fn prepared_mirostat_is_reproducible_with_lookahead_and_mixed_lane_interleavings() {
     fn run(
-        with_peer: bool,
+        peer: Option<eredu_core::TextSamplingStrategy>,
+        lookahead: bool,
+        reject_first: bool,
     ) -> (
         Vec<u32>,
         Vec<usize>,
@@ -174,7 +176,7 @@ fn stochastic_request_is_reproducible_across_scheduler_interleavings() {
         let mut backend = ScriptedBackend {
             first_token: 1,
             rejection_token: 1,
-            reject_first: false,
+            reject_first,
             accept_second: true,
             bonus_token: 0,
             routes: Vec::new(),
@@ -188,7 +190,7 @@ fn stochastic_request_is_reproducible_across_scheduler_interleavings() {
         let mut scheduler = MlxSpeculativeScheduler::new(
             &mut backend,
             SpeculativeExecutionStreams::for_test(target.stream(), draft.stream()).unwrap(),
-            SpeculativeSchedulerOptions::default(),
+            SpeculativeSchedulerOptions::default().with_lookahead(lookahead),
         )
         .unwrap();
         let config = SpeculativeConfig {
@@ -197,31 +199,60 @@ fn stochastic_request_is_reproducible_across_scheduler_interleavings() {
             temperature: 1.0,
             eos_token_ids: Vec::new(),
         };
+        let resolved = eredu_core::generation::resolve_generation_config(
+            None,
+            eredu_core::GenerationConfigOverrides {
+                temperature: Some(1.0),
+                repetition_penalty: Some(1.2),
+                repeat_last_n: Some(2),
+                frequency_penalty: Some(0.3),
+                presence_penalty: Some(0.4),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let sampler = |strategy| {
+            let config = eredu_core::TextGenerationConfig::new(resolved);
+            let config = match strategy {
+                eredu_core::TextSamplingStrategy::Standard => config,
+                eredu_core::TextSamplingStrategy::MirostatV2 { tau, eta } => {
+                    config.with_mirostat_v2(tau, eta).unwrap()
+                }
+            };
+            crate::composition::mlx::session::MlxTextSampler::from_config(config).unwrap()
+        };
         scheduler
             .submit_with_semantics(
                 &mut cache_a,
                 ModelInput::new(&parts_a),
                 config.clone(),
                 Some(safemlx::random::key(7).unwrap()),
-                MirostatV2Sampler::default(),
+                sampler(eredu_core::TextSamplingStrategy::MirostatV2 { tau: 4.0, eta: 0.2 }),
                 Box::new(TestSemanticState::default()),
                 move |event| callback.borrow_mut().push(event),
             )
             .unwrap();
-        if with_peer {
+        if let Some(strategy) = peer {
             scheduler
                 .submit(
                     &mut cache_b,
                     ModelInput::new(&parts_b),
                     config,
                     Some(safemlx::random::key(99).unwrap()),
-                    MirostatV2Sampler::default(),
+                    sampler(strategy),
                     |_| Ok(()),
                 )
                 .unwrap();
         }
         scheduler.run().unwrap();
         let output = scheduler.finish().unwrap();
+        assert!(output.requests[0].stats.draft_tokens() > 0);
+        assert_eq!(output.requests[0].stats.optimistic_draft_tokens(), 0);
+        if reject_first {
+            assert_eq!(output.requests[0].stats.accepted_tokens(), 0);
+        } else {
+            assert!(output.requests[0].stats.accepted_tokens() > 0);
+        }
         let events = events.borrow().clone();
         (
             output.requests[0].token_ids.clone(),
@@ -231,5 +262,16 @@ fn stochastic_request_is_reproducible_across_scheduler_interleavings() {
         )
     }
 
-    assert_eq!(run(false), run(true));
+    for reject_first in [false, true] {
+        let expected = run(None, false, reject_first);
+        for lookahead in [false, true] {
+            for peer in [
+                None,
+                Some(eredu_core::TextSamplingStrategy::Standard),
+                Some(eredu_core::TextSamplingStrategy::MirostatV2 { tau: 3.0, eta: 0.5 }),
+            ] {
+                assert_eq!(run(peer, lookahead, reject_first), expected);
+            }
+        }
+    }
 }

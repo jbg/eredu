@@ -21,14 +21,26 @@ impl SpeculativeGenerationBackend for MockBackend {
 
     fn with_speculative_execution<C, V>(
         runtime: &mut ModelRuntime<Self>,
-        _: SpeculativeGenerationBatchRequest<'_, Self, Self::Drafter, C>,
+        mut request: SpeculativeGenerationBatchRequest<'_, Self, Self::Drafter, C>,
         _: V,
     ) -> Result<SpeculativeGenerationBatchOutput, Self::Error>
     where
         C: SpeculativeTokenFilterController,
         V: SpeculativeGenerationVisitor,
     {
-        runtime.backend().calls.borrow_mut().speculative += 1;
+        let mut calls = runtime.backend().calls.borrow_mut();
+        calls.speculative += 1;
+        for mut lane in request.take_lanes() {
+            assert_eq!(
+                lane.config().temperature,
+                lane.generation().sampling().temperature
+            );
+            assert_eq!(lane.config().max_tokens, 2);
+            calls.configs.push(lane.take_generation());
+            calls
+                .filters
+                .push(lane.take_constraint().filter_at(&[]).unwrap());
+        }
         Err(MockError)
     }
 }
@@ -164,6 +176,13 @@ fn invalid_mirostat_is_rejected_before_backend_work() {
                 },
                 ..mirostat()
             };
+            assert_invalid_speculative_settings(None, settings, |error| {
+                assert!(matches!(
+                    (error, tau_is_invalid),
+                    (GenerationError::InvalidMirostatTau(_), true)
+                        | (GenerationError::InvalidMirostatEta(_), false)
+                ));
+            });
             let error = model
                 .generate_prepared_chat(PreparedChatGenerationRequest {
                     input: PreparedChatInput::rendered_prompt(&chat),
@@ -227,6 +246,19 @@ fn mirostat_requires_positive_effective_temperature_after_resolution() {
     ] {
         let backend = MockBackend::default();
         let calls = backend.calls.clone();
+        assert_invalid_speculative_settings(
+            checkpoint.clone(),
+            PreparedChatGenerationSettings {
+                overrides,
+                ..mirostat()
+            },
+            |error| {
+                assert!(matches!(
+                    error,
+                    GenerationError::InvalidMirostatTemperature(0.0)
+                ))
+            },
+        );
         let mut model = sparse_vocabulary_model_with_backend(backend, checkpoint);
         let chat = chat(&mut model);
         let error = model
@@ -252,13 +284,25 @@ fn mirostat_requires_positive_effective_temperature_after_resolution() {
 }
 
 #[test]
-fn speculative_mirostat_rejects_single_and_mixed_batches_before_backend_work() {
-    let backend = MockBackend::default();
-    let calls = backend.calls.clone();
-    let mut model = sparse_vocabulary_model_with_backend(backend, None);
-    let chat = chat(&mut model);
+fn speculative_mirostat_preserves_single_and_mixed_batch_settings() {
     for lookahead in [false, true] {
         for embedded in [false, true] {
+            let backend = MockBackend::default();
+            let calls = backend.calls.clone();
+            let mut model = sparse_vocabulary_model_with_backend(
+                backend,
+                Some(CheckpointGenerationConfig {
+                    repetition_penalty: Some(1.2),
+                    repeat_last_n: Some(32),
+                    frequency_penalty: Some(0.3),
+                    presence_penalty: Some(0.4),
+                    ..Default::default()
+                }),
+            );
+            let chat = chat(&mut model);
+            let expected = model
+                .resolve_generation_config(mirostat().overrides)
+                .unwrap();
             let mut drafter = ();
             let error = model
                 .generate_prepared_chat_speculative(PreparedChatSpeculativeGenerationRequest {
@@ -276,39 +320,130 @@ fn speculative_mirostat_rejects_single_and_mixed_batches_before_backend_work() {
                     },
                     caller_stop_sequences: &[],
                     cancellation: Default::default(),
-                    on_event: |_| panic!("unsupported sampling must not emit events"),
+                    on_event: |_| panic!("mock backend must not emit events"),
                 })
                 .err()
-                .expect("Mirostat speculation must be rejected");
-            assert!(
-                matches!(error, PreparedChatSpeculativeError::UnsupportedSamplingStrategy(s) if s == mirostat().strategy)
-            );
+                .expect("mock backend returns its sentinel error");
+            assert!(matches!(error, PreparedChatSpeculativeError::Backend(_)));
+            let error = model
+                .generate_prepared_chat_speculative_batch(PreparedChatSpeculativeBatchRequest {
+                    drafting: if embedded {
+                        SpeculativeDraft::Embedded
+                    } else {
+                        SpeculativeDraft::External(&mut drafter)
+                    },
+                    lanes: [TextSamplingStrategy::Standard, mirostat().strategy]
+                        .into_iter()
+                        .map(|strategy| PreparedChatSpeculativeBatchLane {
+                            input: PreparedChatInput::rendered_prompt(&chat),
+                            settings: PreparedChatGenerationSettings {
+                                strategy,
+                                ..mirostat()
+                            },
+                            max_draft_tokens: std::num::NonZeroUsize::new(2).unwrap(),
+                            caller_stop_sequences: &[],
+                            cancellation: Default::default(),
+                            on_event: Box::new(|_| panic!("mock backend must not emit events")),
+                        })
+                        .collect(),
+                    scheduler: eredu_core::SpeculativeSchedulerOptions::default()
+                        .with_lookahead(lookahead),
+                })
+                .err()
+                .expect("mock backend returns its sentinel error");
+            assert!(matches!(error, PreparedChatSpeculativeError::Backend(_)));
+            let calls = calls.borrow();
+            assert_eq!(calls.prompts, 3);
+            assert_eq!(calls.speculative, 2);
+            assert_eq!(calls.configs.len(), 3);
+            for (config, strategy) in calls.configs.iter().zip([
+                mirostat().strategy,
+                TextSamplingStrategy::Standard,
+                mirostat().strategy,
+            ]) {
+                assert_eq!(config.strategy(), strategy);
+                assert_eq!(config.seed(), 73);
+                assert_eq!(config.sampling(), expected);
+            }
+            assert_eq!(calls.filters.len(), 3);
+            for filter in &calls.filters {
+                assert_eq!(
+                    filter.allowed_mask_for(7).unwrap().unwrap().as_ref(),
+                    [true, false, true, false, false, true, false]
+                );
+            }
         }
-        let error = model
-            .generate_prepared_chat_speculative_batch(PreparedChatSpeculativeBatchRequest {
-                drafting: SpeculativeDraft::Embedded,
-                lanes: [PreparedChatGenerationSettings::default(), mirostat()]
-                    .into_iter()
-                    .map(|settings| PreparedChatSpeculativeBatchLane {
-                        input: PreparedChatInput::rendered_prompt(&chat),
-                        settings,
-                        max_draft_tokens: std::num::NonZeroUsize::new(2).unwrap(),
-                        caller_stop_sequences: &[],
-                        cancellation: Default::default(),
-                        on_event: Box::new(|_| panic!("unsupported sampling must not emit events")),
-                    })
-                    .collect(),
-                scheduler: eredu_core::SpeculativeSchedulerOptions::default()
-                    .with_lookahead(lookahead),
-            })
-            .err()
-            .expect("mixed Mirostat batch must be rejected");
-        assert!(
-            matches!(error, PreparedChatSpeculativeError::UnsupportedSamplingStrategy(s) if s == mirostat().strategy)
-        );
+    }
+}
+
+fn assert_invalid_speculative_settings(
+    checkpoint: Option<CheckpointGenerationConfig>,
+    settings: PreparedChatGenerationSettings,
+    check_error: impl Fn(GenerationError),
+) {
+    let backend = MockBackend::default();
+    let calls = backend.calls.clone();
+    let mut model = sparse_vocabulary_model_with_backend(backend, checkpoint);
+    let chat = chat(&mut model);
+    for lookahead in [false, true] {
+        for embedded in [false, true] {
+            let mut drafter = ();
+            let error = model
+                .generate_prepared_chat_speculative(PreparedChatSpeculativeGenerationRequest {
+                    input: PreparedChatInput::rendered_prompt(&chat),
+                    drafting: if embedded {
+                        SpeculativeDraft::Embedded
+                    } else {
+                        SpeculativeDraft::External(&mut drafter)
+                    },
+                    settings,
+                    options: eredu::api::PreparedChatSpeculativeGenerationOptions {
+                        scheduler: eredu_core::SpeculativeSchedulerOptions::default()
+                            .with_lookahead(lookahead),
+                        ..Default::default()
+                    },
+                    caller_stop_sequences: &[],
+                    cancellation: Default::default(),
+                    on_event: |_| panic!("invalid settings must not emit events"),
+                })
+                .err()
+                .expect("invalid settings must fail");
+            let PreparedChatSpeculativeError::Generation(error) = error else {
+                panic!("expected portable generation error: {error}");
+            };
+            check_error(error);
+            let error = model
+                .generate_prepared_chat_speculative_batch(PreparedChatSpeculativeBatchRequest {
+                    drafting: if embedded {
+                        SpeculativeDraft::Embedded
+                    } else {
+                        SpeculativeDraft::External(&mut drafter)
+                    },
+                    lanes: [PreparedChatGenerationSettings::default(), settings]
+                        .into_iter()
+                        .map(|settings| PreparedChatSpeculativeBatchLane {
+                            input: PreparedChatInput::rendered_prompt(&chat),
+                            settings,
+                            max_draft_tokens: std::num::NonZeroUsize::new(2).unwrap(),
+                            caller_stop_sequences: &[],
+                            cancellation: Default::default(),
+                            on_event: Box::new(|_| panic!("invalid settings must not emit events")),
+                        })
+                        .collect(),
+                    scheduler: eredu_core::SpeculativeSchedulerOptions::default()
+                        .with_lookahead(lookahead),
+                })
+                .err()
+                .expect("invalid batch settings must fail");
+            let PreparedChatSpeculativeError::Generation(error) = error else {
+                panic!("expected portable generation error: {error}");
+            };
+            check_error(error);
+        }
     }
     let calls = calls.borrow();
     assert_eq!(calls.prompts, 0);
     assert_eq!(calls.speculative, 0);
     assert!(calls.configs.is_empty());
+    assert!(calls.filters.is_empty());
 }

@@ -151,20 +151,6 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
         Ok((config, max_tokens))
     }
 
-    fn resolve_speculative_generation_settings(
-        &self,
-        settings: PreparedChatGenerationSettings,
-    ) -> Result<(eredu_core::TextGenerationConfig, NonZeroUsize), PreparedChatSpeculativeError>
-    {
-        let resolved = self.resolve_text_generation_settings(settings)?;
-        if settings.strategy != eredu_core::TextSamplingStrategy::Standard {
-            return Err(PreparedChatSpeculativeError::UnsupportedSamplingStrategy(
-                settings.strategy,
-            ));
-        }
-        Ok(resolved)
-    }
-
     /// Generates one constrained semantic response through the selected backend.
     /// Use [`Self::reset`] to establish fresh request state when reusing a model,
     /// and [`Self::synchronize`] to confirm settlement after cancellation.
@@ -316,7 +302,7 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
             cancellation,
             on_event,
         } = request;
-        let generation = self.resolve_speculative_generation_settings(settings)?;
+        let generation = self.resolve_text_generation_settings(settings)?;
         let (prompt, generation, config, constraint, semantic) = self.prepare_speculative_chat(
             input,
             generation,
@@ -375,7 +361,7 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
         // Validate every lane before preparing any backend prompt or execution.
         let generations = lanes
             .iter()
-            .map(|lane| self.resolve_speculative_generation_settings(lane.settings))
+            .map(|lane| self.resolve_text_generation_settings(lane.settings))
             .collect::<Result<Vec<_>, _>>()?;
         let mut prepared_lanes = Vec::with_capacity(lanes.len());
         for (lane, generation) in lanes.into_iter().zip(generations) {

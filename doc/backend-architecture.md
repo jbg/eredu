@@ -3057,10 +3057,16 @@ positive tau, eta, and effective temperature after checkpoint defaults and reque
 overrides are resolved; `do_sample = false` therefore cannot select Mirostat. It
 retains the resolved seed and penalties, replacing top-k, top-p, and min-p. The
 facade's vocabulary and tool masks apply before sampling, so adaptive updates use
-the resulting constrained distribution. Ordinary, observed, intervened, and
-controlled generation share this resolution. Prepared speculative requests reject
-Mirostat with a typed facade error before backend work, including mixed batches;
-the MLX prepared speculative adapter also rejects it for direct trait callers.
+the resulting constrained distribution. Ordinary, observed, intervened,
+controlled, and prepared speculative generation share this resolution. Speculative
+batches may mix strategies and retain independent sampler state per lane. The MLX
+adapter shares sampler construction with ordinary generation and delegates logits
+processing and committed-token updates to the neutral runtime policies. Mirostat
+updates from each committed constrained target distribution, including accepted
+proposals, replacements, and bonus tokens. Its policy disables exact optimistic
+promotion without disabling drafting or verification; standard lanes retain their
+existing lookahead capability. All lane settings are validated before backend
+prompt preparation or execution.
 
 ```rust,ignore
 use eredu::api::{PreparedChatGenerationSettings, TextSamplingStrategy};

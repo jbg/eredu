@@ -12,12 +12,13 @@ use eredu_core::{
     SpeculativeGenerationVisitor, SpeculativeOutputRuntime, SpeculativeSampling,
     SpeculativeSemanticConstraint, SpeculativeSemanticState, SpeculativeTokenFilterController,
 };
-use eredu_runtime::{ConstrainedSampler, GenerationSampler, SpeculativeSampler};
+use eredu_runtime::{ConstrainedSampler, SpeculativeSampler};
 use safemlx::{
     error::Exception, ops::indexing::TryIndexOp, transforms::async_eval_with_event, Array, Stream,
 };
 
 use super::{
+    session::MlxTextSampler,
     speculative::{
         scheduler::{component_timing_enabled, MlxSpeculativeRuntime},
         MlxAssistantPreparationVisitor, MlxDrafter, MlxSpeculativeSampling,
@@ -348,7 +349,7 @@ struct MlxSpeculativeLaneRuntime<'a, C> {
     on_event: Box<dyn FnMut(SemanticEvent) + 'a>,
 }
 
-type MlxPreparedSampler<C> = ConstrainedSampler<GenerationSampler, C>;
+type MlxPreparedSampler<C> = ConstrainedSampler<MlxTextSampler, C>;
 
 fn validate_lane_proposal_capacity(
     config: &SpeculativeConfig,
@@ -550,13 +551,12 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
         C: SpeculativeTokenFilterController,
     {
         let resolved = generation.sampling();
+        let sampler = MlxTextSampler::from_config(generation)
+            .map_err(|error| Error::Speculative(error.to_string()))?;
         let prng_key = (resolved.temperature != 0.0)
             .then(|| safemlx::random::key(generation.seed()))
             .transpose()?;
-        Ok((
-            prng_key,
-            ConstrainedSampler::new(GenerationSampler::from_resolved(resolved), constraint),
-        ))
+        Ok((prng_key, ConstrainedSampler::new(sampler, constraint)))
     }
 
     fn prepare_speculative_batch_lanes<'a, C>(
@@ -604,13 +604,6 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
     {
         let drafting = request.take_drafting();
         let lanes = request.take_lanes();
-        for lane in &lanes {
-            if lane.generation().strategy() != eredu_core::TextSamplingStrategy::Standard {
-                return Err(Error::Speculative(
-                    "prepared speculative generation does not support Mirostat V2; use ordinary text generation".into(),
-                ));
-            }
-        }
         match drafting {
             SpeculativeDraft::External(drafter) => {
                 self.generate_speculative_batch_with_external_draft(drafter, lanes, visitor)

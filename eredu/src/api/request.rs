@@ -35,7 +35,8 @@ pub struct PreparedChatGenerationSettings {
     /// defaults and overrides are resolved. It retains penalties and replaces
     /// top-k, top-p, and min-p. Vocabulary and tool constraints filter logits
     /// before sampling; adaptive state tracks the constrained distribution.
-    /// Prepared speculative generation rejects Mirostat V2 before backend work.
+    /// Prepared speculative generation retains adaptive state per lane and
+    /// disables exact optimistic lookahead promotion for Mirostat V2.
     pub strategy: eredu_core::TextSamplingStrategy,
     /// Deterministic root seed used by the selected backend for stochastic sampling.
     pub seed: u64,
@@ -173,7 +174,8 @@ impl Default for PreparedChatSpeculativeGenerationOptions {
 /// Failure while the facade prepares or a backend executes speculative chat.
 #[derive(Debug, thiserror::Error)]
 pub enum PreparedChatSpeculativeError {
-    /// The prepared speculative path cannot preserve the requested sampler state.
+    /// A sampling strategy is unavailable for prepared speculative generation.
+    /// Retained for source compatibility; all current strategies are supported.
     #[error("prepared-chat speculative generation does not support sampling strategy {0:?}; use ordinary prepared-chat generation")]
     UnsupportedSamplingStrategy(eredu_core::TextSamplingStrategy),
     /// The selected backend failed prompt preparation or speculative execution.

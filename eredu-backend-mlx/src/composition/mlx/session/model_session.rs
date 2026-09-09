@@ -1437,26 +1437,13 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
             } else {
                 Some(RandomState::from_key(safemlx::random::key(config.seed())?))
             };
-            let sampler = match config.strategy() {
-                TextSamplingStrategy::Standard => {
-                    MlxTextSampler::Standard(GenerationSampler::from_resolved(sampling))
+            let sampler = MlxTextSampler::from_config(config).map_err(|error| {
+                eredu_core::BackendError::Execution {
+                    session: "text-generation".into(),
+                    operation: "configure Mirostat V2".into(),
+                    message: error.to_string(),
                 }
-                TextSamplingStrategy::MirostatV2 { tau, eta } => {
-                    let sampler = MirostatV2Sampler::new(tau, eta)
-                        .map_err(|error| eredu_core::BackendError::Execution {
-                            session: "text-generation".into(),
-                            operation: "configure Mirostat V2".into(),
-                            message: error.to_string(),
-                        })?
-                        .penalties(
-                            sampling.repetition_penalty,
-                            sampling.repeat_last_n,
-                            sampling.frequency_penalty,
-                            sampling.presence_penalty,
-                        );
-                    MlxTextSampler::MirostatV2(sampler)
-                }
-            };
+            })?;
             Ok(MlxTextGenerationState {
                 sampling: super::generation::MlxTextSamplingState {
                     temperature: sampling.temperature,

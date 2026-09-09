@@ -1,4 +1,5 @@
 use super::*;
+use eredu_runtime::{SamplingConfigurationError, SpeculativeSampler};
 
 /// MLX sampling and randomness state for backend-generic text generation.
 pub struct MlxTextGenerationState {
@@ -16,12 +17,31 @@ pub struct MlxTextSamplingState {
 }
 
 #[derive(Clone)]
-pub(super) enum MlxTextSampler {
+pub(crate) enum MlxTextSampler {
     Standard(GenerationSampler),
     MirostatV2(MirostatV2Sampler),
 }
 
 impl MlxTextSampler {
+    pub(crate) fn from_config(
+        config: TextGenerationConfig,
+    ) -> Result<Self, SamplingConfigurationError> {
+        let sampling = config.sampling();
+        Ok(match config.strategy() {
+            TextSamplingStrategy::Standard => {
+                Self::Standard(GenerationSampler::from_resolved(sampling))
+            }
+            TextSamplingStrategy::MirostatV2 { tau, eta } => {
+                Self::MirostatV2(MirostatV2Sampler::new(tau, eta)?.penalties(
+                    sampling.repetition_penalty,
+                    sampling.repeat_last_n,
+                    sampling.frequency_penalty,
+                    sampling.presence_penalty,
+                ))
+            }
+        })
+    }
+
     fn sample(
         &mut self,
         logits: &MlxTensor,
@@ -36,6 +56,70 @@ impl MlxTextSampler {
             Self::MirostatV2(sampler) => {
                 Sampler::<MlxSamplingBackend>::sample(sampler, logits, temperature, random, stream)
             }
+        }
+    }
+}
+
+impl SpeculativeSampler<MlxSamplingBackend> for MlxTextSampler {
+    fn supports_exact_optimistic_promotion(&self) -> bool {
+        match self {
+            Self::Standard(sampler) => {
+                SpeculativeSampler::<MlxSamplingBackend>::supports_exact_optimistic_promotion(
+                    sampler,
+                )
+            }
+            Self::MirostatV2(sampler) => {
+                SpeculativeSampler::<MlxSamplingBackend>::supports_exact_optimistic_promotion(
+                    sampler,
+                )
+            }
+        }
+    }
+
+    fn process_logits(
+        &mut self,
+        logits: &MlxTensor,
+        temperature: f32,
+        history: &[u32],
+        stream: &Stream,
+    ) -> Result<MlxTensor, Exception> {
+        match self {
+            Self::Standard(sampler) => SpeculativeSampler::<MlxSamplingBackend>::process_logits(
+                sampler,
+                logits,
+                temperature,
+                history,
+                stream,
+            ),
+            Self::MirostatV2(sampler) => SpeculativeSampler::<MlxSamplingBackend>::process_logits(
+                sampler,
+                logits,
+                temperature,
+                history,
+                stream,
+            ),
+        }
+    }
+
+    fn commit_token(
+        &mut self,
+        processed_logits: &MlxTensor,
+        token: u32,
+        stream: &Stream,
+    ) -> Result<(), Exception> {
+        match self {
+            Self::Standard(sampler) => SpeculativeSampler::<MlxSamplingBackend>::commit_token(
+                sampler,
+                processed_logits,
+                token,
+                stream,
+            ),
+            Self::MirostatV2(sampler) => SpeculativeSampler::<MlxSamplingBackend>::commit_token(
+                sampler,
+                processed_logits,
+                token,
+                stream,
+            ),
         }
     }
 }
