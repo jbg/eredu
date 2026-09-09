@@ -31,8 +31,8 @@ use crate::{
             read_checkpoint_generation_config,
         },
         request::{
-            prepare_chat_from_parts, prepared_chat_control_runtime, BackendGenerationTokenSource,
-            PreparedChatSemanticState, PreparedChatSetupError, PreparedChatTokenDecoder,
+            prepare_chat_from_parts, BackendGenerationTokenSource, PreparedChatSemanticState,
+            PreparedChatSetupError, PreparedChatTokenDecoder, PreparedGenerationMode,
         },
         tokenizer::{
             gguf_sidecar_dir, load_gguf_tokenizer_from_metadata, load_tokenizer_for_kind,
@@ -163,6 +163,33 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
         self.generate_prepared_chat_captured(request, None, std::time::Instant::now())
     }
 
+    /// Generates literal text from a prepared prompt, including unrecognized
+    /// templates, with committed-token timing in the returned output.
+    ///
+    /// Uses the same request and output as [`Self::generate_prepared_chat`], but
+    /// emits only `TextDelta` and `Finished`. Retains sampling, tokenizer validity,
+    /// EOS, caller stops and cancellation; skips special tokens without parsing
+    /// tools, reasoning or profile-specific stops. Admission follows
+    /// [`PreparedChat::text_generation_support`]: native tool declarations and
+    /// required calls are rejected; explicit thinking requires opting into
+    /// unparsed reasoning. Application-emulated tools can use ordinary prompt text.
+    /// Use [`Self::reset`] before reusing request state and [`Self::synchronize`]
+    /// to confirm settlement after cancellation.
+    pub fn generate_prepared_text<F>(
+        &mut self,
+        request: PreparedChatGenerationRequest<'_, B, F>,
+    ) -> Result<PreparedChatGenerationOutput, PreparedChatError>
+    where
+        F: FnMut(SemanticEvent),
+    {
+        self.generate_prepared(
+            request,
+            None,
+            std::time::Instant::now(),
+            PreparedGenerationMode::Text,
+        )
+    }
+
     pub(super) fn generate_prepared_chat_captured<'a, F>(
         &'a mut self,
         request: PreparedChatGenerationRequest<'_, B, F>,
@@ -172,6 +199,28 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
             &'a mut dyn FnMut(Option<u32>, Option<eredu_core::capture::CapturedStep>, f64),
         )>,
         generation_started: std::time::Instant,
+    ) -> Result<PreparedChatGenerationOutput, PreparedChatError>
+    where
+        F: FnMut(SemanticEvent),
+    {
+        self.generate_prepared(
+            request,
+            capture,
+            generation_started,
+            PreparedGenerationMode::Semantic,
+        )
+    }
+
+    fn generate_prepared<'a, F>(
+        &'a mut self,
+        request: PreparedChatGenerationRequest<'_, B, F>,
+        capture: Option<(
+            eredu_core::capture::AdmittedCapturePlan,
+            Option<eredu_core::intervention::AdmittedInterventionPlan>,
+            &'a mut dyn FnMut(Option<u32>, Option<eredu_core::capture::CapturedStep>, f64),
+        )>,
+        generation_started: std::time::Instant,
+        mode: PreparedGenerationMode,
     ) -> Result<PreparedChatGenerationOutput, PreparedChatError>
     where
         F: FnMut(SemanticEvent),
@@ -197,12 +246,13 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
 
         let prepared_chat = input.prepared_chat();
         let (config, max_tokens) = self.resolve_text_generation_settings(settings)?;
-        let control = prepared_chat_control_runtime(
-            prepared_chat,
-            caller_stop_sequences,
-            self.token_validity.clone(),
-        )
-        .map_err(map_prepared_chat_setup_error)?;
+        let control = mode
+            .prepare_control(
+                prepared_chat,
+                caller_stop_sequences,
+                self.token_validity.clone(),
+            )
+            .map_err(map_prepared_chat_setup_error)?;
         let decoder = PreparedChatTokenDecoder {
             decoder: self.text_decoder(true),
         };
@@ -291,6 +341,44 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
         B: SpeculativeGenerationBackend,
         F: FnMut(SemanticEvent),
     {
+        self.generate_prepared_speculative(request, PreparedGenerationMode::Semantic)
+    }
+
+    /// Generates literal text using embedded or external drafting, including
+    /// unrecognized templates. Uses the text admission and output semantics of
+    /// [`Self::generate_prepared_text`] with the existing speculative request type.
+    /// TTFT measures the first target-committed token, including buffered or EOS
+    /// tokens. The selected model must support the requested drafting mode.
+    pub fn generate_prepared_text_speculative<'a, F>(
+        &mut self,
+        request: PreparedChatSpeculativeGenerationRequest<
+            'a,
+            B,
+            <B as SpeculativeGenerationBackend>::Drafter,
+            F,
+        >,
+    ) -> Result<SpeculativeGenerationOutput, PreparedChatSpeculativeError>
+    where
+        B: SpeculativeGenerationBackend,
+        F: FnMut(SemanticEvent),
+    {
+        self.generate_prepared_speculative(request, PreparedGenerationMode::Text)
+    }
+
+    fn generate_prepared_speculative<'a, F>(
+        &mut self,
+        request: PreparedChatSpeculativeGenerationRequest<
+            'a,
+            B,
+            <B as SpeculativeGenerationBackend>::Drafter,
+            F,
+        >,
+        mode: PreparedGenerationMode,
+    ) -> Result<SpeculativeGenerationOutput, PreparedChatSpeculativeError>
+    where
+        B: SpeculativeGenerationBackend,
+        F: FnMut(SemanticEvent),
+    {
         let driver = eredu_runtime::RunSpeculativeGeneration::new(request.options.scheduler);
         let PreparedChatSpeculativeGenerationRequest {
             input,
@@ -302,12 +390,14 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
             on_event,
         } = request;
         let generation = self.resolve_text_generation_settings(settings)?;
-        let (prompt, generation, config, constraint, semantic) = self.prepare_speculative_chat(
-            input,
-            generation,
-            options.max_draft_tokens,
-            caller_stop_sequences,
-        )?;
+        let (prompt, generation, config, constraint, semantic) = self
+            .prepare_speculative_generation(
+                input,
+                generation,
+                options.max_draft_tokens,
+                caller_stop_sequences,
+                mode,
+            )?;
         let output = B::with_speculative_execution(
             &mut self.runtime,
             SpeculativeGenerationBatchRequest::new(
@@ -351,6 +441,38 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
     where
         B: SpeculativeGenerationBackend,
     {
+        self.generate_prepared_speculative_batch(request, PreparedGenerationMode::Semantic)
+    }
+
+    /// Generates independent literal-text lanes through the fair speculative
+    /// scheduler. Each lane follows [`Self::generate_prepared_text`] admission
+    /// and stopping rules; TTFT includes preparation and queueing from this call.
+    pub fn generate_prepared_text_speculative_batch<'a>(
+        &mut self,
+        request: PreparedChatSpeculativeBatchRequest<
+            'a,
+            B,
+            <B as SpeculativeGenerationBackend>::Drafter,
+        >,
+    ) -> Result<SpeculativeGenerationBatchOutput, PreparedChatSpeculativeError>
+    where
+        B: SpeculativeGenerationBackend,
+    {
+        self.generate_prepared_speculative_batch(request, PreparedGenerationMode::Text)
+    }
+
+    fn generate_prepared_speculative_batch<'a>(
+        &mut self,
+        request: PreparedChatSpeculativeBatchRequest<
+            'a,
+            B,
+            <B as SpeculativeGenerationBackend>::Drafter,
+        >,
+        mode: PreparedGenerationMode,
+    ) -> Result<SpeculativeGenerationBatchOutput, PreparedChatSpeculativeError>
+    where
+        B: SpeculativeGenerationBackend,
+    {
         let driver = eredu_runtime::RunSpeculativeGeneration::new(request.scheduler);
         let PreparedChatSpeculativeBatchRequest {
             drafting,
@@ -365,11 +487,12 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
         let mut prepared_lanes = Vec::with_capacity(lanes.len());
         for (lane, generation) in lanes.into_iter().zip(generations) {
             let (prompt, generation, config, constraint, semantic) = self
-                .prepare_speculative_chat(
+                .prepare_speculative_generation(
                     lane.input,
                     generation,
                     lane.max_draft_tokens,
                     lane.caller_stop_sequences,
+                    mode,
                 )?;
             prepared_lanes.push(SpeculativeGenerationLane::new(
                 prompt,
@@ -396,12 +519,13 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
     }
 
     #[allow(clippy::type_complexity)]
-    fn prepare_speculative_chat(
+    fn prepare_speculative_generation(
         &self,
         input: PreparedChatInput<'_, B>,
         generation: (eredu_core::TextGenerationConfig, NonZeroUsize),
         max_draft_tokens: NonZeroUsize,
         caller_stop_sequences: &[String],
+        mode: PreparedGenerationMode,
     ) -> Result<
         (
             B::Prompt,
@@ -413,29 +537,28 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
         PreparedChatSpeculativeError,
     > {
         let prepared_chat = input.prepared_chat();
-        let semantic_plan = match prepared_chat.semantic_support() {
-            crate::runtime::chat::SemanticSupport::Supported => prepared_chat
-                .semantic_runtime_plan()
-                .expect("supported prepared chats carry a semantic runtime plan")
-                .clone(),
-            crate::runtime::chat::SemanticSupport::Unsupported { reason } => {
-                return Err(PreparedChatSpeculativeError::Semantic(format!(
-                    "prepared chat does not have an executable semantic plan: {reason}"
-                )));
-            }
-        };
-        let constraint = PreparedChatSpeculativeConstraint::from_prepared_chat(
-            prepared_chat,
-            self.token_validity.clone(),
-        )?;
+        let control = mode
+            .prepare_control(
+                prepared_chat,
+                caller_stop_sequences,
+                self.token_validity.clone(),
+            )
+            .map_err(|error| match error {
+                PreparedChatSetupError::Constraint(error) => {
+                    PreparedChatSpeculativeError::Constraint(error)
+                }
+                PreparedChatSetupError::Semantic(error) => {
+                    PreparedChatSpeculativeError::Semantic(error)
+                }
+            })?;
+        let constraint = PreparedChatSpeculativeConstraint::new(control.controller);
         let semantic = PreparedChatSemanticState::new(
             PreparedChatTokenDecoder {
                 decoder: self.text_decoder(true),
             },
-            semantic_plan,
-            caller_stop_sequences,
-        )
-        .map_err(|error| PreparedChatSpeculativeError::Semantic(error.to_string()))?;
+            control.parser,
+            control.structural_tokens,
+        );
         let eos_token_ids = prepared_chat.eos_token_ids().to_vec();
         let (generation, max_tokens) = generation;
         let temperature = generation.sampling().temperature;

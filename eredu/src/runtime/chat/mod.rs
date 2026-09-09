@@ -528,12 +528,12 @@ impl PreparedChat {
         &self.semantic_support
     }
 
-    /// Admission for explicit controlled text generation. Tool declarations
+    /// Admission for explicit ordinary, speculative or controlled text generation. Tool declarations
     /// (even with `ToolChoice::None`) and required tool calls are rejected.
     /// Explicit thinking requires `allow_unparsed_reasoning`, since text mode
     /// exposes decoded reasoning as ordinary text even on recognized templates.
-    /// This reports request admission; the loaded backend must separately support
-    /// execution control, and snapshots require complete estimates and limits.
+    /// This reports request admission; backend support for speculation or execution
+    /// control is separate, and snapshots require complete estimates and limits.
     pub fn text_generation_support(&self) -> &CapabilitySupport {
         &self.text_generation_support
     }

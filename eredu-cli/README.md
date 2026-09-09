@@ -64,6 +64,9 @@ thinking control.
 
 Use `--timing` for concise performance statistics, `--verbose` for execution
 details, and `--telemetry-json PATH` for a versioned machine-readable report.
+Unrecognized templates use literal text generation with TTFT and supported
+speculative drafting. They retain EOS and caller stop sequences; native tools
+and parsed reasoning still require a recognized protocol.
 
 ## Automatic planning
 

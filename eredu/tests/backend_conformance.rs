@@ -71,6 +71,8 @@ mod control;
 mod observed_mock;
 #[path = "backend_conformance/templates.rs"]
 mod templates;
+#[path = "backend_conformance/text.rs"]
+mod text;
 #[path = "backend_conformance/timing.rs"]
 mod timing;
 

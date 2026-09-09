@@ -102,6 +102,16 @@ Supply an explicit template before preparing chat. Calling
 Custom templates use the same rendering and protocol checks as checkpoint
 templates; supplying one does not by itself enable native tools or reasoning.
 
+For templates without recognized semantic support, use
+`model.generate_prepared_text(request)` with `PreparedChatGenerationRequest`.
+For supported drafting, use `generate_prepared_text_speculative` or
+`generate_prepared_text_speculative_batch` with the corresponding prepared-chat
+speculative requests. These methods emit literal `TextDelta` and `Finished`
+events and return TTFT through `output.timing().time_to_first_token()`.
+Inspect `prepared.text_generation_support()` for admission: native tool
+declarations and required calls are rejected, and explicit thinking requires
+`allow_unparsed_reasoning`. Emulated tools can use ordinary prompt text.
+
 Realtime speech uses `eredu::api::realtime::PreparedRealtimeModel<M>` and
 `eredu_runtime::RealtimeSessionScheduler`. For MLX,
 `eredu_backend_mlx::create_realtime_execution` loads an architecture-prepared

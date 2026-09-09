@@ -76,6 +76,22 @@ MLX uses the same generic types, with the factory supplying its native drafter.
 absence of the capability implementation fails at the type boundary rather
 than silently falling back to ordinary generation.
 
+Unrecognized chat templates can use `generate_prepared_text_speculative` or
+`generate_prepared_text_speculative_batch` with the same request types. These
+explicit text methods require `PreparedChat::text_generation_support()` and
+backend drafting support, without requiring a recognized semantic protocol.
+They emit `TextDelta` and `Finished`, honor checkpoint EOS and caller stops,
+and skip special tokens. Native tool declarations and required calls are
+rejected; explicit thinking requires `allow_unparsed_reasoning`. Applications
+can still emulate tools using ordinary prompt text and their own output parser.
+
+Both `generate_prepared_text` and the speculative text methods return
+`output.timing().time_to_first_token()`. Timing starts at the generation call
+and ends at the first committed token, even when Unicode buffering, a stop,
+or EOS prevents visible text. A cancelled request with no committed token
+returns `None`; speculative batch timing includes queueing from the batch call.
+The CLI automatically uses these methods for unrecognized templates.
+
 ## Execution placement
 
 Prepared-chat requests do not accept backend queues. The portable execution

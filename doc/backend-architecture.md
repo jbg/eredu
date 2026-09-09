@@ -13,8 +13,8 @@ do not interpret schemas or decide which tool calls applications execute.
 Tokenizer ID membership and model output width are separate domains. The facade
 builds a closed validity mask from actual canonical, round-tripping tokenizer IDs,
 including added and special tokens; holes and inconsistent mappings are excluded.
-Raw text and templated fallback pass it to core's ordinary text machine via
-`TextGeneration::with_token_filter`. Semantic, observed, controlled and speculative
+Raw token generation passes it to core's ordinary text machine via
+`TextGeneration::with_token_filter`. Prepared text, semantic, observed, controlled and speculative
 requests intersect the same immutable mask with their grammar controller. Forced
 choices further restrict that intersection. The grammar and output parsers retain
 their existing activation, EOS and termination behavior.
@@ -27,6 +27,18 @@ Tool/thinking admission stays in facade preparation; backends receive the same
 neutral filters and native execution requests. Text/semantic mode participates in
 snapshot compatibility, with decoder and stop state covered by existing portable
 copying and storage accounting. See [LM Inspector execution control](lm-inspector-execution-control.md).
+
+`generate_prepared_text`, `generate_prepared_text_speculative`, and its batch
+variant accept the same prepared-chat request types while selecting literal text
+output explicitly. They share ordinary commitment/timing and the neutral
+speculative scheduler with semantic chat; unknown templates need no protocol
+parser to use TTFT or supported embedded/external drafting. The facade reuses
+controlled text admission and decoder/stop state: tool declarations and required
+calls are rejected, and explicit thinking requires `allow_unparsed_reasoning`.
+Emulated tools supplied as ordinary prompt text remain application policy.
+`generate_prepared_chat` and its speculative variants still require executable
+semantic support. The CLI retains unrecognized prepared prompts and selects the
+text methods, preserving EOS, caller stops, cancellation, and committed-token TTFT.
 
 `eredu-core::TokenFilter` owns closed-set intersection and projection to an actual
 output width: missing mask entries are forbidden, a shorter output uses the mask's

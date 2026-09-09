@@ -2345,7 +2345,7 @@ fn main() -> Result<()> {
                                 .unwrap_or("unknown reason")
                         );
                     }
-                    (None, rendered_prompt, false)
+                    (Some(prepared), rendered_prompt, false)
                 }
             }
             Err(TextModelError::MissingChatTemplate) if !tools_requested => (None, prompt, true),
@@ -2399,6 +2399,7 @@ fn main() -> Result<()> {
     .with_lookahead(!args.disable_speculative_lookahead);
     let mut prepared_finish_reason = None;
     if let Some(prepared) = &prepared_chat {
+        let semantic = matches!(prepared.semantic_support(), SemanticSupport::Supported);
         let settings = PreparedChatGenerationSettings {
             overrides: GenerationConfigOverrides {
                 max_new_tokens: Some(max_tokens),
@@ -2418,39 +2419,41 @@ fn main() -> Result<()> {
         if drafting.is_enabled() {
             let cancellation = GenerationCancellationToken::new();
             let cancel_on_error = cancellation.clone();
-            let output = model.generate_prepared_chat_speculative(
-                PreparedChatSpeculativeGenerationRequest {
-                    input: PreparedChatInput::rendered_prompt(prepared),
-                    drafting: drafting
-                        .as_speculative_draft()
-                        .expect("drafting is enabled"),
-                    settings,
-                    options: PreparedChatSpeculativeGenerationOptions {
-                        max_draft_tokens: NonZeroUsize::new(args.speculative_draft_tokens).expect(
-                            "planned speculative execution validates non-zero draft tokens",
-                        ),
-                        scheduler: scheduler_options,
-                    },
-                    caller_stop_sequences: &args.stop_sequences,
-                    cancellation,
-                    on_event: |event| {
-                        if semantic_error.is_none() {
-                            semantic_error = write_semantic_event(
-                                &event,
-                                &mut stdout,
-                                &mut stderr,
-                                &mut streamed_text,
-                                &mut reasoning_stream,
-                                reasoning_output,
-                            )
-                            .err();
-                            if semantic_error.is_some() {
-                                cancel_on_error.cancel();
-                            }
-                        }
-                    },
+            let request = PreparedChatSpeculativeGenerationRequest {
+                input: PreparedChatInput::rendered_prompt(prepared),
+                drafting: drafting
+                    .as_speculative_draft()
+                    .expect("drafting is enabled"),
+                settings,
+                options: PreparedChatSpeculativeGenerationOptions {
+                    max_draft_tokens: NonZeroUsize::new(args.speculative_draft_tokens)
+                        .expect("planned speculative execution validates non-zero draft tokens"),
+                    scheduler: scheduler_options,
                 },
-            )?;
+                caller_stop_sequences: &args.stop_sequences,
+                cancellation,
+                on_event: |event| {
+                    if semantic_error.is_none() {
+                        semantic_error = write_semantic_event(
+                            &event,
+                            &mut stdout,
+                            &mut stderr,
+                            &mut streamed_text,
+                            &mut reasoning_stream,
+                            reasoning_output,
+                        )
+                        .err();
+                        if semantic_error.is_some() {
+                            cancel_on_error.cancel();
+                        }
+                    }
+                },
+            };
+            let output = if semantic {
+                model.generate_prepared_chat_speculative(request)
+            } else {
+                model.generate_prepared_text_speculative(request)
+            }?;
             output_ids = output.token_ids().to_vec();
             time_to_first_token = output.timing().time_to_first_token();
             speculative_stats = Some(output.stats().clone());
@@ -2458,7 +2461,7 @@ fn main() -> Result<()> {
         } else {
             let cancellation = GenerationCancellationToken::new();
             let cancel_on_error = cancellation.clone();
-            let output = model.generate_prepared_chat(PreparedChatGenerationRequest {
+            let request = PreparedChatGenerationRequest {
                 input: PreparedChatInput::rendered_prompt(prepared),
                 settings,
                 caller_stop_sequences: &args.stop_sequences,
@@ -2479,7 +2482,12 @@ fn main() -> Result<()> {
                         }
                     }
                 },
-            })?;
+            };
+            let output = if semantic {
+                model.generate_prepared_chat(request)
+            } else {
+                model.generate_prepared_text(request)
+            }?;
             time_to_first_token = output.timing().time_to_first_token();
             output_ids = output.token_ids;
             prepared_finish_reason = Some(output.finish_reason);
@@ -2489,7 +2497,7 @@ fn main() -> Result<()> {
         }
     } else if drafting_enabled {
         bail!(
-            "speculative generation requires a prepared chat with executable semantic support; raw and unrecognized-template fallbacks use ordinary generation"
+            "speculative generation requires a prepared template prompt; raw prompts use ordinary generation"
         );
     } else {
         let config = TextGenerationConfig::new(resolved_generation).with_seed(args.seed);

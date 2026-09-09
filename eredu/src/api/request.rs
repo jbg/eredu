@@ -14,7 +14,6 @@ use eredu_text::tokenizer::{ChatTemplateIdentity, ModelChatTemplate, Tokenizer a
 use super::{ConstraintError, TextDecoderError, TextModelError};
 use crate::api::TextDecoder;
 use crate::runtime::chat::constraints::{ConstraintCompiler, ConstraintController};
-use crate::runtime::chat::SemanticRuntimePlan;
 use crate::runtime::chat::{
     prepare_format_profile, resolve_structural_tokens, CapabilitySupport, ChatCapabilities,
     ChatTemplateRequest, NativeToolSupport, PreparedChat, SemanticSupport, ToolChoice,
@@ -42,9 +41,9 @@ pub struct PreparedChatGenerationSettings {
     pub seed: u64,
 }
 
-/// Explicit prompt source for structured generation from a [`PreparedChat`].
+/// Explicit prompt source for semantic or text generation from a [`PreparedChat`].
 ///
-/// The prepared chat always owns the checkpoint-native generation semantics.
+/// The generation method selects semantic parsing or literal text output.
 /// The selected variant determines only how the model prompt is prefetched.
 pub enum PreparedChatInput<'a, B: eredu_core::TextGenerationBackend> {
     /// Tokenize and prefill the rendered prompt stored in the prepared chat.
@@ -93,8 +92,9 @@ impl<'a, B: eredu_core::TextGenerationBackend> PreparedChatInput<'a, B> {
     }
 }
 
-/// Cohesive request for ordinary structured generation from a [`PreparedChat`].
+/// Request for ordinary semantic or text generation from a [`PreparedChat`].
 ///
+/// Used by `LoadedModel::generate_prepared_chat` and `generate_prepared_text`.
 /// Cache and execution-stream ownership belong to the selected backend
 /// session. The prepared chat's portable constraint controller supplies a
 /// vocabulary filter to the backend before each sampling submission.
@@ -205,7 +205,9 @@ pub enum PreparedChatSpeculativeError {
     },
 }
 
-/// One speculative response from a [`PreparedChat`].
+/// One speculative semantic or text response from a [`PreparedChat`].
+/// Used by `LoadedModel::generate_prepared_chat_speculative` and
+/// `generate_prepared_text_speculative`.
 pub struct PreparedChatSpeculativeGenerationRequest<'a, B: eredu_core::TextGenerationBackend, D, F>
 {
     /// Explicit prompt source and embedded format/runtime plan.
@@ -247,6 +249,8 @@ pub struct PreparedChatSpeculativeBatchLane<'a, B: eredu_core::TextGenerationBac
 }
 
 /// Cohesive fair-scheduler request for independent prepared-chat speculative lanes.
+/// Used by `LoadedModel::generate_prepared_chat_speculative_batch` and
+/// `generate_prepared_text_speculative_batch`.
 pub struct PreparedChatSpeculativeBatchRequest<'a, B: eredu_core::TextGenerationBackend, D> {
     /// Embedded or separately loaded draft-model selection.
     pub drafting: SpeculativeDraft<'a, D>,
@@ -258,26 +262,17 @@ pub struct PreparedChatSpeculativeBatchRequest<'a, B: eredu_core::TextGeneration
 
 /// Facade-prepared speculative grammar state consumed by a backend sampler.
 ///
-/// The facade constructs this state from the prepared chat exactly once. A
-/// backend applies its portable filters to backend-owned logits and commits
-/// only tokens accepted by target verification.
+/// The facade constructs semantic constraints or text-only tokenizer validity
+/// from the prepared request. A backend applies its portable filters to native
+/// logits and commits only tokens accepted by target verification.
 #[derive(Clone)]
 pub struct PreparedChatSpeculativeConstraint {
     controller: ConstraintController,
 }
 
 impl PreparedChatSpeculativeConstraint {
-    pub(super) fn from_prepared_chat(
-        prepared_chat: &PreparedChat,
-        validity: std::sync::Arc<TokenFilter>,
-    ) -> Result<Self, ConstraintError> {
-        let generation_plan = prepared_chat
-            .generation_runtime_plan()
-            .expect("supported prepared chats carry a generation runtime plan");
-        Ok(Self {
-            controller: ConstraintController::from_generation_plan(generation_plan)?
-                .with_validity(validity),
-        })
+    pub(super) fn new(controller: ConstraintController) -> Self {
+        Self { controller }
     }
 }
 
@@ -352,9 +347,6 @@ pub(super) struct PreparedChatControlRuntime {
 }
 
 pub(super) struct PreparedChatSemanticState {
-    initial_decoder: PreparedChatTokenDecoder,
-    plan: SemanticRuntimePlan,
-    caller_stop_sequences: Vec<String>,
     pipeline: CommittedTokenPipeline<PreparedChatTokenDecoder>,
     token_ids: Vec<u32>,
     events: Vec<SemanticEvent>,
@@ -362,37 +354,18 @@ pub(super) struct PreparedChatSemanticState {
 
 impl PreparedChatSemanticState {
     pub(super) fn new(
-        initial_decoder: PreparedChatTokenDecoder,
-        plan: SemanticRuntimePlan,
-        caller_stop_sequences: &[String],
-    ) -> Result<Self, SpeculativeOutputError> {
-        let pipeline = Self::build_pipeline(initial_decoder.clone(), &plan, caller_stop_sequences)?;
-        Ok(Self {
-            initial_decoder,
-            plan,
-            caller_stop_sequences: caller_stop_sequences.to_vec(),
-            pipeline,
+        decoder: PreparedChatTokenDecoder,
+        parser: crate::runtime::generation::streaming::ToolRuntimeParser,
+        structural_tokens: HashMap<u32, String>,
+    ) -> Self {
+        Self {
+            pipeline: CommittedTokenPipeline::new(
+                RawTokenDecoder::with_structural_tokens(decoder, structural_tokens),
+                parser,
+            ),
             token_ids: Vec::new(),
             events: Vec::new(),
-        })
-    }
-
-    fn build_pipeline(
-        decoder: PreparedChatTokenDecoder,
-        plan: &SemanticRuntimePlan,
-        caller_stop_sequences: &[String],
-    ) -> Result<CommittedTokenPipeline<PreparedChatTokenDecoder>, SpeculativeOutputError> {
-        let parser = plan
-            .create_parser_with_stops(caller_stop_sequences.iter().map(String::as_str))
-            .map_err(|error| SpeculativeOutputError::semantic("create parser", error))?;
-        Ok(CommittedTokenPipeline::new(
-            RawTokenDecoder::with_structural_tokens(
-                decoder,
-                plan.structural_tokens()
-                    .map(|(id, spelling)| (id, spelling.to_owned())),
-            ),
-            parser,
-        ))
+        }
     }
 }
 
@@ -403,9 +376,6 @@ impl SpeculativeSemanticState for PreparedChatSemanticState {
             .fork()
             .map_err(|error| SpeculativeOutputError::semantic("fork semantic state", error))?;
         Ok(Box::new(Self {
-            initial_decoder: self.initial_decoder.clone(),
-            plan: self.plan.clone(),
-            caller_stop_sequences: self.caller_stop_sequences.clone(),
             pipeline,
             token_ids: self.token_ids.clone(),
             events: Vec::new(),
@@ -434,6 +404,27 @@ impl SpeculativeSemanticState for PreparedChatSemanticState {
 
     fn take_events(&mut self) -> Vec<SemanticEvent> {
         std::mem::take(&mut self.events)
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum PreparedGenerationMode {
+    Semantic,
+    Text,
+}
+
+impl PreparedGenerationMode {
+    pub(super) fn prepare_control(
+        self,
+        prepared_chat: &PreparedChat,
+        caller_stop_sequences: &[String],
+        validity: std::sync::Arc<TokenFilter>,
+    ) -> Result<PreparedChatControlRuntime, PreparedChatSetupError> {
+        let prepare = match self {
+            Self::Semantic => prepared_chat_control_runtime,
+            Self::Text => prepared_text_control_runtime,
+        };
+        prepare(prepared_chat, caller_stop_sequences, validity)
     }
 }
 
@@ -1699,11 +1690,11 @@ pub(crate) fn prepare_chat_from_parts(
         !request.tools.is_empty() || request.tool_choice == ToolChoice::Required;
     let text_generation_support = if tool_surface_requested {
         CapabilitySupport::Unsupported {
-            reason: "controlled text generation does not support tool declarations or required tool calls; prepare a request without tools".into(),
+            reason: "text generation does not support tool declarations or required tool calls; prepare a request without tools".into(),
         }
     } else if request.enable_thinking == Some(true) && !request.allow_unparsed_reasoning {
         CapabilitySupport::Unsupported {
-            reason: "controlled text generation does not parse explicit thinking; set allow_unparsed_reasoning to opt into raw output".into(),
+            reason: "text generation does not parse explicit thinking; set allow_unparsed_reasoning to opt into raw output".into(),
         }
     } else {
         CapabilitySupport::Supported
