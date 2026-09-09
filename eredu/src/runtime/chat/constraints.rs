@@ -179,7 +179,7 @@ impl ConstraintController {
 
     pub(crate) fn grammar_is_complete(&mut self) -> Result<bool, ConstraintError> {
         match &mut self.runtime {
-            ConstraintRuntime::Active(grammar) => grammar.is_complete().map_err(constraint_error),
+            ConstraintRuntime::Active(grammar) => grammar.is_terminal().map_err(constraint_error),
             ConstraintRuntime::Text
             | ConstraintRuntime::Forbidden { .. }
             | ConstraintRuntime::Auto { .. } => Ok(false),
@@ -188,7 +188,7 @@ impl ConstraintController {
 
     pub(crate) fn prefix_is_complete(&self, history: &[u32]) -> Result<bool, ConstraintError> {
         match &mut self.runtime_at(history)? {
-            ConstraintRuntime::Active(grammar) => grammar.is_complete().map_err(constraint_error),
+            ConstraintRuntime::Active(grammar) => grammar.is_terminal().map_err(constraint_error),
             ConstraintRuntime::Text
             | ConstraintRuntime::Forbidden { .. }
             | ConstraintRuntime::Auto { .. } => Ok(false),
@@ -822,6 +822,13 @@ impl GrammarState {
         Ok(consumed == tokens.len())
     }
 
+    /// An accepted prefix may still allow another call in the same response.
+    /// End generation only when no extension remains or EOS was committed.
+    fn is_terminal(&mut self) -> Result<bool, String> {
+        Ok(self.is_complete()? && (self.terminal_eos_alias_committed || self.matcher.is_stopped()))
+    }
+
+    /// Whether the prefix is a complete grammatical value, even if extendable.
     pub(crate) fn is_complete(&mut self) -> Result<bool, String> {
         if self.terminal_eos_alias_committed {
             return Ok(true);
@@ -1179,6 +1186,86 @@ mod tests {
             "type": "function",
             "function": {"name": name, "parameters": parameters}
         })
+    }
+
+    #[test]
+    fn qwen_parallel_calls_remain_open_until_eos_or_call_limit() {
+        use crate::runtime::chat::{
+            QWEN3_XML_TOOL_SPEC, QWEN_TAGGED_TOOL_SPEC_NO_REASONING, QWEN_XML_TOOL_SPEC,
+        };
+
+        let json_call = "<tool_call>\n{\"name\":\"ping\",\"arguments\":{}}\n</tool_call>";
+        for (spec, call) in [
+            (&QWEN_XML_TOOL_SPEC, json_call),
+            (&QWEN3_XML_TOOL_SPEC, json_call),
+            (
+                &QWEN_TAGGED_TOOL_SPEC_NO_REASONING,
+                "<tool_call>\n<function=ping>\n</function>\n</tool_call>",
+            ),
+        ] {
+            let first: Vec<u32> = call.bytes().map(u32::from).collect();
+            let second: Vec<u32> = format!("\n{call}").bytes().map(u32::from).collect();
+            for choice in [ToolChoice::Auto, ToolChoice::Required] {
+                for max_calls in [None, NonZeroUsize::new(2)] {
+                    let plan =
+                        ConstraintCompiler::synthetic_with_eos_aliases_for_tests(&[255, 254])
+                            .compile_tool_plan(
+                                &DECLARATIVE_DIALECT,
+                                DialectParameters::Declarative(spec),
+                                &[tool(
+                                    "ping",
+                                    json!({"type": "object", "additionalProperties": false}),
+                                )],
+                                choice,
+                                ParallelToolCallPolicy::Enabled { max_calls },
+                                vec![255],
+                            )
+                            .unwrap();
+                    let mut controller =
+                        super::ConstraintController::from_generation_plan(&plan).unwrap();
+
+                    // Speculative prefixes must make the same termination decision
+                    // as the committed controller, without advancing its state.
+                    assert!(!controller.prefix_is_complete(&first).unwrap());
+                    for &token in &first {
+                        controller.commit(token).unwrap();
+                    }
+                    assert!(!controller.grammar_is_complete().unwrap());
+                    let filter = controller.filter_at(&first).unwrap();
+                    assert!(filter.allows(255));
+                    assert!(filter.allows(u32::from(b'\n')));
+
+                    // EOS may end a parallel request before its call limit.
+                    for eos in [255, 254] {
+                        let mut ended = controller.clone();
+                        ended.commit(eos).unwrap();
+                        assert!(ended.grammar_is_complete().unwrap());
+                    }
+
+                    let history = [first.as_slice(), second.as_slice()].concat();
+                    assert_eq!(
+                        controller.prefix_is_complete(&history).unwrap(),
+                        max_calls.is_some()
+                    );
+                    for &token in &second {
+                        controller.commit(token).unwrap();
+                    }
+                    assert_eq!(
+                        controller.grammar_is_complete().unwrap(),
+                        max_calls.is_some()
+                    );
+                    if max_calls.is_some() {
+                        assert!(!controller
+                            .filter_at(&history)
+                            .unwrap()
+                            .allows(u32::from(b'\n')));
+                    } else {
+                        controller.commit(255).unwrap();
+                        assert!(controller.grammar_is_complete().unwrap());
+                    }
+                }
+            }
+        }
     }
 
     fn accepts(

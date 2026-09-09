@@ -118,6 +118,11 @@ checkpoint EOS, maximum tokens, and cancellation. When several conditions
 occur on one committed token, precedence is stop sequence, grammar completion,
 EOS, then maximum tokens.
 
+Grammar completion requires a terminal grammar state. With parallel Qwen XML
+calls enabled, each `ToolCallEnd` leaves generation open while another call is
+allowed. The model can end the response with EOS before reaching the call
+limit; reaching the limit completes the grammar.
+
 ## Cancellation and backpressure
 
 Each request has a cloneable `GenerationCancellationToken`; each batch lane has

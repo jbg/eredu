@@ -23,6 +23,7 @@ mod lifecycle;
 struct BackendCalls {
     configs: Vec<TextGenerationConfig>,
     filters: Vec<TokenFilter>,
+    scripted_tokens: std::collections::VecDeque<u32>,
     prompts: usize,
     speculative: usize,
 }
@@ -36,6 +37,10 @@ struct MockBackend {
 impl MockBackend {
     fn sample(&self, filter: &TokenFilter) -> Result<MockToken, MockError> {
         self.calls.borrow_mut().filters.push(filter.clone());
+        if let Some(token) = self.calls.borrow_mut().scripted_tokens.pop_front() {
+            assert!(filter.allows(token), "scripted token {token} was masked");
+            return Ok(MockToken(token));
+        }
         let allowed = filter
             .allowed_mask_for(self.logits.len())
             .map_err(|_| MockError)?;
@@ -387,6 +392,179 @@ fn lfm_checkpoint_native_tool_activation_with_portable_backend() {
             reason: output.finish_reason
         })
     );
+}
+
+#[test]
+fn qwen_tool_generation_stops_at_eos_or_the_requested_call_limit() {
+    use eredu::api::{
+        PreparedChatGenerationRequest, PreparedChatGenerationSettings, PreparedChatInput,
+    };
+    use eredu::runtime::chat::{ChatTemplateRequest, ParallelToolCallPolicy, ToolChoice};
+    use eredu_core::{FinishReason, SemanticEvent};
+    use serde_json::json;
+    use std::num::NonZeroUsize;
+    use tokenizers::{decoders::byte_level::ByteLevel, models::bpe::BPE};
+
+    let vocabulary: tokenizers::models::bpe::Vocab = ByteLevel::alphabet()
+        .into_iter()
+        .enumerate()
+        .map(|(id, character)| (character.to_string(), id as u32))
+        .collect();
+    let mut tokenizer = Tokenizer::new(
+        BPE::builder()
+            .vocab_and_merges(vocabulary, Vec::new())
+            .build()
+            .unwrap(),
+    );
+    tokenizer.with_pre_tokenizer(Some(ByteLevel::new(false, false, false)));
+    tokenizer.with_decoder(Some(ByteLevel::default()));
+    tokenizer
+        .add_special_tokens([AddedToken::from("<|im_end|>", true).normalized(false)])
+        .unwrap();
+    let eos = tokenizer.token_to_id("<|im_end|>").unwrap();
+    let call = |value| {
+        format!(
+            "<tool_call>\n{{\"name\":\"ping\",\"arguments\":{{\"value\":{value}}}}}\n</tool_call>"
+        )
+    };
+    let first = call(1);
+    let both = format!("{first}\n{}", call(2));
+    let parallel = |limit: Option<usize>| ParallelToolCallPolicy::Enabled {
+        max_calls: limit.and_then(NonZeroUsize::new),
+    };
+    for template in [
+        include_str!("fixtures/chat_templates/qwen2.5-7b-instruct-acbd9653.jinja"),
+        include_str!("fixtures/chat_templates/qwen3-0.6b-7e4ae267.jinja"),
+    ] {
+        for tool_choice in [ToolChoice::Auto, ToolChoice::Required] {
+            for (policy, scripted, expected, count, reason) in [
+                (
+                    ParallelToolCallPolicy::Disabled,
+                    &both,
+                    &first,
+                    1,
+                    FinishReason::GrammarComplete,
+                ),
+                (
+                    parallel(Some(1)),
+                    &both,
+                    &first,
+                    1,
+                    FinishReason::GrammarComplete,
+                ),
+                (
+                    parallel(Some(2)),
+                    &both,
+                    &both,
+                    2,
+                    FinishReason::GrammarComplete,
+                ),
+                (
+                    parallel(Some(3)),
+                    &both,
+                    &both,
+                    2,
+                    FinishReason::StopSequence,
+                ),
+                (parallel(None), &both, &both, 2, FinishReason::StopSequence),
+                (
+                    parallel(Some(2)),
+                    &first,
+                    &first,
+                    1,
+                    FinishReason::StopSequence,
+                ),
+            ] {
+                let backend = MockBackend::default();
+                let calls = backend.calls.clone();
+                calls.borrow_mut().scripted_tokens = tokenizer
+                    .encode(format!("{scripted}<|im_end|>"), false)
+                    .unwrap()
+                    .get_ids()
+                    .iter()
+                    .copied()
+                    .collect();
+                let mut model = LoadedModel::from_runtime(
+                    ModelRuntime::prepare(backend, ()).unwrap(),
+                    ChatTokenizer::from_tokenizer(tokenizer.clone()),
+                    LoadedTextModelConfig {
+                        model_family: ModelKind::Qwen2,
+                        effective_model_type: "qwen2".into(),
+                        model_id: "scripted-qwen-tools".into(),
+                        chat_template: Some(template.into()),
+                        eos_token_ids: vec![eos],
+                        checkpoint_generation_config: None,
+                    },
+                );
+                let prepared = model
+                    .prepare_chat(ChatTemplateRequest {
+                        messages: vec![json!({"role": "user", "content": "Ping twice."})],
+                        tools: vec![json!({"type": "function", "function": {
+                            "name": "ping",
+                            "parameters": {"type": "object", "properties": {
+                                "value": {"type": "integer"}
+                            }, "required": ["value"], "additionalProperties": false}
+                        }})],
+                        tool_choice,
+                        parallel_tool_calls: policy,
+                        add_generation_prompt: true,
+                        ..Default::default()
+                    })
+                    .unwrap();
+                let mut events = Vec::new();
+                let output = model
+                    .generate_prepared_chat(PreparedChatGenerationRequest {
+                        input: PreparedChatInput::rendered_prompt(&prepared),
+                        settings: PreparedChatGenerationSettings {
+                            overrides: GenerationConfigOverrides {
+                                max_new_tokens: Some(256),
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        },
+                        caller_stop_sequences: &[],
+                        cancellation: Default::default(),
+                        on_event: |event| events.push(event),
+                    })
+                    .unwrap();
+                let mut expected_tokens = tokenizer
+                    .encode(expected.as_str(), false)
+                    .unwrap()
+                    .get_ids()
+                    .to_vec();
+                if reason == FinishReason::StopSequence {
+                    expected_tokens.push(eos);
+                }
+                assert_eq!(output.token_ids, expected_tokens);
+                assert_eq!(output.finish_reason, reason);
+                assert_eq!(calls.borrow().filters.len(), expected_tokens.len());
+                let starts: Vec<_> = events
+                    .iter()
+                    .filter_map(|event| match event {
+                        SemanticEvent::ToolCallStart { index, name, .. } => {
+                            Some((*index, name.as_str()))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(
+                    starts,
+                    (0..count).map(|index| (index, "ping")).collect::<Vec<_>>()
+                );
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| matches!(event, SemanticEvent::ToolCallEnd))
+                        .count(),
+                    count
+                );
+                assert!(!events
+                    .iter()
+                    .any(|event| matches!(event, SemanticEvent::TextDelta(_))));
+                assert_eq!(events.last(), Some(&SemanticEvent::Finished { reason }));
+            }
+        }
+    }
 }
 
 #[test]
