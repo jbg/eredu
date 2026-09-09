@@ -331,3 +331,183 @@ fn llama_real_checkpoint_native_tool_smoke() {
 fn nemotron_real_checkpoint_native_tool_smoke() {
     smoke("EREDU_NEMOTRON_TOOL_CHECKPOINT", "nvidia.");
 }
+
+#[test]
+#[ignore = "requires EREDU_NANBEIGE_CHECKPOINT and an MLX Metal device"]
+fn nanbeige_real_checkpoint_executes_tool_and_answers_from_result() {
+    use eredu::api::{ControlledGenerationRecord, ObservedGenerationEvent, TraceLimits};
+    use eredu_core::{capture::CapturePlan, GenerationConfigOverrides};
+    use std::ops::ControlFlow;
+
+    let path = std::env::var("EREDU_NANBEIGE_CHECKPOINT").unwrap();
+    let (mut model, _) =
+        LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &path, &accelerator_plan())
+            .unwrap()
+            .into_parts();
+    let tool = json!({"type":"function", "function": {
+        "name":"lookup", "description":"Look up the secret word for an integer.",
+        "parameters":{"type":"object", "properties":{"value":{"type":"integer", "enum":[7]}},
+            "required":["value"], "additionalProperties":false}
+    }});
+    let settings = PreparedChatGenerationSettings {
+        overrides: GenerationConfigOverrides {
+            temperature: Some(0.0),
+            max_new_tokens: Some(512),
+            ..Default::default()
+        },
+        seed: 0,
+        ..Default::default()
+    };
+    let todo_content = "- [ ] Shell tool round trip\n- [ ] Inspect the request log";
+    let todo_tool = json!({"type":"function", "function":{
+        "name":"todo__todo_write", "description":"Save the todo list and return a secret receipt word.",
+        "parameters":{"type":"object", "properties":{"content":{"type":"string"}},
+            "required":["content"], "additionalProperties":false}
+    }});
+    let cases = [
+        (tool, "Call lookup with value 7. Then reply with only the secret word returned by the tool.".to_owned(), json!({"value":7})),
+        (todo_tool, format!("Use todo__todo_write to save exactly this list:\n{todo_content}\nThen reply with only the secret receipt word returned by the tool."), json!({"content":todo_content})),
+    ];
+    for (tool, prompt, expected_arguments) in cases {
+        let tool_name = tool["function"]["name"].as_str().unwrap();
+        for thinking in [false, true] {
+            for controlled in [false, true] {
+                model.reset().unwrap();
+                let mut messages = vec![
+                    json!({"role":"system", "content":"You are a concise assistant. Follow the user's instructions and use tools when requested."}),
+                    json!({"role":"user", "content":prompt}),
+                ];
+                let mut executions = 0;
+                for turn in 0..2 {
+                    let prepared = model
+                        .prepare_chat(ChatTemplateRequest {
+                            messages: messages.clone(),
+                            tools: vec![tool.clone()],
+                            tool_choice: ToolChoice::Auto,
+                            enable_thinking: Some(thinking),
+                            add_generation_prompt: true,
+                            ..Default::default()
+                        })
+                        .unwrap();
+                    assert!(matches!(
+                        prepared.native_tool_support(),
+                        NativeToolSupport::Supported
+                    ));
+                    let mut events = Vec::new();
+                    let ids = if controlled {
+                        let observed = model
+                            .prepare_observed_chat(
+                                &prepared,
+                                settings,
+                                CapturePlan::none(),
+                                TraceLimits {
+                                    per_record_bytes: 65536,
+                                    total_bytes: 4 << 20,
+                                },
+                            )
+                            .unwrap();
+                        let mut collect = |record: ControlledGenerationRecord| {
+                            if let ObservedGenerationEvent::Semantic { event, .. } =
+                                record.generation.event
+                            {
+                                events.push(event);
+                            }
+                            ControlFlow::Continue(())
+                        };
+                        let mut session = model
+                            .start_controlled_chat(observed, &[], Default::default(), &mut collect)
+                            .unwrap();
+                        session.run(&mut collect).unwrap();
+                        session.token_ids().to_vec()
+                    } else {
+                        model
+                            .generate_prepared_chat(PreparedChatGenerationRequest {
+                                input: PreparedChatInput::rendered_prompt(&prepared),
+                                settings,
+                                caller_stop_sequences: &[],
+                                cancellation: Default::default(),
+                                on_event: |e| events.push(e),
+                            })
+                            .unwrap()
+                            .token_ids
+                    };
+                    let decoded = model.decode(&ids, false).unwrap();
+                    eprintln!(
+                        "thinking={thinking} controlled={controlled} turn={turn}: {decoded:?}"
+                    );
+                    if turn == 0 {
+                        assert_eq!(
+                            events
+                                .iter()
+                                .filter(|e| matches!(e, SemanticEvent::ToolCallEnd))
+                                .count(),
+                            1,
+                            "{events:?}"
+                        );
+                        let (id, name) = events
+                            .iter()
+                            .find_map(|e| match e {
+                                SemanticEvent::ToolCallStart { id, name, .. } => Some((id, name)),
+                                _ => None,
+                            })
+                            .unwrap();
+                        assert_eq!(name, tool_name);
+                        let args = events
+                            .iter()
+                            .filter_map(|e| match e {
+                                SemanticEvent::ToolArgumentsDelta { json_fragment, .. } => {
+                                    Some(json_fragment.as_str())
+                                }
+                                _ => None,
+                            })
+                            .collect::<String>();
+                        let args: serde_json::Value = serde_json::from_str(&args).unwrap();
+                        assert_eq!(args, expected_arguments);
+                        // Dispatch only after ToolCallEnd/schema validation. The
+                        // returned word is absent from the original prompt.
+                        let result = match (name.as_str(), args["value"].as_i64()) {
+                            ("lookup", Some(7)) => {
+                                executions += 1;
+                                "cobalt"
+                            }
+                            ("todo__todo_write", _) => {
+                                let saved_list = args["content"]
+                                    .as_str()
+                                    .unwrap()
+                                    .lines()
+                                    .collect::<Vec<_>>();
+                                assert_eq!(saved_list, todo_content.lines().collect::<Vec<_>>());
+                                executions += 1;
+                                "cobalt"
+                            }
+                            _ => panic!("unexpected native tool request"),
+                        };
+                        let reasoning = events
+                            .iter()
+                            .filter_map(|e| match e {
+                                SemanticEvent::ReasoningDelta(s) => Some(s.as_str()),
+                                _ => None,
+                            })
+                            .collect::<String>();
+                        messages.push(json!({"role":"assistant", "content":"", "reasoning_content":reasoning,
+                        "tool_calls":[{"id":id, "type":"function", "function":{"name":name, "arguments":args}}]}));
+                        messages.push(json!({"role":"tool", "tool_call_id":id, "content":result}));
+                    } else {
+                        let text = events
+                            .iter()
+                            .filter_map(|e| match e {
+                                SemanticEvent::TextDelta(s) => Some(s.as_str()),
+                                _ => None,
+                            })
+                            .collect::<String>();
+                        assert_eq!(text.trim(), "cobalt", "{events:?}");
+                        assert!(!events
+                            .iter()
+                            .any(|e| matches!(e, SemanticEvent::ToolCallEnd)));
+                    }
+                }
+                assert_eq!(executions, 1);
+            }
+        }
+    }
+}

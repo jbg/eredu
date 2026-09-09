@@ -220,8 +220,11 @@ fn vocabulary_bytes(
         if !vocabulary.contains_key(&id) {
             continue;
         }
-        let bracketed = added.content.starts_with('<') && added.content.ends_with('>');
-        if added.special || bracketed {
+        // Ordinary added tokens participate in text grammar literals and regexes.
+        // In particular, promoting an ordinary </think> to a special token makes
+        // it unreachable from a reasoning grammar that names its text spelling.
+        // Dialects can still refer to any explicitly structural token by ID.
+        if added.special {
             match added.content.as_str() {
                 "</s>"
                 | "<|endoftext|>"

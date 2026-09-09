@@ -1067,7 +1067,7 @@ mod tests {
 
         let markers = ["<|tool_call_start|>", "<|tool_call_end|>", "<|im_end|>"];
         // LFM's tool markers are added tokens with special=false. Exercise
-        // special=true too: the grammar trie treats both as structural tokens.
+        // special=true too: explicit grammar token IDs must work for both.
         for special in [false, true] {
             let tokenizer = activation_tokenizer(&markers, special);
             let ids = markers
@@ -1186,6 +1186,57 @@ mod tests {
             "type": "function",
             "function": {"name": name, "parameters": parameters}
         })
+    }
+
+    #[test]
+    fn nanbeige_atomic_opening_marker_activates_before_whitespace_and_forbids_early_eos() {
+        let tokenizer = super::ChatTokenizer::from_tokenizer(
+            tokenizers::Tokenizer::from_bytes(include_bytes!(
+                "../../../tests/fixtures/chat_templates/nanbeige4.2-0e137298-tokenizer.json"
+            ))
+            .unwrap(),
+        );
+        let eos = tokenizer.token_to_id("<|im_end|>").unwrap();
+        let marker = tokenizer.token_to_id("<tool_call>").unwrap();
+        let compiler = ConstraintCompiler::from_tokenizer(&tokenizer, &[eos]).unwrap();
+        let tools = [tool(
+            "ping",
+            json!({"type":"object", "additionalProperties":false}),
+        )];
+        for choice in [ToolChoice::Auto, ToolChoice::Required, ToolChoice::None] {
+            let plan = compiler
+                .compile_tool_plan(
+                    &DECLARATIVE_DIALECT,
+                    DialectParameters::Declarative(
+                        &crate::runtime::chat::QWEN_TAGGED_TOOL_SPEC_NO_REASONING,
+                    ),
+                    &tools,
+                    choice,
+                    ParallelToolCallPolicy::Disabled,
+                    vec![eos],
+                )
+                .unwrap();
+            let mut controller = super::ConstraintController::from_generation_plan(&plan).unwrap();
+            if choice == ToolChoice::None {
+                assert!(!controller.filter_at(&[]).unwrap().allows(marker));
+                continue;
+            }
+            assert!(controller.filter_at(&[]).unwrap().allows(marker));
+            controller.commit(marker).unwrap();
+            assert!(controller.constraint_is_active());
+            let filter = controller.filter_at(&[marker]).unwrap();
+            assert!(!filter.allows(eos));
+            for whitespace in [" ", "\n", "\r", "\t"] {
+                let id = tokenizer
+                    .token_to_id(if whitespace == " " { "▁" } else { whitespace })
+                    .unwrap_or_else(|| {
+                        tokenizer
+                            .token_to_id(&format!("<0x{:02X}>", whitespace.as_bytes()[0]))
+                            .unwrap()
+                    });
+                assert!(filter.allows(id), "{whitespace:?}");
+            }
+        }
     }
 
     #[test]

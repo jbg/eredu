@@ -675,10 +675,10 @@ pub(crate) const QWEN3_XML_TOOL_SPEC: DeclarativeDialectSpec = DeclarativeDialec
 
 const QWEN_TAGGED_PARAMETERS: TaggedParametersEncoding = TaggedParametersEncoding {
     function_prefix: "<function=",
-    function_name_suffix: ">\n",
+    function_name_suffix: ">",
     parameter_prefix: "<parameter=",
-    parameter_name_suffix: ">\n",
-    parameter_suffix: "\n</parameter>\n",
+    parameter_name_suffix: ">",
+    parameter_suffix: "</parameter>",
     function_suffix: "</function>",
 };
 
@@ -691,8 +691,8 @@ const QWEN_TAGGED_TOOL_SPEC_BASE: DeclarativeDialectSpec = DeclarativeDialectSpe
         suffix: "",
     },
     call: ExactEnvelope {
-        prefix: "<tool_call>\n",
-        suffix: "\n</tool_call>",
+        prefix: "<tool_call>",
+        suffix: "</tool_call>",
     },
     payload_shape: DeclarativePayloadShape::TaggedParameters(QWEN_TAGGED_PARAMETERS),
     json_function: None,
@@ -703,7 +703,7 @@ const QWEN_TAGGED_TOOL_SPEC_BASE: DeclarativeDialectSpec = DeclarativeDialectSpe
     parallel_layout: ParallelCallLayout::RepeatedEnvelopes,
     protocol_max_tools: None,
     protocol_max_calls: None,
-    auto_activation_trigger: Some("<tool_call>\n"),
+    auto_activation_trigger: Some("<tool_call>"),
     required_structural_tokens: &["<|im_end|>"],
     stop_sequences: &["<|im_end|>"],
 };

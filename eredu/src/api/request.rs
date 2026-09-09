@@ -604,7 +604,7 @@ fn validate_qwen_tagged_history(messages: &[serde_json::Value]) -> Result<(), Te
                 }
                 if value
                     .as_str()
-                    .is_some_and(|value| value.contains("\n</parameter>"))
+                    .is_some_and(|value| value.contains("</parameter>"))
                 {
                     return Err(TextModelError::ToolConstraint(format!(
                         "messages[{message_index}].tool_calls[{call_index}] parameter {name:?} contains the unescaped tagged-parameter closing delimiter"

@@ -19,6 +19,9 @@ mod sampling;
 #[path = "portable_facade/lifecycle.rs"]
 mod lifecycle;
 
+#[path = "portable_facade/nanbeige.rs"]
+mod nanbeige;
+
 #[derive(Default)]
 struct BackendCalls {
     configs: Vec<TextGenerationConfig>,

@@ -61,6 +61,11 @@ path = "examples/native_tool_calling.rs"
 required-features = ["mlx"]
 
 [[example]]
+name = "chat_probe"
+path = "examples/chat_probe.rs"
+required-features = ["mlx"]
+
+[[example]]
 name = "qwen35_moe_bench"
 path = "examples/qwen35_moe_bench.rs"
 required-features = ["mlx"]

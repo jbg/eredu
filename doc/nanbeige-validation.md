@@ -5,6 +5,161 @@ execution drivers. Its physical blocks are expanded into logical invocations
 with exact checkpoint aliases, independent KV state and optional inter-pass
 RMSNorm. No family-specific backend implementation is required.
 
+## Native tools and reasoning regression from Goose
+
+Investigated against Eredu `7cb5dee5afc4ac50c27aab9993aabc7edffbe879` using
+the same pinned checkpoint below on 2026-09-09. Both shard SHA-256 hashes were
+rechecked and matched. The embedded template was used without modifications.
+
+Two facade runtime defects were demonstrated:
+
+1. The tagged-parameter dialect activated on `<tool_call>\n` and required exact
+   newlines between tags. The observed `<tool_call>  <function=todo__todo_write>`
+   therefore remained ordinary text. Activation now occurs at `<tool_call>`;
+   the grammar and parser accept XML whitespace between structural tags. Raw
+   parameter values retain their whitespace, including extra newlines and CR.
+   See [the wire-format contract](tool-calling.md) for framing and replay rules.
+2. The grammar vocabulary promoted every bracketed added token to a special
+   token. Nanbeige declares `<think>`, `</think>`, `<tool_call>` and
+   `</tool_call>` as **non-special** added tokens. The promoted `</think>` ID
+   `166104` could not match the grammar's ordinary text spelling. This masked
+   the model's chosen reasoning terminator and caused repeated reasoning.
+   Vocabulary construction now honors the tokenizer's `special` flag. Explicit
+   structural token IDs still work for ordinary added tokens, including LFM2.
+
+The Goose session `20260909_1` recorded 98 output tokens, a `stop_sequence`
+finish, and only an incomplete `<tool_call>` after reasoning. Its logs do not
+retain raw sampled token IDs or logits, so the precise model decision cannot be
+reconstructed. Previously this marker alone did not activate constraints and
+could be followed by termination. Now activation immediately masks EOS until a
+call is complete. Budget exhaustion or another interruption still cannot execute
+a partial call: parsing reports an incomplete call and emits no `ToolCallEnd`.
+
+### Matched prompt comparison
+
+The request was exactly:
+
+```text
+System: You are a concise assistant. Follow the user's instructions and use tools when requested.
+User: Reply with just the word hello.
+```
+
+Thinking was enabled. The official template rendered a 40-token prompt ending
+in `<|im_start|>assistant\n<think>\n`. Python and Eredu rendered identical
+UTF-8 text and produced identical prompt IDs, with no extra BOS token:
+
+```text
+[166100,8481,13,4321,392,261,38503,13886,152361,7916,269,2028,152402,
+152350,10126,297,828,4651,724,16668,152361,166101,13,166100,2714,13,
+37380,358,983,269,3670,32349,152361,166101,13,166100,66354,13,166103,13]
+```
+
+Eredu used MLX Metal with the original BF16 checkpoint. The independent reference
+used the unchanged released `modeling_nanbeige.py`, PyTorch 2.14.0,
+Transformers 4.48.3, CPU float32 and eager attention. Its model source SHA-256 was
+`eab3554c228491b99ff518d6a27b3d3cc5320d541966be369069bd1c5f545fcf`.
+The reference loaded the released fast tokenizer directly through
+`PreTrainedTokenizerFast`: the legacy Llama tokenizer class requests a slow
+SentencePiece conversion in this environment. Prompt rendering and token IDs
+were checked for exact equality before inference; no model/template patches
+were applied.
+
+| Run | Output tokens | Result |
+| --- | ---: | --- |
+| Original Eredu, ordinary greedy | 70 | `hello` |
+| Original Eredu, constrained greedy, budget 256 | 256 | repeated reasoning, no final answer |
+| Publisher, greedy | 70 | `hello`; all output IDs match ordinary Eredu |
+| Fixed Eredu, ordinary / constrained / controlled greedy, budget 2048 | 70 each | identical output IDs; `hello` |
+| Fixed Eredu, ordinary / constrained / controlled temperature 0.6, budget 2048 | 68 each | identical output IDs; `hello` |
+| Publisher, temperature 0.6, budget 2048 | 148 | `hello` |
+
+At zero-based output position **65**, ordinary Eredu and the publisher choose
+`166104` (`</think>`); the original constrained run chooses `1526` instead.
+The publisher ranks the closing token first, with logit `40.0951538` using
+cached decode. Recomputing the entire prefix without cache also ranks it first,
+with logit `40.0951843`. The first 65 generated token IDs agree. This locates the
+demonstrated divergence in constraint filtering, rather than the template,
+weights, sampling selection or cached model equations.
+
+The final sampled comparison explicitly sets temperature `0.6`, top-k `40`,
+top-p `0.95`, min-p `0.05`, repetition penalty `1`, seed `0` and budget `2048`
+in both implementations. These match the supplied checkpoint directory's
+effective Eredu sampling defaults with the requested temperature override;
+that directory has no `generation_config.json`. Different native RNGs and
+numerical precision mean equal seeds do not imply identical cross-runtime
+sampled outputs. Within Eredu, all three drivers produce exactly the same IDs.
+The original greedy isolation probe disabled top-k/top-p filtering, which does
+not affect argmax; final greedy runs use the same explicit settings as sampling.
+
+### Tool execution and portable coverage
+
+The native regression uses the complete checkpoint tokenizer and weights. It
+dispatches schema-validated calls, inserts the actual result into conversation
+history, and requires an answer containing only a receipt/secret word absent
+from the original prompt. It covers both `lookup(value=7)` and multiline
+`todo__todo_write(content=...)`, thinking on/off, and uninterrupted/controlled
+generation. Execution requires `ToolCallEnd`. The existing native LFM2 basic
+and optional Python keyword argument tests are also exercised because vocabulary
+construction is shared.
+
+Portable coverage uses the unmodified official template and a compact vocabulary
+retaining the checkpoint's added-token IDs, flags, Metaspace processing and
+byte-fallback decoding. It covers immediate activation, EOS rejection after a
+bare marker, token boundaries, every parser byte split, no whitespace/two
+spaces/LF/CRLF-tab structural separators, inline and framed parameter values,
+Unicode and preserved boundary whitespace, string enums, nullable/JSON values,
+schema rejection, every incomplete call prefix, parallel calls, and replay of
+tool results. Replay rejects unescaped `</parameter>` in raw string arguments.
+
+Verification: 176 facade unit tests, 53 backend conformance tests and 19 portable
+facade tests passed (three existing opt-in tests ignored). All three selected
+native tests passed: Nanbeige's eight tool/result round trips, LFM2 native tools,
+and LFM2 optional keyword arguments. Targeted portable/native Clippy with
+`--no-deps -- -D warnings`, formatting and Python syntax checks passed. A broader
+Clippy invocation also checks dependencies and stops at the pre-existing
+`manual_is_multiple_of` lint in `eredu-architectures/src/nanbeige/mod.rs:342`.
+
+No model-name heuristic, checkpoint/template change, generation default change,
+or forced reasoning-length limit was added. Neither matched reference run
+reproduced the reported unbounded reasoning. This establishes the fix for these
+requests, not a guarantee that all prompts finish within a given token budget
+or that a model always chooses the appropriate tool.
+
+### Reproduce the chat comparison
+
+The reference environment also needs the dependencies from the checkpoint
+comparison below. Keep all generated reports outside the source tree:
+
+```sh
+export NANBEIGE_VALIDATION=/private/tmp/eredu-nanbeige
+CARGO_INCREMENTAL=0 cargo run -p eredu --example chat_probe -- \
+  "$NANBEIGE_VALIDATION/checkpoint" "$NANBEIGE_VALIDATION/final-greedy" 2048 0 metal
+CARGO_INCREMENTAL=0 cargo run -p eredu --example chat_probe -- \
+  "$NANBEIGE_VALIDATION/checkpoint" "$NANBEIGE_VALIDATION/final-sampled" 2048 0.6 metal
+
+HF_HOME="$NANBEIGE_VALIDATION/hf-cache" HF_HUB_OFFLINE=1 OMP_NUM_THREADS=16 \
+  python validation/chat_reference.py \
+  --probe "$NANBEIGE_VALIDATION/final-greedy-ordinary.json" \
+  --output "$NANBEIGE_VALIDATION/publisher-greedy.json"
+HF_HOME="$NANBEIGE_VALIDATION/hf-cache" HF_HUB_OFFLINE=1 OMP_NUM_THREADS=16 \
+  python validation/chat_reference.py \
+  --probe "$NANBEIGE_VALIDATION/final-sampled-ordinary.json" \
+  --output "$NANBEIGE_VALIDATION/publisher-sampled.json"
+
+EREDU_NANBEIGE_CHECKPOINT="$NANBEIGE_VALIDATION/checkpoint" \
+  CARGO_INCREMENTAL=0 cargo test -p eredu --test native_tool_checkpoints \
+  nanbeige_real_checkpoint_executes_tool_and_answers_from_result -- --ignored --nocapture
+cargo test -p eredu --no-default-features --lib --test portable_facade --test backend_conformance
+```
+
+`chat_probe` writes separate ordinary, semantic and explicitly stepped controlled
+reports containing the prompt, token IDs, settings and semantic events.
+`chat_reference.py` verifies rendering/tokenization equality, records the
+unconstrained closing-token rank at every step and checks the closing prediction
+again without cache. Local investigation logs and reports are under
+`/private/tmp/eredu-nanbeige/`, including `before-*`, `final-*`,
+`publisher-greedy.*`, `publisher-sampled.*` and `final-native-tools.log`.
+
 ## Released checkpoint
 
 Validated on 2026-09-09 using the official

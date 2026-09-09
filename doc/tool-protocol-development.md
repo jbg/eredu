@@ -13,6 +13,14 @@ immutable source identifier in the test data or fixture name, and preserve all
 meaningful whitespace. When the source lacks a final line feed, document how
 the signature test removes the repository file terminator.
 
+Retain realistic tokenizer metadata as well as rendered strings: added tokens
+may be ordinary text (`special=false`), even when spelled `<think>` or
+`<tool_call>`. Their grammar vocabulary bytes must reflect that declaration.
+Explicit structural token IDs work for both special and ordinary added tokens;
+do not infer specialness from brackets. Check that closing markers remain
+selectable using the checkpoint tokenizer and compare ordinary and constrained
+generation on the same prompt IDs.
+
 Add rendering cases for:
 
 - an ordinary system/user/assistant conversation;

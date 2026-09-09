@@ -161,6 +161,20 @@ strings containing the unescaped closing delimiter fail closed. Historical
 tool calls must use mapping-valued arguments; serialized argument strings are
 not accepted for these templates.
 
+This protocol also covers the official Nanbeige 4.2 template. Automatic native
+constraints activate on `<tool_call>` itself, before any following whitespace.
+Spaces, tabs, CR and LF are accepted between structural tags, including between
+parallel calls. Parameter values may be inline or framed by one matching LF/CRLF
+on each side. Only those framing line breaks are removed; spaces, tabs, additional line
+breaks and Unicode inside string values are retained. The unescaped
+`</parameter>` delimiter cannot occur inside a replayed raw string.
+
+An opening marker commits generation to completing a schema-valid call; EOS is
+masked until the call can end. A budget, cancellation or transport boundary may
+still interrupt generation. Applications execute only after `ToolCallEnd`, never
+on an opening marker, `ToolCallStart`, or argument delta. Incomplete tagged calls
+return a parsing error without publishing `ToolCallEnd`.
+
 Regardless of wire format, the public result is the same semantic event
 vocabulary. Unsupported behavior returns a capability error rather than
 falling back to unconstrained text.

@@ -208,7 +208,9 @@ pub(crate) enum DeclarativePayloadShape {
     StructuralObject(StructuralObjectEncoding),
 }
 
-/// Exact surface syntax for a function with individually tagged parameters.
+/// Tag delimiters for individually tagged parameters. XML whitespace is allowed
+/// between structural tags. A single LF or CRLF framing each parameter value is
+/// optional; matching framing line breaks are removed and other bytes preserved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TaggedParametersEncoding {
     pub(crate) function_prefix: &'static str,
@@ -648,7 +650,15 @@ impl DeclarativeDialectSpec {
             grammar.push_str("CHANNEL_TEXT_CHARACTER: /[^<]/\n");
         }
 
-        let calls = repeated_rule("call", &literal(self.call_separator)?, min_calls, max_calls);
+        let separator = if matches!(
+            self.payload_shape,
+            DeclarativePayloadShape::TaggedParameters(_)
+        ) {
+            "tagged_ws".to_owned()
+        } else {
+            literal(self.call_separator)?
+        };
+        let calls = repeated_rule("call", &separator, min_calls, max_calls);
         match self.payload_shape {
             DeclarativePayloadShape::JsonObject => {
                 let function = self
@@ -767,7 +777,7 @@ impl DeclarativeDialectSpec {
                     ));
                 }
                 grammar.push_str(&format!(
-                    "call: {} tagged_call {}\n",
+                    "call: {} tagged_ws tagged_call tagged_ws {}\n",
                     literal(self.call.prefix)?,
                     literal(self.call.suffix)?
                 ));
@@ -895,11 +905,12 @@ fn tagged_parameters_grammar(
     encoding: TaggedParametersEncoding,
 ) -> Result<String, String> {
     let tools = parse_tools(tools)?;
+    let mut rules = String::from("tagged_ws: /[ \\t\\r\\n]*/\n");
     if tools.is_empty() {
-        return Ok("tagged_call: \"__eredu_unreachable_tagged_tool_call__\"\n".into());
+        rules.push_str("tagged_call: \"__eredu_unreachable_tagged_tool_call__\"\n");
+        return Ok(rules);
     }
 
-    let mut rules = String::new();
     let mut tool_rules = Vec::with_capacity(tools.len());
     let mut next_value = 0usize;
     for (tool_index, tool) in tools.iter().enumerate() {
@@ -932,7 +943,16 @@ fn tagged_parameters_grammar(
                             .iter()
                             .filter_map(Value::as_str)
                             .filter(|value| !value.contains(encoding.parameter_suffix))
-                            .map(literal)
+                            .flat_map(|value| {
+                                let mut spellings = vec![
+                                    literal(&format!("\n{value}\n")),
+                                    literal(&format!("\r\n{value}\r\n")),
+                                ];
+                                if !value.starts_with('\n') && !value.starts_with("\r\n") {
+                                    spellings.push(literal(value));
+                                }
+                                spellings
+                            })
                             .collect::<Vec<_>>();
                         rules.push_str(&format!("{value_rule}: {}\n", alternatives.join(" | ")));
                     } else {
@@ -946,12 +966,14 @@ fn tagged_parameters_grammar(
                 TaggedValueKind::Json => {
                     let schema = serde_json::to_string(&schema)
                         .expect("validated tagged parameter schemas serialize");
-                    rules.push_str(&format!("{value_rule}: %json {schema}\n"));
+                    rules.push_str(&format!(
+                        "{value_rule}: tagged_ws {value_rule}_json tagged_ws\n{value_rule}_json: %json {schema}\n"
+                    ));
                 }
             }
             let parameter_rule = format!("tagged_parameter_{tool_index}_{}", parameter_rules.len());
             rules.push_str(&format!(
-                "{parameter_rule}: {} {} {} {value_rule} {}\n",
+                "{parameter_rule}: {} {} {} {value_rule} {} tagged_ws\n",
                 literal(encoding.parameter_prefix),
                 literal(&name),
                 literal(encoding.parameter_name_suffix),
@@ -968,7 +990,7 @@ fn tagged_parameters_grammar(
                 let name = format!("tagged_any_parameter_{tool_index}");
                 let value = format!("tagged_any_value_{tool_index}");
                 rules.push_str(&format!(
-                    "{name}: {} /[^<>\\r\\n]+/ {} {value}\n{value}[lazy]: /(?s:.)*/ {}\n",
+                    "{name}: {} /[^<>\\r\\n]+/ {} {value} tagged_ws\n{value}[lazy]: /(?s:.)*/ {}\n",
                     literal(encoding.parameter_prefix),
                     literal(encoding.parameter_name_suffix),
                     literal(encoding.parameter_suffix),
@@ -979,7 +1001,7 @@ fn tagged_parameters_grammar(
             };
         let tool_rule = format!("tagged_tool_{tool_index}");
         rules.push_str(&format!(
-            "{tool_rule}: {} {} {} {sequence} {}\n",
+            "{tool_rule}: {} {} {} tagged_ws {sequence} {}\n",
             literal(encoding.function_prefix),
             literal(&tool.name),
             literal(encoding.function_name_suffix),
@@ -989,6 +1011,22 @@ fn tagged_parameters_grammar(
     }
     rules.push_str(&format!("tagged_call: {}\n", tool_rules.join(" | ")));
     Ok(rules)
+}
+
+fn discard_tagged_whitespace(pending: &mut String) {
+    let length = pending.len() - pending.trim_start_matches([' ', '\t', '\r', '\n']).len();
+    pending.drain(..length);
+}
+
+fn tagged_value_text(raw: &str) -> &str {
+    // The opening line break determines framing. Matching it at the end
+    // preserves a value's trailing CR when the template uses LF framing.
+    for newline in ["\r\n", "\n"] {
+        if let Some(value) = raw.strip_prefix(newline) {
+            return value.strip_suffix(newline).unwrap_or(value);
+        }
+    }
+    raw
 }
 
 fn tagged_parameter_sequence(
@@ -2016,6 +2054,7 @@ impl DeclarativeParser {
                     else {
                         unreachable!("tagged-function state requires tagged parameters")
                     };
+                    discard_tagged_whitespace(&mut self.pending);
                     if !self.consume_exact(encoding.function_prefix)? {
                         return Ok(());
                     }
@@ -2049,6 +2088,7 @@ impl DeclarativeParser {
                     else {
                         unreachable!("tagged-parameter state requires tagged parameters")
                     };
+                    discard_tagged_whitespace(&mut self.pending);
                     if self.pending.starts_with(encoding.function_suffix) {
                         let schema = self
                             .tagged_tools
@@ -2122,7 +2162,7 @@ impl DeclarativeParser {
                     let Some(position) = self.pending.find(encoding.parameter_suffix) else {
                         return Ok(());
                     };
-                    let raw = &self.pending[..position];
+                    let raw = tagged_value_text(&self.pending[..position]);
                     let schema = &self
                         .tagged_tools
                         .get(tool)
@@ -2254,17 +2294,12 @@ impl DeclarativeParser {
                         };
                     }
                     DeclarativePayloadShape::TaggedParameters(_) => {
+                        discard_tagged_whitespace(&mut self.pending);
                         if !self.consume_exact(self.spec.call.suffix)? {
                             return Ok(());
                         }
                         sink.end_tool_call()?;
-                        self.state = if self.spec.output.prefix.is_empty()
-                            && self.spec.call_separator.is_empty()
-                        {
-                            DeclarativeParserState::Outside
-                        } else {
-                            DeclarativeParserState::AfterEnvelope
-                        };
+                        self.state = DeclarativeParserState::AfterEnvelope;
                     }
                     DeclarativePayloadShape::JsonList => {
                         let function_suffix = self
@@ -2292,6 +2327,30 @@ impl DeclarativeParser {
                     }
                 },
                 DeclarativeParserState::AfterEnvelope => {
+                    if matches!(
+                        self.spec.payload_shape,
+                        DeclarativePayloadShape::TaggedParameters(_)
+                    ) {
+                        discard_tagged_whitespace(&mut self.pending);
+                        if self.pending.is_empty() {
+                            return Ok(());
+                        }
+                        if !self.spec.output.suffix.is_empty() {
+                            if self.pending.starts_with(self.spec.output.suffix) {
+                                self.pending.drain(..self.spec.output.suffix.len());
+                                self.state = DeclarativeParserState::Outside;
+                                continue;
+                            }
+                            if self.spec.output.suffix.starts_with(&self.pending) {
+                                return Ok(());
+                            }
+                        }
+                        if !self.consume_exact(self.spec.call.prefix)? {
+                            return Ok(());
+                        }
+                        self.state = self.start_call_payload_state();
+                        continue;
+                    }
                     if !self.spec.output.suffix.is_empty()
                         && self.pending.starts_with(self.spec.output.suffix)
                     {
@@ -3033,6 +3092,14 @@ impl ProtocolParser for DeclarativeParser {
             {
                 return Err("incomplete tagged-parameter tool call".into());
             }
+            DeclarativeParserState::AfterEnvelope
+                if matches!(
+                    self.spec.payload_shape,
+                    DeclarativePayloadShape::TaggedParameters(_)
+                ) && !self.pending.is_empty() =>
+            {
+                return Err("incomplete tagged-parameter tool call".into());
+            }
             _ => {}
         }
         Ok(())
@@ -3465,6 +3532,133 @@ mod tests {
         let mut parser = plan.create_parser().unwrap();
         assert!(parser.push(&output.replace("[1,2]", "[1,1]")).is_err());
         assert!(!parser.events().contains(&SemanticEvent::ToolCallEnd));
+    }
+
+    #[test]
+    fn tagged_whitespace_preserves_values_and_never_completes_partial_or_invalid_calls() {
+        let tools = [
+            json!({"type":"function", "function":{"name":"write", "parameters":{
+                "type":"object", "properties":{
+                    "content":{"type":"string"}, "count":{"type":"integer", "minimum":2}
+                }, "required":["content","count"], "additionalProperties":false
+            }}}),
+        ];
+        let plan = ConstraintCompiler::synthetic_for_tests()
+            .compile_tool_plan(
+                &DECLARATIVE_DIALECT,
+                DialectParameters::Declarative(
+                    &crate::runtime::chat::QWEN_TAGGED_TOOL_SPEC_NO_REASONING,
+                ),
+                &tools,
+                ToolChoice::Required,
+                ParallelToolCallPolicy::Disabled,
+                vec![250],
+            )
+            .unwrap();
+        for ws in ["", "  ", "\n", "\r\n\t "] {
+            for (framing, value) in [
+                ("", " value\t "),
+                ("", "inline\n"),
+                ("\n", "trailing CR\r"),
+                ("\n", "<function=literal> \"quoted\" & \t"),
+                ("\n", "\n  first\nsecond\t\n"),
+                ("\r\n", "  value\r\n"),
+            ] {
+                let valid = format!("<tool_call>{ws}<function=write>{ws}<parameter=content>{framing}{value}{framing}</parameter>{ws}<parameter=count>{framing}2{framing}</parameter>{ws}</function>{ws}</tool_call>");
+                assert!(accepts(&plan, &valid), "{valid:?}");
+                for split in 0..=valid.len() {
+                    let mut parser = plan.create_parser().unwrap();
+                    push_at_byte_split(&mut parser, &valid, split);
+                    parser.finish(FinishReason::GrammarComplete).unwrap();
+                    let arguments = parser
+                        .events()
+                        .iter()
+                        .filter_map(|event| match event {
+                            SemanticEvent::ToolArgumentsDelta { json_fragment, .. } => {
+                                Some(json_fragment.as_str())
+                            }
+                            _ => None,
+                        })
+                        .collect::<String>();
+                    assert_eq!(
+                        serde_json::from_str::<Value>(&arguments).unwrap(),
+                        json!({"content":value,"count":2})
+                    );
+                    assert_eq!(
+                        parser
+                            .events()
+                            .iter()
+                            .filter(|event| matches!(event, SemanticEvent::ToolCallEnd))
+                            .count(),
+                        1
+                    );
+                }
+                // Includes the exact observed bare opening marker, every value
+                // truncation, and a function closed without the call envelope.
+                for end in "<tool_call>".len()..valid.len() {
+                    let mut parser = plan.create_parser().unwrap();
+                    parser.push(&valid[..end]).unwrap();
+                    assert!(
+                        parser.finish(FinishReason::MaxTokens).is_err(),
+                        "{:?}",
+                        &valid[..end]
+                    );
+                    assert!(!parser.events().contains(&SemanticEvent::ToolCallEnd));
+                }
+                for invalid in [
+                    valid.replace("function=write", "function=unknown"),
+                    valid.replace("parameter=count", "parameter=content"),
+                    valid.replace("parameter=count", "parameter=unexpected"),
+                    valid.replace(
+                        &format!("{framing}2{framing}"),
+                        &format!("{framing}1{framing}"),
+                    ),
+                    valid.replace("</function>", "<parameter=count>2</parameter></function>"),
+                ] {
+                    let mut parser = plan.create_parser().unwrap();
+                    assert!(parser.push(&invalid).is_err());
+                    assert!(!parser.events().contains(&SemanticEvent::ToolCallEnd));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tagged_string_enums_preserve_boundary_newlines() {
+        for value in [
+            "plain",
+            "\nleading",
+            "trailing\n",
+            "trailing\r",
+            "\r\nvalue\r\n",
+        ] {
+            let tools = [
+                json!({"type":"function", "function":{"name":"write", "parameters":{
+                    "type":"object", "properties":{"content":{"type":"string", "enum":[value]}},
+                    "required":["content"], "additionalProperties":false
+                }}}),
+            ];
+            let plan = ConstraintCompiler::synthetic_for_tests()
+                .compile_tool_plan(
+                    &DECLARATIVE_DIALECT,
+                    DialectParameters::Declarative(
+                        &crate::runtime::chat::QWEN_TAGGED_TOOL_SPEC_NO_REASONING,
+                    ),
+                    &tools,
+                    ToolChoice::Required,
+                    ParallelToolCallPolicy::Disabled,
+                    vec![250],
+                )
+                .unwrap();
+            for newline in ["\n", "\r\n"] {
+                let call = format!("<tool_call><function=write><parameter=content>{newline}{value}{newline}</parameter></function></tool_call>");
+                assert!(accepts(&plan, &call), "{call:?}");
+                let mut parser = plan.create_parser().unwrap();
+                parser.push(&call).unwrap();
+                parser.finish(FinishReason::GrammarComplete).unwrap();
+                assert!(parser.events().contains(&SemanticEvent::ToolCallEnd));
+            }
+        }
     }
 
     #[test]
