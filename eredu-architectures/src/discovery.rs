@@ -51,6 +51,7 @@ impl ArtifactArchitecturePlan {
         } else if let Some(plan) = self.gguf_plan() {
             match plan.model() {
                 GgufModelConfig::Llama(c) => families::dense(&mut graph, c, None),
+                GgufModelConfig::Nanbeige(c) => families::nanbeige(&mut graph, c),
                 GgufModelConfig::Qwen(c) => families::qwen(&mut graph, c),
                 GgufModelConfig::GptOss(c) => families::gpt_oss(&mut graph, c),
                 GgufModelConfig::QwenHybrid(c) => families::qwen_hybrid(&mut graph, c),

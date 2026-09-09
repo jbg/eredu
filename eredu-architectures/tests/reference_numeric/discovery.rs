@@ -177,6 +177,62 @@ fn advertised_dense_paths_capture_prefill_and_decode_values() {
 }
 
 #[test]
+fn nanbeige_discovery_describes_logical_invocations_and_executable_captures() {
+    let config = super::nanbeige::tiny_config(false);
+    let graph = descriptor(&config);
+    assert_eq!(
+        graph
+            .nodes
+            .iter()
+            .filter(|n| n.layer_index.is_some())
+            .count(),
+        4
+    );
+    assert_ne!(
+        graph.node("decoder.layers.0").unwrap().parameter_groups,
+        graph.node("decoder.layers.2").unwrap().parameter_groups
+    );
+    assert_ne!(
+        graph
+            .node("decoder.layers.1.output_norm")
+            .unwrap()
+            .parameter_groups,
+        graph.node("output.norm").unwrap().parameter_groups
+    );
+    let args = eredu_architectures::nanbeige::model_args_from_config_value(&config).unwrap();
+    let context = NumericContext::default();
+    let model =
+        eredu_architectures::nanbeige::LayeredModel::<NumericBackend>::new(args.clone(), &context)
+            .unwrap();
+    let mut runtime = LayerwiseRuntime::new(model, RebuildingUnitPolicy::default());
+    let mut state = DeviceState::<NumericBackend, _>::create(
+        eredu_architectures::nanbeige::state_layout(&args).unwrap(),
+        |_, p| Ok::<_, Error>(NumericHybridLayerState::new(p)),
+    )
+    .unwrap();
+    for ids in [vec![1, 3, 2], vec![4]] {
+        let tokens = NumericTensor::token_ids(&ids);
+        let mut capture = Capture {
+            request: ObservationRequest::all(),
+            values: BTreeMap::new(),
+        };
+        let logits = runtime
+            .forward_with_observer(
+                decoder::LayeredInput {
+                    tokens: &tokens,
+                    mask: None,
+                },
+                &mut state,
+                &context,
+                &mut capture,
+            )
+            .unwrap();
+        eredu_runtime::observe_model_logits(&mut capture, &logits).unwrap();
+        check_captures(&graph, &capture, ids.len());
+    }
+}
+
+#[test]
 fn advertised_hybrid_shared_moe_paths_capture_both_phases_and_exact_selection() {
     let mut config = heterogeneous_replicated_configs()
         .into_iter()

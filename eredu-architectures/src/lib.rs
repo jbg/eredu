@@ -137,6 +137,9 @@ pub mod gpt_oss;
 /// Llama and Mistral-compatible decoder architecture.
 pub mod llama;
 
+/// Nanbeige shared-weight repeated decoder family.
+pub mod nanbeige;
+
 /// Moshi-family realtime temporal/depth architecture policy.
 pub mod moshi;
 

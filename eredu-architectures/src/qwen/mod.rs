@@ -54,6 +54,7 @@ fn assemble_block<B: NeuralBackend, F>(
     context: &<B::Tensor as Tensor>::Context,
 ) -> Result<crate::decoder::TransformerBlock<B, F>, Error> {
     Ok(crate::decoder::TransformerBlock {
+        output_norm: None,
         self_attention: Attention::new(args, layer, context)?,
         mlp,
         input_norm: B::normalization(

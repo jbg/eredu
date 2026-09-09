@@ -49,7 +49,7 @@ fn canonical_tensor_mapping(
         GgufModelConfig::Lfm2(args) => checkpoint.translated_outputs(|name| {
             crate::lfm2::translate_gguf_weight_name(name, args.has_sparse_moe_layers())
         }),
-        GgufModelConfig::Llama(_) => {
+        GgufModelConfig::Llama(_) | GgufModelConfig::Nanbeige(_) => {
             checkpoint.translated_outputs(crate::llama::translate_gguf_weight_name)
         }
         GgufModelConfig::MuseGlimmer(_) => {
@@ -143,6 +143,12 @@ fn resolve_family(
                 .map_err(|error| error.to_string())?;
             let plan = crate::lfm2::gguf_plan(&args)?;
             Ok((GgufModelConfig::Lfm2(args), plan, None))
+        }
+        GgufArchitecture::Nanbeige => {
+            let args = crate::nanbeige::model_args_from_gguf_catalog(checkpoint, &metadata)
+                .map_err(|e| e.to_string())?;
+            let plan = crate::llama::gguf_plan(args.dense_config())?;
+            Ok((GgufModelConfig::Nanbeige(args), plan, None))
         }
         GgufArchitecture::Llama | GgufArchitecture::Mistral => {
             let args = crate::llama::model_args_from_gguf_catalog(checkpoint, &metadata)

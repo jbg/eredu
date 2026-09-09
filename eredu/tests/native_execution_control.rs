@@ -85,6 +85,22 @@ fn write_weights(root: &Path) {
     write_tensor_plan(root, resolved.architecture.checkpoint());
 }
 
+fn use_nanbeige_weights(root: &Path) {
+    let path = root.join("config.json");
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    config["model_type"] = "nanbeige".into();
+    config["num_loops"] = 2.into();
+    config["hidden_size"] = 32.into();
+    config["intermediate_size"] = 64.into();
+    config["head_dim"] = 8.into();
+    config["num_attention_heads"] = 8.into();
+    config["rope_theta"] = 70_000_000.into();
+    std::fs::write(path, serde_json::to_vec(&config).unwrap()).unwrap();
+    let resolved = eredu_architectures::configuration::resolve_model_config(&config).unwrap();
+    write_tensor_plan(root, resolved.architecture.checkpoint());
+}
+
 fn write_tensor_plan(
     root: &Path,
     checkpoint: &eredu_checkpoint::schema::SafetensorsCheckpointPlan,
@@ -168,7 +184,23 @@ fn native_metal_facade_restores_and_forks_sampled_partial_text() {
 }
 
 fn native_facade(device: LocalDevice, text: bool) {
+    native_facade_with_family(device, text, false);
+}
+
+#[test]
+#[cfg_attr(
+    feature = "metal",
+    ignore = "run with --no-default-features --features mlx for CPU-only native initialization"
+)]
+fn nanbeige_controlled_snapshots_restore_and_fork_all_loop_caches() {
+    native_facade_with_family(LocalDevice::Cpu, true, true);
+}
+
+fn native_facade_with_family(device: LocalDevice, text: bool, nanbeige: bool) {
     let root = fixture(true);
+    if nanbeige {
+        use_nanbeige_weights(&root.0);
+    }
     if text {
         std::fs::write(
             root.0.join("chat_template.jinja"),
@@ -300,7 +332,66 @@ fn complete_controlled_example_verifies_native_capture_restore_and_modified_bran
     ignore = "run with --no-default-features --features mlx for CPU-only native initialization"
 )]
 fn native_text_matches_ordinary_sampling_with_checkpoint_defaults_and_padded_logits() {
+    text_matches_ordinary_sampling(false);
+}
+
+#[test]
+#[cfg_attr(
+    feature = "metal",
+    ignore = "run with --no-default-features --features mlx for CPU-only native initialization"
+)]
+fn nanbeige_controlled_text_matches_uninterrupted_generation() {
+    text_matches_ordinary_sampling(true);
+}
+
+fn text_matches_ordinary_sampling(nanbeige: bool) {
+    text_matches_ordinary_sampling_with_policy(
+        nanbeige,
+        eredu_core::ResidencyPlan::FullyResident,
+        eredu_core::WeightTransformationPlan::PreserveCheckpoint,
+    );
+}
+
+#[test]
+#[cfg_attr(
+    feature = "metal",
+    ignore = "run with --no-default-features --features mlx"
+)]
+fn nanbeige_controlled_host_and_disk_residency_with_affine_transforms() {
+    for residency in [
+        eredu_core::ResidencyPlan::LayerwiseHost {
+            device_layer_window: 1,
+            device_budget_bytes: Some(8 << 20),
+            host_budget_bytes: Some(8 << 20),
+        },
+        eredu_core::ResidencyPlan::DenseDiskStream {
+            device_budget_bytes: 8 << 20,
+            host_budget_bytes: 8 << 20,
+            host_lookahead: 1,
+            background_queue: 1,
+        },
+    ] {
+        for transform in [
+            eredu_core::WeightTransformationPlan::PreserveCheckpoint,
+            eredu_core::WeightTransformationPlan::Affine {
+                bits: 4,
+                group_size: 32,
+            },
+        ] {
+            text_matches_ordinary_sampling_with_policy(true, residency.clone(), transform);
+        }
+    }
+}
+
+fn text_matches_ordinary_sampling_with_policy(
+    nanbeige: bool,
+    residency: eredu_core::ResidencyPlan,
+    transformation: eredu_core::WeightTransformationPlan,
+) {
     let root = fixture(false);
+    if nanbeige {
+        use_nanbeige_weights(&root.0);
+    }
     // Keep the checkpoint's 64 logits positions but only 32 mapped tokenizer IDs.
     let path = root.0.join("tokenizer.json");
     let mut tokenizer: serde_json::Value =
@@ -319,7 +410,9 @@ fn native_text_matches_ordinary_sampling_with_checkpoint_defaults_and_padded_log
     std::fs::write(path, serde_json::to_vec(&config).unwrap()).unwrap();
     std::fs::write(root.0.join("generation_config.json"), r#"{"do_sample":true,"temperature":1.7,"top_k":12,"top_p":0.9,"repetition_penalty":1.1,"max_new_tokens":12}"#).unwrap();
     std::fs::write(root.0.join("chat_template.jinja"), "{% for m in messages %}{{ m.content }}{% endfor %}{% if add_generation_prompt %} word3 word7{% endif %}").unwrap();
-    let execution = ExecutionPlan::fully_resident(local_device_plan(LocalDevice::Cpu).unwrap());
+    let execution = ExecutionPlan::fully_resident(local_device_plan(LocalDevice::Cpu).unwrap())
+        .with_residency(residency)
+        .with_weight_transformation(transformation);
     let (mut model, _) =
         LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &root.0, &execution)
             .unwrap()

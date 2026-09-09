@@ -5,6 +5,9 @@
 
 use std::ops::Range;
 
+/// Shared-weight repeated stacks with independent state for each invocation.
+pub(crate) mod repeated;
+
 use eredu_checkpoint::{LinearFormat, WeightQuantization};
 use eredu_core::cache::LayerCachePolicy;
 use eredu_core::{AttentionPolicy, LayerSchedule};
@@ -148,6 +151,11 @@ pub trait Config: 'static {
     fn hidden_size(&self) -> i32;
     /// Number of decoder layers.
     fn num_hidden_layers(&self) -> i32;
+    /// Optional learned RMS normalization after a block's final residual.
+    /// The returned canonical parameter belongs to that execution unit.
+    fn block_output_normalization(&self, _layer: usize) -> Option<String> {
+        None
+    }
     /// SwiGLU intermediate width.
     fn intermediate_size(&self) -> i32;
     /// Number of query heads.
@@ -1579,6 +1587,8 @@ pub struct TransformerBlock<B: NeuralBackend, F = Mlp<B>> {
     pub input_norm: B::Normalization,
     /// Pre-MLP RMSNorm.
     pub post_attention_norm: B::Normalization,
+    /// Optional normalization of the completed block output.
+    pub output_norm: Option<B::Normalization>,
 }
 
 impl<B: NeuralBackend> TransformerBlock<B, Mlp<B>> {
@@ -1590,6 +1600,19 @@ impl<B: NeuralBackend> TransformerBlock<B, Mlp<B>> {
     ) -> Result<Self, Error> {
         let fields = config.block_parameter_fields().validate()?;
         Ok(Self {
+            output_norm: config
+                .block_output_normalization(layer)
+                .map(|name| {
+                    B::normalization(
+                        NormalizationConstructionSpec::learned(
+                            config.hidden_size(),
+                            config.rms_norm_epsilon(),
+                            ParameterSpec::trainable(name).map_err(Error::backend)?,
+                        ),
+                        context,
+                    )
+                })
+                .transpose()?,
             self_attention: Attention::new(config, layer, context)?,
             mlp: Mlp::new(config, layer, context)?,
             input_norm: B::normalization(
@@ -1627,6 +1650,16 @@ where
     B: NeuralBackend,
     F: FeedForwardOperator<B>,
 {
+    fn normalize_output(
+        &mut self,
+        hidden: B::Tensor,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        match &mut self.output_norm {
+            Some(norm) => norm.forward(&hidden, context),
+            None => Ok(hidden),
+        }
+    }
     /// Executes this block with replicated projections.
     pub fn forward<C: AttentionCache<B::Tensor>>(
         &mut self,
@@ -1647,7 +1680,7 @@ where
         let hidden = input.hidden.add(&attention, context)?;
         let normalized = self.post_attention_norm.forward(&hidden, context)?;
         let mlp = self.mlp.forward_feed_forward(&normalized, context)?;
-        hidden.add(&mlp, context)
+        self.normalize_output(hidden.add(&mlp, context)?, context)
     }
 
     /// Executes attention and residuals while delegating feed-forward execution.
@@ -1675,7 +1708,7 @@ where
         let hidden = input.hidden.add(&attention, context)?;
         let normalized = self.post_attention_norm.forward(&hidden, context)?;
         let mlp = feed_forward(&mut self.mlp, &normalized, context)?;
-        hidden.add(&mlp, context)
+        self.normalize_output(hidden.add(&mlp, context)?, context)
     }
 
     /// Executes a block with rank-local column projections and reduced row projections.
@@ -1705,7 +1738,7 @@ where
         let mlp = self
             .mlp
             .forward_feed_forward_parallel(&normalized, parallel, context)?;
-        hidden.add(&mlp, context)
+        self.normalize_output(hidden.add(&mlp, context)?, context)
     }
 
     /// Executes tensor-parallel attention and residuals with delegated feed-forward execution.
@@ -1735,7 +1768,7 @@ where
         let hidden = input.hidden.add(&attention, context)?;
         let normalized = self.post_attention_norm.forward(&hidden, context)?;
         let mlp = feed_forward(&mut self.mlp, &normalized, context)?;
-        hidden.add(&mlp, context)
+        self.normalize_output(hidden.add(&mlp, context)?, context)
     }
 }
 
@@ -1827,6 +1860,19 @@ pub fn block_common_parallel_parameter_groups<B: NeuralBackend, F>(
         |_, _| Ok(MemberSharding::Replicated),
     )?;
     let mut groups = vec![attention];
+    if let Some(norm) = &block.output_norm {
+        let name = config.block_output_normalization(layer).ok_or_else(|| {
+            ParallelPlanError::InvalidGroup(
+                "block output normalization is absent from configuration".into(),
+            )
+        })?;
+        groups.push(module_parameter_group::<B::Tensor, _>(
+            name.trim_end_matches(".weight"),
+            ParameterRole::Replicated,
+            norm,
+            |_, _| Ok(MemberSharding::Replicated),
+        )?);
+    }
     if let Some(sinks) = &block.self_attention.sinks {
         groups.push(partitioned_module_parameter_group::<B::Tensor, _>(
             format!("{attention_prefix}.{}", fields.attention_sinks),
@@ -2204,6 +2250,17 @@ pub fn dense_parameter_description(
             )],
         )?;
         let mut unit_groups = vec![attention];
+        if let Some(name) = config.block_output_normalization(layer) {
+            unit_groups.push(ParameterGroupSpec::new(
+                name.trim_end_matches(".weight"),
+                ParameterRole::Replicated,
+                [eredu_runtime::ParameterMemberSpec::new(
+                    &name,
+                    vec![hidden],
+                    MemberSharding::Replicated,
+                )],
+            )?);
+        }
         if config.query_key_norm_epsilon().is_some() {
             for field in [fields.attention_query_norm, fields.attention_key_norm] {
                 unit_groups.push(ParameterGroupSpec::new(

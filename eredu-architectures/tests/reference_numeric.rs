@@ -85,6 +85,9 @@ use eredu_runtime::{
 };
 use safetensors::tensor::Dtype;
 
+#[path = "reference_numeric/nanbeige.rs"]
+mod nanbeige;
+
 #[path = "reference_numeric/neural_geometry_conformance.rs"]
 mod neural_geometry_conformance;
 #[path = "reference_numeric/partitioned_adapter.rs"]
@@ -2550,6 +2553,9 @@ struct NumericContext {
     bind_checkpoint_values: bool,
     sliding_attention_calls: Cell<usize>,
     local_layout: Option<Arc<LocalModelLayout>>,
+    // Affine numerical execution stores expanded weights while admission and
+    // transport retain the selected packed layout.
+    expanded_weight_layout: Option<Arc<LocalModelLayout>>,
     mechanisms: Arc<Mutex<Vec<NumericMechanismTrace>>>,
     partition: Option<NumericPartitionContext>,
 }
@@ -2560,6 +2566,7 @@ impl NumericContext {
             bind_checkpoint_values: false,
             sliding_attention_calls: Cell::new(0),
             local_layout: Some(Arc::new(layout)),
+            expanded_weight_layout: None,
             mechanisms: Arc::default(),
             partition: None,
         }
@@ -2574,15 +2581,21 @@ impl NumericContext {
             bind_checkpoint_values: false,
             sliding_attention_calls: Cell::new(0),
             local_layout: Some(Arc::new(layout)),
+            expanded_weight_layout: None,
             mechanisms: Arc::default(),
             partition: Some(NumericPartitionContext::new(rank, world)),
         }
     }
 
     fn tensor_layout(&self, target: &str) -> Option<&LocalTensorLayout> {
-        self.local_layout
+        self.expanded_weight_layout
             .as_deref()
             .and_then(|layout| layout.tensor(target))
+            .or_else(|| {
+                self.local_layout
+                    .as_deref()
+                    .and_then(|layout| layout.tensor(target))
+            })
     }
 
     fn record_bank_lookup(&self, key: impl Into<String>) {
@@ -17882,12 +17895,13 @@ where
     let (text, prompt, plan, _) = facts.into_parts();
     let (prompt_cache_identity, _, _, _) = text.into_parts();
     let factory_world = Arc::clone(&world);
+    let binding_checkpoint = Arc::clone(&checkpoint);
     let binding = prepared
         .prepare_session_runtime(
             prompt,
             &context,
             move |input, _source, layout, selected, context| {
-                let (architecture, partition, manifest, tasks) = input.into_parts();
+                let (mut architecture, partition, manifest, tasks) = input.into_parts();
                 if tasks.is_empty() || layout != *context.local_layout.as_deref().unwrap() {
                     return Err(Error::backend(
                         "numeric direct local task/layout authority drifted",
@@ -17896,12 +17910,22 @@ where
                 factory_world.record_materialization(manifest.rank(), tasks.len());
                 factory_world.realize_manifest(&manifest)?;
                 let addresses = partition.units().collect::<Vec<_>>();
-                let units = addresses
+                let mut units = addresses
                     .iter()
                     .map(|address| {
                         architecture.build_unit(address.group(), address.index(), context)
                     })
                     .collect::<Result<Vec<_>, _>>()?;
+                if context.bind_checkpoint_values {
+                    payload::bind(
+                        &mut architecture,
+                        &mut units,
+                        &tasks,
+                        &[],
+                        binding_checkpoint.as_ref(),
+                        context,
+                    )?;
+                }
                 let state = numeric_partition_state(selected, &partition)?;
                 let parallel = numeric_parallel_context(&factory_world, &manifest, tensor_group)?;
                 let communication = numeric_partition_communication(&factory_world, manifest)?;
@@ -17966,12 +17990,13 @@ where
     let (text, prompt, plan, _) = facts.into_parts();
     let (prompt_cache_identity, _, _, _) = text.into_parts();
     let factory_world = Arc::clone(&world);
+    let binding_checkpoint = Arc::clone(&checkpoint);
     let binding = prepared
         .prepare_session_runtime(
             prompt,
             &context,
             move |input, _source, layout, selected, context| {
-                let (architecture, partition, manifest, tasks) = input.into_parts();
+                let (mut architecture, partition, manifest, tasks) = input.into_parts();
                 if tasks.is_empty() || layout != *context.local_layout.as_deref().unwrap() {
                     return Err(Error::backend(
                         "numeric pipeline local task/layout authority drifted",
@@ -17980,12 +18005,22 @@ where
                 factory_world.record_materialization(manifest.rank(), tasks.len());
                 factory_world.realize_manifest(&manifest)?;
                 let addresses = partition.units().collect::<Vec<_>>();
-                let units = addresses
+                let mut units = addresses
                     .iter()
                     .map(|address| {
                         architecture.build_unit(address.group(), address.index(), context)
                     })
                     .collect::<Result<Vec<_>, _>>()?;
+                if context.bind_checkpoint_values {
+                    payload::bind(
+                        &mut architecture,
+                        &mut units,
+                        &tasks,
+                        &[],
+                        binding_checkpoint.as_ref(),
+                        context,
+                    )?;
+                }
                 let state = numeric_partition_state(selected, &partition)?;
                 let parallel = tensor_group
                     .map(|id| numeric_parallel_context(&factory_world, &manifest, id))
@@ -22517,6 +22552,7 @@ pub(crate) fn run_reference_conformance_replicated_safetensors_families(
 ) -> Vec<ReferenceStageEvidence> {
     let mut cases = vec![
         config("llama", false),
+        nanbeige::tiny_config(false),
         config("qwen2", false),
         config("qwen3", false),
         serde_json::json!({
@@ -22552,7 +22588,7 @@ pub(crate) fn run_reference_conformance_replicated_safetensors_families(
 pub(crate) fn reference_conformance_replicated_safetensors_families() {
     assert_eq!(
         run_reference_conformance_replicated_safetensors_families().len(),
-        9
+        10
     );
 }
 

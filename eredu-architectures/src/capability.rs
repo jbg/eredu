@@ -879,6 +879,19 @@ pub fn llama(args: &crate::llama::ModelArgs) -> Result<CapabilityEstimate, Capab
     Ok(finish(args.model_type.clone(), llama_spec(args, false)?))
 }
 
+/// Derives state memory for every logical decoder invocation.
+pub fn nanbeige(args: &crate::nanbeige::ModelArgs) -> Result<CapabilityEstimate, CapabilityError> {
+    let dense = args.dense_config();
+    let mut spec = llama_spec(dense, false)?;
+    spec.4 = state_memory_layout(
+        crate::nanbeige::state_layout(args),
+        dense.hidden_size,
+        1,
+        EstimationCompleteness::Complete,
+    )?;
+    Ok(finish("nanbeige".into(), spec))
+}
+
 /// Derives Qwen text capabilities from normalized architecture policy.
 pub fn qwen(args: &crate::qwen::ModelArgs) -> Result<CapabilityEstimate, CapabilityError> {
     Ok(finish(args.model_type.clone(), qwen_spec(args, false)?))

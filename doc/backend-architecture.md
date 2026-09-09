@@ -866,7 +866,7 @@ then uses the ordinary requirements, selection, exact materialization tasks,
 neutral session constructor, and lifecycle. Adding it does not require a
 backend family registry case or a complete-model wrapper.
 
-Architecture-owned typed dispatch admits replicated Llama/Mistral, dense
+Architecture-owned typed dispatch admits replicated Llama/Mistral, Nanbeige, dense
 Qwen2/Qwen3, dense LFM2, dense Kimi Linear, target-only dense Nemotron-H, and
 target-only text Qwen3-Next/Qwen3.5 configurations. Its additive routed class
 admits replicated Qwen3 MoE, GPT-OSS, routed LFM2, Kimi Linear, Nemotron-H,
@@ -884,6 +884,20 @@ It constructs modules with the selected executable formats, validates the
 proof-bearing architecture value, and invokes the corresponding typed neutral
 constructor adapter. Optional profiles are additive, so an ordinary backend
 does not acquire heterogeneous-state bounds.
+
+Nanbeige reuses the portable GQA/SwiGLU decoder blocks. `decoder::repeated`
+lowers physical checkpoint blocks to logical invocations with exact source
+aliases and an expanded attention schedule. The generic decoder's optional
+post-block normalization expresses inter-pass RMSNorm. Each invocation owns
+independent cache and residency state, so the ordinary dense drivers provide
+per-block offloading, tensor sharding, pipeline cuts, combined TP/PP and captures.
+Exact full-source aliases retain the physical tensor's encoding and geometry,
+including native GGUF blocks, instead of treating encoded bytes as dense recipe
+outputs. Architecture policy owns repetition, checkpoint geometry and cache
+identity. Resident materialization currently creates a block for each logical
+invocation; estimates count these replicas and all invocation caches, while
+checkpoint storage describes the physical weights. Backends consume the usual
+typed replicated or partitioned architecture and add no family dispatch.
 
 `eredu-runtime::construct_replicated_text_session` and its execution-strategy
 form are the single production construction family for these profiles. The

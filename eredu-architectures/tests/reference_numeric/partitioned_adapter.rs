@@ -32,8 +32,19 @@ pub(super) fn prepare_with_timeout(
     let plan = prepared_adapter::plan(None)
         .with_topology(topology)
         .with_prompt_cache_persistence(prompt_cache_persistence);
+    prepare_plan(inspection, &plan, rank, completion_timeout)
+}
+
+pub(super) fn prepare_plan(
+    inspection: &eredu_core::ArtifactInspection<
+        eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+    >,
+    plan: &eredu_core::ExecutionPlan,
+    rank: usize,
+    completion_timeout: std::time::Duration,
+) -> Result<PreparedModelSources, String> {
     let parallel = eredu_runtime::ParallelLoadRequest::new(
-        ParallelRankTopology::new(topology, rank).map_err(|error| error.to_string())?,
+        ParallelRankTopology::new(*plan.topology(), rank).map_err(|error| error.to_string())?,
         eredu_runtime::PipelineWireContract::new(eredu_runtime::PipelineActivationDtype::Float32),
         1,
         8,
@@ -45,7 +56,7 @@ pub(super) fn prepare_with_timeout(
     )
     .map_err(|error| error.to_string())?;
     let request = eredu_runtime::NormalizedLoadRequest::from_execution_plan(
-        &plan,
+        plan,
         eredu_runtime::ResidencyDiagnostics::new(false, false),
         Some(parallel),
     )

@@ -325,6 +325,14 @@ fn values(
             checkpoint,
             context,
         )?;
+        if let Some(layout) = context.tensor_layout(task.name()) {
+            if value.shape == shape(layout.global_shape())? {
+                for placement in layout.additional_placements() {
+                    value = select_parameter(&value, placement)?;
+                }
+                value = select_parameter(&value, layout.placement())?;
+            }
+        }
         match task.executable() {
             eredu_checkpoint::LinearFormat::Dense => {}
             eredu_checkpoint::LinearFormat::Affine(format)
@@ -343,10 +351,14 @@ fn values(
                         eredu_nn::LinearCompanionRole::Scale => &scale,
                         eredu_nn::LinearCompanionRole::AffineBias => &bias,
                     };
-                    if payload.shape != shape(companion.logical_shape())? {
-                        return Err(Error::backend(
-                            "scalar affine companion geometry differs from admission",
-                        ));
+                    let expected = context
+                        .tensor_layout(companion.name())
+                        .map_or(companion.logical_shape(), |layout| layout.local_shape());
+                    if payload.shape != shape(expected)? {
+                        return Err(Error::backend(format!(
+                            "scalar affine companion {} geometry {:?} differs from local admission {expected:?}",
+                            companion.name(), payload.shape,
+                        )));
                     }
                     if values
                         .insert(companion.name().to_owned(), payload.clone())

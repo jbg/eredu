@@ -142,6 +142,46 @@ it.
   traits, plans, or reports first, then implemented by the backend and wired in
   composition.
 
+## Complete model-family integration
+
+New model families must support the applicable existing execution paths from the
+first integration. A successful resident forward pass is not a complete family
+implementation. Include:
+
+- official SafeTensors admission and the family's published GGUF format, including
+  exact tensor geometry, aliases, quantization companions, and tokenizer policy;
+- resident, host-layerwise, and disk-streamed execution, with units small enough
+  for the existing bounded-residency policies;
+- tensor and pipeline parallel construction, including combined TP/PP, local
+  state geometry, parameter transforms, and transport across semantic boundaries;
+- uninterrupted and controlled prefill/decode, snapshots, restore, fork,
+  termination, prompt-cache identity, and the applicable observation contracts;
+- architecture discovery and cold capability, memory, and residency reports that
+  describe the implementation actually selected.
+
+Reuse or generalize portable mechanisms from existing families. Missing reusable
+mechanisms are part of the integration work; do not hide them by declaring a
+whole-stack residency unit, returning unsupported capabilities, omitting a
+source format, or adding a family branch to a backend. Keep logical invocations,
+shared checkpoint parameters, and mutable state distinct. Residency estimates
+must account for the actual materialization strategy, including any replicas.
+
+Add behavioral coverage for the applicable matrix above, using nonzero numerical
+fixtures and neutral backend contracts. Exercise pipeline cuts at architecture
+boundaries and compare partitioned and bounded execution with ordinary execution.
+Download a pinned official checkpoint outside the tracked source tree, validate
+its provenance, and run prefill plus multiple cached decode steps against an
+independent reference. Record reproducible commands, revisions, tolerances, and
+results in the family support documentation. Synthetic fixtures supplement this
+released-checkpoint validation; they do not replace it. If hardware prevents a
+particular native distributed run, keep its neutral conformance coverage and
+report that native validation gap explicitly.
+
+Only architectural inapplicability justifies omitting an existing feature. Explain
+the concrete equation, state, or resource constraint in the support documentation
+and expose a typed rejection where necessary. Never describe an unimplemented
+path as an inherent model limitation.
+
 ## Controlled inference parity
 
 New inference functionality must also work through controlled sessions by default.

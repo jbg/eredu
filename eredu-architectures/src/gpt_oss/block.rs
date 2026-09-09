@@ -29,6 +29,7 @@ where
     ) -> Result<TransformerBlock<B>, Error> {
         let prefix = format!("{}.layers.{layer}", args.parameter_root);
         Ok(crate::decoder::TransformerBlock {
+            output_norm: None,
             self_attention: Attention::new(args, layer, context)?,
             mlp: RoutedMlp::new(args, layer, context)?,
             input_norm: B::normalization(
@@ -60,6 +61,7 @@ where
     ) -> Result<TransformerBlock<B>, Error> {
         let prefix = format!("{}.layers.{layer}", global.parameter_root);
         Ok(crate::decoder::TransformerBlock {
+            output_norm: None,
             self_attention: Attention::new(local, layer, context)?,
             mlp: RoutedMlp::new_partitioned(global, local, layer, context)?,
             input_norm: B::normalization(

@@ -74,6 +74,18 @@ pub(super) fn dense<C: Config>(g: &mut Builder, c: &C, moe_policy: Option<MoeAtt
             );
         }
         previous = output;
+        if let Some(name) = c.block_output_normalization(i) {
+            let id = format!("{block}.output_norm");
+            g.node(
+                &id,
+                ArchitectureNodeKind::Normalization,
+                Some(&block),
+                Some(name.trim_end_matches(".weight")),
+                Some(width),
+            );
+            g.edge(&previous, &id, ArchitectureEdgeKind::Data);
+            previous = id;
+        }
     }
     g.output(
         &previous,
@@ -86,6 +98,10 @@ pub(super) fn dense<C: Config>(g: &mut Builder, c: &C, moe_policy: Option<MoeAtt
         width,
         c.vocabulary_size() as usize,
     );
+}
+
+pub(super) fn nanbeige(g: &mut Builder, c: &crate::nanbeige::ModelArgs) {
+    dense(g, c, None);
 }
 
 pub(super) fn qwen(g: &mut Builder, c: &crate::qwen::ModelArgs) {
@@ -330,6 +346,7 @@ fn merge_capture(g: &mut Builder, assembly: &str) {
 
 pub(super) fn remaining_safetensors(g: &mut Builder, c: &SafetensorsModelConfig) {
     match c {
+        SafetensorsModelConfig::Nanbeige(c) => nanbeige(g, c),
         SafetensorsModelConfig::Lfm2(c) => lfm2(g, c),
         SafetensorsModelConfig::KimiLinear(c) => kimi(g, c),
         SafetensorsModelConfig::NemotronH(c) => nemotron(g, c),
@@ -381,6 +398,7 @@ pub(super) fn remaining_gguf(g: &mut Builder, c: &GgufModelConfig) {
         GgufModelConfig::MuseGlimmer(c) => muse(g, c),
         GgufModelConfig::Inkling(c) => inkling(g, c),
         GgufModelConfig::Llama(_)
+        | GgufModelConfig::Nanbeige(_)
         | GgufModelConfig::Qwen(_)
         | GgufModelConfig::GptOss(_)
         | GgufModelConfig::QwenHybrid(_) => unreachable!("handled by caller"),

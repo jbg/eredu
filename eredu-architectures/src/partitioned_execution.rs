@@ -5723,6 +5723,10 @@ fn direct_partitioned_state_layout(
             .gguf_plan()
             .map(|plan| plan.model()),
     ) {
+        (Some(crate::configuration::SafetensorsModelConfig::Nanbeige(args)), None)
+        | (None, Some(crate::configuration::GgufModelConfig::Nanbeige(args))) => {
+            dense_decoder_partitioned_state_layout(args, rank).map(Some)
+        }
         (Some(crate::configuration::SafetensorsModelConfig::Llama(args)), None)
         | (None, Some(crate::configuration::GgufModelConfig::Llama(args))) => {
             dense_decoder_partitioned_state_layout(args, rank).map(Some)
@@ -8063,6 +8067,38 @@ where
             .gguf_plan()
             .map(|plan| plan.model()),
     ) {
+        (Some(crate::configuration::SafetensorsModelConfig::Nanbeige(args)), None)
+        | (None, Some(crate::configuration::GgufModelConfig::Nanbeige(args))) => {
+            let source_args = selected
+                .base()
+                .parameters()
+                .iter()
+                .any(|p| {
+                    matches!(
+                        p.lowering(),
+                        eredu_runtime::WeightLoweringKind::Transform
+                            | eredu_runtime::WeightLoweringKind::DerivedTransform
+                    )
+                })
+                .then(|| crate::replicated_text::source_nanbeige_args(args, selected.base()))
+                .transpose()
+                .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
+            let selected_args =
+                crate::replicated_text::selected_nanbeige_args(args, selected.base())
+                    .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
+            let estimate = crate::capability::nanbeige(&selected_args)
+                .map_err(|e| DenseDecoderPartitionedDispatchError::Architecture(e.to_string()))?;
+            prepare_dense_decoder_partition::<B, S, _, crate::decoder::DenseBlockFactory, V>(
+                "nanbeige".into(),
+                selected_args,
+                source_args,
+                selected,
+                store,
+                context,
+                visitor,
+                estimate,
+            )
+        }
         (Some(crate::configuration::SafetensorsModelConfig::Llama(args)), None)
         | (None, Some(crate::configuration::GgufModelConfig::Llama(args))) => {
             let source_args = selected
@@ -9147,7 +9183,9 @@ pub fn is_supported_dense_decoder_partition(plan: &ArtifactArchitecturePlan) -> 
         plan.gguf_plan().map(|plan| plan.model()),
     ) {
         (Some(crate::configuration::SafetensorsModelConfig::Llama(_)), None)
-        | (None, Some(crate::configuration::GgufModelConfig::Llama(_))) => true,
+        | (None, Some(crate::configuration::GgufModelConfig::Llama(_)))
+        | (Some(crate::configuration::SafetensorsModelConfig::Nanbeige(_)), None)
+        | (None, Some(crate::configuration::GgufModelConfig::Nanbeige(_))) => true,
         (Some(crate::configuration::SafetensorsModelConfig::Qwen(args)), None)
         | (None, Some(crate::configuration::GgufModelConfig::Qwen(args))) => !args.is_moe(),
         (Some(crate::configuration::SafetensorsModelConfig::Lfm2(args)), None)
@@ -10711,6 +10749,14 @@ pub fn dense_decoder_partitioned_production_route(
             Some(crate::configuration::SafetensorsModelConfig::Llama(_)),
             None
         ) | (None, Some(crate::configuration::GgufModelConfig::Llama(_)))
+            | (
+                Some(crate::configuration::SafetensorsModelConfig::Nanbeige(_)),
+                None
+            )
+            | (
+                None,
+                Some(crate::configuration::GgufModelConfig::Nanbeige(_))
+            )
     );
     let qwen_compatible = match models {
         (Some(crate::configuration::SafetensorsModelConfig::Qwen(args)), None)

@@ -880,6 +880,36 @@ where
                 .visit(prepared, store)
                 .map_err(ReplicatedTextDispatchError::Backend)
         }
+        EligibleConfig::Nanbeige(args) => {
+            visitor.construction_started();
+            let capability_estimate = crate::capability::nanbeige(args)
+                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+            let effective_model_type = "nanbeige".to_owned();
+            let source_architecture = selected_uses_transform(&selected)
+                .then(|| crate::nanbeige::LayeredModel::<B>::new(args.clone(), context))
+                .transpose()
+                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+            let args = selected_nanbeige_args(args, &selected)
+                .map_err(ReplicatedTextDispatchError::Architecture)?;
+            let prompt_cache_architecture_identity =
+                crate::nanbeige::prompt_cache_architecture_fingerprint(&args);
+            let architecture = crate::nanbeige::LayeredModel::<B>::new(args, context)
+                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+            let prepared = prepare_architecture_handoff::<B, S, _>(
+                architecture,
+                source_architecture,
+                requirements,
+                selected,
+                capability_estimate,
+                effective_model_type,
+                prompt_cache_architecture_identity,
+                context,
+            )
+            .map_err(ReplicatedTextDispatchError::Architecture)?;
+            visitor
+                .visit(prepared, store)
+                .map_err(ReplicatedTextDispatchError::Backend)
+        }
         EligibleConfig::Qwen(args) => {
             visitor.construction_started();
             let capability_estimate = crate::capability::qwen(args)
@@ -1154,6 +1184,30 @@ pub(crate) fn selected_llama_args(
         Ok(args.clone())
     } else {
         crate::llama::with_checkpoint_formats(args, formats)
+    }
+}
+
+pub(crate) fn selected_nanbeige_args(
+    args: &crate::nanbeige::ModelArgs,
+    selected: &SelectedReplicatedTextRealization,
+) -> Result<crate::nanbeige::ModelArgs, String> {
+    let formats = selected_formats(selected);
+    if formats.is_empty() {
+        Ok(args.clone())
+    } else {
+        crate::nanbeige::with_checkpoint_formats(args, formats)
+    }
+}
+
+pub(crate) fn source_nanbeige_args(
+    args: &crate::nanbeige::ModelArgs,
+    selected: &SelectedReplicatedTextRealization,
+) -> Result<crate::nanbeige::ModelArgs, String> {
+    let formats = requirement_formats(selected.requirements());
+    if formats.is_empty() {
+        Ok(args.clone())
+    } else {
+        crate::nanbeige::with_checkpoint_formats(args, formats)
     }
 }
 
@@ -1525,6 +1579,7 @@ where
                 .map_err(ReplicatedTextDispatchError::Backend)
         }
         EligibleConfig::Llama(_)
+        | EligibleConfig::Nanbeige(_)
         | EligibleConfig::Qwen(_)
         | EligibleConfig::GptOss(_)
         | EligibleConfig::DeepSeekV3(_)
@@ -1873,7 +1928,10 @@ where
         )));
     }
     let eligible = eligible_config(plan)?;
-    if matches!(eligible, EligibleConfig::Llama(_) | EligibleConfig::Qwen(_)) {
+    if matches!(
+        eligible,
+        EligibleConfig::Llama(_) | EligibleConfig::Nanbeige(_) | EligibleConfig::Qwen(_)
+    ) {
         visit_replicated_text_architecture(plan, selected, store, context, visitor)
     } else {
         visit_replicated_attention_state_text_architecture(plan, selected, store, context, visitor)
@@ -1902,7 +1960,10 @@ where
         eredu_nn::CompressedAttentionCache<B::Tensor> + eredu_runtime::RuntimeStateComponents<B>,
 {
     let eligible = eligible_config(plan)?;
-    let ordinary = matches!(eligible, EligibleConfig::Llama(_) | EligibleConfig::Qwen(_));
+    let ordinary = matches!(
+        eligible,
+        EligibleConfig::Llama(_) | EligibleConfig::Nanbeige(_) | EligibleConfig::Qwen(_)
+    );
     match (ordinary, selected.state().access()) {
         (true, ReplicatedTextStateAccess::KeyValue) => visit_replicated_text_architecture(
             plan,
@@ -2068,6 +2129,7 @@ where
 
 enum EligibleConfig<'a> {
     Llama(&'a crate::llama::ModelArgs),
+    Nanbeige(&'a crate::nanbeige::ModelArgs),
     Qwen(&'a crate::qwen::ModelArgs),
     Lfm2(&'a crate::lfm2::ModelArgs),
     KimiLinear(&'a crate::kimi_linear::ModelArgs),
@@ -2096,6 +2158,7 @@ impl EligibleConfig<'_> {
                 .map_err(|error| error.to_string())
         };
         match self {
+            Self::Nanbeige(args) => standard(args.dense_config().hidden_size),
             Self::Llama(args) => standard(args.hidden_size),
             Self::Qwen(args) => standard(args.hidden_size),
             Self::Lfm2(args) => standard(args.hidden_size),
@@ -2192,6 +2255,13 @@ impl EligibleConfig<'_> {
         };
         match self {
             Self::Llama(_) => {}
+            Self::Nanbeige(args) => extend(crate::decoder::repeated::recipes(
+                source,
+                "model",
+                args.physical_layer_count(),
+                args.num_loops(),
+                !args.skip_loop_final_norm(),
+            )?)?,
             Self::Qwen(args) if args.is_moe() => {
                 for layer in 0..self.unit_count()? {
                     let expert = crate::qwen::expert_recipes(source, args, layer)?;
@@ -2333,6 +2403,7 @@ impl EligibleConfig<'_> {
 
     fn architecture_identity(&self) -> String {
         match self {
+            Self::Nanbeige(args) => crate::nanbeige::prompt_cache_architecture_fingerprint(args),
             Self::Llama(args) => crate::llama::prompt_cache_architecture_fingerprint(args),
             Self::Qwen(args) => crate::qwen::prompt_cache_architecture_fingerprint(args),
             Self::Lfm2(args) => crate::lfm2::prompt_cache_architecture_fingerprint(args),
@@ -2440,6 +2511,7 @@ impl EligibleConfig<'_> {
             Self::QwenHybrid(_) => name.ends_with(".linear_attn.conv1d.weight"),
             Self::QwenCompositeHybrid(_) => name.ends_with(".linear_attn.conv1d.weight"),
             Self::Llama(_)
+            | Self::Nanbeige(_)
             | Self::Qwen(_)
             | Self::GptOss(_)
             | Self::DeepSeekV3(_)
@@ -2487,9 +2559,11 @@ impl EligibleConfig<'_> {
 
     fn operators(&self) -> NeuralOperatorCapabilities {
         match self {
-            Self::Llama(_) | Self::Qwen(_) | Self::Lfm2(_) | Self::GptOss(_) => {
-                NeuralOperatorCapabilities::NONE
-            }
+            Self::Llama(_)
+            | Self::Nanbeige(_)
+            | Self::Qwen(_)
+            | Self::Lfm2(_)
+            | Self::GptOss(_) => NeuralOperatorCapabilities::NONE,
             Self::KimiLinear(args)
                 if args
                     .layer_schedule
@@ -2529,7 +2603,7 @@ impl EligibleConfig<'_> {
 
     fn execution_group(&self) -> &'static str {
         match self {
-            Self::Llama(_) | Self::Qwen(_) | Self::GptOss(_) => {
+            Self::Llama(_) | Self::Nanbeige(_) | Self::Qwen(_) | Self::GptOss(_) => {
                 crate::decoder::TEXT_DECODER_EXECUTION_GROUP
             }
             Self::Lfm2(_) | Self::KimiLinear(_) | Self::NemotronH(_) | Self::QwenHybrid(_) => {
@@ -2554,6 +2628,7 @@ impl EligibleConfig<'_> {
 
     fn unit_count(&self) -> Result<usize, String> {
         let count = match self {
+            Self::Nanbeige(args) => args.state_layer_count() as i32,
             Self::Llama(args) => args.num_hidden_layers,
             Self::Qwen(args) => args.num_hidden_layers,
             Self::Lfm2(args) => args.num_hidden_layers,
@@ -2620,6 +2695,9 @@ impl EligibleConfig<'_> {
 
     fn state_layout(&self) -> Result<eredu_runtime::StateLayout, String> {
         match self {
+            Self::Nanbeige(args) => {
+                crate::nanbeige::state_layout(args).map_err(|error| error.to_string())
+            }
             Self::Llama(args) => {
                 crate::llama::state_layout(*args).map_err(|error| error.to_string())
             }
@@ -2668,6 +2746,7 @@ impl EligibleConfig<'_> {
 
     fn native_format(&self, name: &str) -> LinearFormat {
         match self {
+            Self::Nanbeige(args) => args.weight_quantization_for(name),
             Self::Llama(args) => args.weight_quantization_for(name),
             Self::Qwen(args) => args.weight_quantization_for(name),
             Self::Lfm2(args) => args.weight_quantization_for(name),
@@ -2767,6 +2846,7 @@ impl EligibleConfig<'_> {
 
     fn linear_parameter_shapes(&self) -> Result<BTreeMap<String, Vec<usize>>, String> {
         match self {
+            Self::Nanbeige(args) => decoder_linear_parameter_shapes(*args),
             Self::Llama(args) => decoder_linear_parameter_shapes(*args),
             Self::Qwen(args) => {
                 let mut shapes = decoder_linear_parameter_shapes(*args)?;
@@ -2978,6 +3058,7 @@ impl EligibleConfig<'_> {
 
     fn parameter_root(&self) -> &str {
         match self {
+            Self::Nanbeige(args) => crate::decoder::Config::parameter_root(*args),
             Self::Llama(args) => crate::decoder::Config::parameter_root(*args),
             Self::Qwen(args) => crate::decoder::Config::parameter_root(*args),
             Self::Lfm2(_) | Self::KimiLinear(_) | Self::QwenHybrid(_) => "model",
@@ -2993,6 +3074,7 @@ impl EligibleConfig<'_> {
 
     fn tied_embeddings(&self) -> bool {
         match self {
+            Self::Nanbeige(args) => crate::decoder::Config::tie_word_embeddings(*args),
             Self::Llama(args) => crate::decoder::Config::tie_word_embeddings(*args),
             Self::Qwen(args) => crate::decoder::Config::tie_word_embeddings(*args),
             Self::Lfm2(args) => args.tie_word_embeddings,
@@ -3012,6 +3094,10 @@ impl EligibleConfig<'_> {
 
     fn embedding_shape(&self) -> Result<Vec<usize>, String> {
         let (vocabulary, hidden) = match self {
+            Self::Nanbeige(args) => (
+                args.dense_config().vocab_size,
+                args.dense_config().hidden_size,
+            ),
             Self::Llama(args) => (args.vocab_size, args.hidden_size),
             Self::Qwen(args) => (args.vocab_size, args.hidden_size),
             Self::Lfm2(args) => (args.vocab_size, args.hidden_size),
@@ -3040,6 +3126,7 @@ impl EligibleConfig<'_> {
         linear_shapes: &BTreeMap<String, Vec<usize>>,
     ) -> ReplicatedTextParameterRole {
         match self {
+            Self::Nanbeige(args) => decoder_parameter_role(*args, name, companion, linear_shapes),
             Self::Llama(args) => decoder_parameter_role(*args, name, companion, linear_shapes),
             Self::Qwen(args) => decoder_parameter_role(*args, name, companion, linear_shapes),
             Self::GptOss(args) => decoder_parameter_role(*args, name, companion, linear_shapes),
@@ -3063,6 +3150,7 @@ impl EligibleConfig<'_> {
         match self {
             Self::NemotronH(_) => "model.embeddings.weight".into(),
             Self::Llama(_)
+            | Self::Nanbeige(_)
             | Self::Qwen(_)
             | Self::Lfm2(_)
             | Self::KimiLinear(_)
@@ -3954,19 +4042,6 @@ fn finalize_materialization_parameters_with_recipes(
             derived_recipes.insert(target, recipe);
         }
     }
-    let derived_recipe_outputs = derived_recipes
-        .iter()
-        .map(|(target, recipe)| {
-            recipe
-                .infer(recipe_source)
-                .map(|metadata| (target.clone(), metadata))
-                .map_err(|error| {
-                    ReplicatedTextRequirementsError::InvalidArtifact(format!(
-                        "derived recipe for {target:?} is invalid: {error}"
-                    ))
-                })
-        })
-        .collect::<Result<BTreeMap<_, _>, _>>()?;
     let linear_shapes = config
         .linear_parameter_shapes()
         .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?;
@@ -3983,6 +4058,100 @@ fn finalize_materialization_parameters_with_recipes(
             config.parameter_role(target, false, &linear_shapes)
         }
     };
+    // Multiple logical consumers of an unchanged physical tensor keep its
+    // original encoding and provenance. A source alias is not an encoded-byte
+    // tensor operation (notably for native GGUF blocks).
+    let original_parameters = parameters.clone();
+    let mut direct_alias_targets = BTreeSet::new();
+    let mut source_consumers = BTreeMap::<&str, usize>::new();
+    for recipe in derived_recipes.values() {
+        if let eredu_checkpoint::recipe::DerivedWeightRecipe::Source {
+            key,
+            selection: eredu_checkpoint::store::TensorSelection::Full,
+        } = recipe
+        {
+            *source_consumers.entry(key).or_default() += 1;
+        }
+    }
+    for (target, recipe) in &derived_recipes {
+        let eredu_checkpoint::recipe::DerivedWeightRecipe::Source {
+            key,
+            selection: eredu_checkpoint::store::TensorSelection::Full,
+        } = recipe
+        else {
+            continue;
+        };
+        if target == key
+            && source_consumers
+                .get(key.as_str())
+                .copied()
+                .unwrap_or_default()
+                < 2
+        {
+            continue;
+        }
+        let Some(source) = original_parameters
+            .iter()
+            .find(|p| p.name() == key && p.presence().has_physical_source())
+        else {
+            continue;
+        };
+        // Renaming can also change semantic role (for example a source-only
+        // routed tensor becoming an executable projection). Such recipes still
+        // need the ordinary derived-parameter classification below.
+        if source.role() != derived_target_role(target) {
+            continue;
+        }
+        // A schema alias already names the same executable parameter. Keep its
+        // canonical-name reconciliation in the existing recipe path; it does
+        // not introduce an independently owned logical consumer.
+        if original_parameters.iter().any(|parameter| {
+            parameter.name() != target && parameter.aliases().iter().any(|alias| alias == target)
+        }) {
+            continue;
+        }
+        let replacement = if target == key {
+            source.clone()
+        } else {
+            parameter_requirement(
+                target.clone(),
+                source.sources().to_vec(),
+                source.physical_sources().to_vec(),
+                Vec::new(),
+                source.source_encoding().cloned(),
+                source.physical_shape().map(<[usize]>::to_vec),
+                source.logical_shape().to_vec(),
+                source.native_executable(),
+                source.transform_companions().is_some(),
+                source.role(),
+                parameter_owner(config, target),
+                source.presence().clone(),
+            )?
+            .with_permitted_native_source_dtypes(source.permitted_native_source_dtypes().to_vec())
+        };
+        if let Some(index) = parameters.iter().position(|p| p.name() == target) {
+            parameters[index] = replacement;
+        } else {
+            parameters.push(replacement);
+        }
+        direct_alias_targets.insert(target.clone());
+    }
+    for target in &direct_alias_targets {
+        derived_recipes.remove(target);
+    }
+    let derived_recipe_outputs = derived_recipes
+        .iter()
+        .map(|(target, recipe)| {
+            recipe
+                .infer(recipe_source)
+                .map(|metadata| (target.clone(), metadata))
+                .map_err(|error| {
+                    ReplicatedTextRequirementsError::InvalidArtifact(format!(
+                        "derived recipe for {target:?} is invalid: {error}"
+                    ))
+                })
+        })
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
     let recipe_targets = derived_recipes.keys().cloned().collect::<BTreeSet<_>>();
     let consumed_sources = derived_recipes
         .values()
@@ -4000,6 +4169,15 @@ fn finalize_materialization_parameters_with_recipes(
         let existing = parameters.iter().position(|parameter| {
             parameter.name() == target || parameter.aliases().iter().any(|alias| alias == target)
         });
+        // Remaining source recipes inherit logical geometry and native format;
+        // independently owned physical aliases were lowered above.
+        let alias_source = match recipe {
+            eredu_checkpoint::recipe::DerivedWeightRecipe::Source {
+                key,
+                selection: eredu_checkpoint::store::TensorSelection::Full,
+            } => parameters.iter().find(|parameter| parameter.name() == key),
+            _ => None,
+        };
         let replacement = if let Some(index) = existing {
             let parameter = &parameters[index];
             let role = if parameter.linear_companion().is_some() {
@@ -4074,19 +4252,27 @@ fn finalize_materialization_parameters_with_recipes(
                         ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string())
                     })?;
             }
-            replacement
+            replacement.with_permitted_native_source_dtypes(
+                parameter.permitted_native_source_dtypes().to_vec(),
+            )
         } else {
             let role = derived_target_role(target);
             let native = if role == ReplicatedTextParameterRole::FormatCompanion {
                 LinearFormat::Dense
             } else {
-                config.native_format(target)
+                alias_source.map_or_else(
+                    || config.native_format(target),
+                    |source| source.native_executable(),
+                )
             };
             let mut logical_shape = linear_shapes
                 .get(target)
                 .cloned()
+                .or_else(|| alias_source.map(|source| source.logical_shape().to_vec()))
                 .unwrap_or_else(|| output.shape.clone());
-            if output.dtype == eredu_checkpoint::recipe::RecipeDtype::U32 {
+            if output.dtype == eredu_checkpoint::recipe::RecipeDtype::U32
+                && logical_shape == output.shape
+            {
                 let packed_bits = match native {
                     LinearFormat::Affine(format) => usize::try_from(format.bits).ok(),
                     LinearFormat::MxFp4 => Some(4),
@@ -4125,6 +4311,11 @@ fn finalize_materialization_parameters_with_recipes(
                     recipe: format!("architecture-output:{target}"),
                 },
             )?
+            .with_permitted_native_source_dtypes(
+                alias_source
+                    .map(|source| source.permitted_native_source_dtypes().to_vec())
+                    .unwrap_or_default(),
+            )
         };
         if let Some(index) = existing {
             parameters[index] = replacement;
@@ -4133,7 +4324,8 @@ fn finalize_materialization_parameters_with_recipes(
         }
     }
     parameters.retain(|parameter| {
-        recipe_targets.contains(parameter.name())
+        direct_alias_targets.contains(parameter.name())
+            || recipe_targets.contains(parameter.name())
             || !std::iter::once(parameter.name())
                 .chain(parameter.sources().iter().map(String::as_str))
                 .chain(parameter.aliases().iter().map(String::as_str))
@@ -4214,6 +4406,7 @@ fn safetensors_eligible_config(
     architecture: &crate::configuration::SafetensorsArchitecturePlan,
 ) -> Result<EligibleConfig<'_>, ReplicatedTextIneligibility> {
     match architecture.model() {
+        SafetensorsModelConfig::Nanbeige(args) => Ok(EligibleConfig::Nanbeige(args)),
         SafetensorsModelConfig::Llama(args) => Ok(EligibleConfig::Llama(args)),
         SafetensorsModelConfig::Qwen(args) if !args.is_moe() => Ok(EligibleConfig::Qwen(args)),
         SafetensorsModelConfig::Qwen(_) => Err(ReplicatedTextIneligibility::Routed),
@@ -4274,6 +4467,7 @@ fn gguf_eligible_config(
 ) -> Result<EligibleConfig<'_>, ReplicatedTextIneligibility> {
     match architecture.model() {
         GgufModelConfig::Llama(args) => Ok(EligibleConfig::Llama(args)),
+        GgufModelConfig::Nanbeige(args) => Ok(EligibleConfig::Nanbeige(args)),
         GgufModelConfig::Qwen(args)
             if matches!(
                 architecture.architecture(),
@@ -4343,7 +4537,9 @@ fn ordinary_eligible_config(
     plan: &ArtifactArchitecturePlan,
 ) -> Result<EligibleConfig<'_>, ReplicatedTextIneligibility> {
     match eligible_config(plan)? {
-        config @ (EligibleConfig::Llama(_) | EligibleConfig::Qwen(_)) => Ok(config),
+        config @ (EligibleConfig::Llama(_)
+        | EligibleConfig::Nanbeige(_)
+        | EligibleConfig::Qwen(_)) => Ok(config),
         EligibleConfig::Lfm2(_)
         | EligibleConfig::KimiLinear(_)
         | EligibleConfig::NemotronH(_)

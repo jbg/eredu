@@ -690,6 +690,39 @@ fn failed_publication_drops_materialized_body_and_native_client() {
 #[test]
 fn bounded_scalar_binding_reads_one_selected_unit_at_a_time_and_matches_resident() {
     let (root, expected_parameters) = prepared_adapter::payload_fixture(1.0);
+    assert_bounded_fixture(root, expected_parameters);
+}
+
+#[test]
+fn nanbeige_bounded_payloads_are_per_block_and_preserve_shared_sources() {
+    let value = super::nanbeige::tiny_config(false);
+    let (root, physical) = prepared_adapter::payload_fixture_config(&value, 1.0);
+    let mut logical = physical.clone();
+    for (name, payload) in &physical {
+        if let Some((layer, suffix)) = name
+            .strip_prefix("model.layers.")
+            .and_then(|s| s.split_once('.'))
+        {
+            logical.insert(
+                format!(
+                    "model.layers.{}.{suffix}",
+                    layer.parse::<usize>().unwrap() + 2
+                ),
+                payload.clone(),
+            );
+        }
+    }
+    logical.insert(
+        "model.layers.1.output_norm.weight".into(),
+        physical["model.norm.weight"].clone(),
+    );
+    assert_bounded_fixture(root, logical);
+}
+
+fn assert_bounded_fixture(
+    root: tempfile::TempDir,
+    expected_parameters: BTreeMap<String, (Vec<i32>, Vec<u32>)>,
+) {
     let inspection = eredu_architectures::configuration::inspect_artifact(root.path()).unwrap();
     let mut expected = None;
     for residency in [
@@ -761,9 +794,17 @@ fn bounded_scalar_binding_reads_one_selected_unit_at_a_time_and_matches_resident
 
 #[test]
 fn transformed_scalar_payload_matches_independently_expanded_dense_oracle() {
+    assert_transformed_fixture(config("llama", false));
+}
+
+#[test]
+fn nanbeige_transformed_repetitions_match_independent_affine_oracle() {
+    assert_transformed_fixture(super::nanbeige::tiny_config(false));
+}
+
+fn assert_transformed_fixture(mut config: serde_json::Value) {
     use safetensors::tensor::{serialize_to_file, TensorView};
 
-    let mut config = config("llama", false);
     config["hidden_size"] = 16.into();
     config["head_dim"] = 8.into();
     config["intermediate_size"] = 32.into();
@@ -798,6 +839,7 @@ fn transformed_scalar_payload_matches_independently_expanded_dense_oracle() {
             matches!(
                 task.lowering(),
                 eredu_runtime::WeightLoweringKind::Transform
+                    | eredu_runtime::WeightLoweringKind::DerivedTransform
             )
         })
         .map(|task| task.name().to_owned())

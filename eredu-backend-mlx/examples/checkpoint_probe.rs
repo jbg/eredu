@@ -39,9 +39,21 @@ const DEFAULT_PROMPT: &str = "The capital of France is";
     after_help = "Example:\n  cargo run -p eredu-backend-mlx --features cuda --example checkpoint_probe -- --model snapshots/model --device gpu --output validation/results/model"
 )]
 struct Args {
-    /// Local Hugging Face-compatible checkpoint directory.
+    /// Local Hugging Face directory or GGUF file.
     #[arg(long)]
     model: PathBuf,
+
+    /// Optional JSON ResidencyPlan for host-windowed or disk-streamed validation.
+    #[arg(long)]
+    residency_plan: Option<PathBuf>,
+
+    /// Optional affine load-time quantization (bits per weight).
+    #[arg(long)]
+    quantization_bits: Option<i32>,
+
+    /// Group size for affine load-time quantization.
+    #[arg(long, default_value_t = 64)]
+    quantization_group_size: i32,
 
     /// Execution device.
     #[arg(long, value_enum, default_value_t = DeviceKind::Gpu)]
@@ -134,6 +146,7 @@ struct RuntimeReport {
     device_type: &'static str,
     device_index: i32,
     device_description: String,
+    execution_plan: eredu_core::ExecutionPlan,
 }
 
 #[derive(Debug, Serialize)]
@@ -208,8 +221,8 @@ fn main() -> Result<()> {
         "--device-index must be non-negative"
     );
     ensure!(
-        args.model.is_dir(),
-        "checkpoint is not a directory: {}",
+        args.model.is_dir() || args.model.is_file(),
+        "checkpoint path does not exist: {}",
         args.model.display()
     );
 
@@ -230,8 +243,38 @@ fn main() -> Result<()> {
 
     memory::reset_peak_memory()?;
     let load_started = Instant::now();
-    let model = load_model(&backend, &args.model, MlxLoadRequest::default())
-        .with_context(|| format!("failed to load checkpoint {}", args.model.display()))?;
+    let residency = args
+        .residency_plan
+        .as_ref()
+        .map(|path| -> Result<eredu_core::ResidencyPlan> {
+            Ok(serde_json::from_slice(&fs::read(path)?)?)
+        })
+        .transpose()?
+        .unwrap_or(eredu_core::ResidencyPlan::FullyResident);
+    let transformation = args.quantization_bits.map_or(
+        eredu_core::WeightTransformationPlan::PreserveCheckpoint,
+        |bits| eredu_core::WeightTransformationPlan::Affine {
+            bits,
+            group_size: args.quantization_group_size,
+        },
+    );
+    let execution_plan = eredu_core::ExecutionPlan::fully_resident(eredu_core::DevicePlan::new(
+        "mlx",
+        format!("{}:{}", args.device.label(), args.device_index),
+    )?)
+    .with_residency(residency)
+    .with_weight_transformation(transformation);
+    let normalized = eredu_runtime::NormalizedLoadRequest::from_execution_plan(
+        &execution_plan,
+        eredu_runtime::ResidencyDiagnostics::default(),
+        None,
+    )?;
+    let model = load_model(
+        &backend,
+        &args.model,
+        MlxLoadRequest::from_normalized(normalized),
+    )
+    .with_context(|| format!("failed to load checkpoint {}", args.model.display()))?;
     let model_family = "selected-by-architecture-plan".to_owned();
     let effective_model_type = "selected-by-architecture-plan".to_owned();
     let mut session = backend.create_session(model)?;
@@ -319,6 +362,7 @@ fn main() -> Result<()> {
             device_type: args.device.label(),
             device_index: args.device_index,
             device_description,
+            execution_plan,
         },
         input: InputReport {
             prompt: prompt_text,

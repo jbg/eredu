@@ -64,6 +64,7 @@ projector.
 | Family | Inputs | SafeTensors | GGUF | Notable support |
 | --- | --- | :---: | :---: | --- |
 | Llama / Mistral | text | yes | yes | full or sliding attention, tied or untied head |
+| Nanbeige 4.2 | text | yes | `nanbeige` | shared-weight repeated GQA/SwiGLU stack; independent KV caches for each pass |
 | Qwen2 / Qwen2.5 | text | yes | `qwen2` | dense text models; exact full/sliding schedules |
 | Qwen3 | text | yes | `qwen3`, `qwen3moe` | dense and MoE |
 | Qwen3-VL | text, image, video | yes | `qwen3vl`, `qwen3vlmoe` + projector | dense and MoE text decoders, MRoPE and DeepStack |
@@ -80,6 +81,30 @@ projector.
 | Muse-Glimmer | text, image, video | yes | `muse-glimmer`; optional image-only projector | vision tower, mixed attention, ATEM/DFlash paths |
 | Moshi | realtime codec tokens | yes | no | temporal/depth generation without a codec dependency |
 | PersonaPlex | realtime speech tokens | yes | no | transformed model layout, voice and text conditioning |
+
+Nanbeige support includes `Nanbeige/Nanbeige4.2-3B` and its dense base configuration.
+The released 22 physical blocks execute twice, with 44 logical block invocations
+and independent KV caches. Both passes use the same checkpoint parameters,
+including the RMSNorm between passes. The ordinary
+and controlled generation drivers support the same model, including snapshot
+restore and fork. Checkpoint tokenizer, chat template, and EOS metadata use the
+existing text utilities.
+
+The family uses the standard dense execution paths: fully resident, per-block
+host offloading, disk streaming, tensor parallelism, pipeline parallelism and
+combined TP/PP, with selected weight transformations and logical-layer captures.
+Publisher-layout GGUF checkpoints preserve their native encodings and Q/K row
+ordering. Each logical invocation owns a separately materialized block, so
+resident memory includes those replicas; checkpoint storage remains physical.
+Bounded residency can admit one logical block at a time.
+
+Validation includes independent numerical oracles, controlled/uninterrupted
+generation comparisons, and the downloaded official SafeTensors checkpoint
+against the publisher's Transformers implementation. See
+[Nanbeige validation](nanbeige-validation.md) for revisions, commands, results,
+and the distinction between native and neutral parallel testing. Experimental
+n-gram, hyper-connection, depth-attention, and shared-KV equations are rejected
+explicitly; they are not used by the released 4.2-3B checkpoint.
 
 DeepSeek-V4 uses the shared execution infrastructure for fully resident,
 host-layerwise, and dense disk-streamed weights; independent expert caches;

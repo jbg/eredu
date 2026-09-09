@@ -213,6 +213,8 @@ pub enum ModelKind {
     KimiLinear,
     /// Llama-compatible dense decoders, including Mistral.
     Llama,
+    /// Nanbeige dense shared-weight repeated decoder.
+    Nanbeige,
     /// Meta Muse-Glimmer multimodal decoder.
     MuseGlimmer,
     /// Liquid AI LFM2/LFM2.5 dense or MoE architecture.
@@ -256,7 +258,7 @@ impl<'de> Deserialize<'de> for ModelKind {
 
 impl ModelKind {
     /// Every architecture family implemented by this crate.
-    pub const ALL: [Self; 17] = [
+    pub const ALL: [Self; 18] = [
         Self::DeepSeekV3,
         Self::DeepSeekV4,
         Self::Gemma4,
@@ -264,6 +266,7 @@ impl ModelKind {
         Self::Inkling,
         Self::KimiLinear,
         Self::Llama,
+        Self::Nanbeige,
         Self::MuseGlimmer,
         Self::Lfm2,
         Self::NemotronH,
@@ -286,6 +289,7 @@ impl ModelKind {
             Self::Inkling => "inkling",
             Self::KimiLinear => "kimi_linear",
             Self::Llama => "llama",
+            Self::Nanbeige => "nanbeige",
             Self::MuseGlimmer => "muse_glimmer",
             Self::Lfm2 => "lfm2",
             Self::NemotronH => "nemotron_h",
@@ -332,6 +336,7 @@ impl ModelKind {
             "inkling_mm_model" => Ok(Self::Inkling),
             "kimi_linear" => Ok(Self::KimiLinear),
             "llama" | "mistral" => Ok(Self::Llama),
+            "nanbeige" => Ok(Self::Nanbeige),
             "muse_glimmer" | "muse_glimmer_text" => Ok(Self::MuseGlimmer),
             "lfm2" | "lfm2_moe" => Ok(Self::Lfm2),
             "nemotron_h" => Ok(Self::NemotronH),
@@ -365,6 +370,8 @@ pub enum GgufArchitecture {
     Gemma4,
     /// `llama`.
     Llama,
+    /// `nanbeige`.
+    Nanbeige,
     /// `mistral`.
     Mistral,
     /// `muse-glimmer`.
@@ -407,6 +414,7 @@ impl GgufArchitecture {
             "gemma4" => Ok(Self::Gemma4),
             "llama" => Ok(Self::Llama),
             "mistral" => Ok(Self::Mistral),
+            "nanbeige" => Ok(Self::Nanbeige),
             "muse-glimmer" => Ok(Self::MuseGlimmer),
             "lfm2" => Ok(Self::Lfm2),
             "lfm2moe" => Ok(Self::Lfm2Moe),
@@ -434,6 +442,7 @@ impl GgufArchitecture {
             Self::Inkling => ModelKind::Inkling,
             Self::Gemma4 => ModelKind::Gemma4,
             Self::Llama | Self::Mistral => ModelKind::Llama,
+            Self::Nanbeige => ModelKind::Nanbeige,
             Self::MuseGlimmer => ModelKind::MuseGlimmer,
             Self::Lfm2 | Self::Lfm2Moe => ModelKind::Lfm2,
             Self::NemotronH | Self::NemotronHMoe => ModelKind::NemotronH,
@@ -457,6 +466,7 @@ impl GgufArchitecture {
             Self::Gemma4 => "gemma4",
             Self::Llama => "llama",
             Self::Mistral => "mistral",
+            Self::Nanbeige => "nanbeige",
             Self::MuseGlimmer => "muse-glimmer",
             Self::Lfm2 => "lfm2",
             Self::Lfm2Moe => "lfm2moe",
@@ -626,6 +636,8 @@ pub enum SafetensorsModelConfig {
     KimiLinear(crate::kimi_linear::ModelArgs),
     /// Llama-compatible family geometry.
     Llama(crate::llama::ModelArgs),
+    /// Nanbeige physical blocks and logical loop policy.
+    Nanbeige(crate::nanbeige::ModelArgs),
     /// Muse-Glimmer family geometry.
     MuseGlimmer(crate::muse_glimmer::DecoderConfig),
     /// LFM2 family geometry.
@@ -671,6 +683,8 @@ pub enum GgufModelConfig {
     Lfm2(crate::lfm2::ModelArgs),
     /// Llama-compatible family geometry.
     Llama(crate::llama::ModelArgs),
+    /// Nanbeige physical blocks and repetition policy.
+    Nanbeige(crate::nanbeige::ModelArgs),
     /// Muse-Glimmer family geometry.
     MuseGlimmer(crate::muse_glimmer::DecoderConfig),
     /// Nemotron-H family geometry.
@@ -691,7 +705,7 @@ impl SafetensorsModelConfig {
             Self::GptOss(args) => args.num_local_experts > 0,
             Self::Inkling(args) => args.text_config.n_routed_experts > 0,
             Self::KimiLinear(args) => args.num_experts > 0,
-            Self::Llama(_) | Self::Moshi(_) => false,
+            Self::Llama(_) | Self::Nanbeige(_) | Self::Moshi(_) => false,
             Self::MuseGlimmer(args) => args.num_experts > 0,
             Self::Lfm2(args) => args.num_experts > 0,
             Self::NemotronH(args) => args.n_routed_experts > 0,
@@ -713,7 +727,7 @@ impl GgufModelConfig {
             Self::Inkling(args) => args.text_config.n_routed_experts > 0,
             Self::KimiLinear(args) => args.num_experts > 0,
             Self::Lfm2(args) => args.num_experts > 0,
-            Self::Llama(_) => false,
+            Self::Llama(_) | Self::Nanbeige(_) => false,
             Self::MuseGlimmer(args) => args.num_experts > 0,
             Self::NemotronH(args) => args.n_routed_experts > 0,
             Self::Qwen(args) => args.num_experts > 0,
@@ -1278,6 +1292,9 @@ fn resolve_safetensors_architecture(
         ModelKind::Llama => crate::llama::model_args_from_config_value(json)
             .map(SafetensorsModelConfig::Llama)
             .map_err(|error| invalid_configuration(kind, error)),
+        ModelKind::Nanbeige => crate::nanbeige::model_args_from_config_value(json)
+            .map(SafetensorsModelConfig::Nanbeige)
+            .map_err(|error| invalid_configuration(kind, error)),
         ModelKind::MuseGlimmer => serde_json::to_vec(json)
             .map_err(ArtifactError::from)
             .and_then(|bytes| {
@@ -1324,6 +1341,8 @@ fn resolve_safetensors_architecture(
         SafetensorsModelConfig::KimiLinear(args) => crate::kimi_linear::safetensors_plan(args)
             .map_err(|error| invalid_configuration(kind, error))?,
         SafetensorsModelConfig::Llama(args) => crate::llama::safetensors_plan(args)
+            .map_err(|error| invalid_configuration(kind, error))?,
+        SafetensorsModelConfig::Nanbeige(args) => crate::nanbeige::safetensors_plan(args)
             .map_err(|error| invalid_configuration(kind, error))?,
         SafetensorsModelConfig::MuseGlimmer(args) => crate::muse_glimmer::safetensors_plan(args)
             .map_err(|error| invalid_configuration(kind, error))?,
