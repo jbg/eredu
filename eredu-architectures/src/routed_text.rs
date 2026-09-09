@@ -647,7 +647,7 @@ pub(crate) fn project_addressable_members_with_tasks(
                     | eredu_runtime::WeightLoweringKind::DerivedTransform
             );
             let selected_bytes = if transforms {
-                eredu_runtime::selected_addressable_parameter_bytes(&task, metadata)
+                eredu_runtime::selected_addressable_parameter_bytes(task, metadata)
                     .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?
             } else {
                 metadata.byte_len()
