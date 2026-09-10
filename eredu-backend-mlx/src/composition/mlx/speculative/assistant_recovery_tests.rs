@@ -73,7 +73,12 @@ fn drafter(stream: &Stream) -> MlxDrafter {
         &speculative_mechanism_capabilities(),
     )
     .unwrap();
-    MlxDrafter::materialize(prepared.preparation, stream, stream).unwrap()
+    MlxDrafter::materialize(
+        eredu_architectures::PreparedExternalDraft::Assistant(prepared.preparation),
+        stream,
+        stream,
+    )
+    .unwrap()
 }
 
 struct CountVisit<'a>(&'a Cell<usize>);

@@ -227,6 +227,7 @@ pub fn sliding_window_prefill_attention(
         seq_len,
         sinks,
         None,
+        eredu_nn::AttentionArithmetic::Fused,
         stream,
     )
 }
@@ -244,6 +245,7 @@ pub fn sliding_window_prefill_attention_with_softcap(
     seq_len: i32,
     sinks: Option<&Array>,
     softcap: Option<f32>,
+    arithmetic: eredu_nn::AttentionArithmetic,
     stream: &Stream,
 ) -> Result<Array, Exception> {
     if window_size <= 0 {
@@ -271,7 +273,11 @@ pub fn sliding_window_prefill_attention_with_softcap(
         ));
     }
 
-    if softcap.is_none() && query_position_offset == 0 && seq_len <= window_size {
+    if arithmetic == eredu_nn::AttentionArithmetic::Fused
+        && softcap.is_none()
+        && query_position_offset == 0
+        && seq_len <= window_size
+    {
         return safemlx::fast::scaled_dot_product_attention(
             queries,
             keys,
@@ -314,6 +320,7 @@ pub fn sliding_window_prefill_attention_with_softcap(
             Some(&mask),
             sinks,
             softcap,
+            arithmetic,
             stream,
         )?);
         start = end;
@@ -338,9 +345,10 @@ pub fn attention_with_softcap(
     mask: Option<&Array>,
     sinks: Option<&Array>,
     softcap: Option<f32>,
+    arithmetic: eredu_nn::AttentionArithmetic,
     stream: &Stream,
 ) -> Result<Array, Exception> {
-    let Some(cap) = softcap else {
+    if softcap.is_none() && arithmetic == eredu_nn::AttentionArithmetic::Fused {
         return safemlx::fast::scaled_dot_product_attention(
             queries,
             keys,
@@ -350,8 +358,8 @@ pub fn attention_with_softcap(
             sinks,
             stream,
         );
-    };
-    if !cap.is_finite() || cap <= 0.0 {
+    }
+    if softcap.is_some_and(|cap| !cap.is_finite() || cap <= 0.0) {
         return Err(Exception::custom(
             "attention score cap must be positive and finite",
         ));
@@ -372,6 +380,13 @@ pub fn attention_with_softcap(
             "incompatible soft-capped attention geometry",
         ));
     }
+    if arithmetic == eredu_nn::AttentionArithmetic::InputScores
+        && i64::from(queries.dim(2)) * i64::from(keys.dim(2)) > 8192
+    {
+        return bounded_input_score_attention(
+            queries, keys, values, scale, mask, sinks, softcap, stream,
+        );
+    }
     let batch = queries.dim(0);
     let heads = queries.dim(1);
     let kv_heads = keys.dim(1);
@@ -385,36 +400,144 @@ pub fn attention_with_softcap(
         )?
         .reshape(&[batch, heads, tokens, x.dim(3)], stream)
     };
-    let keys = expand(keys)?.as_dtype(safemlx::Dtype::Float32, stream)?;
+    let score_dtype = if arithmetic == eredu_nn::AttentionArithmetic::InputScores {
+        queries.dtype()
+    } else {
+        Dtype::Float32
+    };
+    let keys = expand(keys)?.as_dtype(score_dtype, stream)?;
     let values = expand(values)?;
-    let mut scores = safemlx::ops::matmul(
-        &queries.as_dtype(safemlx::Dtype::Float32, stream)?,
-        &keys.swap_axes(-1, -2, stream)?,
-        stream,
-    )?;
-    scores = safemlx::ops::tanh(
-        &scores.multiply(Array::from_f32(scale / cap), stream)?,
-        stream,
-    )?
-    .multiply(Array::from_f32(cap), stream)?;
+    let query = queries.as_dtype(score_dtype, stream)?;
+    let key = keys.swap_axes(-1, -2, stream)?;
+    let mut scores = match super::matrix::bf16_batched_product(&query, &key, false, stream)? {
+        Some(scores) => scores,
+        None => safemlx::ops::matmul(&query, &key, stream)?,
+    };
+    scores = scores
+        .as_dtype(Dtype::Float32, stream)?
+        .multiply(Array::from_f32(scale), stream)?
+        .as_dtype(score_dtype, stream)?;
+    if let Some(cap) = softcap {
+        scores = safemlx::ops::tanh(
+            &scores.multiply(Array::from_f32(cap.recip()), stream)?,
+            stream,
+        )?
+        .multiply(Array::from_f32(cap), stream)?
+        .as_dtype(score_dtype, stream)?;
+    }
     if let Some(mask) = mask {
         scores = if mask.dtype() == safemlx::Dtype::Bool {
             safemlx::ops::r#where(mask, &scores, &Array::from_f32(f32::NEG_INFINITY), stream)?
         } else {
-            scores.add(mask, stream)?
+            scores
+                .add(mask.as_dtype(score_dtype, stream)?, stream)?
+                .as_dtype(score_dtype, stream)?
         };
     }
     if let Some(sinks) = sinks {
         let sinks = safemlx::ops::broadcast_to(
-            &sinks.reshape(&[1, heads, 1, 1], stream)?,
+            &sinks
+                .as_dtype(score_dtype, stream)?
+                .reshape(&[1, heads, 1, 1], stream)?,
             &[batch, heads, queries.dim(2), 1],
             stream,
         )?;
         scores = concatenate_axis(&[&scores, &sinks], -1, stream)?;
     }
-    let probabilities = safemlx::ops::softmax_axis(&scores, -1, true, stream)?;
+    let scores = scores.as_dtype(Dtype::Float32, stream)?;
+    let probabilities = match super::arithmetic::softmax_last(&scores, stream)? {
+        Some(value) => value,
+        None => safemlx::ops::softmax_axis(&scores, -1, true, stream)?,
+    };
     let probabilities = probabilities
         .try_index_device((.., .., .., ..tokens), stream)?
         .as_dtype(queries.dtype(), stream)?;
-    safemlx::ops::matmul(&probabilities, &values, stream)
+    match super::matrix::bf16_batched_product(&probabilities, &values, true, stream)? {
+        Some(output) => Ok(output),
+        None => safemlx::ops::matmul(&probabilities, &values, stream),
+    }
+}
+
+/// Explicit rounding need not materialize the complete Q-by-K score matrix.
+/// Complete key rows use the ordinary softmax and product reduction when they
+/// fit the score budget. Larger rows use the same two-pass recurrence as paged
+/// storage, with bounded views and caller-provided (possibly noncausal) masks.
+#[allow(clippy::too_many_arguments)]
+fn bounded_input_score_attention(
+    queries: &Array,
+    keys: &Array,
+    values: &Array,
+    scale: f32,
+    mask: Option<&Array>,
+    sinks: Option<&Array>,
+    softcap: Option<f32>,
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    use crate::backend::runtime::cache::kv::{
+        BlockwiseAttentionAccumulator, KeyValueAttentionBlock,
+    };
+    let mask = mask
+        .map(|mask| {
+            broadcast_to(
+                mask,
+                &[queries.dim(0), queries.dim(1), queries.dim(2), keys.dim(2)],
+                stream,
+            )
+        })
+        .transpose()?;
+    let mut outputs = Vec::new();
+    let query_step = (8192 / keys.dim(2)).clamp(1, 32);
+    for start in (0..queries.dim(2)).step_by(query_step as usize) {
+        let end = (start + query_step).min(queries.dim(2));
+        let query = queries.try_index_device((.., .., start..end, ..), stream)?;
+        let mask = mask
+            .as_ref()
+            .map(|mask| mask.try_index_device((.., .., start..end, ..), stream))
+            .transpose()?;
+        if keys.dim(2) <= 8192 {
+            outputs.push(attention_with_softcap(
+                &query,
+                keys,
+                values,
+                scale,
+                mask.as_ref(),
+                sinks,
+                softcap,
+                eredu_nn::AttentionArithmetic::InputScores,
+                stream,
+            )?);
+            continue;
+        }
+        let mut accumulator = BlockwiseAttentionAccumulator::new(
+            &query,
+            scale,
+            mask.as_ref(),
+            0,
+            None,
+            0,
+            sinks,
+            i64::from(keys.dim(2)),
+            stream,
+        )?;
+        accumulator.set_arithmetic(eredu_nn::AttentionArithmetic::InputScores)?;
+        accumulator.set_softcap(softcap)?;
+        accumulator.use_explicit_mask_only()?;
+        for pass in 0..2 {
+            if pass == 1 {
+                accumulator.begin_value_pass()?;
+            }
+            for key_start in (0..keys.dim(2)).step_by(256) {
+                let key_end = (key_start + 256).min(keys.dim(2));
+                let block = KeyValueAttentionBlock::unleased(
+                    i64::from(key_start),
+                    i64::from(key_end),
+                    keys.try_index_device((.., .., key_start..key_end, ..), stream)?,
+                    values.try_index_device((.., .., key_start..key_end, ..), stream)?,
+                );
+                accumulator.accumulate(&block, stream)?;
+            }
+        }
+        outputs.push(accumulator.finish(stream)?);
+    }
+    concatenate_axis(&outputs, 2, stream)
 }

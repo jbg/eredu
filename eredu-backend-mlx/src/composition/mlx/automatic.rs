@@ -18,7 +18,7 @@ use super::{
     realtime::MlxRealtimeExecutionContext, speculative::MlxDrafter, MlxBackend, MlxLoadRequest,
 };
 use crate::{
-    backend::runtime::residency::parameter_bank::ParameterBankResidencyReport,
+    backend::runtime::residency::parameter_bank::ParameterBanksResidencyReport,
     backend::{error::Error, MlxAcceleratorFamily, MlxDeviceIdentity},
 };
 use eredu_runtime::selected_text_bounded_requirement;
@@ -253,8 +253,8 @@ impl AutomaticPlanningBackend for MlxBackendFactory {
 
 impl ExecutionPlanBackendFactory for MlxBackendFactory {
     type Backend = MlxBackend<'static>;
-    type DrafterPreparation = eredu_architectures::ExternalAssistantPreparation;
-    type SelectedDrafterPreparation = eredu_architectures::PreparedExternalAssistantExecution;
+    type DrafterPreparation = eredu_architectures::ExternalDraftPreparation;
+    type SelectedDrafterPreparation = eredu_architectures::PreparedExternalDraft;
     type Drafter = MlxDrafter;
 
     fn select_target(
@@ -305,10 +305,13 @@ impl ExecutionPlanBackendFactory for MlxBackendFactory {
         let Some(artifact) = external_artifact else {
             return Ok(None);
         };
-        eredu_architectures::prepare_execution_plan_assistant(
+        eredu_architectures::prepare_execution_plan_draft(
             plan,
             target.inspection(),
             artifact,
+            &super::loading::MlxPreparationMechanisms::new(
+                &super::replicated_text::GROUPED_OPERATION_CAPABILITIES,
+            ),
             |descriptor, transforms| {
                 if transforms && super::replicated_text::supports_transform(descriptor) {
                     Some(eredu_runtime::WeightLoweringKind::Transform)
@@ -318,7 +321,6 @@ impl ExecutionPlanBackendFactory for MlxBackendFactory {
                     None
                 }
             },
-            &super::speculative::speculative_mechanism_capabilities(),
         )
         .map(Some)
     }
@@ -383,7 +385,7 @@ impl ExecutionPlanBackendFactory for MlxBackendFactory {
 }
 
 /// Converts an MLX routed-expert cache snapshot into neutral telemetry.
-pub fn parameter_bank_telemetry(report: &ParameterBankResidencyReport) -> ExpertCacheTelemetry {
+pub fn parameter_bank_telemetry(report: &ParameterBanksResidencyReport) -> ExpertCacheTelemetry {
     ExpertCacheTelemetry {
         owned_experts: report.owned_entries(),
         owned_bytes: report.owned_bytes(),

@@ -13,8 +13,8 @@ use eredu_runtime::{
 
 use crate::{
     decoder::{
-        FeedForwardOperator, TensorParallelFeedForwardOperator,
-        TensorParallelRoutedFeedForwardOperator,
+        DecoderProjectionOperator, TensorParallelProjectionOperator,
+        TensorParallelRoutedProjectionOperator,
     },
     linear_format::standard_expert_projection,
 };
@@ -59,7 +59,7 @@ pub struct RoutedMlp<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBacken
 }
 
 impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
-    crate::decoder::RoutedFeedForwardOperator<B> for RoutedMlp<B>
+    crate::decoder::RoutedProjectionOperator<B> for RoutedMlp<B>
 {
     fn forward_with_provider<P>(
         &mut self,
@@ -78,7 +78,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
 }
 
 impl<B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
-    TensorParallelRoutedFeedForwardOperator<B> for RoutedMlp<B>
+    TensorParallelRoutedProjectionOperator<B> for RoutedMlp<B>
 {
     fn forward_parallel_with_provider<P>(
         &mut self,
@@ -196,6 +196,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> RoutedMlp<B> 
             .forward_grouped(
                 &mut self.experts,
                 RoutedExpertRequest {
+                    bank: eredu_runtime::RoutedBankId::new(0),
                     layer: self.layer,
                     input,
                     routes: &routes,
@@ -224,6 +225,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> RoutedMlp<B> 
             .forward_grouped_tensor_parallel(
                 &mut self.experts,
                 RoutedExpertRequest {
+                    bank: eredu_runtime::RoutedBankId::new(0),
                     layer: self.layer,
                     input,
                     routes: &routes,
@@ -442,7 +444,7 @@ mod tests {
     }
 }
 
-impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> FeedForwardOperator<B>
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> DecoderProjectionOperator<B>
     for RoutedMlp<B>
 {
     fn forward_feed_forward(
@@ -460,7 +462,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> FeedForwardOp
 }
 
 impl<B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
-    TensorParallelFeedForwardOperator<B> for RoutedMlp<B>
+    TensorParallelProjectionOperator<B> for RoutedMlp<B>
 {
     fn forward_feed_forward_parallel(
         &mut self,

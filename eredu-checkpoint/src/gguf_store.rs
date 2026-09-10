@@ -646,14 +646,6 @@ fn plan_bounded_selection(
             .ggml_type
             .block_and_bytes()
             .map_err(|error| gguf_error(key, error))?;
-        if !block_values.is_multiple_of(logical_units) {
-            return Err(bounded_error(
-                key,
-                format!(
-                    "native block length {block_values} is not divisible by {logical_units} converted units"
-                ),
-            ));
-        }
         let logical_elements = physical_shape.iter().try_fold(1u64, |count, dimension| {
             count.checked_mul(*dimension).ok_or(StoreError::Overflow {
                 context: format!("GGUF contiguous element count for tensor {key:?}"),
@@ -675,12 +667,18 @@ fn plan_bounded_selection(
                 ),
             ));
         }
-        let physical_units_per_logical = block_values / logical_units;
         let physical_last = physical_shape.last_mut().ok_or_else(|| {
             bounded_error(key, "contiguous GGUF selection has no packed input axis")
         })?;
+        if !physical_last.is_multiple_of(logical_units) {
+            return Err(bounded_error(
+                key,
+                "contiguous GGUF row must contain complete converted blocks",
+            ));
+        }
         *physical_last = physical_last
-            .checked_mul(physical_units_per_logical)
+            .checked_div(logical_units)
+            .and_then(|blocks| blocks.checked_mul(block_values))
             .ok_or(StoreError::Overflow {
                 context: format!("GGUF contiguous physical shape for tensor {key:?}"),
             })?;
@@ -1101,6 +1099,57 @@ mod tests {
         };
         assert_eq!(native.ggml_type, GgmlType::Q8_0);
         assert_eq!(native.data.len(), 34);
+    }
+
+    #[test]
+    fn native_byte_blocks_support_contiguous_expert_row_selection() {
+        for ty in [GgmlType::IQ4NL, GgmlType::Q8_0] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("bank.gguf");
+            let (_, block_bytes) = ty.block_and_bytes().unwrap();
+            let block_bytes = block_bytes as usize;
+            let raw = (0..16)
+                .flat_map(|block| {
+                    let mut bytes = vec![0, 60]; // finite f16 scale 1
+                    bytes.extend((2..block_bytes).map(|i| ((i + block) % 127) as u8));
+                    bytes
+                })
+                .collect::<Vec<_>>();
+            write_tensor(&path, "bank.weight", &[64, 4, 2], ty, &raw);
+            let store = test_store(&path);
+            let offset = 8 * block_bytes;
+            let lease = store
+                .acquire(TensorReadRequest {
+                    key: "bank.weight".into(),
+                    selection: TensorSelection::Contiguous {
+                        offset_elements: offset,
+                        shape: vec![1, 2, 2 * block_bytes],
+                    },
+                    policy: ReadPolicy::RequireBounded,
+                })
+                .unwrap();
+            assert_eq!(
+                lease.bounded_read_proof().length_bytes,
+                (4 * block_bytes) as u64
+            );
+            let ConvertedTensor::IQuant(selected) =
+                lease.materialize_portable().unwrap().into_converted()
+            else {
+                panic!("expected native blocks")
+            };
+            assert_eq!(selected.shape, [1, 2, 64]);
+            assert_eq!(selected.data, raw[offset..offset + 4 * block_bytes]);
+            assert!(store
+                .acquire(TensorReadRequest {
+                    key: "bank.weight".into(),
+                    selection: TensorSelection::Contiguous {
+                        offset_elements: offset + 1,
+                        shape: vec![1, 2, 2 * block_bytes]
+                    },
+                    policy: ReadPolicy::RequireBounded,
+                })
+                .is_err());
+        }
     }
 
     #[test]

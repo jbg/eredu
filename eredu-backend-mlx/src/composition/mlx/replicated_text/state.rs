@@ -9,6 +9,12 @@ pub(crate) trait MlxStateMechanisms: LayerRuntimeState<MlxNeuralBackend> + Sized
             "complete isolated snapshot is unsupported for this state realization",
         ))
     }
+    fn isolated_snapshot_auxiliary_bytes(&self) -> Option<u64> {
+        Some(0)
+    }
+    fn isolated_snapshot_auxiliary_growth(&self, _additional: u64) -> Option<u64> {
+        Some(0)
+    }
     fn isolated_snapshot_estimate(
         &self,
     ) -> Option<eredu_core::execution_control::SnapshotEstimate> {
@@ -36,6 +42,7 @@ pub(crate) trait MlxStateMechanisms: LayerRuntimeState<MlxNeuralBackend> + Sized
                 .checked_add(4096)?
                 .checked_add(u64::try_from(array.shape().len()).ok()?.checked_mul(16)?)?;
         }
+        retained = retained.checked_add(self.isolated_snapshot_auxiliary_bytes()?)?;
         Some(eredu_core::execution_control::SnapshotEstimate {
             retained_bytes: retained,
             copy_bytes: retained,
@@ -90,7 +97,7 @@ pub(crate) trait MlxStateMechanisms: LayerRuntimeState<MlxNeuralBackend> + Sized
                     )?;
             }
         }
-        Some(bytes)
+        bytes.checked_add(self.isolated_snapshot_auxiliary_growth(additional)?)
     }
     fn offset(&self) -> i32;
     fn realize(
@@ -167,6 +174,13 @@ impl MlxStateMechanisms for MlxKeyValueState {
     fn continuation_capacity_bound(&self, additional: u64) -> Option<u64> {
         self.continuation_capacity_bound(additional)
     }
+    fn isolated_snapshot_auxiliary_bytes(&self) -> Option<u64> {
+        self.isolated_snapshot_auxiliary_bytes()
+    }
+    fn isolated_snapshot_auxiliary_growth(&self, additional: u64) -> Option<u64> {
+        self.isolated_snapshot_auxiliary_growth(additional)
+    }
+
     fn supports_isolated_snapshot(&self) -> bool {
         self.supports_isolated_snapshot()
     }
@@ -293,6 +307,12 @@ impl MlxStateMechanisms for MlxKeyValueState {
 impl MlxStateMechanisms for MlxHybridState {
     fn continuation_capacity_bound(&self, additional: u64) -> Option<u64> {
         self.continuation_capacity_bound(additional)
+    }
+    fn isolated_snapshot_auxiliary_bytes(&self) -> Option<u64> {
+        self.isolated_snapshot_auxiliary_bytes()
+    }
+    fn isolated_snapshot_auxiliary_growth(&self, additional: u64) -> Option<u64> {
+        self.isolated_snapshot_auxiliary_growth(additional)
     }
     fn supports_isolated_snapshot(&self) -> bool {
         self.supports_isolated_snapshot()

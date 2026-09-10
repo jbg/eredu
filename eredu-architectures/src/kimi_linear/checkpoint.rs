@@ -400,7 +400,7 @@ pub fn expert_residency_catalog(
                 .collect::<Result<Vec<_>, _>>()?;
             units.push(
                 crate::ExpertResidencyUnit::new(
-                    eredu_runtime::ParameterBankKey::new(layer, expert),
+                    eredu_runtime::ParameterBankKey::new(0, layer, expert),
                     owner_group.clone(),
                     layer,
                     &unit_path,

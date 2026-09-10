@@ -562,7 +562,11 @@ fn gpt_oss_load_time_transform_preserves_native_experts_in_both_residencies() {
             &capabilities(requirements.text(), request.text()),
         )
         .unwrap();
-        let expert_targets = requirements.catalog().logical_targets();
+        let expert_targets = requirements
+            .banks()
+            .values()
+            .flat_map(|bank| bank.catalog().logical_targets())
+            .collect::<std::collections::BTreeSet<_>>();
         let selected_experts = requirements
             .text()
             .parameters()
@@ -673,6 +677,7 @@ fn routed_addressable_load_time_transform_uses_selected_bank_geometry() {
             .parameter_bank_report()
             .unwrap()
             .unwrap_or_else(|| panic!("{name}: no addressable-bank telemetry"));
+        let report = &report.banks()[&eredu_runtime::RoutedBankId::new(0)];
         assert_eq!(
             report.weight_quantizations(),
             [eredu_checkpoint::WeightQuantization::Affine(

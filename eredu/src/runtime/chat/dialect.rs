@@ -217,6 +217,12 @@ pub(crate) struct TaggedParametersEncoding {
     pub(crate) function_name_suffix: &'static str,
     pub(crate) parameter_prefix: &'static str,
     pub(crate) parameter_name_suffix: &'static str,
+    /// Optional compact JSON-schema type annotation between name and value.
+    pub(crate) parameter_type: Option<ExactEnvelope>,
+    /// Separate opening value tag, or empty when the name delimiter opens it.
+    pub(crate) parameter_value_prefix: &'static str,
+    /// Remove optional paired LF/CRLF framing around raw values.
+    pub(crate) strip_value_framing: bool,
     pub(crate) parameter_suffix: &'static str,
     pub(crate) function_suffix: &'static str,
 }
@@ -392,7 +398,6 @@ impl DeclarativeDialectSpec {
             }
             DeclarativePayloadShape::TaggedParameters(encoding) => {
                 if [
-                    encoding.function_prefix,
                     encoding.function_name_suffix,
                     encoding.parameter_prefix,
                     encoding.parameter_name_suffix,
@@ -403,6 +408,14 @@ impl DeclarativeDialectSpec {
                 .any(|delimiter| delimiter.is_empty())
                 {
                     return Err("declarative tagged parameters require non-empty delimiters".into());
+                }
+                if encoding
+                    .parameter_type
+                    .is_some_and(|tag| tag.prefix.is_empty() || tag.suffix.is_empty())
+                {
+                    return Err(
+                        "declarative parameter type tags require non-empty delimiters".into(),
+                    );
                 }
                 if self.json_function.is_some() {
                     return Err(
@@ -944,6 +957,9 @@ fn tagged_parameters_grammar(
                             .filter_map(Value::as_str)
                             .filter(|value| !value.contains(encoding.parameter_suffix))
                             .flat_map(|value| {
+                                if !encoding.strip_value_framing {
+                                    return vec![literal(value)];
+                                }
                                 let mut spellings = vec![
                                     literal(&format!("\n{value}\n")),
                                     literal(&format!("\r\n{value}\r\n")),
@@ -973,10 +989,11 @@ fn tagged_parameters_grammar(
             }
             let parameter_rule = format!("tagged_parameter_{tool_index}_{}", parameter_rules.len());
             rules.push_str(&format!(
-                "{parameter_rule}: {} {} {} {value_rule} {} tagged_ws\n",
+                "{parameter_rule}: {} {} {} {} {value_rule} {} tagged_ws\n",
                 literal(encoding.parameter_prefix),
                 literal(&name),
                 literal(encoding.parameter_name_suffix),
+                tagged_value_header_grammar(encoding, &schema),
                 if value_consumes_suffix {
                     literal("")
                 } else {
@@ -990,11 +1007,12 @@ fn tagged_parameters_grammar(
                 let name = format!("tagged_any_parameter_{tool_index}");
                 let value = format!("tagged_any_value_{tool_index}");
                 rules.push_str(&format!(
-                    "{name}: {} /[^<>\\r\\n]+/ {} {value} tagged_ws\n{value}[lazy]: /(?s:.)*/ {}\n",
-                    literal(encoding.parameter_prefix),
-                    literal(encoding.parameter_name_suffix),
-                    literal(encoding.parameter_suffix),
-                ));
+                "{name}: {} /[^<>\\r\\n]+/ {} {} {value} tagged_ws\n{value}[lazy]: /(?s:.)*/ {}\n",
+                literal(encoding.parameter_prefix),
+                literal(encoding.parameter_name_suffix),
+                tagged_value_header_grammar(encoding, &Value::Bool(true)),
+                literal(encoding.parameter_suffix),
+            ));
                 format!("{name}*")
             } else {
                 tagged_parameter_sequence(&parameter_rules, &required, 0)
@@ -1155,6 +1173,99 @@ fn tagged_value_matches_schema(value: &Value, schema: &Value) -> bool {
     // those with the correct scope once the argument object is complete.
     crate::runtime::chat::tool_schema::compile(schema)
         .map_or(true, |validator| validator.is_valid(value))
+}
+
+fn tagged_schema_has_union(schema: &Value) -> bool {
+    schema
+        .get("oneOf")
+        .is_some_and(|v| v.as_array().is_some_and(|v| !v.is_empty()))
+        || schema
+            .get("anyOf")
+            .is_some_and(|v| v.as_array().is_some_and(|v| !v.is_empty()))
+        || schema
+            .get("type")
+            .and_then(Value::as_array)
+            .is_some_and(|types| types.len() > 1)
+        || schema.get("items").is_some_and(tagged_schema_has_union)
+        || schema
+            .get("properties")
+            .and_then(Value::as_object)
+            .is_some_and(|properties| properties.values().any(tagged_schema_has_union))
+}
+
+/// Compact JSON-schema type spelling used by tagged argument annotations.
+/// A union (including nested unions) describes its actual JSON value type.
+fn tagged_type_name(schema: &Value, value: Option<&Value>) -> String {
+    if tagged_schema_has_union(schema) {
+        if let Some(value) = value {
+            return match value {
+                Value::Null => "null",
+                Value::Bool(_) => "boolean",
+                Value::Number(n) if n.is_i64() || n.is_u64() => "integer",
+                Value::Number(_) => "number",
+                Value::String(_) => "string",
+                Value::Array(_) => "array",
+                Value::Object(_) => "object",
+            }
+            .into();
+        }
+    }
+    let type_name = schema.get("type").and_then(|kind| {
+        kind.as_str().or_else(|| {
+            kind.as_array()
+                .filter(|types| types.len() == 1)?
+                .first()?
+                .as_str()
+        })
+    });
+    match type_name {
+        Some("array") => format!(
+            "array[{}]",
+            schema
+                .get("items")
+                .map_or_else(|| "any".into(), |items| tagged_type_name(items, None))
+        ),
+        Some(name) => name.into(),
+        None if schema.get("$ref").and_then(Value::as_str).is_some() => schema["$ref"]
+            .as_str()
+            .unwrap()
+            .rsplit('/')
+            .next()
+            .unwrap()
+            .into(),
+        None if schema.get("properties").is_some() => "object".into(),
+        None if schema.get("items").is_some() => {
+            format!("array[{}]", tagged_type_name(&schema["items"], None))
+        }
+        None => "any".into(),
+    }
+}
+
+fn tagged_value_header_grammar(encoding: TaggedParametersEncoding, schema: &Value) -> String {
+    let mut header = String::new();
+    if let Some(tag) = encoding.parameter_type {
+        let types = if tagged_schema_has_union(schema) {
+            [
+                "null", "boolean", "integer", "number", "string", "array", "object",
+            ]
+            .map(literal)
+            .join(" | ")
+        } else {
+            literal(&tagged_type_name(schema, None))
+        };
+        header = format!(
+            "tagged_ws {} ({types}) {} ",
+            literal(tag.prefix),
+            literal(tag.suffix)
+        );
+    }
+    if !encoding.parameter_value_prefix.is_empty() {
+        header.push_str(&format!(
+            "tagged_ws {}",
+            literal(encoding.parameter_value_prefix)
+        ));
+    }
+    header
 }
 
 fn literal(text: &str) -> String {
@@ -1617,6 +1728,8 @@ enum DeclarativeParserState {
         tool: String,
         parameter: String,
         arguments: serde_json::Map<String, Value>,
+        header_consumed: bool,
+        declared_type: Option<String>,
     },
     StructuralName {
         prefix_consumed: bool,
@@ -2147,22 +2260,63 @@ impl DeclarativeParser {
                         tool: std::mem::take(tool),
                         parameter,
                         arguments: std::mem::take(arguments),
+                        header_consumed: false,
+                        declared_type: None,
                     };
                 }
                 DeclarativeParserState::TaggedParameterValue {
                     tool,
                     parameter,
                     arguments,
+                    header_consumed,
+                    declared_type,
                 } => {
                     let DeclarativePayloadShape::TaggedParameters(encoding) =
                         self.spec.payload_shape
                     else {
                         unreachable!("tagged-parameter state requires tagged parameters")
                     };
+                    if !*header_consumed {
+                        // Retain the complete header until it is available, so a
+                        // split inside either tag cannot consume it twice.
+                        let mut header = self.pending.as_str();
+                        if let Some(tag) = encoding.parameter_type {
+                            header = header.trim_start_matches([' ', '\t', '\r', '\n']);
+                            let Some(tail) = header.strip_prefix(tag.prefix) else {
+                                if tag.prefix.starts_with(header) {
+                                    return Ok(());
+                                }
+                                return Err("expected tagged parameter type".into());
+                            };
+                            let Some(end) = tail.find(tag.suffix) else {
+                                return Ok(());
+                            };
+                            *declared_type = Some(tail[..end].to_owned());
+                            header = &tail[end + tag.suffix.len()..];
+                        }
+                        if !encoding.parameter_value_prefix.is_empty() {
+                            header = header.trim_start_matches([' ', '\t', '\r', '\n']);
+                            let Some(tail) = header.strip_prefix(encoding.parameter_value_prefix)
+                            else {
+                                if encoding.parameter_value_prefix.starts_with(header) {
+                                    return Ok(());
+                                }
+                                return Err("expected tagged parameter value".into());
+                            };
+                            header = tail;
+                        }
+                        let consumed = self.pending.len() - header.len();
+                        self.pending.drain(..consumed);
+                        *header_consumed = true;
+                    }
                     let Some(position) = self.pending.find(encoding.parameter_suffix) else {
                         return Ok(());
                     };
-                    let raw = tagged_value_text(&self.pending[..position]);
+                    let raw = if encoding.strip_value_framing {
+                        tagged_value_text(&self.pending[..position])
+                    } else {
+                        &self.pending[..position]
+                    };
                     let schema = &self
                         .tagged_tools
                         .get(tool)
@@ -2170,7 +2324,12 @@ impl DeclarativeParser {
                         .parameters
                         .get(parameter)
                         .unwrap_or(&Value::Bool(true));
-                    let value = match tagged_value_kind(schema)? {
+                    let kind = match declared_type.as_deref() {
+                        Some("string") => TaggedValueKind::RawString,
+                        Some(_) if tagged_schema_has_union(schema) => TaggedValueKind::Json,
+                        _ => tagged_value_kind(schema)?,
+                    };
+                    let value = match kind {
                         TaggedValueKind::RawString => Value::String(raw.to_owned()),
                         TaggedValueKind::RawStringOrJson => {
                             serde_json::from_str(raw).ok()
@@ -2183,6 +2342,12 @@ impl DeclarativeParser {
                             )
                         })?,
                     };
+                    if let Some(declared) = declared_type {
+                        let expected = tagged_type_name(schema, Some(&value));
+                        if *declared != expected {
+                            return Err(format!("tagged parameter {parameter:?} declares type {declared:?}; expected {expected:?}"));
+                        }
+                    }
                     if !tagged_value_matches_schema(&value, schema) {
                         return Err(format!(
                             "tagged tool {tool:?} parameter {parameter:?} has the wrong type or value"

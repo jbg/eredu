@@ -1,0 +1,6 @@
+{
+  "torch": "2.14.0",
+  "torch_git": "08187d9e0fba026dc8217405802ab5381dc88d90",
+  "sha256": "49a457e28139f2c560387b2da54040a6e90c5e635e9ddf501e77386cae156c53",
+  "operation": "BF16 CPU matrix multiplication, FP32 accumulation"
+}

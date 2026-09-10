@@ -137,7 +137,15 @@ fn paged_full_attention_matches_contiguous_causal_attention() {
         .update_and_fetch(keys.clone(), values.clone(), stream)
         .unwrap();
     let paged = cache
-        .paged_attention(&queries, 2.0f32.sqrt().recip(), None, None, None, stream)
+        .paged_attention(
+            &queries,
+            2.0f32.sqrt().recip(),
+            None,
+            None,
+            None,
+            eredu_nn::AttentionArithmetic::Fused,
+            stream,
+        )
         .unwrap()
         .unwrap();
     let reference = safemlx::fast::scaled_dot_product_attention(
@@ -177,7 +185,15 @@ fn paged_attention_preserves_learned_sink_normalization() {
         .update_and_fetch(keys.clone(), values.clone(), stream)
         .unwrap();
     let paged = cache
-        .paged_attention(&queries, 1.0, None, Some(&sinks), None, stream)
+        .paged_attention(
+            &queries,
+            1.0,
+            None,
+            Some(&sinks),
+            None,
+            eredu_nn::AttentionArithmetic::Fused,
+            stream,
+        )
         .unwrap()
         .unwrap();
     let reference = safemlx::fast::scaled_dot_product_attention(
@@ -225,7 +241,15 @@ fn paged_score_softcap_matches_scalar_masked_gqa_through_chunked_prefill() {
                     &[1, 2, count as i32, 1],
                 );
                 let actual = cache
-                    .paged_attention(&queries, 1.0, None, sinks.as_ref(), Some(1.0), stream)
+                    .paged_attention(
+                        &queries,
+                        1.0,
+                        None,
+                        sinks.as_ref(),
+                        Some(1.0),
+                        eredu_nn::AttentionArithmetic::Fused,
+                        stream,
+                    )
                     .unwrap()
                     .unwrap();
                 let mut expected = Vec::new();

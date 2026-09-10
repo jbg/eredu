@@ -105,6 +105,7 @@ impl ExpertRouteTensorMovement<MlxTensor> for MlxExpertRouteTensorMovement {
         value: MlxTensor,
         destination_rows: &[usize],
         output_rows: usize,
+        reduction: eredu_nn::GroupReduction,
     ) -> Result<MlxTensor, Self::Error> {
         if value.as_array().ndim() != 2
             || usize::try_from(value.as_array().dim(0)).ok() != Some(destination_rows.len())
@@ -117,12 +118,37 @@ impl ExpertRouteTensorMovement<MlxTensor> for MlxExpertRouteTensorMovement {
         let output_rows = i32::try_from(output_rows).map_err(|_| {
             Error::ArchitectureModel("expert route output rows exceed MLX i32 geometry".into())
         })?;
-        let indices = self.indices(destination_rows, true)?;
-        let output = zeros_dtype(
+        let mut output = zeros_dtype(
             &[output_rows, value.as_array().dim(1)],
             value.as_array().dtype(),
             &self.stream,
         )?;
+        if reduction == eredu_nn::GroupReduction::SequentialGroupOrder {
+            // Each wave has at most one contribution per destination. Keeping
+            // additions in separate operations preserves rounding after every
+            // contribution without serializing unrelated source rows.
+            let mut counts = vec![0usize; output_rows as usize];
+            let mut waves = Vec::<Vec<usize>>::new();
+            for (row, &destination) in destination_rows.iter().enumerate() {
+                let wave = counts[destination];
+                if wave == waves.len() {
+                    waves.push(Vec::new());
+                }
+                waves[wave].push(row);
+                counts[destination] += 1;
+            }
+            for rows in waves {
+                let destinations = rows
+                    .iter()
+                    .map(|row| destination_rows[*row])
+                    .collect::<Vec<_>>();
+                let indices = self.indices(&destinations, true)?;
+                let selected = self.gather_rows(&value, &rows)?;
+                output = output.scatter_add(&indices, selected.as_array(), 0, &self.stream)?;
+            }
+            return Ok(MlxTensor::from_array(output));
+        }
+        let indices = self.indices(destination_rows, true)?;
         output
             .scatter_add(&indices, value.as_array(), 0, &self.stream)
             .map(MlxTensor::from_array)
@@ -135,6 +161,37 @@ mod tests {
     use eredu_nn::Tensor;
 
     use super::*;
+
+    #[test]
+    fn sequential_row_reduction_rounds_each_contribution_without_mixing_destinations() {
+        let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+        let input = MlxTensor::from_array(
+            Array::from_slice(&[256.0f32, 1.0, 1.0, 2.0, -256.0, 3.0], &[6, 1])
+                .as_dtype(safemlx::Dtype::Bfloat16, &stream)
+                .unwrap(),
+        );
+        let mut movement = MlxExpertRouteTensorMovement::new(&stream);
+        let output = movement
+            .scatter_add_rows(
+                input,
+                &[0, 1, 0, 1, 0, 1],
+                3,
+                eredu_nn::GroupReduction::SequentialGroupOrder,
+            )
+            .unwrap();
+        assert_eq!(output.to_f32_vec(&stream).unwrap(), [0.0, 6.0, 0.0]);
+        let empty =
+            MlxTensor::from_array(zeros_dtype(&[0, 1], safemlx::Dtype::Bfloat16, &stream).unwrap());
+        let output = movement
+            .scatter_add_rows(
+                empty,
+                &[],
+                2,
+                eredu_nn::GroupReduction::SequentialGroupOrder,
+            )
+            .unwrap();
+        assert_eq!(output.to_f32_vec(&stream).unwrap(), [0.0, 0.0]);
+    }
 
     #[test]
     #[ignore = "requires local MLX native execution"]
@@ -150,7 +207,9 @@ mod tests {
             [5.0, 6.0, 1.0, 2.0, 5.0, 6.0]
         );
 
-        let scattered = movement.scatter_add_rows(gathered, &[1, 0, 1], 2).unwrap();
+        let scattered = movement
+            .scatter_add_rows(gathered, &[1, 0, 1], 2, eredu_nn::GroupReduction::Sum)
+            .unwrap();
         assert_eq!(
             scattered.to_f32_vec(stream).unwrap(),
             [1.0, 2.0, 10.0, 12.0]
@@ -178,7 +237,9 @@ mod tests {
         let mut movement = MlxExpertRouteTensorMovement::new(stream);
 
         let gathered = movement.gather_rows(&empty, &[]).unwrap();
-        let scattered = movement.scatter_add_rows(gathered, &[], 2).unwrap();
+        let scattered = movement
+            .scatter_add_rows(gathered, &[], 2, eredu_nn::GroupReduction::Sum)
+            .unwrap();
         assert_eq!(scattered.as_array().shape(), [2, 2]);
         assert_eq!(scattered.to_f32_vec(stream).unwrap(), [0.0; 4]);
 

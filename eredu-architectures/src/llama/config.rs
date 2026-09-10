@@ -186,6 +186,7 @@ impl Config for ModelArgs {
     }
     fn rotary_spec(&self, dimensions: i32) -> RotarySpec {
         RotarySpec {
+            arithmetic: eredu_nn::RotaryArithmetic::Native,
             dimensions,
             base: self.rope_theta,
             traditional: self.rope_traditional,

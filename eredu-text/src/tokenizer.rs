@@ -156,8 +156,12 @@ impl Tokenizer {
     /// Wraps a Hugging Face tokenizer with chat-template support.
     pub fn from_tokenizer(tokenizer: tokenizers::Tokenizer) -> Self {
         let mut env = Environment::new();
+        // Match the Jinja environment used by Transformers chat templates.
+        env.set_trim_blocks(true);
+        env.set_lstrip_blocks(true);
         env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
         env.add_filter("tojson", json::tojson);
+        env.add_function("dict", python_dict);
         Self {
             inner: tokenizer,
             env,
@@ -268,6 +272,39 @@ impl Tokenizer {
             },
         )
     }
+}
+
+/// Jinja's Python dictionary constructor also accepts an iterable of pairs.
+/// MiniJinja's builtin handles mappings and keyword arguments; normalize the
+/// pair form first while retaining insertion order and last-value replacement.
+fn python_dict(
+    value: Option<minijinja::Value>,
+    kwargs: minijinja::value::Kwargs,
+) -> Result<minijinja::Value, minijinja::Error> {
+    let value = value
+        .map(|value| {
+            if !matches!(
+                value.kind(),
+                minijinja::value::ValueKind::Seq | minijinja::value::ValueKind::Iterable
+            ) {
+                return Ok(value);
+            }
+            value
+                .try_iter()?
+                .map(|pair| {
+                    let elements = pair.try_iter()?.collect::<Vec<_>>();
+                    if elements.len() != 2 {
+                        return Err(minijinja::Error::new(
+                            minijinja::ErrorKind::InvalidOperation,
+                            "dict sequence entries must contain exactly two elements",
+                        ));
+                    }
+                    Ok((elements[0].clone(), elements[1].clone()))
+                })
+                .collect::<Result<minijinja::Value, minijinja::Error>>()
+        })
+        .transpose()?;
+    minijinja::functions::dict(value, kwargs)
 }
 
 impl Deref for Tokenizer {
@@ -970,7 +1007,6 @@ where
         }
 
         let mut rendered_chat = template.render(context)?;
-        rendered_chat = rendered_chat.trim_start_matches('\n').to_string();
 
         if continue_final_message {
             let Some(final_message) = chat

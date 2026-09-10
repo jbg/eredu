@@ -30,7 +30,8 @@ where
         None
     }
 
-    /// Copies every native state component, preserving geometry and positions.
+    /// Copies every native state component and completes its native work,
+    /// preserving geometry and positions before distributed preparation agreement.
     /// Mutable storage must be isolated. On error the source remains unchanged;
     /// all unresolved native resources stay with the existing recovery owner.
     fn copy_snapshot_state(
@@ -48,8 +49,6 @@ pub struct ReplicatedTextControlState<S> {
     owner: Arc<()>,
     state: S,
     prompt_input_identity: Option<PreparedInputCacheIdentity>,
-    next_commit_epoch: DistributedCommitEpoch,
-    last_commit_outcome: Option<DistributedCommitOutcome>,
 }
 
 impl<A, B, M, D> ReplicatedTextSession<A, B, M, D>
@@ -124,17 +123,23 @@ where
         ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>,
     > {
         self.ensure_commit_resolved()?;
-        let state = self
+        let provisional = self
             .mechanisms
             .copy_snapshot_state(&self.state, context)
-            .map_err(ReplicatedTextSessionError::Mechanism)?;
-        self.validate_control_geometry(&state)?;
+            .map_err(ReplicatedTextSessionError::Mechanism)
+            .and_then(|state| {
+                self.validate_control_geometry(&state)?;
+                Ok(state)
+            });
+        let state = self.agree_control_preparation(
+            provisional,
+            crate::DistributedExecutionPhase::ControlCapturePreparation,
+            context,
+        )?;
         Ok(ReplicatedTextControlState {
             owner: Arc::clone(&self.control_identity),
             state,
             prompt_input_identity: self.committed_prompt_input_identity.clone(),
-            next_commit_epoch: self.next_commit_epoch,
-            last_commit_outcome: self.last_commit_outcome,
         })
     }
 
@@ -148,19 +153,50 @@ where
         ReplicatedTextControlState<M::State>,
         ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>,
     > {
-        self.validate_control_state(saved)?;
-        let state = self
-            .mechanisms
-            .copy_snapshot_state(&saved.state, context)
-            .map_err(ReplicatedTextSessionError::Mechanism)?;
-        self.validate_control_geometry(&state)?;
+        let provisional = self.validate_control_state(saved).and_then(|()| {
+            let state = self
+                .mechanisms
+                .copy_snapshot_state(&saved.state, context)
+                .map_err(ReplicatedTextSessionError::Mechanism)?;
+            self.validate_control_geometry(&state)?;
+            Ok(state)
+        });
+        let state = self.agree_control_preparation(
+            provisional,
+            crate::DistributedExecutionPhase::ControlCopyPreparation,
+            context,
+        )?;
         Ok(ReplicatedTextControlState {
             owner: Arc::clone(&self.control_identity),
             state,
             prompt_input_identity: saved.prompt_input_identity.clone(),
-            next_commit_epoch: saved.next_commit_epoch,
-            last_commit_outcome: saved.last_commit_outcome,
         })
+    }
+
+    /// Distributed callers advance the same operation and branch on every rank.
+    /// All provisional copies finish before publication; failure leaves installed
+    /// state untouched and fences the distributed session through its shared owner.
+    fn agree_control_preparation<T>(
+        &mut self,
+        provisional: Result<T, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>,
+        phase: crate::DistributedExecutionPhase,
+        context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
+    ) -> Result<T, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>> {
+        self.ensure_commit_resolved()?;
+        self.require_cache_control_agreement()?;
+        if !D::PARTITIONED_SESSION {
+            return provisional;
+        }
+        let agreement = self.agree_cache_control_phase(phase, provisional.is_ok(), context);
+        match (provisional, agreement) {
+            (Ok(value), Ok(true)) => Ok(value),
+            (Ok(_), Ok(false)) => self.fence_remote_cache_control_failure(phase),
+            (Ok(_), Err(error)) => Err(error),
+            (Err(error), _) => {
+                self.control_fence = Some(phase);
+                Err(error)
+            }
+        }
     }
 
     fn validate_control_geometry(
@@ -195,15 +231,21 @@ where
     pub fn exchange_control_state(
         &mut self,
         slot: &mut ReplicatedTextControlState<M::State>,
+        context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
     ) -> Result<(), ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>> {
-        self.validate_control_state(slot)?;
+        let validation = self.validate_control_state(slot);
+        self.agree_control_preparation(
+            validation,
+            crate::DistributedExecutionPhase::ControlExchangePreparation,
+            context,
+        )?;
         std::mem::swap(&mut self.state, &mut slot.state);
         std::mem::swap(
             &mut self.committed_prompt_input_identity,
             &mut slot.prompt_input_identity,
         );
-        std::mem::swap(&mut self.next_commit_epoch, &mut slot.next_commit_epoch);
-        std::mem::swap(&mut self.last_commit_outcome, &mut slot.last_commit_outcome);
+        // Commit epochs and outcomes belong to the live submission owner. A
+        // branch switch must never reuse a completed transaction identity.
         Ok(())
     }
 }

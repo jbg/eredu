@@ -81,7 +81,7 @@ impl PartitionExpertBankOwnership {
     }
     /// Returns the stable architecture-global parameter-bank key.
     pub const fn bank_key(&self) -> eredu_runtime::ParameterBankKey {
-        eredu_runtime::ParameterBankKey::new(self.global_unit, self.global_expert)
+        eredu_runtime::ParameterBankKey::new(0, self.global_unit, self.global_expert)
     }
 }
 
@@ -1536,7 +1536,10 @@ mod tests {
         assert_eq!(bank.global_unit(), 1);
         assert_eq!(bank.global_expert(), 1);
         assert_eq!(bank.owner_local_expert(), 0);
-        assert_eq!(bank.bank_key(), eredu_runtime::ParameterBankKey::new(1, 1));
+        assert_eq!(
+            bank.bank_key(),
+            eredu_runtime::ParameterBankKey::new(0, 1, 1)
+        );
         assert_eq!(geometry.complete_state_layout().len(), 3);
 
         let wrong_topology = eredu_core::ParallelRankTopology::new(shape, 0).unwrap();

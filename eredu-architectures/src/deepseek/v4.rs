@@ -2158,6 +2158,7 @@ where
 
 fn text_static_spec(args: &V4Args) -> StaticModuleSpec {
     StaticModuleSpec {
+        normalization_groups: None,
         embedding_weight: "embed.weight".into(),
         normalization_weight: "norm.weight".into(),
         head_weight: "head.weight".into(),

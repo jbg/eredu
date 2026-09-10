@@ -58,6 +58,16 @@ use crate::{
 /// execution branch, or inspect model-family identity. Architecture code supplies
 /// exact neutral requirements and retains every selection decision.
 pub trait PreparationMechanismProvider {
+    /// Conservative live buffers for one physical recipe, including native
+    /// copies and index buffers. This must inspect metadata only.
+    fn recipe_materialization_workspace(
+        &self,
+        _recipe: &eredu_checkpoint::recipe::DerivedWeightRecipe,
+        _source: &dyn eredu_checkpoint::store::CheckpointSource,
+    ) -> Result<u64, String> {
+        Err("backend did not report native recipe workspace".into())
+    }
+
     /// Host observation collector facts, independent of model family and devices.
     fn observation_mechanisms(&self) -> eredu_core::ObservationMechanisms {
         eredu_core::ObservationMechanisms::default()
@@ -734,9 +744,23 @@ pub(crate) mod tests {
         counters: IndependentCounters,
         failure: IndependentFailure,
         fp8: bool,
+        transforms: bool,
     }
 
     impl BoundedIndependentAdapter {
+        pub(crate) fn with_transforms() -> Self {
+            Self {
+                transforms: true,
+                ..Self::default()
+            }
+        }
+        pub(crate) fn with_fp8() -> Self {
+            Self {
+                fp8: true,
+                ..Self::default()
+            }
+        }
+
         fn failing(failure: IndependentFailure) -> Self {
             Self {
                 failure,
@@ -772,11 +796,15 @@ pub(crate) mod tests {
             .with_prompt_cache(true)
             .with_exact_completion(true)
             .with_grouped_operations([
+                GroupedOperationRequirement::Linear,
                 GroupedOperationRequirement::GatedProduct,
                 GroupedOperationRequirement::GatedProductTensorParallelPartial,
                 GroupedOperationRequirement::Relu2,
             ])
             .with_indexed_movement(true)
+            .with_addressable_storage(
+                eredu_runtime::AddressableStorageCapabilities::new(true, true, true, 1 << 20),
+            )
         }
 
         fn supports_direct(&self, descriptor: &eredu_runtime::WeightLoweringDescriptor) -> bool {
@@ -804,8 +832,12 @@ pub(crate) mod tests {
                 )
         }
 
-        fn supports_transform(&self, _: &eredu_runtime::WeightLoweringDescriptor) -> bool {
-            false
+        fn supports_transform(&self, descriptor: &eredu_runtime::WeightLoweringDescriptor) -> bool {
+            self.transforms
+                && matches!(
+                    descriptor.executable(),
+                    eredu_checkpoint::LinearFormat::Affine(_)
+                )
         }
 
         fn floating_state_dtype(
@@ -839,6 +871,16 @@ pub(crate) mod tests {
     }
 
     impl PreparationMechanismProvider for BoundedIndependentAdapter {
+        fn recipe_materialization_workspace(
+            &self,
+            recipe: &eredu_checkpoint::recipe::DerivedWeightRecipe,
+            source: &dyn eredu_checkpoint::store::CheckpointSource,
+        ) -> Result<u64, String> {
+            recipe
+                .peak_materialization_bytes(source)
+                .map_err(|error| error.to_string())
+        }
+
         fn preparation_capabilities(&self) -> PreparationMechanismCapabilities {
             self.counters
                 .preparation_queries
@@ -976,6 +1018,16 @@ pub(crate) mod tests {
                     .unwrap()
             })
             .chain([
+                CommunicationOperationRequirement::tensors(
+                    CommunicationOperation::VariableAllToAll,
+                    dtypes.clone(),
+                    CommunicationTensorLimits::new(64, 16, usize::MAX / 4, Some(usize::MAX / 4))
+                        .unwrap()
+                        .with_output_tensor_elements(usize::MAX / 2)
+                        .unwrap(),
+                    true,
+                )
+                .unwrap(),
                 CommunicationOperationRequirement::barrier(true),
                 CommunicationOperationRequirement::failure_agreement(true),
             ]);
@@ -1332,7 +1384,10 @@ pub(crate) mod tests {
         )
         .unwrap();
         let members = crate::routed_text::project_addressable_members(
-            requirements.catalog(),
+            requirements
+                .bank(eredu_runtime::RoutedBankId::new(0))
+                .unwrap()
+                .catalog(),
             selected.text_realization(),
         )
         .unwrap();

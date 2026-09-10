@@ -26,20 +26,16 @@ mod routed_session;
 pub use direct_session::{construct_selected_composite_session, construct_selected_text_session};
 pub use ordinary::{CompositeRoute, KeyValueRoute, ReplicatedRoute, RoutedRoute};
 pub use partition_facts::PreparedPartitionSessionFacts;
-pub use partitioned::{
-    GatedPartitionedRoute, PartitionedCompositeRoute, PartitionedDenseRoute, PartitionedRoutedRoute,
-};
+pub use partitioned::{PartitionedCompositeRoute, PartitionedDenseRoute, PartitionedRoutedRoute};
 pub use prediction::{
     PredictionBinding, PredictionConstruction, PredictionMechanisms, WithoutPrediction,
 };
 pub use routed_partition::{
-    construct_selected_gated_partition_provider, construct_selected_relu2_partition_provider,
-    PartitionBankMechanisms,
+    construct_selected_partition_providers, PartitionBankMechanisms, PartitionBankProviders,
 };
 pub use routed_session::{
-    construct_selected_gated_session, construct_selected_relu2_session,
-    construct_selected_routed_composite_session, PreparedCompositeSessionFacts,
-    PreparedTextSessionFacts,
+    construct_selected_routed_composite_session, construct_selected_routed_session,
+    PreparedCompositeSessionFacts, PreparedTextSessionFacts,
 };
 
 pub(crate) mod sealed {

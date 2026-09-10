@@ -24,6 +24,7 @@ pub fn select_routes_with_provider<B, P>(
     input: &B::Tensor,
     context: &<B::Tensor as Tensor>::Context,
     provider: &mut P,
+    bank: crate::RoutedBankId,
 ) -> Result<GroupSelection<B::Tensor>, Error>
 where
     B: GroupedNeuralBackend,
@@ -31,7 +32,7 @@ where
     P::Error: std::fmt::Display,
 {
     let Some(control) = provider
-        .routing_control(token_rows(input)?)
+        .routing_control(bank, token_rows(input)?)
         .map_err(Error::backend)?
     else {
         return selector.select(input, context);
@@ -40,6 +41,7 @@ where
         let selection = selector.select_intervened(input, &control, context)?;
         provider
             .routing_applied(
+                bank,
                 selection.original.as_ref().map(Into::into),
                 (&selection.effective).into(),
             )
@@ -47,7 +49,7 @@ where
         Ok(selection.effective)
     })();
     if let Err(error) = &result {
-        provider.routing_failed(&error.to_string());
+        provider.routing_failed(bank, &error.to_string());
     }
     result
 }

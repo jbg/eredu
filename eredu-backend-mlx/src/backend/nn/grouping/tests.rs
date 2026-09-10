@@ -1,9 +1,49 @@
 use super::*;
 use crate::ops::{
     all_close,
-    indexing::{take_axis, IndexOp},
+    indexing::{take_axis, IndexOp, TryIndexOp},
     matmul, reshape,
 };
+
+#[test]
+fn reduced_precision_cpu_groups_preserve_unsorted_rows_and_reject_invalid_ids() {
+    let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+    for dtype in [Dtype::Bfloat16, Dtype::Float16] {
+        let inputs = Array::from_slice(&[1_f32, 2., 3., 4., 5., 6., 7., 8.], &[4, 2])
+            .as_dtype(dtype, &stream)
+            .unwrap();
+        let weights = Array::from_slice(
+            &[
+                1_f32, 0., 2., 0., 1., 3., 2., 1., 0., 1., 2., 1., 3., 2., 1., 2., 3., 2.,
+            ],
+            &[3, 2, 3],
+        )
+        .as_dtype(dtype, &stream)
+        .unwrap();
+        let ids = Array::from_slice(&[2_i32, 0, 2, 1], &[4]);
+        let result = grouped_matmul(&inputs, &weights, &ids, false, &stream).unwrap();
+        assert_eq!(result.dtype(), dtype);
+        assert_eq!(
+            result
+                .as_dtype(Dtype::Float32, &stream)
+                .unwrap()
+                .into_evaluated()
+                .unwrap()
+                .as_slice::<f32>(),
+            &[7., 8., 5., 3., 4., 18., 27., 28., 17., 22., 23., 8.]
+        );
+        let invalid = Array::from_slice(&[0_u64, 1, 2, 1_u64 << 32], &[4]);
+        assert!(grouped_matmul(&inputs, &weights, invalid, false, &stream).is_err());
+        let empty_inputs = inputs.try_index_device((0..0, ..), &stream).unwrap();
+        let empty_ids = ids.try_index_device(0..0, &stream).unwrap();
+        assert_eq!(
+            grouped_matmul(empty_inputs, &weights, empty_ids, true, &stream)
+                .unwrap()
+                .shape(),
+            &[0, 3]
+        );
+    }
+}
 
 #[test]
 fn test_group_by_id_topk_plan() {

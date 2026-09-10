@@ -113,6 +113,7 @@ impl BankPassStatistics {
 
 /// Point-in-time entry residency and execution report.
 pub struct ParameterBankResidencyReport {
+    pub(super) pool_id: u64,
     /// Every packed encoding used by exact load-time transformed bindings.
     pub(super) weight_quantizations: Vec<WeightQuantization>,
     /// Exact architecture-selected ownership for every bank entry.
@@ -213,6 +214,8 @@ impl ParameterBankResidencyReport {
 
 #[derive(Default)]
 pub(super) struct ParameterBankStatistics {
+    pub(super) peak_host_bytes: u64,
+    pub(super) peak_device_bytes: u64,
     pub(super) bulk: BankPassStatistics,
     pub(super) incremental: BankPassStatistics,
 }
@@ -223,5 +226,158 @@ impl ParameterBankStatistics {
             BankAccessClass::Bulk => &mut self.bulk,
             BankAccessClass::Incremental => &mut self.incremental,
         }
+    }
+}
+
+/// Reports independently identified banks and their total occupancy.
+/// Shared pool peaks are counted once; logical bank counters remain separate.
+pub struct ParameterBanksResidencyReport {
+    banks: std::collections::BTreeMap<eredu_runtime::RoutedBankId, ParameterBankResidencyReport>,
+    bulk: BankPassStatistics,
+    incremental: BankPassStatistics,
+}
+impl ParameterBanksResidencyReport {
+    /// Retains all bank identities, counters, and exact placements.
+    pub fn new(
+        banks: std::collections::BTreeMap<
+            eredu_runtime::RoutedBankId,
+            ParameterBankResidencyReport,
+        >,
+    ) -> Self {
+        let bulk = banks.values().map(|bank| *bank.bulk()).sum();
+        let incremental = banks.values().map(|bank| *bank.incremental()).sum();
+        Self {
+            banks,
+            bulk,
+            incremental,
+        }
+    }
+    /// Reports indexed by the selected architecture bank.
+    pub fn banks(
+        &self,
+    ) -> &std::collections::BTreeMap<eredu_runtime::RoutedBankId, ParameterBankResidencyReport>
+    {
+        &self.banks
+    }
+    /// Total prompt-processing counters across banks.
+    pub const fn bulk(&self) -> &BankPassStatistics {
+        &self.bulk
+    }
+    /// Total cached-decoding counters across banks.
+    pub const fn incremental(&self) -> &BankPassStatistics {
+        &self.incremental
+    }
+    /// Sum of `owned_entries` across independently retained banks.
+    pub fn owned_entries(&self) -> usize {
+        self.banks
+            .values()
+            .fold(0, |sum, bank| sum.saturating_add(bank.owned_entries()))
+    }
+    /// Sum of `owned_bytes` across independently retained banks.
+    pub fn owned_bytes(&self) -> u64 {
+        self.banks
+            .values()
+            .fold(0, |sum, bank| sum.saturating_add(bank.owned_bytes()))
+    }
+    /// Sum of `host_resident_entries` across independently retained banks.
+    pub fn host_resident_entries(&self) -> usize {
+        self.banks.values().fold(0, |sum, bank| {
+            sum.saturating_add(bank.host_resident_entries())
+        })
+    }
+    /// Sum of `device_resident_entries` across independently retained banks.
+    pub fn device_resident_entries(&self) -> usize {
+        self.banks.values().fold(0, |sum, bank| {
+            sum.saturating_add(bank.device_resident_entries())
+        })
+    }
+    /// Sum of `host_resident_bytes` across independently retained banks.
+    pub fn host_resident_bytes(&self) -> u64 {
+        self.banks.values().fold(0, |sum, bank| {
+            sum.saturating_add(bank.host_resident_bytes())
+        })
+    }
+    /// Sum of `device_resident_bytes` across independently retained banks.
+    pub fn device_resident_bytes(&self) -> u64 {
+        self.banks.values().fold(0, |sum, bank| {
+            sum.saturating_add(bank.device_resident_bytes())
+        })
+    }
+    /// Peak shared-pool occupancy, counting each physical pool once.
+    pub fn peak_host_resident_bytes(&self) -> u64 {
+        self.banks
+            .values()
+            .map(|bank| {
+                (
+                    bank.pool_id,
+                    bank.residency()
+                        .offload()
+                        .peak_resident_bytes()
+                        .get(MemoryTier::Host),
+                )
+            })
+            .collect::<BTreeMap<_, _>>()
+            .values()
+            .fold(0, |sum: u64, bytes| sum.saturating_add(*bytes))
+    }
+    /// Peak shared-pool occupancy, counting each physical pool once.
+    pub fn peak_device_resident_bytes(&self) -> u64 {
+        self.banks
+            .values()
+            .map(|bank| {
+                (
+                    bank.pool_id,
+                    bank.residency()
+                        .offload()
+                        .peak_resident_bytes()
+                        .get(MemoryTier::Device),
+                )
+            })
+            .collect::<BTreeMap<_, _>>()
+            .values()
+            .fold(0, |sum: u64, bytes| sum.saturating_add(*bytes))
+    }
+}
+impl std::iter::Sum for BankTierStatistics {
+    fn sum<I: Iterator<Item = Self>>(iter: I) -> Self {
+        iter.fold(Self::default(), |mut total, value| {
+            total.requests = total.requests.saturating_add(value.requests);
+            total.hits = total.hits.saturating_add(value.hits);
+            total.misses = total.misses.saturating_add(value.misses);
+            total.evictions = total.evictions.saturating_add(value.evictions);
+            total.eviction_bytes = total.eviction_bytes.saturating_add(value.eviction_bytes);
+            total
+        })
+    }
+}
+impl std::iter::Sum for BankPassStatistics {
+    fn sum<I: Iterator<Item = Self>>(iter: I) -> Self {
+        iter.fold(Self::default(), |mut total, value| {
+            total.requested_selections = total
+                .requested_selections
+                .saturating_add(value.requested_selections);
+            total.distinct_entries = total
+                .distinct_entries
+                .saturating_add(value.distinct_entries);
+            total.coalesced_duplicates = total
+                .coalesced_duplicates
+                .saturating_add(value.coalesced_duplicates);
+            total.compact_banks = total.compact_banks.saturating_add(value.compact_banks);
+            total.compact_bank_bytes = total
+                .compact_bank_bytes
+                .saturating_add(value.compact_bank_bytes);
+            total.compact_bank_time = total
+                .compact_bank_time
+                .saturating_add(value.compact_bank_time);
+            total.materialization_wait = total
+                .materialization_wait
+                .saturating_add(value.materialization_wait);
+            total.host = [total.host, value.host].into_iter().sum();
+            total.device = [total.device, value.device].into_iter().sum();
+            total.peak_compact_bank_bytes = total
+                .peak_compact_bank_bytes
+                .max(value.peak_compact_bank_bytes);
+            total
+        })
     }
 }

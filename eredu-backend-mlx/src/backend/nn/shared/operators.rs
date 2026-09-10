@@ -120,6 +120,7 @@ impl Parameterized<MlxTensor> for MlxEmbedding {
 /// scale construction.
 #[derive(Debug, Clone)]
 pub struct MlxRmsNorm {
+    pub(super) groups: Option<i32>,
     pub(super) module: Option<nn::RmsNorm>,
     pub(super) topology: BTreeMap<String, ParameterSpec>,
     pub(super) offset: Option<f32>,
@@ -154,6 +155,23 @@ impl NormalizationOperator<MlxTensor> for MlxRmsNorm {
                 self.dimensions,
                 input.shape()
             )));
+        }
+        if let Some(groups) = self.groups {
+            let mut shape = input.shape().to_vec();
+            shape.pop();
+            shape.extend([groups, self.dimensions / groups]);
+            let wide = compute(input.as_dtype(Dtype::Float32, context))?;
+            let grouped = compute(wide.reshape(&shape, context))?;
+            let normalized = mlx_weightless_rms_norm(&grouped, self.epsilon, context)?;
+            let mut normalized = compute(normalized.reshape(input.shape(), context))?;
+            if let Some(module) = &self.module {
+                let mut scale = compute(module.weight.as_ref().as_dtype(Dtype::Float32, context))?;
+                if let Some(offset) = self.offset {
+                    scale = compute(scale.add(Array::from_f32(offset), context))?;
+                }
+                normalized = compute(normalized.multiply(scale, context))?;
+            }
+            return compute_tensor(normalized.as_dtype(input.dtype(), context));
         }
         match (&mut self.module, self.offset) {
             (Some(module), None) => compute_tensor(module.forward(input, context)),
@@ -204,6 +222,11 @@ pub(super) fn mlx_weightless_rms_norm(
     context: &Stream,
 ) -> Result<Array, ComputeError> {
     eredu_nn::operation_geometry::NormalizationGeometry::new(input.shape(), epsilon)?;
+    if let Some(output) = compute(super::super::normalization::f32_weightless_rms(
+        input, epsilon, context,
+    ))? {
+        return Ok(output);
+    }
     let dtype = input.dtype();
     let variance = compute(input.square(context))?;
     let variance = compute(variance.mean_axis(-1, true, context))?;
@@ -216,7 +239,10 @@ pub(super) fn mlx_weightless_rms_norm(
 
 /// MLX RoPE variant selected from model metadata.
 #[derive(Debug, Clone)]
-pub struct MlxRotary(pub(super) RopeVariant);
+pub struct MlxRotary {
+    pub(super) native: RopeVariant,
+    pub(super) explicit: Option<rope::ElementwiseRotary>,
+}
 
 impl RotaryOperator<MlxTensor> for MlxRotary {
     fn forward(
@@ -231,7 +257,12 @@ impl RotaryOperator<MlxTensor> for MlxRotary {
                     .offset(offset)
                     .build()
                     .map_err(ComputeError::backend)?;
-                compute_tensor(self.0.forward(rope_input, context))
+                match &self.explicit {
+                    Some(rotary) => {
+                        compute_tensor(rotary.forward(input.as_array(), offset, context))
+                    }
+                    None => compute_tensor(self.native.forward(rope_input, context)),
+                }
             }
             RotaryPosition::Embeddings { cosine, sine } => {
                 compute_tensor(common::attention::apply_rotary_embeddings(

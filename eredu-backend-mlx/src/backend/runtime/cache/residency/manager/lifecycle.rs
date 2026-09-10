@@ -71,6 +71,34 @@ impl CacheResidencyManager {
     /// Immutable block arrays may be shared, but lifecycle ownership, mutable-tail accounting,
     /// budgets, and future block identities belong exclusively to the returned manager.
     pub(crate) fn fork_session(&self, stream: &Stream) -> Result<Self, CacheResidencyError> {
+        self.copy_session(stream, self.options().clone(), false)
+    }
+
+    /// Copies sealed arrays into a new namespace in the same bounded process pool.
+    pub(crate) fn isolated_snapshot(&self, stream: &Stream) -> Result<Self, CacheResidencyError> {
+        self.copy_session(
+            stream,
+            self.options().clone().with_pool(self.pool().clone())?,
+            true,
+        )
+    }
+
+    /// Includes all catalogued blocks, including blocks currently on host or disk.
+    pub(crate) fn isolated_snapshot_bytes(&self) -> Option<u64> {
+        let state = self.lock().ok()?;
+        state.blocks.values().try_fold(65536_u64, |total, block| {
+            total
+                .checked_add(block.bytes.checked_mul(2)?)?
+                .checked_add(8192)
+        })
+    }
+
+    fn copy_session(
+        &self,
+        stream: &Stream,
+        options: PagedCacheOptions,
+        copy_arrays: bool,
+    ) -> Result<Self, CacheResidencyError> {
         let (blocks, tails) = {
             let state = self.lock()?;
             let blocks = state
@@ -87,10 +115,17 @@ impl CacheResidencyManager {
             let tails = state.lifecycle.tails().collect::<Vec<_>>();
             (blocks, tails)
         };
-        let fork = Self::new(self.options().clone())?;
+        let fork = Self::new(options)?;
         for (id, protected) in blocks {
             let lease = self.lease_block(&id, stream)?;
-            let arrays = lease.arrays().clone();
+            let arrays = if copy_arrays {
+                lease
+                    .arrays()
+                    .isolated_snapshot(stream)
+                    .map_err(|e| CacheResidencyError::Runtime(e.to_string()))?
+            } else {
+                lease.arrays().clone()
+            };
             fork.seal_block(
                 id.global_layer,
                 id.start,

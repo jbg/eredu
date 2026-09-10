@@ -4,8 +4,10 @@ use super::*;
 
 /// Shared entry catalog, scheduler, residency manager, and telemetry.
 pub struct AddressableParameterBank {
+    pub(super) pool_id: u64,
     pub(super) manager: ResidencyManager,
     pub(super) catalog: BTreeMap<ParameterBankKey, u64>,
+    pub(super) unit_banks: BTreeMap<OffloadUnitId, usize>,
     #[cfg(test)]
     pub(super) namespace_entry_counts: BTreeMap<usize, usize>,
     #[cfg(test)]
@@ -14,7 +16,7 @@ pub struct AddressableParameterBank {
     pub(super) scratch_limit: u64,
     #[cfg(test)]
     pub(super) bulk_bank_target: u64,
-    pub(super) statistics: Mutex<ParameterBankStatistics>,
+    pub(super) statistics: Mutex<BTreeMap<usize, ParameterBankStatistics>>,
     pub(super) weight_quantizations: Vec<WeightQuantization>,
     pub(super) placements:
         BTreeMap<ParameterBankKey, eredu_runtime::AddressableBankMemberPlacement>,
@@ -30,6 +32,7 @@ pub struct AddressableParameterBank {
 #[derive(Clone)]
 pub struct SharedAddressableParameterBank {
     pub(super) inner: Arc<Mutex<AddressableParameterBank>>,
+    pub(super) scope: Option<usize>,
 }
 
 pub(super) fn preflight_selected_entry_bindings(
@@ -53,7 +56,26 @@ impl SharedAddressableParameterBank {
     pub fn new(bank: AddressableParameterBank) -> Self {
         Self {
             inner: Arc::new(Mutex::new(bank)),
+            scope: None,
         }
+    }
+
+    /// Restricts a handle to one bank while retaining the shared residency budget.
+    pub fn scoped(&self, bank: usize) -> Result<Self, Error> {
+        let inner = self.inner.lock().map_err(|_| {
+            Error::ArchitectureModel("addressable parameter bank lock was poisoned".into())
+        })?;
+        if self.scope.is_some_and(|scope| scope != bank)
+            || !inner.catalog.keys().any(|key| key.bank() == bank)
+        {
+            return Err(Error::ArchitectureModel(
+                "bank scope is absent from the selected pool".into(),
+            ));
+        }
+        Ok(Self {
+            inner: Arc::clone(&self.inner),
+            scope: Some(bank),
+        })
     }
 
     /// Returns current telemetry for the shared native bank.
@@ -63,7 +85,7 @@ impl SharedAddressableParameterBank {
             .map_err(|_| {
                 Error::ArchitectureModel("addressable parameter bank lock was poisoned".into())
             })?
-            .report()
+            .report_scoped(self.scope)
             .map_err(Into::into)
     }
 }
@@ -295,15 +317,15 @@ impl AddressableParameterBank {
             #[cfg(test)]
             {
                 *namespace_entry_counts
-                    .entry(entry.identity.namespace)
+                    .entry(entry.identity.unit())
                     .or_insert(0) += 1;
             }
             #[cfg(test)]
             {
                 namespace_global_spans
-                    .entry(entry.identity.namespace)
-                    .and_modify(|span: &mut usize| *span = (*span).max(entry.identity.index + 1))
-                    .or_insert(entry.identity.index + 1);
+                    .entry(entry.identity.unit())
+                    .and_modify(|span: &mut usize| *span = (*span).max(entry.identity.member() + 1))
+                    .or_insert(entry.identity.member() + 1);
             }
             specs.push(OffloadUnitSpec::new(
                 entry.identity.unit_id(),
@@ -320,8 +342,14 @@ impl AddressableParameterBank {
         let manager =
             ResidencyManager::new_shared(store, plan, definitions, source_stream, device_stream)?;
         manager.initialize()?;
+        static NEXT_POOL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         Ok(Self {
+            pool_id: NEXT_POOL.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             manager,
+            unit_banks: catalog
+                .keys()
+                .map(|key| (key.unit_id(), key.bank()))
+                .collect(),
             catalog,
             #[cfg(test)]
             namespace_entry_counts,
@@ -335,7 +363,7 @@ impl AddressableParameterBank {
             scratch_limit: options.compact_bank_scratch_bytes,
             #[cfg(test)]
             bulk_bank_target: options.bulk_compact_bank_target_bytes,
-            statistics: Mutex::new(ParameterBankStatistics::default()),
+            statistics: Mutex::new(BTreeMap::new()),
             weight_quantizations,
             placements,
             materialization,
@@ -428,7 +456,7 @@ impl AddressableParameterBank {
                     known_owned_entries: namespace_count,
                 }
             })?;
-            let identity = ParameterBankKey::new(namespace, global_entry);
+            let identity = ParameterBankKey::new(0, namespace, global_entry);
             if !self.catalog.contains_key(&identity) {
                 return Err(AddressableParameterBankError::MissingOwnedEntry { identity });
             }
@@ -448,6 +476,10 @@ impl AddressableParameterBank {
         pass: BankAccessClass,
         stream: &Stream,
     ) -> Result<AcquiredParameterGroups, AddressableParameterBankError> {
+        let bank = compact_ids.first().map(|key| key.bank());
+        if compact_ids.iter().any(|key| Some(key.bank()) != bank) {
+            return Err(AddressableParameterBankError::MixedBanks);
+        }
         let scratch_bytes = demand.keys().try_fold(0u64, |total, identity| {
             total
                 .checked_add(self.catalog[identity])
@@ -514,30 +546,44 @@ impl AddressableParameterBank {
             .statistics
             .lock()
             .map_err(|_| AddressableParameterBankError::StatisticsPoisoned)?;
-        let stats = statistics.pass_mut(pass);
-        let distinct = compact_ids.len() as u64;
-        stats.requested_selections = stats.requested_selections.saturating_add(selection_count);
-        stats.distinct_entries = stats.distinct_entries.saturating_add(distinct);
-        stats.coalesced_duplicates = stats
-            .coalesced_duplicates
-            .saturating_add(selection_count.saturating_sub(distinct));
-        stats.materialization_wait = stats.materialization_wait.saturating_add(wait);
-        stats.host.requests = stats.host.requests.saturating_add(distinct);
-        stats.host.hits = stats.host.hits.saturating_add(host_hits);
-        stats.host.misses = stats.host.misses.saturating_add(host_misses);
-        stats.host.evictions = stats.host.evictions.saturating_add(host_evictions);
-        stats.host.eviction_bytes = stats
-            .host
-            .eviction_bytes
-            .saturating_add(host_eviction_bytes);
-        stats.device.requests = stats.device.requests.saturating_add(distinct);
-        stats.device.hits = stats.device.hits.saturating_add(device_hits);
-        stats.device.misses = stats.device.misses.saturating_add(device_misses);
-        stats.device.evictions = stats.device.evictions.saturating_add(device_evictions);
-        stats.device.eviction_bytes = stats
-            .device
-            .eviction_bytes
-            .saturating_add(device_eviction_bytes);
+        if let Some(bank) = bank {
+            let stats = statistics.entry(bank).or_default().pass_mut(pass);
+            let distinct = compact_ids.len() as u64;
+            stats.requested_selections = stats.requested_selections.saturating_add(selection_count);
+            stats.distinct_entries = stats.distinct_entries.saturating_add(distinct);
+            stats.coalesced_duplicates = stats
+                .coalesced_duplicates
+                .saturating_add(selection_count.saturating_sub(distinct));
+            stats.materialization_wait = stats.materialization_wait.saturating_add(wait);
+            stats.host.requests = stats.host.requests.saturating_add(distinct);
+            stats.host.hits = stats.host.hits.saturating_add(host_hits);
+            stats.host.misses = stats.host.misses.saturating_add(host_misses);
+            stats.host.evictions = stats.host.evictions.saturating_add(host_evictions);
+            stats.host.eviction_bytes = stats
+                .host
+                .eviction_bytes
+                .saturating_add(host_eviction_bytes);
+            stats.device.requests = stats.device.requests.saturating_add(distinct);
+            stats.device.hits = stats.device.hits.saturating_add(device_hits);
+            stats.device.misses = stats.device.misses.saturating_add(device_misses);
+            stats.device.evictions = stats.device.evictions.saturating_add(device_evictions);
+            stats.device.eviction_bytes = stats
+                .device
+                .eviction_bytes
+                .saturating_add(device_eviction_bytes);
+        }
+        let mut occupancy = BTreeMap::<usize, (u64, u64)>::new();
+        for (id, bytes) in &after.host {
+            occupancy.entry(self.unit_banks[id]).or_default().0 += bytes;
+        }
+        for (id, bytes) in &after.device {
+            occupancy.entry(self.unit_banks[id]).or_default().1 += bytes;
+        }
+        for (bank, (host, device)) in occupancy {
+            let stats = statistics.entry(bank).or_default();
+            stats.peak_host_bytes = stats.peak_host_bytes.max(host);
+            stats.peak_device_bytes = stats.peak_device_bytes.max(device);
+        }
         drop(statistics);
 
         Ok(AcquiredParameterGroups {
@@ -582,6 +628,7 @@ impl AddressableParameterBank {
     /// Records a completed compact-bank construction.
     pub fn record_compact_bank(
         &self,
+        bank: usize,
         pass: BankAccessClass,
         bytes: u64,
         duration: Duration,
@@ -597,7 +644,7 @@ impl AddressableParameterBank {
             .statistics
             .lock()
             .map_err(|_| AddressableParameterBankError::StatisticsPoisoned)?;
-        let stats = statistics.pass_mut(pass);
+        let stats = statistics.entry(bank).or_default().pass_mut(pass);
         stats.compact_banks = stats.compact_banks.saturating_add(1);
         stats.compact_bank_bytes = stats.compact_bank_bytes.saturating_add(bytes);
         stats.peak_compact_bank_bytes = stats.peak_compact_bank_bytes.max(bytes);
@@ -607,12 +654,32 @@ impl AddressableParameterBank {
 
     /// Returns current entry residency, transfer, storage, and pass statistics.
     pub fn report(&self) -> Result<ParameterBankResidencyReport, AddressableParameterBankError> {
+        self.report_scoped(None)
+    }
+
+    fn report_scoped(
+        &self,
+        scope: Option<usize>,
+    ) -> Result<ParameterBankResidencyReport, AddressableParameterBankError> {
         let residency = self.manager.report()?;
+        let catalog = self
+            .catalog
+            .iter()
+            .filter(|(key, _)| scope.is_none_or(|bank| key.bank() == bank))
+            .collect::<BTreeMap<_, _>>();
+        let ids = catalog
+            .keys()
+            .map(|key| key.unit_id())
+            .collect::<std::collections::BTreeSet<_>>();
         let mut host_resident_entries = 0;
         let mut device_resident_entries = 0;
         let mut host_resident_bytes = 0u64;
         let mut device_resident_bytes = 0u64;
-        for unit in residency.units() {
+        for unit in residency
+            .units()
+            .iter()
+            .filter(|unit| ids.contains(unit.id()))
+        {
             if unit.host_resident() {
                 host_resident_entries += 1;
                 host_resident_bytes =
@@ -629,28 +696,56 @@ impl AddressableParameterBank {
             .lock()
             .map_err(|_| AddressableParameterBankError::StatisticsPoisoned)?;
         Ok(ParameterBankResidencyReport {
+            pool_id: self.pool_id,
             weight_quantizations: self.weight_quantizations.clone(),
             placements: self
                 .placements
                 .iter()
+                .filter(|(key, _)| scope.is_none_or(|bank| key.bank() == bank))
                 .map(|(key, placement)| (*key, placement.clone()))
                 .collect(),
-            owned_entries: self.catalog.len(),
-            owned_bytes: self.catalog.values().copied().sum(),
+            owned_entries: catalog.len(),
+            owned_bytes: catalog.values().map(|bytes| **bytes).sum(),
             host_resident_entries,
             device_resident_entries,
             host_resident_bytes,
             device_resident_bytes,
-            peak_host_resident_bytes: residency
-                .offload()
-                .peak_resident_bytes()
-                .get(MemoryTier::Host),
-            peak_device_resident_bytes: residency
-                .offload()
-                .peak_resident_bytes()
-                .get(MemoryTier::Device),
-            bulk: statistics.bulk,
-            incremental: statistics.incremental,
+            peak_host_resident_bytes: scope.map_or_else(
+                || {
+                    residency
+                        .offload()
+                        .peak_resident_bytes()
+                        .get(MemoryTier::Host)
+                },
+                |bank| {
+                    statistics
+                        .get(&bank)
+                        .map_or(0, |stats| stats.peak_host_bytes)
+                },
+            ),
+            peak_device_resident_bytes: scope.map_or_else(
+                || {
+                    residency
+                        .offload()
+                        .peak_resident_bytes()
+                        .get(MemoryTier::Device)
+                },
+                |bank| {
+                    statistics
+                        .get(&bank)
+                        .map_or(0, |stats| stats.peak_device_bytes)
+                },
+            ),
+            bulk: statistics
+                .iter()
+                .filter(|(bank, _)| scope.is_none_or(|scope| scope == **bank))
+                .map(|(_, stats)| stats.bulk)
+                .sum(),
+            incremental: statistics
+                .iter()
+                .filter(|(bank, _)| scope.is_none_or(|scope| scope == **bank))
+                .map(|(_, stats)| stats.incremental)
+                .sum(),
             residency,
             materialization: self.materialization.clone(),
         })

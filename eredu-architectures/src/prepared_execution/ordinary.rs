@@ -200,9 +200,9 @@ where
         + eredu_runtime::RuntimeStateComponents<B>,
     PS: LayerRuntimeState<B>,
     PS::LayerState: eredu_nn::PoolingAttentionCache<B::Tensor>,
-    G: GatedRoutedTextArchitectureVisitor<B, S, Output = E, Error = F>,
+    G: RoutedTextArchitectureVisitor<B, S, Output = E, Error = F>,
     R: Relu2RoutedTextArchitectureVisitor<B, S, Output = E, Error = F>,
-    T: GatedRoutedTextArchitectureVisitor<B, PS, Output = E, Error = F>,
+    T: RoutedTextArchitectureVisitor<B, PS, Output = E, Error = F>,
     P: PredictionConstruction<B, SelectedRoutedTextRealization, C, E, F>,
 {
     fn construct(
@@ -217,7 +217,12 @@ where
                 self.context,
             );
         }
-        if branch.selected.plan().relu2().is_some() {
+        if branch
+            .selected
+            .banks()
+            .values()
+            .all(|bank| bank.plan().relu2().is_some())
+        {
             return visit_relu2_routed_text_architecture::<B, S, _>(
                 &branch.inspection,
                 branch.selected,
@@ -251,7 +256,7 @@ where
             )
             .map_err(routed_error)
         } else {
-            visit_gated_routed_text_architecture::<B, S, _>(
+            visit_routed_text_architecture::<B, S, _>(
                 &branch.inspection,
                 branch.selected,
                 branch.target,

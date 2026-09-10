@@ -1326,6 +1326,12 @@ pub enum DistributedExecutionPhase {
     SessionResetPreparation,
     /// Every stateful rank restored a checkpoint into provisional state.
     SessionRollbackPreparation,
+    /// Every rank completed an independent copy of its installed state.
+    ControlCapturePreparation,
+    /// Every rank completed an independent copy of the same saved branch.
+    ControlCopyPreparation,
+    /// Every rank validated the same branch exchange before any state changes.
+    ControlExchangePreparation,
     /// Source tensor dependencies reached exact bounded completion for one route.
     BoundarySourceCompletion(CommunicationRouteId),
     /// Source execution and both endpoint preparations completed for one route.

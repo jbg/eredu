@@ -37,9 +37,12 @@ where
         mask: Option<&Array>,
         sinks: Option<&Array>,
         softcap: Option<f32>,
+        arithmetic: eredu_nn::AttentionArithmetic,
         stream: &Stream,
     ) -> Result<Option<Array>, Exception> {
-        T::paged_attention(self, queries, scale, mask, sinks, softcap, stream)
+        T::paged_attention(
+            self, queries, scale, mask, sinks, softcap, arithmetic, stream,
+        )
     }
 
     fn update_for_attention(
@@ -277,12 +280,13 @@ impl KeyValueCache for LiveKeyValueCache {
         mask: Option<&Array>,
         sinks: Option<&Array>,
         softcap: Option<f32>,
+        arithmetic: eredu_nn::AttentionArithmetic,
         stream: &Stream,
     ) -> Result<Option<Array>, Exception> {
         match self {
             Self::Resident(_) => Ok(None),
             Self::Paged(cache) => {
-                cache.paged_attention(queries, scale, mask, sinks, softcap, stream)
+                cache.paged_attention(queries, scale, mask, sinks, softcap, arithmetic, stream)
             }
         }
     }
@@ -322,18 +326,20 @@ impl PagedKeyValueCache {
         Self::new_with_layout(manager, global_layer, sliding_window, 0, None)
     }
 
-    /// Forks the mutable tail while sharing immutable sealed blocks.
-    pub fn deep_clone_state(&self) -> Result<Self, Exception> {
-        let clone_array = |array: &Option<Array>| {
+    /// Copies every logical tail element, including strided head/token views.
+    /// Immutable sealed blocks still belong to the existing manager; independent
+    /// branches rebind this layer to their copied manager before advancing.
+    pub fn deep_clone_state(&self, stream: &Stream) -> Result<Self, Exception> {
+        let copy = |array: &Option<Array>| {
             array
                 .as_ref()
-                .map(|array| array.clone().deep_clone())
+                .map(|array| array.contiguous(false, stream)?.deep_clone())
                 .transpose()
         };
-        let mut clone = self.clone();
-        clone.tail_keys = clone_array(&self.tail_keys)?;
-        clone.tail_values = clone_array(&self.tail_values)?;
-        Ok(clone)
+        let mut snapshot = self.clone();
+        snapshot.tail_keys = copy(&self.tail_keys)?;
+        snapshot.tail_values = copy(&self.tail_values)?;
+        Ok(snapshot)
     }
 
     /// Snapshots append-only local state while retaining its exact array views.
@@ -631,8 +637,8 @@ impl PagedKeyValueCache {
                 }
             };
             safemlx::transforms::async_eval_with_event([&keys, &values])?.synchronize()?;
-            let keys = keys.deep_clone()?;
-            let values = values.deep_clone()?;
+            let keys = keys.contiguous(false, stream)?.deep_clone()?;
+            let values = values.contiguous(false, stream)?.deep_clone()?;
             Some((lease, CacheBlockArrays::KeyValue { keys, values }))
         } else {
             None
@@ -677,7 +683,17 @@ impl PagedKeyValueCache {
                 checkpoint.key_only,
             )));
         }
-        self.truncate(checkpoint.offset, stream)?;
+        // A saved mutable tail can have become an immutable block while the
+        // speculative continuation ran. Retain only the saved sealed prefix:
+        // truncating at the token offset would publish a duplicate of that tail.
+        self.truncate(checkpoint.tail_start, stream)?;
+        self.manager
+            .set_tail_state(
+                self.global_layer,
+                checkpoint.tail_bytes(),
+                checkpoint.offset,
+            )
+            .map_err(cache_residency_exception)?;
         self.clone_from(checkpoint);
         Ok(())
     }
@@ -1074,6 +1090,7 @@ impl KeyValueCache for PagedKeyValueCache {
         mask: Option<&Array>,
         sinks: Option<&Array>,
         softcap: Option<f32>,
+        arithmetic: eredu_nn::AttentionArithmetic,
         stream: &Stream,
     ) -> Result<Option<Array>, Exception> {
         if self.key_only {
@@ -1108,54 +1125,64 @@ impl KeyValueCache for PagedKeyValueCache {
             stream,
         )?;
         accumulator.set_softcap(softcap)?;
+        accumulator.set_arithmetic(arithmetic)?;
         let mut scanned_blocks = 0u64;
         let mut scanned_bytes = 0u64;
         let mut scratch = 0u64;
-        let mut blocks = self
-            .manager
-            .prefetch_blocks(ids, stream)
-            .map_err(cache_residency_exception)?;
-        while let Some(lease) = blocks.next_block().map_err(cache_residency_exception)? {
-            let id = lease.id();
-            let (keys, values) = match lease.arrays() {
-                CacheBlockArrays::KeyValue { keys, values } => (keys.clone(), values.clone()),
-                _ => {
-                    return Err(Exception::custom(
-                        "paged key/value cache found an incompatible block representation",
-                    ));
-                }
-            };
-            let block = KeyValueAttentionBlock::unleased(id.start, id.end, keys, values);
-            scratch = scratch.max(
-                queries.dim(0) as u64
-                    * queries.dim(1) as u64
-                    * query_len as u64
-                    * (id.end - id.start) as u64
-                    * 4,
-            );
-            scanned_blocks += 1;
-            scanned_bytes += lease.bytes();
-            accumulator.accumulate(&block, stream)?;
-            accumulator.submit()?;
-            drop(lease);
-        }
-        if let (Some(keys), Some(values)) = (&self.tail_keys, &self.tail_values) {
-            let block = KeyValueAttentionBlock::unleased(
-                self.tail_start,
-                self.offset,
-                keys.clone(),
-                values.clone(),
-            );
-            scratch = scratch.max(
-                queries.dim(0) as u64
-                    * queries.dim(1) as u64
-                    * query_len as u64
-                    * (self.offset - self.tail_start) as u64
-                    * 4,
-            );
-            scanned_blocks += 1;
-            scanned_bytes += block.bytes;
-            accumulator.accumulate(&block, stream)?;
+        for pass in 0..if arithmetic == eredu_nn::AttentionArithmetic::InputScores {
+            2
+        } else {
+            1
+        } {
+            if pass == 1 {
+                accumulator.begin_value_pass()?;
+            }
+            let mut blocks = self
+                .manager
+                .prefetch_blocks(ids.clone(), stream)
+                .map_err(cache_residency_exception)?;
+            while let Some(lease) = blocks.next_block().map_err(cache_residency_exception)? {
+                let id = lease.id();
+                let (keys, values) = match lease.arrays() {
+                    CacheBlockArrays::KeyValue { keys, values } => (keys.clone(), values.clone()),
+                    _ => {
+                        return Err(Exception::custom(
+                            "paged key/value cache found an incompatible block representation",
+                        ));
+                    }
+                };
+                let block = KeyValueAttentionBlock::unleased(id.start, id.end, keys, values);
+                scratch = scratch.max(
+                    queries.dim(0) as u64
+                        * queries.dim(1) as u64
+                        * query_len as u64
+                        * (id.end - id.start) as u64
+                        * 4,
+                );
+                scanned_blocks += 1;
+                scanned_bytes += lease.bytes();
+                accumulator.accumulate(&block, stream)?;
+                accumulator.submit()?;
+                drop(lease);
+            }
+            if let (Some(keys), Some(values)) = (&self.tail_keys, &self.tail_values) {
+                let block = KeyValueAttentionBlock::unleased(
+                    self.tail_start,
+                    self.offset,
+                    keys.clone(),
+                    values.clone(),
+                );
+                scratch = scratch.max(
+                    queries.dim(0) as u64
+                        * queries.dim(1) as u64
+                        * query_len as u64
+                        * (self.offset - self.tail_start) as u64
+                        * 4,
+                );
+                scanned_blocks += 1;
+                scanned_bytes += block.bytes;
+                accumulator.accumulate(&block, stream)?;
+            }
         }
         let output = accumulator.finish(stream)?;
         safemlx::transforms::eval([&output])?;

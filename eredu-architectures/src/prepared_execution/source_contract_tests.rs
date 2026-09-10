@@ -517,10 +517,15 @@ where
     construct_prepared_execution(
         sources,
         Some(communication),
-        PreparedExecutionRoutes::new().with_partitioned_routed(
-            PartitionedRoutedRoute::<B, S, PS, _, _>::new(context, context, gated, pooling)
-                .without_relu2(),
-        ),
+        PreparedExecutionRoutes::new().with_partitioned_routed(PartitionedRoutedRoute::<
+            B,
+            S,
+            PS,
+            _,
+            _,
+        >::new(
+            context, context, gated, pooling
+        )),
         assembler,
     )
 }

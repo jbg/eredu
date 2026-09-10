@@ -43,6 +43,9 @@ fn canonical_tensor_mapping(
         GgufModelConfig::Inkling(args) => checkpoint.translated_outputs(|name| {
             crate::inkling::translate_gguf_weight_name_for_model(name, args)
         }),
+        GgufModelConfig::K2Horizon(_) => {
+            checkpoint.translated_outputs(crate::k2_horizon::translate_gguf_weight_name)
+        }
         GgufModelConfig::KimiLinear(_) => {
             checkpoint.translated_outputs(crate::kimi_linear::translate_gguf_weight_name)
         }
@@ -183,6 +186,13 @@ fn resolve_family(
                 .map_err(|error| error.to_string())?;
             let plan = crate::nemotron_h::gguf_plan(&args)?;
             Ok((GgufModelConfig::NemotronH(args), plan, None))
+        }
+        GgufArchitecture::K2Horizon => {
+            let mut args = crate::k2_horizon::model_args_from_gguf_catalog(checkpoint, &metadata)
+                .map_err(|e| e.to_string())?;
+            crate::k2_horizon::normalize_gguf_formats(&mut args, checkpoint)?;
+            let plan = crate::k2_horizon::gguf_plan(&args)?;
+            Ok((GgufModelConfig::K2Horizon(args), plan, None))
         }
         GgufArchitecture::Qwen2 | GgufArchitecture::Qwen3 | GgufArchitecture::Qwen3Moe => {
             let args = crate::qwen::model_args_from_gguf_catalog(checkpoint, &metadata)

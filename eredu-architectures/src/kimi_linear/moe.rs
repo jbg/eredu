@@ -11,7 +11,7 @@ use eredu_runtime::{
 };
 
 use crate::{
-    decoder::{FeedForwardOperator, TensorParallelFeedForwardOperator},
+    decoder::{DecoderProjectionOperator, TensorParallelProjectionOperator},
     linear_format::standard_expert_projection,
 };
 
@@ -372,6 +372,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> FeedForward<B
                     .forward_grouped(
                         &mut sparse.experts,
                         RoutedExpertRequest {
+                            bank: eredu_runtime::RoutedBankId::new(0),
                             layer: sparse.layer,
                             input,
                             routes: &routes,
@@ -388,7 +389,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> FeedForward<B
     /// Executes sparse routed/shared work with one complete semantic observation.
     pub fn forward_observed_with_provider<P, O>(
         &mut self,
-        point: eredu_runtime::RoutedObservationPoint,
+        point: eredu_runtime::RoutedObservationPoints,
         input: &B::Tensor,
         pass: eredu_runtime::ExpertPass,
         context: &<B::Tensor as Tensor>::Context,
@@ -400,6 +401,9 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> FeedForward<B
         P::Error: std::fmt::Display,
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {
+        let point = point
+            .bank(eredu_runtime::RoutedBankId::new(0))
+            .ok_or_else(|| Error::backend("missing feed-forward routing observation"))?;
         match self {
             Self::Dense(dense) => dense.forward(input, context),
             Self::Sparse(sparse) => {
@@ -414,6 +418,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> FeedForward<B
                     .forward_grouped(
                         &mut sparse.experts,
                         RoutedExpertRequest {
+                            bank: eredu_runtime::RoutedBankId::new(0),
                             layer: sparse.layer,
                             input,
                             routes: &routes,
@@ -469,6 +474,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> FeedForward<B
                     .forward_grouped_tensor_parallel(
                         &mut sparse.experts,
                         RoutedExpertRequest {
+                            bank: eredu_runtime::RoutedBankId::new(0),
                             layer: sparse.layer,
                             input,
                             routes: &routes,
@@ -494,7 +500,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> FeedForward<B
     }
 }
 
-impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> FeedForwardOperator<B>
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> DecoderProjectionOperator<B>
     for FeedForward<B>
 {
     fn forward_feed_forward(
@@ -517,7 +523,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> FeedForwardOp
 }
 
 impl<B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
-    TensorParallelFeedForwardOperator<B> for FeedForward<B>
+    TensorParallelProjectionOperator<B> for FeedForward<B>
 {
     fn forward_feed_forward_parallel(
         &mut self,

@@ -1,0 +1,102 @@
+--- a/mlx/backend/cpu/matmul.cpp
++++ b/mlx/backend/cpu/matmul.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include <cstring>
+ #include "mlx/array.h"
++#include "mlx/backend/common/utils.h"
+ #include "mlx/backend/cpu/binary.h"
+ #include "mlx/backend/cpu/binary_ops.h"
+ #include "mlx/backend/cpu/copy.h"
+@@ -10,6 +11,70 @@
+ #include "mlx/primitives.h"
+ 
+ namespace mlx::core {
++
++// Complete FP32 reductions for reduced-precision matrix products.
++// Keep reduction trees independent of GEMM tiles and prompt length. Products
++// of BF16 inputs are exactly representable in FP32; only accumulation rounds.
++// No expanded or widened copy of the weight matrix is required.
++static void bf16_row_matmul(
++    const bfloat16_t* a, const bfloat16_t* b, bfloat16_t* out,
++    size_t m, size_t n, size_t k, size_t ar, size_t ak, size_t bc, size_t bk) {
++  for (size_t row = 0; row < m; ++row) {
++    for (size_t col = 0; col < n; ++col) {
++      // Strided right-hand columns use four independent FP32 accumulators.
++      // Contiguous row dots below use the wider vector reduction tree.
++      if (bk != 1) {
++        float partial[4] = {};
++        size_t index = 0;
++        for (; index + 4 <= k; index += 4) {
++          for (size_t lane = 0; lane < 4; ++lane) {
++            partial[lane] += static_cast<float>(a[row * ar + (index + lane) * ak]) *
++                static_cast<float>(b[col * bc + (index + lane) * bk]);
++          }
++        }
++        for (; index < k; ++index) {
++          partial[0] += static_cast<float>(a[row * ar + index * ak]) *
++              static_cast<float>(b[col * bc + index * bk]);
++        }
++        for (size_t lane = 1; lane < 4; ++lane) {
++          partial[0] += partial[lane];
++        }
++        out[row * n + col] = partial[0];
++        continue;
++      }
++      float lanes[32] = {};
++      size_t index = 0;
++      for (; index + 32 <= k; index += 32) {
++        for (size_t lane = 0; lane < 32; ++lane) {
++          lanes[lane] += static_cast<float>(a[row * ar + (index + lane) * ak]) *
++              static_cast<float>(b[col * bc + (index + lane) * bk]);
++        }
++      }
++      for (size_t width = 16; width >= 4; width /= 2) {
++        for (size_t lane = 0; lane < width; ++lane) {
++          lanes[lane] += lanes[lane + width];
++        }
++      }
++      float sum = (lanes[0] + lanes[1]) + (lanes[2] + lanes[3]);
++      // The same four-lane tree handles complete tail vectors.
++      float tail[4] = {};
++      for (; index + 8 <= k; index += 8) {
++        for (size_t lane = 0; lane < 4; ++lane) {
++          tail[lane] += static_cast<float>(a[row * ar + (index + lane) * ak]) *
++              static_cast<float>(b[col * bc + (index + lane) * bk]);
++          tail[lane] += static_cast<float>(a[row * ar + (index + lane + 4) * ak]) *
++              static_cast<float>(b[col * bc + (index + lane + 4) * bk]);
++        }
++      }
++      sum += (tail[0] + tail[1]) + (tail[2] + tail[3]);
++      for (; index < k; ++index) {
++        sum += static_cast<float>(a[row * ar + index * ak]) *
++            static_cast<float>(b[col * bc + index * bk]);
++      }
++      out[row * n + col] = sum;
++    }
++  }
++}
+ 
+ template <typename T>
+ void matmul_dispatch(
+@@ -47,6 +112,20 @@
+                     a_strides = a.strides(),
+                     b_shape = b.shape(),
+                     b_strides = b.strides()]() {
++    if constexpr (std::is_same_v<T, bfloat16_t>) {
++      if (alpha == 1.0f && beta == 0.0f) {
++        size_t m = a_shape[a_shape.size() - 2];
++        size_t k = a_shape.back();
++        size_t n = b_shape.back();
++        for (size_t batch = 0; batch < batch_size; ++batch) {
++          bf16_row_matmul(
++              a_ptr + elem_to_loc(m * k * batch, a_shape, a_strides),
++              b_ptr + elem_to_loc(k * n * batch, b_shape, b_strides),
++              out_ptr + m * n * batch, m, n, k, a_transposed ? 1 : lda, a_transposed ? lda : 1, b_transposed ? ldb : 1, b_transposed ? 1 : ldb);
++        }
++        return;
++      }
++    }
+     matmul<T>(
+         a_ptr,
+         b_ptr,

@@ -78,14 +78,15 @@ impl KeyValueCache for MlxKeyValueLayerState {
         mask: Option<&Array>,
         sinks: Option<&Array>,
         softcap: Option<f32>,
+        arithmetic: eredu_nn::AttentionArithmetic,
         stream: &Stream,
     ) -> Result<Option<Array>, Exception> {
         match self {
             Self::Device(cache) => {
-                cache.paged_attention(queries, scale, mask, sinks, softcap, stream)
+                cache.paged_attention(queries, scale, mask, sinks, softcap, arithmetic, stream)
             }
             Self::Paged(cache) => {
-                cache.paged_attention(queries, scale, mask, sinks, softcap, stream)
+                cache.paged_attention(queries, scale, mask, sinks, softcap, arithmetic, stream)
             }
         }
     }
@@ -232,7 +233,13 @@ impl MlxKeyValueState {
             MlxKeyValueLayerState::Device(cache) => {
                 Some(bound.max(cache.continuation_capacity_bound(additional)?))
             }
-            MlxKeyValueLayerState::Paged(_) => None,
+            MlxKeyValueLayerState::Paged(cache) => Some(
+                bound.max(
+                    u64::try_from(KeyValueCache::offset(cache))
+                        .ok()?
+                        .checked_add(additional)?,
+                ),
+            ),
         })
     }
 
@@ -412,33 +419,87 @@ impl MlxKeyValueState {
     }
 
     pub(crate) fn supports_isolated_snapshot(&self) -> bool {
-        self.layers
-            .iter()
-            .all(|layer| matches!(layer, MlxKeyValueLayerState::Device(_)))
+        let mut manager = None;
+        self.layers.iter().all(|layer| match layer {
+            MlxKeyValueLayerState::Device(_) => true,
+            MlxKeyValueLayerState::Paged(cache) => {
+                let id = cache.manager().session_id();
+                *manager.get_or_insert(id) == id
+            }
+        })
     }
 
-    /// Copies every device array even when an ordinary transaction would rely on
-    /// append-only sharing. Paged catalogs need independent admission separately.
+    pub(crate) fn isolated_snapshot_auxiliary_bytes(&self) -> Option<u64> {
+        self.layers
+            .iter()
+            .find_map(|layer| match layer {
+                MlxKeyValueLayerState::Paged(cache) => {
+                    Some(cache.manager().isolated_snapshot_bytes())
+                }
+                _ => None,
+            })
+            .unwrap_or(Some(0))
+    }
+
+    pub(crate) fn isolated_snapshot_auxiliary_growth(&self, additional: u64) -> Option<u64> {
+        // At most one new block per token per layer. This conservative catalog
+        // bound also covers partial tails becoming sealed during advancement.
+        let paged = self
+            .layers
+            .iter()
+            .filter(|layer| matches!(layer, MlxKeyValueLayerState::Paged(_)))
+            .count() as u64;
+        additional
+            .checked_add(1)?
+            .checked_mul(paged)?
+            .checked_mul(8192)
+    }
+
+    /// Copies device arrays, mutable tails and sealed blocks with independent
+    /// namespace ownership. Every paged copy remains in the same finite pool.
     pub(crate) fn isolated_snapshot(&self, stream: &Stream) -> Result<Self, Exception> {
         if !self.supports_isolated_snapshot() {
             return Err(Exception::custom(
-                "isolated snapshots of paged state are unsupported",
+                "isolated state contains inconsistent paging managers",
             ));
         }
+        let manager = self
+            .layers
+            .iter()
+            .find_map(|layer| match layer {
+                MlxKeyValueLayerState::Paged(cache) => Some(cache.manager()),
+                _ => None,
+            })
+            .map(|manager| {
+                manager
+                    .isolated_snapshot(stream)
+                    .map_err(|e| Exception::custom(e.to_string()))
+            })
+            .transpose()?;
+        let layers = self
+            .layers
+            .iter()
+            .map(|layer| match layer {
+                MlxKeyValueLayerState::Device(cache) => cache
+                    .isolated_snapshot(stream)
+                    .map(MlxKeyValueLayerState::Device),
+                MlxKeyValueLayerState::Paged(cache) => {
+                    let mut copy = cache.deep_clone_state(stream)?;
+                    copy.rebind_paging_manager(
+                        manager
+                            .as_ref()
+                            .expect("paged state has copied manager")
+                            .clone(),
+                    );
+                    Ok(MlxKeyValueLayerState::Paged(copy))
+                }
+            })
+            .collect::<Result<_, _>>()?;
         Ok(Self {
             layout: self.layout.clone(),
             global_layer_start: self.global_layer_start,
             paged_transaction_branch: self.paged_transaction_branch,
-            layers: self
-                .layers
-                .iter()
-                .map(|layer| match layer {
-                    MlxKeyValueLayerState::Device(cache) => cache
-                        .isolated_snapshot(stream)
-                        .map(MlxKeyValueLayerState::Device),
-                    MlxKeyValueLayerState::Paged(_) => unreachable!("validated device state"),
-                })
-                .collect::<Result<_, _>>()?,
+            layers,
         })
     }
 

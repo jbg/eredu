@@ -13,7 +13,6 @@ use crate::{
     backend::nn::grouped::{PackedGatedProductGroups, PackedRelu2Groups},
     backend::runtime::residency::parameter_bank::{
         AddressableParameterBank, BankAccessClass, ParameterBankEntry,
-        ParameterBankKey as BackendParameterBankKey,
     },
     module::PhysicalParam,
     tests::support::expert_dispatch::{
@@ -177,6 +176,7 @@ fn execute_cached_qwen_routes(
             let started = Instant::now();
             let mut bank = PackedGatedProductGroups {
                 policy: eredu_nn::GatedProductPolicy::ordinary_silu(),
+                reduction: eredu_nn::GroupReduction::Sum,
                 group_count: acquired.identities().len() as i32,
                 hidden_dim: 1,
                 intermediate_dim: 1,
@@ -194,7 +194,12 @@ fn execute_cached_qwen_routes(
                 down_proj_scales: PhysicalParam::new(None),
                 down_proj_biases: PhysicalParam::new(None),
             };
-            cache.record_compact_bank(access, acquired.scratch_bytes(), started.elapsed())?;
+            cache.record_compact_bank(
+                acquired.identities()[0].bank(),
+                access,
+                acquired.scratch_bytes(),
+                started.elapsed(),
+            )?;
             let compact_selections = compact_selections.reshape(&[-1, 1], stream)?;
             let unit_weights =
                 safemlx::ops::ones_dtype(&[hidden.dim(0), 1], hidden.dtype(), stream)?;
@@ -349,6 +354,7 @@ fn expert_exchange_ring_worker() {
     let qwen_weights = f32_array(&[0.25, 0.75, 0.4, 0.6], &[2, 2], &stream);
     let mut full_qwen = PackedGatedProductGroups {
         policy: eredu_nn::GatedProductPolicy::ordinary_silu(),
+        reduction: eredu_nn::GroupReduction::Sum,
         group_count: 4,
         hidden_dim: 1,
         intermediate_dim: 1,
@@ -377,7 +383,7 @@ fn expert_exchange_ring_worker() {
         .iter()
         .copied()
         .map(|expert| {
-            let identity = ParameterBankKey::new(0, expert);
+            let identity = ParameterBankKey::new(0, 0, expert);
             let bindings = [
                 WeightBinding::new(
                     "gate_up_proj",
@@ -402,7 +408,7 @@ fn expert_exchange_ring_worker() {
                 )
                 .unwrap(),
             ];
-            let key = BackendParameterBankKey::new(identity.unit(), identity.member());
+            let key = identity;
             let unit = OffloadUnit::new(key.unit_id(), bindings).unwrap();
             ParameterBankEntry::new(key, unit, 12).unwrap()
         })

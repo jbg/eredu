@@ -645,6 +645,7 @@ impl<B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Att
                 };
                 B::attention_with_sinks(
                     AttentionRequest {
+                        arithmetic: eredu_nn::AttentionArithmetic::Fused,
                         softcap: None,
                         queries: query,
                         keys: keys.clone(),
@@ -671,6 +672,7 @@ impl<B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Att
                         let keys = local.expand_dims(1, context)?;
                         B::attention_with_sinks(
                             AttentionRequest {
+                                arithmetic: eredu_nn::AttentionArithmetic::Fused,
                                 softcap: None,
                                 queries: query,
                                 keys: keys.clone(),

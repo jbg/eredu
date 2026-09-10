@@ -211,6 +211,8 @@ fn routed_selection_rejects_top_two_when_scratch_holds_only_one_member() {
     let requirements = eredu_architectures::routed_text_requirements(&inspection).unwrap();
     assert_eq!(requirements.routes_per_token(), 2);
     let one_member = requirements
+        .bank(eredu_runtime::RoutedBankId::new(0))
+        .unwrap()
         .catalog()
         .units()
         .iter()
@@ -241,10 +243,14 @@ fn routed_selection_rejects_top_two_when_scratch_holds_only_one_member() {
         &capabilities(requirements.text(), request.text()),
     )
     .expect_err("top-two route was admitted into one-member scratch");
-    assert!(error
-        .issues()
-        .iter()
-        .any(|issue| issue.contains("one routed token row") && issue.contains("2 routes")));
+    assert!(
+        error.issues().iter().any(|issue| {
+            issue.contains("routed bank")
+                && issue.contains("2 routes")
+                && issue.contains("exceeding limit")
+        }),
+        "{error:?}"
+    );
     assert_eq!(
         crate::tests::support::path_instrumentation::snapshot(),
         crate::tests::support::path_instrumentation::Counts::default()

@@ -342,13 +342,17 @@ impl ModelArgs {
         self.layer_schedule.get(layer)
     }
     /// Returns the canonical routed observation point for one sparse layer.
-    pub fn routed_observation_point(
+    pub fn routed_observation_points(
         &self,
         unit_path: &str,
         layer: usize,
-    ) -> Option<eredu_runtime::RoutedObservationPoint> {
+    ) -> Option<eredu_runtime::RoutedObservationPoints> {
         (self.layer_policy(layer)?.feed_forward == FeedForwardPolicy::SparseMoe).then(|| {
-            eredu_runtime::RoutedObservationPoint::new(format!("{unit_path}.mlp"), self.num_experts)
+            eredu_runtime::RoutedObservationPoints::new(
+                eredu_runtime::RoutedBankId::new(0),
+                format!("{unit_path}.mlp"),
+                self.num_experts,
+            )
         })
     }
     /// Returns whether any layer uses routed experts.
@@ -816,10 +820,24 @@ mod tests {
             layout.layers().get(1).unwrap(),
             LayerCachePolicy::CompressedLatentRotary { .. }
         ));
-        assert!(args.routed_observation_point("model.layers.0", 0).is_none());
-        let point = args.routed_observation_point("model.layers.1", 1).unwrap();
-        assert_eq!(point.path(), "model.layers.1.mlp");
-        assert_eq!(point.expert_count(), 2);
+        assert!(args
+            .routed_observation_points("model.layers.0", 0)
+            .is_none());
+        let point = args.routed_observation_points("model.layers.1", 1).unwrap();
+        assert_eq!(
+            point
+                .bank(eredu_runtime::RoutedBankId::new(0))
+                .unwrap()
+                .path(),
+            "model.layers.1.mlp"
+        );
+        assert_eq!(
+            point
+                .bank(eredu_runtime::RoutedBankId::new(0))
+                .unwrap()
+                .expert_count(),
+            2
+        );
     }
 
     #[test]

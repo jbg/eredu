@@ -57,6 +57,51 @@ pub(super) fn selected_addressable_bank(
     .map_err(Into::into)
 }
 
+/// Binds all selected banks to one cache and its single residency budget.
+pub(super) fn selected_addressable_banks(
+    banks: &std::collections::BTreeMap<
+        eredu_runtime::RoutedBankId,
+        eredu_architectures::routed_text::SelectedRoutedBank,
+    >,
+    store: Arc<dyn CheckpointSource>,
+    options: eredu_runtime::ParameterBankLoadOptions,
+    weights_stream: &Stream,
+    stream: &Stream,
+) -> Result<
+    std::collections::BTreeMap<
+        eredu_runtime::RoutedBankId,
+        (
+            MlxSharedAddressableBank,
+            crate::backend::runtime::residency::parameter_bank::MlxIndexedMovement,
+        ),
+    >,
+    Error,
+> {
+    let members = banks
+        .iter()
+        .flat_map(|(_, bank)| bank.addressable_members().iter().cloned())
+        .collect::<Vec<_>>();
+    let pool = MlxSharedAddressableBank::new(selected_addressable_bank(
+        &members,
+        store,
+        options,
+        weights_stream,
+        stream,
+    )?);
+    banks
+        .keys()
+        .map(|id| {
+            Ok((
+                *id,
+                (
+                    pool.scoped(id.value() as usize)?,
+                    crate::backend::runtime::residency::parameter_bank::MlxIndexedMovement,
+                ),
+            ))
+        })
+        .collect()
+}
+
 pub(super) fn shard_addressable_members(
     members: &[eredu_runtime::AddressableBankMember],
     store: &dyn CheckpointSource,
@@ -163,7 +208,7 @@ impl eredu_architectures::Relu2RoutedTextArchitectureVisitor<MlxNeuralBackend, M
 
     fn visit<A>(
         self,
-        prepared: eredu_architectures::PreparedRelu2RoutedTextArchitecture<A>,
+        prepared: eredu_architectures::PreparedRoutedTextArchitecture<A>,
         store: Arc<dyn CheckpointSource>,
     ) -> Result<Self::Output, Self::Error>
     where
@@ -177,22 +222,18 @@ impl eredu_architectures::Relu2RoutedTextArchitectureVisitor<MlxNeuralBackend, M
             MlxReplicatedTextMechanisms::new(Arc::clone(&store), self.stream, self.weights_stream);
         #[cfg(test)]
         crate::tests::support::path_instrumentation::constructor();
-        eredu_architectures::prepared_execution::construct_selected_relu2_session(
+        eredu_architectures::prepared_execution::construct_selected_routed_session(
             prepared,
             mechanisms,
             self.stream,
-            |prepared, options| {
-                let bank = selected_addressable_bank(
-                    prepared.addressable_members(),
-                    store,
+            |banks, options| {
+                super::routed::selected_addressable_banks(
+                    banks,
+                    Arc::clone(&store),
                     options,
                     self.weights_stream,
                     self.stream,
-                )?;
-                Ok((
-                    bank,
-                    crate::backend::runtime::residency::parameter_bank::MlxIndexedMovement,
-                ))
+                )
             },
             (self.stream, OrdinaryReplicatedFinalizer),
             finish_routed_session,
@@ -232,22 +273,18 @@ where
         MlxReplicatedTextMechanisms::new(Arc::clone(&store), stream, weights_stream);
     #[cfg(test)]
     crate::tests::support::path_instrumentation::constructor();
-    eredu_architectures::prepared_execution::construct_selected_gated_session(
+    eredu_architectures::prepared_execution::construct_selected_routed_session(
         prepared,
         mechanisms,
         stream,
-        |prepared, options| {
-            let bank = selected_addressable_bank(
-                prepared.addressable_members(),
-                store,
+        |banks, options| {
+            super::routed::selected_addressable_banks(
+                banks,
+                Arc::clone(&store),
                 options,
                 weights_stream,
                 stream,
-            )?;
-            Ok((
-                bank,
-                crate::backend::runtime::residency::parameter_bank::MlxIndexedMovement,
-            ))
+            )
         },
         (stream, OrdinaryReplicatedFinalizer),
         finish_routed_session,
@@ -286,22 +323,18 @@ where
     };
     #[cfg(test)]
     crate::tests::support::path_instrumentation::constructor();
-    eredu_architectures::prepared_execution::construct_selected_gated_session(
+    eredu_architectures::prepared_execution::construct_selected_routed_session(
         prepared,
         mechanisms,
         stream,
-        |prepared, options| {
-            let bank = selected_addressable_bank(
-                prepared.addressable_members(),
-                store,
+        |banks, options| {
+            super::routed::selected_addressable_banks(
+                banks,
+                Arc::clone(&store),
                 options,
                 weights_stream,
                 stream,
-            )?;
-            Ok((
-                bank,
-                crate::backend::runtime::residency::parameter_bank::MlxIndexedMovement,
-            ))
+            )
         },
         (
             stream,
@@ -357,11 +390,8 @@ where
     }
 }
 
-impl
-    eredu_architectures::GatedRoutedTextArchitectureVisitor<
-        MlxNeuralBackend,
-        MlxPoolingAttentionState,
-    > for PoolingRoutedBindingVisitor<'_>
+impl eredu_architectures::RoutedTextArchitectureVisitor<MlxNeuralBackend, MlxPoolingAttentionState>
+    for PoolingRoutedBindingVisitor<'_>
 {
     type Output = Box<dyn ErasedReplicatedTextExecutable>;
     type Error = Error;
@@ -390,7 +420,7 @@ impl
     }
 }
 
-impl eredu_architectures::GatedRoutedTextArchitectureVisitor<MlxNeuralBackend, MlxHybridState>
+impl eredu_architectures::RoutedTextArchitectureVisitor<MlxNeuralBackend, MlxHybridState>
     for RoutedBindingVisitor<'_>
 {
     type Output = Box<dyn ErasedReplicatedTextExecutable>;

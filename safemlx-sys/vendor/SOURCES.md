@@ -20,3 +20,14 @@ Common MLX build dependencies are vendored from the upstream release inputs:
 | `metal-cpp-26.zip` | `https://developer.apple.com/metal/cpp/files/metal-cpp_26.zip` | `4df3c078b9aadcb516212e9cb03004cbc5ce9a3e9c068fa3144d021db585a3a4` |
 
 Each archive retains its upstream license and attribution files.
+
+`mlx-cpu-softmax-reduction.patch` adapts the Float32 exponential
+from SLEEF `xexpf` at revision `5a1d179df9cf652951b59010a2d2075372d67f68`.
+The patch retains the upstream copyright and complete Boost Software License.
+Its explicit fused operations make BF16 softmax and sigmoid rounding independent of the
+host's scalar/vector exponential implementations.
+
+The same pinned SLEEF exponential polynomial and Boost license are retained in
+`eredu-backend-mlx/src/backend/nn/exp_f32.metal` for the native FP32 activation
+mechanism. CPU sigmoid uses the same exponential through `exp_f32.h` supplied by
+the softmax/reduction patch.

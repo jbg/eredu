@@ -1,0 +1,6 @@
+{
+  "torch": "2.14.0",
+  "torch_git": "08187d9e0fba026dc8217405802ab5381dc88d90",
+  "sha256": "625d61aa2d3047a79fa0f3f89a23c25278ec433b329401b1c540987038705e2b",
+  "operation": "descending finite top-k with equal cutoff keys"
+}

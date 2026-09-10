@@ -510,3 +510,92 @@ fn ring_four_process_gpt_oss_pipeline_parameter_bank_session() {
         WorkerMode::OpaqueSessionAddressableParameterBank,
     );
 }
+
+#[test]
+#[ignore = "spawns local CPU ranks and opens loopback sockets; run explicitly"]
+fn ring_k2_dense_and_mova_partition_matrix() {
+    for family in [FixtureFamily::K2Dense, FixtureFamily::K2Mova] {
+        for axes in ["tp", "tp-pp"] {
+            run_ring_cartesian_pipeline_mode(false, family, axes, WorkerMode::OpaqueSession);
+        }
+        run_ring_pipeline_mode(false, family, WorkerMode::OpaqueSession);
+        run_ring_layerwise_host_cartesian_pipeline_mode(family, "tp", WorkerMode::OpaqueSession);
+        run_ring_pipeline_mode(true, family, WorkerMode::OpaqueSession);
+    }
+    for axes in ["ep", "tp-ep", "pp-ep", "tp-pp-ep"] {
+        run_ring_cartesian_pipeline_mode(
+            false,
+            FixtureFamily::K2Mova,
+            axes,
+            WorkerMode::OpaqueSession,
+        );
+    }
+}
+
+#[test]
+#[ignore = "spawns local CPU ranks and opens loopback sockets; run explicitly"]
+fn ring_k2_mova_bounded_bank_partition_matrix() {
+    for axes in ["tp", "ep", "tp-pp", "tp-ep", "pp-ep", "tp-pp-ep"] {
+        run_ring_cartesian_pipeline_mode(
+            false,
+            FixtureFamily::K2Mova,
+            axes,
+            WorkerMode::OpaqueSessionAddressableParameterBank,
+        );
+    }
+    run_ring_layerwise_host_cartesian_pipeline_mode(
+        FixtureFamily::K2Mova,
+        "tp-pp-ep",
+        WorkerMode::OpaqueSessionAddressableParameterBank,
+    );
+    run_ring_cartesian_pipeline_mode(
+        true,
+        FixtureFamily::K2Mova,
+        "tp-pp-ep",
+        WorkerMode::OpaqueSessionAddressableParameterBank,
+    );
+}
+
+#[test]
+#[ignore = "spawns local CPU ranks and opens loopback sockets; run explicitly"]
+fn ring_k2_mova_quantized_banks_tensor_pipeline_expert() {
+    for format in [GgmlType::Q4_0, GgmlType::MxFp4, GgmlType::IQ4NL] {
+        for residency in [
+            WorkerResidency::FullyResident,
+            WorkerResidency::LayerwiseHost,
+            WorkerResidency::DenseDiskStream,
+        ] {
+            let checkpoint = crate::tests::support::k2_horizon::gguf(format);
+            let path = checkpoint.path().join("packed.gguf");
+            run_ring_pipeline_processes(
+                residency,
+                FixtureFamily::K2Mova,
+                WorkerMode::OpaqueSessionAddressableParameterBank,
+                checkpoint,
+                path,
+                Some("tp-pp-ep"),
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "spawns local CPU ranks and opens loopback sockets; run explicitly"]
+fn ring_k2_mova_fp8_banks_tensor_pipeline_expert() {
+    for residency in [
+        WorkerResidency::FullyResident,
+        WorkerResidency::LayerwiseHost,
+        WorkerResidency::DenseDiskStream,
+    ] {
+        let (_dense, checkpoint) = crate::tests::support::k2_horizon::fp8();
+        let path = checkpoint.path().to_owned();
+        run_ring_pipeline_processes(
+            residency,
+            FixtureFamily::K2Mova,
+            WorkerMode::OpaqueSessionAddressableParameterBank,
+            checkpoint,
+            path,
+            Some("tp-pp-ep"),
+        );
+    }
+}

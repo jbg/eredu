@@ -498,6 +498,7 @@ fn mlx_general_normalization_matches_scalar_references() {
 
     let mut normalization = <MlxNeuralBackend as NeuralBackend>::normalization(
         NormalizationConstructionSpec {
+            groups: None,
             dimensions: 4,
             epsilon,
             scale: NormalizationScale::Unit,
@@ -603,4 +604,28 @@ fn mlx_segmented_attention_matches_scalar_reference() {
         reference_segmented_attention(4, 1, 2, 2, &queries, &keys, &values, &segments, scale)
             .unwrap();
     close(&actual, &expected, 2e-5);
+}
+
+#[test]
+#[ignore = "explicit native activation precision conformance"]
+fn scaled_softplus_preserves_bfloat16_and_rounds_once() {
+    let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+    let stream = execution.stream();
+    let values = [-20.0_f32, -2.296875, -0.69921875, 0.0, 0.5, 4.0, 25.0];
+    let input = MlxTensor::from_array(
+        Array::from_slice(&values, &[7])
+            .as_dtype(Dtype::Bfloat16, stream)
+            .unwrap(),
+    );
+    let beta = std::f32::consts::LN_2;
+    let actual = MlxNeuralBackend::softplus(input, beta, stream).unwrap();
+    assert_eq!(actual.as_array().dtype(), Dtype::Bfloat16);
+    let expected = values.map(|x| {
+        let wide = f64::from(beta) * f64::from(x);
+        let result = ((wide.max(0.0) + (-wide.abs()).exp().ln_1p()) / f64::from(beta)) as f32;
+        let bits = result.to_bits();
+        f32::from_bits((bits + 0x7fff + ((bits >> 16) & 1)) & 0xffff0000)
+    });
+    let actual = MlxTensor::from_array(actual.as_array().as_dtype(Dtype::Float32, stream).unwrap());
+    close(&actual, &expected, 0.0);
 }

@@ -1,5 +1,44 @@
 # Language-model backend architecture
 
+Attention arithmetic is a neutral request policy. An architecture can require
+rounding QK products, scaled/masked scores and normalized probabilities to the
+query dtype. Native operators implement those boundaries for contiguous,
+sliding and paged storage. The paged implementation retains only global row
+maxima/denominators between two bounded scans and accumulates rounded-probability
+value products in FP32 before the output cast. Cache telemetry counts both
+scans and their transfers; page size does not introduce extra output rounding.
+Resident attention tiles query rows while complete key rows fit its bounded
+score workspace, preserving the ordinary softmax and value-product reductions.
+Larger key rows retain the two-scan bounded mechanism. Explicit rotary input
+products retain inverse frequencies directly so positions multiply the same
+rounded coefficients instead of dividing by reconstructed denominators.
+The CPU realization uses complete FP32 matrix accumulations, cascade row sums
+and a fixed softmax reduction with a pinned exponential polynomial. These are
+generic native numerical operations, independent of checkpoint and family policy.
+Metal realizes complete BF16 row and batched products, cascade normalization
+and FP32 softmax/sigmoid with the same accumulation and rounding boundaries.
+These operators select by device, dtype and geometry. Router cutoff ties use
+value-only CPU partitioning of the small score/index tensors; expert parameters
+remain on their selected device. Independent PyTorch fixtures verify the native
+operations without importing architecture equations.
+Grouped linear and gated-product specifications also declare their reduction
+policy. Sequential group-order reduction sorts each token's selected global
+group IDs and rounds every weighted addition to the output dtype. Compact-bank
+and executable-format transformations retain this equation policy. CPU grouped
+projection selects an expert with a unit slice, retaining its matrix strides and
+avoiding an advanced-indexing copy that changes reduced-precision accumulation.
+Native block-FP8 linear and grouped projections quantize activation blocks on
+both CPU and GPU. The CPU realization independently expands the same E4M3 values
+and scales before multiplication; checkpoint parsing remains portable.
+
+Chat templates use Transformers-compatible Jinja whitespace and dictionary
+construction. Rendered bytes, including leading newlines, remain artifact
+policy. IFM reasoning and JSON/XML/typed-XML tools are facade declarative
+protocols recognized from rendered probes and tokenizer properties. Separate
+argument value tags, compact type annotations and literal value framing are
+shared parser/constraint features. Partial annotation state is included in
+snapshot storage estimates.
+
 Tool-schema admission and completed-argument validation belong to the facade.
 Application JSON Schemas are retained unchanged for rendering and checked with
 the portable `jsonschema` validator without remote or filesystem retrieval.
@@ -3268,3 +3307,140 @@ asserting a particular file layout: those checks couple architecture to
 repository shape instead of semantic ownership.
 Repeated violations should be made unrepresentable with a crate boundary or
 visibility change.
+
+## Independent projection banks
+
+The shared decoder's `DecoderProjectionOperator` supplies both optional values
+before attention and the feed-forward projection after attention. Q/K projection,
+rotary position handling, normalization, masks, ordinary KV storage, output gates,
+output projection and residuals remain in `eredu-architectures::decoder`.
+Architecture block factories select these stages and their parameter topology;
+native backends receive ordinary operator specifications.
+
+`eredu-nn::GroupedLinearSpec` describes independently selected complete input
+projections, a per-expert pointwise activation, and an owned contiguous output
+range. Its output is the weighted sum of activated expert projections. Output
+partitioning retains the entire input axis, so nonlinear activation occurs after
+a complete projection. Unlike a row-parallel feed-forward down projection, this
+owned output does not require a tensor-parallel sum. MLX realizes the contract
+with generic indexed matrix multiplication and pointwise operations. CPU reduced
+precision uses ordinary matmul over contiguous selection runs and views of the
+selected matrices, without expanding weights per token or widening a complete
+expert bank.
+
+Every routed provider request and control callback carries a `RoutedBankId` in
+addition to its logical layer. `RoutedObservationPoints` maps bank identity to
+its canonical observation path and global cardinality. `RoutedBankProviders`
+retains independent providers and observation identities. Their storage handles
+share the selected residency pool, while acquisition and completion leases protect
+individual entries. Heterogeneous prepared providers may be erased behind
+the same neutral provider contract. A missing bank fails before dispatch.
+
+Grouped RMS normalization retains one full-width checkpoint scale while reducing
+independently within each group. The native realization promotes input and scale
+to FP32 for reduction and multiplication before restoring the input dtype.
+Rotary specifications retain an explicit amplitude independently of frequency
+scaling. Architecture normalization resolves family conventions before passing
+that amplitude to a backend. `RotaryArithmetic::InputProducts` additionally
+specifies input-dtype rotary products, while `Native` allows the backend's fused
+rotary arithmetic.
+
+`eredu-checkpoint::fp8` normalizes block-FP8 and compressed-tensors metadata into
+physical block geometry, dequantization-scale names and explicit module
+exclusions. Architecture schemas assign that policy to actual Linear parameters
+and retain canonical companion recipes; embeddings remain a distinct operator.
+Shared decoder construction consumes complete `LinearFormat` values, including
+FP8, rather than treating the absence of integer quantization as dense storage.
+Encoded input-axis alignment participates in the same portable partition rules.
+
+Routed preparation and selection retain a `BTreeMap<RoutedBankId, ...>` of exact
+bank contracts. Each entry owns its grouped equation, expert ownership, catalog,
+route counts and selected materialization tasks. `PreparedRoutedTextArchitecture`
+and the shared routed-session constructor consume the complete collection;
+there is no separate ReLU-squared prepared architecture. Native bank binding is
+called once for the complete selected collection and has no family branch.
+`ParameterBankKey` includes bank, execution unit and global member; the backend
+uses this neutral identity directly. Scoped handles share one residency manager
+and the configured host/device budgets, so switching banks can evict entries
+from either bank. Runtime reports retain per-bank placements and counters, while
+aggregate peak occupancy counts each shared physical pool once.
+
+Routing specifications independently select projection, score and coefficient
+precision. Scaled softplus is a neutral operation with explicit beta and an
+input-dtype output; native implementations may widen intermediates before one
+final cast. These policies belong to portable equations, including cache identity.
+
+Expert-exchange waves carry an architecture-selected `ExpertRouteInvocation`
+with bank identity, logical unit, access class and local output width. The neutral
+transport validates input and result geometry independently; projection banks
+can therefore return fewer columns than they consume. Owner-local execution IDs
+remain distinct from global `(bank, unit, member)` storage keys throughout the
+forward and reverse route permutations.
+
+Partitioned preparation retains the same identified bank collection and builds
+one provider collection for resident or addressable execution. `ExpertOutput`
+parameter groups combine ownership of the expert axis with ownership of output
+rows; their complete input axis is preserved. Collective schedules retain each
+bank's input/output geometry and order within a block, and pipeline cuts occur
+only after a completed block. Ordered expert reduction sorts returned routes by
+global expert identity before scatter, preserving the selected accumulation
+precision across expert exchange.
+
+Ordinary KV and hybrid KV/fixed-state snapshots copy strided tails through
+contiguous views and copy every sealed paging block into an independent session
+namespace. These managers share the source process pool, so branches retain the
+same finite host/device limits. Snapshot admission includes sealed blocks across
+all tiers, catalog metadata, tail arrays and conservative growth through future
+block boundaries. Completion/accounting ledgers remain outside the exchanged
+model state. Native tests compare interleaved branches against an independent
+attention calculation for full and sliding paging.
+
+Selected grouped-linear materialization derives compact field identities and
+storage dtypes from the declared projection format, including byte FP8/native
+GGUF weights and integer MXFP4 scales. Architecture recipes preserve both
+logical projection dimensions and encoded byte shapes. The neutral lowering
+contract validates those distinct geometries before a backend accepts a derived
+native-block source; source catalog ownership remains in `eredu-checkpoint`.
+
+Ordinary distributed snapshot copies complete their native work and pass a
+portable all-rank preparation agreement before publication. Branch exchange
+validates every rank before moving state; the existing native communication
+owner retains completion resources. Live commit epochs, communication/capture
+budgets and copy ledgers are never part of a rewindable branch. Independently
+addressable bank observations are added once to ordinary parameter-memory
+reports; sharing a physical pool does not duplicate its owned entries.
+
+Cold parameter resource totals are derived in `eredu-runtime` from the retained
+executable tasks, including attached physical companions once. Architecture
+selection supplies the independent-bank identities; shared experts remain in
+ordinary block windows. Artifact profiles retain their unsharded scope, while
+native session observations report actual rank-local replicas and bank occupancy.
+
+Automatic schema version 7 also retains a separate selected-rank resource
+profile. K2's tensor-free physical parameter description feeds the same TP/EP
+placement primitive used by construction. Runtime sizing applies each output's
+own physical geometry, including scale companions and replicated global routers;
+PP ownership selects static consumers and repeated units before aggregation.
+KV accounting uses only locally owned layers and complete KV heads. Source-recipe
+workspace uses the existing bounded binding-placement rewrite for both ordinary
+parameters and individual bank members. Compact-bank bounds preserve each bank's
+independent identity and the selected finite assembly budget. Native recipe estimates include source copies, intermediate tensors, indices
+and contiguous outputs. Separate conversion estimates count encoded outputs;
+queue concurrency and per-bank compact bounds are explicit. These are conservative
+tensor-buffer estimates, not bounds on opaque driver/allocator bookkeeping.
+
+The vendored MLX CPU BF16 matrix kernel accumulates complete dot products in FP32
+with explicit row-dot and strided-column reduction trees. It does not widen
+or expand a bank's weights. Batch row count does not change accumulation
+precision, and bank slicing preserves the projection's row-dot layout. This is a native matrix mechanism; it carries
+no family configuration, checkpoint names, routing policy, or layer equations.
+
+
+Independent external drafting uses architecture-owned inspection and preparation
+of a second ordinary model. The source graph, lowering, tokenizer proof and
+selected placement remain paired until native materialization. The shared runtime
+owns private proposal branches, full-sequence target verification, accepted-prefix
+replay and joint rollback. Ordinary sessions expose complete sequence logits
+through their existing publication/completion transaction. Backend adapters bind
+the selected ordinary executables and isolated state copies; the facade retains
+one speculative sampling, termination, observation and controlled-session driver.

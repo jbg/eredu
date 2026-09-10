@@ -64,6 +64,7 @@ pub trait KeyValueCache {
         _mask: Option<&Array>,
         _sinks: Option<&Array>,
         _softcap: Option<f32>,
+        _arithmetic: eredu_nn::AttentionArithmetic,
         _stream: &Stream,
     ) -> Result<Option<Array>, Exception> {
         Ok(None)

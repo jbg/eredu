@@ -1135,6 +1135,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAtt
 
 pub(crate) fn static_spec(args: &V3Args) -> StaticModuleSpec {
     StaticModuleSpec {
+        normalization_groups: None,
         embedding_weight: "model.embed_tokens.weight".into(),
         normalization_weight: "model.norm.weight".into(),
         head_weight: "lm_head.weight".into(),

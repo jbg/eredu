@@ -416,6 +416,43 @@ Active/automatic llguidance state still needs a complete upstream storage estima
 and a conservative continuation-growth bound to broaden snapshot support; those
 configurations fail before copying today.
 
-Partitioned, speculative, media and realtime execution control, persistent snapshot
-files, cross-process/cross-backend restoration and layer-level pausing remain outside
-the initial support target.
+Ordinary partitioned state copies require bounded all-rank preparation agreement.
+Callers must advance the same operation and branch on every participant. Native
+state-copy tests and six public distributed facade cases cover this contract,
+including greedy and seeded sampled restore/fork with resident/host/disk weights. Selected prediction state, media and realtime control, persistent
+snapshot files, cross-process/cross-backend restoration and layer-level pausing
+remain separate capability decisions.
+
+## Multiple routing banks in one layer
+
+Routing control and observation dispatch include the architecture-declared bank
+identity as well as the logical layer. Attention-value and feed-forward routing
+therefore have independent paths, global expert cardinalities and effective
+decisions. The observed provider uses the same bank identity before selection,
+when attributing evidence, and when dispatching acquired expert work. Provider
+boxing and bank lookup retain the original completion and accounting owners;
+they do not create a second generation driver or a rewindable budget ledger.
+
+K2 Horizon's replicated native tests cover both routing banks, device and paged
+KV snapshots, independent interventions, and exact restored continuations.
+Facade tests cover controlled/uninterrupted sampling with resident/host/disk
+weights, partial-text restore/fork, captures and modified branches. Paged snapshot
+copies retain independent namespaces within the same finite pool; estimates
+include sealed blocks and mutable tails. See [K2 validation](k2-horizon-validation.md)
+for commands and speculative validation results. Distributed
+copies complete before preparation agreement, and exchanges leave every installed
+state unchanged on preparation failure. Commit epochs remain monotonic across
+branch exchange, manual rollback and prompt-cache restore. Snapshot copies and
+branches continue to consume the existing nonrefundable copy and observation
+ledgers.
+
+
+K2 can use an independently executable external draft with the same tokenizer.
+The existing external-drafting plan prepares both ordinary decoders before
+execution. Proposal caches are private; snapshots preserve canonical target and
+draft caches plus the immutable proposal seed. Rejected verification replays only
+the accepted target prefix and advances the draft to that same frontier. Both
+uninterrupted and controlled requests use the shared speculative driver, including
+logit capture/intervention, sampling, termination and nonrefundable copy budgets.
+K2 has no published embedded prediction head, so embedded drafting is rejected
+by ordinary architecture admission.

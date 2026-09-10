@@ -15,6 +15,8 @@ pub struct PackedGatedProductGroups {
     pub intermediate_dim: i32,
     /// Exact gate activation, bounds, sigmoid multiplier, and up offset.
     pub policy: GatedProductPolicy,
+    /// Weighted expert accumulation order and rounding.
+    pub reduction: eredu_nn::GroupReduction,
     /// Optional encoding for the concatenated gate/up projection.
     pub gate_up_affine: Option<WeightQuantization>,
     /// Optional encoding for the down projection.
@@ -191,6 +193,7 @@ impl PackedGatedProductGroups {
             hidden_dim,
             intermediate_dim,
             policy: GatedProductPolicy::ordinary_silu(),
+            reduction: eredu_nn::GroupReduction::Sum,
             gate_up_affine,
             down_affine,
             gate_up_iquant,
@@ -416,7 +419,14 @@ impl PackedGatedProductGroups {
             Some(bias) => output.add(bias.take_axis(&plan.sorted_group_ids, 0, stream)?, stream)?,
             None => output,
         };
-        weighted_group_sum(output, top_k_weights, &plan, num_tokens, stream)
+        weighted_group_sum(
+            output,
+            top_k_weights,
+            &plan,
+            num_tokens,
+            self.reduction,
+            stream,
+        )
     }
 
     /// Evaluates selected groups and reduces selection outputs back to source tokens.
@@ -472,6 +482,7 @@ impl PackedGatedProductGroups {
             top_k_weights,
             &plan,
             hidden_states.dim(0),
+            self.reduction,
             stream,
         )?;
         Ok(TensorParallelGroupedOutput::new(

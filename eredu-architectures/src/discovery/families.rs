@@ -80,12 +80,15 @@ pub(super) fn dense<C: Config>(g: &mut Builder, c: &C, moe_policy: Option<MoeAtt
             width,
         );
         if let Some(attributes) = &moe_policy {
-            let point = c.routed_observation_point(&path, i);
+            let point = c.routed_observation_points(&path, i);
             g.moe(
                 &ff,
                 &format!("{path}.{}", fields.feed_forward),
                 attributes.clone(),
-                point.as_ref().map(|p| p.path()),
+                point
+                    .as_ref()
+                    .and_then(|p| p.bank(eredu_runtime::RoutedBankId::new(0)))
+                    .map(|p| p.path()),
                 width,
             );
         }
@@ -138,10 +141,13 @@ pub(super) fn qwen(g: &mut Builder, c: &crate::qwen::ModelArgs) {
     if let Ok(spec) = c.routing_spec() {
         for layer in 0..c.num_hidden_layers as usize {
             let unit = format!("{}.layers.{layer}", c.parameter_root);
-            if let Some(point) = c.routed_observation_point(&unit, layer) {
+            if let Some(point) = c.routed_observation_points(&unit, layer) {
                 g.routing_control(
                     &format!("decoder.layers.{layer}.feed_forward"),
-                    point.path(),
+                    point
+                        .bank(eredu_runtime::RoutedBankId::new(0))
+                        .expect("declared feed-forward observation")
+                        .path(),
                     spec,
                     0,
                     false,
@@ -363,6 +369,7 @@ fn merge_capture(g: &mut Builder, assembly: &str) {
 
 pub(super) fn remaining_safetensors(g: &mut Builder, c: &SafetensorsModelConfig) {
     match c {
+        SafetensorsModelConfig::K2Horizon(c) => k2_horizon(g, c),
         SafetensorsModelConfig::Nanbeige(c) => nanbeige(g, c),
         SafetensorsModelConfig::Lfm2(c) => lfm2(g, c),
         SafetensorsModelConfig::KimiLinear(c) => kimi(g, c),
@@ -407,6 +414,7 @@ fn remove_moe_captures(g: &mut Builder) {
 
 pub(super) fn remaining_gguf(g: &mut Builder, c: &GgufModelConfig) {
     match c {
+        GgufModelConfig::K2Horizon(c) => k2_horizon(g, c),
         GgufModelConfig::Lfm2(c) => lfm2(g, c),
         GgufModelConfig::KimiLinear(c) => kimi(g, c),
         GgufModelConfig::NemotronH(c) => nemotron(g, c),
@@ -472,7 +480,7 @@ fn lfm2(g: &mut Builder, c: &crate::lfm2::ModelArgs) {
             ArchitectureNodeKind::FeedForward,
         );
         if policy.feed_forward == FeedForwardPolicy::SparseMoe {
-            let point = c.routed_observation_point(&path, i).expect("sparse layer");
+            let point = c.routed_observation_points(&path, i).expect("sparse layer");
             g.moe(
                 &ff,
                 &format!("{path}.feed_forward"),
@@ -483,7 +491,12 @@ fn lfm2(g: &mut Builder, c: &crate::lfm2::ModelArgs) {
                     c.norm_topk_prob,
                     RoutingScoreTransform::Sigmoid,
                 ),
-                Some(point.path()),
+                Some(
+                    point
+                        .bank(eredu_runtime::RoutedBankId::new(0))
+                        .expect("declared feed-forward observation")
+                        .path(),
+                ),
                 width,
             );
         }
@@ -567,7 +580,7 @@ fn kimi(g: &mut Builder, c: &crate::kimi_linear::ModelArgs) {
             ArchitectureNodeKind::FeedForward,
         );
         if policy.feed_forward == FeedForwardPolicy::SparseMoe {
-            let point = c.routed_observation_point(&path, i).expect("sparse layer");
+            let point = c.routed_observation_points(&path, i).expect("sparse layer");
             let mut attrs = moe(
                 c.num_experts,
                 c.num_experts_per_token,
@@ -580,7 +593,12 @@ fn kimi(g: &mut Builder, c: &crate::kimi_linear::ModelArgs) {
                 &ff,
                 &format!("{path}.mlp"),
                 attrs,
-                Some(point.path()),
+                Some(
+                    point
+                        .bank(eredu_runtime::RoutedBankId::new(0))
+                        .expect("declared feed-forward observation")
+                        .path(),
+                ),
                 width,
             );
         }
@@ -1135,5 +1153,62 @@ fn post_sublayer_norm(
         });
         g.edge(op, &id, ArchitectureEdgeKind::Data);
         g.edge(&id, join, ArchitectureEdgeKind::Data);
+    }
+}
+
+fn k2_horizon(g: &mut Builder, c: &crate::k2_horizon::ModelArgs) {
+    dense(g, c, None);
+    let score = if c.router_score_func == "sigmoid" {
+        RoutingScoreTransform::Sigmoid
+    } else {
+        RoutingScoreTransform::Softmax
+    };
+    for layer in 0..c.num_hidden_layers as usize {
+        let path = format!("model.layers.{layer}");
+        let Some(points) = c.routed_observation_points(&path, layer) else {
+            continue;
+        };
+        for (bank, node, count, topk, shared, normalized) in [
+            (
+                crate::k2_horizon::ExpertBank::FeedForward,
+                format!("decoder.layers.{layer}.feed_forward"),
+                c.num_experts,
+                c.num_experts_per_tok,
+                c.num_shared_experts,
+                c.norm_topk_prob,
+            ),
+            (
+                crate::k2_horizon::ExpertBank::AttentionValue,
+                format!("decoder.layers.{layer}.attention.values"),
+                c.mova_num_experts,
+                c.mova_num_experts_per_tok,
+                0,
+                c.mova_num_experts_per_tok > 1,
+            ),
+        ] {
+            let Some(point) = points.bank(bank.id()) else {
+                continue;
+            };
+            let width = if bank == crate::k2_horizon::ExpertBank::AttentionValue {
+                let attention = format!("decoder.layers.{layer}.attention");
+                g.node(
+                    &node,
+                    ArchitectureNodeKind::MixtureOfExperts,
+                    Some(&attention),
+                    Some(&format!("{path}.self_attn.v_experts")),
+                    Some((c.num_key_value_heads * c.head_dim) as usize),
+                );
+                (c.num_key_value_heads * c.head_dim) as usize
+            } else {
+                c.hidden_size as usize
+            };
+            let mut attributes = moe(count, topk, shared, normalized, score);
+            attributes.shared_expert_width =
+                (shared > 0).then_some((shared * c.moe_intermediate_size) as usize);
+            g.moe(&node, point.path(), attributes, Some(point.path()), width);
+            if let Ok(spec) = c.routing_spec(bank) {
+                g.routing_control(&node, point.path(), spec, shared as u32, false);
+            }
+        }
     }
 }

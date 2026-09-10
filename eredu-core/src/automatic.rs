@@ -38,7 +38,7 @@ fn next_execution_plan_target_id() -> Result<u64, AutomaticPlanningError> {
 }
 
 /// Schema version shared by automatic-planning and telemetry documents.
-pub const AUTOMATIC_SCHEMA_VERSION: u32 = 6;
+pub const AUTOMATIC_SCHEMA_VERSION: u32 = 7;
 
 /// Confidence attached to an observed or derived value.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
@@ -157,6 +157,53 @@ pub struct ModelResourceProfile {
     pub largest_adjacent_execution_groups_bytes: Observed<u64>,
     /// Total routed-expert bytes, where the architecture exposes an exact plan.
     pub expert_parameter_bytes: Observed<u64>,
+    /// Resources of the retained rank, including replicas and physical companions.
+    pub selected_rank: Observed<SelectedRankResourceProfile>,
+}
+
+/// Cold resources for one selected execution rank, before native allocation.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SelectedRankResourceProfile {
+    /// Distributed coordinates; absent for ordinary single-rank execution.
+    pub topology: Option<crate::ParallelRankTopology>,
+    /// Every local executable parameter, including independently acquired banks.
+    pub materialized_parameter_bytes: u64,
+    /// Local parameters outside repeated execution groups.
+    pub pinned_parameter_bytes: u64,
+    /// Largest local ordinary execution group.
+    pub largest_execution_group_bytes: u64,
+    /// Largest adjacent pair of local ordinary groups.
+    pub largest_adjacent_execution_groups_bytes: u64,
+    /// Local routed banks, excluding always-on shared feed-forward experts.
+    pub expert_parameter_bytes: u64,
+    /// KV bytes per cached position and batch element on this rank.
+    pub cache_bytes_per_position: u64,
+    /// Physical recipe and compact-bank temporary bounds for this rank.
+    pub materialization_workspace: Observed<ParameterMaterializationWorkspace>,
+}
+
+/// Temporary allocations implied by selected source recipes and bank assembly.
+/// Values include recipe outputs, so adding them to resident parameters is a
+/// conservative bound. These are parameter preparation buffers; request-sized
+/// inference activations and opaque native driver allocations are separate.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ParameterMaterializationWorkspace {
+    /// Largest ordinary parameter recipe's simultaneously live values.
+    pub ordinary_recipe_peak_bytes: u64,
+    /// Largest individual expert materialization across all independently acquired banks.
+    pub expert_member_recipe_peak_bytes: u64,
+    /// Sum of the selected banks' bounded compact output buffers.
+    pub compact_bank_bytes: u64,
+    /// Largest ordinary group of native recipe buffers, including retained
+    /// sources, copies and indices. Multiply by `ordinary_materializations`
+    /// when bounding concurrent ordinary materialization.
+    pub ordinary_native_peak_bytes: u64,
+    /// Native buffers retained while preparing one independently acquired expert.
+    pub expert_member_native_peak_bytes: u64,
+    /// Conservative load-time conversion buffers, including encoded outputs.
+    pub conversion_workspace_bytes: u64,
+    /// Maximum queued and foreground ordinary materializations.
+    pub ordinary_materializations: usize,
 }
 
 impl ModelResourceProfile {
@@ -186,6 +233,9 @@ impl ModelResourceProfile {
             largest_execution_group_bytes: unavailable(),
             largest_adjacent_execution_groups_bytes: unavailable(),
             expert_parameter_bytes: unavailable(),
+            selected_rank: Observed::unavailable(
+                "selected rank parameter topology is not available",
+            ),
         }
     }
 }

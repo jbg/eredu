@@ -798,8 +798,8 @@ impl AutomaticPlanningBackend for MockBackend {
 
 impl ExecutionPlanBackendFactory for MockBackend {
     type Backend = Self;
-    type DrafterPreparation = eredu_architectures::ExternalAssistantPreparation;
-    type SelectedDrafterPreparation = eredu_architectures::ExternalAssistantPreparation;
+    type DrafterPreparation = eredu_architectures::ExternalDraftPreparation;
+    type SelectedDrafterPreparation = eredu_architectures::ExternalDraftPreparation;
     type Drafter = MockDrafter;
 
     fn select_target(
@@ -1648,7 +1648,7 @@ fn planned_loading_client_code<F>(
 )
 where
     F: ExecutionPlanBackendFactory<
-            DrafterPreparation = eredu_architectures::ExternalAssistantPreparation,
+            DrafterPreparation = eredu_architectures::ExternalDraftPreparation,
         > + AutomaticPlanningBackend<
             Inspection = eredu_core::ArtifactInspection<
                 eredu_architectures::processor_plan::ArtifactArchitecturePlan,
@@ -1825,7 +1825,7 @@ fn assert_automatic_planning_conformance() {
             &changed_external,
             &selected_target,
             Some(ExternalDraftArtifact {
-                preparation: eredu_architectures::prepare_external_assistant(assistant.path())
+                preparation: eredu_architectures::prepare_external_draft(assistant.path())
                     .unwrap(),
                 tokenizer_compatibility: eredu_core::TokenizerCompatibilityProof::prove(
                     [11; 32], [11; 32],
@@ -1841,7 +1841,7 @@ fn assert_automatic_planning_conformance() {
         &external,
         &selected_target,
         Some(ExternalDraftArtifact {
-            preparation: eredu_architectures::prepare_external_assistant(assistant.path()).unwrap(),
+            preparation: eredu_architectures::prepare_external_draft(assistant.path()).unwrap(),
             tokenizer_compatibility: eredu_core::TokenizerCompatibilityProof::prove(
                 [11; 32], [11; 32],
             )
@@ -1874,7 +1874,7 @@ fn assert_automatic_planning_conformance() {
         &external,
         &first_target,
         Some(ExternalDraftArtifact {
-            preparation: eredu_architectures::prepare_external_assistant(assistant.path()).unwrap(),
+            preparation: eredu_architectures::prepare_external_draft(assistant.path()).unwrap(),
             tokenizer_compatibility: eredu_core::TokenizerCompatibilityProof::prove(
                 [11; 32], [11; 32],
             )
@@ -1916,8 +1916,7 @@ fn assert_automatic_planning_conformance() {
             &external,
             &selected,
             Some(ExternalDraftArtifact {
-                preparation: eredu_architectures::prepare_external_assistant(assistant.path())
-                    .unwrap(),
+                preparation: eredu_architectures::prepare_external_draft(assistant.path()).unwrap(),
                 tokenizer_compatibility: eredu_core::TokenizerCompatibilityProof::prove(
                     [11; 32], [11; 32],
                 )

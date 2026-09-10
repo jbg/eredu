@@ -194,6 +194,7 @@ where
     fn static_spec(args: &ModelArgs) -> StaticModuleSpec {
         let embedding_name = "model.embed_tokens.weight";
         StaticModuleSpec {
+            normalization_groups: None,
             embedding_weight: embedding_name.into(),
             normalization_weight: "model.norm.weight".into(),
             head_weight: "lm_head.weight".into(),
@@ -870,13 +871,13 @@ where
     S: LayerRuntimeState<B>,
     S::LayerState: RuntimeStateComponents<B> + CompressedAttentionCache<B::Tensor>,
 {
-    fn routed_observation_point(
+    fn routed_observation_points(
         &self,
         group: usize,
         index: usize,
-    ) -> Result<Option<eredu_runtime::RoutedObservationPoint>, Self::Error> {
+    ) -> Result<Option<eredu_runtime::RoutedObservationPoints>, Self::Error> {
         let unit_path = self.group.unit_path(group, index)?;
-        Ok(self.args.routed_observation_point(&unit_path, index))
+        Ok(self.args.routed_observation_points(&unit_path, index))
     }
 
     fn forward_unit_with_provider<P>(
@@ -928,7 +929,7 @@ where
         O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
     {
         let unit_path = self.group.unit_path(group, index)?;
-        let point = self.args.routed_observation_point(&unit_path, index);
+        let point = self.args.routed_observation_points(&unit_path, index);
         self.forward_block_with_feed_forward(
             index,
             unit,

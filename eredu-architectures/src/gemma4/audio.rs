@@ -541,7 +541,7 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> AudioAttention<B> {
                 context,
             )?
         };
-        let query_scale = B::softplus(self.per_dimension_scale.as_ref().clone(), context)?
+        let query_scale = B::softplus(self.per_dimension_scale.as_ref().clone(), 1.0, context)?
             .multiply_scalar(
                 (self.head_dim as f32).powf(-0.5) / std::f32::consts::LN_2,
                 context,

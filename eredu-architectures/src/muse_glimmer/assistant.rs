@@ -661,6 +661,7 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> DFlashAttention<B> {
             key_norm: norm("k_norm")?,
             rotary: B::rotary(
                 RotarySpec {
+                    arithmetic: eredu_nn::RotaryArithmetic::Native,
                     dimensions: config.head_dim,
                     base: config.rope_theta,
                     traditional: false,

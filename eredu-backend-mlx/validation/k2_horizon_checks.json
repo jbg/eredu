@@ -1,0 +1,339 @@
+{
+  "schema_version": 2,
+  "date_utc": "2026-09-10",
+  "base_revision": "19069a8cb1ef63088a62747fedf7e1688575c37f",
+  "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)",
+  "cargo": "cargo 1.98.0 (797e8a9bc 2026-08-05)",
+  "hardware": "Apple M3 Ultra, 256 GiB RAM, macOS 26.6.2 arm64",
+  "checks": [
+    {
+      "command": "cargo check -p eredu-gguf --offline",
+      "exit_code": 0,
+      "evidence": {
+        "sha256": "736e2582f563605dd272e5fb977840b0c0767377d27b6940c440caf75eec7157",
+        "test_summaries": []
+      }
+    },
+    {
+      "command": "cargo check -p eredu-checkpoint --offline",
+      "exit_code": 0,
+      "evidence": {
+        "sha256": "02db5a66fa0c60ca8618bd08aac556eac4f3ec863e8630a0d353dba6a0f6e126",
+        "test_summaries": []
+      }
+    },
+    {
+      "command": "cargo check -p eredu-core --offline",
+      "exit_code": 0,
+      "evidence": {
+        "sha256": "aabb39751df1cc8067f020b779f5d5db481361ccd596789c775f520c816ce4ca",
+        "test_summaries": []
+      }
+    },
+    {
+      "command": "cargo check -p eredu-text --no-default-features --offline",
+      "exit_code": 0,
+      "evidence": {
+        "sha256": "8c233a54790c4800d3dd585436af679aa838da259bfdb129412e2d51cdb75cdc",
+        "test_summaries": []
+      }
+    },
+    {
+      "command": "cargo check -p eredu-runtime --offline",
+      "exit_code": 0,
+      "evidence": {
+        "sha256": "42a9eb935d3091ea72dcf1d8b93dfa3516cea4dec6a1b82d9db58c00c52c4ea0",
+        "test_summaries": []
+      }
+    },
+    {
+      "command": "cargo check -p eredu-nn --all-features --offline",
+      "exit_code": 0,
+      "evidence": {
+        "sha256": "736e2582f563605dd272e5fb977840b0c0767377d27b6940c440caf75eec7157",
+        "test_summaries": []
+      }
+    },
+    {
+      "command": "cargo check -p eredu-codec --all-features --offline",
+      "exit_code": 0,
+      "evidence": {
+        "sha256": "ddedbeb3aabbf8ea554d504814b8070c9c942ffd3e76eb4dab76ec3f15de8cb2",
+        "test_summaries": []
+      }
+    },
+    {
+      "command": "cargo check -p eredu-media --no-default-features --offline",
+      "exit_code": 0,
+      "evidence": {
+        "sha256": "30ccee19ede09674b36d90a3256278652bfdb3ec201c3e5224174ecd8e01a2b2",
+        "test_summaries": []
+      }
+    },
+    {
+      "command": "cargo check -p eredu-media --all-features --offline",
+      "exit_code": 0,
+      "evidence": {
+        "sha256": "84406accf09de67d6225c94809abb6b6d9a5540dfffe54539c149636ad605419",
+        "test_summaries": []
+      }
+    },
+    {
+      "command": "cargo check -p eredu-architectures --offline",
+      "exit_code": 0,
+      "evidence": {
+        "sha256": "91e0999713fd13dfada8ed00015f7b0689b771a7ce982a7866a0ba19e2c5ee93",
+        "test_summaries": []
+      }
+    },
+    {
+      "command": "cargo check -p eredu-backend-mlx --no-default-features --offline",
+      "exit_code": 0,
+      "evidence": {
+        "log": "/private/tmp/eredu-k2-horizon/completed-backend-portable.log",
+        "sha256": "9fceff6c263bc00b948632eedd08e8ff63e392e3999fa3068b72b971bd65fad1",
+        "test_summaries": []
+      }
+    },
+    {
+      "command": "cargo test -p eredu --no-default-features --test portable_facade --offline",
+      "exit_code": 0,
+      "evidence": {
+        "sha256": "77ea02df4046b6e8cb306cfdf51d467058644972e054e46b3e198b844959235a",
+        "test_summaries": [
+          "test result: ok. 19 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 6.79s"
+        ]
+      }
+    },
+    {
+      "command": "cargo test -p eredu --no-default-features --test backend_conformance --offline",
+      "exit_code": 0,
+      "evidence": {
+        "log": "/private/tmp/eredu-k2-horizon/final-backend-conformance.log",
+        "sha256": "386741686899bd845f7f7a7ace5de758e9d1e426470fe5fc2e24d589cbb2ca6b",
+        "test_summaries": [
+          "test result: ok. 53 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.75s"
+        ]
+      }
+    },
+    {
+      "command": "cargo test -p eredu-architectures --release --lib --test reference_numeric --test reference_structural --test k2_horizon --offline",
+      "exit_code": 0,
+      "evidence": {
+        "sha256": "455d9197225644ea302a36c74347878c0e69b082c36a4241e350c4a0e8d45822",
+        "test_summaries": [
+          "test result: ok. 533 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.11s",
+          "test result: ok. 10 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.15s",
+          "test result: ok. 154 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 22.49s",
+          "test result: ok. 46 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s"
+        ]
+      }
+    },
+    {
+      "command": "cargo test -p eredu-runtime --release --lib --test backend_independence --offline",
+      "exit_code": 0,
+      "evidence": {
+        "sha256": "9411f951aad56f76b62a43300a9da3366b79e155433cad680a43b58cbf47c901",
+        "test_summaries": [
+          "test result: ok. 312 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.26s",
+          "test result: ok. 64 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s"
+        ]
+      }
+    },
+    {
+      "command": "cargo test -p eredu-core --release --lib --offline",
+      "exit_code": 0,
+      "evidence": {
+        "sha256": "18b569abf1eef0d9ed58410e1c13aa6448c00a5980cef344171072d466d68420",
+        "test_summaries": [
+          "test result: ok. 210 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s"
+        ]
+      }
+    },
+    {
+      "command": "cargo test -p eredu-nn --all-features --offline",
+      "exit_code": 0,
+      "evidence": {
+        "sha256": "b606570ac40708fb22156b92d6f2860615115b7a43893dd4457d38d46e78a9be",
+        "test_summaries": [
+          "test result: ok. 37 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+        ]
+      }
+    },
+    {
+      "command": "cargo test -p eredu-checkpoint --lib --offline",
+      "exit_code": 0,
+      "evidence": {
+        "sha256": "26edcaea5c9d17c60482599715fc8c6b8b2f6683a74c30b7d5a3237efae6965c",
+        "test_summaries": [
+          "test result: ok. 98 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.20s"
+        ]
+      }
+    },
+    {
+      "command": "cargo test -p eredu-text --no-default-features --test k2_horizon --offline",
+      "exit_code": 0,
+      "evidence": {
+        "sha256": "0974ed1be50afcd2c5bd04cd06afdfffb5f41f8cb2f8cdb57779878f05603b1a",
+        "test_summaries": [
+          "test result: ok. 1 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.06s"
+        ]
+      }
+    },
+    {
+      "command": "cargo test -p eredu --no-default-features --lib ifm_ --offline",
+      "exit_code": 0,
+      "evidence": {
+        "sha256": "c4354383c423cd4ce7ddc99918df90e91e92970e70b36e5ad51c407fcec16899",
+        "test_summaries": [
+          "test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 178 filtered out; finished in 7.54s"
+        ]
+      }
+    },
+    {
+      "command": "cargo test --release -p eredu-backend-mlx --features metal --lib --offline -- --test-threads=1",
+      "exit_code": 0,
+      "evidence": {
+        "log": "/private/tmp/eredu-k2-horizon/completed-native-all.log",
+        "sha256": "17903eef45eb279843b7fac972ba2fea879cbe0634e30110edb7f633a9728ced",
+        "test_summaries": [
+          "test result: ok. 623 passed; 0 failed; 357 ignored; 0 measured; 0 filtered out; finished in 8.08s"
+        ]
+      }
+    },
+    {
+      "command": "cargo test --release -p eredu-backend-mlx --features metal --lib backend::nn --offline -- --include-ignored --test-threads=1",
+      "exit_code": 0,
+      "evidence": {
+        "log": "/private/tmp/eredu-k2-horizon/native-attention-operators.log",
+        "sha256": "c587aa1fa01382e95395a8f6ec26b7fa1b698808ebb2a59d2aca56cd4531b414",
+        "test_summaries": [
+          "test result: ok. 86 passed; 0 failed; 0 ignored; 0 measured; 894 filtered out; finished in 1.42s"
+        ]
+      }
+    },
+    {
+      "command": "cargo test --release -p eredu-backend-mlx --no-default-features --test bf16_matmul --offline",
+      "exit_code": 0,
+      "evidence": {
+        "log": "/private/tmp/eredu-k2-horizon/sigmoid-operators.log",
+        "sha256": "b9354853743242a40540a299a9956f8f4c503cdd4b0486eb4276445abd6da3a9",
+        "test_summaries": [
+          "test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s"
+        ]
+      }
+    },
+    {
+      "command": "cargo test --release -p eredu-backend-mlx --features metal --lib ring_k2_ --offline -- --ignored --nocapture --test-threads=1",
+      "exit_code": 0,
+      "distributed_cases": 34,
+      "requires_loopback_sockets": true,
+      "evidence": {
+        "log": "/private/tmp/eredu-k2-horizon/completed-native-ring.log",
+        "sha256": "212c2cc654b616800827968c0638d2478e83e256055b6d2c3079e0d96eaf7423",
+        "test_summaries": [
+          "test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 976 filtered out; finished in 41.83s"
+        ]
+      }
+    },
+    {
+      "command": "cargo test --release -p eredu-backend-mlx --no-default-features --lib cold_workspace_counts_native_copies_without_reading_payloads --offline",
+      "exit_code": 0,
+      "evidence": {
+        "log": "/private/tmp/eredu-k2-horizon/final-native-workspace.log",
+        "sha256": "b0d5f928e304bb2e7282af7c4341c2af396108d04c815aafaf2e5d3c6d6b7a83",
+        "test_summaries": [
+          "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 951 filtered out; finished in 0.01s"
+        ]
+      }
+    },
+    {
+      "command": "cargo test --release -p eredu --no-default-features --features mlx --test native_execution_control --offline -- --test-threads=1",
+      "exit_code": 0,
+      "evidence": {
+        "log": "/private/tmp/eredu-k2-horizon/completed-native-facade.log",
+        "sha256": "909d7a5858c78c1a01b69692af8728c6fe37adc8120b4d61b1b900209a2e578d",
+        "test_summaries": [
+          "test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.35s"
+        ]
+      }
+    },
+    {
+      "command": "cargo fmt --all -- --check",
+      "exit_code": 0,
+      "evidence": {
+        "log": "/private/tmp/eredu-k2-horizon/completed-format.log",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "test_summaries": []
+      }
+    },
+    {
+      "command": "git diff --check",
+      "exit_code": 0,
+      "evidence": {
+        "log": "/private/tmp/eredu-k2-horizon/completed-diff-check.log",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "test_summaries": []
+      }
+    },
+    {
+      "command": "cargo test --release -p eredu-cli --no-default-features --features mlx --test k2_distributed_control --offline -- --exact k2_distributed_facade_control_matrix --ignored --nocapture",
+      "exit_code": 0,
+      "distributed_cases": 6,
+      "requires_loopback_sockets": true,
+      "evidence": {
+        "log": "/private/tmp/eredu-k2-horizon/completed-distributed-facade.log",
+        "sha256": "9480e1e666c60eedd305fcecad3d795eaacb07632b0008b6132741eacc068c8d",
+        "test_summaries": [
+          "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 10.78s"
+        ]
+      }
+    },
+    {
+      "command": "cargo build --release -p eredu-backend-mlx --features metal --example k2_checkpoint_parity --offline",
+      "exit_code": 0,
+      "evidence": {
+        "log": "/private/tmp/eredu-k2-horizon/completed-parity-build.log",
+        "sha256": "e988c5691f4cca28084d2a376965b5bc03867157be1f28d90f5dd0f8475d6073",
+        "test_summaries": []
+      }
+    },
+    {
+      "command": "target/release/examples/k2_checkpoint_parity /private/tmp/eredu-k2-horizon/artifacts/dense /private/tmp/eredu-k2-horizon/dense-reference.safetensors",
+      "exit_code": 0,
+      "evidence": {
+        "log": "/private/tmp/eredu-k2-horizon/completed-clean-example-cpu.log",
+        "sha256": "77ba4bff2509df49609907e664aba2d454ec8982c15a4a71eccf0f7fcd79fa57",
+        "test_summaries": [
+          "step 0: relative L2 0, cosine 1",
+          "step 1: relative L2 0, cosine 1",
+          "step 2: relative L2 0, cosine 1",
+          "step 3: relative L2 0, cosine 1",
+          "step 4: relative L2 0, cosine 1"
+        ],
+        "executable_sha256": "7f214e39772e0c16e070e43a80d64fabb84a9fa3624aa4a5cabe58324629bb8b"
+      }
+    },
+    {
+      "command": "EREDU_VALIDATION_DEVICE=gpu target/release/examples/k2_checkpoint_parity /private/tmp/eredu-k2-horizon/artifacts/dense /private/tmp/eredu-k2-horizon/dense-reference.safetensors",
+      "exit_code": 0,
+      "evidence": {
+        "log": "/private/tmp/eredu-k2-horizon/completed-clean-example-metal.log",
+        "sha256": "77ba4bff2509df49609907e664aba2d454ec8982c15a4a71eccf0f7fcd79fa57",
+        "test_summaries": [
+          "step 0: relative L2 0, cosine 1",
+          "step 1: relative L2 0, cosine 1",
+          "step 2: relative L2 0, cosine 1",
+          "step 3: relative L2 0, cosine 1",
+          "step 4: relative L2 0, cosine 1"
+        ],
+        "executable_sha256": "7f214e39772e0c16e070e43a80d64fabb84a9fa3624aa4a5cabe58324629bb8b"
+      }
+    }
+  ],
+  "released_checkpoint_status": "All 16 BF16 CPU/Metal cases pass unchanged numerical tolerances with bit-exact logits. See k2_horizon_released_results.json.",
+  "hardware_validation_gaps": [
+    "Native multi-GPU, CUDA and NCCL distributed execution unavailable on this single-GPU Apple host; neutral numerical and multi-process CPU Ring coverage passes."
+  ]
+}

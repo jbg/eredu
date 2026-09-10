@@ -9,6 +9,7 @@ pub(crate) mod constraints;
 pub(crate) mod dialect;
 pub(crate) mod gemma;
 pub(crate) mod harmony;
+pub(crate) mod ifm;
 pub(crate) mod inkling;
 pub(crate) mod lfm2;
 mod tokenizer_env;
@@ -678,6 +679,9 @@ const QWEN_TAGGED_PARAMETERS: TaggedParametersEncoding = TaggedParametersEncodin
     function_name_suffix: ">",
     parameter_prefix: "<parameter=",
     parameter_name_suffix: ">",
+    parameter_type: None,
+    parameter_value_prefix: "",
+    strip_value_framing: true,
     parameter_suffix: "</parameter>",
     function_suffix: "</function>",
 };

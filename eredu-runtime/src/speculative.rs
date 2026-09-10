@@ -9,6 +9,7 @@ use eredu_core::{
 
 mod control;
 pub use control::*;
+pub mod autoregressive;
 
 /// Neutral owner of speculative request registration and fair scheduling.
 pub struct SpeculativeScheduler<'a, E, S, C, P>

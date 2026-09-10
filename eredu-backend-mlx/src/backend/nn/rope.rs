@@ -188,7 +188,7 @@ pub struct YarnRope {
     pub freqs: Array,
 }
 
-fn yarn_frequency_values(
+fn yarn_inverse_frequency_values(
     dims: i32,
     base: f32,
     factor: f32,
@@ -198,28 +198,30 @@ fn yarn_frequency_values(
     truncate: bool,
 ) -> Vec<f32> {
     let correction = |rotations: f32| {
-        dims as f32 * (original_context / (rotations * 2.0 * std::f32::consts::PI)).ln()
-            / (2.0 * base.ln())
+        dims as f64
+            * (original_context as f64 / (rotations as f64 * 2.0 * std::f64::consts::PI)).ln()
+            / (2.0 * (base as f64).ln())
     };
     let low = if truncate {
         correction(beta_fast).floor()
     } else {
         correction(beta_fast)
     }
-    .max(0.0);
+    .max(0.0) as f32;
     let high = if truncate {
         correction(beta_slow).ceil()
     } else {
         correction(beta_slow)
     }
-    .min((dims - 1) as f32);
+    .min((dims - 1) as f64) as f32;
     let width = if low == high { 0.001 } else { high - low };
     (0..dims / 2)
         .map(|index| {
             let base_frequency = base.powf(2.0 * index as f32 / dims as f32);
             let ramp = ((index as f32 - low) / width).clamp(0.0, 1.0);
             let extrapolation_mask = 1.0 - ramp;
-            factor * base_frequency / (factor * extrapolation_mask + (1.0 - extrapolation_mask))
+            (1.0 / (factor * base_frequency)) * (1.0 - extrapolation_mask)
+                + (1.0 / base_frequency) * extrapolation_mask
         })
         .collect()
 }
@@ -235,18 +237,10 @@ impl YarnRope {
         original_context: f32,
         beta_fast: f32,
         beta_slow: f32,
-        mscale: f32,
-        mscale_all_dim: f32,
+        amplitude: f32,
         truncate: bool,
     ) -> Self {
-        let scale = |coefficient: f32| {
-            if factor <= 1.0 {
-                1.0
-            } else {
-                0.1 * coefficient * factor.ln() + 1.0
-            }
-        };
-        let values = yarn_frequency_values(
+        let values = yarn_inverse_frequency_values(
             dims,
             base,
             factor,
@@ -258,8 +252,11 @@ impl YarnRope {
         Self {
             dimensions: dims,
             traditional,
-            concentration: scale(mscale) / scale(mscale_all_dim),
-            freqs: Array::from_slice(&values, &[dims / 2]),
+            concentration: amplitude,
+            freqs: Array::from_slice(
+                &values.iter().map(|v| 1.0 / v).collect::<Vec<_>>(),
+                &[dims / 2],
+            ),
         }
     }
 }
@@ -373,6 +370,142 @@ pub enum RopeVariant {
     Yarn(YarnRope),
 }
 
+/// Explicit input-dtype rotary products over precomputed frequency denominators.
+#[derive(Debug, Clone)]
+pub(super) struct ElementwiseRotary {
+    dimensions: i32,
+    traditional: bool,
+    inverse_frequencies: Array,
+    amplitude: f32,
+}
+
+impl ElementwiseRotary {
+    pub(super) fn new(
+        spec: eredu_nn::RotarySpec,
+        native: &RopeVariant,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
+        let (inverse_frequencies, amplitude) = match native {
+            RopeVariant::Yarn(rope) => {
+                let RotaryAlgorithm::Yarn {
+                    factor,
+                    original_max_positions,
+                    beta_fast,
+                    beta_slow,
+                    truncate,
+                    ..
+                } = spec.algorithm
+                else {
+                    return Err(Exception::custom(
+                        "rotary algorithm and materialization disagree",
+                    ));
+                };
+                let values = yarn_inverse_frequency_values(
+                    spec.dimensions,
+                    spec.base,
+                    factor,
+                    original_max_positions as f32,
+                    beta_fast,
+                    beta_slow,
+                    truncate,
+                );
+                (
+                    Array::from_slice(&values, &[spec.dimensions / 2]),
+                    rope.concentration,
+                )
+            }
+            RopeVariant::FrequencyScaled(rope) => (rope.freqs.reciprocal(stream)?, 1.0),
+            RopeVariant::Proportional(rope) => (rope.freqs.reciprocal(stream)?, 1.0),
+            RopeVariant::Default(_) => {
+                let factor = match spec.algorithm {
+                    RotaryAlgorithm::Linear { factor } => factor,
+                    _ => 1.0,
+                };
+                let values = (0..spec.dimensions / 2)
+                    .map(|index| {
+                        (1.0 / spec.base.powf(2.0 * index as f32 / spec.dimensions as f32)) / factor
+                    })
+                    .collect::<Vec<_>>();
+                (Array::from_slice(&values, &[spec.dimensions / 2]), 1.0)
+            }
+        };
+        Ok(Self {
+            dimensions: spec.dimensions,
+            traditional: spec.traditional,
+            inverse_frequencies,
+            amplitude,
+        })
+    }
+
+    pub(super) fn forward(
+        &self,
+        input: &Array,
+        offset: i32,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let shape = input.shape();
+        let length = input.dim(-2);
+        let width = input.dim(-1);
+        let x = input.reshape(&[-1, length, width], stream)?;
+        let positions = Array::arange::<_, f32>(Some(offset), offset + length, None, stream)?
+            .expand_dims(-1, stream)?;
+        let angles = positions.multiply(&self.inverse_frequencies, stream)?;
+        let amplitude = Array::from_f32(self.amplitude);
+        let cos = cos(&angles, stream)?
+            .multiply(&amplitude, stream)?
+            .as_dtype(input.dtype(), stream)?;
+        let sin = sin(&angles, stream)?
+            .multiply(&amplitude, stream)?
+            .as_dtype(input.dtype(), stream)?;
+        let rotary = x.try_index_device((.., .., ..self.dimensions), stream)?;
+        let half = self.dimensions / 2;
+        let (first, second) = if self.traditional {
+            let pairs = rotary.reshape(&[-1, length, half, 2], stream)?;
+            (
+                pairs.try_index_device((.., .., .., 0), stream)?,
+                pairs.try_index_device((.., .., .., 1), stream)?,
+            )
+        } else {
+            (
+                rotary.try_index_device((.., .., ..half), stream)?,
+                rotary.try_index_device((.., .., half..), stream)?,
+            )
+        };
+        let left = first
+            .multiply(&cos, stream)?
+            .subtract(second.multiply(&sin, stream)?, stream)?;
+        let right = second
+            .multiply(&cos, stream)?
+            .add(first.multiply(&sin, stream)?, stream)?;
+        let rotated = if self.traditional {
+            concatenate_axis(
+                &[
+                    left.expand_dims(-1, stream)?,
+                    right.expand_dims(-1, stream)?,
+                ],
+                -1,
+                stream,
+            )?
+            .reshape(&[-1, length, self.dimensions], stream)?
+        } else {
+            concatenate_axis(&[left, right], -1, stream)?
+        };
+        let output = if width == self.dimensions {
+            rotated
+        } else {
+            concatenate_axis(
+                &[
+                    rotated,
+                    x.try_index_device((.., .., self.dimensions..), stream)?,
+                ],
+                -1,
+                stream,
+            )?
+        };
+        output.reshape(shape, stream)
+    }
+}
+
 impl<'a, Input> Module<Input> for RopeVariant
 where
     Input: Into<nn::RopeInput<'a>>,
@@ -445,21 +578,22 @@ pub fn initialize_rope(
             original_max_positions,
             beta_fast,
             beta_slow,
-            concentration,
-            attention_factor,
+            amplitude,
             truncate,
-        } => Ok(RopeVariant::Yarn(YarnRope::new(
-            dims,
-            traditional,
-            base,
-            factor,
-            original_max_positions as f32,
-            beta_fast,
-            beta_slow,
-            concentration,
-            attention_factor,
-            truncate,
-        ))),
+        } => {
+            let rope = YarnRope::new(
+                dims,
+                traditional,
+                base,
+                factor,
+                original_max_positions as f32,
+                beta_fast,
+                beta_slow,
+                amplitude,
+                truncate,
+            );
+            Ok(RopeVariant::Yarn(rope))
+        }
     }
 }
 

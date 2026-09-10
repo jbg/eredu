@@ -490,6 +490,7 @@ impl DecoderConfig for MoshiTransformerConfig {
 
     fn rotary_spec(&self, dimensions: i32) -> RotarySpec {
         RotarySpec {
+            arithmetic: eredu_nn::RotaryArithmetic::Native,
             dimensions,
             base: self.rope_base,
             traditional: true,

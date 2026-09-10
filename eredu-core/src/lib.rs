@@ -81,11 +81,11 @@ pub use automatic::{
     ExecutionPlanTargetLoadError, ExecutionPlanTargetSelection, ExecutionTelemetry,
     ExpertCacheTelemetry, ExternalDraftArtifact, HardwareBackendProfile, HardwareDeviceProfile,
     HardwareMemorySemantics, HardwareProfile, ModelResourceProfile, ObservationKind, Observed,
-    PlanExplanation, PlanExplanationEntry, PlanExplanationLevel, PreparedExecutionPlanTarget,
-    RealizedDrafting, ResidencyTelemetry, RetainedAutomaticPlan, SelectedExecutionPlanDrafting,
-    SelectedExecutionPlanTarget, SpeculativeDecodingTelemetry, TimingTelemetry,
-    TokenizerCompatibilityError, TokenizerCompatibilityProof, TransferTelemetry,
-    AUTOMATIC_SCHEMA_VERSION,
+    ParameterMaterializationWorkspace, PlanExplanation, PlanExplanationEntry, PlanExplanationLevel,
+    PreparedExecutionPlanTarget, RealizedDrafting, ResidencyTelemetry, RetainedAutomaticPlan,
+    SelectedExecutionPlanDrafting, SelectedExecutionPlanTarget, SelectedRankResourceProfile,
+    SpeculativeDecodingTelemetry, TimingTelemetry, TokenizerCompatibilityError,
+    TokenizerCompatibilityProof, TransferTelemetry, AUTOMATIC_SCHEMA_VERSION,
 };
 pub use backend::{
     load_model, prepare_inspected_model, BackendDescriptor, BackendError, BackendFailure,

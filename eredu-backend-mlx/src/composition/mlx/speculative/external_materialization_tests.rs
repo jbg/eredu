@@ -223,7 +223,7 @@ fn incompatible_target_assistant_pair_fails_before_native_target_resources() {
         .expect("tiny target inspection");
     let selected_target = eredu_core::select_execution_plan_target(&factory, &plan, inspection)
         .expect("ordinary target selection");
-    let preparation = eredu_architectures::prepare_external_assistant(assistant.path())
+    let preparation = eredu_architectures::prepare_external_draft(assistant.path())
         .expect("assistant inspection");
     crate::tests::support::path_instrumentation::reset();
 

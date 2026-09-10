@@ -3194,6 +3194,38 @@ struct ReferenceTextMechanisms {
     prompt_cache: Option<ReferencePromptCache>,
 }
 
+impl<A> eredu_runtime::replicated_session::ReplicatedTextSnapshotMechanisms<A, FakeBackend>
+    for ReferenceTextMechanisms
+where
+    A: LayeredArchitecture<
+        FakeBackend,
+        DeviceState<FakeBackend, FakeLayerState>,
+        StaticModules = FakeOperator,
+        Unit = FakeUnit,
+        Error = Error,
+    >,
+{
+    fn estimate_snapshot_state(
+        &self,
+        _: &Self::State,
+    ) -> Option<eredu_core::execution_control::SnapshotEstimate> {
+        Some(eredu_core::execution_control::SnapshotEstimate {
+            retained_bytes: 64,
+            copy_bytes: 64,
+        })
+    }
+    fn copy_snapshot_state(
+        &mut self,
+        state: &Self::State,
+        _: &(),
+    ) -> Result<Self::State, Self::Error> {
+        if self.fail_checkpoint {
+            return Err("injected independent copy failure");
+        }
+        Ok(state.clone())
+    }
+}
+
 impl<A> ReplicatedTextSessionMechanisms<A, FakeBackend> for ReferenceTextMechanisms
 where
     A: LayeredArchitecture<
@@ -8488,5 +8520,164 @@ fn independent_prompt_cache_uses_the_canonical_rank_path() {
     assert_eq!(
         eredu_runtime::prompt_cache_rank_path(root, &distributed),
         root.join("rank-p2-tx-e5")
+    );
+}
+
+#[test]
+fn distributed_independent_branches_preserve_transaction_epochs() {
+    let (mut session, _, _, calls, _) = partitioned_cache_control_session(
+        0,
+        DistributedExecutionPhase::PromptCacheLoadPreflight,
+        None,
+        true,
+    );
+    session.decode(&FakeTensor(vec![3]), &()).unwrap();
+    let saved = session.capture_control_state(&()).unwrap();
+    let mut branch = session.copy_control_state(&saved, &()).unwrap();
+    for expected in 2..=5 {
+        session.decode(&FakeTensor(vec![4]), &()).unwrap();
+        assert_eq!(
+            session
+                .report()
+                .unwrap()
+                .distributed_commit()
+                .unwrap()
+                .epoch()
+                .value(),
+            expected
+        );
+    }
+    session.exchange_control_state(&mut branch, &()).unwrap();
+    assert_eq!(session.report().unwrap().state_report(), &[1]);
+    assert_eq!(
+        session
+            .report()
+            .unwrap()
+            .distributed_commit()
+            .unwrap()
+            .epoch()
+            .value(),
+        5
+    );
+    session.decode(&FakeTensor(vec![4]), &()).unwrap();
+    assert_eq!(
+        session
+            .report()
+            .unwrap()
+            .distributed_commit()
+            .unwrap()
+            .epoch()
+            .value(),
+        6
+    );
+    assert_eq!(session.report().unwrap().state_report(), &[2]);
+    let mut restored = session.copy_control_state(&saved, &()).unwrap();
+    session.exchange_control_state(&mut restored, &()).unwrap();
+    assert_eq!(session.report().unwrap().state_report(), &[1]);
+    session.decode(&FakeTensor(vec![4]), &()).unwrap();
+    assert_eq!(
+        session
+            .report()
+            .unwrap()
+            .distributed_commit()
+            .unwrap()
+            .epoch()
+            .value(),
+        7
+    );
+    assert!(calls
+        .borrow()
+        .contains(&(DistributedExecutionPhase::ControlExchangePreparation, true)));
+}
+
+#[test]
+fn distributed_independent_copy_and_exchange_failures_leave_state_and_fence_retries() {
+    for phase in [
+        DistributedExecutionPhase::ControlCapturePreparation,
+        DistributedExecutionPhase::ControlCopyPreparation,
+        DistributedExecutionPhase::ControlExchangePreparation,
+    ] {
+        let (mut session, _, _, calls, counters) =
+            partitioned_cache_control_session(0, phase, None, true);
+        session.decode(&FakeTensor(vec![3]), &()).unwrap();
+        let result = match phase {
+            DistributedExecutionPhase::ControlCapturePreparation => {
+                session.capture_control_state(&()).map(|_| ())
+            }
+            DistributedExecutionPhase::ControlCopyPreparation => {
+                let saved = session.capture_control_state(&()).unwrap();
+                session.copy_control_state(&saved, &()).map(|_| ())
+            }
+            _ => {
+                let mut saved = session.capture_control_state(&()).unwrap();
+                session.decode(&FakeTensor(vec![3]), &()).unwrap();
+                session.exchange_control_state(&mut saved, &())
+            }
+        };
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("another rank failed"));
+        assert_eq!(
+            session.report().unwrap().state_report(),
+            if phase == DistributedExecutionPhase::ControlExchangePreparation {
+                &[2]
+            } else {
+                &[1]
+            }
+        );
+        assert_eq!(calls.borrow().last(), Some(&(phase, true)));
+        let before = counters.snapshot().forward_calls;
+        assert!(session.decode(&FakeTensor(vec![4]), &()).is_err());
+        assert!(session.capture_control_state(&()).is_err());
+        assert_eq!(counters.snapshot().forward_calls, before);
+    }
+}
+
+#[test]
+fn distributed_prompt_cache_and_manual_rollback_never_reuse_a_commit_epoch() {
+    let (mut session, descriptor, _, _, _) = partitioned_cache_control_session(
+        0,
+        DistributedExecutionPhase::ControlCapturePreparation,
+        None,
+        true,
+    );
+    session.decode(&FakeTensor(vec![3]), &()).unwrap();
+    let saved = session.checkpoint_complete_distributed(&()).unwrap();
+    session
+        .save_prompt_cache_distributed(
+            std::path::Path::new("unused"),
+            descriptor.clone(),
+            &[3],
+            &eredu_core::cache::PromptCacheOptions::default(),
+            &(),
+        )
+        .unwrap();
+    session.decode(&FakeTensor(vec![4]), &()).unwrap();
+    session.rollback_complete_distributed(saved, &()).unwrap();
+    session.decode(&FakeTensor(vec![4]), &()).unwrap();
+    assert_eq!(
+        session
+            .report()
+            .unwrap()
+            .distributed_commit()
+            .unwrap()
+            .epoch()
+            .value(),
+        3
+    );
+    session
+        .load_prompt_cache_distributed(std::path::Path::new("unused"), &descriptor, &[3], &())
+        .unwrap();
+    session.decode(&FakeTensor(vec![4]), &()).unwrap();
+    assert_eq!(
+        session
+            .report()
+            .unwrap()
+            .distributed_commit()
+            .unwrap()
+            .epoch()
+            .value(),
+        4
     );
 }

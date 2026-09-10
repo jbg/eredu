@@ -1,0 +1,6 @@
+{
+  "torch": "2.14.0",
+  "torch_git": "08187d9e0fba026dc8217405802ab5381dc88d90",
+  "sha256": "bb6c0013992789b3eb3078addaf3ed9a45a67516a310e8605d933fdf5ad0c2e8",
+  "operation": "selected BF16 row projections; FP32 accumulation; seed 937"
+}

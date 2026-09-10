@@ -158,6 +158,7 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> Attention<B> {
                 .transpose()?,
             rotary: B::rotary(
                 RotarySpec {
+                    arithmetic: eredu_nn::RotaryArithmetic::Native,
                     dimensions: partial_dimensions,
                     base: args.rope_theta_for(policy.attention),
                     traditional: false,
@@ -633,6 +634,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> DenseBlock<B>
                     .forward_grouped(
                         experts,
                         RoutedExpertRequest {
+                            bank: eredu_runtime::RoutedBankId::new(0),
                             layer: self.layer,
                             input: &routed_input,
                             routes: &routes,
@@ -719,6 +721,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> DenseBlock<B>
                     .forward_grouped_tensor_parallel(
                         experts,
                         RoutedExpertRequest {
+                            bank: eredu_runtime::RoutedBankId::new(0),
                             layer: self.layer,
                             input: &routed_input,
                             routes: &routes,

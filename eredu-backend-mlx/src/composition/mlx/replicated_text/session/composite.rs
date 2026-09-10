@@ -538,6 +538,38 @@ where
         + 'static,
     P: CompositePredictionCapability<A, D> + 'static,
 {
+    fn prepare_autoregressive_cache(&mut self) -> Result<MlxPredictionTargetState, Error> {
+        self.session
+            .prepare_prediction_target_state(&self.stream)
+            .map(MlxPredictionTargetState::new)
+            .map_err(|e| Error::Speculative(e.to_string()))
+    }
+    fn autoregressive_forward(
+        &mut self,
+        tokens: &Array,
+        cache: &mut MlxPredictionTargetState,
+        prefill: bool,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        let (prepared, admitted, _) = self.text_input(tokens)?;
+        let paired =
+            PreparedCompositeInput::new(&prepared, &admitted).map_err(Error::ArchitectureModel)?;
+        let output = self.with_native_prediction_target_state(cache, |session| {
+            session
+                .sequence_logits(
+                    paired,
+                    if prefill {
+                        eredu_runtime::ExpertPass::Prefill
+                    } else {
+                        eredu_runtime::ExpertPass::Decode
+                    },
+                    stream,
+                )
+                .map_err(|e| Error::Speculative(e.to_string()))
+        })?;
+        Ok(self.published(output.into_array()))
+    }
+
     fn effective_model_type(&self) -> &str {
         &self.effective_model_type
     }
@@ -704,7 +736,7 @@ where
     fn parameter_bank_report(
         &self,
     ) -> Result<
-        Option<crate::backend::runtime::residency::parameter_bank::ParameterBankResidencyReport>,
+        Option<crate::backend::runtime::residency::parameter_bank::ParameterBanksResidencyReport>,
         Error,
     > {
         self.session.execution_strategy().parameter_bank_report()

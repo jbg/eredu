@@ -172,19 +172,19 @@ mod expert_selection_tests {
     fn expert_selection_uses_owner_address_and_distribution_before_lowering() {
         let units = vec![
             expert_unit(
-                ParameterBankKey::new(1, 0),
+                ParameterBankKey::new(0, 1, 0),
                 "target",
                 7,
                 ExpertResidencyDistribution::ExpertParallel,
             ),
             expert_unit(
-                ParameterBankKey::new(7, 1),
+                ParameterBankKey::new(0, 7, 1),
                 "mtp.0",
                 1,
                 ExpertResidencyDistribution::ExpertParallel,
             ),
             expert_unit(
-                ParameterBankKey::new(9, 2),
+                ParameterBankKey::new(0, 9, 2),
                 "mtp.0",
                 1,
                 ExpertResidencyDistribution::Replicated,
@@ -201,7 +201,10 @@ mod expert_selection_tests {
 
         assert_eq!(
             selected,
-            vec![ParameterBankKey::new(7, 1), ParameterBankKey::new(9, 2)]
+            vec![
+                ParameterBankKey::new(0, 7, 1),
+                ParameterBankKey::new(0, 9, 2)
+            ]
         );
     }
 }

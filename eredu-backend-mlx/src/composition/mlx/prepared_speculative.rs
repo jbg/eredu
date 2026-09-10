@@ -670,6 +670,38 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
             .get();
         let target_stream = self.runtime.backend().stream().clone();
         let draft_stream = drafter.stream().clone();
+        if drafter.is_autoregressive() {
+            let topology = drafter.topology();
+            return self.runtime.session_mut().with_model_operation(|model| {
+                let streams =
+                    SpeculativeExecutionStreams::bind(&target_stream, &draft_stream, topology)?;
+                let prepared_lanes =
+                    Self::prepare_speculative_batch_lanes(lanes, proposal_capacity)?;
+                drafter.with_autoregressive(|draft| {
+                    let mut executor =
+                        eredu_runtime::speculative::autoregressive::AutoregressiveExecutor::<
+                            super::speculative::autoregressive::MlxAutoregressiveMechanisms,
+                        >::new(
+                            model.erased_mut(),
+                            draft.executable_mut().erased_mut(),
+                            std::num::NonZeroUsize::new(proposal_capacity)
+                                .expect("selected nonzero capacity"),
+                        );
+                    let mut caches = (0..prepared_lanes.len())
+                        .map(|_| executor.new_cache(streams))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    run_speculative_batch(
+                        &mut executor,
+                        prepared_lanes,
+                        &mut caches,
+                        Ok,
+                        streams,
+                        visitor,
+                    )
+                    .map_err(|e| Error::Speculative(e.to_string()))
+                })
+            });
+        }
         let capture = drafter.capture().clone();
         let selected = drafter.selected().clone();
         self.runtime.session_mut().with_model_operation(|model| {

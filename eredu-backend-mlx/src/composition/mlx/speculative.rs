@@ -33,6 +33,7 @@ use crate::{
 };
 
 mod assistant;
+pub(crate) mod autoregressive;
 mod completion;
 mod execution_streams;
 mod sampling;

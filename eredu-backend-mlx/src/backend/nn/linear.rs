@@ -288,7 +288,10 @@ impl PhysicalLinear {
         } else if let Some(scale) = self.weight_scale_inv.as_ref() {
             super::fp8::linear(input, self.weight.as_ref(), scale, stream)?
         } else {
-            matmul(input, self.weight.as_ref().transpose(stream)?, stream)?
+            match super::matrix::bf16_row_projection(input, self.weight.as_ref(), None, stream)? {
+                Some(output) => output,
+                None => matmul(input, self.weight.as_ref().transpose(stream)?, stream)?,
+            }
         };
         if let Some(bias) = self.bias.as_ref() {
             output = output.add(bias, stream)?;

@@ -103,6 +103,9 @@ pub enum ParameterRole {
     FeedForwardIntermediate,
     /// Routed expert intermediate channels partitioned over the expert axis.
     ExpertIntermediate,
+    /// Expert-parallel packed projections whose complete output rows are
+    /// owned by tensor ranks, while every projection retains its full input.
+    ExpertOutput,
     /// Always-on expert intermediate channels replicated over the expert axis.
     SharedExpertIntermediate,
     /// State-space, convolution, or recurrent channels.

@@ -68,6 +68,19 @@ pub fn grouped_matmul(
     let stream = stream.as_ref();
     let inputs = inputs.as_ref();
     let weights = weights.as_ref();
+    if stream.get_device()?.get_type()? == safemlx::DeviceType::Cpu
+        && matches!(inputs.dtype(), Dtype::Bfloat16 | Dtype::Float16)
+    {
+        return grouped_matmul_cpu(inputs, weights, group_ids.as_ref(), stream);
+    }
+    if let Some(output) = super::matrix::bf16_row_projection(
+        inputs,
+        &weights.swap_axes(-1, -2, stream)?,
+        Some(group_ids.as_ref()),
+        stream,
+    )? {
+        return Ok(output);
+    }
     let selections = inputs.dim(0);
     let in_dim = inputs.dim(-1);
     let out_dim = weights.dim(-1);
@@ -81,6 +94,64 @@ pub fn grouped_matmul(
         stream,
     )?
     .reshape(&[selections, out_dim], stream)
+}
+
+// CPU GatherMM accepts F32 only. Ordinary CPU matmul supports reduced precision;
+// execute contiguous runs against views of each selected matrix, avoiding an
+// expanded selection-sized weight tensor or a widened copy of the whole bank.
+fn grouped_matmul_cpu(
+    inputs: &Array,
+    weights: &Array,
+    ids: &Array,
+    stream: &Stream,
+) -> Result<Array> {
+    use safemlx::ops::indexing::TryIndexOp;
+    if inputs.ndim() != 2
+        || weights.ndim() != 3
+        || ids.ndim() != 1
+        || ids.dim(0) != inputs.dim(0)
+        || inputs.dim(1) != weights.dim(1)
+        || inputs.dtype() != weights.dtype()
+        || !matches!(
+            ids.dtype(),
+            Dtype::Int32 | Dtype::Uint32 | Dtype::Int64 | Dtype::Uint64
+        )
+    {
+        return Err(safemlx::error::Exception::custom(
+            "invalid grouped matrix multiplication geometry or dtype",
+        ));
+    }
+    if inputs.dim(0) == 0 {
+        return safemlx::ops::zeros_dtype(&[0, weights.dim(2)], inputs.dtype(), stream);
+    }
+    let valid = ids
+        .ge(Array::from_int(0), stream)?
+        .logical_and(ids.lt(Array::from_int(weights.dim(0)), stream)?, stream)?;
+    if !valid.all(None, stream)?.try_item::<bool>(stream)? {
+        return Err(safemlx::error::Exception::custom(
+            "grouped matrix index is outside the bank",
+        ));
+    }
+    let ids = ids.as_dtype(Dtype::Int32, stream)?.into_evaluated()?;
+    let ids = ids.as_slice::<i32>();
+    let mut products = Vec::new();
+    let mut start = 0;
+    while start < ids.len() {
+        let mut end = start + 1;
+        while end < ids.len() && ids[end] == ids[start] {
+            end += 1;
+        }
+        let rows = inputs.try_index_device((start as i32..end as i32, ..), stream)?;
+        // Integer advanced indexing materializes the transposed matrix in
+        // column order. A unit slice retains the resident bank's strides and
+        // avoids an extra expert-sized copy.
+        let matrix = weights
+            .try_index_device((ids[start]..ids[start] + 1, .., ..), stream)?
+            .squeeze_axes(&[0], stream)?;
+        products.push(rows.matmul(&matrix, stream)?);
+        start = end;
+    }
+    safemlx::ops::concatenate_axis(&products, 0, stream)
 }
 
 /// Gather source rows according to a selection plan.
@@ -129,3 +200,49 @@ pub fn topk_group_plan(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod reduction_tests {
+    use safemlx::{Array, Device, DeviceType, Dtype, Stream};
+
+    #[test]
+    fn cpu_bf16_grouped_projections_preserve_resident_bank_reduction_layout() {
+        let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+        let fixture = Array::load_safetensors(
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/validation/bf16_grouped.safetensors"
+            ),
+            &stream,
+        )
+        .unwrap();
+        for width in [128, 768, 2560] {
+            let actual = super::grouped_matmul(
+                &fixture[&format!("{width}.input")],
+                fixture[&format!("{width}.weight")]
+                    .swap_axes(-1, -2, &stream)
+                    .unwrap(),
+                &fixture["ids"],
+                false,
+                &stream,
+            )
+            .unwrap()
+            .as_dtype(Dtype::Float32, &stream)
+            .unwrap()
+            .into_evaluated()
+            .unwrap();
+            let expected = fixture[&format!("{width}.output")]
+                .as_dtype(Dtype::Float32, &stream)
+                .unwrap()
+                .into_evaluated()
+                .unwrap();
+            let mismatches = actual
+                .as_slice::<f32>()
+                .iter()
+                .zip(expected.as_slice::<f32>())
+                .filter(|(a, b)| a != b)
+                .count();
+            assert_eq!(mismatches, 0, "selected projection width={width}");
+        }
+    }
+}

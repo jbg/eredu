@@ -1,4 +1,6 @@
-use super::{proportional_frequency_values, proportional_rotary_dims, yarn_frequency_values};
+use super::{
+    proportional_frequency_values, proportional_rotary_dims, yarn_inverse_frequency_values,
+};
 
 #[test]
 fn proportional_rope_uses_full_half_head_frequency_layout() {
@@ -19,7 +21,10 @@ fn proportional_rope_uses_full_half_head_frequency_layout() {
 fn yarn_interpolates_between_original_and_extended_frequencies() {
     let factor = 32.0;
     let base = 150_000.0;
-    let freqs = yarn_frequency_values(64, base, factor, 4096.0, 32.0, 1.0, false);
+    let freqs = yarn_inverse_frequency_values(64, base, factor, 4096.0, 32.0, 1.0, false)
+        .into_iter()
+        .map(|v| 1.0 / v)
+        .collect::<Vec<_>>();
     assert_eq!(freqs.len(), 32);
     assert!((freqs[0] - 1.0).abs() < 1e-6);
     let last_base = base.powf(62.0 / 64.0);

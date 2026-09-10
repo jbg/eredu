@@ -291,7 +291,7 @@ where
         C: RuntimeStateComponents<B> + CompressedAttentionCache<B::Tensor>,
     {
         self.forward_with_feed_forward(hidden, mask, state, context, |policy, input, context| {
-            crate::decoder::FeedForwardOperator::forward_feed_forward(policy, input, context)
+            crate::decoder::DecoderProjectionOperator::forward_feed_forward(policy, input, context)
         })
     }
 
@@ -367,7 +367,7 @@ where
             parallel,
             context,
             |policy, input, parallel, context| {
-                crate::decoder::TensorParallelFeedForwardOperator::forward_feed_forward_parallel(
+                crate::decoder::TensorParallelProjectionOperator::forward_feed_forward_parallel(
                     policy, input, parallel, context,
                 )
             },

@@ -194,6 +194,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Attention<B> 
             key_norm: gguf.then(|| norm("k_norm")).transpose()?,
             rotary: B::rotary(
                 RotarySpec {
+                    arithmetic: eredu_nn::RotaryArithmetic::Native,
                     dimensions: args.head_dim,
                     base: args.rope_theta,
                     traditional: args.weight_convention.uses_traditional_rope(),
@@ -262,6 +263,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Attention<B> 
                 let (keys, values) = cache.update_for_attention(keys, values, context)?;
                 cache.attention(
                     AttentionRequest {
+                        arithmetic: eredu_nn::AttentionArithmetic::Fused,
                         softcap: None,
                         queries,
                         keys,
@@ -275,6 +277,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Attention<B> 
             }
             None => B::attention_with_sinks(
                 AttentionRequest {
+                    arithmetic: eredu_nn::AttentionArithmetic::Fused,
                     softcap: None,
                     queries,
                     keys,
@@ -505,6 +508,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMoe<B> 
             .forward_grouped(
                 &mut self.experts,
                 RoutedExpertRequest {
+                    bank: eredu_runtime::RoutedBankId::new(0),
                     layer,
                     input: &flat,
                     routes: &routes,
@@ -539,6 +543,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMoe<B> 
             .forward_grouped_tensor_parallel(
                 &mut self.experts,
                 RoutedExpertRequest {
+                    bank: eredu_runtime::RoutedBankId::new(0),
                     layer,
                     input: &flat,
                     routes: &routes,

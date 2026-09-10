@@ -220,6 +220,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMoe<B> 
             .forward_relu2_routed(
                 &mut self.experts,
                 RoutedExpertRequest {
+                    bank: eredu_runtime::RoutedBankId::new(0),
                     layer: self.layer,
                     input,
                     routes: &routes,
@@ -259,6 +260,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMoe<B> 
             .forward_relu2_routed(
                 &mut self.experts,
                 RoutedExpertRequest {
+                    bank: eredu_runtime::RoutedBankId::new(0),
                     layer: self.layer,
                     input,
                     routes: &routes,
@@ -302,6 +304,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMoe<B> 
             .forward_relu2_routed_tensor_parallel(
                 &mut self.experts,
                 RoutedExpertRequest {
+                    bank: eredu_runtime::RoutedBankId::new(0),
                     layer: self.layer,
                     input,
                     routes: &routes,

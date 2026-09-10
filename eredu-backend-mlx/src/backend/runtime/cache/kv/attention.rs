@@ -30,6 +30,9 @@ pub struct BlockwiseAttentionAccumulator {
     output_dtype: Dtype,
     scale: f32,
     softcap: Option<f32>,
+    arithmetic: eredu_nn::AttentionArithmetic,
+    value_pass: bool,
+    causal: bool,
     explicit_mask: Option<Array>,
     query_start: i64,
     sliding_window: Option<i32>,
@@ -64,14 +67,9 @@ impl BlockwiseAttentionAccumulator {
             ));
         }
         if let Some(mask) = explicit_mask {
-            if mask.ndim() != 2 {
+            if mask.ndim() == 0 || mask.ndim() > 4 {
                 return Err(Exception::custom(
-                    "paged attention supports only rank-2 explicit attention masks",
-                ));
-            }
-            if mask.dim(0) != queries.dim(-2) {
-                return Err(Exception::custom(
-                    "paged attention mask query dimension does not match the active query",
+                    "attention masks must broadcast to rank-4 scores",
                 ));
             }
         }
@@ -84,12 +82,19 @@ impl BlockwiseAttentionAccumulator {
             output_dtype: queries.dtype(),
             scale,
             softcap: None,
-            explicit_mask: explicit_mask.cloned(),
+            arithmetic: eredu_nn::AttentionArithmetic::Fused,
+            value_pass: false,
+            causal: true,
+            explicit_mask: explicit_mask
+                .map(|mask| {
+                    broadcast_to(mask, &[batch, query_heads, query_len, mask.dim(-1)], stream)
+                })
+                .transpose()?,
             query_start,
             sliding_window,
             prefix_tokens,
             sinks: sinks.cloned(),
-            mask_origin: explicit_mask.map_or(0, |mask| context_end - mask.dim(1) as i64),
+            mask_origin: explicit_mask.map_or(0, |mask| context_end - mask.dim(-1) as i64),
             batch,
             query_heads,
             query_len,
@@ -113,6 +118,48 @@ impl BlockwiseAttentionAccumulator {
             ));
         }
         self.softcap = cap;
+        Ok(())
+    }
+
+    /// Chooses score rounding before any cache block is consumed.
+    pub fn set_arithmetic(
+        &mut self,
+        arithmetic: eredu_nn::AttentionArithmetic,
+    ) -> Result<(), Exception> {
+        if self.running_max.is_some() {
+            return Err(Exception::custom(
+                "attention arithmetic cannot change after accumulation starts",
+            ));
+        }
+        self.arithmetic = arithmetic;
+        Ok(())
+    }
+
+    /// Contiguous callers supply their own complete mask, including causality.
+    pub fn use_explicit_mask_only(&mut self) -> Result<(), Exception> {
+        if self.running_max.is_some() {
+            return Err(Exception::custom(
+                "attention masking cannot change after accumulation starts",
+            ));
+        }
+        self.causal = false;
+        Ok(())
+    }
+
+    /// Retains the global softmax normalization and starts a second bounded
+    /// scan, rounding normalized probabilities before their value products.
+    pub fn begin_value_pass(&mut self) -> Result<(), Exception> {
+        if self.arithmetic != eredu_nn::AttentionArithmetic::InputScores
+            || self.value_pass
+            || self.running_max.is_none()
+            || self.running_sum.is_none()
+        {
+            return Err(Exception::custom(
+                "rounded-probability attention requires a completed normalization pass",
+            ));
+        }
+        self.value_pass = true;
+        self.accumulator = None;
         Ok(())
     }
 
@@ -187,11 +234,19 @@ impl BlockwiseAttentionAccumulator {
         };
         let keys = keys.as_dtype(Dtype::Float32, stream)?;
         let values = values.as_dtype(Dtype::Float32, stream)?;
-        let mut scores = matmul(
-            &self.queries.multiply(Array::from_f32(self.scale), stream)?,
-            &keys.swap_axes(-1, -2, stream)?,
-            stream,
-        )?;
+        let mut scores = if self.arithmetic == eredu_nn::AttentionArithmetic::InputScores {
+            matmul(&self.queries, &keys.swap_axes(-1, -2, stream)?, stream)?
+                .as_dtype(self.output_dtype, stream)?
+                .as_dtype(Dtype::Float32, stream)?
+                .multiply(Array::from_f32(self.scale), stream)?
+                .as_dtype(self.output_dtype, stream)?
+        } else {
+            matmul(
+                &self.queries.multiply(Array::from_f32(self.scale), stream)?,
+                &keys.swap_axes(-1, -2, stream)?,
+                stream,
+            )?
+        };
         if let Some(cap) = self.softcap {
             scores = safemlx::ops::tanh(
                 &scores.multiply(Array::from_f32(cap.recip()), stream)?,
@@ -200,27 +255,33 @@ impl BlockwiseAttentionAccumulator {
             .multiply(Array::from_f32(cap), stream)?;
         }
         if let Some(bias) = additive_bias {
-            scores = scores.add(bias, stream)?;
+            scores = scores.add(bias.as_dtype(scores.dtype(), stream)?, stream)?;
         }
-        let allowed = absolute_attention_mask(
-            self.query_start,
-            self.query_len,
-            block_start,
-            block_end,
-            self.sliding_window,
-            self.prefix_tokens,
-        );
+        let allowed = if self.causal {
+            absolute_attention_mask(
+                self.query_start,
+                self.query_len,
+                block_start,
+                block_end,
+                self.sliding_window,
+                self.prefix_tokens,
+            )
+        } else {
+            vec![true; self.query_len as usize * key_len as usize]
+        };
         let allowed = Array::from_slice(&allowed, &[self.query_len, key_len]);
         let effective_mask = if let Some(mask) = &self.explicit_mask {
             let relative_start = block_start - self.mask_origin;
             let relative_end = block_end - self.mask_origin;
-            if relative_start < 0 || relative_end > mask.dim(1) as i64 {
+            if relative_start < 0 || relative_end > mask.dim(-1) as i64 {
                 return Err(Exception::custom(
                     "paged attention mask does not cover every visible cache block",
                 ));
             }
-            let mask =
-                mask.try_index_device((.., relative_start as i32..relative_end as i32), stream)?;
+            let mask = mask.try_index_device(
+                (.., .., .., relative_start as i32..relative_end as i32),
+                stream,
+            )?;
             if mask.dtype() == Dtype::Bool {
                 let combined = allowed.logical_and(&mask, stream)?;
                 scores = r#where(&combined, scores, Array::from_f32(f32::MIN), stream)?;
@@ -228,7 +289,7 @@ impl BlockwiseAttentionAccumulator {
             } else {
                 let combined =
                     allowed.logical_and(&mask.is_neg_inf(stream)?.logical_not(stream)?, stream)?;
-                scores = scores.add(mask, stream)?;
+                scores = scores.add(mask.as_dtype(scores.dtype(), stream)?, stream)?;
                 scores = r#where(&combined, scores, Array::from_f32(f32::MIN), stream)?;
                 combined
             }
@@ -236,11 +297,54 @@ impl BlockwiseAttentionAccumulator {
             scores = r#where(&allowed, scores, Array::from_f32(f32::MIN), stream)?;
             allowed
         };
+        let scores = scores.as_dtype(Dtype::Float32, stream)?;
+        if self.value_pass {
+            let maximum = self
+                .running_max
+                .as_ref()
+                .expect("normalization pass established maxima");
+            let sum = self
+                .running_sum
+                .as_ref()
+                .expect("normalization pass established denominators");
+            let safe_sum = r#where(
+                &sum.gt(Array::from_f32(0.0), stream)?,
+                sum,
+                Array::from_f32(1.0),
+                stream,
+            )?;
+            let probabilities = scores
+                .subtract(maximum, stream)?
+                .exp(stream)?
+                .multiply(effective_mask.as_dtype(Dtype::Float32, stream)?, stream)?
+                .divide(&safe_sum, stream)?
+                .as_dtype(self.output_dtype, stream)?;
+            // Each page contributes to one FP32 product accumulator; rounding
+            // partial page outputs would make the equation depend on page size.
+            let product = matmul(
+                &probabilities.as_dtype(Dtype::Float32, stream)?,
+                &values,
+                stream,
+            )?;
+            self.accumulator = Some(match &self.accumulator {
+                Some(previous) => previous.add(&product, stream)?,
+                None => product,
+            });
+            safemlx::transforms::eval(self.accumulator.iter())?;
+            return Ok(());
+        }
         let block_max = scores.max_axis(-1, true, stream)?;
         let mut weights = scores.subtract(&block_max, stream)?.exp(stream)?;
         weights = weights.multiply(effective_mask.as_dtype(Dtype::Float32, stream)?, stream)?;
         let block_sum = sum_axis(&weights, -1, true, stream)?;
-        let block_accumulator = matmul(&weights, &values, stream)?;
+        let block_accumulator = if self.arithmetic == eredu_nn::AttentionArithmetic::InputScores {
+            safemlx::ops::zeros::<f32>(
+                &[self.batch, self.query_heads, self.query_len, value_dim],
+                stream,
+            )?
+        } else {
+            matmul(&weights, &values, stream)?
+        };
         match (&self.running_max, &self.running_sum, &self.accumulator) {
             (Some(old_max), Some(old_sum), Some(old_accumulator)) => {
                 let new_max = maximum(old_max, &block_max, stream)?;
@@ -305,6 +409,14 @@ impl BlockwiseAttentionAccumulator {
         let accumulator = self
             .accumulator
             .ok_or_else(|| Exception::custom("blockwise attention received no cache blocks"))?;
+        if self.arithmetic == eredu_nn::AttentionArithmetic::InputScores {
+            if !self.value_pass {
+                return Err(Exception::custom(
+                    "rounded-probability attention is missing its value pass",
+                ));
+            }
+            return accumulator.as_dtype(self.output_dtype, stream);
+        }
         let running_sum = self
             .running_sum
             .ok_or_else(|| Exception::custom("blockwise attention normalization is empty"))?;

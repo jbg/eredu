@@ -177,13 +177,17 @@ impl ModelArgs {
     }
 
     /// Returns the canonical routed observation point for one decoder layer.
-    pub fn routed_observation_point(
+    pub fn routed_observation_points(
         &self,
         unit_path: &str,
         _layer: usize,
-    ) -> Option<eredu_runtime::RoutedObservationPoint> {
+    ) -> Option<eredu_runtime::RoutedObservationPoints> {
         self.is_moe().then(|| {
-            eredu_runtime::RoutedObservationPoint::new(format!("{unit_path}.mlp"), self.num_experts)
+            eredu_runtime::RoutedObservationPoints::new(
+                eredu_runtime::RoutedBankId::new(0),
+                format!("{unit_path}.mlp"),
+                self.num_experts,
+            )
         })
     }
 
@@ -222,12 +226,12 @@ impl Config for ModelArgs {
     fn parameter_root(&self) -> &str {
         &self.parameter_root
     }
-    fn routed_observation_point(
+    fn routed_observation_points(
         &self,
         unit_path: &str,
         layer: usize,
-    ) -> Option<eredu_runtime::RoutedObservationPoint> {
-        ModelArgs::routed_observation_point(self, unit_path, layer)
+    ) -> Option<eredu_runtime::RoutedObservationPoints> {
+        ModelArgs::routed_observation_points(self, unit_path, layer)
     }
     fn validate_config(&self) -> Result<(), eredu_nn::Error> {
         self.validate().map_err(eredu_nn::Error::backend)
@@ -280,6 +284,7 @@ impl Config for ModelArgs {
     }
     fn rotary_spec(&self, dimensions: i32) -> RotarySpec {
         RotarySpec {
+            arithmetic: eredu_nn::RotaryArithmetic::Native,
             dimensions,
             base: self.rope_theta,
             traditional: false,
@@ -1424,12 +1429,24 @@ mod tests {
         value["norm_topk_prob"] = Value::Bool(true);
         let args = model_args_from_config_value(&value).unwrap();
         assert!(args.is_moe());
-        let point = args.routed_observation_point("model.layers.2", 2).unwrap();
-        assert_eq!(point.path(), "model.layers.2.mlp");
-        assert_eq!(point.expert_count(), 4);
+        let point = args.routed_observation_points("model.layers.2", 2).unwrap();
+        assert_eq!(
+            point
+                .bank(eredu_runtime::RoutedBankId::new(0))
+                .unwrap()
+                .path(),
+            "model.layers.2.mlp"
+        );
+        assert_eq!(
+            point
+                .bank(eredu_runtime::RoutedBankId::new(0))
+                .unwrap()
+                .expert_count(),
+            4
+        );
         assert!(model_args_from_config_value(&base("qwen3"))
             .unwrap()
-            .routed_observation_point("model.layers.2", 2)
+            .routed_observation_points("model.layers.2", 2)
             .is_none());
     }
 }

@@ -144,10 +144,8 @@ impl AddressableGroupedBank<MlxNeuralBackend> for AddressableParameterBank {
     type Report = ParameterBankResidencyReport;
     type Error = Error;
 
-    fn member_bytes(&self, key: NeutralParameterBankKey) -> Option<u64> {
-        self.catalog
-            .get(&ParameterBankKey::new(key.unit(), key.member()))
-            .copied()
+    fn member_bytes(&self, key: ParameterBankKey) -> Option<u64> {
+        self.catalog.get(&key).copied()
     }
 
     fn acquire(
@@ -158,7 +156,7 @@ impl AddressableGroupedBank<MlxNeuralBackend> for AddressableParameterBank {
         let entries = request
             .entries()
             .iter()
-            .map(|(key, count)| (ParameterBankKey::new(key.unit(), key.member()), *count))
+            .map(|(key, count)| (*key, *count))
             .collect::<Vec<_>>();
         let pass = match request.access() {
             ParameterBankAccess::Bulk => BankAccessClass::Bulk,
@@ -192,6 +190,35 @@ impl AddressableGroupedBank<MlxNeuralBackend> for AddressableParameterBank {
             .collect::<Result<BTreeMap<_, _>, _>>()?;
         groups.bind_local_parameters(bindings)?;
         self.record_compact_bank(
+            acquisition.identities()[0].bank(),
+            acquisition.pass(),
+            acquisition.scratch_bytes(),
+            started.elapsed(),
+        )?;
+        Ok(groups)
+    }
+
+    /// Constructs one compact selected-linear bank from acquired bindings.
+    fn linear_groups(
+        &mut self,
+        acquisition: &Self::Acquisition,
+        spec: &eredu_nn::GroupedLinearSpec,
+        stream: &Stream,
+    ) -> Result<<MlxNeuralBackend as GroupedNeuralBackend>::LinearGroups, Self::Error> {
+        let started = Instant::now();
+        let mut groups = MlxNeuralBackend::grouped_linear_bank(spec.clone(), stream)?;
+        let bindings = groups
+            .local_parameter_names()
+            .into_iter()
+            .map(|name| {
+                acquisition
+                    .compact_binding(&name, stream)
+                    .map(|value| (name, value))
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        groups.bind_local_parameters(bindings)?;
+        self.record_compact_bank(
+            acquisition.identities()[0].bank(),
             acquisition.pass(),
             acquisition.scratch_bytes(),
             started.elapsed(),
@@ -218,6 +245,7 @@ impl AddressableGroupedBank<MlxNeuralBackend> for AddressableParameterBank {
             .collect::<Result<BTreeMap<_, _>, _>>()?;
         groups.bind_local_parameters(bindings)?;
         self.record_compact_bank(
+            acquisition.identities()[0].bank(),
             acquisition.pass(),
             acquisition.scratch_bytes(),
             started.elapsed(),
@@ -246,7 +274,10 @@ impl AddressableGroupedBank<MlxNeuralBackend> for SharedAddressableParameterBank
     type Report = ParameterBankResidencyReport;
     type Error = Error;
 
-    fn member_bytes(&self, key: NeutralParameterBankKey) -> Option<u64> {
+    fn member_bytes(&self, key: ParameterBankKey) -> Option<u64> {
+        if self.scope.is_some_and(|bank| bank != key.bank()) {
+            return None;
+        }
         self.inner.lock().ok()?.member_bytes(key)
     }
 
@@ -255,6 +286,15 @@ impl AddressableGroupedBank<MlxNeuralBackend> for SharedAddressableParameterBank
         request: ParameterBankAcquisition<'_>,
         stream: &Stream,
     ) -> Result<Self::Acquisition, Self::Error> {
+        if request
+            .entries()
+            .iter()
+            .any(|(key, _)| self.scope.is_some_and(|bank| bank != key.bank()))
+        {
+            return Err(Error::ArchitectureModel(
+                "acquisition exceeds selected bank scope".into(),
+            ));
+        }
         self.inner
             .lock()
             .map_err(|_| {
@@ -275,6 +315,21 @@ impl AddressableGroupedBank<MlxNeuralBackend> for SharedAddressableParameterBank
                 Error::ArchitectureModel("addressable parameter bank lock was poisoned".into())
             })?
             .gated_product_groups(acquisition, spec, stream)
+    }
+
+    /// Constructs one compact selected-linear bank from acquired bindings.
+    fn linear_groups(
+        &mut self,
+        acquisition: &Self::Acquisition,
+        spec: &eredu_nn::GroupedLinearSpec,
+        stream: &Stream,
+    ) -> Result<<MlxNeuralBackend as GroupedNeuralBackend>::LinearGroups, Self::Error> {
+        self.inner
+            .lock()
+            .map_err(|_| {
+                Error::ArchitectureModel("addressable parameter bank lock was poisoned".into())
+            })?
+            .linear_groups(acquisition, spec, stream)
     }
 
     fn relu2_groups(

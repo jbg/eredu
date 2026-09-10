@@ -75,6 +75,7 @@ projector.
 | Gemma 2 | text | yes | `gemma2` | alternating sliding/full GQA, four RMSNorms, GELU and attention/output soft caps; [validation status](gemma2-validation.md) |
 | Gemma 4 | text, image, video, audio | yes | `gemma4` + projector | dense and MoE variants, shared-KV and media towers |
 | Gemma 4 assistant | text draft model | yes | `gemma4_assistant` | external multi-token prediction |
+| K2 Horizon | text | yes | `k2-horizon` | dense, MoE and MoVA; independently addressable value/feed-forward experts, grouped RMSNorm, YaRN, IFM reasoning/tools and external drafting; [validation](k2-horizon-validation.md) |
 | Kimi Linear | text | yes | `kimi-linear` | KDA/MLA hybrid layers, dense and routed/shared experts |
 | LFM2 / LFM2.5 | text | yes | `lfm2`, `lfm2moe` | causal-convolution/attention hybrid, dense and MoE |
 | Nemotron-H | text | yes | `nemotron_h`, `nemotron_h_moe` | Mamba, attention, dense MLP, and MoE layers |

@@ -380,6 +380,7 @@ pub fn prepared_safetensors_floating_state_dtype_source(
         }
         SafetensorsModelConfig::DeepSeekV4(_) => "embed.weight".into(),
         SafetensorsModelConfig::DeepSeekV3(_)
+        | SafetensorsModelConfig::K2Horizon(_)
         | SafetensorsModelConfig::KimiLinear(_)
         | SafetensorsModelConfig::Gemma2(_)
         | SafetensorsModelConfig::Llama(_)
@@ -403,6 +404,7 @@ pub fn prepared_gguf_floating_state_dtype_source(
         | GgufModelConfig::Gemma4(_)
         | GgufModelConfig::GptOss(_)
         | GgufModelConfig::Inkling(_)
+        | GgufModelConfig::K2Horizon(_)
         | GgufModelConfig::KimiLinear(_)
         | GgufModelConfig::Lfm2(_)
         | GgufModelConfig::Gemma2(_)
@@ -533,6 +535,7 @@ pub fn prepared_safetensors_capabilities(
                 capabilities.3 = usize::try_from(args.num_nextn_predict_layers).map_err(invalid)?;
                 capabilities
             }
+            SafetensorsModelConfig::K2Horizon(args) => routed_text(args.is_moe()),
             SafetensorsModelConfig::Qwen(args) => routed_text(args.is_moe()),
             SafetensorsModelConfig::QwenHybrid(args) => {
                 let routed = args.text.is_moe();
@@ -614,6 +617,7 @@ pub fn prepared_gguf_capabilities(
         GgufModelConfig::KimiLinear(args) => args.has_sparse_moe_layers(),
         GgufModelConfig::Lfm2(args) => args.has_sparse_moe_layers(),
         GgufModelConfig::NemotronH(args) => args.has_sparse_moe_layers(),
+        GgufModelConfig::K2Horizon(args) => args.is_moe(),
         GgufModelConfig::Qwen(args) => args.is_moe(),
         GgufModelConfig::QwenHybrid(args) => args.text.is_moe(),
         GgufModelConfig::Gemma2(_) | GgufModelConfig::Llama(_) | GgufModelConfig::Nanbeige(_) => {

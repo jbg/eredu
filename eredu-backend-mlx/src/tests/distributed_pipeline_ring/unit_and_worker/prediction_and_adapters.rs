@@ -584,7 +584,7 @@ fn execute_public_gemma_external_scheduler(
     });
     let factory = crate::composition::mlx::automatic::MlxBackendFactory::default();
     let tokenizer_compatibility = TokenizerCompatibilityProof::prove([7; 32], [7; 32]).unwrap();
-    let preparation = eredu_architectures::prepare_external_assistant(assistant).unwrap();
+    let preparation = eredu_architectures::prepare_external_draft(assistant).unwrap();
     let inspection = eredu_architectures::configuration::inspect_artifact(target).unwrap();
     let selected = eredu_core::select_execution_plan_target(&factory, &plan, inspection).unwrap();
     let external_artifact = eredu_core::select_execution_plan_drafting(

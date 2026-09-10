@@ -96,6 +96,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> PredictionUni
         let norm = |name: &str| {
             B::normalization(
                 NormalizationConstructionSpec {
+                    groups: None,
                     dimensions: config.hidden_size,
                     epsilon: config.rms_norm_eps,
                     scale: NormalizationScale::LearnedOffset {

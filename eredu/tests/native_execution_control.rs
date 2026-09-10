@@ -277,7 +277,9 @@ fn native_facade_with_family(device: LocalDevice, text: bool, family: &str) {
     let baseline = run.token_ids().to_vec();
     let text = semantics(&records[before..]);
     assert!(text.contains(&SemanticEvent::TextDelta("é".into())));
+    let copied_before_restore = run.snapshot_usage().unwrap().cumulative_copy_bytes;
     run.restore(&partial, collect(&mut records)).unwrap();
+    assert!(run.snapshot_usage().unwrap().cumulative_copy_bytes > copied_before_restore);
     let before = records.len();
     run.run(collect(&mut records)).unwrap();
     assert_eq!(run.token_ids(), baseline);
@@ -301,8 +303,13 @@ fn native_facade_with_family(device: LocalDevice, text: bool, family: &str) {
     assert_eq!(semantics(&records[before..]), text);
     run.exchange(&mut branch, collect(&mut records)).unwrap();
     assert_eq!(run.token_ids(), baseline);
+    let copied_before_drop = run.snapshot_usage().unwrap().cumulative_copy_bytes;
     drop(branch);
     assert_eq!(run.snapshot_usage().unwrap().branches, 0);
+    assert_eq!(
+        run.snapshot_usage().unwrap().cumulative_copy_bytes,
+        copied_before_drop
+    );
 }
 
 #[allow(dead_code)]
@@ -487,6 +494,28 @@ mod speculative;
 fn use_family_weights(root: &Path, family: &str) {
     match family {
         "qwen2" => {}
+        "k2_horizon_dense" | "k2_horizon_mova" => {
+            let fixture: serde_json::Value = serde_json::from_str(include_str!(
+                "../../eredu-architectures/tests/fixtures/k2_horizon/reference.json"
+            ))
+            .unwrap();
+            let mut config = fixture[if family == "k2_horizon_dense" {
+                "dense"
+            } else {
+                "mova"
+            }]["config"]
+                .clone();
+            config["vocab_size"] = 64.into();
+            config["eos_token_id"] = 63.into();
+            std::fs::write(
+                root.join("config.json"),
+                serde_json::to_vec(&config).unwrap(),
+            )
+            .unwrap();
+            let resolved =
+                eredu_architectures::configuration::resolve_model_config(&config).unwrap();
+            write_tensor_plan(root, resolved.architecture.checkpoint());
+        }
         "nanbeige" => use_nanbeige_weights(root),
         "gemma2" => {
             let config = serde_json::json!({"model_type":"gemma2", "hidden_size":32,
@@ -547,4 +576,61 @@ fn gemma2_controlled_resident_host_disk_and_transforms_match_uninterrupted() {
             text_matches_ordinary_sampling_with_policy("gemma2", residency.clone(), transform);
         }
     }
+}
+
+#[test]
+#[cfg_attr(
+    feature = "metal",
+    ignore = "run with --no-default-features --features mlx"
+)]
+fn k2_controlled_text_matches_uninterrupted_generation_with_bounded_weights() {
+    for family in ["k2_horizon_dense", "k2_horizon_mova"] {
+        for residency in [
+            eredu_core::ResidencyPlan::FullyResident,
+            eredu_core::ResidencyPlan::LayerwiseHost {
+                device_layer_window: 1,
+                device_budget_bytes: Some(1 << 20),
+                host_budget_bytes: Some(1 << 20),
+            },
+            eredu_core::ResidencyPlan::DenseDiskStream {
+                device_budget_bytes: 1 << 20,
+                host_budget_bytes: 1 << 20,
+                host_lookahead: 1,
+                background_queue: 1,
+            },
+        ] {
+            text_matches_ordinary_sampling_with_policy(
+                family,
+                residency,
+                eredu_core::WeightTransformationPlan::PreserveCheckpoint,
+            );
+        }
+    }
+}
+
+#[test]
+#[cfg_attr(
+    feature = "metal",
+    ignore = "run with --no-default-features --features mlx"
+)]
+fn k2_controlled_snapshots_restore_and_fork_sampled_partial_text() {
+    for family in ["k2_horizon_dense", "k2_horizon_mova"] {
+        native_facade_with_family(LocalDevice::Cpu, true, family);
+    }
+}
+
+#[test]
+#[cfg_attr(
+    feature = "metal",
+    ignore = "run with --no-default-features --features mlx"
+)]
+fn k2_controlled_capture_restore_and_modified_branch_use_shared_drivers() {
+    let root = fixture(false);
+    use_family_weights(&root.0, "k2_horizon_mova");
+    controlled_example::run_example(
+        &root.0,
+        "Explain gravity briefly.",
+        eredu_core::intervention::InterventionDtype::Float32,
+    )
+    .unwrap();
 }

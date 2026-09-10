@@ -15,7 +15,7 @@ include = [
     "tests/**",
     "examples/*.rs",
     "examples/support/**",
-    "validation/*.py",
+    "validation/**",
     "doc/**",
     "README.md",
     "LICENSE-MIT",

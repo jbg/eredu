@@ -164,6 +164,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
     fn static_spec(args: &ModelArgs) -> StaticModuleSpec {
         let embedding_name = "model.embed_tokens.weight";
         StaticModuleSpec {
+            normalization_groups: None,
             embedding_weight: embedding_name.into(),
             normalization_weight: "model.embedding_norm.weight".into(),
             head_weight: "lm_head.weight".into(),
@@ -814,13 +815,13 @@ where
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {
-    fn routed_observation_point(
+    fn routed_observation_points(
         &self,
         group: usize,
         index: usize,
-    ) -> Result<Option<eredu_runtime::RoutedObservationPoint>, Self::Error> {
+    ) -> Result<Option<eredu_runtime::RoutedObservationPoints>, Self::Error> {
         let unit_path = self.decoder.unit_path(group, index)?;
-        Ok(self.args.routed_observation_point(&unit_path, index))
+        Ok(self.args.routed_observation_points(&unit_path, index))
     }
 
     fn forward_unit_with_provider<P>(

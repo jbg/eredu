@@ -1,0 +1,117 @@
+{
+  "torch": "2.14.0",
+  "reference_sha256": "fc0055530ea23eb9586696e2032cd192e2a6550248706d0772b3ac8bc9806846",
+  "native_sha256": "43fea8515bc50908712227c3a549355abf50cc74c6ea7c719606d16bdfed7f02",
+  "divergent_projections": [
+    {
+      "layer": 0,
+      "projection": "q_proj",
+      "row": 2,
+      "column": 3105,
+      "publisher": -0.81640625,
+      "native": -0.8125,
+      "fp64_dot": -0.8144534165476216,
+      "rounded_bf16": -0.81640625
+    },
+    {
+      "layer": 0,
+      "projection": "q_proj",
+      "row": 2,
+      "column": 3534,
+      "publisher": -0.004486083984375,
+      "native": -0.0045166015625,
+      "fp64_dot": -0.004501297458773479,
+      "rounded_bf16": -0.004486083984375
+    },
+    {
+      "layer": 0,
+      "projection": "v_proj",
+      "row": 0,
+      "column": 505,
+      "publisher": 0.0001373291015625,
+      "native": 0.00013828277587890625,
+      "fp64_dot": 0.00013786533963866532,
+      "rounded_bf16": 0.00013828277587890625
+    },
+    {
+      "layer": 0,
+      "projection": "v_proj",
+      "row": 0,
+      "column": 586,
+      "publisher": -0.031982421875,
+      "native": -0.03173828125,
+      "fp64_dot": -0.03186035857652314,
+      "rounded_bf16": -0.031982421875
+    },
+    {
+      "layer": 1,
+      "projection": "q_proj",
+      "row": 0,
+      "column": 878,
+      "publisher": 0.0003871917724609375,
+      "native": 0.00038909912109375,
+      "fp64_dot": 0.0003881389638991095,
+      "rounded_bf16": 0.0003871917724609375
+    },
+    {
+      "layer": 1,
+      "projection": "q_proj",
+      "row": 0,
+      "column": 2642,
+      "publisher": -0.173828125,
+      "native": -0.1748046875,
+      "fp64_dot": -0.17431628992198966,
+      "rounded_bf16": -0.173828125
+    },
+    {
+      "layer": 1,
+      "projection": "q_proj",
+      "row": 0,
+      "column": 3778,
+      "publisher": -0.006195068359375,
+      "native": -0.00616455078125,
+      "fp64_dot": -0.006179843781865202,
+      "rounded_bf16": -0.006195068359375
+    },
+    {
+      "layer": 1,
+      "projection": "q_proj",
+      "row": 2,
+      "column": 1169,
+      "publisher": 0.001373291015625,
+      "native": 0.00136566162109375,
+      "fp64_dot": 0.0013695333036594093,
+      "rounded_bf16": 0.001373291015625
+    },
+    {
+      "layer": 1,
+      "projection": "q_proj",
+      "row": 2,
+      "column": 3089,
+      "publisher": -0.00075531005859375,
+      "native": -0.000759124755859375,
+      "fp64_dot": -0.0007572596077807248,
+      "rounded_bf16": -0.000759124755859375
+    },
+    {
+      "layer": 1,
+      "projection": "v_proj",
+      "row": 2,
+      "column": 462,
+      "publisher": 0.4453125,
+      "native": 0.447265625,
+      "fp64_dot": 0.4462890982395038,
+      "rounded_bf16": 0.447265625
+    },
+    {
+      "layer": 2,
+      "projection": "k_proj",
+      "row": 0,
+      "column": 769,
+      "publisher": -0.016845703125,
+      "native": -0.0169677734375,
+      "fp64_dot": -0.016906839387957007,
+      "rounded_bf16": -0.0169677734375
+    }
+  ]
+}

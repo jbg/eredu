@@ -619,12 +619,12 @@ where
     A: CompositeArchitecture<B, S> + RoutedLayeredArchitecture<B, S> + 'static,
     A::InputPartPlan: 'static,
 {
-    fn routed_observation_point(
+    fn routed_observation_points(
         &self,
         group: usize,
         index: usize,
-    ) -> Result<Option<eredu_runtime::RoutedObservationPoint>, Self::Error> {
-        self.inner.routed_observation_point(group, index)
+    ) -> Result<Option<eredu_runtime::RoutedObservationPoints>, Self::Error> {
+        self.inner.routed_observation_points(group, index)
     }
 
     fn forward_unit_with_provider<P>(

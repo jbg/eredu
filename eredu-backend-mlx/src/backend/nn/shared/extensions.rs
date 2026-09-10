@@ -50,6 +50,15 @@ impl HyperNeuralBackend for MlxNeuralBackend {
 }
 
 impl GroupedNeuralBackend for MlxNeuralBackend {
+    type LinearGroups = super::selected_linear::MlxGroupedLinear;
+
+    fn grouped_linear_bank(
+        spec: eredu_nn::GroupedLinearSpec,
+        context: &Stream,
+    ) -> Result<Self::LinearGroups, ComputeError> {
+        Self::LinearGroups::new(spec, context)
+    }
+
     type Selector = MlxTopKGroupSelector;
     type GatedProductGroups = MlxGroupedGatedProduct;
     type Relu2Groups = MlxGroupedRelu2;
@@ -166,7 +175,8 @@ impl GroupedNeuralBackend for MlxNeuralBackend {
                 spec.input_transform()
                     .is_some_and(|transform| transform.inverse_sqrt_dimensions()),
                 spec.coefficient_scale().is_some(),
-            ))?,
+            ))?
+            .with_arithmetic(spec.arithmetic()),
             spec.format().encoding().weight_quantization(),
             context,
         ))?;
@@ -242,6 +252,7 @@ impl GroupedNeuralBackend for MlxNeuralBackend {
             context,
         ))?;
         module = compute(module.with_policy(policy))?;
+        module.reduction = spec.reduction();
         if let Some(format) = native_fp8 {
             module = compute(module.with_native_fp8(format, context))?;
         }
@@ -379,6 +390,7 @@ macro_rules! impl_attention_cache {
                     request.mask.map(MlxTensor::as_array),
                     request.sinks.map(MlxTensor::as_array),
                     request.softcap,
+                    request.arithmetic,
                     context,
                 ))? {
                     return Ok(MlxTensor::from_array(output));
@@ -391,6 +403,7 @@ macro_rules! impl_attention_cache {
                     request.mask.map(MlxTensor::as_array),
                     request.sinks.map(MlxTensor::as_array),
                     request.softcap,
+                    request.arithmetic,
                     context,
                 ))
             }

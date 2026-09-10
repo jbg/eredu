@@ -393,13 +393,14 @@ impl ModelArgs {
     }
 
     /// Returns the canonical routed observation point for one sparse layer.
-    pub fn routed_observation_point(
+    pub fn routed_observation_points(
         &self,
         unit_path: &str,
         layer: usize,
-    ) -> Option<eredu_runtime::RoutedObservationPoint> {
+    ) -> Option<eredu_runtime::RoutedObservationPoints> {
         (self.layer_policy(layer)?.feed_forward == FeedForwardPolicy::SparseMoe).then(|| {
-            eredu_runtime::RoutedObservationPoint::new(
+            eredu_runtime::RoutedObservationPoints::new(
+                eredu_runtime::RoutedBankId::new(0),
                 format!("{unit_path}.feed_forward"),
                 self.num_experts,
             )
@@ -937,10 +938,24 @@ mod tests {
         let args = model_args_from_config_value(&fixture).unwrap();
         assert_eq!(args.layer_schedule_fingerprint(), "cd,cd,afe,ce");
         assert!(args.use_expert_bias);
-        assert!(args.routed_observation_point("model.layers.0", 0).is_none());
-        let point = args.routed_observation_point("model.layers.2", 2).unwrap();
-        assert_eq!(point.path(), "model.layers.2.feed_forward");
-        assert_eq!(point.expert_count(), 4);
+        assert!(args
+            .routed_observation_points("model.layers.0", 0)
+            .is_none());
+        let point = args.routed_observation_points("model.layers.2", 2).unwrap();
+        assert_eq!(
+            point
+                .bank(eredu_runtime::RoutedBankId::new(0))
+                .unwrap()
+                .path(),
+            "model.layers.2.feed_forward"
+        );
+        assert_eq!(
+            point
+                .bank(eredu_runtime::RoutedBankId::new(0))
+                .unwrap()
+                .expert_count(),
+            4
+        );
     }
 
     #[test]

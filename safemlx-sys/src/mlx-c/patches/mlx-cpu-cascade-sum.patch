@@ -1,0 +1,129 @@
+diff --git a/mlx/backend/cpu/reduce.cpp b/mlx/backend/cpu/reduce.cpp
+--- a/mlx/backend/cpu/reduce.cpp
++++ b/mlx/backend/cpu/reduce.cpp
+@@ -10,6 +10,77 @@
+ #include "mlx/primitives.h"
+ 
+ namespace mlx::core {
++
++// Cascade similarly sized partial sums instead of accumulating a whole row in
++// one vector. Four fixed levels bound both rounding error and stack storage.
++// The four-lane tree is independent of the compiler's selected SIMD width.
++static float cascade_sum_f32(const float* values, size_t size) {
++  constexpr size_t lanes = 4;
++  constexpr size_t parallel = 4;
++  const size_t vectors = size / lanes;
++  const size_t steps = vectors / parallel;
++  size_t ceil_log = 0;
++  for (size_t n = steps > 0 ? steps - 1 : 0; n; n >>= 1) {
++    ++ceil_log;
++  }
++  const size_t power = std::max(size_t(4), ceil_log / 4);
++  const size_t chunk = size_t(1) << power;
++  float sums[4][parallel][lanes] = {};
++  size_t i = 0;
++  for (; i + chunk <= steps;) {
++    for (size_t end = i + chunk; i < end; ++i) {
++      for (size_t p = 0; p < parallel; ++p) {
++        for (size_t lane = 0; lane < lanes; ++lane) {
++          sums[0][p][lane] += values[(i * parallel + p) * lanes + lane];
++        }
++      }
++    }
++    for (size_t level = 1; level < 4; ++level) {
++      for (size_t p = 0; p < parallel; ++p) {
++        for (size_t lane = 0; lane < lanes; ++lane) {
++          sums[level][p][lane] += sums[level - 1][p][lane];
++          sums[level - 1][p][lane] = 0;
++        }
++      }
++      if (i & ((chunk - 1) << (level * power))) {
++        break;
++      }
++    }
++  }
++  for (; i < steps; ++i) {
++    for (size_t p = 0; p < parallel; ++p) {
++      for (size_t lane = 0; lane < lanes; ++lane) {
++        sums[0][p][lane] += values[(i * parallel + p) * lanes + lane];
++      }
++    }
++  }
++  for (size_t level = 1; level < 4; ++level) {
++    for (size_t p = 0; p < parallel; ++p) {
++      for (size_t lane = 0; lane < lanes; ++lane) {
++        sums[0][p][lane] += sums[level][p][lane];
++      }
++    }
++  }
++  for (size_t v = steps * parallel; v < vectors; ++v) {
++    for (size_t lane = 0; lane < lanes; ++lane) {
++      sums[0][0][lane] += values[v * lanes + lane];
++    }
++  }
++  for (size_t p = 1; p < parallel; ++p) {
++    for (size_t lane = 0; lane < lanes; ++lane) {
++      sums[0][0][lane] += sums[0][p][lane];
++    }
++  }
++  float sum = 0;
++  for (size_t tail = vectors * lanes; tail < size; ++tail) {
++    sum += values[tail];
++  }
++  for (size_t lane = 0; lane < lanes; ++lane) {
++    sum += sums[0][0][lane];
++  }
++  return sum;
++}
++
+ 
+ template <typename U>
+ struct Limits {
+@@ -457,6 +528,15 @@
+                     out = array::unsafe_weak_copy(out),
+                     reduce_type_ = reduce_type_,
+                     axes_ = axes_]() mutable {
++    if (reduce_type_ == Reduce::Sum && in.dtype() == float32 &&
++        out.dtype() == float32 && in.flags().row_contiguous &&
++        axes_.size() == 1 && axes_[0] == in.ndim() - 1) {
++      const size_t width = in.shape().back();
++      for (size_t row = 0; row < out.size(); ++row) {
++        out.data<float>()[row] = cascade_sum_f32(in.data<float>() + row * width, width);
++      }
++      return;
++    }
+     switch (reduce_type_) {
+       case Reduce::And:
+       case Reduce::Or: {
+diff --git a/mlx/ops.cpp b/mlx/ops.cpp
+--- a/mlx/ops.cpp
++++ b/mlx/ops.cpp
+@@ -2205,8 +2205,9 @@
+     }
+   }
+   auto dtype = at_least_float(a.dtype());
+-  auto normalizer = number_of_elements(a, axes, true, dtype, s);
+-  return multiply(sum(a, axes, keepdims, s), normalizer, s);
++  // Divide once: a rounded reciprocal introduces an extra FP32 rounding.
++  auto count = number_of_elements(a, axes, false, dtype, s);
++  return divide(sum(a, axes, keepdims, s), count, s);
+ }
+ 
+ array mean(
+diff --git a/mlx/backend/cpu/simd/accelerate_simd.h b/mlx/backend/cpu/simd/accelerate_simd.h
+--- a/mlx/backend/cpu/simd/accelerate_simd.h
++++ b/mlx/backend/cpu/simd/accelerate_simd.h
+@@ -128,7 +128,12 @@
+ SIMD_DEFAULT_UNARY(rint, asd::rint)
+ SIMD_DEFAULT_UNARY(sinh, asd::sinh)
+ SIMD_DEFAULT_UNARY(sqrt, asd::sqrt)
+-SIMD_DEFAULT_UNARY(rsqrt, asd::rsqrt)
++// Keep scalar and vector reciprocal square roots on the same two-operation
++// rounding path. The approximate SIMD reciprocal-root changes BF16 boundaries.
++template <typename T, int N>
++Simd<T, N> rsqrt(Simd<T, N> v) {
++  return T(1) / asd::sqrt(v.value);
++}
+ SIMD_DEFAULT_UNARY(recip, asd::recip)
+ SIMD_DEFAULT_UNARY(tan, asd::tan)
+ SIMD_DEFAULT_UNARY(tanh, asd::tanh)

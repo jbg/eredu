@@ -61,12 +61,23 @@ impl ParameterGroupOwner {
         groups: &[PartitionGroup],
         ownership: &PartitionOwnership,
     ) -> bool {
+        self.is_owned_by(ownership, |group, unit| {
+            groups
+                .iter()
+                .any(|owned| owned.group() == group && owned.contains(unit))
+        })
+    }
+
+    /// Tests static consumers and unit ownership without constructing a module.
+    pub fn is_owned_by(
+        &self,
+        ownership: &PartitionOwnership,
+        owns_unit: impl Fn(&ExecutionGroupId, usize) -> bool,
+    ) -> bool {
         match self {
             Self::StaticRole(role) => ownership.owns_static_role(role),
             Self::StaticAnyOf(roles) => roles.iter().any(|role| ownership.owns_static_role(role)),
-            Self::ExecutionUnit { group, global_unit } => groups
-                .iter()
-                .any(|owned| owned.group() == group && owned.contains(*global_unit)),
+            Self::ExecutionUnit { group, global_unit } => owns_unit(group, *global_unit),
         }
     }
 

@@ -14,12 +14,14 @@ use eredu_checkpoint::LinearFormat;
 
 pub use eredu_nn_macros::Parameterized;
 
+mod grouped_linear;
 /// Reusable patch projection and multi-axis position operations.
 pub mod multimodal;
 /// Checked tensor-independent normalization and mask geometry.
 pub mod operation_geometry;
 /// Typed pre-dispatch controls for architecture-configured expert selectors.
 pub mod routing_intervention;
+pub use grouped_linear::{GroupedLinearActivation, GroupedLinearOperator, GroupedLinearSpec};
 /// Pure sequence layouts shared by patch-based encoders.
 pub mod sequence_layout;
 
@@ -377,6 +379,7 @@ mod recurrent_encoder_contract_tests {
     #[test]
     fn normalization_construction_rejects_invalid_geometry_and_scalars() {
         assert!(NormalizationConstructionSpec {
+            groups: None,
             dimensions: 8,
             epsilon: 1e-6,
             scale: NormalizationScale::Unit,
@@ -384,6 +387,7 @@ mod recurrent_encoder_contract_tests {
         .validate()
         .is_ok());
         assert!(NormalizationConstructionSpec {
+            groups: None,
             dimensions: 0,
             epsilon: 1e-6,
             scale: NormalizationScale::Unit,
@@ -391,6 +395,7 @@ mod recurrent_encoder_contract_tests {
         .validate()
         .is_err());
         assert!(NormalizationConstructionSpec {
+            groups: None,
             dimensions: 8,
             epsilon: f32::NAN,
             scale: NormalizationScale::Unit,
@@ -1218,6 +1223,9 @@ pub enum NormalizationScale {
 /// Complete construction policy for an RMS normalization operator.
 #[derive(Debug, Clone)]
 pub struct NormalizationConstructionSpec {
+    /// Independent reduction groups, with one scale per feature. When present,
+    /// reduction and scale multiplication both use float32 before casting back.
+    pub groups: Option<i32>,
     /// Normalized feature count.
     pub dimensions: i32,
     /// Numerical stability epsilon.
@@ -1230,10 +1238,18 @@ impl NormalizationConstructionSpec {
     /// Creates an RMS normalization with an ordinary learned scale.
     pub fn learned(dimensions: i32, epsilon: f32, weight: ParameterSpec) -> Self {
         Self {
+            groups: None,
             dimensions,
             epsilon,
             scale: NormalizationScale::Learned(weight),
         }
+    }
+
+    /// Selects independent float32 reductions over equal contiguous groups.
+    pub fn with_groups(mut self, groups: i32) -> Result<Self, Error> {
+        self.groups = Some(groups);
+        self.validate()?;
+        Ok(self)
     }
 
     /// Validates feature geometry and fixed scalar policy.
@@ -1243,6 +1259,9 @@ impl NormalizationConstructionSpec {
             NormalizationScale::Learned(_) | NormalizationScale::Unit => None,
         };
         if self.dimensions <= 0
+            || self
+                .groups
+                .is_some_and(|groups| groups <= 0 || self.dimensions % groups != 0)
             || !self.epsilon.is_finite()
             || self.epsilon <= 0.0
             || offset.is_some_and(|offset| !offset.is_finite())
@@ -1294,10 +1313,9 @@ pub enum RotaryAlgorithm {
         beta_fast: f32,
         /// Slow correction rotation count.
         beta_slow: f32,
-        /// Rotary concentration coefficient.
-        concentration: f32,
-        /// All-dimension attention-scale coefficient.
-        attention_factor: f32,
+        /// Explicit multiplier on rotary sine/cosine values. Architecture
+        /// parsing resolves external attention-factor or mscale conventions.
+        amplitude: f32,
         /// Whether correction boundaries are rounded to integer frequency slots.
         truncate: bool,
     },
@@ -1331,8 +1349,7 @@ impl RotaryAlgorithm {
                 original_max_positions,
                 beta_fast,
                 beta_slow,
-                concentration,
-                attention_factor,
+                amplitude,
                 ..
             } => {
                 positive(factor)
@@ -1340,9 +1357,7 @@ impl RotaryAlgorithm {
                     && positive(beta_fast)
                     && positive(beta_slow)
                     && beta_fast > beta_slow
-                    && positive(concentration)
-                    && attention_factor.is_finite()
-                    && attention_factor >= 0.0
+                    && positive(amplitude)
             }
         };
         if valid {
@@ -1355,9 +1370,21 @@ impl RotaryAlgorithm {
     }
 }
 
+/// Rounding policy for rotary position application.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RotaryArithmetic {
+    /// Backend-native fused rotary application.
+    Native,
+    /// Compute trigonometric values and amplitude in FP32, cast to the input
+    /// dtype, and round each product before adding the rotated components.
+    InputProducts,
+}
+
 /// Complete backend-neutral rotary-position construction specification.
 #[derive(Debug, Clone, Copy)]
 pub struct RotarySpec {
+    /// Explicit product rounding policy.
+    pub arithmetic: RotaryArithmetic,
     /// Rotated head dimensions.
     pub dimensions: i32,
     /// Base frequency.
@@ -1640,6 +1667,38 @@ pub struct TopKGroupSelectorSpec {
     format: LinearFormatSpec,
     /// Architecture-selected scoring and selection semantics.
     selection: TopKGroupSelectionSpec,
+    arithmetic: RoutingArithmetic,
+}
+
+/// Arithmetic dtype for one routing stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoutingPrecision {
+    /// Retain the dtype produced by the preceding stage.
+    Preserve,
+    /// Use the dtype of the original selector input.
+    Input,
+    /// Evaluate or retain the stage in FP32.
+    Float32,
+}
+/// Independent precision of projection, score calculation and final coefficients.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RoutingArithmetic {
+    /// Router dot-product precision.
+    pub projection: RoutingPrecision,
+    /// Nonlinearity and selected normalization precision.
+    pub scores: RoutingPrecision,
+    /// Dtype consumed by expert mixture multiplication.
+    pub coefficients: RoutingPrecision,
+}
+impl RoutingArithmetic {
+    /// Uses a single arithmetic dtype throughout routing.
+    pub const fn uniform(precision: RoutingPrecision) -> Self {
+        Self {
+            projection: precision,
+            scores: precision,
+            coefficients: precision,
+        }
+    }
 }
 
 /// Learned normalization and scale applied before a selector projection.
@@ -1694,7 +1753,12 @@ impl TopKGroupSelectorSpec {
         format: LinearFormatSpec,
         selection: TopKGroupSelectionSpec,
     ) -> Result<Self, Error> {
+        let precision = match selection.scoring() {
+            GroupScoring::Sigmoid | GroupScoring::SqrtSoftplus => RoutingPrecision::Float32,
+            _ => RoutingPrecision::Preserve,
+        };
         let spec = Self {
+            arithmetic: RoutingArithmetic::uniform(precision),
             input_dimensions,
             weight,
             bias: None,
@@ -1706,6 +1770,16 @@ impl TopKGroupSelectorSpec {
         };
         spec.validate()?;
         Ok(spec)
+    }
+
+    /// Sets independent projection, score and mixture-coefficient precision.
+    pub fn with_arithmetic(mut self, arithmetic: RoutingArithmetic) -> Self {
+        self.arithmetic = arithmetic;
+        self
+    }
+    /// Returns the complete arithmetic policy retained for controlled routing too.
+    pub const fn arithmetic(&self) -> RoutingArithmetic {
+        self.arithmetic
     }
 
     /// Adds an ordinary projection bias.
@@ -2400,6 +2474,17 @@ pub enum GatedProductGroupLayout {
     Independent(Vec<GatedProductGroupParameters>),
 }
 
+/// Weighted group reduction arithmetic.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum GroupReduction {
+    /// Reduce weighted outputs using the backend's stable sum operation.
+    #[default]
+    Sum,
+    /// Add weighted outputs in ascending group-ID order, rounding each addition
+    /// to the output dtype. Top-k score order must not determine accumulation.
+    SequentialGroupOrder,
+}
+
 /// Complete architecture-owned construction specification for grouped gated-product groups.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GroupedGatedProductSpec {
@@ -2413,6 +2498,7 @@ pub struct GroupedGatedProductSpec {
     output_dimensions: i32,
     /// Exact gate activation, bounds, multiplier, and up offset.
     policy: GatedProductPolicy,
+    reduction: GroupReduction,
     /// Stable logical parameter identities and storage organization.
     layout: GatedProductGroupLayout,
 }
@@ -2433,6 +2519,7 @@ impl GroupedGatedProductSpec {
             intermediate_dimensions,
             output_dimensions,
             policy,
+            reduction: GroupReduction::Sum,
             layout,
         };
         spec.validate()?;
@@ -2468,6 +2555,15 @@ impl GroupedGatedProductSpec {
     /// Returns the gated-product equation policy.
     pub const fn policy(&self) -> GatedProductPolicy {
         self.policy
+    }
+    /// Selects the weighted-output accumulation equation.
+    pub const fn with_reduction(mut self, reduction: GroupReduction) -> Self {
+        self.reduction = reduction;
+        self
+    }
+    /// Weighted-output accumulation equation.
+    pub const fn reduction(&self) -> GroupReduction {
+        self.reduction
     }
     /// Returns the parameter-bank layout.
     pub const fn layout(&self) -> &GatedProductGroupLayout {
@@ -2696,6 +2792,15 @@ pub trait TensorParallelGroupedRelu2Operator<T: Tensor>: GroupedRelu2Operator<T>
 
 /// Neural backend extension for grouped computation.
 pub trait GroupedNeuralBackend: NeuralBackend {
+    /// Activated selected projections with an explicitly owned output partition.
+    type LinearGroups: GroupedLinearOperator<Self::Tensor>;
+
+    /// Builds a selected projection bank, retaining its complete input width.
+    fn grouped_linear_bank(
+        spec: GroupedLinearSpec,
+        context: &<Self::Tensor as Tensor>::Context,
+    ) -> Result<Self::LinearGroups, Error>;
+
     /// Concrete top-k selector.
     type Selector: GroupSelectionOperator<Self::Tensor>;
     /// Concrete packed or independently materialized gated-product bank.
@@ -3006,6 +3111,17 @@ impl<B: HyperNeuralBackend> HyperHead<B> {
     }
 }
 
+/// Rounding boundaries in scaled-dot-product attention.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AttentionArithmetic {
+    /// A fused kernel may retain score/probability intermediates in FP32.
+    #[default]
+    Fused,
+    /// Round QK products and scaled/masked scores to the query dtype. Compute
+    /// softmax in FP32, then round probabilities before the value product.
+    InputScores,
+}
+
 /// One backend-native scaled-dot-product attention request.
 ///
 /// Projected queries, keys, and values remain owned backend tensors so cached,
@@ -3014,6 +3130,8 @@ impl<B: HyperNeuralBackend> HyperHead<B> {
 /// sink logits are borrowed architecture state.
 #[derive(Debug)]
 pub struct AttentionRequest<'a, T> {
+    /// Arithmetic and rounding policy, independent of cache representation.
+    pub arithmetic: AttentionArithmetic,
     /// Queries shaped `[batch, query_heads, query_tokens, head_dimensions]`.
     pub queries: T,
     /// Keys shaped `[batch, key_value_heads, key_tokens, head_dimensions]`.
@@ -3669,12 +3787,14 @@ pub trait NeuralBackend: Sized + 'static {
         let _ = (input, context);
         Err(Error::backend("sigmoid is not implemented by this backend"))
     }
-    /// Applies softplus elementwise.
+    /// Applies `log(1 + exp(beta * x)) / beta` with positive finite beta.
+    /// Floating intermediates may widen, but the output preserves the input dtype.
     fn softplus(
         input: Self::Tensor,
+        beta: f32,
         context: &<Self::Tensor as Tensor>::Context,
     ) -> Result<Self::Tensor, Error> {
-        let _ = (input, context);
+        let _ = (input, beta, context);
         Err(Error::backend(
             "softplus is not implemented by this backend",
         ))
@@ -3849,6 +3969,11 @@ pub trait NeuralBackend: Sized + 'static {
         context: &<Self::Tensor as Tensor>::Context,
     ) -> Result<Self::Tensor, Error> {
         request.validate()?;
+        if request.arithmetic != AttentionArithmetic::Fused {
+            return Err(Error::backend(
+                "attention arithmetic requires a backend implementation",
+            ));
+        }
         if request.softcap.is_some() {
             return Err(Error::backend(
                 "attention score soft-capping is not implemented by this backend",
@@ -3876,6 +4001,11 @@ pub trait NeuralBackend: Sized + 'static {
         context: &<Self::Tensor as Tensor>::Context,
     ) -> Result<Self::Tensor, Error> {
         request.validate()?;
+        if request.arithmetic != AttentionArithmetic::Fused {
+            return Err(Error::backend(
+                "sliding attention arithmetic requires a backend implementation",
+            ));
+        }
         if request.softcap.is_some() {
             return Err(Error::backend(
                 "attention score soft-capping is not implemented by this backend",

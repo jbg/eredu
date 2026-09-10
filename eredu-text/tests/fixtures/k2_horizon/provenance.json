@@ -1,0 +1,16 @@
+{
+  "python": "3.14.7",
+  "transformers": "5.16.1",
+  "jinja2": "3.1.6",
+  "template_sha256": {
+    "dense-safetensors": "5415a881f1c4391f8463187d1ffe80f2227d15ea060a54ce4c73eb626943bf01",
+    "dense-gguf": "f6e3cd6dbf0f95016fff531f41f921dee541025733c14580a881cf5a5f9fa750",
+    "mova-safetensors": "a892cd0b0195599f283a8c706787520d9a6747640efb2f4dec4144b0abb62590",
+    "mova-gguf": "f6e3cd6dbf0f95016fff531f41f921dee541025733c14580a881cf5a5f9fa750"
+  },
+  "tokenization_reference": {
+    "safetensors": "Publisher Transformers tokenizer",
+    "gguf": "MBZUAI-IFM/llama.cpp 35999d101cf2233fc54f09c3c8d599da7303ce02 llama-tokenize --stdin --ids --no-bos --no-escape"
+  },
+  "llama_tokenize_sha256": "0f661342d6753a24ba1c2fdeda44fd154190db7775a906cdb6bb8ddff3e2af6c"
+}

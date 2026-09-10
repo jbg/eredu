@@ -231,3 +231,50 @@ fn write_llama_compatible_fixture(directory: &Path, model_type: &str) {
     )
     .unwrap();
 }
+
+fn write_k2_fixture(directory: &Path, mova: bool) {
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../eredu-architectures/tests/fixtures/k2_horizon/reference.json"
+    )))
+    .unwrap();
+    let mut config = fixture[if mova { "mova" } else { "dense" }]["config"].clone();
+    config["num_hidden_layers"] = 3.into();
+    let args = eredu_architectures::k2_horizon::model_args_from_config_value(&config).unwrap();
+    std::fs::write(
+        directory.join("config.json"),
+        serde_json::to_vec(&config).unwrap(),
+    )
+    .unwrap();
+    let tensors = eredu_architectures::k2_horizon::parameter_shapes(&args, false)
+        .unwrap()
+        .into_iter()
+        .map(|(name, shape)| {
+            let phase = name
+                .bytes()
+                .fold(0_usize, |a, b| a.wrapping_mul(31).wrapping_add(b as usize));
+            let bytes = (0..shape.iter().product::<usize>())
+                .flat_map(|i| {
+                    (if name.contains("norm") {
+                        1.0 + (i % 7) as f32 * 0.01
+                    } else {
+                        ((i * 17 + phase) % 101) as f32 * 0.003 - 0.15
+                    })
+                    .to_le_bytes()
+                })
+                .collect::<Vec<_>>();
+            (name, shape, bytes)
+        })
+        .collect::<Vec<_>>();
+    serialize_to_file(
+        tensors.iter().map(|(name, shape, bytes)| {
+            (
+                name.as_str(),
+                TensorView::new(Dtype::F32, shape.clone(), bytes).unwrap(),
+            )
+        }),
+        None,
+        &directory.join("model.safetensors"),
+    )
+    .unwrap();
+}

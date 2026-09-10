@@ -10,7 +10,7 @@ pub(crate) use partitioned::{
     PartitionedDenseDecoderBindingVisitor, PartitionedPoolingRoutedDecoderBindingVisitor,
     PartitionedPredictionBindingVisitor, PartitionedRoutedDecoderBindingVisitor,
 };
-use routed::{selected_addressable_bank, selected_addressable_partition_bank};
+use routed::selected_addressable_partition_bank;
 pub(in crate::composition::mlx) use routed::{
     PoolingRoutedBindingVisitor, Relu2RoutedBindingVisitor, RoutedBindingVisitor,
 };

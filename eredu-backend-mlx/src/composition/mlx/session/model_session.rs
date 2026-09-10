@@ -394,11 +394,6 @@ impl eredu_core::execution_control::NativeTextStateBackend for MlxBackend<'_> {
                 reason: error.to_string(),
             };
         }
-        if session.payload.distributed.is_some() {
-            return ControlSupport::Unsupported {
-                reason: "native text snapshots require ordinary single-rank execution".into(),
-            };
-        }
         session.payload.model.erased().native_control_support()
     }
 
@@ -507,8 +502,9 @@ impl eredu_core::execution_control::NativeTextStateBackend for MlxBackend<'_> {
         slot: &mut MlxNativeTextState,
     ) -> Result<(), Error> {
         Self::validate_native_text_state(runtime, slot)?;
-        // The exchange is a checked host move with no native work. It must
-        // therefore not open a scope whose failure could follow the swap.
+        // Partitioned exchanges complete their bounded all-rank preparation
+        // before the checked host move. Do not open a subsequent native scope
+        // whose failure could follow that move.
         let session = runtime.session_mut();
         session.ensure_no_submission_in_flight()?;
         let payload = Rc::get_mut(&mut session.payload)
@@ -805,7 +801,7 @@ impl MlxModelSession {
     pub fn parameter_bank_report(
         &self,
     ) -> Result<
-        Option<crate::backend::runtime::residency::parameter_bank::ParameterBankResidencyReport>,
+        Option<crate::backend::runtime::residency::parameter_bank::ParameterBanksResidencyReport>,
         Error,
     > {
         self.payload.model.parameter_bank_report()

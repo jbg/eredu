@@ -244,6 +244,7 @@ impl<B: NeuralBackend> LinearAttention<B> {
             self.input_decay
                 .forward(input, context)?
                 .add(&decay_bias, context)?,
+            1.0,
             context,
         )?
         .multiply(

@@ -23,6 +23,12 @@ pub enum BoundedResidencySizingError {
     /// An exact byte or unit count cannot be represented.
     #[error("selected {0} overflowed")]
     ArithmeticOverflow(&'static str),
+    /// An attached executable companion has no retained source/output extent.
+    #[error("selected companion {0:?} has no byte geometry")]
+    MissingCompanionGeometry(String),
+    /// A selected physical output has no authoritative rank-local placement.
+    #[error("selected parameter {0:?} has invalid or missing local geometry")]
+    InvalidLocalGeometry(String),
 }
 
 /// Computes the pinned bytes and largest group-local device window.
@@ -37,14 +43,300 @@ pub fn selected_text_bounded_requirement(
 ) -> Result<BoundedResidencyRequirement, BoundedResidencySizingError> {
     let tasks = replicated_text_materialization_tasks(selected)?;
     bounded_requirement(
-        tasks.iter().map(|task| {
-            (task.name(), task.owner(), || {
-                selected_materialization_task_bytes(task)
-            })
-        }),
+        task_parameter_bytes(&tasks)?
+            .into_iter()
+            .map(|(name, owner, bytes)| (name, owner, move || Ok(bytes))),
         selected.residency(),
         excluded,
     )
+}
+
+/// Exact parameter totals for the selected executable tasks. Routed storage is
+/// identified by task identity, independently of its ordinary residency policy.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct SelectedParameterResources {
+    /// All executable parameters, including independently acquired banks.
+    pub parameter_bytes: u64,
+    /// Parameters outside repeated execution units.
+    pub pinned_bytes: u64,
+    /// Largest ordinary execution unit, excluding independently acquired banks.
+    pub largest_unit_bytes: u64,
+    /// Largest adjacent pair within one execution group.
+    pub largest_adjacent_units_bytes: u64,
+    /// All routed-bank parameters; shared feed-forward experts remain ordinary.
+    pub expert_bytes: u64,
+}
+
+/// Peak simultaneously live recipe values, including the produced source tensor.
+/// Native conversion scratch is a separate backend mechanism fact.
+pub fn placed_recipe_peak_bytes(
+    recipe: &eredu_checkpoint::recipe::DerivedWeightRecipe,
+    target: &str,
+    source: &dyn eredu_checkpoint::store::CheckpointSource,
+    layout: Option<&crate::LocalModelLayout>,
+    member_selected: bool,
+) -> Result<u64, String> {
+    placed_source_recipe(recipe, target, source, layout, member_selected)?
+        .peak_materialization_bytes(source)
+        .map_err(|e| e.to_string())
+}
+
+/// Projects an exact selected recipe through the ordinary or member-local
+/// physical placement, using the same bounded source rewrite as materialization.
+pub fn placed_source_recipe(
+    recipe: &eredu_checkpoint::recipe::DerivedWeightRecipe,
+    target: &str,
+    source: &dyn eredu_checkpoint::store::CheckpointSource,
+    layout: Option<&crate::LocalModelLayout>,
+    member_selected: bool,
+) -> Result<eredu_checkpoint::recipe::DerivedWeightRecipe, String> {
+    let bytes = recipe.infer(source).map_err(|e| e.to_string())?.byte_len();
+    let binding = crate::WeightBinding::from_recipe(target, recipe.clone(), bytes)
+        .and_then(|binding| binding.with_logical_target(target))
+        .map_err(|e| e.to_string())?;
+    let bindings = if let Some(layout) = layout {
+        if member_selected {
+            crate::place_addressable_member_bindings(vec![binding], source, layout)
+        } else {
+            crate::place_weight_bindings(vec![binding], source, layout)
+        }
+        .map_err(|e| e.to_string())?
+    } else {
+        vec![binding]
+    };
+    Ok(bindings[0].source_recipe())
+}
+
+/// Sizes exact selected tasks without reading payloads or constructing modules.
+/// Attached physical companions are counted once, whether they also occur as
+/// standalone tasks. Transform tasks already include their generated companions.
+pub fn selected_parameter_resources(
+    tasks: &[crate::ReplicatedTextMaterializationTask],
+    routed: &BTreeSet<String>,
+    independently_acquired: &BTreeSet<String>,
+) -> Result<SelectedParameterResources, BoundedResidencySizingError> {
+    parameter_resources(task_parameter_bytes(tasks)?, routed, independently_acquired)
+}
+
+/// Sizes a rank's owned physical outputs using the architecture's TP/EP layout.
+/// Replicated outputs retain their full extent; packed weights and companions
+/// use their own physical shapes. No global-total division is involved.
+pub fn selected_parameter_resources_for_layout(
+    tasks: &[crate::ReplicatedTextMaterializationTask],
+    layout: &crate::LocalModelLayout,
+    owned: &BTreeSet<String>,
+    routed: &BTreeSet<String>,
+    independently_acquired: &BTreeSet<String>,
+) -> Result<SelectedParameterResources, BoundedResidencySizingError> {
+    use BoundedResidencySizingError::InvalidLocalGeometry;
+    let names = tasks
+        .iter()
+        .map(|task| task.name())
+        .collect::<BTreeSet<_>>();
+    let mut parameters = Vec::new();
+    for task in tasks {
+        let target = std::iter::once(task.name())
+            .chain(task.aliases().iter().map(String::as_str))
+            .find(|name| layout.contains(name))
+            .ok_or_else(|| InvalidLocalGeometry(task.name().into()))?;
+        if !owned.contains(target) {
+            continue;
+        }
+        let placement = layout.tensor(target).expect("resolved target");
+        let bytes = if matches!(
+            task.lowering(),
+            crate::WeightLoweringKind::Transform | crate::WeightLoweringKind::DerivedTransform
+        ) {
+            let shape = task
+                .logical_shape()
+                .iter()
+                .zip(placement.global_shape())
+                .zip(placement.local_shape())
+                .map(|((&logical, &global), &local)| {
+                    logical
+                        .checked_mul(local)
+                        .filter(|_| global != 0)
+                        .filter(|scaled| scaled % global == 0)
+                        .map(|scaled| scaled / global)
+                        .ok_or_else(|| InvalidLocalGeometry(target.into()))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            if shape.len() != task.logical_shape().len() {
+                return Err(InvalidLocalGeometry(target.into()));
+            }
+            let dtype = task
+                .source_encoding()
+                .scalar_dtype()
+                .map(eredu_checkpoint::recipe::RecipeDtype::from)
+                .ok_or_else(|| InvalidLocalGeometry(target.into()))?;
+            crate::selected_addressable_parameter_bytes(
+                task,
+                &eredu_checkpoint::recipe::RecipeMetadata {
+                    shape,
+                    dtype,
+                    byte_len: 0,
+                },
+            )
+            .map_err(|_| InvalidLocalGeometry(target.into()))?
+        } else {
+            local_output_bytes(
+                selected_materialization_task_bytes(task)?,
+                placement,
+                target,
+            )?
+        };
+        parameters.push((task.name(), task.owner(), bytes));
+        if matches!(
+            task.lowering(),
+            crate::WeightLoweringKind::Transform | crate::WeightLoweringKind::DerivedTransform
+        ) {
+            continue;
+        }
+        for companion in task.output_companions() {
+            if names.contains(companion.name()) {
+                continue;
+            }
+            let bytes = companion_parameter_bytes(companion)?;
+            let placement = layout
+                .tensor(companion.name())
+                .ok_or_else(|| InvalidLocalGeometry(companion.name().into()))?;
+            if !owned.contains(companion.name()) {
+                return Err(InvalidLocalGeometry(companion.name().into()));
+            }
+            parameters.push((
+                task.name(),
+                task.owner(),
+                local_output_bytes(bytes, placement, companion.name())?,
+            ));
+        }
+    }
+    parameter_resources(parameters, routed, independently_acquired)
+}
+
+fn local_output_bytes(
+    bytes: u64,
+    placement: &crate::LocalTensorLayout,
+    name: &str,
+) -> Result<u64, BoundedResidencySizingError> {
+    let invalid = || BoundedResidencySizingError::InvalidLocalGeometry(name.into());
+    let elements = |shape: &[usize]| {
+        shape
+            .iter()
+            .try_fold(1u128, |n, &d| n.checked_mul(d as u128))
+            .ok_or_else(invalid)
+    };
+    let global = elements(placement.global_shape())?;
+    let local = elements(placement.local_shape())?;
+    let scaled = (bytes as u128).checked_mul(local).ok_or_else(invalid)?;
+    if global == 0 || scaled % global != 0 {
+        return Err(invalid());
+    }
+    u64::try_from(scaled / global).map_err(|_| invalid())
+}
+
+fn companion_parameter_bytes(
+    companion: &crate::ReplicatedTextOutputCompanion,
+) -> Result<u64, BoundedResidencySizingError> {
+    if let Some(task) = companion.materialization_task() {
+        Ok(selected_materialization_task_bytes(task)?)
+    } else if let Some(output) = companion.derived_output() {
+        Ok(output.byte_len())
+    } else if let Some(source) = companion.catalog_source() {
+        Ok(source.encoded_byte_len())
+    } else {
+        Err(BoundedResidencySizingError::MissingCompanionGeometry(
+            companion.name().into(),
+        ))
+    }
+}
+
+type ParameterBytes<'a> = (&'a str, &'a ReplicatedTextParameterOwner, u64);
+
+fn task_parameter_bytes(
+    tasks: &[crate::ReplicatedTextMaterializationTask],
+) -> Result<Vec<ParameterBytes<'_>>, BoundedResidencySizingError> {
+    let names = tasks
+        .iter()
+        .map(|task| task.name())
+        .collect::<BTreeSet<_>>();
+    let mut parameters = Vec::new();
+    for task in tasks {
+        parameters.push((
+            task.name(),
+            task.owner(),
+            selected_materialization_task_bytes(task)?,
+        ));
+        if matches!(
+            task.lowering(),
+            crate::WeightLoweringKind::Transform | crate::WeightLoweringKind::DerivedTransform
+        ) {
+            continue;
+        }
+        for companion in task.output_companions() {
+            if names.contains(companion.name()) {
+                continue;
+            }
+            let bytes = companion_parameter_bytes(companion)?;
+            // Atomic companions have the primary's execution owner and bank.
+            parameters.push((task.name(), task.owner(), bytes));
+        }
+    }
+    Ok(parameters)
+}
+
+fn parameter_resources<'a>(
+    parameters: impl IntoIterator<Item = (&'a str, &'a ReplicatedTextParameterOwner, u64)>,
+    routed: &BTreeSet<String>,
+    independently_acquired: &BTreeSet<String>,
+) -> Result<SelectedParameterResources, BoundedResidencySizingError> {
+    use BoundedResidencySizingError::ArithmeticOverflow;
+    let add = |total: &mut u64, bytes| -> Result<(), BoundedResidencySizingError> {
+        *total = total
+            .checked_add(bytes)
+            .ok_or(ArithmeticOverflow("selected parameter bytes"))?;
+        Ok(())
+    };
+    let mut result = SelectedParameterResources {
+        parameter_bytes: 0,
+        pinned_bytes: 0,
+        largest_unit_bytes: 0,
+        largest_adjacent_units_bytes: 0,
+        expert_bytes: 0,
+    };
+    let mut groups = BTreeMap::<&str, BTreeMap<usize, u64>>::new();
+    for (name, owner, bytes) in parameters {
+        add(&mut result.parameter_bytes, bytes)?;
+        if routed.contains(name) {
+            add(&mut result.expert_bytes, bytes)?;
+        }
+        if independently_acquired.contains(name) {
+            continue;
+        }
+        match owner {
+            ReplicatedTextParameterOwner::StaticRole(_) => add(&mut result.pinned_bytes, bytes)?,
+            ReplicatedTextParameterOwner::ExecutionUnit { group, unit } => {
+                add(
+                    groups.entry(group).or_default().entry(*unit).or_default(),
+                    bytes,
+                )?;
+            }
+        }
+    }
+    for units in groups.values() {
+        for (&unit, &bytes) in units {
+            result.largest_unit_bytes = result.largest_unit_bytes.max(bytes);
+            let next = unit
+                .checked_add(1)
+                .and_then(|next| units.get(&next))
+                .copied()
+                .unwrap_or(0);
+            let pair = bytes
+                .checked_add(next)
+                .ok_or(ArithmeticOverflow("adjacent execution-unit bytes"))?;
+            result.largest_adjacent_units_bytes = result.largest_adjacent_units_bytes.max(pair);
+        }
+    }
+    Ok(result)
 }
 
 fn bounded_requirement<'a, F>(
@@ -174,6 +466,46 @@ mod tests {
         LayerWeightResidency::LayerwiseHost(crate::LayerwiseLoadOptions::new(
             OffloadConfig::new(None, None, depth).unwrap(),
         ))
+    }
+
+    #[test]
+    fn resources_keep_both_banks_shared_experts_and_sparse_windows() {
+        let pinned = ReplicatedTextParameterOwner::StaticRole("embedding".into());
+        let first = unit("text", 0);
+        let second = unit("text", 1);
+        let fourth = unit("text", 3);
+        let parameters = [
+            ("embedding", &pinned, 17),
+            ("dense", &first, 11),
+            ("attention", &second, 13),
+            ("shared", &second, 7),
+            ("values", &second, 64),
+            ("feed_forward", &second, 100),
+            ("later", &fourth, 40),
+        ];
+        let banks = BTreeSet::from(["values".into(), "feed_forward".into()]);
+        let independent = parameter_resources(parameters, &banks, &banks).unwrap();
+        assert_eq!(
+            independent,
+            SelectedParameterResources {
+                parameter_bytes: 252,
+                pinned_bytes: 17,
+                largest_unit_bytes: 40,
+                largest_adjacent_units_bytes: 40,
+                expert_bytes: 164,
+            }
+        );
+        let with_layer = parameter_resources(parameters, &banks, &BTreeSet::new()).unwrap();
+        assert_eq!(with_layer.parameter_bytes, independent.parameter_bytes);
+        assert_eq!(with_layer.expert_bytes, 164);
+        assert_eq!(with_layer.largest_unit_bytes, 184);
+        assert_eq!(with_layer.largest_adjacent_units_bytes, 195);
+        assert!(parameter_resources(
+            [("overflow", &pinned, u64::MAX), ("extra", &first, 1)],
+            &banks,
+            &banks
+        )
+        .is_err());
     }
 
     fn size(

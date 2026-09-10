@@ -12,9 +12,9 @@ use eredu_nn::Tensor;
 use eredu_runtime::{
     AddressableExpertRouteProvider, AddressableExpertRouteRequest, AddressableGatedProductBank,
     CollectiveBackend, CommunicationPeerCounts, CommunicationTensorMetadata, EvenGatherBackend,
-    ExecutionGroupId, ExpertPass, ExpertRouteCombination, ExpertRouteExchange,
-    ExpertRouteTensorMovement, ParameterBankKey, PartitionCommunication,
-    RoutedExpertTensorParallelOutput, VariableAllToAllBackend,
+    ExecutionGroupId, ExpertRouteCombination, ExpertRouteExchange, ExpertRouteTensorMovement,
+    ParameterBankKey, PartitionCommunication, RoutedExpertTensorParallelOutput,
+    VariableAllToAllBackend,
 };
 
 /// Complete architecture-derived ownership and rank-local bank construction plan.
@@ -764,8 +764,7 @@ pub fn execute_expert_route_exchange<S, T, M, X, P>(
     input: &T,
     selected_scores: &T,
     coefficients: &T,
-    unit: usize,
-    pass: ExpertPass,
+    invocation: eredu_runtime::ExpertRouteInvocation,
     movement: &mut M,
     forward: &mut X,
     reverse: &mut X,
@@ -787,8 +786,7 @@ where
         input,
         selected_scores,
         coefficients,
-        unit,
-        pass,
+        invocation,
         movement,
         forward,
         reverse,
@@ -817,8 +815,7 @@ pub fn execute_expert_route_exchange_tensor_parallel<S, T, M, X, P>(
     input: &T,
     selected_scores: &T,
     coefficients: &T,
-    unit: usize,
-    pass: ExpertPass,
+    invocation: eredu_runtime::ExpertRouteInvocation,
     movement: &mut M,
     forward: &mut X,
     reverse: &mut X,
@@ -832,6 +829,11 @@ where
     P: AddressableExpertRouteProvider<T>,
     P::Error: std::fmt::Display,
 {
+    if invocation.output_dimensions == 0 {
+        return Err(RoutedMechanismExecutionError::InvalidPlan(
+            "expert output width must be positive".into(),
+        ));
+    }
     validate_expert_route_execution(
         realization,
         packing,
@@ -935,14 +937,15 @@ where
 
     let output = provider
         .execute_addressable_routes_tensor_parallel(AddressableExpertRouteRequest {
-            unit,
+            bank: invocation.bank,
+            unit: invocation.unit,
             input: &received_input,
             global_experts: &received_global_experts,
             owner_local_experts: &received_local_experts,
             selected_scores: &received_scores,
             coefficients: &received_coefficients,
-            pass,
-            access: pass.parameter_bank_access(),
+            pass: invocation.pass,
+            access: invocation.pass.parameter_bank_access(),
             combination: ExpertRouteCombination::CoefficientWeightedSum,
         })
         .map_err(|error| RoutedMechanismExecutionError::Mechanism(error.to_string()))?;
@@ -957,7 +960,7 @@ where
         movement,
         &reducible,
         received_rows,
-        Some(hidden),
+        Some(invocation.output_dimensions),
         "provider activation contribution",
     )?;
     if let Some(bias) = post_reduce.as_ref() {
@@ -965,7 +968,7 @@ where
             movement,
             bias,
             received_rows,
-            Some(hidden),
+            Some(invocation.output_dimensions),
             "provider post-reduction bias",
         )?;
     }
@@ -987,7 +990,7 @@ where
         movement,
         &returned,
         packed_rows,
-        Some(hidden),
+        Some(invocation.output_dimensions),
         "returned output",
     )?;
     if let Some(bias) = returned_bias.as_ref() {
@@ -995,7 +998,7 @@ where
             movement,
             bias,
             packed_rows,
-            Some(hidden),
+            Some(invocation.output_dimensions),
             "returned post-reduction bias",
         )?;
     }
@@ -1004,11 +1007,37 @@ where
             "expert route return order differs from the dispatched route permutation".into(),
         ));
     }
+    // Transport preserves peer order. Sequential accumulation instead follows
+    // the architecture-global expert order, independently for every token.
+    let (returned, returned_bias, destinations) =
+        if invocation.reduction == eredu_nn::GroupReduction::SequentialGroupOrder {
+            let mut order = (0..packed_rows).collect::<Vec<_>>();
+            order.sort_by_key(|row| packing.packed_global_experts()[*row]);
+            let returned = movement
+                .gather_rows(&returned, &order)
+                .map_err(|error| RoutedMechanismExecutionError::Mechanism(error.to_string()))?;
+            let returned_bias = returned_bias
+                .map(|bias| movement.gather_rows(&bias, &order))
+                .transpose()
+                .map_err(|error| RoutedMechanismExecutionError::Mechanism(error.to_string()))?;
+            let destinations = order
+                .iter()
+                .map(|row| packing.packed_token_indices()[*row])
+                .collect::<Vec<_>>();
+            (returned, returned_bias, destinations)
+        } else {
+            (
+                returned,
+                returned_bias,
+                packing.packed_token_indices().to_vec(),
+            )
+        };
     let output = movement
         .scatter_add_rows(
             returned,
-            packing.packed_token_indices(),
+            &destinations,
             packing.source_tokens(),
+            invocation.reduction,
         )
         .map_err(|error| RoutedMechanismExecutionError::Mechanism(error.to_string()))?;
     let post_reduce = returned_bias
@@ -1016,8 +1045,9 @@ where
             movement
                 .scatter_add_rows(
                     bias,
-                    packing.packed_token_indices(),
+                    &destinations,
                     packing.source_tokens(),
+                    invocation.reduction,
                 )
                 .map_err(|error| RoutedMechanismExecutionError::Mechanism(error.to_string()))
         })
@@ -1192,6 +1222,7 @@ where
 pub fn execute_routed_gated_product<B, P>(
     plan: &ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>,
     owner_group: &str,
+    bank_id: eredu_runtime::RoutedBankId,
     owner_unit: usize,
     local_bank_member: usize,
     input: &B::Tensor,
@@ -1230,7 +1261,7 @@ where
             "execution unit {owner_group:?}/{owner_unit} has no grouped bank"
         ))
     })?;
-    let key = ParameterBankKey::new(owner_unit, global_member);
+    let key = ParameterBankKey::new(bank_id.value() as usize, owner_unit, global_member);
     let groups = bank
         .acquire(key, spec, context)
         .map_err(|error| RoutedMechanismExecutionError::Mechanism(error.to_string()))?;
@@ -1806,6 +1837,7 @@ pub enum ExpertResidencyCatalogError {
 mod tests {
     use super::*;
     use eredu_core::ParallelTopology;
+    use eredu_runtime::ExpertPass;
 
     #[derive(Debug, Clone, PartialEq)]
     struct NumericTensor {
@@ -1882,6 +1914,7 @@ mod tests {
             value: NumericTensor,
             destination_rows: &[usize],
             output_rows: usize,
+            _reduction: eredu_nn::GroupReduction,
         ) -> Result<NumericTensor, Self::Error> {
             self.scatter_rows += 1;
             self.scattered_destinations = destination_rows.to_vec();
@@ -2109,8 +2142,13 @@ mod tests {
             input,
             scores,
             coefficients,
-            7,
-            ExpertPass::Prefill,
+            eredu_runtime::ExpertRouteInvocation {
+                reduction: eredu_nn::GroupReduction::Sum,
+                bank: eredu_runtime::RoutedBankId::new(0),
+                unit: 7,
+                output_dimensions: 2,
+                pass: ExpertPass::Prefill,
+            },
             movement,
             forward,
             reverse,
@@ -2250,10 +2288,10 @@ mod tests {
         assert_eq!(
             provider.addressable_keys,
             [
-                ParameterBankKey::new(7, 2),
-                ParameterBankKey::new(7, 3),
-                ParameterBankKey::new(7, 2),
-                ParameterBankKey::new(7, 3),
+                ParameterBankKey::new(0, 7, 2),
+                ParameterBankKey::new(0, 7, 3),
+                ParameterBankKey::new(0, 7, 2),
+                ParameterBankKey::new(0, 7, 3),
             ]
         );
         assert_eq!(
@@ -2277,6 +2315,132 @@ mod tests {
     }
 
     #[test]
+    fn expert_exchange_preserves_bank_identity_and_distinct_output_width() {
+        struct ProjectionProvider;
+        impl AddressableExpertRouteProvider<NumericTensor> for ProjectionProvider {
+            type Error = &'static str;
+            fn execute_addressable_routes(
+                &mut self,
+                request: AddressableExpertRouteRequest<'_, NumericTensor>,
+            ) -> Result<NumericTensor, Self::Error> {
+                assert_eq!(request.bank, eredu_runtime::RoutedBankId::new(1));
+                let mut values = Vec::new();
+                for row in 0..request.input.rows {
+                    assert_eq!(
+                        request.addressable_bank_key(row),
+                        Some(ParameterBankKey::new(1, 7, request.global_experts[row]))
+                    );
+                    let a = request.input.values[row * 2];
+                    let b = request.input.values[row * 2 + 1];
+                    let coefficient = request.coefficients.values[row]
+                        * (request.owner_local_experts[row] + 1) as f32;
+                    values
+                        .extend([a + b, a - b, 2.0 * a + 3.0 * b].map(|value| value * coefficient));
+                }
+                Ok(NumericTensor::new(request.input.rows, 3, values))
+            }
+        }
+        let (realization, packing, counts, input, scores, coefficients) =
+            numeric_exchange_fixture();
+        for width in [3, 2] {
+            let mut movement = NumericMovement::default();
+            let mut forward = IdentityExchange::default();
+            let mut reverse = IdentityExchange::default();
+            let output = execute_expert_route_exchange(
+                &realization,
+                &packing,
+                &counts,
+                &input,
+                &scores,
+                &coefficients,
+                eredu_runtime::ExpertRouteInvocation {
+                    reduction: eredu_nn::GroupReduction::Sum,
+                    bank: eredu_runtime::RoutedBankId::new(1),
+                    unit: 7,
+                    output_dimensions: width,
+                    pass: ExpertPass::Decode,
+                },
+                &mut movement,
+                &mut forward,
+                &mut reverse,
+                &mut ProjectionProvider,
+            );
+            if width == 3 {
+                assert_eq!(
+                    output.unwrap(),
+                    NumericTensor::new(2, 3, vec![11.0, 9.0, 23.0, 110.0, 90.0, 230.0])
+                );
+                assert_eq!(reverse.calls, 2);
+            } else {
+                assert!(output.is_err());
+                assert_eq!(
+                    reverse.calls, 0,
+                    "wrong output width must fail before return transport"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn exchange_sequential_reduction_uses_global_expert_order_after_reverse_transport() {
+        struct Cancellation;
+        impl AddressableExpertRouteProvider<NumericTensor> for Cancellation {
+            type Error = &'static str;
+            fn execute_addressable_routes(
+                &mut self,
+                request: AddressableExpertRouteRequest<'_, NumericTensor>,
+            ) -> Result<NumericTensor, Self::Error> {
+                assert_eq!(request.bank, eredu_runtime::RoutedBankId::new(1));
+                Ok(NumericTensor::new(
+                    request.global_experts.len(),
+                    1,
+                    request
+                        .global_experts
+                        .iter()
+                        .map(|id| [16_777_216.0, 1.0, -16_777_216.0][*id])
+                        .collect(),
+                ))
+            }
+        }
+        let realization = ExpertRealizationPlan::balanced(
+            3,
+            ParallelRankTopology::new(ParallelTopology::new(1, 1, 1, 1).unwrap(), 0).unwrap(),
+            BTreeMap::from([((ExecutionGroupId::new("decoder").unwrap(), 7), ())]),
+        )
+        .unwrap();
+        let packing = ExpertRoutePackingPlan::new(&realization, 1, 3, &[2, 0, 1]).unwrap();
+        let counts =
+            ExpertRouteCountPlan::from_consensus(CollectiveGroupId::new(71), 0, vec![3], vec![3])
+                .unwrap();
+        for (reduction, expected) in [
+            (eredu_nn::GroupReduction::Sum, 1.0),
+            (eredu_nn::GroupReduction::SequentialGroupOrder, 0.0),
+        ] {
+            let output = execute_expert_route_exchange(
+                &realization,
+                &packing,
+                &counts,
+                &NumericTensor::new(1, 2, vec![1.0, 2.0]),
+                &NumericTensor::new(1, 3, vec![1.0; 3]),
+                &NumericTensor::new(1, 3, vec![1.0; 3]),
+                eredu_runtime::ExpertRouteInvocation {
+                    bank: eredu_runtime::RoutedBankId::new(1),
+                    unit: 7,
+                    output_dimensions: 1,
+                    reduction,
+                    pass: ExpertPass::Decode,
+                },
+                &mut NumericMovement::default(),
+                &mut IdentityExchange::default(),
+                &mut IdentityExchange::default(),
+                &mut Cancellation,
+            )
+            .unwrap();
+            assert_eq!(output.values, [expected]);
+        }
+    }
+
+    #[test]
     fn tp2_ep2_reverse_exchange_preserves_bias_for_one_post_sum_addition() {
         let (realization, packing, counts, input, scores, coefficients) =
             numeric_exchange_fixture();
@@ -2297,8 +2461,13 @@ mod tests {
                 &input,
                 &scores,
                 &coefficients,
-                7,
-                ExpertPass::Decode,
+                eredu_runtime::ExpertRouteInvocation {
+                    reduction: eredu_nn::GroupReduction::Sum,
+                    bank: eredu_runtime::RoutedBankId::new(0),
+                    unit: 7,
+                    output_dimensions: 2,
+                    pass: ExpertPass::Decode,
+                },
                 &mut movement,
                 &mut forward,
                 &mut reverse,

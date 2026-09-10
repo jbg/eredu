@@ -1,4 +1,3 @@
-#[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
 use super::quantize_activations;
 use super::{decode_scale, grouped_linear, linear, segmented_linear, segmented_transposed_linear};
 
@@ -159,7 +158,16 @@ fn block_fp8_cpu_reference_projections() {
 #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
 #[test]
 fn dynamic_activation_quantization_matches_e4m3_and_clamped_scale() {
-    let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+    assert_dynamic_activation_quantization(DeviceType::Gpu);
+}
+
+#[test]
+fn cpu_dynamic_activation_quantization_matches_e4m3_and_clamped_scale() {
+    assert_dynamic_activation_quantization(DeviceType::Cpu);
+}
+
+fn assert_dynamic_activation_quantization(device_type: DeviceType) {
+    let context = ExecutionContext::new(Device::new(device_type, 0));
     let stream = context.stream();
     let mut input = vec![0.0f32; 256];
     for (index, value) in [448.0, -448.0, 1.0, 0.5, 0.015625, 0.001953125]

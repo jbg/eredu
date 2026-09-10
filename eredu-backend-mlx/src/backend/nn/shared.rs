@@ -90,6 +90,8 @@ fn trace_partition_collective(operation: &str, input: &Array, group: &Group, det
 mod core_backend;
 mod extensions;
 mod operators;
+mod selected_linear;
+pub use selected_linear::MlxGroupedLinear;
 mod parameters;
 mod submission;
 

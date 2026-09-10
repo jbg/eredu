@@ -77,10 +77,13 @@ impl SnapshotStorage for DeclarativeParserState {
                 tool,
                 parameter,
                 arguments,
+                declared_type,
+                header_consumed: _,
             } => tool
                 .heap_bytes()?
                 .checked_add(parameter.heap_bytes()?)?
-                .checked_add(arguments.heap_bytes()?),
+                .checked_add(arguments.heap_bytes()?)?
+                .checked_add(declared_type.heap_bytes()?),
             Self::StructuralPayload { normalizer } => normalizer.heap_bytes(),
             Self::Outside
             | Self::ToolStart

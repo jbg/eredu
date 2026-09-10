@@ -60,6 +60,14 @@ pub struct LayerSchedule<P> {
 }
 
 impl<P> LayerSchedule<P> {
+    /// Represents a partition owning no local invocations. Whole-family
+    /// construction through `new` still requires a positive layer count.
+    pub fn empty() -> Self {
+        Self {
+            layers: Box::new([]),
+        }
+    }
+
     /// Validates an exact ordered policy list against the decoder layer count.
     pub fn new(layer_count: usize, layers: Vec<P>) -> Result<Self, LayerScheduleError> {
         if layer_count == 0 {

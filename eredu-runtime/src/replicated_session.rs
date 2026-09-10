@@ -2019,6 +2019,20 @@ where
         self.publish(output, checkpoint, forward_context, context)
     }
 
+    /// Runs an ordinary transaction and retains every sequence logit row for
+    /// independent-draft verification. Output publication, all-rank agreement,
+    /// state rollback and completion use the same lifecycle as ordinary decoding.
+    pub fn sequence_logits<'a>(
+        &mut self,
+        input: A::Input<'a>,
+        pass: ExpertPass,
+        context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>> {
+        let (output, checkpoint, forward_context) =
+            self.execute_input_with_observer(input, pass, context, &mut crate::NoopObserver)?;
+        self.publish(output, checkpoint, forward_context, context)
+    }
+
     /// Runs prompt processing and selects the architecture-declared text output.
     pub fn prefill(
         &mut self,
@@ -2747,7 +2761,7 @@ where
             .restore_state(&mut self.state, checkpoint.state, context)
             .map_err(ReplicatedTextSessionError::Mechanism)?;
         self.committed_prompt_input_identity = checkpoint.prompt_input_identity;
-        self.next_commit_epoch = checkpoint.next_commit_epoch;
+        self.next_commit_epoch = self.next_commit_epoch.max(checkpoint.next_commit_epoch);
         self.last_commit_outcome = checkpoint.last_commit_outcome;
         self.active_commit_epoch = None;
         Ok(())
@@ -3066,9 +3080,11 @@ where
             self.active_commit_epoch = None;
             self.last_commit_outcome = manifest.distributed_commit;
             if let Some(outcome) = manifest.distributed_commit {
-                self.next_commit_epoch = outcome.epoch().next().unwrap_or_else(|| {
-                    unreachable!("provisional commit epoch was validated before agreement")
-                });
+                self.next_commit_epoch =
+                    self.next_commit_epoch
+                        .max(outcome.epoch().next().unwrap_or_else(|| {
+                            unreachable!("provisional commit epoch was validated before agreement")
+                        }));
             }
             manifest
         });
@@ -3110,7 +3126,7 @@ where
                 outcome
                     .epoch()
                     .next()
-                    .is_some_and(|expected| expected == *next)
+                    .is_some_and(|expected| expected <= *next)
             })
         });
         let success = provisional.as_ref().is_none_or(Result::is_ok) && metadata_valid;
@@ -3137,7 +3153,7 @@ where
         match metadata {
             Some((identity, next, outcome)) => {
                 self.committed_prompt_input_identity = identity;
-                self.next_commit_epoch = next;
+                self.next_commit_epoch = self.next_commit_epoch.max(next);
                 self.last_commit_outcome = outcome;
                 self.active_commit_epoch = None;
             }
@@ -3551,9 +3567,13 @@ where
         self.active_commit_epoch = None;
         self.last_commit_outcome = outcome;
         if let Some(outcome) = outcome {
-            self.next_commit_epoch = outcome.epoch().next().ok_or_else(|| {
-                ReplicatedTextSessionError::Contract("distributed commit epoch overflow".into())
-            })?;
+            self.next_commit_epoch =
+                self.next_commit_epoch
+                    .max(outcome.epoch().next().ok_or_else(|| {
+                        ReplicatedTextSessionError::Contract(
+                            "distributed commit epoch overflow".into(),
+                        )
+                    })?);
         }
         Ok(())
     }

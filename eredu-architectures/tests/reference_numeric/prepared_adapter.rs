@@ -24,6 +24,8 @@ impl eredu_architectures::PreparationMechanismProvider for NumericPreparationPro
             .with_parallel_axis(eredu_core::ParallelAxis::Pipeline, true)
             .with_parallel_axis(eredu_core::ParallelAxis::Expert, true)
             .with_residency(eredu_core::ResidencyRequest::FullyResident, true)
+            .with_residency(eredu_core::ResidencyRequest::LayerwiseHost, true)
+            .with_residency(eredu_core::ResidencyRequest::DenseDiskStream, true)
             .with_residency(
                 eredu_core::ResidencyRequest::AddressableParameterBanks,
                 self.addressable,
@@ -217,7 +219,7 @@ pub(super) fn composite(
 }
 
 #[cfg(test)]
-type ParameterBits = BTreeMap<String, (Vec<i32>, Vec<u32>)>;
+pub(super) type ParameterBits = BTreeMap<String, (Vec<i32>, Vec<u32>)>;
 
 #[cfg(test)]
 pub(super) fn payload_fixture(head_scale: f32) -> (tempfile::TempDir, ParameterBits) {
@@ -228,6 +230,14 @@ pub(super) fn payload_fixture(head_scale: f32) -> (tempfile::TempDir, ParameterB
 pub(super) fn payload_fixture_config(
     config: &serde_json::Value,
     head_scale: f32,
+) -> (tempfile::TempDir, ParameterBits) {
+    payload_fixture_config_with(config, head_scale, |_, _| None)
+}
+
+pub(super) fn payload_fixture_config_with(
+    config: &serde_json::Value,
+    head_scale: f32,
+    custom: impl Fn(&str, &[i32]) -> Option<NumericTensor>,
 ) -> (tempfile::TempDir, ParameterBits) {
     use safetensors::tensor::{serialize_to_file, TensorView};
     let root = tempfile::tempdir().unwrap();
@@ -244,11 +254,13 @@ pub(super) fn payload_fixture_config(
                 .into_iter()
                 .map(|x| i32::try_from(x).unwrap())
                 .collect::<Vec<_>>();
-            let mut value = parameter(
-                &spec,
-                dimensions,
-                name.contains("norm") && config["model_type"] != "gemma2",
-            );
+            let mut value = custom(&name, &dimensions).unwrap_or_else(|| {
+                parameter(
+                    &spec,
+                    dimensions,
+                    name.contains("norm") && config["model_type"] != "gemma2",
+                )
+            });
             if name == "lm_head.weight" {
                 value = value.map(|value| value * head_scale);
             }

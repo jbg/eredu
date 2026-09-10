@@ -1,18 +1,20 @@
 use super::super::*;
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn bind_partitioned_routed_pipeline_with_provider<A, S, G, E, Provider, F>(
+pub(crate) fn bind_partitioned_routed_pipeline_with_provider<A, S, G, Provider, F>(
     prepared: eredu_architectures::partitioned_execution::PreparedRoutedPartitionedArchitecture<
         MlxNeuralBackend,
         A,
         G,
         <A as eredu_runtime::PartitionedLayeredArchitecture<MlxNeuralBackend, S>>::Boundary,
-        E,
     >,
     store: Arc<dyn CheckpointSource>,
     distributed: crate::backend::distributed::MlxDistributedSession,
     provider: Provider,
-    parameter_bank: Option<MlxSharedAddressableBank>,
+    parameter_bank: std::collections::BTreeMap<
+        eredu_runtime::RoutedBankId,
+        MlxSharedAddressableBank,
+    >,
     additional_claimed_sources: std::collections::BTreeSet<String>,
     stream: &Stream,
     weights_stream: &Stream,
@@ -26,9 +28,6 @@ where
         + 'static,
     A::StaticModules: Clone,
     G: 'static,
-    E: eredu_architectures::partitioned_execution::RoutedCollectiveSpec
-        + eredu_architectures::routed_text::RoutedGroupedSpec
-        + 'static,
     Provider: eredu_runtime::TensorParallelRoutedExpertProvider<MlxNeuralBackend> + 'static,
     Provider::Error: std::fmt::Display,
     F: ReplicatedExecutableFinalizer<A, S>,
@@ -142,9 +141,7 @@ where
         publication_authority.local_public_output(),
         stream,
     );
-    if let Some(bank) = parameter_bank {
-        completed = completed.with_parameter_bank(bank);
-    }
+    completed = completed.with_parameter_banks(parameter_bank);
     finalizer.finish(completed)
 }
 

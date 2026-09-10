@@ -114,6 +114,16 @@ pub(crate) fn normalize_algorithm(
             let beta_slow = number("beta_slow")?.unwrap_or(1.0);
             let concentration = number("mscale")?.unwrap_or(1.0);
             let attention_factor = number("mscale_all_dim")?.unwrap_or(0.0);
+            let factor = required_positive("factor")?;
+            let scale = |coefficient: f32| {
+                if factor <= 1.0 {
+                    1.0
+                } else {
+                    1.0 + 0.1 * coefficient * factor.ln()
+                }
+            };
+            let amplitude = number("attention_factor")?
+                .unwrap_or_else(|| scale(concentration) / scale(attention_factor));
             if beta_fast <= 0.0
                 || beta_slow <= 0.0
                 || concentration <= 0.0
@@ -122,12 +132,11 @@ pub(crate) fn normalize_algorithm(
                 return Err("RoPE YaRN scalar values are outside their valid ranges".into());
             }
             RotaryAlgorithm::Yarn {
-                factor: required_positive("factor")?,
+                factor,
                 original_max_positions: original_positions()?,
                 beta_fast,
                 beta_slow,
-                concentration,
-                attention_factor,
+                amplitude,
                 truncate: boolean("truncate", true)?,
             }
         }
@@ -163,8 +172,7 @@ mod tests {
                 original_max_positions: 4_096,
                 beta_fast: 32.0,
                 beta_slow: 1.0,
-                concentration: 1.0,
-                attention_factor: 0.0,
+                amplitude: 1.0 + 0.1 * 4.0_f32.ln(),
                 truncate: true,
             }
         );

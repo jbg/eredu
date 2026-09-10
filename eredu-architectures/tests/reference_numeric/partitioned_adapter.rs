@@ -43,6 +43,18 @@ pub(super) fn prepare_plan(
     rank: usize,
     completion_timeout: std::time::Duration,
 ) -> Result<PreparedModelSources, String> {
+    prepare_plan_with_banks(inspection, plan, rank, completion_timeout, None)
+}
+
+pub(super) fn prepare_plan_with_banks(
+    inspection: &eredu_core::ArtifactInspection<
+        eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+    >,
+    plan: &eredu_core::ExecutionPlan,
+    rank: usize,
+    completion_timeout: std::time::Duration,
+    bank_options: Option<ParameterBankLoadOptions>,
+) -> Result<PreparedModelSources, String> {
     let parallel = eredu_runtime::ParallelLoadRequest::new(
         ParallelRankTopology::new(*plan.topology(), rank).map_err(|error| error.to_string())?,
         eredu_runtime::PipelineWireContract::new(eredu_runtime::PipelineActivationDtype::Float32),
@@ -61,10 +73,31 @@ pub(super) fn prepare_plan(
         Some(parallel),
     )
     .map_err(|error| error.to_string())?;
+    let request = if let Some(options) = bank_options {
+        let ordinary = match request.weight_residency().layers() {
+            LayerWeightResidency::FullyResident => {
+                eredu_runtime::OrdinaryWeightResidency::FullyResident
+            }
+            LayerWeightResidency::LayerwiseHost(options) => {
+                eredu_runtime::OrdinaryWeightResidency::LayerwiseHost(options)
+            }
+            LayerWeightResidency::DenseDiskStream(options) => {
+                eredu_runtime::OrdinaryWeightResidency::DenseDiskStream(options)
+            }
+            _ => return Err("selected residency has no ordinary component".into()),
+        };
+        request.with_weight_residency(
+            eredu_runtime::WeightResidency::with_independent_parameter_banks(ordinary, options),
+        )
+    } else {
+        request
+    };
     let selected = eredu_architectures::select_preparation(
         inspection,
         &request,
-        &prepared_adapter::NumericPreparationProvider { addressable: false },
+        &prepared_adapter::NumericPreparationProvider {
+            addressable: bank_options.is_some(),
+        },
     )
     .map_err(|error| error.to_string())?;
     let admitted = eredu_core::ModelPreparationPlan::from_retained_admission(
@@ -210,8 +243,7 @@ pub(super) fn routed(
     type State = DeviceState<NumericBackend, NumericHybridLayerState>;
     let route = PartitionedRoutedRoute::<NumericBackend, State, State, _, _>::new(
         context, context, visitor, visitor,
-    )
-    .without_relu2();
+    );
     construct_prepared_execution(
         sources,
         Some(communication),
@@ -258,7 +290,7 @@ pub(super) fn composite(
     .map_err(|error| error.to_string())
 }
 
-pub(super) fn assert_narrow_route_and_native_pairing_rejections() {
+pub(super) fn assert_shared_route_and_native_pairing_contract() {
     let config = serde_json::json!({
         "model_type":"nemotron_h", "vocab_size":16, "hidden_size":8,
         "intermediate_size":12, "num_hidden_layers":2,
@@ -302,15 +334,13 @@ pub(super) fn assert_narrow_route_and_native_pairing_rejections() {
     assert!(NumericPreparedCommunication::realize(&other_sources, &context).is_err());
 
     let provider_calls = Arc::new(AtomicUsize::new(0));
-    let error = routed(sources, &context, Arc::clone(&provider_calls), None)
-        .err()
-        .expect("a gated/pooling-only route must reject selected ReLU-squared execution");
-    assert_eq!(
-        error,
-        "selected execution has no supplied typed construction mechanism"
-    );
+    let executable = routed(sources, &context, Arc::clone(&provider_calls), None)
+        .expect("the shared routed constructor admits the selected ReLU-squared equation");
+    assert!(executable
+        .positions()
+        .unwrap()
+        .iter()
+        .all(|position| *position == 0));
     assert_eq!(provider_calls.load(Ordering::Relaxed), 0);
-    assert!(world.materializations().is_empty());
     assert!(world.trace().is_empty());
-    assert!(context.mechanism_trace().is_empty());
 }

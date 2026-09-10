@@ -81,7 +81,8 @@ where
         let path = self.decoder.unit_path(group, index)?;
         match unit {
             Unit::Target(block) if group == 0 => block.forward_observed_with_provider(
-                eredu_runtime::RoutedObservationPoint::new(
+                eredu_runtime::RoutedObservationPoints::new(
+                    eredu_runtime::RoutedBankId::new(0),
                     format!("{path}.mlp"),
                     self.config.num_experts,
                 ),
@@ -298,6 +299,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         let embedding_name = "model.embed_tokens.weight";
         let decoder = HybridDecoder::new_with_prediction_groups(
             StaticModuleSpec {
+                normalization_groups: None,
                 embedding_weight: embedding_name.into(),
                 normalization_weight: "model.norm.weight".into(),
                 head_weight: "lm_head.weight".into(),
@@ -706,6 +708,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
 
 fn static_spec(config: &HybridConfig) -> Result<StaticModuleSpec, Error> {
     Ok(StaticModuleSpec {
+        normalization_groups: None,
         embedding_weight: "model.embed_tokens.weight".into(),
         normalization_weight: "model.norm.weight".into(),
         head_weight: "lm_head.weight".into(),

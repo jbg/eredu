@@ -36,6 +36,7 @@ impl TopKGroupSelector {
             &mut NativeRouting {
                 selector: self,
                 stream,
+                input_dtype: input.dtype(),
             },
             input,
             control,
@@ -43,13 +44,19 @@ impl TopKGroupSelector {
         .map_err(|error| Exception::custom(error.to_string()))?;
         let output = |selection: eredu_nn::GroupSelection<Array>| {
             let (indices, scores, weights) = selection.into_parts();
-            GroupSelectionOutput {
+            Ok::<_, Exception>(GroupSelectionOutput {
                 indices,
                 scores,
-                weights,
-            }
+                weights: weights.as_dtype(
+                    routing_dtype(self.arithmetic.coefficients, input.dtype(), weights.dtype()),
+                    stream,
+                )?,
+            })
         };
-        Ok((result.original.map(output), output(result.effective)))
+        Ok((
+            result.original.map(output).transpose()?,
+            output(result.effective)?,
+        ))
     }
 }
 
@@ -63,6 +70,7 @@ struct NativeRows {
 struct NativeRouting<'a> {
     selector: &'a mut TopKGroupSelector,
     stream: &'a Stream,
+    input_dtype: Dtype,
 }
 
 impl NativeRouting<'_> {
@@ -149,7 +157,8 @@ impl RoutingMechanism for NativeRouting<'_> {
         self.selector.project_logits(input, self.stream)
     }
     fn transform(&self, raw: &Array) -> Result<Array, Exception> {
-        self.selector.score_function.apply(raw.clone(), self.stream)
+        self.selector
+            .apply_scores(raw.clone(), self.input_dtype, self.stream)
     }
     fn ranking(&self, scores: &Array) -> Result<Array, Exception> {
         match self.selector.e_score_correction_bias.as_ref() {
@@ -310,6 +319,7 @@ mod tests {
             &mut NativeRouting {
                 selector: &mut selector,
                 stream: &stream,
+                input_dtype: input.dtype(),
             },
             &input,
             |v| {
@@ -345,6 +355,7 @@ mod tests {
             &mut NativeRouting {
                 selector: &mut selector,
                 stream: &stream,
+                input_dtype: input.dtype(),
             },
             &grouped_input,
             |v| {

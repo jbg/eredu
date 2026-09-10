@@ -55,15 +55,103 @@ fn native_speculative_forks_force_tokens_and_apply_independent_target_and_draft_
 
 fn native_speculative_control(experiment: bool) {
     let (target, draft) = artifacts();
+    speculative_control_artifacts(
+        target,
+        draft,
+        experiment,
+        eredu_core::ResidencyPlan::FullyResident,
+        false,
+        0.8,
+    );
+}
+
+#[test]
+#[cfg_attr(feature = "metal", ignore = "run CPU-only native initialization")]
+fn k2_independent_draft_control_matches_uninterrupted_and_preserves_budgets() {
+    for family in ["k2_horizon_dense", "k2_horizon_mova"] {
+        for residency in [
+            eredu_core::ResidencyPlan::FullyResident,
+            eredu_core::ResidencyPlan::LayerwiseHost {
+                device_layer_window: 1,
+                device_budget_bytes: Some(1 << 20),
+                host_budget_bytes: Some(1 << 20),
+            },
+            eredu_core::ResidencyPlan::DenseDiskStream {
+                device_budget_bytes: 1 << 20,
+                host_budget_bytes: 1 << 20,
+                host_lookahead: 1,
+                background_queue: 1,
+            },
+        ] {
+            for temperature in [0.0, 0.8] {
+                let target = fixture(false);
+                let draft = fixture(false);
+                use_family_weights(&target.0, family);
+                use_family_weights(&draft.0, "k2_horizon_dense");
+                eprintln!("independent draft: {family}, {residency:?}, temperature={temperature}");
+                speculative_control_artifacts(
+                    target,
+                    draft,
+                    false,
+                    residency.clone(),
+                    true,
+                    temperature,
+                );
+            }
+        }
+        let target = fixture(false);
+        let draft = fixture(false);
+        use_family_weights(&target.0, family);
+        use_family_weights(&draft.0, "k2_horizon_dense");
+        speculative_control_artifacts(
+            target,
+            draft,
+            true,
+            eredu_core::ResidencyPlan::FullyResident,
+            true,
+            0.8,
+        );
+    }
+}
+
+fn speculative_control_artifacts(
+    target: Fixture,
+    draft: Fixture,
+    experiment: bool,
+    residency: eredu_core::ResidencyPlan,
+    compare: bool,
+    temperature: f32,
+) {
+    let split = compare && matches!(residency, eredu_core::ResidencyPlan::FullyResident);
     let plan = ExecutionPlan::fully_resident(local_device_plan(LocalDevice::Cpu).unwrap())
         .with_required_session_capabilities(SessionCapabilities::new(true, true, true))
+        .with_residency(residency)
         .with_drafting(DraftingPlan::External {
             model: draft.0.display().to_string(),
-            placement: DraftPlacementPlan::Target,
+            placement: if split {
+                DraftPlacementPlan::Device {
+                    device: local_device_plan(LocalDevice::Cpu).unwrap(),
+                }
+            } else {
+                DraftPlacementPlan::Target
+            },
             max_draft_tokens: 2,
-            lookahead: false,
-            adaptive_lookahead: false,
+            lookahead: compare,
+            adaptive_lookahead: compare,
         });
+    let config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(target.0.join("config.json")).unwrap()).unwrap();
+    let plan = if compare && config["num_experts"].as_u64().unwrap_or(0) > 0 {
+        plan.with_expert_cache(Some(eredu_core::ExpertCachePlan::new(
+            Some(1152),
+            Some(1152),
+            1152,
+            1152,
+            eredu_core::residency::CacheEvictionPolicy::LeastRecentlyUsed,
+        )))
+    } else {
+        plan
+    };
     let mut loaded =
         LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &target.0, &plan).unwrap();
     let generation_options = loaded.speculative_generation_options().unwrap().unwrap();
@@ -80,12 +168,29 @@ fn native_speculative_control(experiment: bool) {
     let settings = PreparedChatGenerationSettings {
         overrides: GenerationConfigOverrides {
             max_new_tokens: Some(7),
-            temperature: Some(0.8),
+            temperature: Some(temperature),
             top_k: Some(8),
             ..Default::default()
         },
         seed: 17,
         ..Default::default()
+    };
+    let expected = if compare {
+        Some(
+            model
+                .generate_prepared_chat_speculative(PreparedChatSpeculativeGenerationRequest {
+                    input: PreparedChatInput::rendered_prompt(&chat),
+                    drafting: drafting.as_speculative_draft().unwrap(),
+                    settings,
+                    options: generation_options.clone(),
+                    caller_stop_sequences: &[],
+                    cancellation: Default::default(),
+                    on_event: |_| {},
+                })
+                .unwrap(),
+        )
+    } else {
+        None
     };
     let usage = CaptureUsage {
         captures: if experiment { 512 } else { 128 },
@@ -155,8 +260,10 @@ fn native_speculative_control(experiment: bool) {
         Vec::new()
     };
     // An entire controlled run, including replay, uses retained prepared resources.
-    std::fs::remove_file(target.0.join("model.safetensors")).unwrap();
-    std::fs::remove_file(draft.0.join("model.safetensors")).unwrap();
+    if !compare {
+        std::fs::remove_file(target.0.join("model.safetensors")).unwrap();
+        std::fs::remove_file(draft.0.join("model.safetensors")).unwrap();
+    }
     let mut replays = Vec::new();
     let mut captures = Vec::new();
     let output = model
@@ -205,7 +312,12 @@ fn native_speculative_control(experiment: bool) {
                     }
                     replays.push(tokens);
                     if epoch < 2 {
+                        let before = session.snapshot_usage();
                         session.restore(&saved)?;
+                        assert!(
+                            session.snapshot_usage().cumulative_copy_bytes
+                                > before.cumulative_copy_bytes
+                        );
                     }
                 }
                 if experiment {
@@ -272,10 +384,19 @@ fn native_speculative_control(experiment: bool) {
             },
         )
         .unwrap();
+    if !experiment {
+        if let Some(expected) = expected {
+            assert_eq!(output.token_ids(), expected.token_ids());
+        }
+    }
     assert!(output.timing().time_to_first_token().is_some());
     assert_eq!(replays[0], replays[1]);
     assert_eq!(replays[0], replays[2]);
-    assert!(!replays[0].is_empty());
+    if replays[0].is_empty() {
+        // This greedy fixture terminates at prefill, before any draft block.
+        assert!(compare && temperature == 0.0 && output.token_ids().len() == 1);
+        return;
+    }
     assert!(captures
         .iter()
         .any(|c| c.role == SpeculativeCaptureRole::Draft));

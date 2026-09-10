@@ -357,6 +357,28 @@ impl WeightLoweringDescriptor {
                         .is_some_and(|(physical, logical)| physical == logical)
                 }) && self.has_valid_packed_geometry()
             }
+            SourceTensorEncoding::RecipeOutput(StoredDtype::U8)
+                if matches!(self.executable(), LinearFormat::GgufIQuant { .. }) =>
+            {
+                let Some(axis) = self.packed_axis() else {
+                    return false;
+                };
+                let LinearFormat::GgufIQuant { ggml_type, .. } = self.executable() else {
+                    unreachable!()
+                };
+                same_unpacked_dimensions(axis)
+                    && self.has_valid_packed_geometry()
+                    && ggml_type
+                        .block_and_bytes()
+                        .ok()
+                        .is_some_and(|(block, bytes)| {
+                            let logical = self.logical_shape()[axis] as u64;
+                            logical
+                                .checked_div(block)
+                                .and_then(|n| n.checked_mul(bytes))
+                                == Some(self.physical_shape()[axis] as u64)
+                        })
+            }
             SourceTensorEncoding::Safetensors(StoredDtype::U8)
             | SourceTensorEncoding::RecipeOutput(StoredDtype::U8)
                 if self.executable() == LinearFormat::MxFp4 =>

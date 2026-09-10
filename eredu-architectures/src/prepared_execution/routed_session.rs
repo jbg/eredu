@@ -10,8 +10,7 @@ use eredu_runtime::{
 use super::PreparedExecutionError;
 use crate::composite_execution::PreparedCompositeArchitecture;
 use crate::routed_text::{
-    PlannedAddressableGatedProduct, PlannedAddressableRelu2, PlannedResidentGatedProduct,
-    PlannedResidentRelu2, PreparedRelu2RoutedTextArchitecture, PreparedRoutedTextArchitecture,
+    PlannedAddressableBank, PlannedResidentBank, PreparedRoutedTextArchitecture, SelectedRoutedBank,
 };
 
 /// Retained architecture facts for final adaptation of a constructed text session.
@@ -65,7 +64,7 @@ pub fn construct_selected_routed_composite_session<
     Bank,
     Movement,
     C,
-    MakeBank,
+    MakeBanks,
     R,
     I,
     O,
@@ -74,7 +73,7 @@ pub fn construct_selected_routed_composite_session<
     prepared: crate::replicated_text::PreparedRoutedCompositeTextArchitecture<A, Admission>,
     mechanisms: M,
     context: &<B::Tensor as Tensor>::Context,
-    make_bank: MakeBank,
+    make_banks: MakeBanks,
     native: C,
     finish_resident: R,
     finish_addressable: I,
@@ -93,17 +92,20 @@ where
     Bank::Error: std::fmt::Display,
     Movement: IndexedMovement<B>,
     Movement::Error: std::fmt::Display,
-    MakeBank: FnOnce(
-        &PreparedRoutedTextArchitecture<PreparedCompositeArchitecture<A>>,
+    MakeBanks: FnOnce(
+        &std::collections::BTreeMap<eredu_runtime::RoutedBankId, SelectedRoutedBank>,
         eredu_runtime::ParameterBankLoadOptions,
-    ) -> Result<(Bank, Movement), E>,
+    ) -> Result<
+        std::collections::BTreeMap<eredu_runtime::RoutedBankId, (Bank, Movement)>,
+        E,
+    >,
     R: FnOnce(
         C,
         ReplicatedTextSession<
             PreparedCompositeArchitecture<A>,
             B,
             M,
-            RoutedReplicatedTextExecution<PlannedResidentGatedProduct>,
+            RoutedReplicatedTextExecution<eredu_runtime::RoutedBankProviders<PlannedResidentBank>>,
         >,
         PreparedCompositeSessionFacts<Admission>,
     ) -> Result<O, E>,
@@ -113,7 +115,9 @@ where
             PreparedCompositeArchitecture<A>,
             B,
             M,
-            RoutedReplicatedTextExecution<PlannedAddressableGatedProduct<B, Bank, Movement>>,
+            RoutedReplicatedTextExecution<
+                eredu_runtime::RoutedBankProviders<PlannedAddressableBank<B, Bank, Movement>>,
+            >,
         >,
         PreparedCompositeSessionFacts<Admission>,
     ) -> Result<O, E>,
@@ -127,11 +131,11 @@ where
         processor,
         admission,
     };
-    construct_selected_gated_session(
+    construct_selected_routed_session(
         routed,
         mechanisms,
         context,
-        make_bank,
+        make_banks,
         (native, facts),
         |(native, facts), session, _| finish_resident(native, session, facts),
         |(native, facts), session, _| finish_addressable(native, session, facts),
@@ -203,18 +207,18 @@ impl PreparedTextSessionFacts {
     }
 }
 
-/// Constructs the selected gated provider and session before native final adaptation.
+/// Constructs the selected providers and session before native final adaptation.
 ///
-/// Bank creation runs only for the exact independently cached selection. The
+/// Bank creation receives the complete collection and one shared residency budget. The
 /// borrowed prepared value supplies admitted bank recipes and geometry, never
 /// caller load options. Final callbacks receive already constructed sessions;
 /// the shared native context is moved into only the selected final callback.
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
-pub fn construct_selected_gated_session<B, A, M, Bank, Movement, C, MakeBank, R, I, O, E>(
+pub fn construct_selected_routed_session<B, A, M, Bank, Movement, C, MakeBanks, R, I, O, E>(
     prepared: PreparedRoutedTextArchitecture<A>,
     mechanisms: M,
     context: &<B::Tensor as Tensor>::Context,
-    make_bank: MakeBank,
+    make_banks: MakeBanks,
     native: C,
     finish_resident: R,
     finish_addressable: I,
@@ -231,13 +235,21 @@ where
     Bank::Error: std::fmt::Display,
     Movement: IndexedMovement<B>,
     Movement::Error: std::fmt::Display,
-    MakeBank: FnOnce(
-        &PreparedRoutedTextArchitecture<A>,
+    MakeBanks: FnOnce(
+        &std::collections::BTreeMap<eredu_runtime::RoutedBankId, SelectedRoutedBank>,
         eredu_runtime::ParameterBankLoadOptions,
-    ) -> Result<(Bank, Movement), E>,
+    ) -> Result<
+        std::collections::BTreeMap<eredu_runtime::RoutedBankId, (Bank, Movement)>,
+        E,
+    >,
     R: FnOnce(
         C,
-        ReplicatedTextSession<A, B, M, RoutedReplicatedTextExecution<PlannedResidentGatedProduct>>,
+        ReplicatedTextSession<
+            A,
+            B,
+            M,
+            RoutedReplicatedTextExecution<eredu_runtime::RoutedBankProviders<PlannedResidentBank>>,
+        >,
         PreparedTextSessionFacts,
     ) -> Result<O, E>,
     I: FnOnce(
@@ -246,7 +258,9 @@ where
             A,
             B,
             M,
-            RoutedReplicatedTextExecution<PlannedAddressableGatedProduct<B, Bank, Movement>>,
+            RoutedReplicatedTextExecution<
+                eredu_runtime::RoutedBankProviders<PlannedAddressableBank<B, Bank, Movement>>,
+            >,
         >,
         PreparedTextSessionFacts,
     ) -> Result<O, E>,
@@ -260,84 +274,15 @@ where
             finish_resident(native, session, facts).map_err(PreparedExecutionError::Backend)
         }
         ParameterBankResidency::IndependentCache(options) => {
-            let (bank, movement) =
-                make_bank(&prepared, options).map_err(PreparedExecutionError::Backend)?;
+            let banks =
+                make_banks(prepared.banks(), options).map_err(PreparedExecutionError::Backend)?;
             let session = prepared
-                .construct_addressable_session::<B, M, Bank, Movement>(
-                    mechanisms, bank, movement, context,
-                )
+                .construct_addressable_session::<B, M, Bank, Movement>(mechanisms, banks, context)
                 .map_err(PreparedExecutionError::Architecture)?;
             finish_addressable(native, session, facts).map_err(PreparedExecutionError::Backend)
         }
         _ => Err(PreparedExecutionError::Architecture(
-            "selected gated bank residency has no construction mechanism".into(),
-        )),
-    }
-}
-
-/// Constructs the selected ReLU-squared provider and session before native final adaptation.
-#[allow(clippy::too_many_arguments, clippy::type_complexity)]
-pub fn construct_selected_relu2_session<B, A, M, Bank, Movement, C, MakeBank, R, I, O, E>(
-    prepared: PreparedRelu2RoutedTextArchitecture<A>,
-    mechanisms: M,
-    context: &<B::Tensor as Tensor>::Context,
-    make_bank: MakeBank,
-    native: C,
-    finish_resident: R,
-    finish_addressable: I,
-) -> Result<O, PreparedExecutionError<E>>
-where
-    B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>
-        + GroupedNeuralBackend,
-    M: ReplicatedTextSessionMechanisms<A, B>,
-    A: LayeredArchitecture<B, M::State> + RoutedLayeredArchitecture<B, M::State>,
-    A::Error: std::fmt::Display,
-    M::PolicyError: std::fmt::Display,
-    M::Error: std::fmt::Display,
-    Bank: AddressableGroupedBank<B>,
-    Bank::Error: std::fmt::Display,
-    Movement: IndexedMovement<B>,
-    Movement::Error: std::fmt::Display,
-    MakeBank: FnOnce(
-        &PreparedRelu2RoutedTextArchitecture<A>,
-        eredu_runtime::ParameterBankLoadOptions,
-    ) -> Result<(Bank, Movement), E>,
-    R: FnOnce(
-        C,
-        ReplicatedTextSession<A, B, M, RoutedReplicatedTextExecution<PlannedResidentRelu2>>,
-        PreparedTextSessionFacts,
-    ) -> Result<O, E>,
-    I: FnOnce(
-        C,
-        ReplicatedTextSession<
-            A,
-            B,
-            M,
-            RoutedReplicatedTextExecution<PlannedAddressableRelu2<B, Bank, Movement>>,
-        >,
-        PreparedTextSessionFacts,
-    ) -> Result<O, E>,
-{
-    let facts = PreparedTextSessionFacts::from_prepared(prepared.text());
-    match prepared.bank_residency() {
-        ParameterBankResidency::WithLayer => {
-            let session = prepared
-                .construct_resident_session::<B, M>(mechanisms, context)
-                .map_err(PreparedExecutionError::Architecture)?;
-            finish_resident(native, session, facts).map_err(PreparedExecutionError::Backend)
-        }
-        ParameterBankResidency::IndependentCache(options) => {
-            let (bank, movement) =
-                make_bank(&prepared, options).map_err(PreparedExecutionError::Backend)?;
-            let session = prepared
-                .construct_addressable_session::<B, M, Bank, Movement>(
-                    mechanisms, bank, movement, context,
-                )
-                .map_err(PreparedExecutionError::Architecture)?;
-            finish_addressable(native, session, facts).map_err(PreparedExecutionError::Backend)
-        }
-        _ => Err(PreparedExecutionError::Architecture(
-            "selected ReLU-squared bank residency has no construction mechanism".into(),
+            "selected bank residency has no construction mechanism".into(),
         )),
     }
 }

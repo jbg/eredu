@@ -17,6 +17,88 @@ use crate::backend::runtime::checkpoint::store::{
     MlxParameterMaterializationContext, PendingWeightMaterialization, WeightMaterialization,
 };
 
+/// Conservative native tensor and host-index buffers of the recipe materializer.
+/// Direct encoded initialization needs only its output. The ordinary path can
+/// retain every source until completion; count all intermediates, source copies,
+/// and the final contiguous output even when the allocator can recycle them.
+/// Native driver bookkeeping and allocator caches are not tensor workspace.
+pub(crate) fn native_recipe_workspace(
+    recipe: &DerivedWeightRecipe,
+    source: &dyn CheckpointSource,
+) -> Result<u64, String> {
+    if DirectRecipeRead::prepare(recipe, source)
+        .map_err(|error| error.to_string())?
+        .is_some()
+    {
+        return recipe
+            .infer(source)
+            .map(|metadata| metadata.byte_len())
+            .map_err(|error| error.to_string());
+    }
+    fn add(left: u64, right: u64) -> Result<u64, String> {
+        left.checked_add(right)
+            .ok_or_else(|| "native recipe workspace overflow".into())
+    }
+    fn buffers(recipe: &DerivedWeightRecipe, source: &dyn CheckpointSource) -> Result<u64, String> {
+        let output = recipe
+            .infer(source)
+            .map_err(|error| error.to_string())?
+            .byte_len();
+        match recipe {
+            DerivedWeightRecipe::Source { .. } => add(output, output),
+            DerivedWeightRecipe::Stack { inputs, .. }
+            | DerivedWeightRecipe::Concatenate { inputs, .. } => inputs
+                .iter()
+                .try_fold(output, |bytes, input| add(bytes, buffers(input, source)?)),
+            DerivedWeightRecipe::Select { input, selection } => {
+                let indices = match selection {
+                    TensorSelection::Full => 0,
+                    TensorSelection::Range { start, end, .. } => end - start,
+                    TensorSelection::Indices { indices, .. } => indices.len(),
+                    TensorSelection::Contiguous { shape, .. } => shape
+                        .iter()
+                        .try_fold(1usize, |n, d| n.checked_mul(*d))
+                        .ok_or("native index count overflow")?,
+                };
+                let index_bytes = (indices as u64)
+                    .checked_mul(8)
+                    .ok_or("native index buffers overflow")?;
+                add(add(buffers(input, source)?, output)?, index_bytes)
+            }
+            DerivedWeightRecipe::NegLog { input } => {
+                // Negation output plus the sign-validation boolean tensor.
+                let metadata = input.infer(source).map_err(|error| error.to_string())?;
+                let elements = metadata
+                    .shape()
+                    .iter()
+                    .try_fold(1u64, |n, d| n.checked_mul(*d as u64))
+                    .ok_or("native validation size overflow")?;
+                add(
+                    add(
+                        buffers(input, source)?,
+                        output
+                            .checked_mul(2)
+                            .ok_or("native neg-log size overflow")?,
+                    )?,
+                    elements,
+                )
+            }
+            DerivedWeightRecipe::Reshape { input, .. }
+            | DerivedWeightRecipe::Transpose { input, .. }
+            | DerivedWeightRecipe::Cast { input, .. }
+            | DerivedWeightRecipe::View { input, .. }
+            | DerivedWeightRecipe::SubtractOne { input } => add(buffers(input, source)?, output),
+        }
+    }
+    add(
+        buffers(recipe, source)?,
+        recipe
+            .infer(source)
+            .map_err(|error| error.to_string())?
+            .byte_len(),
+    )
+}
+
 /// A byte-preserving recipe admitted for direct initialization of native storage.
 pub(crate) struct DirectRecipeRead {
     shape: Vec<i32>,

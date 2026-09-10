@@ -207,8 +207,8 @@ impl<B: NeuralBackend> KimiDeltaAttention<B> {
             .as_ref()
             .reshape(&[1, 1, self.num_heads, self.head_dim], context)?;
         let rate = B::exp(self.a_log.as_ref().clone(), context)?.multiply_scalar(-1.0, context)?;
-        let log_decay =
-            B::softplus(decay_logits.add(&dt_bias, context)?, context)?.multiply(&rate, context)?;
+        let log_decay = B::softplus(decay_logits.add(&dt_bias, context)?, 1.0, context)?
+            .multiply(&rate, context)?;
         let beta = B::sigmoid(
             self.b_proj
                 .forward(input, context)?

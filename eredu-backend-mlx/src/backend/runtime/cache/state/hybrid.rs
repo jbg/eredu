@@ -528,20 +528,56 @@ impl MlxHybridState {
                 Some(MlxHybridAttentionState::KeyValue(MlxKeyValueLayerState::Device(cache))) => {
                     Some(bound.max(cache.continuation_capacity_bound(additional)?))
                 }
+                Some(MlxHybridAttentionState::KeyValue(MlxKeyValueLayerState::Paged(cache))) => {
+                    Some(
+                        bound.max(
+                            u64::try_from(KeyValueCache::offset(cache))
+                                .ok()?
+                                .checked_add(additional)?,
+                        ),
+                    )
+                }
                 _ => None,
             })
     }
 
     pub(crate) fn supports_isolated_snapshot(&self) -> bool {
-        self.manager.is_none()
-            && self.layers.iter().all(|layer| {
+        self.layers.iter().all(|layer| match &layer.attention {
+            None | Some(MlxHybridAttentionState::KeyValue(MlxKeyValueLayerState::Device(_))) => {
+                true
+            }
+            Some(MlxHybridAttentionState::KeyValue(MlxKeyValueLayerState::Paged(cache))) => self
+                .manager
+                .as_ref()
+                .is_some_and(|manager| manager.session_id() == cache.manager().session_id()),
+            _ => false,
+        })
+    }
+
+    pub(crate) fn isolated_snapshot_auxiliary_bytes(&self) -> Option<u64> {
+        self.manager
+            .as_ref()
+            .map(|manager| manager.isolated_snapshot_bytes())
+            .unwrap_or(Some(0))
+    }
+
+    pub(crate) fn isolated_snapshot_auxiliary_growth(&self, additional: u64) -> Option<u64> {
+        let paged = self
+            .layers
+            .iter()
+            .filter(|layer| {
                 matches!(
                     layer.attention,
-                    None | Some(MlxHybridAttentionState::KeyValue(
-                        MlxKeyValueLayerState::Device(_)
+                    Some(MlxHybridAttentionState::KeyValue(
+                        MlxKeyValueLayerState::Paged(_)
                     ))
                 )
             })
+            .count() as u64;
+        additional
+            .checked_add(1)?
+            .checked_mul(paged)?
+            .checked_mul(8192)
     }
 
     /// Deeply copies attention and every architecture-declared fixed tensor.
@@ -549,9 +585,18 @@ impl MlxHybridState {
     pub(crate) fn isolated_snapshot(&self, stream: &Stream) -> Result<Self, Exception> {
         if !self.supports_isolated_snapshot() {
             return Err(Exception::custom(
-                "isolated snapshots of paged/compressed state are unsupported",
+                "isolated snapshots require ordinary KV attention and consistent paging managers",
             ));
         }
+        let manager = self
+            .manager
+            .as_ref()
+            .map(|manager| {
+                manager
+                    .isolated_snapshot(stream)
+                    .map_err(|e| Exception::custom(e.to_string()))
+            })
+            .transpose()?;
         let layers = self
             .layers
             .iter()
@@ -563,7 +608,21 @@ impl MlxHybridState {
                     ))) => Some(MlxHybridAttentionState::KeyValue(
                         MlxKeyValueLayerState::Device(cache.isolated_snapshot(stream)?),
                     )),
-                    _ => unreachable!("validated device attention and fixed state"),
+                    Some(MlxHybridAttentionState::KeyValue(MlxKeyValueLayerState::Paged(
+                        cache,
+                    ))) => {
+                        let mut cache = cache.deep_clone_state(stream)?;
+                        cache.rebind_paging_manager(
+                            manager
+                                .as_ref()
+                                .expect("paged state has copied manager")
+                                .clone(),
+                        );
+                        Some(MlxHybridAttentionState::KeyValue(
+                            MlxKeyValueLayerState::Paged(cache),
+                        ))
+                    }
+                    _ => unreachable!("validated KV attention and fixed state"),
                 };
                 let fixed = layer
                     .fixed
@@ -595,7 +654,7 @@ impl MlxHybridState {
             layout: self.layout.clone(),
             global_layer_start: self.global_layer_start,
             layers,
-            manager: None,
+            manager,
         })
     }
 

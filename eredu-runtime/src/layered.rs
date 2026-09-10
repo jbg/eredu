@@ -10,7 +10,7 @@ use eredu_nn::{NeuralBackend, Parameterized, Tensor};
 use crate::{
     observe_and_intervene, ActivationObserver, ExecutionGraph, ExecutionGroupSchedule,
     ExecutionScheduleError, ExecutionUnitLayout, ExpertPass, NoAuxiliaryBoundary,
-    ObservedExpertProvider, RoutedExpertProvider, RoutedObservationPoint, RuntimeState,
+    ObservedExpertProvider, RoutedExpertProvider, RoutedObservationPoints, RuntimeState,
     StateLayout, SubmissionBackend,
 };
 
@@ -1057,11 +1057,11 @@ where
     /// Architectures without observable routed work in the selected unit return
     /// `None`. Concrete backends must not reconstruct semantic paths or expert
     /// cardinality.
-    fn routed_observation_point(
+    fn routed_observation_points(
         &self,
         _group: usize,
         _index: usize,
-    ) -> Result<Option<RoutedObservationPoint>, Self::Error> {
+    ) -> Result<Option<RoutedObservationPoints>, Self::Error> {
         Ok(None)
     }
 
@@ -1128,7 +1128,7 @@ where
         O: ActivationObserver<B::Tensor, Self::Error> + ?Sized,
         Self::Error: std::fmt::Display,
     {
-        match self.routed_observation_point(group, index)? {
+        match self.routed_observation_points(group, index)? {
             Some(point) => {
                 let mut observed = ObservedExpertProvider::new(provider, observer, point);
                 self.forward_unit_with_provider(
@@ -2558,7 +2558,7 @@ where
             |architecture, group, index, unit, hidden, state, forward, parallel, context| {
                 let path = architecture.unit_path(group, index)?;
                 let input = observe_and_intervene(observer, &format!("{path}.input"), hidden)?;
-                let output = match architecture.routed_observation_point(group, index)? {
+                let output = match architecture.routed_observation_points(group, index)? {
                     Some(point) => {
                         let mut observed = ObservedExpertProvider::new(provider, observer, point);
                         architecture.forward_unit_parallel_with_provider(

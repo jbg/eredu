@@ -109,6 +109,14 @@ pub struct SpeculativeCaptureSchema {
 }
 
 impl SpeculativeCaptureSchema {
+    /// An independent decoder requires no target feature tensors.
+    pub fn independent(identity: SpeculativeIdentity) -> Self {
+        Self {
+            identity,
+            entries: Vec::new(),
+        }
+    }
+
     /// Creates a nonempty schema with unique paths and observation identities.
     pub fn new(
         identity: SpeculativeIdentity,

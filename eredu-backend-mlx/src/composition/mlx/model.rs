@@ -24,13 +24,13 @@ impl Executable {
 
     pub(crate) fn erased(
         &self,
-    ) -> &(dyn super::replicated_text::ErasedReplicatedTextExecutable + '_) {
+    ) -> &(dyn super::replicated_text::ErasedReplicatedTextExecutable + 'static) {
         self.inner.as_ref()
     }
 
     pub(crate) fn erased_mut(
         &mut self,
-    ) -> &mut (dyn super::replicated_text::ErasedReplicatedTextExecutable + '_) {
+    ) -> &mut (dyn super::replicated_text::ErasedReplicatedTextExecutable + 'static) {
         self.inner.as_mut()
     }
 
@@ -135,7 +135,7 @@ impl Executable {
     pub fn parameter_bank_report(
         &self,
     ) -> Result<
-        Option<crate::backend::runtime::residency::parameter_bank::ParameterBankResidencyReport>,
+        Option<crate::backend::runtime::residency::parameter_bank::ParameterBanksResidencyReport>,
         Error,
     > {
         self.erased().parameter_bank_report()

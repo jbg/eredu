@@ -80,6 +80,10 @@ else()
       mlx-embedded-metallib.patch
       mlx-host-transfer-noexcept-move.patch
       mlx-cpu-submission-progress.patch
+      mlx-cpu-bf16-row-reduction.patch
+      mlx-cpu-cascade-sum.patch
+      mlx-cpu-softmax-reduction.patch
+      mlx-cpu-argpartition-equal-keys.patch
       mlx-gpu-submission-progress.patch
       mlx-submission-recovery.patch)
   set(mlx_patch_applier "${CMAKE_CURRENT_LIST_DIR}/patches/apply-idempotent.cmake")

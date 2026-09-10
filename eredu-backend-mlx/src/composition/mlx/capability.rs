@@ -227,65 +227,81 @@ pub fn static_model_memory(
     let residency = session
         .residency_report()
         .map_err(|error| CapabilityError::Observation(error.to_string()))?;
-    let (logical, host, device, disk, cached_shards) = if let Some(report) = residency {
-        let planned = report.offload().planned_bytes();
-        let resident = report.offload().resident_bytes();
-        let logical = checked_add(
-            checked_add(
-                planned.get(MemoryTier::Host),
-                planned.get(MemoryTier::Device),
-                "planned host plus device parameters",
-            )?,
-            planned.get(MemoryTier::Disk),
-            "complete planned parameter bytes",
-        )?;
-        (
-            Observed::Available {
-                value: logical,
-                kind: ObservationKind::Exact,
-                source: "validated bounded-residency plan".into(),
-            },
-            Observed::Available {
-                value: resident.get(MemoryTier::Host),
-                kind: ObservationKind::Exact,
-                source: "bounded-residency manager".into(),
-            },
-            Observed::Available {
-                value: resident.get(MemoryTier::Device),
-                kind: ObservationKind::Exact,
-                source: "bounded-residency manager".into(),
-            },
-            Observed::Available {
-                value: planned.get(MemoryTier::Disk),
-                kind: ObservationKind::Exact,
-                source: "bounded-residency plan".into(),
-            },
-            Observed::Available {
-                value: report.weight_store().currently_cached_shards as u64,
-                kind: ObservationKind::Observational,
-                source: "checkpoint shard cache".into(),
-            },
-        )
-    } else {
-        (
-            Observed::Unavailable {
-                reason: "loaded model exposes neither resident parameters nor a residency plan"
-                    .into(),
-            },
-            Observed::Unavailable {
-                reason: "host residency unavailable".into(),
-            },
-            Observed::Unavailable {
-                reason: "device residency unavailable".into(),
-            },
-            Observed::Unavailable {
-                reason: "disk residency unavailable".into(),
-            },
-            Observed::Unavailable {
-                reason: "checkpoint shard-cache information unavailable".into(),
-            },
-        )
-    };
+    let (mut logical, mut host, mut device, mut disk, cached_shards) =
+        if let Some(report) = residency {
+            let planned = report.offload().planned_bytes();
+            let resident = report.offload().resident_bytes();
+            let logical = checked_add(
+                checked_add(
+                    planned.get(MemoryTier::Host),
+                    planned.get(MemoryTier::Device),
+                    "planned host plus device parameters",
+                )?,
+                planned.get(MemoryTier::Disk),
+                "complete planned parameter bytes",
+            )?;
+            (
+                Observed::Available {
+                    value: logical,
+                    kind: ObservationKind::Exact,
+                    source: "validated bounded-residency plan".into(),
+                },
+                Observed::Available {
+                    value: resident.get(MemoryTier::Host),
+                    kind: ObservationKind::Exact,
+                    source: "bounded-residency manager".into(),
+                },
+                Observed::Available {
+                    value: resident.get(MemoryTier::Device),
+                    kind: ObservationKind::Exact,
+                    source: "bounded-residency manager".into(),
+                },
+                Observed::Available {
+                    value: planned.get(MemoryTier::Disk),
+                    kind: ObservationKind::Exact,
+                    source: "bounded-residency plan".into(),
+                },
+                Observed::Available {
+                    value: report.weight_store().currently_cached_shards as u64,
+                    kind: ObservationKind::Observational,
+                    source: "checkpoint shard cache".into(),
+                },
+            )
+        } else {
+            (
+                Observed::Unavailable {
+                    reason: "loaded model exposes neither resident parameters nor a residency plan"
+                        .into(),
+                },
+                Observed::Unavailable {
+                    reason: "host residency unavailable".into(),
+                },
+                Observed::Unavailable {
+                    reason: "device residency unavailable".into(),
+                },
+                Observed::Unavailable {
+                    reason: "disk residency unavailable".into(),
+                },
+                Observed::Unavailable {
+                    reason: "checkpoint shard-cache information unavailable".into(),
+                },
+            )
+        };
+    // Independently addressable parameters are excluded from ordinary block
+    // residency. Count each bank's owned entries once, even when banks share
+    // the same physical pool and its aggregate telemetry.
+    if let Some(banks) = session
+        .parameter_bank_report()
+        .map_err(|error| CapabilityError::Observation(error.to_string()))?
+    {
+        for bank in banks.banks().values() {
+            add_parameter_observation(&mut logical, bank.owned_bytes())?;
+            add_parameter_observation(&mut host, bank.host_resident_bytes())?;
+            add_parameter_observation(&mut device, bank.device_resident_bytes())?;
+            // Addressable entries retain independently reopenable disk recipes.
+            add_parameter_observation(&mut disk, bank.owned_bytes())?;
+        }
+    }
     Ok(StaticMemoryReport {
         logical_parameter_bytes: logical,
         current_host_resident_bytes: host,
@@ -306,6 +322,23 @@ pub fn static_model_memory(
         },
         currently_cached_shards: cached_shards,
     })
+}
+
+fn add_parameter_observation(
+    observation: &mut Observed<u64>,
+    extra: u64,
+) -> Result<(), CapabilityError> {
+    if let Observed::Available { value, source, .. } = observation {
+        *value = checked_add(
+            *value,
+            extra,
+            "ordinary and independent bank parameter bytes",
+        )?;
+        if extra != 0 {
+            *source = "ordinary residency plus independently owned bank entries".into();
+        }
+    }
+    Ok(())
 }
 
 impl<'a> ModelCapabilityBackend for MlxBackend<'a> {

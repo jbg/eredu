@@ -1,0 +1,6 @@
+{
+  "torch": "2.14.0",
+  "torch_git": "08187d9e0fba026dc8217405802ab5381dc88d90",
+  "sha256": "1b7012faa1b0184c79728d99976f1236be8ec776288346a341f6edf88a5dd15f",
+  "operation": "weighted RMS normalization with FP32 reduction and BF16 output"
+}

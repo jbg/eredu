@@ -313,14 +313,7 @@ where
     ) -> Result<MaterializedPredictionExtension<B, M>, F>,
     VF: FnOnce(PreparedPartitionPredictionResources<C>) -> V,
     V: RoutedPartitionedPredictionTargetProductionVisitor<B, S, M, Output = E, Error = F>
-        + RoutedPartitionedPredictionTargetProductionVisitor<
-            B,
-            S,
-            M,
-            eredu_nn::GroupedRelu2Spec,
-            Output = E,
-            Error = F,
-        > + RoutedPartitionedPredictionTargetProductionVisitor<B, PS, M, Output = E, Error = F>,
+        + RoutedPartitionedPredictionTargetProductionVisitor<B, PS, M, Output = E, Error = F>,
 {
     fn construct(
         self,

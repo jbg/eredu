@@ -38,6 +38,10 @@ pub(crate) fn supports_direct(descriptor: &WeightLoweringDescriptor) -> bool {
         }
         (SourceTensorEncoding::RecipeOutput(StoredDtype::U32), LinearFormat::MxFp4) => true,
         (SourceTensorEncoding::RecipeOutput(StoredDtype::U8), LinearFormat::MxFp4) => true,
+        (
+            SourceTensorEncoding::RecipeOutput(StoredDtype::U8),
+            LinearFormat::GgufIQuant { ggml_type, .. },
+        ) => NativeQuantizationFormat::from_ggml_type(ggml_type).is_some(),
         (SourceTensorEncoding::RecipeOutput(StoredDtype::F4), LinearFormat::MxFp4) => true,
         (
             SourceTensorEncoding::Safetensors(StoredDtype::F8E4M3)

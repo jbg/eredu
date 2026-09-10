@@ -117,7 +117,19 @@ fn build_gpt(
         .and_then(GgufMetadataValue::as_str)
         .unwrap_or_default();
     const GPT4O_PATTERN: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
-    if pre_tokenizer == "kimi-k2" || architecture == "kimi-linear" {
+    if pre_tokenizer == "k2-horizon" {
+        // Publisher pattern: combining marks and joiners stay in words, while
+        // numbers split into groups of at most three digits. No NFC transform.
+        const K2_HORIZON_PATTERN: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?(?:\p{L}|\p{M}|\x{200C}|\x{200D})+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+        tokenizer.with_pre_tokenizer(Some(PreTokenizerSequence::new(vec![
+            PreTokenizerWrapper::Split(Split::new(
+                SplitPattern::Regex(K2_HORIZON_PATTERN.into()),
+                SplitDelimiterBehavior::Isolated,
+                false,
+            )?),
+            PreTokenizerWrapper::ByteLevel(ByteLevel::new(false, true, false)),
+        ])));
+    } else if pre_tokenizer == "kimi-k2" || architecture == "kimi-linear" {
         tokenizer.with_pre_tokenizer(Some(PreTokenizerSequence::new(vec![
             PreTokenizerWrapper::Split(Split::new(
                 SplitPattern::Regex(super::tiktoken::KIMI_K2_PATTERN.into()),
@@ -598,6 +610,46 @@ mod tests {
     use eredu_gguf::{MetadataArray as GgufMetadataArray, MetadataValue as GgufMetadataValue};
 
     use super::*;
+
+    #[test]
+    fn k2_horizon_preserves_joined_words_marks_and_three_digit_boundaries() {
+        use tokenizers::PreTokenizer;
+        let metadata = HashMap::from([
+            (
+                "tokenizer.ggml.pre".into(),
+                GgufMetadataValue::String("k2-horizon".into()),
+            ),
+            (
+                "tokenizer.ggml.merges".into(),
+                GgufMetadataValue::Array(GgufMetadataArray::String(vec![])),
+            ),
+        ]);
+        let tokenizer = build_gpt(&["x".into()], &metadata).unwrap();
+        let input = "a\u{301}b x\u{200c}y\u{200d}z 1234567";
+        let mut pretokenized = tokenizers::PreTokenizedString::from(input);
+        tokenizer
+            .get_pre_tokenizer()
+            .unwrap()
+            .pre_tokenize(&mut pretokenized)
+            .unwrap();
+        let offsets = pretokenized
+            .get_splits(
+                tokenizers::OffsetReferential::Original,
+                tokenizers::OffsetType::Byte,
+            )
+            .into_iter()
+            .map(|(_, offset, _)| offset)
+            .collect::<Vec<_>>();
+        let pieces = offsets
+            .iter()
+            .map(|&(start, end)| &input[start..end])
+            .collect::<Vec<_>>();
+        assert_eq!(
+            pieces,
+            ["a\u{301}b", " x\u{200c}y\u{200d}z", " ", "123", "456", "7"]
+        );
+        assert!(tokenizer.get_normalizer().is_none());
+    }
 
     #[test]
     fn builds_embedded_gpt_tokenizer() {

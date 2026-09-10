@@ -200,7 +200,15 @@ fn distinct_window_schedule_save_reopen_continue_preserves_ranges() {
             .update_for_attention(suffix.clone(), suffix.clone(), stream)
             .unwrap();
         let output = cache
-            .paged_attention(&query, 1.0, None, None, None, stream)
+            .paged_attention(
+                &query,
+                1.0,
+                None,
+                None,
+                None,
+                eredu_nn::AttentionArithmetic::Fused,
+                stream,
+            )
             .unwrap()
             .unwrap()
             .evaluated()
@@ -252,7 +260,15 @@ fn distinct_window_schedule_save_reopen_continue_preserves_ranges() {
             .update_for_attention(suffix.clone(), suffix.clone(), stream)
             .unwrap();
         let output = restored
-            .paged_attention(&query, 1.0, None, None, None, stream)
+            .paged_attention(
+                &query,
+                1.0,
+                None,
+                None,
+                None,
+                eredu_nn::AttentionArithmetic::Fused,
+                stream,
+            )
             .unwrap()
             .unwrap()
             .evaluated()

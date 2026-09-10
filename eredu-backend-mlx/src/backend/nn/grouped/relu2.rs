@@ -249,7 +249,14 @@ impl PackedRelu2Groups {
                 )?,
             }
         };
-        weighted_group_sum(current, top_k_weights, &plan, num_tokens, stream)
+        weighted_group_sum(
+            current,
+            top_k_weights,
+            &plan,
+            num_tokens,
+            eredu_nn::GroupReduction::Sum,
+            stream,
+        )
     }
 
     /// Returns the rank-local ReLU2 contribution for one tensor-parallel sum.

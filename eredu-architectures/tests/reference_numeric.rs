@@ -21,9 +21,9 @@ use eredu_architectures::{
     },
     ExpertParameterRecipe, ExpertParameterRole, ExpertRealizationPlan, ExpertResidencyCatalog,
     ExpertResidencyDistribution, ExpertResidencyUnit, ExpertRouteCountPlan,
-    ExpertRouteExchangeDirection, ExpertRoutePackingPlan, GatedRoutedTextArchitectureVisitor,
-    PlannedAddressableGatedProduct, PlannedAddressableRelu2, PlannedResidentGatedProduct,
-    PreparedRoutedTextArchitecture, RoutedTextExecutionError,
+    ExpertRouteExchangeDirection, ExpertRoutePackingPlan, PlannedAddressableGatedProduct,
+    PlannedAddressableRelu2, PlannedResidentGatedProduct, PreparedRoutedTextArchitecture,
+    RoutedTextArchitectureVisitor, RoutedTextExecutionError,
 };
 use eredu_checkpoint::{
     recipe::DerivedWeightRecipe,
@@ -46,8 +46,8 @@ use eredu_nn::{
     FusedProjectionSegment, GatedDeltaScanInput, GatedDeltaScanOutput, GatedProductGroupLayout,
     GatedProductPolicy, GatedShortConvolution, GatedShortConvolutionSpec, GroupSelection,
     GroupSelectionOperator, GroupedGatedProductOperator, GroupedGatedProductSpec,
-    GroupedNeuralBackend, GroupedRelu2Operator, GroupedRelu2Spec, HyperConnection,
-    HyperConnectionOperator, HyperConnectionSpec, HyperConnectionState, HyperHead,
+    GroupedLinearOperator, GroupedNeuralBackend, GroupedRelu2Operator, GroupedRelu2Spec,
+    HyperConnection, HyperConnectionOperator, HyperConnectionSpec, HyperConnectionState, HyperHead,
     HyperHeadOperator, HyperHeadSpec, HyperNeuralBackend, Index, IndexedAttentionInput,
     JointGroupSelection, JointGroupSelectionInput, LinearOperator, LinearSpec, LowRankProjection,
     LowRankProjectionSpec, NeuralBackend, NormalizationConstructionSpec, NormalizationOperator,
@@ -85,6 +85,16 @@ use eredu_runtime::{
 };
 use safetensors::tensor::Dtype;
 
+#[path = "reference_numeric/k2_horizon.rs"]
+mod k2_horizon;
+#[path = "reference_numeric/k2_speculative.rs"]
+mod k2_speculative;
+#[path = "reference_numeric/rotary.rs"]
+mod rotary;
+
+#[path = "reference_numeric/grouped_linear.rs"]
+mod grouped_linear;
+
 #[path = "reference_numeric/gemma2.rs"]
 mod gemma2;
 
@@ -93,6 +103,8 @@ mod nanbeige;
 
 #[path = "reference_numeric/neural_geometry_conformance.rs"]
 mod neural_geometry_conformance;
+#[path = "reference_numeric/partition_banks.rs"]
+mod partition_banks;
 #[path = "reference_numeric/partitioned_adapter.rs"]
 mod partitioned_adapter;
 #[path = "reference_numeric/prediction_adapter.rs"]
@@ -2076,6 +2088,7 @@ impl EmbeddingOperator<NumericTensor> for NumericEmbedding {
 
 #[derive(Debug, Clone)]
 struct NumericNorm {
+    groups: usize,
     weight: NumericTensor,
     offset: f32,
     metadata: ParameterMetadata,
@@ -2118,13 +2131,20 @@ impl NormalizationOperator<NumericTensor> for NumericNorm {
             .chunks_exact(dimensions)
             .zip(output.data.chunks_exact_mut(dimensions))
         {
-            let rms = (input_row.iter().map(|value| value * value).sum::<f32>()
-                / dimensions as f32
-                + self.epsilon)
-                .sqrt();
-            for index in 0..dimensions {
-                output_row[index] =
-                    input_row[index] / rms * (self.weight.data[index] + self.offset);
+            let width = dimensions / self.groups;
+            for group in 0..self.groups {
+                let start = group * width;
+                let rms = (input_row[start..start + width]
+                    .iter()
+                    .map(|x| x * x)
+                    .sum::<f32>()
+                    / width as f32
+                    + self.epsilon)
+                    .sqrt();
+                for index in start..start + width {
+                    output_row[index] =
+                        input_row[index] / rms * (self.weight.data[index] + self.offset);
+                }
             }
         }
         Ok(output)
@@ -2133,6 +2153,7 @@ impl NormalizationOperator<NumericTensor> for NumericNorm {
 
 #[derive(Debug, Clone)]
 struct NumericRotary {
+    algorithm: eredu_nn::RotaryAlgorithm,
     dimensions: i32,
     traditional: bool,
     base: f32,
@@ -2162,13 +2183,9 @@ impl RotaryOperator<NumericTensor> for NumericRotary {
         _: &NumericContext,
     ) -> Result<NumericTensor, Error> {
         match position {
-            RotaryPosition::Offset(position_offset) => rotary_offset(
-                input,
-                self.dimensions,
-                self.traditional,
-                self.base,
-                position_offset,
-            ),
+            RotaryPosition::Offset(position_offset) => {
+                rotary::scaled_rotary(input, self, position_offset)
+            }
             RotaryPosition::Embeddings { cosine, sine } => {
                 rotary_embeddings(input, self.dimensions, self.traditional, cosine, sine)
             }
@@ -4387,6 +4404,7 @@ impl NeuralBackend for NumericBackend {
             }
         };
         Ok(NumericNorm {
+            groups: spec.groups.unwrap_or(1) as usize,
             weight,
             offset,
             metadata,
@@ -4396,6 +4414,7 @@ impl NeuralBackend for NumericBackend {
 
     fn rotary(spec: RotarySpec, _: &NumericContext) -> Result<Self::Rotary, Error> {
         Ok(NumericRotary {
+            algorithm: spec.algorithm,
             dimensions: spec.dimensions,
             traditional: spec.traditional,
             base: spec.base,
@@ -4416,8 +4435,9 @@ impl NeuralBackend for NumericBackend {
         Ok(input.map(|value| 1.0 / (1.0 + (-value).exp())))
     }
 
-    fn softplus(input: Self::Tensor, _: &NumericContext) -> Result<Self::Tensor, Error> {
-        Ok(input.map(|value| value.exp().ln_1p()))
+    fn softplus(input: Self::Tensor, beta: f32, _: &NumericContext) -> Result<Self::Tensor, Error> {
+        Ok(input
+            .map(|value| ((beta * value).max(0.0) + (-(beta * value).abs()).exp().ln_1p()) / beta))
     }
 
     fn exp(input: Self::Tensor, _: &NumericContext) -> Result<Self::Tensor, Error> {
@@ -6103,16 +6123,76 @@ impl Parameterized<NumericTensor> for NumericExpertBank {
     }
 }
 
-impl GroupedGatedProductOperator<NumericTensor> for NumericExpertBank {
-    fn spec(&self) -> &GroupedGatedProductSpec {
-        &self.spec
+impl NumericExpertBank {
+    // Parameter visitors bind canonical packed tensors. Refresh scalar views
+    // before execution so checkpoint-backed tests consume the admitted payload.
+    fn refresh_bound_experts(&mut self) -> Result<(), Error> {
+        if self.parameters.is_empty() {
+            return Ok(());
+        }
+        let value = |spec: &ParameterSpec| {
+            self.parameters
+                .iter()
+                .find(|(_, metadata)| metadata.id == spec.id)
+                .map(|(value, _)| value.clone())
+                .ok_or_else(|| {
+                    Error::backend(format!(
+                        "missing scalar expert parameter {}",
+                        spec.id.as_str()
+                    ))
+                })
+        };
+        let optional = |spec: Option<&ParameterSpec>| spec.map(&value).transpose();
+        let mut experts = Vec::new();
+        match self.spec.layout() {
+            GatedProductGroupLayout::Packed { gate_up, down } => {
+                let gu = value(gate_up.weight())?;
+                let d = value(down.weight())?;
+                let gu_bias = optional(gate_up.bias())?;
+                let d_bias = optional(down.bias())?;
+                let width = self.spec.intermediate_dimensions() as usize;
+                let member = |tensor: &NumericTensor, expert| {
+                    let tensor = tensor.axis_slice(0, expert, expert + 1);
+                    NumericTensor::new(tensor.shape[1..].to_vec(), tensor.data)
+                };
+                for expert in 0..self.spec.group_count() as usize {
+                    let gu = member(&gu, expert);
+                    experts.push(NumericExpert {
+                        gate: gu.axis_slice(0, 0, width),
+                        up: gu.axis_slice(0, width, width * 2),
+                        down: member(&d, expert),
+                        gate_bias: gu_bias
+                            .as_ref()
+                            .map(|b| member(b, expert).axis_slice(0, 0, width)),
+                        up_bias: gu_bias
+                            .as_ref()
+                            .map(|b| member(b, expert).axis_slice(0, width, width * 2)),
+                        down_bias: d_bias.as_ref().map(|b| member(b, expert)),
+                    });
+                }
+            }
+            GatedProductGroupLayout::Independent(specs) => {
+                for spec in specs {
+                    experts.push(NumericExpert {
+                        gate: value(spec.gate().weight())?,
+                        up: value(spec.up().weight())?,
+                        down: value(spec.down().weight())?,
+                        gate_bias: optional(spec.gate().bias())?,
+                        up_bias: optional(spec.up().bias())?,
+                        down_bias: optional(spec.down().bias())?,
+                    });
+                }
+            }
+            _ => return Err(Error::backend("unsupported scalar expert layout")),
+        }
+        self.experts = experts;
+        Ok(())
     }
 
-    fn forward_grouped(
+    fn forward_bound(
         &mut self,
         input: &NumericTensor,
         routes: &GroupSelection<NumericTensor>,
-        _: &NumericContext,
     ) -> Result<NumericTensor, Error> {
         let hidden = input.shape.last().copied().unwrap() as usize;
         let tokens = input.data.len() / hidden;
@@ -6128,7 +6208,13 @@ impl GroupedGatedProductOperator<NumericTensor> for NumericExpertBank {
                 vec![1, hidden as i32],
                 input.data[token * hidden..(token + 1) * hidden].to_vec(),
             );
-            for route in 0..top_k {
+            let mut order = (0..top_k).collect::<Vec<_>>();
+            if self.spec.reduction() == eredu_nn::GroupReduction::SequentialGroupOrder {
+                order.sort_by_key(|&route| {
+                    routes.group_indices().data[token * top_k + route] as usize
+                });
+            }
+            for route in order {
                 let route_index = token * top_k + route;
                 let expert_id = routes.group_indices().data[route_index] as usize;
                 let expert = self
@@ -6170,6 +6256,23 @@ impl GroupedGatedProductOperator<NumericTensor> for NumericExpertBank {
     }
 }
 
+impl GroupedGatedProductOperator<NumericTensor> for NumericExpertBank {
+    fn spec(&self) -> &GroupedGatedProductSpec {
+        &self.spec
+    }
+    fn forward_grouped(
+        &mut self,
+        input: &NumericTensor,
+        routes: &GroupSelection<NumericTensor>,
+        context: &NumericContext,
+    ) -> Result<NumericTensor, Error> {
+        if context.bind_checkpoint_values {
+            self.refresh_bound_experts()?;
+        }
+        self.forward_bound(input, routes)
+    }
+}
+
 impl TensorParallelGroupedGatedProductOperator<NumericTensor> for NumericExpertBank {
     fn forward_grouped_tensor_parallel(
         &mut self,
@@ -6178,6 +6281,9 @@ impl TensorParallelGroupedGatedProductOperator<NumericTensor> for NumericExpertB
         _: usize,
         context: &NumericContext,
     ) -> Result<TensorParallelGroupedOutput<NumericTensor>, Error> {
+        if context.bind_checkpoint_values {
+            self.refresh_bound_experts()?;
+        }
         let mut local = self.clone();
         let has_down_bias = local
             .experts
@@ -6186,7 +6292,7 @@ impl TensorParallelGroupedGatedProductOperator<NumericTensor> for NumericExpertB
         for expert in &mut local.experts {
             expert.down_bias = None;
         }
-        let reducible = local.forward_grouped(input, routes, context)?;
+        let reducible = local.forward_bound(input, routes)?;
         let post_reduce = if has_down_bias {
             let hidden = input.shape.last().copied().unwrap() as usize;
             let tokens = input.data.len() / hidden;
@@ -6434,6 +6540,14 @@ impl Sampler<NumericBackend> for NumericSampler {
 }
 
 impl GroupedNeuralBackend for NumericBackend {
+    type LinearGroups = grouped_linear::NumericLinearGroups;
+    fn grouped_linear_bank(
+        spec: eredu_nn::GroupedLinearSpec,
+        context: &NumericContext,
+    ) -> Result<Self::LinearGroups, Error> {
+        grouped_linear::NumericLinearGroups::new(spec, context)
+    }
+
     type Selector = NumericRouter;
     type GatedProductGroups = NumericExpertBank;
     type Relu2Groups = NumericRelu2Groups;
@@ -8450,6 +8564,7 @@ fn sink_aware_request_matches_cached_full_and_sliding_scalar_references() {
 
     let uncached = NumericBackend::attention_with_sinks(
         AttentionRequest {
+            arithmetic: eredu_nn::AttentionArithmetic::Fused,
             softcap: None,
             queries: queries.clone(),
             keys: keys.clone(),
@@ -8474,6 +8589,7 @@ fn sink_aware_request_matches_cached_full_and_sliding_scalar_references() {
     let cached = full
         .attention(
             AttentionRequest {
+                arithmetic: eredu_nn::AttentionArithmetic::Fused,
                 softcap: None,
                 queries: queries.clone(),
                 keys: cached_keys,
@@ -8489,6 +8605,7 @@ fn sink_aware_request_matches_cached_full_and_sliding_scalar_references() {
 
     let sliding = NumericBackend::sliding_window_attention_with_sinks(
         AttentionRequest {
+            arithmetic: eredu_nn::AttentionArithmetic::Fused,
             softcap: None,
             queries,
             keys,
@@ -8510,6 +8627,7 @@ fn sink_aware_request_matches_cached_full_and_sliding_scalar_references() {
 
     let malformed_sinks = NumericTensor::zeros(vec![2]);
     let malformed = AttentionRequest {
+        arithmetic: eredu_nn::AttentionArithmetic::Fused,
         softcap: None,
         queries: NumericTensor::zeros(vec![1, 1, 1, 1]),
         keys: NumericTensor::zeros(vec![1, 1, 1, 1]),
@@ -8810,7 +8928,7 @@ pub(crate) fn routed_extension_translates_architecture_identity_to_grouped_mecha
     assert_eq!(bank.intermediate_dimensions(), 3);
 
     let grouped_context = NumericContext::default();
-    let bank_key = ParameterBankKey::new(0, plan.local_global_group_indices()[0]);
+    let bank_key = ParameterBankKey::new(0, 0, plan.local_global_group_indices()[0]);
     let mut addressable_banks = NumericAddressableBank {
         banks: BTreeMap::from([(
             bank_key,
@@ -8845,6 +8963,7 @@ pub(crate) fn routed_extension_translates_architecture_identity_to_grouped_mecha
     let exchanged = execute_routed_gated_product::<NumericBackend, _>(
         &plan,
         "text_decoder",
+        eredu_runtime::RoutedBankId::new(0),
         0,
         0,
         &hidden,
@@ -9034,6 +9153,7 @@ impl IndexedMovement<NumericBackend> for NumericIndexedMovement {
 
 struct NumericBankAcquisition {
     banks: Vec<NumericExpertBank>,
+    linear: Vec<grouped_linear::NumericLinearGroups>,
 }
 
 #[derive(Default, Debug, Clone, Copy, Eq, PartialEq)]
@@ -9047,6 +9167,7 @@ struct NumericBankReport {
 
 struct NumericGroupedBankMechanism {
     banks: BTreeMap<ParameterBankKey, NumericExpertBank>,
+    linear: BTreeMap<ParameterBankKey, grouped_linear::NumericLinearGroups>,
     bytes: BTreeMap<ParameterBankKey, u64>,
     report: NumericBankReport,
     resident: Vec<ParameterBankKey>,
@@ -9085,19 +9206,20 @@ impl AddressableGroupedBank<NumericBackend> for NumericGroupedBankMechanism {
             }
         }
         self.report.peak_resident = self.report.peak_resident.max(self.resident.len());
-        let banks = request
-            .entries()
-            .iter()
-            .map(|(key, _)| {
-                self.banks
-                    .get(key)
-                    .cloned()
-                    .ok_or_else(|| Error::backend("numeric grouped bank omitted a selected key"))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut banks = Vec::new();
+        let mut linear = Vec::new();
+        for (key, _) in request.entries() {
+            if let Some(bank) = self.banks.get(key) {
+                banks.push(bank.clone());
+            } else if let Some(bank) = self.linear.get(key) {
+                linear.push(bank.clone());
+            } else {
+                return Err(Error::backend("numeric bank omitted a selected key"));
+            }
+        }
         self.report.acquisitions += 1;
-        self.report.peak_entries = self.report.peak_entries.max(banks.len());
-        Ok(NumericBankAcquisition { banks })
+        self.report.peak_entries = self.report.peak_entries.max(banks.len() + linear.len());
+        Ok(NumericBankAcquisition { banks, linear })
     }
 
     fn gated_product_groups(
@@ -9123,6 +9245,15 @@ impl AddressableGroupedBank<NumericBackend> for NumericGroupedBankMechanism {
             policy: spec.policy(),
             spec: spec.clone(),
         })
+    }
+
+    fn linear_groups(
+        &mut self,
+        acquisition: &Self::Acquisition,
+        spec: &eredu_nn::GroupedLinearSpec,
+        context: &NumericContext,
+    ) -> Result<grouped_linear::NumericLinearGroups, Self::Error> {
+        grouped_linear::NumericLinearGroups::concatenate(&acquisition.linear, spec, context)
     }
 
     fn relu2_groups(
@@ -9175,7 +9306,7 @@ fn architecture_driver_executes_addressable_groups_with_bounded_generic_mechanis
         .cloned()
         .enumerate()
         .map(|(member, expert)| {
-            let key = ParameterBankKey::new(0, member);
+            let key = ParameterBankKey::new(0, 0, member);
             (
                 key,
                 NumericExpertBank {
@@ -9192,7 +9323,7 @@ fn architecture_driver_executes_addressable_groups_with_bounded_generic_mechanis
         .collect::<BTreeMap<_, _>>();
     let catalog = ExpertResidencyCatalog::new((0..4).map(|member| {
         ExpertResidencyUnit::new(
-            ParameterBankKey::new(0, member),
+            ParameterBankKey::new(0, 0, member),
             owner_group.clone(),
             0,
             "text_decoder.layers.0.mlp",
@@ -9226,7 +9357,7 @@ fn architecture_driver_executes_addressable_groups_with_bounded_generic_mechanis
     }))
     .unwrap();
     let bytes = (0..4)
-        .map(|member| (ParameterBankKey::new(0, member), 100))
+        .map(|member| (ParameterBankKey::new(0, 0, member), 100))
         .collect::<BTreeMap<_, _>>();
     let options = ParameterBankLoadOptions::new(
         eredu_core::residency::OffloadConfig::new(Some(400), Some(200), 1).unwrap(),
@@ -9240,6 +9371,7 @@ fn architecture_driver_executes_addressable_groups_with_bounded_generic_mechanis
         catalog,
         bytes.clone(),
         NumericGroupedBankMechanism {
+            linear: BTreeMap::new(),
             banks,
             bytes,
             report: NumericBankReport::default(),
@@ -9264,6 +9396,7 @@ fn architecture_driver_executes_addressable_groups_with_bounded_generic_mechanis
         .forward_grouped(
             &mut resident,
             RoutedExpertRequest {
+                bank: eredu_runtime::RoutedBankId::new(0),
                 layer: 0,
                 input: &input,
                 routes: &forged_routes,
@@ -9284,6 +9417,7 @@ fn architecture_driver_executes_addressable_groups_with_bounded_generic_mechanis
         .forward_grouped(
             &mut resident,
             RoutedExpertRequest {
+                bank: eredu_runtime::RoutedBankId::new(0),
                 layer: 0,
                 input: &input,
                 routes: &routes,
@@ -9352,6 +9486,18 @@ impl AddressableGroupedBank<NumericBackend> for NumericRelu2BankMechanism {
     ) -> Result<NumericExpertBank, Self::Error> {
         Err(Error::backend(
             "numeric ReLU-squared bank cannot build gated-product groups",
+        ))
+    }
+
+    /// Constructs one compact selected-linear bank from acquired bindings.
+    fn linear_groups(
+        &mut self,
+        _acquisition: &Self::Acquisition,
+        _spec: &eredu_nn::GroupedLinearSpec,
+        _context: &NumericContext,
+    ) -> Result<grouped_linear::NumericLinearGroups, Self::Error> {
+        Err(Error::backend(
+            "numeric homogeneous fixture has no linear bank",
         ))
     }
 
@@ -9447,7 +9593,7 @@ fn architecture_driver_executes_relu2_groups_through_the_same_bounded_compositio
         .map(|member| {
             let one = spec.clone().with_group_count(1).unwrap();
             (
-                ParameterBankKey::new(0, member),
+                ParameterBankKey::new(0, 0, member),
                 NumericRelu2Groups {
                     spec: one,
                     expert_count: 1,
@@ -9467,7 +9613,7 @@ fn architecture_driver_executes_relu2_groups_through_the_same_bounded_compositio
         .collect::<BTreeMap<_, _>>();
     let catalog = ExpertResidencyCatalog::new((0..3).map(|member| {
         ExpertResidencyUnit::new(
-            ParameterBankKey::new(0, member),
+            ParameterBankKey::new(0, 0, member),
             owner_group.clone(),
             0,
             "target.layers.0.mlp",
@@ -9507,7 +9653,7 @@ fn architecture_driver_executes_relu2_groups_through_the_same_bounded_compositio
     )
     .unwrap();
     let bytes = (0..3)
-        .map(|member| (ParameterBankKey::new(0, member), 64))
+        .map(|member| (ParameterBankKey::new(0, 0, member), 64))
         .collect::<BTreeMap<_, _>>();
     let mut provider = PlannedAddressableRelu2::<NumericBackend, _, _>::new(
         owner_group,
@@ -9538,6 +9684,7 @@ fn architecture_driver_executes_relu2_groups_through_the_same_bounded_compositio
         .forward_relu2_routed(
             &mut resident,
             RoutedExpertRequest {
+                bank: eredu_runtime::RoutedBankId::new(0),
                 layer: 0,
                 input: &input,
                 routes: &routes,
@@ -13336,6 +13483,7 @@ fn explicit_rotary_embeddings_match_offset_positions() {
         vec![0.1, -0.2, 0.3, -0.4, 0.5, -0.6, 0.7, -0.8],
     );
     let mut rotary = NumericRotary {
+        algorithm: eredu_nn::RotaryAlgorithm::Default,
         dimensions: 4,
         traditional: false,
         base: 10_000.0,
@@ -13372,6 +13520,7 @@ fn partial_rotary_preserves_non_rotary_head_dimensions() {
     let context = NumericContext::default();
     let input = NumericTensor::new(vec![1, 1, 6], vec![9.0, 1.0, 2.0, 3.0, 4.0, -7.0]);
     let mut rotary = NumericRotary {
+        algorithm: eredu_nn::RotaryAlgorithm::Default,
         dimensions: 4,
         traditional: false,
         base: 10_000.0,
@@ -13650,6 +13799,16 @@ impl RoutedExpertProvider<NumericBackend> for RecordingNumericExpertProvider {
         resident_bank.forward_grouped(request.input, request.routes, context)
     }
 
+    /// Executes an activated selected-linear bank with owned output rows.
+    fn forward_linear_routed(
+        &mut self,
+        resident_bank: &mut grouped_linear::NumericLinearGroups,
+        request: RoutedExpertRequest<'_, NumericTensor>,
+        context: &NumericContext,
+    ) -> Result<NumericTensor, Self::Error> {
+        resident_bank.forward_grouped(request.input, request.routes, context)
+    }
+
     fn forward_relu2_routed(
         &mut self,
         resident_bank: &mut NumericRelu2Groups,
@@ -13705,6 +13864,7 @@ fn external_expert_provider_preserves_route_order_weights_bias_and_telemetry() {
         .forward_grouped(
             &mut bank,
             RoutedExpertRequest {
+                bank: eredu_runtime::RoutedBankId::new(0),
                 layer: 7,
                 input: &input,
                 routes: &routes,
@@ -15860,7 +16020,11 @@ impl eredu_runtime::ReplicatedTextMechanismSupport for NumericMechanismSupport {
     ) -> eredu_runtime::BackendMechanismFacts {
         let mut facts = eredu_runtime::BackendMechanismFacts::new(
             NumericBackend::OPERATOR_CAPABILITIES,
-            [eredu_runtime::WeightResidencyMechanism::Resident],
+            [
+                eredu_runtime::WeightResidencyMechanism::Resident,
+                eredu_runtime::WeightResidencyMechanism::Windowed,
+                eredu_runtime::WeightResidencyMechanism::DiskStreamed,
+            ],
             eredu_runtime::StateLifecycleCapabilities::new()
                 .with_transactions(true, true)
                 .with_reset(true)
@@ -15868,6 +16032,7 @@ impl eredu_runtime::ReplicatedTextMechanismSupport for NumericMechanismSupport {
                 .with_observation_retention(self.persistent_session),
         )
         .with_grouped_operations([
+            eredu_runtime::GroupedOperationRequirement::Linear,
             eredu_runtime::GroupedOperationRequirement::GatedProduct,
             eredu_runtime::GroupedOperationRequirement::GatedProductTensorParallelPartial,
             eredu_runtime::GroupedOperationRequirement::Relu2,
@@ -16328,14 +16493,25 @@ impl<U> std::ops::DerefMut for NumericReplicatedLease<U> {
 }
 
 struct NumericReplicatedPolicy<U> {
-    resident: Option<Vec<Option<U>>>,
+    resident: Option<std::rc::Rc<std::cell::RefCell<Vec<Option<U>>>>>,
     bounded_binding: Option<payload::BoundedBinding>,
+}
+
+impl<U> Clone for NumericReplicatedPolicy<U> {
+    fn clone(&self) -> Self {
+        Self {
+            resident: self.resident.clone(),
+            bounded_binding: self.bounded_binding.clone(),
+        }
+    }
 }
 
 impl<U> NumericReplicatedPolicy<U> {
     fn resident(units: Vec<U>) -> Self {
         Self {
-            resident: Some(units.into_iter().map(Some).collect()),
+            resident: Some(std::rc::Rc::new(std::cell::RefCell::new(
+                units.into_iter().map(Some).collect(),
+            ))),
             bounded_binding: None,
         }
     }
@@ -16370,6 +16546,7 @@ impl<U: Parameterized<NumericTensor>> LayerwisePolicy<NumericBackend, U>
     {
         let mut unit = match &mut self.resident {
             Some(units) => units
+                .borrow_mut()
                 .get_mut(ordinal)
                 .and_then(Option::take)
                 .ok_or_else(|| Error::backend("numeric resident unit is unavailable"))
@@ -16408,7 +16585,7 @@ impl<U: Parameterized<NumericTensor>> LayerwisePolicy<NumericBackend, U>
             return Err(Error::backend("numeric resident unit ordinal drifted"));
         }
         if let Some(units) = &mut self.resident {
-            units[ordinal] = Some(lease.unit);
+            units.borrow_mut()[ordinal] = Some(lease.unit);
         }
         Ok(())
     }
@@ -16452,6 +16629,43 @@ where
     type StateReport = Self::State;
     type ExecutionReport = LayerWeightResidency;
     type Error = Error;
+
+    fn prepare_partition_materialization(
+        &mut self,
+        architecture: &mut A,
+        layout: &eredu_runtime::ExecutionUnitLayout,
+        addresses: &[ExecutionUnitAddress],
+        _: &eredu_runtime::ReplicatedTextMaterializationPartitionPlan,
+        units: &mut [A::Unit],
+        source: Option<&mut A>,
+        source_units: Option<&mut [A::Unit]>,
+        tasks: &[ReplicatedTextMaterializationTask],
+        omitted: &[String],
+        context: &NumericContext,
+    ) -> Result<(), Self::Error> {
+        self.prepare_materialization(
+            architecture,
+            layout,
+            units,
+            source,
+            source_units,
+            tasks,
+            omitted,
+            context,
+        )?;
+        if let Some(binding) = &mut self.bounded_binding {
+            let ordinals = addresses
+                .iter()
+                .map(|a| {
+                    layout
+                        .ordinal(a.group(), a.index())
+                        .ok_or_else(|| Error::backend("partition address is outside global layout"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            binding.restrict_units(&ordinals)?;
+        }
+        Ok(())
+    }
 
     fn prepare_materialization(
         &mut self,
@@ -17629,7 +17843,7 @@ struct NumericResidentPartitionVisitor {
 }
 
 struct CountingPartitionedRoutedProvider {
-    inner: PlannedResidentGatedProduct,
+    inner: eredu_architectures::prepared_execution::PartitionBankProviders<NumericBackend>,
     calls: Arc<AtomicUsize>,
 }
 
@@ -17734,7 +17948,7 @@ where
 }
 
 impl RoutedExpertProvider<NumericBackend> for CountingPartitionedRoutedProvider {
-    type Error = RoutedTextExecutionError;
+    type Error = eredu_runtime::RoutedBankProviderError<RoutedTextExecutionError>;
 
     fn forward_grouped(
         &mut self,
@@ -17743,7 +17957,22 @@ impl RoutedExpertProvider<NumericBackend> for CountingPartitionedRoutedProvider 
         context: &NumericContext,
     ) -> Result<NumericTensor, Self::Error> {
         self.calls.fetch_add(1, Ordering::Relaxed);
-        <PlannedResidentGatedProduct as RoutedExpertProvider<NumericBackend>>::forward_grouped(
+        <eredu_architectures::prepared_execution::PartitionBankProviders<NumericBackend> as RoutedExpertProvider<NumericBackend>>::forward_grouped(
+            &mut self.inner,
+            resident_bank,
+            request,
+            context,
+        )
+    }
+
+    /// Executes an activated selected-linear bank with owned output rows.
+    fn forward_linear_routed(
+        &mut self,
+        resident_bank: &mut grouped_linear::NumericLinearGroups,
+        request: RoutedExpertRequest<'_, NumericTensor>,
+        context: &NumericContext,
+    ) -> Result<NumericTensor, Self::Error> {
+        <eredu_architectures::prepared_execution::PartitionBankProviders<NumericBackend> as RoutedExpertProvider<NumericBackend>>::forward_linear_routed(
             &mut self.inner,
             resident_bank,
             request,
@@ -17757,7 +17986,7 @@ impl RoutedExpertProvider<NumericBackend> for CountingPartitionedRoutedProvider 
         request: RoutedExpertRequest<'_, NumericTensor>,
         context: &NumericContext,
     ) -> Result<NumericTensor, Self::Error> {
-        <PlannedResidentGatedProduct as RoutedExpertProvider<NumericBackend>>::forward_relu2_routed(
+        <eredu_architectures::prepared_execution::PartitionBankProviders<NumericBackend> as RoutedExpertProvider<NumericBackend>>::forward_relu2_routed(
             &mut self.inner,
             resident_bank,
             request,
@@ -17775,7 +18004,7 @@ impl TensorParallelRoutedExpertProvider<NumericBackend> for CountingPartitionedR
         context: &NumericContext,
     ) -> Result<RoutedExpertTensorParallelOutput<NumericTensor>, Self::Error> {
         self.calls.fetch_add(1, Ordering::Relaxed);
-        <PlannedResidentGatedProduct as TensorParallelRoutedExpertProvider<NumericBackend>>::forward_grouped_tensor_parallel(
+        <eredu_architectures::prepared_execution::PartitionBankProviders<NumericBackend> as TensorParallelRoutedExpertProvider<NumericBackend>>::forward_grouped_tensor_parallel(
             &mut self.inner,
             resident_bank,
             request,
@@ -17791,7 +18020,7 @@ impl TensorParallelRoutedExpertProvider<NumericBackend> for CountingPartitionedR
         partitions: usize,
         context: &NumericContext,
     ) -> Result<RoutedExpertTensorParallelOutput<NumericTensor>, Self::Error> {
-        <PlannedResidentGatedProduct as TensorParallelRoutedExpertProvider<NumericBackend>>::forward_relu2_routed_tensor_parallel(
+        <eredu_architectures::prepared_execution::PartitionBankProviders<NumericBackend> as TensorParallelRoutedExpertProvider<NumericBackend>>::forward_relu2_routed_tensor_parallel(
             &mut self.inner,
             resident_bank,
             request,
@@ -17964,48 +18193,45 @@ where
     let facts = prepared.session_facts().map_err(Error::backend)?;
     let tensor_group = facts.required_tensor_group().map_err(Error::backend)?;
     let (text, prompt, plan, _) = facts.into_parts();
-    let (prompt_cache_identity, _, _, _) = text.into_parts();
+    let (prompt_cache_identity, _, _, selected_residency) = text.into_parts();
     let factory_world = Arc::clone(&world);
-    let binding_checkpoint = Arc::clone(&checkpoint);
+    let mut mechanisms = if context.bind_checkpoint_values {
+        if matches!(selected_residency, LayerWeightResidency::FullyResident) {
+            NumericReplicatedMechanisms::with_bound_checkpoint(Arc::clone(&checkpoint))
+        } else {
+            NumericReplicatedMechanisms::with_bounded_checkpoint(Arc::clone(&checkpoint))
+        }
+    } else {
+        NumericReplicatedMechanisms::with_checkpoint(Arc::clone(&checkpoint))
+    };
+    let factory_prompt = prompt.clone();
     let binding = prepared
         .prepare_session_runtime(
             prompt,
             &context,
-            move |input, _source, layout, selected, context| {
-                let (mut architecture, partition, manifest, tasks) = input.into_parts();
-                if tasks.is_empty() || layout != *context.local_layout.as_deref().unwrap() {
-                    return Err(Error::backend(
-                        "numeric direct local task/layout authority drifted",
-                    ));
-                }
-                factory_world.record_materialization(manifest.rank(), tasks.len());
+            |input, _source, layout, selected, context| {
+                let prepared = eredu_runtime::prepare_default_partitioned_runtime(
+                    input,
+                    None,
+                    layout,
+                    None,
+                    selected,
+                    &factory_prompt,
+                    eredu_runtime::PartitionedUnitScope::Owned,
+                    &[],
+                    &mut mechanisms,
+                    context,
+                )
+                .map_err(|e| Error::backend(e.to_string()))?;
+                let (architecture, partition, manifest, execution_policy, bounded_policy, state) =
+                    prepared.into_parts();
                 factory_world.realize_manifest(&manifest)?;
-                let addresses = partition.units().collect::<Vec<_>>();
-                let mut units = addresses
-                    .iter()
-                    .map(|address| {
-                        architecture.build_unit(address.group(), address.index(), context)
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                if context.bind_checkpoint_values {
-                    payload::bind(
-                        &mut architecture,
-                        &mut units,
-                        &tasks,
-                        &[],
-                        binding_checkpoint.as_ref(),
-                        context,
-                    )?;
-                }
-                let state = numeric_partition_state(selected, &partition)?;
+                let _ = partition;
                 let parallel = numeric_parallel_context(&factory_world, &manifest, tensor_group)?;
                 let communication = numeric_partition_communication(&factory_world, manifest)?;
                 let executor =
                     eredu_architectures::partitioned_execution::DirectPartitionExecutor::new(
-                        LayerwiseRuntime::new(
-                            architecture,
-                            NumericReplicatedPolicy::resident(units),
-                        ),
+                        LayerwiseRuntime::new(architecture, execution_policy),
                         parallel,
                     );
                 let runtime = eredu_runtime::PartitionedTextRuntime::new(
@@ -18016,17 +18242,17 @@ where
                     eredu_runtime::NoBoundaryTransport,
                     eredu_runtime::OpaqueOutputPublisher,
                     eredu_runtime::OpaqueFailureAgreement,
-                    eredu_runtime::ExecutionResidency::FullyResident,
-                    None::<NumericReplicatedPolicy<A::Unit>>,
+                    selected_residency.execution_residency(),
+                    bounded_policy,
                 )
                 .map_err(|error| Error::backend(error.to_string()))?;
-                Ok((runtime, state))
+                Ok::<_, Error>((runtime, state))
             },
         )
         .map_err(|error| Error::backend(error.to_string()))?;
     let session = eredu_runtime::construct_replicated_text_session_with_runtime(
         binding,
-        NumericReplicatedMechanisms::with_checkpoint(checkpoint),
+        mechanisms,
         eredu_runtime::PartitionedTextExecution::new(),
     )
     .map_err(|error| Error::backend(error.to_string()))?;
@@ -18059,40 +18285,40 @@ where
     let tensor_group = facts.tensor_group();
     let activation_dtype = facts.activation_dtype();
     let (text, prompt, plan, _) = facts.into_parts();
-    let (prompt_cache_identity, _, _, _) = text.into_parts();
+    let (prompt_cache_identity, _, _, selected_residency) = text.into_parts();
     let factory_world = Arc::clone(&world);
-    let binding_checkpoint = Arc::clone(&checkpoint);
+    let mut mechanisms = if context.bind_checkpoint_values {
+        if matches!(selected_residency, LayerWeightResidency::FullyResident) {
+            NumericReplicatedMechanisms::with_bound_checkpoint(Arc::clone(&checkpoint))
+        } else {
+            NumericReplicatedMechanisms::with_bounded_checkpoint(Arc::clone(&checkpoint))
+        }
+    } else {
+        NumericReplicatedMechanisms::with_checkpoint(Arc::clone(&checkpoint))
+    };
+    let factory_prompt = prompt.clone();
     let binding = prepared
         .prepare_session_runtime(
             prompt,
             &context,
-            move |input, _source, layout, selected, context| {
-                let (mut architecture, partition, manifest, tasks) = input.into_parts();
-                if tasks.is_empty() || layout != *context.local_layout.as_deref().unwrap() {
-                    return Err(Error::backend(
-                        "numeric pipeline local task/layout authority drifted",
-                    ));
-                }
-                factory_world.record_materialization(manifest.rank(), tasks.len());
+            |input, _source, layout, selected, context| {
+                let prepared = eredu_runtime::prepare_default_partitioned_runtime(
+                    input,
+                    None,
+                    layout,
+                    None,
+                    selected,
+                    &factory_prompt,
+                    eredu_runtime::PartitionedUnitScope::Owned,
+                    &[],
+                    &mut mechanisms,
+                    context,
+                )
+                .map_err(|e| Error::backend(e.to_string()))?;
+                let (architecture, partition, manifest, execution_policy, bounded_policy, state) =
+                    prepared.into_parts();
                 factory_world.realize_manifest(&manifest)?;
                 let addresses = partition.units().collect::<Vec<_>>();
-                let mut units = addresses
-                    .iter()
-                    .map(|address| {
-                        architecture.build_unit(address.group(), address.index(), context)
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                if context.bind_checkpoint_values {
-                    payload::bind(
-                        &mut architecture,
-                        &mut units,
-                        &tasks,
-                        &[],
-                        binding_checkpoint.as_ref(),
-                        context,
-                    )?;
-                }
-                let state = numeric_partition_state(selected, &partition)?;
                 let parallel = tensor_group
                     .map(|id| numeric_parallel_context(&factory_world, &manifest, id))
                     .transpose()?;
@@ -18100,7 +18326,7 @@ where
                 let executor =
                     eredu_architectures::partitioned_execution::PipelinePartitionExecutor::new(
                         architecture,
-                        NumericReplicatedPolicy::resident(units),
+                        execution_policy,
                         addresses,
                         parallel,
                         NumericPartitionTensorAllocator,
@@ -18114,17 +18340,17 @@ where
                     eredu_runtime::OpaqueBoundaryTransport,
                     eredu_runtime::OpaqueOutputPublisher,
                     eredu_runtime::OpaqueFailureAgreement,
-                    eredu_runtime::ExecutionResidency::FullyResident,
-                    None::<NumericReplicatedPolicy<A::Unit>>,
+                    selected_residency.execution_residency(),
+                    bounded_policy,
                 )
                 .map_err(|error| Error::backend(error.to_string()))?;
-                Ok((runtime, state))
+                Ok::<_, Error>((runtime, state))
             },
         )
         .map_err(|error| Error::backend(error.to_string()))?;
     let session = eredu_runtime::construct_replicated_text_session_with_runtime(
         binding,
-        NumericReplicatedMechanisms::with_checkpoint(checkpoint),
+        mechanisms,
         eredu_runtime::PartitionedTextExecution::new(),
     )
     .map_err(|error| Error::backend(error.to_string()))?;
@@ -18150,7 +18376,7 @@ fn bind_numeric_routed_direct<A, G>(
     prepared: NumericPreparedRoutedPartition<A, G>,
     world: Arc<NumericPartitionWorld>,
     context: NumericContext,
-    provider_calls: Arc<AtomicUsize>,
+    provider: CountingPartitionedRoutedProvider,
     checkpoint: SharedCheckpointSource,
 ) -> Result<NumericPartitionExecutable, Error>
 where
@@ -18168,36 +18394,46 @@ where
     A::StaticModules: Clone,
     G: 'static,
 {
+    let addressable_parameters = prepared
+        .addressable_logical_targets()
+        .into_iter()
+        .collect::<Vec<_>>();
     let facts = prepared.session_facts().map_err(Error::backend)?;
     let (text, prompt, plan, _) = facts.into_parts();
-    let (prompt_cache_identity, _, _, _) = text.into_parts();
-    let provider = CountingPartitionedRoutedProvider {
-        inner: prepared
-            .resident_gated_product_provider()
-            .map_err(|error| Error::backend(error.to_string()))?,
-        calls: provider_calls,
-    };
+    let (prompt_cache_identity, _, _, selected_residency) = text.into_parts();
     let factory_world = Arc::clone(&world);
+    let mut mechanisms = if context.bind_checkpoint_values {
+        if matches!(selected_residency, LayerWeightResidency::FullyResident) {
+            NumericReplicatedMechanisms::with_bound_checkpoint(Arc::clone(&checkpoint))
+        } else {
+            NumericReplicatedMechanisms::with_bounded_checkpoint(Arc::clone(&checkpoint))
+        }
+    } else {
+        NumericReplicatedMechanisms::with_checkpoint(Arc::clone(&checkpoint))
+    };
+    let factory_prompt = prompt.clone();
     let binding = prepared
         .prepare_session_runtime(
             prompt,
             &context,
-            move |input, layout, selected, execution, context| {
-                let (architecture, partition, manifest, tasks) = input.into_parts();
-                if tasks.is_empty() || layout != *context.local_layout.as_deref().unwrap() {
-                    return Err(Error::backend(
-                        "numeric routed direct local task/layout authority drifted",
-                    ));
-                }
-                factory_world.record_materialization(manifest.rank(), tasks.len());
+            |input, layout, selected, execution, context| {
+                let prepared = eredu_runtime::prepare_default_partitioned_runtime(
+                    input,
+                    None,
+                    layout,
+                    None,
+                    selected,
+                    &factory_prompt,
+                    eredu_runtime::PartitionedUnitScope::Owned,
+                    &addressable_parameters,
+                    &mut mechanisms,
+                    context,
+                )
+                .map_err(|e| Error::backend(e.to_string()))?;
+                let (architecture, partition, manifest, execution_policy, bounded_policy, state) =
+                    prepared.into_parts();
                 factory_world.realize_manifest(&manifest)?;
-                let units = partition
-                    .units()
-                    .map(|address| {
-                        architecture.build_unit(address.group(), address.index(), context)
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                let state = numeric_partition_state(selected, &partition)?;
+                let _ = partition;
                 let parallel = execution
                     .communication_tensor_group()
                     .map(|id| numeric_parallel_context(&factory_world, &manifest, id))
@@ -18205,10 +18441,7 @@ where
                 let communication = numeric_partition_communication(&factory_world, manifest)?;
                 let executor = execution
                     .local_executor(
-                        LayerwiseRuntime::new(
-                            architecture,
-                            NumericReplicatedPolicy::resident(units),
-                        ),
+                        LayerwiseRuntime::new(architecture, execution_policy),
                         parallel,
                         provider,
                         RouteMovement::default(),
@@ -18222,17 +18455,17 @@ where
                     eredu_runtime::NoBoundaryTransport,
                     eredu_runtime::OpaqueOutputPublisher,
                     eredu_runtime::OpaqueFailureAgreement,
-                    eredu_runtime::ExecutionResidency::FullyResident,
-                    None::<NumericReplicatedPolicy<A::Unit>>,
+                    selected_residency.execution_residency(),
+                    bounded_policy,
                 )
                 .map_err(|error| Error::backend(error.to_string()))?;
-                Ok((runtime, state))
+                Ok::<_, Error>((runtime, state))
             },
         )
         .map_err(|error| Error::backend(error.to_string()))?;
     let session = eredu_runtime::construct_replicated_text_session_with_runtime(
         binding,
-        NumericReplicatedMechanisms::with_checkpoint(checkpoint),
+        mechanisms,
         eredu_runtime::PartitionedTextExecution::new(),
     )
     .map_err(|error| Error::backend(error.to_string()))?;
@@ -18266,29 +18499,47 @@ where
     A::StaticModules: Clone,
     G: 'static,
 {
-    prepared.dispatch_execution(
-        (world, context, provider_calls, omit_inactive, checkpoint),
-        |prepared, (world, context, provider_calls, _, checkpoint)| {
-            bind_numeric_routed_direct(prepared, world, context, provider_calls, checkpoint)
+    let binding_context = context.clone();
+    let bank_checkpoint = Arc::clone(&checkpoint);
+    eredu_architectures::prepared_execution::construct_selected_partition_providers(
+        prepared,
+        |prepared, options| {
+            partition_banks::bind(
+                prepared.banks(),
+                options,
+                bank_checkpoint.as_ref(),
+                &binding_context,
+            )
         },
-        |prepared, (world, context, provider_calls, omit_inactive, checkpoint)| {
-            bind_numeric_routed_pipeline_impl(
-                prepared,
-                world,
-                context,
-                provider_calls,
-                omit_inactive,
-                checkpoint,
+        (world, context, provider_calls, omit_inactive, checkpoint),
+        |(world, context, calls, omit_inactive, checkpoint), prepared, inner, _| {
+            let provider = CountingPartitionedRoutedProvider { inner, calls };
+            prepared.dispatch_execution(
+                (world, context, provider, omit_inactive, checkpoint),
+                |prepared, (world, context, provider, _, checkpoint)| {
+                    bind_numeric_routed_direct(prepared, world, context, provider, checkpoint)
+                },
+                |prepared, (world, context, provider, omit_inactive, checkpoint)| {
+                    bind_numeric_routed_pipeline_impl(
+                        prepared,
+                        world,
+                        context,
+                        provider,
+                        omit_inactive,
+                        checkpoint,
+                    )
+                },
             )
         },
     )
+    .map_err(|e| Error::backend(e.to_string()))
 }
 
 fn bind_numeric_routed_pipeline_impl<A, G>(
     prepared: NumericPreparedRoutedPartition<A, G>,
     world: Arc<NumericPartitionWorld>,
     context: NumericContext,
-    provider_calls: Arc<AtomicUsize>,
+    provider: CountingPartitionedRoutedProvider,
     omit_inactive: Option<Arc<AtomicBool>>,
     checkpoint: SharedCheckpointSource,
 ) -> Result<NumericPartitionExecutable, Error>
@@ -18307,38 +18558,37 @@ where
     A::StaticModules: Clone,
     G: 'static,
 {
+    let addressable_parameters = prepared
+        .addressable_logical_targets()
+        .into_iter()
+        .collect::<Vec<_>>();
     let facts = prepared.session_facts().map_err(Error::backend)?;
     let activation_dtype = facts.activation_dtype();
     let (text, prompt, plan, _) = facts.into_parts();
-    let (prompt_cache_identity, _, _, _) = text.into_parts();
-    let provider = CountingPartitionedRoutedProvider {
-        inner: prepared
-            .resident_gated_product_provider()
-            .map_err(|error| Error::backend(error.to_string()))?,
-        calls: provider_calls,
-    };
+    let (prompt_cache_identity, _, _, selected_residency) = text.into_parts();
     let factory_world = Arc::clone(&world);
+    let mut mechanisms = if context.bind_checkpoint_values {
+        if matches!(selected_residency, LayerWeightResidency::FullyResident) {
+            NumericReplicatedMechanisms::with_bound_checkpoint(Arc::clone(&checkpoint))
+        } else {
+            NumericReplicatedMechanisms::with_bounded_checkpoint(Arc::clone(&checkpoint))
+        }
+    } else {
+        NumericReplicatedMechanisms::with_checkpoint(Arc::clone(&checkpoint))
+    };
+    let factory_prompt = prompt.clone();
     let binding = prepared
         .prepare_session_runtime(
             prompt,
             &context,
-            move |input, layout, selected, execution, context| {
-                let (architecture, partition, manifest, tasks) = input.into_parts();
-                if tasks.is_empty() || layout != *context.local_layout.as_deref().unwrap() {
-                    return Err(Error::backend(
-                        "numeric routed pipeline local task/layout authority drifted",
-                    ));
-                }
-                factory_world.record_materialization(manifest.rank(), tasks.len());
+            |input, layout, selected, execution, context| {
+                let prepared = eredu_runtime::prepare_default_partitioned_runtime(
+                    input, None, layout, None, selected, &factory_prompt,
+                    eredu_runtime::PartitionedUnitScope::Owned, &addressable_parameters, &mut mechanisms, context,
+                ).map_err(|e| Error::backend(e.to_string()))?;
+                let (architecture, partition, manifest, execution_policy, bounded_policy, state) = prepared.into_parts();
                 factory_world.realize_manifest(&manifest)?;
                 let addresses = partition.units().collect::<Vec<_>>();
-                let units = addresses
-                    .iter()
-                    .map(|address| {
-                        architecture.build_unit(address.group(), address.index(), context)
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                let state = numeric_partition_state(selected, &partition)?;
                 let parallel = execution
                     .communication_tensor_group()
                     .map(|id| numeric_parallel_context(&factory_world, &manifest, id))
@@ -18354,7 +18604,7 @@ where
                 };
                 let executor = eredu_architectures::partitioned_execution::PipelinePartitionExecutor::new_with_unit_strategy(
                     architecture,
-                    NumericReplicatedPolicy::resident(units),
+                    execution_policy,
                     addresses,
                     parallel,
                     NumericPartitionTensorAllocator,
@@ -18369,17 +18619,17 @@ where
                     eredu_runtime::OpaqueBoundaryTransport,
                     eredu_runtime::OpaqueOutputPublisher,
                     eredu_runtime::OpaqueFailureAgreement,
-                    eredu_runtime::ExecutionResidency::FullyResident,
-                    None::<NumericReplicatedPolicy<A::Unit>>,
+                    selected_residency.execution_residency(),
+                    bounded_policy,
                 )
                 .map_err(|error| Error::backend(error.to_string()))?;
-                Ok((runtime, state))
+                Ok::<_, Error>((runtime, state))
             },
         )
         .map_err(|error| Error::backend(error.to_string()))?;
     let session = eredu_runtime::construct_replicated_text_session_with_runtime(
         binding,
-        NumericReplicatedMechanisms::with_checkpoint(checkpoint),
+        mechanisms,
         eredu_runtime::PartitionedTextExecution::new(),
     )
     .map_err(|error| Error::backend(error.to_string()))?;
@@ -18462,7 +18712,7 @@ fn numeric_partition_capabilities() -> eredu_runtime::CommunicationCapabilities 
 pub(crate) fn authoritative_partitioned_numeric_sessions_match_tp_pp_and_tp_pp_reference() {
     use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
 
-    partitioned_adapter::assert_narrow_route_and_native_pairing_rejections();
+    partitioned_adapter::assert_shared_route_and_native_pairing_contract();
 
     for (architecture_name, model_type) in [
         ("LlamaForCausalLM", "llama"),
@@ -19201,7 +19451,7 @@ fn assert_authoritative_routed_numeric_sessions(
         NumericReplicatedRun {
             outputs,
             state,
-            bank_report: None,
+            bank_reports: BTreeMap::new(),
         }
     } else {
         execute_numeric_routed_visitor(&config, &reference_context, &inputs[0], false)
@@ -19949,7 +20199,7 @@ impl<'a>
         Ok(NumericReplicatedRun {
             outputs,
             state,
-            bank_report: None,
+            bank_reports: BTreeMap::new(),
         })
     }
 
@@ -19977,7 +20227,7 @@ impl<'a>
         assert!(self.construction_started);
         let layout = prepared.requirements().state_layout().clone();
         verify_addressable_member_payloads(
-            prepared.routed().addressable_members(),
+            prepared.routed().banks()[&eredu_runtime::RoutedBankId::new(0)].addressable_members(),
             checkpoint.as_ref(),
         )?;
         macro_rules! run_session {
@@ -20044,15 +20294,20 @@ impl<'a>
             prepared,
             NumericReplicatedMechanisms::with_checkpoint(checkpoint),
             self.context,
-            |prepared, _| {
-                let bank = numeric_addressable_gated_bank(
-                    prepared.plan(),
-                    prepared.catalog(),
-                    prepared.addressable_members(),
-                    prepared.routes_per_token(),
-                    self.context,
-                )?;
-                Ok::<_, String>((bank, NumericIndexedMovement))
+            |banks, _options| {
+                banks
+                    .iter()
+                    .map(|(id, prepared)| {
+                        let bank = numeric_addressable_gated_bank(
+                            prepared.plan().gated().unwrap(),
+                            prepared.catalog(),
+                            prepared.addressable_members(),
+                            prepared.routes_per_token(),
+                            self.context,
+                        )?;
+                        Ok::<_, String>((*id, (bank, NumericIndexedMovement)))
+                    })
+                    .collect()
             },
             (),
             |_, session, facts| {
@@ -20061,7 +20316,7 @@ impl<'a>
                 Ok(NumericReplicatedRun {
                     outputs,
                     state,
-                    bank_report: None,
+                    bank_reports: BTreeMap::new(),
                 })
             },
             |_, session, facts| {
@@ -20070,12 +20325,14 @@ impl<'a>
                 let report = session
                     .execution_strategy()
                     .provider()
+                    .bank(eredu_runtime::RoutedBankId::new(0))
+                    .unwrap()
                     .bank_report()
                     .map_err(|error| error.to_string())?;
                 Ok(NumericReplicatedRun {
                     outputs,
                     state,
-                    bank_report: Some(report),
+                    bank_reports: BTreeMap::from([(eredu_runtime::RoutedBankId::new(0), report)]),
                 })
             },
         )
@@ -20086,7 +20343,7 @@ impl<'a>
 struct NumericReplicatedRun {
     outputs: Vec<NumericTensor>,
     state: DeviceState<NumericBackend, NumericHybridLayerState>,
-    bank_report: Option<NumericBankReport>,
+    bank_reports: BTreeMap<eredu_runtime::RoutedBankId, NumericBankReport>,
 }
 
 struct NumericRoutedVisitor<'a> {
@@ -20110,7 +20367,7 @@ impl<'a>
 
     fn visit<A>(
         self,
-        prepared: eredu_architectures::PreparedRelu2RoutedTextArchitecture<A>,
+        prepared: eredu_architectures::PreparedRoutedTextArchitecture<A>,
         checkpoint: eredu_checkpoint::store::SharedCheckpointSource,
     ) -> Result<Self::Output, Self::Error>
     where
@@ -20147,18 +20404,25 @@ impl<'a>
             }};
         }
 
-        verify_addressable_member_payloads(prepared.addressable_members(), checkpoint.as_ref())?;
-        eredu_architectures::prepared_execution::construct_selected_relu2_session(
+        for bank in prepared.banks().values() {
+            verify_addressable_member_payloads(bank.addressable_members(), checkpoint.as_ref())?;
+        }
+        eredu_architectures::prepared_execution::construct_selected_routed_session(
             prepared,
             NumericReplicatedMechanisms::with_checkpoint(checkpoint),
             self.context,
-            |prepared, _| {
-                let bank = numeric_addressable_relu2_bank(
-                    prepared.plan(),
-                    prepared.catalog(),
-                    self.context,
-                )?;
-                Ok::<_, String>((bank, NumericIndexedMovement))
+            |banks, _options| {
+                banks
+                    .iter()
+                    .map(|(id, prepared)| {
+                        let bank = numeric_addressable_relu2_bank(
+                            prepared.plan().relu2().unwrap(),
+                            prepared.catalog(),
+                            self.context,
+                        )?;
+                        Ok::<_, String>((*id, (bank, NumericIndexedMovement)))
+                    })
+                    .collect()
             },
             (),
             |_, session, _| {
@@ -20166,7 +20430,7 @@ impl<'a>
                 Ok(NumericReplicatedRun {
                     outputs,
                     state,
-                    bank_report: None,
+                    bank_reports: BTreeMap::new(),
                 })
             },
             |_, session, _| {
@@ -20174,12 +20438,14 @@ impl<'a>
                 let report = session
                     .execution_strategy()
                     .provider()
+                    .bank(eredu_runtime::RoutedBankId::new(0))
+                    .unwrap()
                     .bank_report()
                     .map_err(|error| error.to_string())?;
                 Ok(NumericReplicatedRun {
                     outputs,
                     state,
-                    bank_report: Some(report),
+                    bank_reports: BTreeMap::from([(eredu_runtime::RoutedBankId::new(0), report)]),
                 })
             },
         )
@@ -20188,7 +20454,7 @@ impl<'a>
 }
 
 impl<'a>
-    GatedRoutedTextArchitectureVisitor<
+    RoutedTextArchitectureVisitor<
         NumericBackend,
         DeviceState<NumericBackend, NumericHybridLayerState>,
     > for NumericRoutedVisitor<'a>
@@ -20235,20 +20501,55 @@ impl<'a>
             }};
         }
 
-        verify_addressable_member_payloads(prepared.addressable_members(), checkpoint.as_ref())?;
-        eredu_architectures::prepared_execution::construct_selected_gated_session(
+        for bank in prepared.banks().values() {
+            verify_addressable_member_payloads(bank.addressable_members(), checkpoint.as_ref())?;
+        }
+        eredu_architectures::prepared_execution::construct_selected_routed_session(
             prepared,
             NumericReplicatedMechanisms::with_checkpoint(checkpoint),
             self.context,
-            |prepared, _| {
-                let bank = numeric_addressable_gated_bank(
-                    prepared.plan(),
-                    prepared.catalog(),
-                    prepared.addressable_members(),
-                    prepared.routes_per_token(),
-                    self.context,
-                )?;
-                Ok::<_, String>((bank, NumericIndexedMovement))
+            |banks, options| {
+                banks
+                    .iter()
+                    .map(|(id, prepared)| {
+                        let largest = prepared
+                            .addressable_members()
+                            .iter()
+                            .map(|member| member.selected_bytes())
+                            .max()
+                            .ok_or("empty bank")?;
+                        let capacity = options
+                            .offload()
+                            .device_budget_bytes()
+                            .map_or(usize::MAX, |bytes| (bytes / largest) as usize);
+                        let bank = match prepared.plan() {
+                            eredu_architectures::routed_text::RoutedGroupedPlan::Gated(plan) => {
+                                numeric_addressable_gated_bank(
+                                    plan,
+                                    prepared.catalog(),
+                                    prepared.addressable_members(),
+                                    capacity,
+                                    self.context,
+                                )?
+                            }
+                            eredu_architectures::routed_text::RoutedGroupedPlan::Linear(plan) => {
+                                grouped_linear::addressable_bank(
+                                    plan,
+                                    prepared.catalog(),
+                                    prepared.addressable_members(),
+                                    capacity,
+                                    self.context,
+                                )?
+                            }
+                            _ => {
+                                return Err(
+                                    "gated/linear visitor received a different equation".into()
+                                )
+                            }
+                        };
+                        Ok::<_, String>((*id, (bank, NumericIndexedMovement)))
+                    })
+                    .collect()
             },
             (),
             |_, session, _| {
@@ -20256,20 +20557,23 @@ impl<'a>
                 Ok(NumericReplicatedRun {
                     outputs,
                     state,
-                    bank_report: None,
+                    bank_reports: BTreeMap::new(),
                 })
             },
             |_, session, _| {
                 let (outputs, state, session) = run_session!(session);
-                let report = session
+                let bank_reports = session
                     .execution_strategy()
                     .provider()
-                    .bank_report()
+                    .banks()
+                    .iter()
+                    .map(|(id, bank)| bank.bank_report().map(|report| (*id, report)))
+                    .collect::<Result<BTreeMap<_, _>, _>>()
                     .map_err(|error| error.to_string())?;
                 Ok(NumericReplicatedRun {
                     outputs,
                     state,
-                    bank_report: Some(report),
+                    bank_reports,
                 })
             },
         )
@@ -20328,6 +20632,7 @@ fn numeric_addressable_gated_bank(
         bytes.insert(unit.identity(), selected_bytes);
     }
     Ok(NumericGroupedBankMechanism {
+        linear: BTreeMap::new(),
         banks,
         bytes,
         report: NumericBankReport::default(),
@@ -20409,6 +20714,10 @@ pub(crate) struct ReferenceStageEvidence {
     pub(crate) bound_parameters: BTreeMap<String, (Vec<i32>, Vec<u32>)>,
     pub(crate) bounded_unit_acquisitions: Vec<usize>,
     pub(crate) peak_bound_units: usize,
+    pub(crate) bank_acquisitions: Vec<ParameterBankKey>,
+    pub(crate) bank_completions: usize,
+    pub(crate) bank_evictions: usize,
+    pub(crate) peak_bank_bytes: u64,
 }
 
 thread_local! {
@@ -20545,7 +20854,7 @@ impl<'a>
         Ok(NumericReplicatedRun {
             outputs,
             state,
-            bank_report: None,
+            bank_reports: BTreeMap::new(),
         })
     }
 }
@@ -20647,15 +20956,23 @@ fn execute_numeric_routed_visitor(
     tokens: &NumericTensor,
     addressable: bool,
 ) -> NumericReplicatedRun {
-    execute_numeric_routed_visitor_with_quantization(config, context, tokens, addressable, None)
+    execute_numeric_routed_visitor_with_policy(
+        config,
+        context,
+        tokens,
+        addressable,
+        None,
+        eredu_core::ResidencyPlan::FullyResident,
+    )
 }
 
-fn execute_numeric_routed_visitor_with_quantization(
+fn execute_numeric_routed_visitor_with_policy(
     config: &serde_json::Value,
     context: &NumericContext,
     tokens: &NumericTensor,
     addressable: bool,
     quantization: Option<eredu_core::QuantizationRequest>,
+    residency: eredu_core::ResidencyPlan,
 ) -> NumericReplicatedRun {
     use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
 
@@ -20717,20 +21034,28 @@ fn execute_numeric_routed_visitor_with_quantization(
 
     let inspection = eredu_architectures::configuration::inspect_artifact(artifact.path()).unwrap();
     let requirements = eredu_architectures::routed_text_requirements(&inspection).unwrap();
-    let mut plan = prepared_adapter::plan(quantization);
+    let mut plan = prepared_adapter::plan(quantization).with_residency(residency);
     if addressable {
-        let member_bytes = requirements
-            .catalog()
-            .units()
-            .iter()
-            .filter_map(ExpertResidencyUnit::byte_len)
+        let working_set = requirements
+            .banks()
+            .values()
+            .map(|bank| {
+                bank.catalog()
+                    .units()
+                    .iter()
+                    .filter_map(ExpertResidencyUnit::byte_len)
+                    .max()
+                    .expect("routed fixture has exact member geometry")
+                    .checked_mul(bank.routes_per_token() as u64)
+                    .unwrap()
+            })
             .max()
-            .expect("routed fixture has exact member geometry");
+            .unwrap();
         plan = plan.with_expert_cache(Some(eredu_core::ExpertCachePlan::new(
-            Some(member_bytes),
-            Some(member_bytes),
-            member_bytes.checked_mul(2).unwrap(),
-            member_bytes,
+            Some(working_set),
+            Some(working_set),
+            working_set,
+            working_set,
             eredu_core::residency::CacheEvictionPolicy::LeastRecentlyUsed,
         )));
     }
@@ -20769,6 +21094,8 @@ fn execute_numeric_composite_visitor_with_observer(
             .routed_execution()
             .expect("addressable composite fixture requires routed requirements");
         let member_bytes = routed
+            .bank(eredu_runtime::RoutedBankId::new(0))
+            .unwrap()
             .catalog()
             .units()
             .iter()
@@ -21493,7 +21820,7 @@ pub(crate) fn non_mlx_routed_composite_reuses_the_planned_provider() {
         1,
         "addressable routed composite Qwen repeated-decode state",
     );
-    let report = addressable.bank_report.unwrap();
+    let report = addressable.bank_reports[&eredu_runtime::RoutedBankId::new(0)];
     assert!(report.acquisitions > 0);
     assert_eq!(report.acquisitions, report.completions);
     assert!(report.evictions > 0);
@@ -21615,7 +21942,7 @@ pub(crate) fn non_mlx_inkling_composite_executes_routed_and_shared_banks() {
         1,
         "addressable Inkling composite state",
     );
-    let report = addressable.bank_report.unwrap();
+    let report = addressable.bank_reports[&eredu_runtime::RoutedBankId::new(0)];
     assert!(report.acquisitions >= 6);
     assert_eq!(report.acquisitions, report.completions);
     assert!(report.evictions > 0);
@@ -22147,7 +22474,8 @@ pub(crate) fn non_mlx_session_executes_resident_and_addressable_routing_through_
         "non-MLX routed resident/addressable state",
     );
     let report = addressable
-        .bank_report
+        .bank_reports
+        .get(&eredu_runtime::RoutedBankId::new(0))
         .expect("addressable production session reports its generic bank activity");
     assert!(report.acquisitions > 3);
     assert_eq!(report.acquisitions, report.completions);
@@ -22196,7 +22524,8 @@ pub(crate) fn non_mlx_session_executes_relu2_routing_through_the_same_driver() {
         "non-MLX ReLU-squared resident/addressable state",
     );
     let report = addressable
-        .bank_report
+        .bank_reports
+        .get(&eredu_runtime::RoutedBankId::new(0))
         .expect("addressable ReLU-squared session reports bank activity");
     assert!(report.acquisitions > 0);
     assert_eq!(report.acquisitions, report.completions);
@@ -22309,7 +22638,7 @@ pub(crate) fn run_reference_conformance_transformed_addressable_route() -> Refer
     reset_reference_stage_evidence("SafeTensors");
     record_reference_family("qwen3_moe");
     let context = NumericContext::default();
-    let run = execute_numeric_routed_visitor_with_quantization(
+    let run = execute_numeric_routed_visitor_with_policy(
         &config,
         &context,
         &NumericTensor::token_ids(&[1, 3, 2]),
@@ -22318,9 +22647,10 @@ pub(crate) fn run_reference_conformance_transformed_addressable_route() -> Refer
             group_size: 16,
             bits: 4,
         }),
+        eredu_core::ResidencyPlan::FullyResident,
     );
     assert_eq!(run.outputs.len(), 3);
-    assert!(run.bank_report.is_some());
+    assert!(!run.bank_reports.is_empty());
     last_reference_stage_evidence()
 }
 
@@ -23085,6 +23415,17 @@ impl RoutedExpertProvider<NumericBackend> for TypedRelu2ProviderProbe {
         request: RoutedExpertRequest<'_, NumericTensor>,
         _: &NumericContext,
     ) -> Result<NumericTensor, Self::Error> {
+        Ok(request.input.clone())
+    }
+
+    /// Executes an activated selected-linear bank with owned output rows.
+    fn forward_linear_routed(
+        &mut self,
+        _resident_bank: &mut grouped_linear::NumericLinearGroups,
+        request: RoutedExpertRequest<'_, NumericTensor>,
+        _: &NumericContext,
+    ) -> Result<NumericTensor, Self::Error> {
+        self.replicated_calls += 1;
         Ok(request.input.clone())
     }
 
@@ -24812,6 +25153,7 @@ impl ExpertRouteTensorMovement<NumericTensor> for RouteMovement {
         value: NumericTensor,
         destination_rows: &[usize],
         output_rows: usize,
+        _reduction: eredu_nn::GroupReduction,
     ) -> Result<NumericTensor, Self::Error> {
         self.scatters += 1;
         let width = value.shape[1] as usize;
@@ -24974,8 +25316,13 @@ fn qwen_partition_route_mechanism_combines_duplicates_with_zero_peer_rows() {
         &input,
         &scores,
         &coefficients,
-        0,
-        ExpertPass::Decode,
+        eredu_runtime::ExpertRouteInvocation {
+            reduction: eredu_nn::GroupReduction::Sum,
+            bank: eredu_runtime::RoutedBankId::new(0),
+            unit: 0,
+            output_dimensions: 2,
+            pass: ExpertPass::Decode,
+        },
         &mut movement,
         &mut forward,
         &mut reverse,
@@ -25036,8 +25383,13 @@ fn pp2_ep2_route_exchange_uses_complete_provider_output_without_tp_reduction() {
         &input,
         &scores,
         &coefficients,
-        0,
-        ExpertPass::Decode,
+        eredu_runtime::ExpertRouteInvocation {
+            reduction: eredu_nn::GroupReduction::Sum,
+            bank: eredu_runtime::RoutedBankId::new(0),
+            unit: 0,
+            output_dimensions: 2,
+            pass: ExpertPass::Decode,
+        },
         &mut movement,
         &mut forward,
         &mut reverse,
@@ -25106,8 +25458,13 @@ fn gpt_oss_partition_route_mechanism_keeps_weighted_bias_for_one_tp_add() {
             &input,
             &scores,
             &coefficients,
-            0,
-            ExpertPass::Decode,
+            eredu_runtime::ExpertRouteInvocation {
+                reduction: eredu_nn::GroupReduction::Sum,
+                bank: eredu_runtime::RoutedBankId::new(0),
+                unit: 0,
+                output_dimensions: 2,
+                pass: ExpertPass::Decode,
+            },
             &mut movement,
             &mut forward,
             &mut reverse,

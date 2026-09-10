@@ -2943,6 +2943,7 @@ impl decoder::Config for ProjectionLayoutConfig {
 
     fn rotary_spec(&self, dimensions: i32) -> RotarySpec {
         RotarySpec {
+            arithmetic: eredu_nn::RotaryArithmetic::Native,
             dimensions,
             base: self.args.rope_theta,
             traditional: self.args.rope_traditional,
@@ -4365,6 +4366,22 @@ impl RoutedExpertProvider<ReferenceBackend> for ProbeExpertProvider {
         Ok(request.input.clone())
     }
 
+    /// Executes an activated selected-linear bank with owned output rows.
+    fn forward_linear_routed(
+        &mut self,
+        _resident_bank: &mut ReferenceLinearGroups,
+        request: RoutedExpertRequest<'_, ReferenceTensor>,
+        _: &(),
+    ) -> Result<ReferenceTensor, Self::Error> {
+        self.calls.push((
+            request.layer,
+            request.pass,
+            request.input.shape().to_vec(),
+            request.routes.group_indices().shape().to_vec(),
+        ));
+        Ok(request.input.clone())
+    }
+
     fn forward_relu2_routed(
         &mut self,
         _resident_bank: &mut ReferenceLinear,
@@ -4437,7 +4454,7 @@ fn qwen_routed_execution_uses_the_runtime_provider_and_observer_contract() {
     );
 
     let mut observer = ProbeObserver::default();
-    let point = args.routed_observation_point("model.layers.0", 0).unwrap();
+    let point = args.routed_observation_points("model.layers.0", 0).unwrap();
     let mut observed_provider =
         eredu_runtime::ObservedExpertProvider::new(&mut provider, &mut observer, point);
     let output = policy

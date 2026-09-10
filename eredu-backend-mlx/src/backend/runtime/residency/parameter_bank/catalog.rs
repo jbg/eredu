@@ -2,38 +2,7 @@
 
 use super::*;
 
-/// Stable backend identity for one independently addressable bank entry.
-#[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct ParameterBankKey {
-    pub(super) namespace: usize,
-    pub(super) index: usize,
-}
-
-impl ParameterBankKey {
-    /// Creates an entry identity within a caller-defined namespace.
-    pub const fn new(namespace: usize, index: usize) -> Self {
-        Self { namespace, index }
-    }
-
-    /// Returns the caller-defined namespace.
-    pub const fn namespace(self) -> usize {
-        self.namespace
-    }
-
-    /// Returns the entry index within its namespace.
-    pub const fn index(self) -> usize {
-        self.index
-    }
-
-    /// Returns the deterministic residency-unit identifier.
-    pub fn unit_id(self) -> OffloadUnitId {
-        OffloadUnitId::new(format!(
-            "parameter-bank.namespace.{:05}.entry.{:05}",
-            self.namespace, self.index
-        ))
-        .expect("parameter-bank unit identifier is non-empty")
-    }
-}
+pub use eredu_runtime::ParameterBankKey;
 
 /// Workload class used only for bank chunking and mechanism telemetry.
 #[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -203,7 +172,7 @@ pub fn entries_from_selected_members(
     let mut placements = BTreeMap::new();
     for plan in plans {
         let (key, bindings, transforms, selected_bytes, placement) = plan.into_parts();
-        let key = ParameterBankKey::new(key.unit(), key.member());
+
         let source_bytes = bindings.iter().try_fold(0u64, |total, binding| {
             total.checked_add(binding.expected_bytes()).ok_or_else(|| {
                 Error::ArchitectureModel(format!(
@@ -353,9 +322,10 @@ fn quantize_selected_entry_catalog_once(
             let recipe = binding.source_recipe();
             let metadata = recipe.infer(source.as_ref())?;
             let target_name = format!(
-                "__eredu.entry.namespace.{:05}.global.{:05}.{}.weight",
-                identity.namespace,
-                identity.index,
+                "__eredu.entry.bank.{:05}.unit.{:05}.global.{:05}.{}.weight",
+                identity.bank(),
+                identity.unit(),
+                identity.member(),
                 binding.name()
             );
             let target_prefix = target_name

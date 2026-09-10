@@ -8,8 +8,7 @@ use eredu_checkpoint::{store::TensorSelection, WeightQuantization};
 use eredu_nn::GroupedNeuralBackend;
 use eredu_runtime::{
     AddressableGroupedBank, IndexedMovement, OffloadUnit, ParameterBankAccess,
-    ParameterBankAcquisition, ParameterBankKey as NeutralParameterBankKey, ResidencyReport,
-    WeightBinding, WeightMaterializationReport,
+    ParameterBankAcquisition, ResidencyReport, WeightBinding, WeightMaterializationReport,
 };
 
 use std::{
@@ -56,7 +55,10 @@ use catalog::{
 
 mod telemetry;
 use telemetry::ParameterBankStatistics;
-pub use telemetry::{BankPassStatistics, BankTierStatistics, ParameterBankResidencyReport};
+pub use telemetry::{
+    BankPassStatistics, BankTierStatistics, ParameterBankResidencyReport,
+    ParameterBanksResidencyReport,
+};
 
 mod acquisition;
 pub use acquisition::{
@@ -70,6 +72,9 @@ pub use movement::MlxIndexedMovement;
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum AddressableParameterBankError {
+    /// A compact operator cannot mix independently identified banks.
+    #[error("compact parameter-bank demand mixes bank identities")]
+    MixedBanks,
     /// Grouped-entry placement controls were invalid.
     #[error(transparent)]
     Policy(#[from] ParameterBankOptionsError),

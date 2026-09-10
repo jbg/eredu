@@ -14,6 +14,8 @@ pub mod artifact;
 pub mod composite;
 /// Backend-neutral logical GGUF storage and portable encoded leases.
 pub mod expert;
+/// Neutral block-FP8 metadata normalization.
+pub mod fp8;
 pub mod gguf_store;
 pub mod recipe;
 /// Canonical SafeTensors index parsing and shard-path admission.

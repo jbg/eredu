@@ -793,6 +793,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMlp<B> 
             .forward_grouped(
                 &mut self.routed_experts,
                 RoutedExpertRequest {
+                    bank: eredu_runtime::RoutedBankId::new(0),
                     layer,
                     input: hidden,
                     routes: &routed_routes,
@@ -815,6 +816,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMlp<B> 
             .forward_grouped(
                 &mut self.shared_experts,
                 RoutedExpertRequest {
+                    bank: eredu_runtime::RoutedBankId::new(0),
                     layer: shared_layer,
                     input: hidden,
                     routes: &shared_routes,
@@ -864,6 +866,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMlp<B> 
             .forward_grouped_tensor_parallel(
                 &mut self.routed_experts,
                 RoutedExpertRequest {
+                    bank: eredu_runtime::RoutedBankId::new(0),
                     layer,
                     input: hidden,
                     routes: &routed_routes,
@@ -887,6 +890,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMlp<B> 
             .forward_grouped_tensor_parallel(
                 &mut self.shared_experts,
                 RoutedExpertRequest {
+                    bank: eredu_runtime::RoutedBankId::new(0),
                     layer: shared_layer,
                     input: hidden,
                     routes: &shared_routes,

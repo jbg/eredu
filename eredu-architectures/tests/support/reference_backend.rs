@@ -712,7 +712,7 @@ impl NeuralBackend for ReferenceBackend {
     fn sigmoid(input: Self::Tensor, _: &()) -> Result<Self::Tensor, Error> {
         Ok(input)
     }
-    fn softplus(input: Self::Tensor, _: &()) -> Result<Self::Tensor, Error> {
+    fn softplus(input: Self::Tensor, _: f32, _: &()) -> Result<Self::Tensor, Error> {
         Ok(input)
     }
 
@@ -906,7 +906,53 @@ impl eredu_nn::BlockwiseAttentionBackend for ReferenceBackend {
     }
 }
 
+#[derive(Debug, Clone, eredu_nn::Parameterized)]
+#[parameterized(tensor = "ReferenceTensor")]
+struct ReferenceLinearGroups {
+    #[parameter(skip)]
+    spec: eredu_nn::GroupedLinearSpec,
+    projection: ReferenceLinear,
+}
+impl eredu_nn::GroupedLinearOperator<ReferenceTensor> for ReferenceLinearGroups {
+    fn spec(&self) -> &eredu_nn::GroupedLinearSpec {
+        &self.spec
+    }
+    fn forward_grouped(
+        &mut self,
+        input: &ReferenceTensor,
+        _: &GroupSelection<ReferenceTensor>,
+        _: &(),
+    ) -> Result<ReferenceTensor, Error> {
+        Ok(ReferenceTensor(vec![
+            input.shape()[0],
+            self.spec.output_dimensions(),
+        ]))
+    }
+}
+
 impl GroupedNeuralBackend for ReferenceBackend {
+    type LinearGroups = ReferenceLinearGroups;
+    fn grouped_linear_bank(
+        spec: eredu_nn::GroupedLinearSpec,
+        context: &(),
+    ) -> Result<Self::LinearGroups, Error> {
+        let mut projection = Self::linear(
+            LinearSpec {
+                input: spec.input_dimensions(),
+                output: spec.output_dimensions(),
+                weight: spec.projection().weight().clone(),
+                bias: spec.projection().bias().cloned(),
+                format: spec.projection().format().clone(),
+            },
+            context,
+        )?;
+        projection.weight.0.insert(0, spec.group_count());
+        if let Some((bias, _)) = &mut projection.bias {
+            bias.0.insert(0, spec.group_count());
+        }
+        Ok(ReferenceLinearGroups { spec, projection })
+    }
+
     type Selector = ReferenceLinear;
     type GatedProductGroups = ReferenceLinear;
     type Relu2Groups = ReferenceLinear;

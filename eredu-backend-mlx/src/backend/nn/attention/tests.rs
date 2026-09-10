@@ -5,6 +5,151 @@ use crate::backend::{nn::tensor::create_causal_mask, ExecutionContext};
 
 #[test]
 #[ignore = "requires MLX runtime execution"]
+fn bounded_input_score_attention_matches_pytorch_with_broadcast_noncausal_mask() {
+    use safemlx::Dtype;
+    let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+    let stream = context.stream();
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../../validation/attention_input_scores.json"
+    ))
+    .unwrap();
+    let tensor = |name: &str| {
+        let value = &fixture["bounded"][name];
+        let shape = value["shape"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_i64().unwrap() as i32)
+            .collect::<Vec<_>>();
+        let data = value["values"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_f64().unwrap() as f32)
+            .collect::<Vec<_>>();
+        Array::from_slice(&data, &shape)
+            .as_dtype(Dtype::Bfloat16, stream)
+            .unwrap()
+    };
+    let mask = Array::from_slice(&(0..257).map(|x| x % 7 != 0).collect::<Vec<_>>(), &[257]);
+    let actual = super::attention_with_softcap(
+        &tensor("queries"),
+        &tensor("keys"),
+        &tensor("values"),
+        fixture["scale"].as_f64().unwrap() as f32,
+        Some(&mask),
+        None,
+        None,
+        eredu_nn::AttentionArithmetic::InputScores,
+        stream,
+    )
+    .unwrap();
+    assert!(actual
+        .all_close(&tensor("output"), 0.0, 0.0, None, stream)
+        .unwrap()
+        .item::<bool>(stream));
+}
+
+#[test]
+#[ignore = "requires MLX runtime execution"]
+fn input_score_rounding_matches_pytorch_for_contiguous_and_bounded_paged_attention() {
+    use crate::backend::runtime::cache::{
+        kv::{KeyValueCache, PagedKeyValueCache},
+        residency::CacheResidencyManager,
+    };
+    use eredu_nn::AttentionArithmetic;
+    use safemlx::Dtype;
+    let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+    let stream = context.stream();
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../../validation/attention_input_scores.json"
+    ))
+    .unwrap();
+    let tensor = |name: &str| {
+        let value = &fixture[name];
+        let shape = value["shape"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_i64().unwrap() as i32)
+            .collect::<Vec<_>>();
+        let values = value["values"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_f64().unwrap() as f32)
+            .collect::<Vec<_>>();
+        Array::from_slice(&values, &shape)
+            .as_dtype(Dtype::Bfloat16, stream)
+            .unwrap()
+    };
+    let q = tensor("queries");
+    let k = tensor("keys");
+    let v = tensor("values");
+    let expected = tensor("output");
+    let mask = create_causal_mask(3, Some(2), None, None, stream).unwrap();
+    let contiguous = super::attention_with_softcap(
+        &q,
+        &k,
+        &v,
+        fixture["scale"].as_f64().unwrap() as f32,
+        Some(&mask),
+        None,
+        None,
+        AttentionArithmetic::InputScores,
+        stream,
+    )
+    .unwrap();
+    assert!(contiguous
+        .all_close(&expected, 0.0, 0.0, None, stream)
+        .unwrap()
+        .item::<bool>(stream));
+    for page_size in [1, 2, 3, 5] {
+        let options =
+            eredu_runtime::PagedCacheOptions::new(page_size, 80 * page_size as u64, 1 << 20, 1)
+                .unwrap()
+                .with_full_attention(true);
+        let manager = CacheResidencyManager::new(options).unwrap();
+        let mut cache = PagedKeyValueCache::new(manager.clone(), 0, None).unwrap();
+        use safemlx::ops::indexing::TryIndexOp;
+        let cached_values = v.try_index_device((.., .., .., ..4), stream).unwrap();
+        let cached_expected = expected
+            .try_index_device((.., .., .., ..4), stream)
+            .unwrap();
+        cache
+            .update_for_attention(k.clone(), cached_values, stream)
+            .unwrap();
+        let actual = cache
+            .paged_attention(
+                &q,
+                fixture["scale"].as_f64().unwrap() as f32,
+                None,
+                None,
+                None,
+                AttentionArithmetic::InputScores,
+                stream,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(actual.dtype(), Dtype::Bfloat16);
+        assert!(
+            actual
+                .all_close(&cached_expected, 0.0, 0.0, None, stream)
+                .unwrap()
+                .item::<bool>(stream),
+            "page size {page_size}"
+        );
+        let report = manager.report().unwrap();
+        assert_eq!(
+            report.prefill_full_attention_blocks,
+            2 * 5u64.div_ceil(page_size as u64)
+        );
+        assert!(report.peak_device_bytes <= manager.options().device_budget_bytes());
+    }
+}
+
+#[test]
+#[ignore = "requires MLX runtime execution"]
 fn chunked_sliding_prefill_matches_full_masked_gqa_attention() {
     let ctx = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = ctx.stream();
@@ -194,6 +339,7 @@ fn score_softcap_precedes_boolean_and_additive_masks_and_preserves_sinks() {
             Some(&mask),
             Some(&sinks),
             Some(1.0),
+            eredu_nn::AttentionArithmetic::Fused,
             stream,
         )
         .unwrap();
@@ -201,5 +347,64 @@ fn score_softcap_precedes_boolean_and_additive_masks_and_preserves_sinks() {
             .all_close(&expected, 1e-5, 1e-5, None, stream)
             .unwrap()
             .item::<bool>(stream));
+    }
+}
+
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+#[test]
+fn native_bf16_attention_query_tiles_match_independent_reference() {
+    use super::attention_with_softcap;
+    use safemlx::{Array, Device, DeviceType, Dtype, Stream};
+    let weights = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+    let stream = Stream::new_with_device(&Device::new(DeviceType::Gpu, 0));
+    let fixture = Array::load_safetensors(
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/validation/bf16_attention.safetensors"
+        ),
+        &weights,
+    )
+    .unwrap();
+    for width in [6, 7, 8, 9, 10, 93, 193, 513] {
+        let allowed: Vec<bool> = (0..width)
+            .flat_map(|q| (0..width).map(move |k| k <= q))
+            .collect();
+        let mask = Array::from_slice(&allowed, &[width, width]);
+        let output = attention_with_softcap(
+            &fixture[&format!("{width}.queries")],
+            &fixture[&format!("{width}.keys")],
+            &fixture[&format!("{width}.values")],
+            0.125,
+            Some(&mask),
+            None,
+            None,
+            eredu_nn::AttentionArithmetic::InputScores,
+            &stream,
+        )
+        .unwrap();
+        let actual = output
+            .as_dtype(Dtype::Float32, &stream)
+            .unwrap()
+            .into_evaluated()
+            .unwrap();
+        let expected = fixture[&format!("{width}.output")]
+            .as_dtype(Dtype::Float32, &stream)
+            .unwrap()
+            .into_evaluated()
+            .unwrap();
+        let mismatches: Vec<_> = actual
+            .as_slice::<f32>()
+            .iter()
+            .zip(expected.as_slice::<f32>())
+            .enumerate()
+            .filter(|(_, (a, b))| a != b)
+            .map(|(i, (a, b))| (i, *a, *b))
+            .collect();
+        assert!(
+            mismatches.is_empty(),
+            "width {width}: {} mismatches; first {:?}",
+            mismatches.len(),
+            &mismatches[..mismatches.len().min(12)]
+        );
     }
 }

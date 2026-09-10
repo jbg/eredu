@@ -85,13 +85,19 @@ pub struct YarnConfig {
 impl YarnConfig {
     /// Returns the complete backend-neutral rotary algorithm.
     pub fn rotary_algorithm(&self) -> RotaryAlgorithm {
+        let scale = |coefficient: f32| {
+            if self.factor <= 1.0 {
+                1.0
+            } else {
+                1.0 + 0.1 * coefficient * self.factor.ln()
+            }
+        };
         RotaryAlgorithm::Yarn {
             factor: self.factor,
             original_max_positions: self.original_max_position_embeddings,
             beta_fast: self.beta_fast,
             beta_slow: self.beta_slow,
-            concentration: self.mscale,
-            attention_factor: self.mscale_all_dim,
+            amplitude: scale(self.mscale) / scale(self.mscale_all_dim),
             truncate: true,
         }
     }

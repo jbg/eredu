@@ -29,7 +29,7 @@ pub(super) trait MlxParameterBankTelemetry {
     fn parameter_bank_report(
         &self,
     ) -> Result<
-        Option<crate::backend::runtime::residency::parameter_bank::ParameterBankResidencyReport>,
+        Option<crate::backend::runtime::residency::parameter_bank::ParameterBanksResidencyReport>,
         Error,
     >;
 }
@@ -38,7 +38,7 @@ impl MlxParameterBankTelemetry for eredu_runtime::DirectReplicatedTextExecution 
     fn parameter_bank_report(
         &self,
     ) -> Result<
-        Option<crate::backend::runtime::residency::parameter_bank::ParameterBankResidencyReport>,
+        Option<crate::backend::runtime::residency::parameter_bank::ParameterBanksResidencyReport>,
         Error,
     > {
         Ok(None)
@@ -47,26 +47,13 @@ impl MlxParameterBankTelemetry for eredu_runtime::DirectReplicatedTextExecution 
 
 impl MlxParameterBankTelemetry
     for eredu_runtime::RoutedReplicatedTextExecution<
-        eredu_architectures::PlannedResidentGatedProduct,
+        eredu_runtime::RoutedBankProviders<eredu_architectures::routed_text::PlannedResidentBank>,
     >
 {
     fn parameter_bank_report(
         &self,
     ) -> Result<
-        Option<crate::backend::runtime::residency::parameter_bank::ParameterBankResidencyReport>,
-        Error,
-    > {
-        Ok(None)
-    }
-}
-
-impl MlxParameterBankTelemetry
-    for eredu_runtime::RoutedReplicatedTextExecution<eredu_architectures::PlannedResidentRelu2>
-{
-    fn parameter_bank_report(
-        &self,
-    ) -> Result<
-        Option<crate::backend::runtime::residency::parameter_bank::ParameterBankResidencyReport>,
+        Option<crate::backend::runtime::residency::parameter_bank::ParameterBanksResidencyReport>,
         Error,
     > {
         Ok(None)
@@ -79,48 +66,47 @@ impl<E, G, R, I, T, U, V> MlxParameterBankTelemetry
     fn parameter_bank_report(
         &self,
     ) -> Result<
-        Option<crate::backend::runtime::residency::parameter_bank::ParameterBankResidencyReport>,
+        Option<crate::backend::runtime::residency::parameter_bank::ParameterBanksResidencyReport>,
         Error,
     > {
         Ok(None)
     }
 }
 
-pub(super) type MlxAddressableGated = eredu_architectures::PlannedAddressableGatedProduct<
-    MlxNeuralBackend,
-    crate::backend::runtime::residency::parameter_bank::AddressableParameterBank,
-    crate::backend::runtime::residency::parameter_bank::MlxIndexedMovement,
+pub(super) type MlxAddressableBanks = eredu_runtime::RoutedBankProviders<
+    eredu_architectures::routed_text::PlannedAddressableBank<
+        MlxNeuralBackend,
+        crate::backend::runtime::residency::parameter_bank::SharedAddressableParameterBank,
+        crate::backend::runtime::residency::parameter_bank::MlxIndexedMovement,
+    >,
 >;
-pub(super) type MlxAddressableRelu2 = eredu_architectures::PlannedAddressableRelu2<
-    MlxNeuralBackend,
-    crate::backend::runtime::residency::parameter_bank::AddressableParameterBank,
-    crate::backend::runtime::residency::parameter_bank::MlxIndexedMovement,
->;
-
-macro_rules! addressable_bank_telemetry {
-    ($provider:ty) => {
-        impl MlxParameterBankTelemetry
-            for eredu_runtime::RoutedReplicatedTextExecution<$provider>
-        {
-            fn parameter_bank_report(
-                &self,
-            ) -> Result<
-                Option<
-                    crate::backend::runtime::residency::parameter_bank::ParameterBankResidencyReport,
-                >,
-                Error,
-            > {
-                self.provider()
+impl MlxParameterBankTelemetry
+    for eredu_runtime::RoutedReplicatedTextExecution<MlxAddressableBanks>
+{
+    fn parameter_bank_report(
+        &self,
+    ) -> Result<
+        Option<crate::backend::runtime::residency::parameter_bank::ParameterBanksResidencyReport>,
+        Error,
+    > {
+        let banks = self
+            .provider()
+            .banks()
+            .iter()
+            .map(|(id, provider)| {
+                provider
                     .bank_report()
-                    .map(Some)
+                    .map(|report| (*id, report))
                     .map_err(|error| Error::ArchitectureModel(error.to_string()))
-            }
-        }
-    };
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(Some(
+            crate::backend::runtime::residency::parameter_bank::ParameterBanksResidencyReport::new(
+                banks,
+            ),
+        ))
+    }
 }
-
-addressable_bank_telemetry!(MlxAddressableGated);
-addressable_bank_telemetry!(MlxAddressableRelu2);
 
 pub(super) trait ErasedPredictionTargetState: std::any::Any {
     fn control_estimate(&self) -> Option<eredu_core::execution_control::SnapshotEstimate>;
@@ -544,6 +530,23 @@ pub(crate) trait ErasedExternalPredictionExecutable: 'static {
 
 /// Backend-private erased operations for a paired architecture and mutable state.
 pub(crate) trait ErasedReplicatedTextExecutable {
+    fn prepare_autoregressive_cache(&mut self) -> Result<MlxPredictionTargetState, Error> {
+        Err(Error::Speculative(
+            "ordinary prediction state is unavailable".into(),
+        ))
+    }
+    fn autoregressive_forward(
+        &mut self,
+        _tokens: &Array,
+        _cache: &mut MlxPredictionTargetState,
+        _prefill: bool,
+        _stream: &Stream,
+    ) -> Result<Array, Error> {
+        Err(Error::Speculative(
+            "ordinary prediction state is unavailable".into(),
+        ))
+    }
+
     fn native_control_support(&self) -> eredu_core::execution_control::ControlSupport {
         eredu_core::execution_control::ControlSupport::Unsupported {
             reason: "complete native state copying is unavailable for this executable".into(),
@@ -608,7 +611,7 @@ pub(crate) trait ErasedReplicatedTextExecutable {
     fn parameter_bank_report(
         &self,
     ) -> Result<
-        Option<crate::backend::runtime::residency::parameter_bank::ParameterBankResidencyReport>,
+        Option<crate::backend::runtime::residency::parameter_bank::ParameterBanksResidencyReport>,
         Error,
     >;
     fn has_partition_control(&self) -> bool {

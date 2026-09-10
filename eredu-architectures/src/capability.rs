@@ -808,6 +808,24 @@ pub struct CapabilityEstimate {
 }
 
 impl CapabilityEstimate {
+    /// Projects memory accounting onto the exact selected rank-local state.
+    /// Family capabilities and context limits remain global model properties.
+    pub(crate) fn for_selected_state(
+        mut self,
+        layout: Option<&RuntimeStateLayout>,
+    ) -> Result<Self, CapabilityError> {
+        self.state_layout = StateMemoryLayout::new(
+            layout.map_or_else(eredu_core::LayerSchedule::empty, |layout| {
+                layout.layers().clone()
+            }),
+            layout.map_or_else(Vec::new, |layout| layout.layer_prefix_offsets()),
+            self.state_layout.hidden_size,
+            self.state_layout.allocation_granularity,
+            self.state_layout.completeness,
+        )?;
+        Ok(self)
+    }
+
     /// Reuses an exact mechanism/state estimate for an architecture extension
     /// that implements the same validated neutral geometry under a new identity.
     pub fn for_architecture_extension(mut self, effective_model_type: impl Into<String>) -> Self {
@@ -890,6 +908,49 @@ pub fn nanbeige(args: &crate::nanbeige::ModelArgs) -> Result<CapabilityEstimate,
         EstimationCompleteness::Complete,
     )?;
     Ok(finish("nanbeige".into(), spec))
+}
+
+/// Derives context and ordinary KV geometry from the normalized K2 schedule.
+pub fn k2_horizon(
+    args: &crate::k2_horizon::ModelArgs,
+) -> Result<CapabilityEstimate, CapabilityError> {
+    let context = context_from_rope(
+        args.max_position_embeddings,
+        args.rope_parameters.as_ref().or(args.rope_scaling.as_ref()),
+    )?;
+    let sliding = args
+        .schedule
+        .sliding_windows()
+        .into_iter()
+        .map(|(window, layers)| SlidingWindowLayerCount {
+            window: u64::from(window.get()),
+            layers: layers as u64,
+        })
+        .collect::<Vec<_>>();
+    let full_layers = args.schedule.full_layer_count() as u64;
+    let strategy = match (full_layers, sliding.as_slice()) {
+        (_, []) => CacheStateStrategy::FullKv,
+        (0, [only]) => CacheStateStrategy::SlidingKv {
+            window: only.window,
+        },
+        _ => CacheStateStrategy::MixedKv {
+            full_layers,
+            sliding,
+        },
+    };
+    let state = state_memory_layout(
+        crate::decoder::state_layout(args),
+        args.hidden_size,
+        1,
+        EstimationCompleteness::Complete,
+    )?;
+    Ok(with_speculative_draft_source(
+        finish(
+            "k2_horizon".into(),
+            (context.0, context.1, strategy, text_modalities(), state),
+        ),
+        Some(SpeculativeDraftSource::Separate),
+    ))
 }
 
 /// Derives Qwen text capabilities from normalized architecture policy.
@@ -1013,6 +1074,38 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::num::NonZeroU8;
+
+    #[test]
+    fn selected_partition_memory_uses_only_owned_layers_and_heads() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/k2_horizon/reference.json"))
+                .unwrap();
+        let mut config = fixture["mova"]["config"].clone();
+        let global =
+            k2_horizon(&crate::k2_horizon::model_args_from_config_value(&config).unwrap()).unwrap();
+        config["num_hidden_layers"] = 1.into();
+        config["num_attention_heads"] = 2.into();
+        config["num_key_value_heads"] = 1.into();
+        config["head_dim"] = 4.into();
+        let local = crate::decoder::state_layout(
+            &crate::k2_horizon::model_args_from_config_value(&config).unwrap(),
+        )
+        .unwrap();
+        for (layout, expected) in [(Some(&local), 32), (None, 0)] {
+            let projected = global.clone().for_selected_state(layout).unwrap();
+            assert_eq!(projected.capabilities(), global.capabilities());
+            let state = eredu_core::estimate_runtime_state(
+                projected.state_layout(),
+                eredu_core::InputTokenCount::text(3),
+                4,
+                1,
+                NonZeroU8::new(4).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(state.bytes_per_position_per_batch, expected);
+            assert_eq!(state.requested_state_bytes, 7 * expected);
+        }
+    }
 
     #[test]
     fn context_scaling_distinguishes_native_and_effective_limits() {

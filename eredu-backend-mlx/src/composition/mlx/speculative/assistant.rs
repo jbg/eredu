@@ -149,9 +149,56 @@ pub struct MlxDrafter {
 }
 
 struct DrafterPayload {
-    execution:
-        eredu_architectures::MaterializedExternalAssistantExecution<MlxAssistantPreparationVisitor>,
+    execution: DrafterExecution,
     stream: Stream,
+}
+
+enum DrafterExecution {
+    Assistant(
+        eredu_architectures::MaterializedExternalAssistantExecution<MlxAssistantPreparationVisitor>,
+    ),
+    Autoregressive {
+        model: crate::backend::MlxModel,
+        selected: SelectedSpeculativeRealization,
+        tokenizer: TokenizerCompatibilityProof,
+    },
+}
+impl DrafterExecution {
+    fn selected(&self) -> &SelectedSpeculativeRealization {
+        match self {
+            Self::Assistant(a) => a.selected(),
+            Self::Autoregressive { selected, .. } => selected,
+        }
+    }
+    fn tokenizer_compatibility(&self) -> TokenizerCompatibilityProof {
+        match self {
+            Self::Assistant(a) => a.tokenizer_compatibility(),
+            Self::Autoregressive { tokenizer, .. } => *tokenizer,
+        }
+    }
+    fn visit<
+        W: eredu_architectures::MaterializedExternalAssistantVisitor<MlxAssistantPreparationVisitor>,
+    >(
+        &mut self,
+        visitor: W,
+    ) -> W::Output {
+        match self {
+            Self::Assistant(a) => a.visit(visitor),
+            Self::Autoregressive { .. } => {
+                unreachable!("independent draft uses its selected ordinary executor")
+            }
+        }
+    }
+    fn capture(
+        &self,
+    ) -> &eredu_architectures::composite_execution::ExternalPredictionCaptureRequest {
+        match self {
+            Self::Assistant(a) => a.capture(),
+            Self::Autoregressive { .. } => {
+                unreachable!("independent draft consumes no target features")
+            }
+        }
+    }
 }
 
 struct DrafterRetention {
@@ -262,6 +309,9 @@ impl MlxDrafter {
         TensorObserver: eredu_runtime::ActivationObserver<MlxTensor, Exception> + 'static,
         LogitsObserver: eredu_runtime::ActivationObserver<Array, Exception> + 'static,
     {
+        if self.is_autoregressive() {
+            return Err(Error::Speculative("independent drafts expose ordinary model observations, not target-feature assistant observations".into()));
+        }
         let mut operation = self.begin_operation()?;
         operation
             .payload()
@@ -278,7 +328,7 @@ impl MlxDrafter {
 
     /// Materializes an architecture-inspected drafter with proven tokenizer compatibility.
     pub(crate) fn materialize(
-        preparation: eredu_architectures::PreparedExternalAssistantExecution,
+        preparation: eredu_architectures::PreparedExternalDraft,
         stream: &Stream,
         weights_stream: &Stream,
     ) -> Result<Self, Error> {
@@ -289,10 +339,28 @@ impl MlxDrafter {
             _payload: Rc::clone(&retained),
             poisoned: Rc::clone(&poisoned),
         })?;
-        let execution = preparation.materialize(MlxAssistantPreparationVisitor {
-            stream: stream.clone(),
-            weights_stream: weights_stream.clone(),
-        })?;
+        let execution = match preparation {
+            eredu_architectures::PreparedExternalDraft::Assistant(p) => {
+                DrafterExecution::Assistant(p.materialize(MlxAssistantPreparationVisitor {
+                    stream: stream.clone(),
+                    weights_stream: weights_stream.clone(),
+                })?)
+            }
+            eredu_architectures::PreparedExternalDraft::Autoregressive(p) => {
+                let (sources, selected, tokenizer) = p.into_parts();
+                let model = crate::composition::mlx::loading::materialize_model_plan(
+                    sources,
+                    None,
+                    stream,
+                    weights_stream,
+                )?;
+                DrafterExecution::Autoregressive {
+                    model,
+                    selected,
+                    tokenizer,
+                }
+            }
+        };
         let payload = Rc::new(OrdinaryRetirement::new(DrafterPayload {
             execution,
             stream: stream.clone(),
@@ -319,6 +387,26 @@ impl MlxDrafter {
     {
         let mut operation = self.begin_operation()?;
         let result = operation.payload().execution.visit(visitor);
+        operation.finish(result)
+    }
+
+    pub(crate) fn is_autoregressive(&self) -> bool {
+        matches!(
+            self.payload.execution,
+            DrafterExecution::Autoregressive { .. }
+        )
+    }
+    pub(crate) fn with_autoregressive<T>(
+        &mut self,
+        run: impl FnOnce(&mut crate::backend::MlxModel) -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        let mut operation = self.begin_operation()?;
+        let result = match &mut operation.payload().execution {
+            DrafterExecution::Autoregressive { model, .. } => run(model),
+            _ => Err(Error::Speculative(
+                "draft requires target-feature execution".into(),
+            )),
+        };
         operation.finish(result)
     }
 

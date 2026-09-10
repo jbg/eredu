@@ -964,10 +964,16 @@ impl ReplicatedTextParameterRequirement {
                     | SourceTensorEncoding::RecipeOutput(StoredDtype::U32)
             )
         );
+        let encoded_byte_output = matches!(self.native_executable, LinearFormat::GgufIQuant { .. })
+            && matches!(
+                self.source_encoding,
+                Some(SourceTensorEncoding::RecipeOutput(StoredDtype::U8))
+            );
         let lowering_shape = if matches!(
             self.presence,
             ReplicatedTextParameterPresence::Derived { .. }
         ) && !alias_backed_packed_output
+            && !encoded_byte_output
         {
             self.physical_shape.as_ref().unwrap_or(&self.logical_shape)
         } else {
@@ -1413,6 +1419,8 @@ fn validate_state_access_profile(
 #[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[non_exhaustive]
 pub enum GroupedOperationRequirement {
+    /// Activated selected linear projections with explicitly owned output rows.
+    Linear,
     /// Ordinary grouped gated-product output.
     GatedProduct,
     /// Rank-local gated-product partial with an explicit post-reduce term.
@@ -3612,6 +3620,47 @@ mod tests {
         .unwrap()
     }
 
+    #[test]
+    fn derived_native_byte_blocks_preserve_logical_projection_width() {
+        let format = LinearFormat::GgufIQuant {
+            ggml_type: eredu_gguf::GgmlType::IQ4NL,
+            endian: eredu_gguf::Endian::Little,
+        };
+        let requirement = ReplicatedTextParameterRequirement::new(
+            "bank.weight",
+            vec!["packed.weight".into()],
+            vec![physical_source("packed.weight")],
+            vec![],
+            Some(SourceTensorEncoding::RecipeOutput(StoredDtype::U8)),
+            Some(vec![3, 16, 18]),
+            vec![3, 16, 32],
+            format,
+            ReplicatedTextParameterRole::LinearWeight,
+            ReplicatedTextParameterOwner::StaticRole("bank".into()),
+            ReplicatedTextParameterPresence::Derived {
+                recipe: "selected-expert-rows".into(),
+            },
+            ParameterTransformConstraint::Linear { packed_axis: 2 },
+        )
+        .unwrap();
+        let descriptor = requirement.lowering_descriptor(format).unwrap();
+        assert_eq!(descriptor.logical_shape(), [3, 16, 32]);
+        assert_eq!(descriptor.physical_shape(), [3, 16, 18]);
+        assert_eq!(descriptor.packed_axis(), Some(2));
+        assert!(descriptor.has_valid_direct_geometry());
+        for physical in [vec![3, 16, 17], vec![3, 17, 18], vec![3, 16, 36]] {
+            let invalid = WeightLoweringDescriptor::new(
+                SourceTensorEncoding::RecipeOutput(StoredDtype::U8),
+                format,
+                physical,
+                vec![3, 16, 32],
+                Some(2),
+            )
+            .unwrap();
+            assert!(!invalid.has_valid_direct_geometry());
+        }
+    }
+
     fn requirements() -> ReplicatedTextRequirements {
         let graph =
             ExecutionGraph::new(vec![ExecutionGroupSpec::root("decoder")], "decoder").unwrap();
@@ -4065,6 +4114,18 @@ mod tests {
             .find(|task| task.name() == "model.layers.0.mlp.weight")
             .unwrap();
         assert_eq!(task.output_companions().len(), 2);
+        // Packed weight + F16 scale/bias companions. Generated
+        // companions are already included in the transform's output extent.
+        assert_eq!(
+            crate::selected_parameter_resources(
+                std::slice::from_ref(task),
+                &BTreeSet::new(),
+                &BTreeSet::new()
+            )
+            .unwrap()
+            .parameter_bytes,
+            64 * 32 + 2 * 64 * 2
+        );
 
         let members = physical.members();
         let primary = ParameterGroupSpec::new(
@@ -4296,7 +4357,7 @@ mod tests {
             assert!(std::ptr::eq(parameter.clone().task(), shared.task()));
             members.push(
                 crate::AddressableBankMember::new(
-                    crate::ParameterBankKey::new(0, member),
+                    crate::ParameterBankKey::new(0, 0, member),
                     crate::AddressableBankMemberPlacement::new(
                         crate::ExecutionGroupId::new("decoder").unwrap(),
                         0,

@@ -588,7 +588,7 @@ impl PartitionExpertBankOwnership {
 
     /// Stable addressable cache identity; the local ordinal is never used here.
     pub const fn bank_key(&self) -> eredu_runtime::ParameterBankKey {
-        eredu_runtime::ParameterBankKey::new(self.global_unit, self.global_expert)
+        eredu_runtime::ParameterBankKey::new(0, self.global_unit, self.global_expert)
     }
 }
 

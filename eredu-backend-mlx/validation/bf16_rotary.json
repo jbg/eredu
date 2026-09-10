@@ -1,0 +1,11 @@
+{
+  "torch": "2.14.0",
+  "width": 64,
+  "base": 1000000.0,
+  "factor": 16.0,
+  "original_context": 8192,
+  "beta_fast": 128.0,
+  "beta_slow": 4.0,
+  "amplitude": 1.2772588722239782,
+  "sha256": "4d1d0473b45ec8ba73caa9ee965bbbae9786a9a6676d7a9954370425b56ac84b"
+}

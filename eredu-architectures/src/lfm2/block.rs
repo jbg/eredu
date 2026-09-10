@@ -10,7 +10,7 @@ use eredu_nn::{
 use eredu_runtime::RuntimeStateComponents;
 
 use crate::decoder::{
-    Attention, AttentionInput, FeedForwardOperator, TensorParallelFeedForwardOperator,
+    Attention, AttentionInput, DecoderProjectionOperator, TensorParallelProjectionOperator,
 };
 
 use super::{FeedForward, ModelArgs, OperatorPolicy};
@@ -121,6 +121,7 @@ impl<B: NeuralBackend> ReplicatedBlock<B> {
                     Some(norm("k_layernorm")?),
                     Some(B::rotary(
                         RotarySpec {
+                            arithmetic: eredu_nn::RotaryArithmetic::Native,
                             dimensions: head_dim,
                             base: args.rope.theta,
                             traditional: false,
@@ -316,6 +317,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Block<B> {
                     Some(norm("k_layernorm")?),
                     Some(B::rotary(
                         RotarySpec {
+                            arithmetic: eredu_nn::RotaryArithmetic::Native,
                             dimensions: head_dim,
                             base: args.rope.theta,
                             traditional: false,

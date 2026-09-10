@@ -168,6 +168,7 @@ impl NeuralBackend for MlxNeuralBackend {
             None => (None, BTreeMap::new()),
         };
         Ok(MlxRmsNorm {
+            groups: spec.groups,
             module,
             topology,
             offset,
@@ -177,14 +178,21 @@ impl NeuralBackend for MlxNeuralBackend {
     }
 
     fn rotary(spec: RotarySpec, context: &Stream) -> Result<MlxRotary, ComputeError> {
-        compute(rope::initialize_rope(
+        let native = compute(rope::initialize_rope(
             spec.dimensions,
             spec.base,
             spec.traditional,
             spec.algorithm,
             context,
-        ))
-        .map(MlxRotary)
+        ))?;
+        let explicit = if spec.arithmetic == eredu_nn::RotaryArithmetic::InputProducts {
+            Some(compute(rope::ElementwiseRotary::new(
+                spec, &native, context,
+            ))?)
+        } else {
+            None
+        };
+        Ok(MlxRotary { native, explicit })
     }
 
     fn silu(input: MlxTensor, context: &Stream) -> Result<MlxTensor, ComputeError> {
@@ -196,11 +204,31 @@ impl NeuralBackend for MlxNeuralBackend {
     }
 
     fn sigmoid(input: MlxTensor, context: &Stream) -> Result<MlxTensor, ComputeError> {
-        compute_tensor(safemlx::ops::sigmoid(input.into_array(), context))
+        compute_tensor(common::layers::sigmoid(input.into_array(), context))
     }
 
-    fn softplus(input: MlxTensor, context: &Stream) -> Result<MlxTensor, ComputeError> {
-        compute_tensor(nn::softplus(input.into_array(), context))
+    fn softplus(input: MlxTensor, beta: f32, context: &Stream) -> Result<MlxTensor, ComputeError> {
+        if !beta.is_finite() || beta <= 0.0 {
+            return Err(ComputeError::backend(
+                "softplus beta must be positive and finite",
+            ));
+        }
+        let input = input.into_array();
+        let dtype = input.dtype();
+        let wide = compute(input.as_dtype(Dtype::Float32, context))?;
+        let scaled = compute(wide.multiply(Array::from_f32(beta), context))?;
+        let output = compute(scaled.exp(context))?;
+        let output = compute(output.log1p(context))?;
+        let output = compute(output.divide(Array::from_f32(beta), context))?;
+        let output = compute(safemlx::ops::r#where(
+            scaled
+                .gt(Array::from_f32(20.0), context)
+                .map_err(ComputeError::backend)?,
+            &wide,
+            output,
+            context,
+        ))?;
+        compute_tensor(output.as_dtype(dtype, context))
     }
 
     fn exp(input: MlxTensor, context: &Stream) -> Result<MlxTensor, ComputeError> {
@@ -859,6 +887,7 @@ impl NeuralBackend for MlxNeuralBackend {
             request.mask.map(MlxTensor::as_array),
             request.sinks.map(MlxTensor::as_array),
             request.softcap,
+            request.arithmetic,
             context,
         ))
     }
@@ -884,6 +913,7 @@ impl NeuralBackend for MlxNeuralBackend {
                 sequence,
                 request.sinks.map(MlxTensor::as_array),
                 request.softcap,
+                request.arithmetic,
                 context,
             ),
         )

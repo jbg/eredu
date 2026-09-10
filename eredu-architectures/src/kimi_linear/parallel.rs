@@ -78,7 +78,7 @@ impl PartitionExpertBankOwnership {
     }
     /// Returns the stable architecture-global parameter-bank key.
     pub const fn bank_key(&self) -> eredu_runtime::ParameterBankKey {
-        eredu_runtime::ParameterBankKey::new(self.global_unit, self.global_expert)
+        eredu_runtime::ParameterBankKey::new(0, self.global_unit, self.global_expert)
     }
 }
 

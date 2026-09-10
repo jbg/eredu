@@ -110,6 +110,14 @@ impl<'a> MlxPreparationMechanisms<'a> {
 }
 
 impl eredu_architectures::PreparationMechanismProvider for MlxPreparationMechanisms<'_> {
+    fn recipe_materialization_workspace(
+        &self,
+        recipe: &eredu_checkpoint::recipe::DerivedWeightRecipe,
+        source: &dyn eredu_checkpoint::store::CheckpointSource,
+    ) -> Result<u64, String> {
+        crate::backend::runtime::checkpoint::recipe::native_recipe_workspace(recipe, source)
+    }
+
     fn observation_mechanisms(&self) -> eredu_core::ObservationMechanisms {
         eredu_core::ObservationMechanisms {
             activation_tensors: true,

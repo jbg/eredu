@@ -25,8 +25,10 @@ pub(in crate::composition::mlx::replicated_text) struct CompletedReplicatedText<
     effective_model_type: String,
     pub(super) prediction: P,
     pub(super) embedded_prediction_observers: MlxEmbeddedPredictionObservers,
-    parameter_bank:
-        Option<crate::backend::runtime::residency::parameter_bank::SharedAddressableParameterBank>,
+    parameter_banks: std::collections::BTreeMap<
+        eredu_runtime::RoutedBankId,
+        crate::backend::runtime::residency::parameter_bank::SharedAddressableParameterBank,
+    >,
     #[cfg(test)]
     selected_residency: eredu_runtime::LayerWeightResidency,
     partition_sampling_group: Option<crate::backend::runtime::distributed::Group>,
@@ -99,7 +101,7 @@ where
             effective_model_type,
             prediction: NoSelectedPrediction,
             embedded_prediction_observers: MlxEmbeddedPredictionObservers::default(),
-            parameter_bank: None,
+            parameter_banks: std::collections::BTreeMap::new(),
             #[cfg(test)]
             selected_residency,
             stream: stream.clone(),
@@ -110,11 +112,14 @@ where
         }
     }
 
-    pub(super) fn with_parameter_bank(
+    pub(super) fn with_parameter_banks(
         mut self,
-        parameter_bank: crate::backend::runtime::residency::parameter_bank::SharedAddressableParameterBank,
+        parameter_banks: std::collections::BTreeMap<
+            eredu_runtime::RoutedBankId,
+            crate::backend::runtime::residency::parameter_bank::SharedAddressableParameterBank,
+        >,
     ) -> Self {
-        self.parameter_bank = Some(parameter_bank);
+        self.parameter_banks = parameter_banks;
         self
     }
 
@@ -142,7 +147,7 @@ where
             effective_model_type: self.effective_model_type,
             prediction,
             embedded_prediction_observers: self.embedded_prediction_observers,
-            parameter_bank: self.parameter_bank,
+            parameter_banks: self.parameter_banks,
             #[cfg(test)]
             selected_residency: self.selected_residency,
             partition_sampling_group: self.partition_sampling_group,
@@ -191,11 +196,69 @@ where
         + 'static,
     P: ReplicatedPredictionCapability<A, S, D> + 'static,
 {
+    fn prepare_autoregressive_cache(&mut self) -> Result<MlxPredictionTargetState, Error> {
+        self.session
+            .prepare_prediction_target_state(&self.stream)
+            .map(MlxPredictionTargetState::new)
+            .map_err(|e| Error::Speculative(e.to_string()))
+    }
+    fn autoregressive_forward(
+        &mut self,
+        tokens: &Array,
+        cache: &mut MlxPredictionTargetState,
+        prefill: bool,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        if !cache.is::<S>() {
+            return Err(Error::Speculative(
+                "ordinary lane state type differs".into(),
+            ));
+        }
+        let mut lane = cache.take_state::<S>()?;
+        if let Err(error) = self
+            .session
+            .exchange_prediction_target_state(&mut lane, stream)
+        {
+            cache.restore_state(lane);
+            return Err(Error::Speculative(error.to_string()));
+        }
+        let tokens = MlxTensor::from_array(tokens.clone());
+        let result = self.session.sequence_logits(
+            A::text_input(&tokens, None),
+            if prefill {
+                eredu_runtime::ExpertPass::Prefill
+            } else {
+                eredu_runtime::ExpertPass::Decode
+            },
+            stream,
+        );
+        let restored = match self
+            .session
+            .exchange_prediction_target_state(&mut lane, stream)
+        {
+            Ok(()) => Ok(()),
+            Err(error) => self
+                .session
+                .recover_prediction_target_state_after_failure(&mut lane)
+                .map_err(|recovery| {
+                    Error::Speculative(format!(
+                        "lane exchange failed: {error}; ownership recovery failed: {recovery}"
+                    ))
+                })
+                .and(Err(Error::Speculative(error.to_string()))),
+        };
+        cache.restore_state(lane);
+        let output = result.map_err(|e| Error::Speculative(e.to_string()))?;
+        restored?;
+        Ok(self.published(output.into_array()))
+    }
+
     fn native_control_support(&self) -> eredu_core::execution_control::ControlSupport {
         use eredu_core::execution_control::ControlSupport;
-        if self.has_partition_control() {
+        if D::PARTITIONED_SESSION && !D::DISTRIBUTED_PHASE_AGREEMENT {
             return ControlSupport::Unsupported {
-                reason: "native text snapshots require single-rank execution".into(),
+                reason: "partitioned state copies require bounded all-rank preparation agreement"
+                    .into(),
             };
         }
         if P::present() {
@@ -295,7 +358,7 @@ where
             .downcast_mut::<eredu_runtime::replicated_session::ReplicatedTextControlState<S>>()
             .ok_or_else(|| Error::ArchitectureModel("native control state type differs".into()))?;
         self.session
-            .exchange_control_state(slot)
+            .exchange_control_state(slot, &self.stream)
             .map_err(|error| Error::ArchitectureModel(error.to_string()))
     }
 
@@ -456,12 +519,15 @@ where
     fn parameter_bank_report(
         &self,
     ) -> Result<
-        Option<crate::backend::runtime::residency::parameter_bank::ParameterBankResidencyReport>,
+        Option<crate::backend::runtime::residency::parameter_bank::ParameterBanksResidencyReport>,
         Error,
     > {
-        match &self.parameter_bank {
-            Some(bank) => bank.report().map(Some),
-            None => self.session.execution_strategy().parameter_bank_report(),
+        if self.parameter_banks.is_empty() {
+            self.session.execution_strategy().parameter_bank_report()
+        } else {
+            self.parameter_banks.iter().map(|(id, bank)| bank.report().map(|report| (*id, report)))
+                .collect::<Result<std::collections::BTreeMap<_, _>, _>>()
+                .map(|reports| Some(crate::backend::runtime::residency::parameter_bank::ParameterBanksResidencyReport::new(reports)))
         }
     }
 

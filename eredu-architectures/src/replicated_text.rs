@@ -11,9 +11,7 @@ use std::{
     sync::Arc,
 };
 
-use eredu_checkpoint::{
-    AffineQuantization, LinearFormat, SourceTensorEncoding, StoredDtype, WeightQuantization,
-};
+use eredu_checkpoint::{LinearFormat, SourceTensorEncoding, StoredDtype, WeightQuantization};
 use eredu_core::{
     cache::PromptCacheModelIdentity,
     checkpoint::{TensorCatalog, TensorDtype},
@@ -117,6 +115,7 @@ impl<B: NeuralBackend> FixedReplicatedFamily<B> for Lfm2Replicated {
     fn static_spec(config: &Self::Config) -> crate::decoder::StaticModuleSpec {
         let embedding = "model.embed_tokens.weight";
         crate::decoder::StaticModuleSpec {
+            normalization_groups: None,
             embedding_weight: embedding.into(),
             normalization_weight: "model.embedding_norm.weight".into(),
             head_weight: "lm_head.weight".into(),
@@ -194,6 +193,7 @@ impl<B: eredu_nn::BlockwiseAttentionBackend> CompressedReplicatedFamily<B>
     fn static_spec(config: &Self::Config) -> crate::decoder::StaticModuleSpec {
         let embedding = "model.embed_tokens.weight";
         crate::decoder::StaticModuleSpec {
+            normalization_groups: None,
             embedding_weight: embedding.into(),
             normalization_weight: "model.norm.weight".into(),
             head_weight: "lm_head.weight".into(),
@@ -327,6 +327,7 @@ impl<B: NeuralBackend> FixedReplicatedFamily<B> for KimiLinearReplicated {
     fn static_spec(config: &Self::Config) -> crate::decoder::StaticModuleSpec {
         let embedding = "model.embed_tokens.weight";
         crate::decoder::StaticModuleSpec {
+            normalization_groups: None,
             embedding_weight: embedding.into(),
             normalization_weight: "model.norm.weight".into(),
             head_weight: "lm_head.weight".into(),
@@ -398,6 +399,7 @@ impl<B: NeuralBackend> FixedReplicatedFamily<B> for NemotronHReplicated {
     fn static_spec(config: &Self::Config) -> crate::decoder::StaticModuleSpec {
         let embedding = "model.embeddings.weight";
         crate::decoder::StaticModuleSpec {
+            normalization_groups: None,
             embedding_weight: embedding.into(),
             normalization_weight: "model.norm_f.weight".into(),
             head_weight: "lm_head.weight".into(),
@@ -466,6 +468,7 @@ impl<B: NeuralBackend> FixedReplicatedFamily<B> for QwenHybridReplicated {
     }
     fn static_spec(config: &Self::Config) -> crate::decoder::StaticModuleSpec {
         crate::decoder::StaticModuleSpec {
+            normalization_groups: None,
             embedding_weight: "model.embed_tokens.weight".into(),
             normalization_weight: "model.norm.weight".into(),
             head_weight: "lm_head.weight".into(),
@@ -940,6 +943,36 @@ where
                 .visit(prepared, store)
                 .map_err(ReplicatedTextDispatchError::Backend)
         }
+        EligibleConfig::K2Horizon(args) => {
+            visitor.construction_started();
+            let capability_estimate = crate::capability::k2_horizon(args)
+                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+            let effective_model_type = args.model_type.clone();
+            let source_architecture = selected_uses_transform(&selected)
+                .then(|| crate::k2_horizon::DenseLayeredModel::<B>::new(args.clone(), context))
+                .transpose()
+                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+            let args = selected_k2_horizon_args(args, &selected)
+                .map_err(ReplicatedTextDispatchError::Architecture)?;
+            let prompt_cache_architecture_identity =
+                crate::k2_horizon::prompt_cache_architecture_fingerprint(&args);
+            let architecture = crate::k2_horizon::DenseLayeredModel::<B>::new(args, context)
+                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+            let prepared = prepare_architecture_handoff::<B, S, _>(
+                architecture,
+                source_architecture,
+                requirements,
+                selected,
+                capability_estimate,
+                effective_model_type,
+                prompt_cache_architecture_identity,
+                context,
+            )
+            .map_err(ReplicatedTextDispatchError::Architecture)?;
+            visitor
+                .visit(prepared, store)
+                .map_err(ReplicatedTextDispatchError::Backend)
+        }
         EligibleConfig::Qwen(args) => {
             visitor.construction_started();
             let capability_estimate = crate::capability::qwen(args)
@@ -1275,6 +1308,33 @@ pub(crate) fn source_llama_args(
     } else {
         crate::llama::with_checkpoint_formats(args, formats)
     }
+}
+
+pub(crate) fn selected_k2_horizon_args(
+    args: &crate::k2_horizon::ModelArgs,
+    selected: &SelectedReplicatedTextRealization,
+) -> Result<crate::k2_horizon::ModelArgs, String> {
+    crate::k2_horizon::with_checkpoint_formats(
+        args,
+        selected
+            .parameters()
+            .iter()
+            .map(|p| (p.name().to_owned(), p.executable())),
+    )
+}
+
+pub(crate) fn source_k2_horizon_args(
+    args: &crate::k2_horizon::ModelArgs,
+    selected: &SelectedReplicatedTextRealization,
+) -> Result<crate::k2_horizon::ModelArgs, String> {
+    crate::k2_horizon::with_checkpoint_formats(
+        args,
+        selected
+            .requirements()
+            .parameters()
+            .iter()
+            .map(|parameter| (parameter.name().to_owned(), parameter.native_executable())),
+    )
 }
 
 pub(crate) fn selected_qwen_args(
@@ -1635,6 +1695,7 @@ where
         EligibleConfig::Gemma2(_)
         | EligibleConfig::Llama(_)
         | EligibleConfig::Nanbeige(_)
+        | EligibleConfig::K2Horizon(_)
         | EligibleConfig::Qwen(_)
         | EligibleConfig::GptOss(_)
         | EligibleConfig::DeepSeekV3(_)
@@ -1988,6 +2049,7 @@ where
         EligibleConfig::Gemma2(_)
             | EligibleConfig::Llama(_)
             | EligibleConfig::Nanbeige(_)
+            | EligibleConfig::K2Horizon(_)
             | EligibleConfig::Qwen(_)
     ) {
         visit_replicated_text_architecture(plan, selected, store, context, visitor)
@@ -2023,6 +2085,7 @@ where
         EligibleConfig::Gemma2(_)
             | EligibleConfig::Llama(_)
             | EligibleConfig::Nanbeige(_)
+            | EligibleConfig::K2Horizon(_)
             | EligibleConfig::Qwen(_)
     );
     match (ordinary, selected.state().access()) {
@@ -2189,6 +2252,7 @@ where
 }
 
 enum EligibleConfig<'a> {
+    K2Horizon(&'a crate::k2_horizon::ModelArgs),
     Llama(&'a crate::llama::ModelArgs),
     Gemma2(&'a crate::gemma2::ModelArgs),
     Nanbeige(&'a crate::nanbeige::ModelArgs),
@@ -2223,6 +2287,7 @@ impl EligibleConfig<'_> {
             Self::Nanbeige(args) => standard(args.dense_config().hidden_size),
             Self::Gemma2(args) => standard(args.dense_config().hidden_size),
             Self::Llama(args) => standard(args.hidden_size),
+            Self::K2Horizon(args) => standard(args.hidden_size),
             Self::Qwen(args) => standard(args.hidden_size),
             Self::Lfm2(args) => standard(args.hidden_size),
             Self::KimiLinear(args) => standard(args.hidden_size),
@@ -2325,6 +2390,33 @@ impl EligibleConfig<'_> {
                 args.num_loops(),
                 !args.skip_loop_final_norm(),
             )?)?,
+            Self::K2Horizon(args) => {
+                extend(crate::k2_horizon::linear_companion_recipes(source, args)?)?;
+                for layer in 0..self.unit_count()? {
+                    for (bank, count, enabled) in [
+                        (
+                            crate::k2_horizon::ExpertBank::FeedForward,
+                            args.num_experts,
+                            args.is_sparse_layer(layer),
+                        ),
+                        (
+                            crate::k2_horizon::ExpertBank::AttentionValue,
+                            args.mova_num_experts,
+                            args.is_mova_layer(layer),
+                        ),
+                    ] {
+                        if enabled {
+                            extend(crate::k2_horizon::expert_recipes(
+                                source,
+                                args,
+                                layer,
+                                bank,
+                                &(0..count as usize).collect::<Vec<_>>(),
+                            )?)?;
+                        }
+                    }
+                }
+            }
             Self::Qwen(args) if args.is_moe() => {
                 for layer in 0..self.unit_count()? {
                     let expert = crate::qwen::expert_recipes(source, args, layer)?;
@@ -2469,6 +2561,7 @@ impl EligibleConfig<'_> {
             Self::Nanbeige(args) => crate::nanbeige::prompt_cache_architecture_fingerprint(args),
             Self::Gemma2(args) => crate::gemma2::prompt_cache_architecture_fingerprint(args),
             Self::Llama(args) => crate::llama::prompt_cache_architecture_fingerprint(args),
+            Self::K2Horizon(args) => crate::k2_horizon::prompt_cache_architecture_fingerprint(args),
             Self::Qwen(args) => crate::qwen::prompt_cache_architecture_fingerprint(args),
             Self::Lfm2(args) => crate::lfm2::prompt_cache_architecture_fingerprint(args),
             Self::KimiLinear(args) => {
@@ -2577,6 +2670,7 @@ impl EligibleConfig<'_> {
             Self::Gemma2(_)
             | Self::Llama(_)
             | Self::Nanbeige(_)
+            | Self::K2Horizon(_)
             | Self::Qwen(_)
             | Self::GptOss(_)
             | Self::DeepSeekV3(_)
@@ -2624,6 +2718,7 @@ impl EligibleConfig<'_> {
 
     fn operators(&self) -> NeuralOperatorCapabilities {
         match self {
+            Self::K2Horizon(args) => crate::decoder::operator_requirements(*args),
             Self::Gemma2(args) => crate::decoder::operator_requirements(*args),
             Self::Llama(_)
             | Self::Nanbeige(_)
@@ -2672,6 +2767,7 @@ impl EligibleConfig<'_> {
             Self::Gemma2(_)
             | Self::Llama(_)
             | Self::Nanbeige(_)
+            | Self::K2Horizon(_)
             | Self::Qwen(_)
             | Self::GptOss(_) => crate::decoder::TEXT_DECODER_EXECUTION_GROUP,
             Self::Lfm2(_) | Self::KimiLinear(_) | Self::NemotronH(_) | Self::QwenHybrid(_) => {
@@ -2699,6 +2795,7 @@ impl EligibleConfig<'_> {
             Self::Nanbeige(args) => args.state_layer_count() as i32,
             Self::Gemma2(args) => args.dense_config().num_hidden_layers,
             Self::Llama(args) => args.num_hidden_layers,
+            Self::K2Horizon(args) => args.num_hidden_layers,
             Self::Qwen(args) => args.num_hidden_layers,
             Self::Lfm2(args) => args.num_hidden_layers,
             Self::KimiLinear(args) => args.num_hidden_layers,
@@ -2773,6 +2870,9 @@ impl EligibleConfig<'_> {
             Self::Llama(args) => {
                 crate::llama::state_layout(*args).map_err(|error| error.to_string())
             }
+            Self::K2Horizon(args) => {
+                crate::decoder::state_layout(*args).map_err(|error| error.to_string())
+            }
             Self::Qwen(args) => crate::qwen::state_layout(*args).map_err(|error| error.to_string()),
             Self::Lfm2(args) => crate::lfm2::state_layout(args).map_err(|error| error.to_string()),
             Self::KimiLinear(args) => {
@@ -2821,6 +2921,7 @@ impl EligibleConfig<'_> {
             Self::Nanbeige(args) => args.weight_quantization_for(name),
             Self::Gemma2(args) => args.weight_quantization_for(name),
             Self::Llama(args) => args.weight_quantization_for(name),
+            Self::K2Horizon(args) => return args.linear_format_for(name),
             Self::Qwen(args) => args.weight_quantization_for(name),
             Self::Lfm2(args) => args.weight_quantization_for(name),
             Self::KimiLinear(args) => args.weight_quantization_for(name),
@@ -2922,6 +3023,44 @@ impl EligibleConfig<'_> {
             Self::Nanbeige(args) => decoder_linear_parameter_shapes(*args),
             Self::Gemma2(args) => decoder_linear_parameter_shapes(*args),
             Self::Llama(args) => decoder_linear_parameter_shapes(*args),
+            Self::K2Horizon(args) => {
+                let mut shapes = family_linear_parameter_shapes(
+                    crate::k2_horizon::safetensors_plan(args)?,
+                    |name| Some(args.linear_format_for(name)),
+                    "model.embed_tokens.weight",
+                )?;
+                let rank = eredu_core::ParallelRankTopology::new(
+                    eredu_core::ParallelTopology::new(1, 1, 1, 1).map_err(|e| e.to_string())?,
+                    0,
+                )
+                .map_err(|e| e.to_string())?;
+                for bank in crate::k2_horizon::expert_realization_plans(args, rank, None)
+                    .map_err(|e| e.to_string())?
+                    .values()
+                {
+                    match bank {
+                        crate::RoutedGroupedPlan::Gated(plan) => {
+                            insert_grouped_gated_linear_shapes(&mut shapes, plan)?
+                        }
+                        crate::RoutedGroupedPlan::Linear(plan) => {
+                            for spec in plan.unit_specs().values() {
+                                shapes.insert(
+                                    spec.projection().weight().id.to_string(),
+                                    vec![
+                                        spec.group_count() as usize,
+                                        spec.output_dimensions() as usize,
+                                        spec.input_dimensions() as usize,
+                                    ],
+                                );
+                            }
+                        }
+                        crate::RoutedGroupedPlan::Relu2(_) => {
+                            unreachable!("family specifies SwiGLU")
+                        }
+                    }
+                }
+                Ok(shapes)
+            }
             Self::Qwen(args) => {
                 let mut shapes = decoder_linear_parameter_shapes(*args)?;
                 if args.num_experts > 0 {
@@ -3135,6 +3274,7 @@ impl EligibleConfig<'_> {
             Self::Nanbeige(args) => crate::decoder::Config::parameter_root(*args),
             Self::Gemma2(args) => crate::decoder::Config::parameter_root(*args),
             Self::Llama(args) => crate::decoder::Config::parameter_root(*args),
+            Self::K2Horizon(args) => crate::decoder::Config::parameter_root(*args),
             Self::Qwen(args) => crate::decoder::Config::parameter_root(*args),
             Self::Lfm2(_) | Self::KimiLinear(_) | Self::QwenHybrid(_) => "model",
             Self::NemotronH(_) => "model",
@@ -3152,6 +3292,7 @@ impl EligibleConfig<'_> {
             Self::Nanbeige(args) => crate::decoder::Config::tie_word_embeddings(*args),
             Self::Gemma2(args) => crate::decoder::Config::tie_word_embeddings(*args),
             Self::Llama(args) => crate::decoder::Config::tie_word_embeddings(*args),
+            Self::K2Horizon(args) => crate::decoder::Config::tie_word_embeddings(*args),
             Self::Qwen(args) => crate::decoder::Config::tie_word_embeddings(*args),
             Self::Lfm2(args) => args.tie_word_embeddings,
             Self::KimiLinear(args) => args.tie_word_embeddings,
@@ -3179,6 +3320,7 @@ impl EligibleConfig<'_> {
                 args.dense_config().hidden_size,
             ),
             Self::Llama(args) => (args.vocab_size, args.hidden_size),
+            Self::K2Horizon(args) => (args.vocab_size, args.hidden_size),
             Self::Qwen(args) => (args.vocab_size, args.hidden_size),
             Self::Lfm2(args) => (args.vocab_size, args.hidden_size),
             Self::KimiLinear(args) => (args.vocab_size, args.hidden_size),
@@ -3209,6 +3351,7 @@ impl EligibleConfig<'_> {
             Self::Nanbeige(args) => decoder_parameter_role(*args, name, companion, linear_shapes),
             Self::Gemma2(args) => decoder_parameter_role(*args, name, companion, linear_shapes),
             Self::Llama(args) => decoder_parameter_role(*args, name, companion, linear_shapes),
+            Self::K2Horizon(args) => decoder_parameter_role(*args, name, companion, linear_shapes),
             Self::Qwen(args) => decoder_parameter_role(*args, name, companion, linear_shapes),
             Self::GptOss(args) => decoder_parameter_role(*args, name, companion, linear_shapes),
             Self::Lfm2(_)
@@ -3233,6 +3376,7 @@ impl EligibleConfig<'_> {
             Self::Gemma2(_)
             | Self::Llama(_)
             | Self::Nanbeige(_)
+            | Self::K2Horizon(_)
             | Self::Qwen(_)
             | Self::Lfm2(_)
             | Self::KimiLinear(_)
@@ -3682,6 +3826,13 @@ fn derive_replicated_text_requirements(
     let plan = inspection.architecture_plan();
     let config = eligible_config(plan)?;
     replicated_text_requirements_for_config(inspection, config)
+}
+
+pub(crate) fn k2_horizon_replicated_text_requirements(
+    inspection: &ArtifactInspection<ArtifactArchitecturePlan>,
+    args: &crate::k2_horizon::ModelArgs,
+) -> Result<ReplicatedTextRequirements, ReplicatedTextRequirementsError> {
+    replicated_text_requirements_for_config(inspection, EligibleConfig::K2Horizon(args))
 }
 
 pub(crate) fn qwen_replicated_text_requirements(
@@ -4491,6 +4642,10 @@ fn safetensors_eligible_config(
         SafetensorsModelConfig::Nanbeige(args) => Ok(EligibleConfig::Nanbeige(args)),
         SafetensorsModelConfig::Llama(args) => Ok(EligibleConfig::Llama(args)),
         SafetensorsModelConfig::Gemma2(args) => Ok(EligibleConfig::Gemma2(args)),
+        SafetensorsModelConfig::K2Horizon(args) if args.is_moe() => {
+            Err(ReplicatedTextIneligibility::Routed)
+        }
+        SafetensorsModelConfig::K2Horizon(args) => Ok(EligibleConfig::K2Horizon(args)),
         SafetensorsModelConfig::Qwen(args) if !args.is_moe() => Ok(EligibleConfig::Qwen(args)),
         SafetensorsModelConfig::Qwen(_) => Err(ReplicatedTextIneligibility::Routed),
         SafetensorsModelConfig::QwenHybrid(args) if args.vision.is_some() => {
@@ -4550,6 +4705,10 @@ fn gguf_eligible_config(
 ) -> Result<EligibleConfig<'_>, ReplicatedTextIneligibility> {
     match architecture.model() {
         GgufModelConfig::Llama(args) => Ok(EligibleConfig::Llama(args)),
+        GgufModelConfig::K2Horizon(args) if args.is_moe() => {
+            Err(ReplicatedTextIneligibility::Routed)
+        }
+        GgufModelConfig::K2Horizon(args) => Ok(EligibleConfig::K2Horizon(args)),
         GgufModelConfig::Gemma2(args) => Ok(EligibleConfig::Gemma2(args)),
         GgufModelConfig::Nanbeige(args) => Ok(EligibleConfig::Nanbeige(args)),
         GgufModelConfig::Qwen(args)
@@ -4624,6 +4783,7 @@ fn ordinary_eligible_config(
         config @ (EligibleConfig::Gemma2(_)
         | EligibleConfig::Llama(_)
         | EligibleConfig::Nanbeige(_)
+        | EligibleConfig::K2Horizon(_)
         | EligibleConfig::Qwen(_)) => Ok(config),
         EligibleConfig::Lfm2(_)
         | EligibleConfig::KimiLinear(_)
@@ -5018,33 +5178,11 @@ fn gguf_parameters(
                 mapping.physical_name
             )));
         };
-        let native = if let Some((bits, group)) = tensor.affine() {
-            LinearFormat::Affine(AffineQuantization::new(
-                i32::try_from(group).map_err(|_| {
-                    ReplicatedTextRequirementsError::InvalidArtifact(format!(
-                        "GGUF group size {group} exceeds i32"
-                    ))
-                })?,
-                i32::from(bits),
-            )?)
-        } else if tensor.is_mxfp4() {
-            LinearFormat::MxFp4
-        } else if tensor.descriptor().ggml_type.block_and_bytes().is_ok()
-            && !matches!(
-                tensor.descriptor().ggml_type,
-                eredu_gguf::GgmlType::F16 | eredu_gguf::GgmlType::F32 | eredu_gguf::GgmlType::Bf16
-            )
-        {
-            let SourceTensorEncoding::Gguf { ggml_type, endian } = source_encoding else {
-                unreachable!("GGUF catalog produces GGUF source encodings")
-            };
-            LinearFormat::GgufIQuant {
-                ggml_type: *ggml_type,
-                endian: *endian,
-            }
-        } else {
-            LinearFormat::Dense
+        let SourceTensorEncoding::Gguf { endian, .. } = source_encoding else {
+            unreachable!("GGUF catalog produces GGUF source encodings")
         };
+        let native = crate::linear_format::gguf_tensor_format(tensor, *endian)
+            .map_err(ReplicatedTextRequirementsError::InvalidArtifact)?;
         let companion = mapping.original_name != mapping.physical_name;
         let role = config.parameter_role(&mapping.layout.name, companion, &linear_shapes);
         let translated_shape = mapping
@@ -6513,6 +6651,8 @@ pub(crate) fn partitioned_boundary_schema(
         plan.safetensors_architecture().map(|plan| plan.model()),
         plan.gguf_plan().map(|plan| plan.model()),
     ) {
+        (Some(SafetensorsModelConfig::K2Horizon(args)), None)
+        | (None, Some(GgufModelConfig::K2Horizon(args))) => EligibleConfig::K2Horizon(args),
         (Some(SafetensorsModelConfig::Qwen(args)), None) if args.is_moe() => {
             EligibleConfig::Qwen(args)
         }
@@ -7116,7 +7256,7 @@ where
     let architecture = crate::composite_execution::PreparedCompositeArchitecture::new(architecture);
     let source_architecture =
         source_architecture.map(crate::composite_execution::PreparedCompositeArchitecture::new);
-    let routed = crate::routed_text::prepare_gated_routed_architecture_handoff::<B, S, _>(
+    let routed = crate::routed_text::prepare_routed_architecture_handoff::<B, S, _>(
         architecture,
         source_architecture,
         routed_requirements,
@@ -8194,7 +8334,14 @@ mod tests {
             requirements.text().grouped_operations(),
             &[eredu_runtime::GroupedOperationRequirement::GatedProduct]
         );
-        assert_eq!(requirements.plan().global_group_count(), 2);
+        assert_eq!(
+            requirements
+                .bank(eredu_runtime::RoutedBankId::new(0))
+                .unwrap()
+                .plan()
+                .global_group_count(),
+            2
+        );
         for name in [
             "model.layers.0.mlp.experts.gate_up_proj_bias",
             "model.layers.0.mlp.experts.down_proj_bias",
@@ -8386,11 +8533,31 @@ mod tests {
                     | eredu_runtime::ParameterBankResidency::IndependentCache(_)
             ));
         }
-        assert_eq!(requirements.owner_group().as_str(), "text_decoder");
-        let plan = requirements.plan().gated().unwrap();
+        assert_eq!(
+            requirements
+                .bank(eredu_runtime::RoutedBankId::new(0))
+                .unwrap()
+                .owner_group()
+                .as_str(),
+            "text_decoder"
+        );
+        let plan = requirements
+            .bank(eredu_runtime::RoutedBankId::new(0))
+            .unwrap()
+            .plan()
+            .gated()
+            .unwrap();
         assert_eq!(plan.global_expert_count(), 2);
         assert_eq!(plan.unit_specs().len(), 1);
-        assert_eq!(requirements.catalog().units().len(), 2);
+        assert_eq!(
+            requirements
+                .bank(eredu_runtime::RoutedBankId::new(0))
+                .unwrap()
+                .catalog()
+                .units()
+                .len(),
+            2
+        );
         assert_eq!(requirements.routes_per_token(), 2);
         assert_eq!(
             requirements.text().grouped_operations(),
@@ -8501,6 +8668,8 @@ mod tests {
             eredu_runtime::ParameterBankResidency::IndependentCache(_)
         ));
         let member_bytes = requirements
+            .bank(eredu_runtime::RoutedBankId::new(0))
+            .unwrap()
             .catalog()
             .units()
             .iter()
@@ -8527,10 +8696,9 @@ mod tests {
             &addressable_capabilities,
         )
         .expect_err("undersized compact bank was admitted");
-        assert!(error
-            .issues()
-            .iter()
-            .any(|issue| issue.contains("one routed token row") && issue.contains("2 routes")));
+        assert!(error.issues().iter().any(
+            |issue| issue.contains("selected compact-bank bytes") && issue.contains("2 routes")
+        ));
     }
 
     #[test]

@@ -105,7 +105,10 @@ impl PreparedPartitionSessionFacts {
         Ok(Self {
             text: PreparedTextSessionFacts::from_parts(
                 identity,
-                capability.clone(),
+                capability
+                    .clone()
+                    .for_selected_state(selected.partition().state().map(|state| state.layout()))
+                    .map_err(|error| error.to_string())?,
                 model_type.to_owned(),
                 residency,
             ),
@@ -143,7 +146,7 @@ where
     }
 }
 
-impl<B, A, G, W, E> PreparedRoutedPartitionedArchitecture<B, A, G, W, E>
+impl<B, A, G, W> PreparedRoutedPartitionedArchitecture<B, A, G, W>
 where
     B: eredu_nn::GroupedNeuralBackend,
     A: ArchitectureParameters<B>,

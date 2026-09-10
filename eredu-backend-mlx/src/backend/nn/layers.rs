@@ -5,13 +5,41 @@ use std::f32::consts::PI;
 use safemlx::{
     array,
     error::{Exception, Result as MlxResult},
-    ops::{erf, exp, maximum, r#where, sigmoid, sqrt, tanh},
+    ops::{erf, exp, maximum, r#where, sqrt, tanh},
     Array, Stream,
 };
 
 /// Applies the SiLU activation function.
 pub fn silu(x: Array, stream: &Stream) -> Result<Array, Exception> {
-    x.multiply(sigmoid(&x, stream)?, stream)
+    let dtype = x.dtype();
+    // SiLU is one pointwise operation. Keep its intermediate sigmoid in FP32
+    // for low-precision input so it is rounded only once at the output.
+    let work = match dtype {
+        safemlx::Dtype::Bfloat16 | safemlx::Dtype::Float16 => {
+            x.as_dtype(safemlx::Dtype::Float32, stream)?
+        }
+        _ => x,
+    };
+    if let Some(output) =
+        super::arithmetic::f32_pointwise(&work, super::arithmetic::Pointwise::Silu, stream)?
+    {
+        return output.as_dtype(dtype, stream);
+    }
+    work.divide(
+        work.negative(stream)?
+            .exp(stream)?
+            .add(Array::from_f32(1.0), stream)?,
+        stream,
+    )?
+    .as_dtype(dtype, stream)
+}
+
+/// Applies sigmoid with FP32 exponential and quotient rounding.
+pub fn sigmoid(input: Array, stream: &Stream) -> Result<Array, Exception> {
+    match super::arithmetic::f32_pointwise(&input, super::arithmetic::Pointwise::Sigmoid, stream)? {
+        Some(output) => Ok(output),
+        None => safemlx::ops::sigmoid(input, stream),
+    }
 }
 
 /// Applies the squared rectified-linear activation.

@@ -152,6 +152,7 @@ impl<B: BlockwiseAttentionBackend> Attention<B> {
             )?,
             rotary: B::rotary(
                 RotarySpec {
+                    arithmetic: eredu_nn::RotaryArithmetic::Native,
                     dimensions: args.qk_rope_head_dim,
                     base: args.rope_theta,
                     traditional: false,

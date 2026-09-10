@@ -1,0 +1,10 @@
+{
+  "repository": "IFM/K2-Horizon-7B-FP8",
+  "revision": "7f26f4c991cb5ba9bde7d7b409f8b6bf5784f191",
+  "config_sha256": "166b0cda51f2fe0799851f871aad25eee6b6d6290f2761f5a7192a8019697091",
+  "bounded_header": {
+    "file": "model.safetensors",
+    "raw_header_with_length_sha256": "773dfd292ab69e54cad8f058ecbcbbc32b5d9c6fbd870204008af7011a70596d",
+    "fixture_sha256": "f39d7f13e084b826546f92463a74002920da6b7fa0c8e8a8e3c9adfb75423465"
+  }
+}

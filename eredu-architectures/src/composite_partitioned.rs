@@ -333,7 +333,7 @@ impl CompositeExpertBankOwnership {
     }
     /// Stable addressable bank key; the compact ordinal is never used here.
     pub const fn bank_key(&self) -> eredu_runtime::ParameterBankKey {
-        eredu_runtime::ParameterBankKey::new(self.unit, self.global_expert)
+        eredu_runtime::ParameterBankKey::new(0, self.unit, self.global_expert)
     }
 }
 
@@ -774,7 +774,7 @@ impl PreparedCompositeExecutorPlan {
                 plan,
                 expert_group,
             } => crate::partitioned_execution::SelectedCompositePartitionUnitStrategy::routed_from_prepared_grouped_plan(
-                provider, plan, expert_group, movement,
+                provider, std::collections::BTreeMap::from([(eredu_runtime::RoutedBankId::new(0), plan)]), expert_group, movement,
             ),
             PreparedCompositeUnitStrategy::RoutedCollective {
                 provider,
@@ -784,7 +784,7 @@ impl PreparedCompositeExecutorPlan {
                 waves,
             } => crate::partitioned_execution::SelectedCompositePartitionUnitStrategy::routed_with_prepared_collective_waves(
                 provider,
-                plan,
+                std::collections::BTreeMap::from([(eredu_runtime::RoutedBankId::new(0), plan)]),
                 expert_group,
                 movement,
                 tensor_group,
@@ -1227,7 +1227,11 @@ where
     let SelectedCompositeTextRealization::Routed { execution, .. } = selected.base() else {
         return Err("dense composite selection cannot bind a routed execution plan".into());
     };
-    if execution.owner_group().as_str()
+    if execution
+        .bank(eredu_runtime::RoutedBankId::new(0))
+        .expect("validated composite bank")
+        .owner_group()
+        .as_str()
         != plan
             .unit_specs()
             .keys()
@@ -1237,7 +1241,11 @@ where
     {
         return Err("localized composite expert plan names a different owner group".into());
     }
-    let routes_by_unit = execution.routes_by_unit().clone();
+    let routes_by_unit = execution
+        .bank(eredu_runtime::RoutedBankId::new(0))
+        .expect("validated composite bank")
+        .routes_by_unit()
+        .clone();
     let expected = plan
         .unit_specs()
         .keys()
@@ -1281,7 +1289,11 @@ where
         return Err("selected composite routed output width is zero".into());
     }
     Ok(PreparedCompositeRoutedExecution {
-        owner_group: execution.owner_group().clone(),
+        owner_group: execution
+            .bank(eredu_runtime::RoutedBankId::new(0))
+            .expect("validated composite bank")
+            .owner_group()
+            .clone(),
         plan: plan.into(),
         routes_by_unit,
         owner_units,

@@ -118,3 +118,45 @@ pub(crate) fn standard_parallel_linear_format(
     .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
     Ok(Some(declaration))
 }
+
+/// Input-axis block granularity required to retain encoded projection slices.
+pub(crate) fn input_partition_alignment(format: LinearFormat) -> i32 {
+    match format {
+        LinearFormat::Dense => 1,
+        LinearFormat::E4M3BlockFp8(block) => block.block_columns,
+        _ => format
+            .weight_quantization()
+            .expect("packed format")
+            .group_size(),
+    }
+}
+
+/// Canonical executable encoding of one physical GGUF matrix.
+pub(crate) fn gguf_tensor_format(
+    tensor: &eredu_gguf::CatalogTensor,
+    endian: eredu_gguf::Endian,
+) -> Result<LinearFormat, String> {
+    if let Some((bits, group)) = tensor.affine() {
+        Ok(LinearFormat::Affine(
+            eredu_checkpoint::AffineQuantization::new(
+                i32::try_from(group).map_err(|_| "GGUF group size exceeds i32")?,
+                i32::from(bits),
+            )
+            .map_err(|e| e.to_string())?,
+        ))
+    } else if tensor.is_mxfp4() {
+        Ok(LinearFormat::MxFp4)
+    } else if tensor.descriptor().ggml_type.block_and_bytes().is_ok()
+        && !matches!(
+            tensor.descriptor().ggml_type,
+            eredu_gguf::GgmlType::F16 | eredu_gguf::GgmlType::F32 | eredu_gguf::GgmlType::Bf16
+        )
+    {
+        Ok(LinearFormat::GgufIQuant {
+            ggml_type: tensor.descriptor().ggml_type,
+            endian,
+        })
+    } else {
+        Ok(LinearFormat::Dense)
+    }
+}

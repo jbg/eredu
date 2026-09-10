@@ -76,6 +76,16 @@ impl RoutedExpertProvider<B> for Probe {
             request.input.shape(),
         )))
     }
+    /// Executes an activated selected-linear bank with owned output rows.
+    fn forward_linear_routed(
+        &mut self,
+        _: &mut <B as GroupedNeuralBackend>::LinearGroups,
+        _: RoutedExpertRequest<'_, MlxTensor>,
+        _: &Stream,
+    ) -> Result<MlxTensor, Self::Error> {
+        unreachable!()
+    }
+
     fn forward_relu2_routed(
         &mut self,
         _: &mut <B as GroupedNeuralBackend>::Relu2Groups,
@@ -218,7 +228,11 @@ fn routing_intervention_shared_hybrid_controls_actual_dispatch_and_preserves_sha
         };
         let output = moe
             .forward_observed_with_provider(
-                eredu_runtime::RoutedObservationPoint::new("model.layers.0.mlp", 4),
+                eredu_runtime::RoutedObservationPoints::new(
+                    eredu_runtime::RoutedBankId::new(0),
+                    "model.layers.0.mlp",
+                    4,
+                ),
                 &input,
                 &stream,
                 &mut provider,
@@ -333,7 +347,11 @@ fn routing_intervention_shared_hybrid_controls_actual_dispatch_and_preserves_sha
         };
         assert!(moe
             .forward_observed_with_provider(
-                eredu_runtime::RoutedObservationPoint::new("model.layers.0.mlp", 4),
+                eredu_runtime::RoutedObservationPoints::new(
+                    eredu_runtime::RoutedBankId::new(0),
+                    "model.layers.0.mlp",
+                    4
+                ),
                 &input,
                 &stream,
                 &mut provider,

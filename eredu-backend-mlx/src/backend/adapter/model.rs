@@ -35,6 +35,10 @@ impl MlxModel {
         }
     }
 
+    pub(crate) fn executable_mut(&mut self) -> &mut Executable {
+        &mut self.executable
+    }
+
     pub(crate) const fn floating_state_dtype_bytes(&self) -> NonZeroU8 {
         self.floating_state_dtype_bytes
     }
@@ -122,7 +126,7 @@ impl MlxModel {
     pub fn parameter_bank_report(
         &self,
     ) -> Result<
-        Option<crate::backend::runtime::residency::parameter_bank::ParameterBankResidencyReport>,
+        Option<crate::backend::runtime::residency::parameter_bank::ParameterBanksResidencyReport>,
         Error,
     > {
         self.executable.parameter_bank_report()

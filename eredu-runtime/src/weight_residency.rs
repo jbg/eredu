@@ -367,14 +367,20 @@ pub enum LayerWeightResidency {
 /// Stable mechanism identity for one member of an independently addressable bank.
 #[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ParameterBankKey {
+    bank: usize,
     unit: usize,
     member: usize,
 }
 
 impl ParameterBankKey {
     /// Creates one generic bank member identity after semantic translation.
-    pub const fn new(unit: usize, member: usize) -> Self {
-        Self { unit, member }
+    pub const fn new(bank: usize, unit: usize, member: usize) -> Self {
+        Self { bank, unit, member }
+    }
+
+    /// Returns the independently identified bank ordinal.
+    pub const fn bank(self) -> usize {
+        self.bank
     }
 
     /// Returns the owning execution-unit ordinal.
@@ -390,8 +396,8 @@ impl ParameterBankKey {
     /// Returns the deterministic residency unit identifier.
     pub fn unit_id(self) -> OffloadUnitId {
         OffloadUnitId::new(format!(
-            "bank.unit.{:05}.member.{:05}",
-            self.unit, self.member
+            "bank.{:05}.unit.{:05}.member.{:05}",
+            self.bank, self.unit, self.member
         ))
         .expect("parameter-bank unit identifier is non-empty")
     }
@@ -473,7 +479,7 @@ impl ParameterBankLoadOptions {
         Ok(())
     }
 
-    /// Returns the independent bank offload limits.
+    /// Returns the shared pool limits for all independently addressable banks.
     pub const fn offload(self) -> OffloadConfig {
         self.members
     }
@@ -980,8 +986,8 @@ mod tests {
             Err(WeightResidencyPolicyError::ZeroParameterBankPrefillTarget)
         ));
         assert_eq!(
-            ParameterBankKey::new(3, 7).unit_id().as_str(),
-            "bank.unit.00003.member.00007"
+            ParameterBankKey::new(0, 3, 7).unit_id().as_str(),
+            "bank.00000.unit.00003.member.00007"
         );
     }
 

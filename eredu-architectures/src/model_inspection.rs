@@ -206,6 +206,13 @@ where
                 embedded_capacity,
                 "normalized architecture prediction contract",
             );
+            record_parameter_resources(&mut report.resources, preparation.execution());
+            record_rank_resources(
+                &mut report.resources,
+                &inspection,
+                preparation.execution(),
+                mechanisms,
+            );
             record_gguf_media(&mut report, &inspection, media);
             record_discovery(&mut report, descriptor, Some(&preparation), mechanisms);
             ModelInspectionOutcome {
@@ -237,6 +244,123 @@ where
             }
         }
     }
+}
+
+fn record_parameter_resources(
+    report: &mut eredu_core::ModelResourceProfile,
+    selected: &crate::SelectedExecution,
+) {
+    match selected.parameter_resources() {
+        Ok(resources) => {
+            let source = "unsharded selected executable tasks, including both ordinary and independently acquired parameters";
+            report.materialized_parameter_bytes =
+                eredu_core::Observed::exact(resources.parameter_bytes, source);
+            report.pinned_parameter_bytes =
+                eredu_core::Observed::exact(resources.pinned_bytes, source);
+            report.largest_execution_group_bytes =
+                eredu_core::Observed::exact(resources.largest_unit_bytes, source);
+            report.largest_adjacent_execution_groups_bytes =
+                eredu_core::Observed::exact(resources.largest_adjacent_units_bytes, source);
+            report.expert_parameter_bytes =
+                eredu_core::Observed::exact(resources.expert_bytes, source);
+        }
+        Err(error) => {
+            let unavailable = eredu_core::Observed::unavailable(error.to_string());
+            report.materialized_parameter_bytes = unavailable.clone();
+            report.pinned_parameter_bytes = unavailable.clone();
+            report.largest_execution_group_bytes = unavailable.clone();
+            report.largest_adjacent_execution_groups_bytes = unavailable.clone();
+            report.expert_parameter_bytes = unavailable;
+        }
+    }
+}
+
+fn record_rank_resources(
+    report: &mut eredu_core::ModelResourceProfile,
+    inspection: &ArtifactInspection<ArtifactArchitecturePlan>,
+    selected: &crate::SelectedExecution,
+    mechanisms: &impl PreparationMechanismProvider,
+) {
+    use crate::configuration::{GgufModelConfig, SafetensorsModelConfig};
+    let plan = inspection.architecture_plan();
+    let args = match (
+        plan.safetensors_architecture().map(|p| p.model()),
+        plan.gguf_plan().map(|p| p.model()),
+    ) {
+        (Some(SafetensorsModelConfig::K2Horizon(args)), None)
+        | (None, Some(GgufModelConfig::K2Horizon(args))) => args,
+        _ => return,
+    };
+    let project = || -> Result<eredu_core::SelectedRankResourceProfile, String> {
+        let args =
+            crate::replicated_text::selected_k2_horizon_args(args, selected.text_realization())?;
+        let parameters =
+            crate::k2_horizon::parameter_description(&args).map_err(|e| e.to_string())?;
+        let (resources, layout) = match selected.partition_parameter_resources(&parameters)? {
+            Some((resources, layout)) => (resources, Some(layout)),
+            None => (
+                selected.parameter_resources().map_err(|e| e.to_string())?,
+                None,
+            ),
+        };
+        let scalar_bytes = selected
+            .text_realization()
+            .state()
+            .floating_dtype()
+            .ok_or_else(|| "selected KV dtype is missing".to_owned())?
+            .bytes();
+        let mut cache_bytes_per_position = 0u64;
+        for layer in 0..args.num_hidden_layers as usize {
+            if selected.partition_groups().is_some_and(|groups| {
+                !groups.iter().any(|group| {
+                    group.group().as_str() == crate::decoder::TEXT_DECODER_EXECUTION_GROUP
+                        && group.units().contains(&layer)
+                })
+            }) {
+                continue;
+            }
+            let width = if let Some(layout) = &layout {
+                layout
+                    .tensor(&format!("model.layers.{layer}.self_attn.k_proj.weight"))
+                    .ok_or_else(|| "local key projection is missing".to_owned())?
+                    .local_shape()[0]
+            } else {
+                (args.num_key_value_heads * args.head_dim) as usize
+            };
+            cache_bytes_per_position += 2 * width as u64 * u64::from(scalar_bytes.get());
+        }
+        let source = crate::replicated_text::inspection_recipe_source(inspection)
+            .map_err(|e| e.to_string())?;
+        let workspace = selected.parameter_materialization_workspace(
+            source.as_ref(),
+            layout.as_ref(),
+            mechanisms,
+        );
+        Ok(eredu_core::SelectedRankResourceProfile {
+            topology: selected.parallel_topology(),
+            materialized_parameter_bytes: resources.parameter_bytes,
+            pinned_parameter_bytes: resources.pinned_bytes,
+            largest_execution_group_bytes: resources.largest_unit_bytes,
+            largest_adjacent_execution_groups_bytes: resources.largest_adjacent_units_bytes,
+            expert_parameter_bytes: resources.expert_bytes,
+            cache_bytes_per_position,
+            materialization_workspace: match workspace {
+                Ok(value) => eredu_core::Observed::Available {
+                    value,
+                    kind: eredu_core::ObservationKind::Conservative,
+                    source: "live source-recipe values and bounded compact-bank assembly".into(),
+                },
+                Err(error) => eredu_core::Observed::unavailable(error),
+            },
+        })
+    };
+    report.selected_rank = match project() {
+        Ok(resources) => eredu_core::Observed::exact(
+            resources,
+            "selected physical parameter topology and rank-local head ownership",
+        ),
+        Err(error) => eredu_core::Observed::unavailable(error),
+    };
 }
 
 fn record_discovery(
@@ -536,6 +660,367 @@ mod tests {
     use crate::preparation_selection::tests::{
         inspected_config, prediction_config, BoundedIndependentAdapter,
     };
+
+    #[test]
+    fn k2_cold_resources_count_both_banks_and_shared_parameters() {
+        use eredu_runtime::{
+            LayerWeightResidency, OrdinaryWeightResidency, ParameterBankLoadOptions,
+            WeightResidency,
+        };
+        let fixtures: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/k2_horizon/reference.json"))
+                .unwrap();
+        for (
+            family,
+            expected_total,
+            expected_experts,
+            ordinary_largest,
+            ordinary_pair,
+            resident_largest,
+            resident_pair,
+        ) in [
+            ("dense", 9376, 0, 2752, 5504, 2752, 5504),
+            ("mova", 18560, 7296, 3392, 6784, 7040, 14080),
+        ] {
+            let (_root, inspection) = inspected_config(fixtures[family]["config"].clone());
+            for independent in [false, true] {
+                if family == "dense" && independent {
+                    continue;
+                }
+                for ordinary in [
+                    OrdinaryWeightResidency::FullyResident,
+                    OrdinaryWeightResidency::LayerwiseHost(Default::default()),
+                    OrdinaryWeightResidency::DenseDiskStream(
+                        eredu_runtime::DenseDiskStreamLoadOptions::new(1 << 20, 1 << 20, 2, 1)
+                            .unwrap(),
+                    ),
+                ] {
+                    let residency = if independent {
+                        WeightResidency::with_independent_parameter_banks(
+                            ordinary,
+                            ParameterBankLoadOptions::new(Default::default(), 1 << 20, 1 << 16)
+                                .unwrap(),
+                        )
+                    } else {
+                        WeightResidency::with_layers(match ordinary {
+                            OrdinaryWeightResidency::FullyResident => {
+                                LayerWeightResidency::FullyResident
+                            }
+                            OrdinaryWeightResidency::LayerwiseHost(options) => {
+                                LayerWeightResidency::LayerwiseHost(options)
+                            }
+                            OrdinaryWeightResidency::DenseDiskStream(options) => {
+                                LayerWeightResidency::DenseDiskStream(options)
+                            }
+                            _ => unreachable!(),
+                        })
+                    };
+                    let outcome = inspect_selected_model(
+                        inspection.clone(),
+                        &NormalizedLoadRequest::default().with_weight_residency(residency),
+                        &BoundedIndependentAdapter::default(),
+                        MediaFeatureAvailability {
+                            image: false,
+                            audio: false,
+                        },
+                    );
+                    assert!(
+                        outcome.report().is_loadable(),
+                        "{family}/{residency:?}: {:?}",
+                        outcome.report().issues
+                    );
+                    let resources = &outcome.report().resources;
+                    let rank = resources
+                        .selected_rank
+                        .value()
+                        .unwrap_or_else(|| panic!("{:?}", resources.selected_rank));
+                    assert_eq!(rank.materialized_parameter_bytes, expected_total);
+                    assert_eq!(rank.expert_parameter_bytes, expected_experts);
+                    let workspace = rank
+                        .materialization_workspace
+                        .value()
+                        .unwrap_or_else(|| panic!("{:?}", rank.materialization_workspace));
+                    assert!(workspace.ordinary_recipe_peak_bytes > 0);
+                    assert!(
+                        workspace.ordinary_native_peak_bytes
+                            >= workspace.ordinary_recipe_peak_bytes
+                    );
+                    assert_eq!(workspace.conversion_workspace_bytes, 0);
+                    assert_eq!(workspace.compact_bank_bytes > 0, independent);
+                    assert_eq!(workspace.expert_member_recipe_peak_bytes > 0, independent);
+                    assert!(
+                        workspace.expert_member_native_peak_bytes
+                            >= workspace.expert_member_recipe_peak_bytes
+                    );
+                    assert_eq!(
+                        resources.materialized_parameter_bytes.value(),
+                        Some(&expected_total)
+                    );
+                    assert_eq!(resources.pinned_parameter_bytes.value(), Some(&1120));
+                    assert_eq!(
+                        resources.expert_parameter_bytes.value(),
+                        Some(&expected_experts)
+                    );
+                    assert_eq!(
+                        resources.largest_execution_group_bytes.value(),
+                        Some(&if independent {
+                            ordinary_largest
+                        } else {
+                            resident_largest
+                        })
+                    );
+                    assert_eq!(
+                        resources.largest_adjacent_execution_groups_bytes.value(),
+                        Some(&if independent {
+                            ordinary_pair
+                        } else {
+                            resident_pair
+                        })
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn k2_cold_rank_resources_preserve_replicas_and_local_head_geometry() {
+        use eredu_core::{CompletionCancellationMode, ParallelRankTopology, ParallelTopology};
+        use eredu_runtime::{
+            CommunicationCompletionPolicy, ParallelLoadRequest, PipelineActivationDtype,
+            PipelineWireContract,
+        };
+        let fixtures: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/k2_horizon/reference.json"))
+                .unwrap();
+        for family in ["dense", "mova"] {
+            let (_root, inspection) = inspected_config(fixtures[family]["config"].clone());
+            let global = inspect_selected_model(
+                inspection.clone(),
+                &NormalizedLoadRequest::default(),
+                &BoundedIndependentAdapter::default(),
+                MediaFeatureAvailability {
+                    image: false,
+                    audio: false,
+                },
+            );
+            let total = global.report().resources.selected_rank.value().unwrap();
+            for independent in [false, true] {
+                if family == "dense" && independent {
+                    continue;
+                }
+                for (tp, pp, ep) in [(2, 1, 1), (1, 2, 1), (2, 2, 1), (1, 1, 2), (2, 2, 2)] {
+                    if family == "dense" && ep != 1 {
+                        continue;
+                    }
+                    let topology = ParallelTopology::new(tp, pp, ep, 1).unwrap();
+                    let mut parameters = 0;
+                    let mut experts = 0;
+                    let mut cache = 0;
+                    for rank in 0..tp * pp * ep {
+                        let parallel = ParallelLoadRequest::new(
+                            ParallelRankTopology::new(topology, rank).unwrap(),
+                            PipelineWireContract::new(PipelineActivationDtype::Float32),
+                            1,
+                            32,
+                            CommunicationCompletionPolicy::new(
+                                std::time::Duration::from_secs(1),
+                                CompletionCancellationMode::QuarantineUntilComplete,
+                            )
+                            .unwrap(),
+                        )
+                        .unwrap();
+                        let mut request = NormalizedLoadRequest::default()
+                            .with_parallel_execution(parallel)
+                            .unwrap();
+                        if independent {
+                            request = request.with_weight_residency(
+                                eredu_runtime::WeightResidency::with_independent_parameter_banks(
+                                    eredu_runtime::OrdinaryWeightResidency::FullyResident,
+                                    eredu_runtime::ParameterBankLoadOptions::new(
+                                        Default::default(),
+                                        1 << 20,
+                                        1 << 16,
+                                    )
+                                    .unwrap(),
+                                ),
+                            );
+                        }
+                        let outcome = inspect_selected_model(
+                            inspection.clone(),
+                            &request,
+                            &BoundedIndependentAdapter::default(),
+                            MediaFeatureAvailability {
+                                image: false,
+                                audio: false,
+                            },
+                        );
+                        assert!(
+                            outcome.report().is_loadable(),
+                            "{family}/{tp}/{pp}/{rank}: {:?}",
+                            outcome.report().issues
+                        );
+                        let local = outcome
+                            .report()
+                            .resources
+                            .selected_rank
+                            .value()
+                            .unwrap_or_else(|| {
+                                panic!(
+                                    "{family}/{tp}/{pp}/{rank}: {:?}",
+                                    outcome.report().resources.selected_rank
+                                )
+                            });
+                        assert!(
+                            local.materialization_workspace.value().is_some(),
+                            "{:?}",
+                            local.materialization_workspace
+                        );
+                        parameters += local.materialized_parameter_bytes;
+                        experts += local.expert_parameter_bytes;
+                        cache += local.cache_bytes_per_position;
+                    }
+                    assert!(parameters >= total.materialized_parameter_bytes);
+                    assert_eq!(experts, total.expert_parameter_bytes);
+                    assert_eq!(cache, total.cache_bytes_per_position * ep as u64);
+                    if tp == 1 && ep == 1 {
+                        assert_eq!(parameters, total.materialized_parameter_bytes);
+                    } else {
+                        assert!(
+                            parameters > total.materialized_parameter_bytes,
+                            "replicated norms and global routers must be counted"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn k2_cold_transformation_workspace_covers_outputs_and_independent_members() {
+        let fixtures: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/k2_horizon/reference.json"))
+                .unwrap();
+        let mut config = fixtures["mova"]["config"].clone();
+        for (key, value) in [
+            ("hidden_size", 64),
+            ("head_dim", 16),
+            ("intermediate_size", 64),
+            ("moe_intermediate_size", 64),
+        ] {
+            config[key] = value.into();
+        }
+        let (_root, inspection) = inspected_config(config);
+        for independent in [false, true] {
+            let mut request =
+                NormalizedLoadRequest::with_quantization(eredu_core::QuantizationRequest::Affine {
+                    group_size: 16,
+                    bits: 4,
+                });
+            if independent {
+                request = request.with_weight_residency(
+                    eredu_runtime::WeightResidency::with_independent_parameter_banks(
+                        eredu_runtime::OrdinaryWeightResidency::FullyResident,
+                        eredu_runtime::ParameterBankLoadOptions::new(
+                            Default::default(),
+                            1 << 20,
+                            1 << 16,
+                        )
+                        .unwrap(),
+                    ),
+                );
+            }
+            let outcome = inspect_selected_model(
+                inspection.clone(),
+                &request,
+                &BoundedIndependentAdapter::with_transforms(),
+                MediaFeatureAvailability {
+                    image: false,
+                    audio: false,
+                },
+            );
+            assert!(
+                outcome.report().is_loadable(),
+                "{:?}",
+                outcome.report().issues
+            );
+            let rank = outcome.report().resources.selected_rank.value().unwrap();
+            let workspace = rank
+                .materialization_workspace
+                .value()
+                .unwrap_or_else(|| panic!("{:?}", rank.materialization_workspace));
+            assert!(workspace.conversion_workspace_bytes > 0);
+            assert!(workspace.ordinary_native_peak_bytes >= workspace.ordinary_recipe_peak_bytes);
+            assert_eq!(workspace.expert_member_native_peak_bytes > 0, independent);
+            if independent {
+                assert!(
+                    workspace.expert_member_native_peak_bytes
+                        > workspace.expert_member_recipe_peak_bytes
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn k2_cold_fp8_resources_include_preserved_scale_companions() {
+        let fixtures: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/k2_horizon/reference.json"))
+                .unwrap();
+        let mut config = fixtures["mova"]["config"].clone();
+        for (key, value) in [
+            ("hidden_size", 256),
+            ("head_dim", 128),
+            ("intermediate_size", 256),
+            ("moe_intermediate_size", 256),
+        ] {
+            config[key] = value.into();
+        }
+        config["query_key_norm"] = false.into();
+        config["quantization_config"] = serde_json::json!({"quant_method":"fp8", "activation_scheme":"dynamic", "weight_block_size":[128,128], "ignored_layers":[
+            "model.embed_tokens", "lm_head", "model.layers.0", "model.layers.1.mlp.gate", "model.layers.2.mlp.gate",
+            "model.layers.1.self_attn.v_router", "model.layers.2.self_attn.v_router", "model.layers.1.mlp.shared_experts", "model.layers.2.mlp.shared_experts",
+            "model.layers.1.self_attn.gate_proj", "model.layers.2.self_attn.gate_proj"
+        ]});
+        let (_root, inspection) = inspected_config(config);
+        let outcome = inspect_selected_model(
+            inspection,
+            &NormalizedLoadRequest::default(),
+            &BoundedIndependentAdapter::with_fp8(),
+            MediaFeatureAvailability {
+                image: false,
+                audio: false,
+            },
+        );
+        assert!(
+            outcome.report().is_loadable(),
+            "{:?}",
+            outcome.report().issues
+        );
+        let resources = &outcome.report().resources;
+        let rank = resources
+            .selected_rank
+            .value()
+            .unwrap_or_else(|| panic!("{:?}", resources.selected_rank));
+        assert!(
+            rank.materialization_workspace.value().is_some(),
+            "{:?}",
+            rank.materialization_workspace
+        );
+        assert_eq!(
+            Some(&rank.materialized_parameter_bytes),
+            resources.stored_tensor_bytes.value()
+        );
+        assert_eq!(
+            resources.materialized_parameter_bytes.value(),
+            resources.stored_tensor_bytes.value()
+        );
+        assert!(resources.materialized_parameter_bytes.value().is_some());
+        // Two routed layers, each containing 15 feed-forward matrices and
+        // three value matrices; every 256x256 matrix has four F32 scales.
+        assert_eq!(
+            resources.expert_parameter_bytes.value(),
+            Some(&(2 * 18 * (256 * 256 + 4 * 4)))
+        );
+    }
 
     #[test]
     fn missing_artifact_is_a_total_report_without_a_selection() {

@@ -1,5 +1,6 @@
 //! Architecture-neutral neural-network building blocks.
 
+pub(crate) mod arithmetic;
 /// Shared attention inputs, transforms, cache updates, and kernels.
 pub mod attention;
 /// Architecture-neutral block-scaled FP8 projections.
@@ -12,9 +13,11 @@ pub(crate) mod hyper_connections;
 /// Activation functions.
 pub mod layers;
 pub(crate) mod linear;
+pub(crate) mod matrix;
 pub(crate) mod module;
 pub(crate) mod native_quantization;
 pub(crate) mod nested;
+pub(crate) mod normalization;
 pub(crate) mod primitives;
 pub(crate) mod rope;
 /// Backend-neutral architecture operators specialized to MLX.

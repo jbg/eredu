@@ -218,10 +218,11 @@ where
         layer: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<RoutedTransformerBlock<B>, Error> {
-        if !global.is_moe() || !local.is_moe() {
-            return Err(Error::backend(
-                "partitioned routed Qwen construction requires Qwen3-MoE",
-            ));
+        if global.is_moe() != local.is_moe() {
+            return Err(Error::backend("global and local Qwen equations differ"));
+        }
+        if !global.is_moe() {
+            return Self::build(local, layer, context);
         }
         assemble_block(
             local,

@@ -23,6 +23,8 @@ use crate::runtime::generation::streaming::{
 };
 use std::collections::HashMap;
 
+mod ifm;
+
 /// Model sampling and stopping settings for one prepared chat generation.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PreparedChatGenerationSettings {
@@ -574,7 +576,11 @@ fn capability(condition: bool, reason: impl Into<String>) -> CapabilitySupport {
     }
 }
 
-fn validate_qwen_tagged_history(messages: &[serde_json::Value]) -> Result<(), TextModelError> {
+fn validate_tagged_history(
+    messages: &[serde_json::Value],
+    parameter_suffix: &str,
+    profile: &str,
+) -> Result<(), TextModelError> {
     for (message_index, message) in messages.iter().enumerate() {
         let Some(tool_calls) = message
             .get("tool_calls")
@@ -589,7 +595,7 @@ fn validate_qwen_tagged_history(messages: &[serde_json::Value]) -> Result<(), Te
             };
             let arguments = arguments.as_object().ok_or_else(|| {
                 TextModelError::ToolConstraint(format!(
-                    "messages[{message_index}].tool_calls[{call_index}].function.arguments must be a mapping for Qwen tagged-parameter templates; serialized strings are unsupported"
+                    "messages[{message_index}].tool_calls[{call_index}].function.arguments must be a mapping for {profile} tagged-parameter templates; serialized strings are unsupported"
                 ))
             })?;
             for (name, value) in arguments {
@@ -604,7 +610,7 @@ fn validate_qwen_tagged_history(messages: &[serde_json::Value]) -> Result<(), Te
                 }
                 if value
                     .as_str()
-                    .is_some_and(|value| value.contains("</parameter>"))
+                    .is_some_and(|value| value.contains(parameter_suffix))
                 {
                     return Err(TextModelError::ToolConstraint(format!(
                         "messages[{message_index}].tool_calls[{call_index}] parameter {name:?} contains the unescaped tagged-parameter closing delimiter"
@@ -1576,6 +1582,12 @@ pub(crate) fn prepare_chat_from_parts(
     };
     let mut profile = prepare_format_profile(selected.template());
     if profile.dialect.is_none() {
+        if let Some(recognized) = ifm::recognize(tokenizer, &selected_template, model_id, &request)?
+        {
+            profile = recognized;
+        }
+    }
+    if profile.dialect.is_none() {
         if let Some(recognized) =
             recognize_muse_atem_protocol(tokenizer, &selected_template, model_id)
                 .or_else(|| recognize_gemma_protocol(tokenizer, &selected_template, model_id))
@@ -1665,7 +1677,7 @@ pub(crate) fn prepare_chat_from_parts(
         profile.dialect_parameters = Some(parameters);
         profile.tool_dialect_parameters = Some(parameters);
         profile.supports_reasoning_parsing = request.enable_thinking != Some(false);
-        validate_qwen_tagged_history(&request.messages)?;
+        validate_tagged_history(&request.messages, "</parameter>", "Qwen")?;
     }
     if profile.identity.as_deref() == Some("muse-glimmer.atem.v1") {
         if request.enable_thinking == Some(false) {

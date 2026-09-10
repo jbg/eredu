@@ -1262,7 +1262,7 @@ pub fn expert_residency_catalog<C: RecipeCatalog + ?Sized>(
                     .collect::<Result<Vec<_>, String>>()?;
                 units.push(
                     crate::ExpertResidencyUnit::new(
-                        eredu_runtime::ParameterBankKey::new(cache_layer, expert),
+                        eredu_runtime::ParameterBankKey::new(0, cache_layer, expert),
                         owner_group.clone(),
                         layer,
                         &unit_path,
@@ -1994,11 +1994,11 @@ mod tests {
         assert_eq!(catalog.units()[0].unit_path(), "model.layers.1");
         assert_eq!(
             catalog.units()[0].identity(),
-            eredu_runtime::ParameterBankKey::new(1, 0)
+            eredu_runtime::ParameterBankKey::new(0, 1, 0)
         );
         assert_eq!(
             catalog.units()[4].identity(),
-            eredu_runtime::ParameterBankKey::new(3, 0)
+            eredu_runtime::ParameterBankKey::new(0, 3, 0)
         );
         assert_eq!(catalog.units()[4].owner_group().as_str(), "text_decoder");
         assert_eq!(catalog.units()[4].owner_unit(), 1);

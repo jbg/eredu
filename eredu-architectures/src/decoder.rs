@@ -138,11 +138,11 @@ pub trait Config: 'static {
         BlockParameterFields::default()
     }
     /// Returns the canonical routed-observation point for one decoder layer.
-    fn routed_observation_point(
+    fn routed_observation_points(
         &self,
         _unit_path: &str,
         _layer: usize,
-    ) -> Option<eredu_runtime::RoutedObservationPoint> {
+    ) -> Option<eredu_runtime::RoutedObservationPoints> {
         None
     }
     /// Validates architecture-owned configuration policy.
@@ -170,6 +170,22 @@ pub trait Config: 'static {
     fn normalization_offset(&self) -> f32 {
         0.0
     }
+    /// Independent float32 RMS reductions with a distinct scale per feature.
+    fn normalization_groups(&self) -> Option<i32> {
+        None
+    }
+    /// Whether Q/K normalization owns a different scale vector for each head.
+    fn query_key_norm_per_head_weights(&self) -> bool {
+        false
+    }
+    /// Separate projection and activation applied to attended values.
+    fn attention_output_gate(&self) -> Option<(&str, OutputGateActivation)> {
+        None
+    }
+    /// Paired dimensions rotated across the two halves of each complete head.
+    fn rotary_pair_dimensions(&self) -> i32 {
+        self.head_dim()
+    }
     /// Optional normalization after attention, before its residual addition.
     fn attention_output_normalization(&self, _layer: usize) -> Option<String> {
         None
@@ -194,11 +210,21 @@ pub trait Config: 'static {
     fn attention_softcap(&self) -> Option<f32> {
         None
     }
+    /// Score and softmax rounding boundaries shared by every cache layout.
+    fn attention_arithmetic(&self) -> eredu_nn::AttentionArithmetic {
+        eredu_nn::AttentionArithmetic::Fused
+    }
     /// Vocabulary size.
     fn vocabulary_size(&self) -> i32;
     /// Whether one attention projection owns a learned bias.
     fn attention_bias(&self, projection: AttentionProjection) -> bool;
     /// Physical construction of the query/key/value input projection.
+    /// Whether this layer receives mixed values from its projection policy.
+    fn external_attention_value(&self, _layer: usize) -> bool {
+        false
+    }
+
+    /// Physical layout of the query, key, and optional ordinary value projections.
     fn attention_projection_layout(&self) -> AttentionProjectionLayout<'_> {
         AttentionProjectionLayout::Split
     }
@@ -226,6 +252,10 @@ pub trait Config: 'static {
     fn attention_schedule(&self) -> &LayerSchedule<AttentionPolicy>;
     /// Physical encoding selected for one canonical checkpoint parameter.
     fn weight_quantization(&self, name: &str) -> Option<WeightQuantization>;
+    /// Complete matrix encoding, including block-FP8 companions.
+    fn linear_format(&self, name: &str) -> eredu_checkpoint::LinearFormat {
+        self.weight_quantization(name).into()
+    }
     /// Complete rotary-position construction specification.
     fn rotary_spec(&self, dimensions: i32) -> RotarySpec;
     /// Whether this decoder stack applies rotary position encoding.
@@ -238,6 +268,13 @@ pub trait Config: 'static {
 pub(crate) fn operator_requirements(config: &impl Config) -> eredu_nn::NeuralOperatorCapabilities {
     use eredu_nn::{GatedProductActivation, NeuralOperatorCapabilities as Caps};
     let mut required = Caps::NONE;
+    if let Some((_, activation)) = config.attention_output_gate() {
+        required = required.union(match activation {
+            OutputGateActivation::Sigmoid => Caps::SIGMOID,
+            OutputGateActivation::Softplus(_) => Caps::SOFTPLUS,
+            OutputGateActivation::Silu => Caps::NONE,
+        });
+    }
     if config.learned_attention_sinks() {
         required = required.union(Caps::ATTENTION_SINKS);
     }
@@ -259,6 +296,19 @@ pub(crate) fn operator_requirements(config: &impl Config) -> eredu_nn::NeuralOpe
 /// Configuration that can derive one tensor-parallel local block without
 /// backend module construction.
 pub trait PartitionedConfig: Config + Clone {
+    /// Ordered routed invocations inside a logical decoder block.
+    fn routed_bank_order(&self, _layer: usize) -> Vec<eredu_runtime::RoutedBankId> {
+        vec![eredu_runtime::RoutedBankId::new(0)]
+    }
+
+    /// Tensor sums surrounding a routed invocation in execution order.
+    fn routed_bank_tensor_reductions(
+        &self,
+        _layer: usize,
+        _bank: eredu_runtime::RoutedBankId,
+    ) -> Result<(usize, usize), Error> {
+        Ok((1, 1))
+    }
     /// Rewrites only the local attention-head and feed-forward geometry.
     fn set_local_geometry(
         &mut self,
@@ -883,6 +933,13 @@ pub struct FusedAttentionProjection<B: NeuralBackend> {
 #[derive(Debug, Clone, eredu_nn::Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
 pub enum AttentionInputProjection<B: NeuralBackend> {
+    /// Q/K projections paired with an architecture-owned routed value provider.
+    ExternalValue {
+        /// Query projection.
+        query: B::Linear,
+        /// Key projection.
+        key: B::Linear,
+    },
     /// Independent projections used by conventional decoder checkpoints.
     Split {
         /// Query projection.
@@ -900,6 +957,17 @@ pub enum AttentionInputProjection<B: NeuralBackend> {
 #[derive(Debug, Clone, eredu_nn::Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
 pub struct Attention<B: NeuralBackend> {
+    /// Independent projection of the attention output gate.
+    pub output_gate: Option<B::Linear>,
+    /// Activation applied to either separately projected or fused-query gates.
+    #[parameter(skip)]
+    pub output_gate_activation: OutputGateActivation,
+    /// Normalize complete Q/K projections using per-head scale vectors.
+    #[parameter(skip)]
+    pub query_key_norm_per_head_weights: bool,
+    /// Rotated paired width; zero means the complete head.
+    #[parameter(skip)]
+    pub rotary_pair_dimensions: i32,
     /// Number of query heads.
     #[parameter(skip)]
     pub query_heads: i32,
@@ -912,6 +980,9 @@ pub struct Attention<B: NeuralBackend> {
     /// Optional score cap applied before masking and softmax.
     #[parameter(skip)]
     pub softcap: Option<f32>,
+    /// Selected score/probability arithmetic.
+    #[parameter(skip)]
+    pub arithmetic: eredu_nn::AttentionArithmetic,
     /// Split or fused query/key/value projections.
     pub input_projection: AttentionInputProjection<B>,
     /// Output projection.
@@ -939,6 +1010,36 @@ struct ProjectedAttention<T> {
     output_gate: Option<T>,
     batch: i32,
     sequence: i32,
+}
+
+/// Pointwise gate applied after attention and before the output projection.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum OutputGateActivation {
+    /// Logistic sigmoid.
+    Sigmoid,
+    /// SiLU.
+    Silu,
+    /// `softplus(beta * x) / beta` with finite positive beta.
+    Softplus(f32),
+}
+
+impl OutputGateActivation {
+    fn apply<B: NeuralBackend>(
+        self,
+        input: B::Tensor,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        match self {
+            Self::Sigmoid => B::sigmoid(input, context),
+            Self::Silu => B::silu(input, context),
+            Self::Softplus(beta) if beta.is_finite() && beta > 0.0 => {
+                B::softplus(input, beta, context)
+            }
+            Self::Softplus(_) => Err(Error::backend(
+                "attention gate beta must be finite and positive",
+            )),
+        }
+    }
 }
 
 impl<B: NeuralBackend> Attention<B> {
@@ -1031,10 +1132,15 @@ impl<B: NeuralBackend> Attention<B> {
             )));
         }
         Ok(Self {
+            output_gate: None,
+            output_gate_activation: OutputGateActivation::Sigmoid,
+            query_key_norm_per_head_weights: false,
+            rotary_pair_dimensions: 0,
             query_heads,
             key_value_heads,
             scale: (head_dim as f32).sqrt().recip(),
             softcap: None,
+            arithmetic: eredu_nn::AttentionArithmetic::Fused,
             input_projection: AttentionInputProjection::Split { query, key, value },
             output,
             sinks: None,
@@ -1082,7 +1188,7 @@ impl<B: NeuralBackend> Attention<B> {
                     bias,
                     format: crate::linear_format::standard_linear_format(
                         &weight_name,
-                        config.weight_quantization(&weight_name).into(),
+                        config.linear_format(&weight_name),
                     )?,
                 },
                 context,
@@ -1100,6 +1206,22 @@ impl<B: NeuralBackend> Attention<B> {
             .checked_mul(head)
             .ok_or_else(|| Error::backend("decoder key/value projection width overflowed"))?;
         let input_projection = match config.attention_projection_layout() {
+            AttentionProjectionLayout::Split if config.external_attention_value(layer) => {
+                AttentionInputProjection::ExternalValue {
+                    query: linear(
+                        fields.attention_query,
+                        hidden,
+                        query_width,
+                        config.attention_bias(AttentionProjection::Query),
+                    )?,
+                    key: linear(
+                        fields.attention_key,
+                        hidden,
+                        key_value_width,
+                        config.attention_bias(AttentionProjection::Key),
+                    )?,
+                }
+            }
             AttentionProjectionLayout::Split => AttentionInputProjection::Split {
                 query: linear(
                     fields.attention_query,
@@ -1146,10 +1268,20 @@ impl<B: NeuralBackend> Attention<B> {
             }
         };
         Ok(Self {
+            output_gate: config
+                .attention_output_gate()
+                .map(|(field, _)| linear(field, hidden, query_width, false))
+                .transpose()?,
+            output_gate_activation: config
+                .attention_output_gate()
+                .map_or(OutputGateActivation::Sigmoid, |(_, activation)| activation),
+            query_key_norm_per_head_weights: config.query_key_norm_per_head_weights(),
+            rotary_pair_dimensions: config.rotary_pair_dimensions(),
             query_heads,
             key_value_heads,
             scale: config.attention_scale(),
             softcap: config.attention_softcap(),
+            arithmetic: config.attention_arithmetic(),
             input_projection,
             output: linear(
                 fields.attention_output,
@@ -1171,35 +1303,45 @@ impl<B: NeuralBackend> Attention<B> {
             query_norm: config
                 .query_key_norm_epsilon()
                 .map(|epsilon| {
-                    B::normalization(
-                        NormalizationConstructionSpec::learned(
-                            head,
-                            epsilon,
-                            ParameterSpec::trainable(format!(
-                                "{prefix}.{}.weight",
-                                fields.attention_query_norm
-                            ))
-                            .map_err(Error::backend)?,
-                        ),
-                        context,
-                    )
+                    let mut spec = NormalizationConstructionSpec::learned(
+                        if config.query_key_norm_per_head_weights() {
+                            query_width
+                        } else {
+                            head
+                        },
+                        epsilon,
+                        ParameterSpec::trainable(format!(
+                            "{prefix}.{}.weight",
+                            fields.attention_query_norm
+                        ))
+                        .map_err(Error::backend)?,
+                    );
+                    if config.query_key_norm_per_head_weights() {
+                        spec = spec.with_groups(query_heads)?;
+                    }
+                    B::normalization(spec, context)
                 })
                 .transpose()?,
             key_norm: config
                 .query_key_norm_epsilon()
                 .map(|epsilon| {
-                    B::normalization(
-                        NormalizationConstructionSpec::learned(
-                            head,
-                            epsilon,
-                            ParameterSpec::trainable(format!(
-                                "{prefix}.{}.weight",
-                                fields.attention_key_norm
-                            ))
-                            .map_err(Error::backend)?,
-                        ),
-                        context,
-                    )
+                    let mut spec = NormalizationConstructionSpec::learned(
+                        if config.query_key_norm_per_head_weights() {
+                            key_value_width
+                        } else {
+                            head
+                        },
+                        epsilon,
+                        ParameterSpec::trainable(format!(
+                            "{prefix}.{}.weight",
+                            fields.attention_key_norm
+                        ))
+                        .map_err(Error::backend)?,
+                    );
+                    if config.query_key_norm_per_head_weights() {
+                        spec = spec.with_groups(key_value_heads)?;
+                    }
+                    B::normalization(spec, context)
                 })
                 .transpose()?,
             rotary: config
@@ -1218,8 +1360,19 @@ impl<B: NeuralBackend> Attention<B> {
     fn projections(
         &mut self,
         hidden: &B::Tensor,
+        external_value: Option<B::Tensor>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<ProjectedAttention<B::Tensor>, Error> {
+        if external_value.is_some()
+            && !matches!(
+                self.input_projection,
+                AttentionInputProjection::ExternalValue { .. }
+            )
+        {
+            return Err(Error::backend(
+                "externally projected values require an external-value attention layout",
+            ));
+        }
         let batch = hidden.dim(0);
         let sequence = hidden.dim(1);
         let reshape = |tensor: B::Tensor, heads| {
@@ -1227,7 +1380,14 @@ impl<B: NeuralBackend> Attention<B> {
                 .reshape(&[batch, sequence, heads, -1], context)?
                 .transpose_axes(&[0, 2, 1, 3], context)
         };
-        let (query, key, value) = match &mut self.input_projection {
+        let (mut query, mut key, value) = match &mut self.input_projection {
+            AttentionInputProjection::ExternalValue { query, key } => (
+                query.forward(hidden, context)?,
+                key.forward(hidden, context)?,
+                external_value.ok_or_else(|| {
+                    Error::backend("attention requires a provider-projected value")
+                })?,
+            ),
             AttentionInputProjection::Split { query, key, value } => (
                 query.forward(hidden, context)?,
                 key.forward(hidden, context)?,
@@ -1253,6 +1413,25 @@ impl<B: NeuralBackend> Attention<B> {
                 (query, key, value)
             }
         };
+        if matches!(
+            self.input_projection,
+            AttentionInputProjection::ExternalValue { .. }
+        ) && value.shape() != key.shape()
+        {
+            return Err(Error::backend(format!(
+                "provider-projected value shape {:?} differs from key projection {:?}",
+                value.shape(),
+                key.shape()
+            )));
+        }
+        if self.query_key_norm_per_head_weights {
+            if let Some(norm) = &mut self.query_norm {
+                query = norm.forward(&query, context)?;
+            }
+            if let Some(norm) = &mut self.key_norm {
+                key = norm.forward(&key, context)?;
+            }
+        }
         let query = query.reshape(&[batch, sequence, self.query_heads, -1], context)?;
         let (query, output_gate) = if self.query_output_gate {
             let projected = query.dim(3);
@@ -1282,15 +1461,24 @@ impl<B: NeuralBackend> Attention<B> {
                 ),
             )
         } else {
-            (query, None)
+            let gate = self
+                .output_gate
+                .as_mut()
+                .map(|gate| gate.forward(hidden, context))
+                .transpose()?;
+            (query, gate)
         };
         let mut queries = query.transpose_axes(&[0, 2, 1, 3], context)?;
-        if let Some(norm) = &mut self.query_norm {
-            queries = norm.forward(&queries, context)?;
+        if !self.query_key_norm_per_head_weights {
+            if let Some(norm) = &mut self.query_norm {
+                queries = norm.forward(&queries, context)?;
+            }
         }
         let mut keys = reshape(key, self.key_value_heads)?;
-        if let Some(norm) = &mut self.key_norm {
-            keys = norm.forward(&keys, context)?;
+        if !self.query_key_norm_per_head_weights {
+            if let Some(norm) = &mut self.key_norm {
+                keys = norm.forward(&keys, context)?;
+            }
         }
         let values = reshape(value, self.key_value_heads)?;
         Ok(ProjectedAttention {
@@ -1310,6 +1498,7 @@ impl<B: NeuralBackend> Attention<B> {
         mut cache: Option<&mut C>,
         allow_sliding_prefill: bool,
         rotary_position: Option<RotaryPosition<'_, B::Tensor>>,
+        external_value: Option<B::Tensor>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
         let ProjectedAttention {
@@ -1319,14 +1508,26 @@ impl<B: NeuralBackend> Attention<B> {
             output_gate,
             batch,
             sequence,
-        } = self.projections(hidden, context)?;
+        } = self.projections(hidden, external_value, context)?;
         let offset = cache.as_ref().map_or(0, |cache| cache.offset());
         let (queries, keys) = match &mut self.rotary {
             Some(rotary) => {
                 let position = rotary_position.unwrap_or(RotaryPosition::Offset(offset));
                 (
-                    rotary.forward_subspace(&queries, RotarySubspace::Full, position, context)?,
-                    rotary.forward_subspace(&keys, RotarySubspace::Full, position, context)?,
+                    paired_rotary(
+                        rotary,
+                        &queries,
+                        self.rotary_pair_dimensions,
+                        position,
+                        context,
+                    )?,
+                    paired_rotary(
+                        rotary,
+                        &keys,
+                        self.rotary_pair_dimensions,
+                        position,
+                        context,
+                    )?,
                 )
             }
             None => (queries, keys),
@@ -1341,8 +1542,9 @@ impl<B: NeuralBackend> Attention<B> {
                 && sequence > 1
                 && !cache.as_ref().is_some_and(|c| c.uses_blockwise_attention())
         }) {
-            return B::sliding_window_attention_with_sinks(
+            let attended = B::sliding_window_attention_with_sinks(
                 AttentionRequest {
+                    arithmetic: self.arithmetic,
                     softcap: self.softcap,
                     queries,
                     keys,
@@ -1354,9 +1556,17 @@ impl<B: NeuralBackend> Attention<B> {
                 window,
                 offset,
                 context,
-            );
+            )?;
+            return match output_gate {
+                Some(gate) => attended.multiply(
+                    &self.output_gate_activation.apply::<B>(gate, context)?,
+                    context,
+                ),
+                None => Ok(attended),
+            };
         }
         let request = AttentionRequest {
+            arithmetic: self.arithmetic,
             softcap: self.softcap,
             queries,
             keys,
@@ -1374,7 +1584,10 @@ impl<B: NeuralBackend> Attention<B> {
             .transpose_axes(&[0, 2, 1, 3], context)?
             .reshape(&[batch, sequence, -1], context)?;
         match output_gate {
-            Some(gate) => attended.multiply(&B::sigmoid(gate, context)?, context),
+            Some(gate) => attended.multiply(
+                &self.output_gate_activation.apply::<B>(gate, context)?,
+                context,
+            ),
             None => Ok(attended),
         }
     }
@@ -1385,12 +1598,24 @@ impl<B: NeuralBackend> Attention<B> {
         input: AttentionInput<'_, B::Tensor, C>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
+        self.forward_with_value(input, None, context)
+    }
+
+    /// Executes ordinary attention with already mixed provider-projected values.
+    /// Values enter the same KV cache exactly once, before attention.
+    pub fn forward_with_value<C: AttentionCache<B::Tensor>>(
+        &mut self,
+        input: AttentionInput<'_, B::Tensor, C>,
+        value: Option<B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
         let attended = self.attend(
             input.hidden,
             input.mask,
             input.cache,
             input.allow_sliding_prefill,
             input.rotary_position,
+            value,
             context,
         )?;
         self.output.forward(&attended, context)
@@ -1403,16 +1628,74 @@ impl<B: NeuralBackend> Attention<B> {
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
+        self.forward_parallel_with_value(input, None, parallel, context)
+    }
+
+    /// Executes head-local attention with mixed local value rows and reduces
+    /// only the output projection; activated value rows are never all-summed.
+    pub fn forward_parallel_with_value<C: AttentionCache<B::Tensor>>(
+        &mut self,
+        input: AttentionInput<'_, B::Tensor, C>,
+        value: Option<B::Tensor>,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
         let attended = self.attend(
             input.hidden,
             input.mask,
             input.cache,
             input.allow_sliding_prefill,
             input.rotary_position,
+            value,
             context,
         )?;
         B::row_parallel_linear(&mut self.output, &attended, parallel, context)
     }
+}
+
+fn paired_rotary<T: Tensor, R: RotaryOperator<T>>(
+    rotary: &mut R,
+    input: &T,
+    dimensions: i32,
+    position: RotaryPosition<'_, T>,
+    context: &T::Context,
+) -> Result<T, Error> {
+    let head = *input
+        .shape()
+        .last()
+        .ok_or_else(|| Error::backend("rotary input is scalar"))?;
+    if dimensions == 0 || dimensions == head {
+        return rotary.forward_subspace(input, RotarySubspace::Full, position, context);
+    }
+    if dimensions <= 0 || dimensions > head || dimensions % 2 != 0 || head % 2 != 0 {
+        return Err(Error::backend("invalid partial paired rotary geometry"));
+    }
+    let slice = |value: &T, start, end| {
+        let mut index = vec![Index::Full; value.shape().len()];
+        *index.last_mut().expect("non-scalar rotary input") = Index::Range(start, end);
+        value.index(&index, context)
+    };
+    let half = head / 2;
+    let rotated_half = dimensions / 2;
+    let selected = T::concatenate(
+        &[
+            slice(input, 0, rotated_half)?,
+            slice(input, half, half + rotated_half)?,
+        ],
+        -1,
+        context,
+    )?;
+    let rotated = rotary.forward_subspace(&selected, RotarySubspace::Full, position, context)?;
+    T::concatenate(
+        &[
+            slice(&rotated, 0, rotated_half)?,
+            slice(input, rotated_half, half)?,
+            slice(&rotated, rotated_half, dimensions)?,
+            slice(input, half + rotated_half, head)?,
+        ],
+        -1,
+        context,
+    )
 }
 
 /// One component-major fused gate/up affine projection.
@@ -1496,7 +1779,7 @@ impl<B: NeuralBackend> Mlp<B> {
                     bias,
                     format: crate::linear_format::standard_linear_format(
                         &weight_name,
-                        config.weight_quantization(&weight_name).into(),
+                        config.linear_format(&weight_name),
                     )?,
                 },
                 context,
@@ -1591,8 +1874,18 @@ impl<B: NeuralBackend> Mlp<B> {
     }
 }
 
-/// Feed-forward policy executed by the shared residual decoder block.
-pub trait FeedForwardOperator<B: NeuralBackend>: eredu_nn::Parameterized<B::Tensor> {
+/// Replaceable value and feed-forward projections inside the shared residual block.
+pub trait DecoderProjectionOperator<B: NeuralBackend>: eredu_nn::Parameterized<B::Tensor> {
+    /// Optionally projects mixed values from normalized attention input. The
+    /// result has `[batch, tokens, local_kv_heads * head_width]` geometry.
+    fn project_values(
+        &mut self,
+        _input: &B::Tensor,
+        _context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Option<B::Tensor>, Error> {
+        Ok(None)
+    }
+
     /// Executes replicated feed-forward computation.
     fn forward_feed_forward(
         &mut self,
@@ -1602,7 +1895,7 @@ pub trait FeedForwardOperator<B: NeuralBackend>: eredu_nn::Parameterized<B::Tens
 }
 
 /// Additive feed-forward execution for tensor-parallel realizations.
-pub trait TensorParallelFeedForwardOperator<B: NeuralBackend>: FeedForwardOperator<B> {
+pub trait TensorParallelProjectionOperator<B: NeuralBackend>: DecoderProjectionOperator<B> {
     /// Executes tensor-parallel feed-forward computation.
     fn forward_feed_forward_parallel(
         &mut self,
@@ -1612,7 +1905,7 @@ pub trait TensorParallelFeedForwardOperator<B: NeuralBackend>: FeedForwardOperat
     ) -> Result<B::Tensor, Error>;
 }
 
-impl<B: NeuralBackend> FeedForwardOperator<B> for Mlp<B> {
+impl<B: NeuralBackend> DecoderProjectionOperator<B> for Mlp<B> {
     fn forward_feed_forward(
         &mut self,
         input: &B::Tensor,
@@ -1622,7 +1915,7 @@ impl<B: NeuralBackend> FeedForwardOperator<B> for Mlp<B> {
     }
 }
 
-impl<B: NeuralBackend> TensorParallelFeedForwardOperator<B> for Mlp<B> {
+impl<B: NeuralBackend> TensorParallelProjectionOperator<B> for Mlp<B> {
     fn forward_feed_forward_parallel(
         &mut self,
         input: &B::Tensor,
@@ -1664,6 +1957,7 @@ impl<B: NeuralBackend> TransformerBlock<B, Mlp<B>> {
         let norm = |name: String| {
             B::normalization(
                 NormalizationConstructionSpec {
+                    groups: config.normalization_groups(),
                     dimensions: config.hidden_size(),
                     epsilon: config.rms_norm_epsilon(),
                     scale: normalization_scale(
@@ -1715,7 +2009,7 @@ impl<B: NeuralBackend> TransformerBlock<B, Mlp<B>> {
 impl<B, F> TransformerBlock<B, F>
 where
     B: NeuralBackend,
-    F: FeedForwardOperator<B>,
+    F: DecoderProjectionOperator<B>,
 {
     fn normalize_output(
         &mut self,
@@ -1727,30 +2021,60 @@ where
             None => Ok(hidden),
         }
     }
-    /// Executes this block with replicated projections.
-    pub fn forward<C: AttentionCache<B::Tensor>>(
+    /// Executes the shared normalization, attention, cache, and residual lifecycle
+    /// with family-owned projection callbacks. The same provider is borrowed
+    /// sequentially by value and feed-forward execution.
+    fn forward_projections<C, D, V, H>(
         &mut self,
         input: AttentionInput<'_, B::Tensor, C>,
+        parallel: Option<&B::ParallelContext>,
         context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error> {
+        state: &mut D,
+        values: V,
+        feed_forward: H,
+    ) -> Result<B::Tensor, Error>
+    where
+        C: AttentionCache<B::Tensor>,
+        V: FnOnce(
+            &mut F,
+            &B::Tensor,
+            &mut D,
+            &<B::Tensor as Tensor>::Context,
+        ) -> Result<Option<B::Tensor>, Error>,
+        H: FnOnce(
+            &mut F,
+            &B::Tensor,
+            &mut D,
+            &<B::Tensor as Tensor>::Context,
+        ) -> Result<B::Tensor, Error>,
+    {
         let normalized = self.input_norm.forward(input.hidden, context)?;
-        let attention = self.self_attention.forward(
-            AttentionInput {
-                hidden: &normalized,
-                mask: input.mask,
-                cache: input.cache,
-                allow_sliding_prefill: input.allow_sliding_prefill,
-                rotary_position: input.rotary_position,
-            },
-            context,
-        )?;
+        let value = values(&mut self.mlp, &normalized, state, context)?;
+        let attention_input = AttentionInput {
+            hidden: &normalized,
+            mask: input.mask,
+            cache: input.cache,
+            allow_sliding_prefill: input.allow_sliding_prefill,
+            rotary_position: input.rotary_position,
+        };
+        let attention = match parallel {
+            Some(parallel) => self.self_attention.forward_parallel_with_value(
+                attention_input,
+                value,
+                parallel,
+                context,
+            )?,
+            None => self
+                .self_attention
+                .forward_with_value(attention_input, value, context)?,
+        };
         let attention = match &mut self.attention_output_norm {
             Some(norm) => norm.forward(&attention, context)?,
             None => attention,
         };
         let hidden = input.hidden.add(&attention, context)?;
         let normalized = self.post_attention_norm.forward(&hidden, context)?;
-        let mlp = self.mlp.forward_feed_forward(&normalized, context)?;
+        let mlp = feed_forward(&mut self.mlp, &normalized, state, context)?;
         let mlp = match &mut self.feed_forward_output_norm {
             Some(norm) => norm.forward(&mlp, context)?,
             None => mlp,
@@ -1758,7 +2082,23 @@ where
         self.normalize_output(hidden.add(&mlp, context)?, context)
     }
 
-    /// Executes attention and residuals while delegating feed-forward execution.
+    /// Executes this block with replicated projections.
+    pub fn forward<C: AttentionCache<B::Tensor>>(
+        &mut self,
+        input: AttentionInput<'_, B::Tensor, C>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        self.forward_projections(
+            input,
+            None,
+            context,
+            &mut (),
+            |policy, input, _, context| policy.project_values(input, context),
+            |policy, input, _, context| policy.forward_feed_forward(input, context),
+        )
+    }
+
+    /// Delegates feed-forward computation while retaining the shared block lifecycle.
     pub fn forward_with_feed_forward<C, H>(
         &mut self,
         input: AttentionInput<'_, B::Tensor, C>,
@@ -1769,32 +2109,17 @@ where
         C: AttentionCache<B::Tensor>,
         H: FnOnce(&mut F, &B::Tensor, &<B::Tensor as Tensor>::Context) -> Result<B::Tensor, Error>,
     {
-        let normalized = self.input_norm.forward(input.hidden, context)?;
-        let attention = self.self_attention.forward(
-            AttentionInput {
-                hidden: &normalized,
-                mask: input.mask,
-                cache: input.cache,
-                allow_sliding_prefill: input.allow_sliding_prefill,
-                rotary_position: input.rotary_position,
-            },
+        self.forward_projections(
+            input,
+            None,
             context,
-        )?;
-        let attention = match &mut self.attention_output_norm {
-            Some(norm) => norm.forward(&attention, context)?,
-            None => attention,
-        };
-        let hidden = input.hidden.add(&attention, context)?;
-        let normalized = self.post_attention_norm.forward(&hidden, context)?;
-        let mlp = feed_forward(&mut self.mlp, &normalized, context)?;
-        let mlp = match &mut self.feed_forward_output_norm {
-            Some(norm) => norm.forward(&mlp, context)?,
-            None => mlp,
-        };
-        self.normalize_output(hidden.add(&mlp, context)?, context)
+            &mut (),
+            |policy, input, _, context| policy.project_values(input, context),
+            |policy, input, _, context| feed_forward(policy, input, context),
+        )
     }
 
-    /// Executes a block with rank-local column projections and reduced row projections.
+    /// Executes column partitions and reduced row projections.
     pub fn forward_tensor_parallel<C: AttentionCache<B::Tensor>>(
         &mut self,
         input: AttentionInput<'_, B::Tensor, C>,
@@ -1802,37 +2127,21 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error>
     where
-        F: TensorParallelFeedForwardOperator<B>,
+        F: TensorParallelProjectionOperator<B>,
     {
-        let normalized = self.input_norm.forward(input.hidden, context)?;
-        let attention = self.self_attention.forward_parallel(
-            AttentionInput {
-                hidden: &normalized,
-                mask: input.mask,
-                cache: input.cache,
-                allow_sliding_prefill: input.allow_sliding_prefill,
-                rotary_position: input.rotary_position,
-            },
-            parallel,
+        self.forward_projections(
+            input,
+            Some(parallel),
             context,
-        )?;
-        let attention = match &mut self.attention_output_norm {
-            Some(norm) => norm.forward(&attention, context)?,
-            None => attention,
-        };
-        let hidden = input.hidden.add(&attention, context)?;
-        let normalized = self.post_attention_norm.forward(&hidden, context)?;
-        let mlp = self
-            .mlp
-            .forward_feed_forward_parallel(&normalized, parallel, context)?;
-        let mlp = match &mut self.feed_forward_output_norm {
-            Some(norm) => norm.forward(&mlp, context)?,
-            None => mlp,
-        };
-        self.normalize_output(hidden.add(&mlp, context)?, context)
+            &mut (),
+            |policy, input, _, context| policy.project_values(input, context),
+            |policy, input, _, context| {
+                policy.forward_feed_forward_parallel(input, parallel, context)
+            },
+        )
     }
 
-    /// Executes tensor-parallel attention and residuals with delegated feed-forward execution.
+    /// Delegates feed-forward computation for a tensor-parallel block.
     pub fn forward_tensor_parallel_with_feed_forward<C, H>(
         &mut self,
         input: AttentionInput<'_, B::Tensor, C>,
@@ -1844,30 +2153,77 @@ where
         C: AttentionCache<B::Tensor>,
         H: FnOnce(&mut F, &B::Tensor, &<B::Tensor as Tensor>::Context) -> Result<B::Tensor, Error>,
     {
-        let normalized = self.input_norm.forward(input.hidden, context)?;
-        let attention = self.self_attention.forward_parallel(
-            AttentionInput {
-                hidden: &normalized,
-                mask: input.mask,
-                cache: input.cache,
-                allow_sliding_prefill: input.allow_sliding_prefill,
-                rotary_position: input.rotary_position,
-            },
-            parallel,
+        self.forward_projections(
+            input,
+            Some(parallel),
             context,
-        )?;
-        let attention = match &mut self.attention_output_norm {
-            Some(norm) => norm.forward(&attention, context)?,
-            None => attention,
-        };
-        let hidden = input.hidden.add(&attention, context)?;
-        let normalized = self.post_attention_norm.forward(&hidden, context)?;
-        let mlp = feed_forward(&mut self.mlp, &normalized, context)?;
-        let mlp = match &mut self.feed_forward_output_norm {
-            Some(norm) => norm.forward(&mlp, context)?,
-            None => mlp,
-        };
-        self.normalize_output(hidden.add(&mlp, context)?, context)
+            &mut (),
+            |policy, input, _, context| policy.project_values(input, context),
+            |policy, input, _, context| feed_forward(policy, input, context),
+        )
+    }
+
+    /// Routes both replaceable projection stages through one runtime provider.
+    pub fn forward_routed<C, P>(
+        &mut self,
+        layer: usize,
+        input: AttentionInput<'_, B::Tensor, C>,
+        pass: eredu_runtime::ExpertPass,
+        provider: &mut P,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error>
+    where
+        B: GroupedNeuralBackend,
+        C: AttentionCache<B::Tensor>,
+        F: RoutedProjectionOperator<B>,
+        P: eredu_runtime::RoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+    {
+        self.forward_projections(
+            input,
+            None,
+            context,
+            provider,
+            |policy, input, provider, context| {
+                policy.project_values_with_provider(layer, input, pass, provider, context)
+            },
+            |policy, input, provider, context| {
+                policy.forward_with_provider(layer, input, pass, provider, context)
+            },
+        )
+    }
+
+    /// Routes both stages with owned value-output rows and reduced feed-forward rows.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_routed_parallel<C, P>(
+        &mut self,
+        layer: usize,
+        input: AttentionInput<'_, B::Tensor, C>,
+        pass: eredu_runtime::ExpertPass,
+        provider: &mut P,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error>
+    where
+        B: GroupedNeuralBackend,
+        C: AttentionCache<B::Tensor>,
+        F: TensorParallelRoutedProjectionOperator<B>,
+        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+    {
+        self.forward_projections(
+            input,
+            Some(parallel),
+            context,
+            provider,
+            |policy, input, provider, context| {
+                policy.project_values_with_provider(layer, input, pass, provider, context)
+            },
+            |policy, input, provider, context| {
+                policy
+                    .forward_parallel_with_provider(layer, input, pass, provider, parallel, context)
+            },
+        )
     }
 }
 
@@ -1902,18 +2258,13 @@ pub fn block_common_parallel_parameter_groups<B: NeuralBackend, F>(
         .ok_or_else(|| {
             ParallelPlanError::InvalidGroup("decoder GQA group width overflowed".into())
         })?;
-    let attention_alignment = config
-        .weight_quantization(&format!(
+    let attention_alignment = usize::try_from(crate::linear_format::input_partition_alignment(
+        config.linear_format(&format!(
             "{attention_prefix}.{}.weight",
             fields.attention_output
-        ))
-        .map_or(Ok(1), |quantization| {
-            usize::try_from(quantization.group_size()).map_err(|_| {
-                ParallelPlanError::InvalidGroup(
-                    "decoder output-projection quantization group exceeds usize".into(),
-                )
-            })
-        })?;
+        )),
+    ))
+    .map_err(|e| ParallelPlanError::InvalidGroup(e.to_string()))?;
     let attention_units = aligned_partition_units(
         &attention_prefix,
         key_value_heads,
@@ -1921,16 +2272,36 @@ pub fn block_common_parallel_parameter_groups<B: NeuralBackend, F>(
         attention_alignment,
     )?;
     let attention = match &block.self_attention.input_projection {
-        AttentionInputProjection::Split { query, key, value } => {
+        AttentionInputProjection::ExternalValue { query, key } => {
+            let mut projections = vec![
+                (query, ProjectionSharding::Column),
+                (key, ProjectionSharding::Column),
+                (&block.self_attention.output, ProjectionSharding::Row),
+            ];
+            if let Some(gate) = &block.self_attention.output_gate {
+                projections.push((gate, ProjectionSharding::Column));
+            }
             partitioned_projection_group::<B::Tensor, B::Linear>(
                 format!("{attention_prefix}.projections"),
                 ParameterRole::AttentionHeads,
-                &[
-                    (query, ProjectionSharding::Column),
-                    (key, ProjectionSharding::Column),
-                    (value, ProjectionSharding::Column),
-                    (&block.self_attention.output, ProjectionSharding::Row),
-                ],
+                &projections,
+                attention_units,
+            )?
+        }
+        AttentionInputProjection::Split { query, key, value } => {
+            let mut projections = vec![
+                (query, ProjectionSharding::Column),
+                (key, ProjectionSharding::Column),
+                (value, ProjectionSharding::Column),
+                (&block.self_attention.output, ProjectionSharding::Row),
+            ];
+            if let Some(gate) = &block.self_attention.output_gate {
+                projections.push((gate, ProjectionSharding::Column));
+            }
+            partitioned_projection_group::<B::Tensor, B::Linear>(
+                format!("{attention_prefix}.projections"),
+                ParameterRole::AttentionHeads,
+                &projections,
                 attention_units,
             )?
         }
@@ -1988,21 +2359,37 @@ pub fn block_common_parallel_parameter_groups<B: NeuralBackend, F>(
             },
         )?);
     }
-    if let Some(norm) = &block.self_attention.query_norm {
-        groups.push(module_parameter_group::<B::Tensor, _>(
-            format!("{attention_prefix}.{}", fields.attention_query_norm),
-            ParameterRole::Replicated,
-            norm,
-            |_, _| Ok(MemberSharding::Replicated),
-        )?);
-    }
-    if let Some(norm) = &block.self_attention.key_norm {
-        groups.push(module_parameter_group::<B::Tensor, _>(
-            format!("{attention_prefix}.{}", fields.attention_key_norm),
-            ParameterRole::Replicated,
-            norm,
-            |_, _| Ok(MemberSharding::Replicated),
-        )?);
+    for (norm, field, heads) in [
+        (
+            &block.self_attention.query_norm,
+            fields.attention_query_norm,
+            query_heads,
+        ),
+        (
+            &block.self_attention.key_norm,
+            fields.attention_key_norm,
+            key_value_heads,
+        ),
+    ] {
+        if let Some(norm) = norm {
+            let name = format!("{attention_prefix}.{field}");
+            groups.push(if config.query_key_norm_per_head_weights() {
+                partitioned_module_parameter_group::<B::Tensor, _>(
+                    name,
+                    ParameterRole::AttentionHeads,
+                    heads,
+                    norm,
+                    |_, _| Ok(MemberSharding::Partitioned { axis: 0 }),
+                )?
+            } else {
+                module_parameter_group::<B::Tensor, _>(
+                    name,
+                    ParameterRole::Replicated,
+                    norm,
+                    |_, _| Ok(MemberSharding::Replicated),
+                )?
+            });
+        }
     }
     for (name, norm) in [
         (
@@ -2045,15 +2432,10 @@ pub fn dense_mlp_parallel_parameter_group<B: NeuralBackend>(
     let intermediate = usize::try_from(config.intermediate_size()).map_err(|_| {
         ParallelPlanError::InvalidGroup("decoder feed-forward width exceeds usize".into())
     })?;
-    let alignment = config
-        .weight_quantization(&format!("{prefix}.{}.weight", fields.feed_forward_output))
-        .map_or(Ok(1), |quantization| {
-            usize::try_from(quantization.group_size()).map_err(|_| {
-                ParallelPlanError::InvalidGroup(
-                    "decoder down-projection quantization group exceeds usize".into(),
-                )
-            })
-        })?;
+    let alignment = usize::try_from(crate::linear_format::input_partition_alignment(
+        config.linear_format(&format!("{prefix}.{}.weight", fields.feed_forward_output)),
+    ))
+    .map_err(|e| ParallelPlanError::InvalidGroup(e.to_string()))?;
     let units = aligned_partition_units(&prefix, intermediate, 1, alignment)?;
     match &mlp.input_projection {
         GatedInputProjection::Split { gate, up } => {
@@ -2122,6 +2504,16 @@ pub fn layer_parallel_parameter_groups<B: NeuralBackend>(
 /// configuration without constructing backend modules.
 pub fn dense_parameter_description(
     config: &impl Config,
+) -> Result<ArchitectureParameterDescription, ParallelPlanError> {
+    parameter_description(config, |_| true, |_| Ok(None))
+}
+
+/// Declares a split-projection decoder with optional provider-owned values and
+/// replacement feed-forward groups, without constructing backend tensors.
+pub(crate) fn parameter_description(
+    config: &impl Config,
+    ordinary_value_projection: impl Fn(usize) -> bool,
+    replacement_groups: impl Fn(usize) -> Result<Option<Vec<ParameterGroupSpec>>, ParallelPlanError>,
 ) -> Result<ArchitectureParameterDescription, ParallelPlanError> {
     config
         .validate_config()
@@ -2225,14 +2617,13 @@ pub fn dense_parameter_description(
     for layer in 0..layers {
         let prefix = format!("{root}.layers.{layer}");
         let attention_prefix = format!("{prefix}.{}", fields.attention);
-        let attention_alignment = config
-            .weight_quantization(&format!(
+        let attention_alignment = usize::try_from(crate::linear_format::input_partition_alignment(
+            config.linear_format(&format!(
                 "{attention_prefix}.{}.weight",
                 fields.attention_output
-            ))
-            .map_or(Ok(1), |quantization| {
-                dimension("attention quantization group", quantization.group_size())
-            })?;
+            )),
+        ))
+        .map_err(|e| ParallelPlanError::InvalidGroup(e.to_string()))?;
         let attention_units = aligned_partition_units(
             &attention_prefix,
             key_value_heads,
@@ -2279,18 +2670,28 @@ pub fn dense_parameter_description(
             MemberSharding::Partitioned { axis: 0 },
             config.attention_bias(AttentionProjection::Key),
         );
-        projection(
-            fields.attention_value,
-            vec![key_value_width, hidden],
-            MemberSharding::Partitioned { axis: 0 },
-            config.attention_bias(AttentionProjection::Value),
-        );
+        if ordinary_value_projection(layer) {
+            projection(
+                fields.attention_value,
+                vec![key_value_width, hidden],
+                MemberSharding::Partitioned { axis: 0 },
+                config.attention_bias(AttentionProjection::Value),
+            );
+        }
         projection(
             fields.attention_output,
             vec![hidden, query_width],
             MemberSharding::Partitioned { axis: 1 },
             config.attention_bias(AttentionProjection::Output),
         );
+        if let Some((field, _)) = config.attention_output_gate() {
+            projection(
+                field,
+                vec![query_width, hidden],
+                MemberSharding::Partitioned { axis: 0 },
+                false,
+            );
+        }
         let attention = ParameterGroupSpec::partitioned(
             format!("{attention_prefix}.projections"),
             ParameterRole::AttentionHeads,
@@ -2299,14 +2700,13 @@ pub fn dense_parameter_description(
         )?;
 
         let feed_forward_prefix = format!("{prefix}.{}", fields.feed_forward);
-        let feed_forward_alignment = config
-            .weight_quantization(&format!(
+        let feed_forward_alignment = usize::try_from(
+            crate::linear_format::input_partition_alignment(config.linear_format(&format!(
                 "{feed_forward_prefix}.{}.weight",
                 fields.feed_forward_output
-            ))
-            .map_or(Ok(1), |quantization| {
-                dimension("feed-forward quantization group", quantization.group_size())
-            })?;
+            ))),
+        )
+        .map_err(|e| ParallelPlanError::InvalidGroup(e.to_string()))?;
         let feed_forward_units = aligned_partition_units(
             &feed_forward_prefix,
             intermediate,
@@ -2387,19 +2787,39 @@ pub fn dense_parameter_description(
             )?);
         }
         if config.query_key_norm_epsilon().is_some() {
-            for field in [fields.attention_query_norm, fields.attention_key_norm] {
-                unit_groups.push(ParameterGroupSpec::new(
-                    format!("{attention_prefix}.{field}"),
-                    ParameterRole::Replicated,
-                    [eredu_runtime::ParameterMemberSpec::new(
-                        format!("{attention_prefix}.{field}.weight"),
-                        vec![head],
-                        MemberSharding::Replicated,
-                    )],
-                )?);
+            for (field, heads) in [
+                (fields.attention_query_norm, query_heads),
+                (fields.attention_key_norm, key_value_heads),
+            ] {
+                let name = format!("{attention_prefix}.{field}");
+                let owned = config.query_key_norm_per_head_weights();
+                let members = [eredu_runtime::ParameterMemberSpec::new(
+                    format!("{name}.weight"),
+                    vec![if owned { heads * head } else { head }],
+                    if owned {
+                        MemberSharding::Partitioned { axis: 0 }
+                    } else {
+                        MemberSharding::Replicated
+                    },
+                )];
+                unit_groups.push(if owned {
+                    ParameterGroupSpec::partitioned(
+                        name,
+                        ParameterRole::AttentionHeads,
+                        heads,
+                        members,
+                    )?
+                } else {
+                    ParameterGroupSpec::new(name, ParameterRole::Replicated, members)?
+                });
             }
         }
-        unit_groups.extend([input_norm, post_attention_norm, feed_forward]);
+        unit_groups.extend([input_norm, post_attention_norm]);
+        if let Some(groups) = replacement_groups(layer)? {
+            unit_groups.extend(groups);
+        } else {
+            unit_groups.push(feed_forward);
+        }
         for group in unit_groups {
             owned.push(OwnedParameterGroupSpec::new(
                 ParameterGroupOwner::execution_unit(group_id.clone(), layer),
@@ -2416,7 +2836,7 @@ pub fn dense_parameter_description(
             |member| {
                 crate::linear_format::standard_parallel_linear_format(
                     member,
-                    config.weight_quantization(member.target()).into(),
+                    config.linear_format(member.target()),
                 )
             },
         )?
@@ -2507,6 +2927,8 @@ impl<B: NeuralBackend> Clone for StaticModules<B> {
 /// modules.
 #[derive(Debug, Clone)]
 pub struct StaticModuleSpec {
+    /// Independent final normalization groups using float32 scale multiplication.
+    pub normalization_groups: Option<i32>,
     /// Token embedding parameter identity.
     pub embedding_weight: String,
     /// Final normalization parameter identity.
@@ -2552,6 +2974,7 @@ impl<B: NeuralBackend> StaticModules<B> {
             ParameterSpec::trainable(&spec.normalization_weight).map_err(Error::backend)?;
         let norm = B::normalization(
             eredu_nn::NormalizationConstructionSpec {
+                groups: spec.normalization_groups,
                 dimensions: spec.hidden_size,
                 epsilon: spec.normalization_epsilon,
                 scale: if spec.normalization_offset == 0.0 {
@@ -2617,6 +3040,7 @@ impl<B: NeuralBackend> StaticModules<B> {
             ParameterSpec::trainable(&spec.normalization_weight).map_err(Error::backend)?;
         let norm = B::normalization(
             eredu_nn::NormalizationConstructionSpec {
+                groups: spec.normalization_groups,
                 dimensions: spec.hidden_size,
                 epsilon: spec.normalization_epsilon,
                 scale: if spec.normalization_offset == 0.0 {
@@ -2677,6 +3101,7 @@ impl<B: NeuralBackend> StaticModules<B> {
         let norm_name = format!("{}.norm.weight", config.parameter_root());
         Self::from_spec(
             StaticModuleSpec {
+                normalization_groups: config.normalization_groups(),
                 embedding_weight: embedding_name.clone(),
                 normalization_weight: norm_name,
                 head_weight: "lm_head.weight".into(),
@@ -2685,7 +3110,7 @@ impl<B: NeuralBackend> StaticModules<B> {
                 normalization_epsilon: config.rms_norm_epsilon(),
                 normalization_offset: config.normalization_offset(),
                 embedding_quantization: config.weight_quantization(&embedding_name),
-                head_format: config.weight_quantization("lm_head.weight").into(),
+                head_format: config.linear_format("lm_head.weight"),
                 tied_head: config.tie_word_embeddings(),
             },
             context,
@@ -2705,6 +3130,7 @@ impl<B: NeuralBackend> StaticModules<B> {
         let norm_name = format!("{}.norm.weight", config.parameter_root());
         Self::from_parallel_spec(
             StaticModuleSpec {
+                normalization_groups: config.normalization_groups(),
                 embedding_weight: embedding_name.clone(),
                 normalization_weight: norm_name,
                 head_weight: "lm_head.weight".into(),
@@ -2713,7 +3139,7 @@ impl<B: NeuralBackend> StaticModules<B> {
                 normalization_epsilon: config.rms_norm_epsilon(),
                 normalization_offset: config.normalization_offset(),
                 embedding_quantization: config.weight_quantization(&embedding_name),
-                head_format: config.weight_quantization("lm_head.weight").into(),
+                head_format: config.linear_format("lm_head.weight"),
                 tied_head: config.tie_word_embeddings(),
             },
             geometry.embedding_range().clone(),
@@ -2955,7 +3381,7 @@ pub struct ForwardContext<T> {
 /// Statically dispatched construction policy for one decoder block family.
 pub trait BlockFactory<B: NeuralBackend, C: Config>: 'static {
     /// Architecture-selected feed-forward policy inside the shared block.
-    type FeedForward: FeedForwardOperator<B>;
+    type FeedForward: DecoderProjectionOperator<B>;
 
     /// Validates configuration requirements specific to this block policy.
     fn validate(config: &C) -> Result<(), Error> {
@@ -2994,7 +3420,24 @@ pub trait BlockFactory<B: NeuralBackend, C: Config>: 'static {
 }
 
 /// Feed-forward policy that can delegate routed experts to runtime residency.
-pub trait RoutedFeedForwardOperator<B: GroupedNeuralBackend>: FeedForwardOperator<B> {
+pub trait RoutedProjectionOperator<B: GroupedNeuralBackend>: DecoderProjectionOperator<B> {
+    /// Executes the optional value projection through the same provider as the
+    /// feed-forward bank. Independent banks retain distinct request identities.
+    fn project_values_with_provider<P>(
+        &mut self,
+        _layer: usize,
+        _input: &B::Tensor,
+        _pass: eredu_runtime::ExpertPass,
+        _provider: &mut P,
+        _context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Option<B::Tensor>, Error>
+    where
+        P: eredu_runtime::RoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+    {
+        Ok(None)
+    }
+
     /// Executes replicated dense or provider-backed routed work.
     fn forward_with_provider<P>(
         &mut self,
@@ -3010,8 +3453,8 @@ pub trait RoutedFeedForwardOperator<B: GroupedNeuralBackend>: FeedForwardOperato
 }
 
 /// Additive routed feed-forward execution for tensor-parallel realizations.
-pub trait TensorParallelRoutedFeedForwardOperator<B: GroupedNeuralBackend>:
-    RoutedFeedForwardOperator<B> + TensorParallelFeedForwardOperator<B>
+pub trait TensorParallelRoutedProjectionOperator<B: GroupedNeuralBackend>:
+    RoutedProjectionOperator<B> + TensorParallelProjectionOperator<B>
 {
     /// Executes tensor-parallel dense or provider-backed routed work.
     #[allow(clippy::too_many_arguments)]
@@ -3146,7 +3589,7 @@ where
                 weight: ParameterSpec::trainable(&embedding_name).map_err(Error::backend)?,
                 format: crate::linear_format::standard_linear_format(
                     &embedding_name,
-                    config.weight_quantization(&embedding_name).into(),
+                    config.linear_format(&embedding_name),
                 )?,
             },
             geometry.embedding_range.clone(),
@@ -3159,6 +3602,7 @@ where
         .then(|| {
             B::normalization(
                 NormalizationConstructionSpec {
+                    groups: config.normalization_groups(),
                     dimensions: config.hidden_size(),
                     epsilon: config.rms_norm_epsilon(),
                     scale: normalization_scale(
@@ -3188,7 +3632,7 @@ where
                     bias: None,
                     format: crate::linear_format::standard_linear_format(
                         name,
-                        config.weight_quantization(name).into(),
+                        config.linear_format(name),
                     )?,
                 },
                 range,
@@ -3768,7 +4212,7 @@ where
     B: eredu_nn::DistributedNeuralBackend,
     C: PartitionedConfig,
     P: BlockFactory<B, C>,
-    P::FeedForward: TensorParallelFeedForwardOperator<B>,
+    P::FeedForward: TensorParallelProjectionOperator<B>,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor>,
 {
@@ -3847,22 +4291,22 @@ where
     B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     C: PartitionedConfig,
     P: BlockFactory<B, C>,
-    P::FeedForward: RoutedFeedForwardOperator<B>,
+    P::FeedForward: RoutedProjectionOperator<B>,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor>,
 {
-    fn routed_observation_point(
+    fn routed_observation_points(
         &self,
         group: usize,
         index: usize,
-    ) -> Result<Option<eredu_runtime::RoutedObservationPoint>, Self::Error> {
+    ) -> Result<Option<eredu_runtime::RoutedObservationPoints>, Self::Error> {
         if group != 0 || !self.geometry.owned_units.contains(&index) {
             return Err(Error::backend(
                 "routed decoder observation requested for an unowned unit",
             ));
         }
         let unit_path = <Self as LayeredArchitecture<B, S>>::unit_path(self, group, index)?;
-        Ok(self.args.routed_observation_point(&unit_path, index))
+        Ok(self.args.routed_observation_points(&unit_path, index))
     }
 
     fn forward_unit_with_provider<R>(
@@ -3887,7 +4331,8 @@ where
         let cache = state
             .layer(index - self.geometry.owned_units.start)
             .map_err(Error::backend)?;
-        unit.forward_with_feed_forward(
+        unit.forward_routed(
+            index,
             AttentionInput {
                 hidden,
                 mask: forward.mask.as_ref(),
@@ -3895,10 +4340,9 @@ where
                 allow_sliding_prefill: forward.allow_sliding_prefill,
                 rotary_position: None,
             },
+            pass,
+            provider,
             context,
-            |policy, normalized, context| {
-                policy.forward_with_provider(index, normalized, pass, provider, context)
-            },
         )
     }
 }
@@ -3909,7 +4353,7 @@ where
     B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     C: PartitionedConfig,
     P: BlockFactory<B, C>,
-    P::FeedForward: TensorParallelRoutedFeedForwardOperator<B>,
+    P::FeedForward: TensorParallelRoutedProjectionOperator<B>,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor>,
 {
@@ -3936,7 +4380,8 @@ where
         let cache = state
             .layer(index - self.geometry.owned_units.start)
             .map_err(Error::backend)?;
-        unit.forward_tensor_parallel_with_feed_forward(
+        unit.forward_routed_parallel(
+            index,
             AttentionInput {
                 hidden,
                 mask: forward.mask.as_ref(),
@@ -3944,13 +4389,10 @@ where
                 allow_sliding_prefill: forward.allow_sliding_prefill,
                 rotary_position: None,
             },
+            pass,
+            provider,
             parallel,
             context,
-            |policy, normalized, context| {
-                policy.forward_parallel_with_provider(
-                    index, normalized, pass, provider, parallel, context,
-                )
-            },
         )
     }
 }
@@ -3960,7 +4402,7 @@ where
     B: eredu_nn::DistributedNeuralBackend,
     C: PartitionedConfig,
     P: BlockFactory<B, C>,
-    P::FeedForward: TensorParallelFeedForwardOperator<B>,
+    P::FeedForward: TensorParallelProjectionOperator<B>,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor>,
 {
@@ -4055,7 +4497,7 @@ where
     B: eredu_nn::DistributedNeuralBackend,
     C: PartitionedConfig,
     P: BlockFactory<B, C>,
-    P::FeedForward: TensorParallelFeedForwardOperator<B>,
+    P::FeedForward: TensorParallelProjectionOperator<B>,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor>,
 {
@@ -4070,7 +4512,7 @@ where
     B: eredu_nn::DistributedNeuralBackend,
     C: PartitionedConfig,
     P: BlockFactory<B, C>,
-    P::FeedForward: TensorParallelFeedForwardOperator<B>,
+    P::FeedForward: TensorParallelProjectionOperator<B>,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor>,
 {
@@ -4080,6 +4522,18 @@ where
 
     fn partition_output_width(&self) -> i32 {
         self.args.vocabulary_size()
+    }
+
+    fn partition_routed_bank_order(&self, unit: usize) -> Vec<eredu_runtime::RoutedBankId> {
+        self.args.routed_bank_order(unit)
+    }
+
+    fn partition_routed_bank_tensor_reductions(
+        &self,
+        unit: usize,
+        bank: eredu_runtime::RoutedBankId,
+    ) -> Result<(usize, usize), Error> {
+        self.args.routed_bank_tensor_reductions(unit, bank)
     }
 }
 
@@ -4188,7 +4642,7 @@ where
             })?,
             None => &self.args,
         };
-        P::build(args, index, context)
+        P::build_partitioned(&self.args, args, index, context)
     }
 
     /// Prepares architecture-owned mask state after an execution policy has
@@ -4462,7 +4916,7 @@ where
     where
         S: LayerRuntimeState<B>,
         S::LayerState: AttentionCache<B::Tensor>,
-        P::FeedForward: TensorParallelFeedForwardOperator<B>,
+        P::FeedForward: TensorParallelProjectionOperator<B>,
     {
         let cache = state.layer(index).map_err(Error::backend)?;
         block.forward_tensor_parallel(
@@ -4839,7 +5293,7 @@ where
     B: NeuralBackend + eredu_nn::DistributedNeuralBackend,
     C: Config,
     P: BlockFactory<B, C>,
-    P::FeedForward: TensorParallelFeedForwardOperator<B>,
+    P::FeedForward: TensorParallelProjectionOperator<B>,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor>,
 {
@@ -4898,7 +5352,7 @@ where
     B: NeuralBackend + eredu_nn::DistributedNeuralBackend,
     C: Config,
     P: BlockFactory<B, C>,
-    P::FeedForward: TensorParallelFeedForwardOperator<B>,
+    P::FeedForward: TensorParallelProjectionOperator<B>,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor>,
 {
@@ -4986,17 +5440,17 @@ where
     B: GroupedNeuralBackend,
     C: Config,
     P: BlockFactory<B, C>,
-    P::FeedForward: RoutedFeedForwardOperator<B>,
+    P::FeedForward: RoutedProjectionOperator<B>,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor>,
 {
-    fn routed_observation_point(
+    fn routed_observation_points(
         &self,
         group: usize,
         index: usize,
-    ) -> Result<Option<eredu_runtime::RoutedObservationPoint>, Self::Error> {
+    ) -> Result<Option<eredu_runtime::RoutedObservationPoints>, Self::Error> {
         let unit_path = <Self as LayeredArchitecture<B, S>>::unit_path(self, group, index)?;
-        Ok(self.args.routed_observation_point(&unit_path, index))
+        Ok(self.args.routed_observation_points(&unit_path, index))
     }
 
     fn forward_unit_with_provider<R>(
@@ -5015,16 +5469,22 @@ where
         R: eredu_runtime::RoutedExpertProvider<B>,
         R::Error: std::fmt::Display,
     {
-        self.forward_block_with_feed_forward(
+        let cache = state.layer(index).map_err(Error::backend)?;
+        unit.forward_routed(
             index,
-            unit,
-            hidden,
-            state,
-            forward,
-            context,
-            |policy, normalized, context| {
-                policy.forward_with_provider(index, normalized, pass, provider, context)
+            AttentionInput {
+                hidden,
+                mask: forward.mask.as_ref(),
+                cache: Some(cache),
+                allow_sliding_prefill: forward.allow_sliding_prefill,
+                rotary_position: forward
+                    .rotary_embeddings
+                    .as_ref()
+                    .map(|(cosine, sine)| RotaryPosition::Embeddings { cosine, sine }),
             },
+            pass,
+            provider,
+            context,
         )
     }
 }
@@ -5034,7 +5494,7 @@ where
     B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     C: Config,
     P: BlockFactory<B, C>,
-    P::FeedForward: TensorParallelRoutedFeedForwardOperator<B>,
+    P::FeedForward: TensorParallelRoutedProjectionOperator<B>,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor>,
 {
@@ -5055,19 +5515,23 @@ where
         R: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
         R::Error: std::fmt::Display,
     {
-        self.forward_block_parallel_with_feed_forward(
+        let cache = state.layer(index).map_err(Error::backend)?;
+        unit.forward_routed_parallel(
             index,
-            unit,
-            hidden,
-            state,
-            forward,
+            AttentionInput {
+                hidden,
+                mask: forward.mask.as_ref(),
+                cache: Some(cache),
+                allow_sliding_prefill: forward.allow_sliding_prefill,
+                rotary_position: forward
+                    .rotary_embeddings
+                    .as_ref()
+                    .map(|(cosine, sine)| RotaryPosition::Embeddings { cosine, sine }),
+            },
+            pass,
+            provider,
             parallel,
             context,
-            |policy, normalized, context| {
-                policy.forward_parallel_with_provider(
-                    index, normalized, pass, provider, parallel, context,
-                )
-            },
         )
     }
 }

@@ -209,6 +209,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> RoutedPlusSha
             .forward_grouped_tensor_parallel(
                 &mut self.experts,
                 RoutedExpertRequest {
+                    bank: eredu_runtime::RoutedBankId::new(0),
                     layer: self.layer,
                     input,
                     routes: &routes,
@@ -269,6 +270,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> RoutedPlusSha
             .forward_grouped(
                 &mut self.experts,
                 RoutedExpertRequest {
+                    bank: eredu_runtime::RoutedBankId::new(0),
                     layer: self.layer,
                     input,
                     routes: &routes,

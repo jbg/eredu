@@ -13,7 +13,7 @@ use eredu_runtime::{
 
 use crate::{
     decoder::{
-        Attention, AttentionInput, FeedForwardOperator, Mlp, TensorParallelFeedForwardOperator,
+        Attention, AttentionInput, DecoderProjectionOperator, Mlp, TensorParallelProjectionOperator,
     },
     linear_format::standard_expert_projection,
 };
@@ -108,6 +108,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SharedRoutedG
             .forward_grouped(
                 &mut self.experts,
                 RoutedExpertRequest {
+                    bank: eredu_runtime::RoutedBankId::new(0),
                     layer: self.layer,
                     input,
                     routes: &routes,
@@ -125,7 +126,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SharedRoutedG
     /// and separately attributable shared contributions.
     pub fn forward_observed_with_provider<P, O>(
         &mut self,
-        point: eredu_runtime::RoutedObservationPoint,
+        point: eredu_runtime::RoutedObservationPoints,
         input: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
         provider: &mut P,
@@ -136,6 +137,9 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SharedRoutedG
         P::Error: std::fmt::Display,
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {
+        let point = point
+            .bank(eredu_runtime::RoutedBankId::new(0))
+            .ok_or_else(|| Error::backend("missing feed-forward routing observation"))?;
         let routes = eredu_runtime::select_routes_with_observer(
             &mut self.router,
             input,
@@ -147,6 +151,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SharedRoutedG
             .forward_grouped(
                 &mut self.experts,
                 RoutedExpertRequest {
+                    bank: eredu_runtime::RoutedBankId::new(0),
                     layer: self.layer,
                     input,
                     routes: &routes,
@@ -194,6 +199,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SharedRoutedG
             .forward_grouped_tensor_parallel(
                 &mut self.experts,
                 RoutedExpertRequest {
+                    bank: eredu_runtime::RoutedBankId::new(0),
                     layer: self.layer,
                     input,
                     routes: &routes,
@@ -322,7 +328,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> FeedForward<B
 
     fn forward_observed_with_provider<P, O>(
         &mut self,
-        point: eredu_runtime::RoutedObservationPoint,
+        point: eredu_runtime::RoutedObservationPoints,
         input: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
         provider: &mut P,
@@ -394,6 +400,7 @@ impl<B: NeuralBackend> ReplicatedBlock<B> {
         let norm = |field: &str| {
             B::normalization(
                 NormalizationConstructionSpec {
+                    groups: None,
                     dimensions: config.hidden_size,
                     epsilon: config.rms_norm_eps,
                     scale: NormalizationScale::LearnedOffset {
@@ -510,6 +517,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Block<B> {
         let norm = |field: &str| {
             B::normalization(
                 NormalizationConstructionSpec {
+                    groups: None,
                     dimensions: config.hidden_size,
                     epsilon: config.rms_norm_eps,
                     scale: NormalizationScale::LearnedOffset {
@@ -581,7 +589,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Block<B> {
     /// Executes one block while exposing the complete routed/shared contribution.
     pub fn forward_observed_with_provider<S, P, O>(
         &mut self,
-        point: eredu_runtime::RoutedObservationPoint,
+        point: eredu_runtime::RoutedObservationPoints,
         hidden: &B::Tensor,
         mask: Option<&B::Tensor>,
         state: &mut S,
@@ -692,6 +700,7 @@ fn new_attention<B: NeuralBackend>(
     let norm = |field: &str| {
         B::normalization(
             NormalizationConstructionSpec {
+                groups: None,
                 dimensions: config.head_dim,
                 epsilon: config.rms_norm_eps,
                 scale: NormalizationScale::LearnedOffset {
@@ -731,6 +740,7 @@ fn new_attention<B: NeuralBackend>(
         Some(norm("k_norm")?),
         Some(B::rotary(
             RotarySpec {
+                arithmetic: eredu_nn::RotaryArithmetic::Native,
                 dimensions: config.rope_dimensions(),
                 base: config.rope_theta(),
                 traditional: false,

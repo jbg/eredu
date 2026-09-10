@@ -27,6 +27,8 @@ fn pipeline_activation_dtype_comes_from_wire_contract_not_weights() {
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum FixtureFamily {
+    K2Dense,
+    K2Mova,
     Llama,
     Mistral,
     DeepSeek,
@@ -69,6 +71,8 @@ enum FixtureFamily {
 impl FixtureFamily {
     const fn name(self) -> &'static str {
         match self {
+            Self::K2Dense => "k2-dense",
+            Self::K2Mova => "k2-mova",
             Self::Llama => "llama",
             Self::Mistral => "mistral",
             Self::DeepSeek => "deepseek",
@@ -111,6 +115,8 @@ impl FixtureFamily {
 
     fn parse(value: &str) -> Self {
         for family in [
+            Self::K2Dense,
+            Self::K2Mova,
             Self::Llama,
             Self::Mistral,
             Self::DeepSeek,
@@ -158,6 +164,7 @@ impl FixtureFamily {
 
     fn layer_count(self) -> usize {
         match self {
+            Self::K2Dense | Self::K2Mova => 3,
             Self::Llama
             | Self::Mistral
             | Self::DeepSeek
@@ -198,6 +205,8 @@ impl FixtureFamily {
 
     fn stage_range(self, rank: usize) -> std::ops::Range<usize> {
         match (self, rank) {
+            (Self::K2Dense | Self::K2Mova, 0) => 0..2,
+            (Self::K2Dense | Self::K2Mova, 1) => 2..3,
             (Self::Gemma, 0) => 0..1,
             (Self::Gemma, 1) => 1..4,
             (Self::NemotronH | Self::NemotronHGguf, 0) => 0..2,
@@ -224,6 +233,8 @@ impl FixtureFamily {
 
     fn expert_layer_count(self, range: std::ops::Range<usize>) -> usize {
         match self {
+            Self::K2Dense => 0,
+            Self::K2Mova => range.filter(|index| *index >= 1).count(),
             Self::DeepSeek
             | Self::DeepSeekGguf
             | Self::Lfm2Moe
@@ -243,6 +254,7 @@ impl FixtureFamily {
 
     fn effective_model_type(self) -> &'static str {
         match self {
+            Self::K2Dense | Self::K2Mova => "k2_horizon",
             Self::Llama => "llama",
             Self::Mistral => "mistral",
             Self::DeepSeek | Self::DeepSeekGguf => "deepseek_v3",
@@ -273,7 +285,9 @@ impl FixtureFamily {
     const fn needs_opaque_reference(self) -> bool {
         matches!(
             self,
-            Self::Llama
+            Self::K2Dense
+                | Self::K2Mova
+                | Self::Llama
                 | Self::Mistral
                 | Self::Gemma
                 | Self::MuseGlimmer

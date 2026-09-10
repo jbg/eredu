@@ -19,7 +19,9 @@ where
     }
 
     fn copy_snapshot_state(&mut self, state: &S, context: &Stream) -> Result<S, Error> {
-        state.isolated_snapshot(context).map_err(Into::into)
+        let copied = state.isolated_snapshot(context)?;
+        async_eval_with_event(copied.retained_arrays())?.synchronize()?;
+        Ok(copied)
     }
 }
 

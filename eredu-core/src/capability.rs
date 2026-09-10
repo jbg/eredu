@@ -418,18 +418,12 @@ impl StateMemoryLayout {
         allocation_granularity: u64,
         completeness: EstimationCompleteness,
     ) -> Result<Self, CapabilityError> {
-        if layer_layout.is_empty()
-            || layer_prefix_offsets.len() != layer_layout.len()
+        if layer_prefix_offsets.len() != layer_layout.len()
             || layer_prefix_offsets.iter().any(|offset| *offset > 0)
             || hidden_size == 0
             || allocation_granularity == 0
         {
-            let (field, detail) = if layer_layout.is_empty() {
-                (
-                    "layer_layout",
-                    "must contain at least one executable state layer",
-                )
-            } else if layer_prefix_offsets.len() != layer_layout.len() {
+            let (field, detail) = if layer_prefix_offsets.len() != layer_layout.len() {
                 (
                     "layer_prefix_offsets",
                     "must contain one entry per executable state layer",

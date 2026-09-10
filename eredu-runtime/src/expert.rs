@@ -1,18 +1,20 @@
 //! Runtime ownership boundary for routed expert acquisition and residency.
 
 use eredu_nn::{
-    DistributedNeuralBackend, GroupSelection, GroupedGatedProductOperator, GroupedNeuralBackend,
-    GroupedRelu2Operator, Tensor, TensorParallelGroupedOutput,
+    DistributedNeuralBackend, GroupSelection, GroupedGatedProductOperator, GroupedLinearOperator,
+    GroupedNeuralBackend, GroupedRelu2Operator, Tensor, TensorParallelGroupedOutput,
 };
 
 use crate::ExpertPass;
 
+mod banks;
 mod route_intervention;
 use crate::{
     observe_and_intervene, ActivationObserver, ParameterBankAccess, ParameterBankKey,
     ReplicatedTextMaterializationTask, ReplicatedTextParameterOwner, RoutingObservation,
     WeightLoweringKind,
 };
+pub use banks::{RoutedBankProviderError, RoutedBankProviders};
 pub use route_intervention::{select_routes_with_observer, select_routes_with_provider};
 
 /// A validated materialization task shared by all members of one bank target.
@@ -916,6 +918,8 @@ pub trait ExpertRouteTensorMovement<T> {
     ) -> Result<T, Self::Error>;
 
     /// Additively combines route rows into their architecture source rows.
+    /// With sequential reduction, consume each destination's contributions in
+    /// supplied row order, rounding to the input dtype after every addition.
     ///
     /// Every input row must be consumed exactly once. Repeated destination
     /// rows are intentional and implement weighted routed-expert summation.
@@ -924,6 +928,7 @@ pub trait ExpertRouteTensorMovement<T> {
         value: T,
         destination_rows: &[usize],
         output_rows: usize,
+        reduction: eredu_nn::GroupReduction,
     ) -> Result<T, Self::Error>;
 }
 
@@ -959,8 +964,25 @@ pub enum ExpertRouteCombination {
     CoefficientWeightedSum,
 }
 
+/// Architecture-selected identity and result geometry for one exchange wave.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct ExpertRouteInvocation {
+    /// Independently identified bank within the logical layer.
+    pub bank: RoutedBankId,
+    /// Global logical layer ordinal.
+    pub unit: usize,
+    /// Rank-local output width after a complete expert projection.
+    pub output_dimensions: usize,
+    /// Addition policy; sequential contributions follow global expert identity.
+    pub reduction: eredu_nn::GroupReduction,
+    /// Prompt or cached-decoding access class.
+    pub pass: ExpertPass,
+}
+
 /// One owner-local grouped batch submitted after expert exchange.
 pub struct AddressableExpertRouteRequest<'a, T> {
+    /// Independently identified bank within the logical layer.
+    pub bank: RoutedBankId,
     /// Global execution unit containing the addressable expert bank.
     pub unit: usize,
     /// Rows received from every source peer.
@@ -994,7 +1016,7 @@ impl<T> AddressableExpertRouteRequest<'_, T> {
         self.global_experts
             .get(row)
             .copied()
-            .map(|global| ParameterBankKey::new(self.unit, global))
+            .map(|global| ParameterBankKey::new(self.bank.value() as usize, self.unit, global))
     }
 
     /// Returns the rank-local grouped-operator ID for one routed row.
@@ -1095,6 +1117,15 @@ where
     ) -> Result<B::GatedProductGroups, Self::Error>;
 
     /// Constructs one compact ReLU-squared operator from acquired bindings.
+    /// Constructs one compact selected-linear bank from acquired bindings.
+    fn linear_groups(
+        &mut self,
+        acquisition: &Self::Acquisition,
+        spec: &eredu_nn::GroupedLinearSpec,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::LinearGroups, Self::Error>;
+
+    /// Constructs compact ReLU-squared projections.
     fn relu2_groups(
         &mut self,
         acquisition: &Self::Acquisition,
@@ -1131,8 +1162,25 @@ where
     ) -> Result<&mut B::GatedProductGroups, Self::Error>;
 }
 
+/// Stable bank identity within a logical layer; independent banks can have
+/// different equations, cardinalities, ownership maps, and residency policies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RoutedBankId(u32);
+impl RoutedBankId {
+    /// Creates an architecture-declared bank identity.
+    pub const fn new(value: u32) -> Self {
+        Self(value)
+    }
+    /// Returns the architecture-declared ordinal.
+    pub const fn value(self) -> u32 {
+        self.0
+    }
+}
+
 /// One architecture route batch submitted to a runtime expert provider.
 pub struct RoutedExpertRequest<'a, T> {
+    /// Independently identified bank in this logical layer.
+    pub bank: RoutedBankId,
     /// Global decoder layer requesting experts.
     pub layer: usize,
     /// Flattened token rows submitted to the selected experts.
@@ -1255,6 +1303,7 @@ where
     /// Optional pre-dispatch control supplied by an instrumented provider adapter.
     fn routing_control(
         &mut self,
+        _bank: RoutedBankId,
         _token_rows: u64,
     ) -> Result<Option<eredu_nn::routing_intervention::GroupSelectionControl>, Self::Error> {
         Ok(None)
@@ -1263,6 +1312,7 @@ where
     /// Consumes bounded decision evidence before dispatch. Shared experts are not included.
     fn routing_applied(
         &mut self,
+        _bank: RoutedBankId,
         _original: Option<crate::RoutingDecision<'_, B::Tensor>>,
         _effective: crate::RoutingDecision<'_, B::Tensor>,
     ) -> Result<(), Self::Error> {
@@ -1270,7 +1320,7 @@ where
     }
 
     /// Attributes selector failure without claiming cache rollback.
-    fn routing_failed(&mut self, _message: &str) {}
+    fn routing_failed(&mut self, _bank: RoutedBankId, _message: &str) {}
 
     /// Executes one typed route batch while retaining its acquired resources.
     fn forward_grouped(
@@ -1294,7 +1344,15 @@ where
         self.forward_grouped(resident_bank, request, context)
     }
 
-    /// Executes one ReLU-squared route batch through the same residency boundary.
+    /// Executes an activated selected-linear bank with owned output rows.
+    fn forward_linear_routed(
+        &mut self,
+        resident_bank: &mut B::LinearGroups,
+        request: RoutedExpertRequest<'_, B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error>;
+
+    /// Executes a routed ReLU-squared batch.
     fn forward_relu2_routed(
         &mut self,
         resident_bank: &mut B::Relu2Groups,
@@ -1339,37 +1397,71 @@ where
     ) -> Result<RoutedExpertTensorParallelOutput<B::Tensor>, Self::Error>;
 }
 
-/// Stable routing metadata supplied by an architecture composition at one
-/// canonical unit boundary.
+/// Stable bank-specific routing observation metadata.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct RoutedObservationPoint {
     path: String,
     expert_count: i32,
 }
-
 impl RoutedObservationPoint {
-    /// Creates one routed observation point.
-    pub fn new(path: impl Into<String>, expert_count: i32) -> Self {
-        Self {
-            path: path.into(),
-            expert_count,
-        }
-    }
-
-    /// Returns the stable routed-module path.
+    /// Canonical routed module path.
     pub fn path(&self) -> &str {
         &self.path
     }
-
-    /// Returns the total number of routed experts.
+    /// Global routed cardinality for this bank.
     pub const fn expert_count(&self) -> i32 {
         self.expert_count
+    }
+}
+
+/// Independently identified routed observation points within one logical layer.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct RoutedObservationPoints(
+    std::collections::BTreeMap<RoutedBankId, RoutedObservationPoint>,
+);
+impl RoutedObservationPoints {
+    /// Declares the first routing bank in a logical layer.
+    pub fn new(bank: RoutedBankId, path: impl Into<String>, expert_count: i32) -> Self {
+        Self(std::collections::BTreeMap::from([(
+            bank,
+            RoutedObservationPoint {
+                path: path.into(),
+                expert_count,
+            },
+        )]))
+    }
+    /// Adds a distinct bank without replacing an existing observation identity.
+    pub fn with_bank(
+        mut self,
+        bank: RoutedBankId,
+        path: impl Into<String>,
+        expert_count: i32,
+    ) -> Result<Self, eredu_nn::Error> {
+        if self.0.contains_key(&bank) {
+            return Err(eredu_nn::Error::backend(
+                "duplicate routed observation bank",
+            ));
+        }
+        self.0.insert(
+            bank,
+            RoutedObservationPoint {
+                path: path.into(),
+                expert_count,
+            },
+        );
+        Ok(self)
+    }
+    /// Resolves one bank's canonical path and global cardinality.
+    pub fn bank(&self, bank: RoutedBankId) -> Option<&RoutedObservationPoint> {
+        self.0.get(&bank)
     }
 }
 
 /// Failure from either canonical expert execution or its observation hook.
 #[derive(Debug)]
 pub enum ObservedExpertProviderError<P, O> {
+    /// Request names a bank absent from architecture discovery.
+    Bank(RoutedBankId),
     /// The wrapped provider rejected or failed the expert request.
     Provider(P),
     /// The observer rejected the normalized routing event.
@@ -1383,6 +1475,11 @@ where
 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Bank(bank) => write!(
+                formatter,
+                "unknown routed observation bank {}",
+                bank.value()
+            ),
             Self::Provider(error) => write!(formatter, "routed expert provider failed: {error}"),
             Self::Observer(error) => write!(formatter, "routed expert observer failed: {error}"),
         }
@@ -1406,13 +1503,13 @@ where
 pub struct ObservedExpertProvider<'a, P, O: ?Sized, E> {
     provider: &'a mut P,
     observer: &'a mut O,
-    point: RoutedObservationPoint,
+    point: RoutedObservationPoints,
     error: std::marker::PhantomData<fn() -> E>,
 }
 
 impl<'a, P, O: ?Sized, E> ObservedExpertProvider<'a, P, O, E> {
     /// Wraps `provider` for one canonical routed module invocation.
-    pub fn new(provider: &'a mut P, observer: &'a mut O, point: RoutedObservationPoint) -> Self {
+    pub fn new(provider: &'a mut P, observer: &'a mut O, point: RoutedObservationPoints) -> Self {
         Self {
             provider,
             observer,
@@ -1423,6 +1520,7 @@ impl<'a, P, O: ?Sized, E> ObservedExpertProvider<'a, P, O, E> {
 
     fn observe<T, ObservationError>(
         &mut self,
+        point: &RoutedObservationPoint,
         routes: &eredu_nn::GroupSelection<T>,
         output: &T,
     ) -> Result<T, ObservationError>
@@ -1431,7 +1529,7 @@ impl<'a, P, O: ?Sized, E> ObservedExpertProvider<'a, P, O, E> {
         O: ActivationObserver<T, ObservationError>,
     {
         self.observer.observe_routing(RoutingObservation {
-            path: self.point.path(),
+            path: point.path(),
             selected_experts: routes.group_indices(),
             selected_scores: routes.selected_scores(),
             coefficients: routes.coefficients(),
@@ -1440,13 +1538,9 @@ impl<'a, P, O: ?Sized, E> ObservedExpertProvider<'a, P, O, E> {
             reduced_routed_output: None,
             shared_output: None,
             combined_output: None,
-            expert_count: self.point.expert_count(),
+            expert_count: point.expert_count(),
         })?;
-        observe_and_intervene(
-            self.observer,
-            &format!("{}.output", self.point.path()),
-            output,
-        )
+        observe_and_intervene(self.observer, &format!("{}.output", point.path()), output)
     }
 }
 
@@ -1460,25 +1554,37 @@ where
 
     fn routing_control(
         &mut self,
+        bank: RoutedBankId,
         token_rows: u64,
     ) -> Result<Option<eredu_nn::routing_intervention::GroupSelectionControl>, Self::Error> {
+        let point = self
+            .point
+            .bank(bank)
+            .ok_or(ObservedExpertProviderError::Bank(bank))?;
         self.observer
-            .routing_control(self.point.path(), token_rows)
+            .routing_control(point.path(), token_rows)
             .map_err(ObservedExpertProviderError::Observer)
     }
 
     fn routing_applied(
         &mut self,
+        bank: RoutedBankId,
         original: Option<crate::RoutingDecision<'_, B::Tensor>>,
         effective: crate::RoutingDecision<'_, B::Tensor>,
     ) -> Result<(), Self::Error> {
+        let point = self
+            .point
+            .bank(bank)
+            .ok_or(ObservedExpertProviderError::Bank(bank))?;
         self.observer
-            .routing_applied(self.point.path(), original, effective)
+            .routing_applied(point.path(), original, effective)
             .map_err(ObservedExpertProviderError::Observer)
     }
 
-    fn routing_failed(&mut self, message: &str) {
-        self.observer.routing_failed(self.point.path(), message);
+    fn routing_failed(&mut self, bank: RoutedBankId, message: &str) {
+        if let Some(point) = self.point.bank(bank) {
+            self.observer.routing_failed(point.path(), message);
+        }
     }
 
     fn forward_grouped(
@@ -1487,12 +1593,38 @@ where
         request: RoutedExpertRequest<'_, B::Tensor>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
+        let point = self
+            .point
+            .bank(request.bank)
+            .ok_or(ObservedExpertProviderError::Bank(request.bank))?
+            .clone();
         let routes = request.routes;
         let output = self
             .provider
             .forward_grouped(resident_bank, request, context)
             .map_err(ObservedExpertProviderError::Provider)?;
-        self.observe(routes, &output)
+        self.observe(&point, routes, &output)
+            .map_err(ObservedExpertProviderError::Observer)
+    }
+
+    /// Executes an activated selected-linear bank with owned output rows.
+    fn forward_linear_routed(
+        &mut self,
+        resident_bank: &mut B::LinearGroups,
+        request: RoutedExpertRequest<'_, B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error> {
+        let point = self
+            .point
+            .bank(request.bank)
+            .ok_or(ObservedExpertProviderError::Bank(request.bank))?
+            .clone();
+        let routes = request.routes;
+        let output = self
+            .provider
+            .forward_linear_routed(resident_bank, request, context)
+            .map_err(ObservedExpertProviderError::Provider)?;
+        self.observe(&point, routes, &output)
             .map_err(ObservedExpertProviderError::Observer)
     }
 
@@ -1502,12 +1634,17 @@ where
         request: RoutedExpertRequest<'_, B::Tensor>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
+        let point = self
+            .point
+            .bank(request.bank)
+            .ok_or(ObservedExpertProviderError::Bank(request.bank))?
+            .clone();
         let routes = request.routes;
         let output = self
             .provider
             .forward_relu2_routed(resident_bank, request, context)
             .map_err(ObservedExpertProviderError::Provider)?;
-        self.observe(routes, &output)
+        self.observe(&point, routes, &output)
             .map_err(ObservedExpertProviderError::Observer)
     }
 }
@@ -1556,6 +1693,16 @@ where
     fn forward_grouped(
         &mut self,
         resident_bank: &mut B::GatedProductGroups,
+        request: RoutedExpertRequest<'_, B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error> {
+        resident_bank.forward_grouped(request.input, request.routes, context)
+    }
+
+    /// Executes an activated selected-linear bank with owned output rows.
+    fn forward_linear_routed(
+        &mut self,
+        resident_bank: &mut B::LinearGroups,
         request: RoutedExpertRequest<'_, B::Tensor>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {

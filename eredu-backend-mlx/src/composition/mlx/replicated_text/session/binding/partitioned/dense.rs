@@ -122,7 +122,7 @@ impl
         A::StaticModules: Clone,
         G: 'static,
     {
-        bind_partitioned_routed_resident(
+        bind_partitioned_routed(
             prepared,
             store,
             self.distributed,
@@ -174,7 +174,7 @@ macro_rules! impl_partitioned_prediction_binding {
                 A::StaticModules: Clone,
                 G: 'static,
             {
-                bind_partitioned_routed_resident(
+                bind_partitioned_routed(
                     prepared,
                     store,
                     self.distributed,
@@ -198,64 +198,6 @@ impl_partitioned_prediction_binding!(MlxHybridState);
 impl_partitioned_prediction_binding!(MlxPoolingAttentionState);
 
 impl
-    eredu_architectures::partitioned_execution::RoutedPartitionedPredictionTargetProductionVisitor<
-        MlxNeuralBackend,
-        MlxHybridState,
-        MlxEmbeddedPredictionMaterializer,
-        eredu_nn::GroupedRelu2Spec,
-    > for PartitionedPredictionBindingVisitor<'_>
-{
-    type Output = Box<dyn ErasedReplicatedTextExecutable>;
-    type Error = Error;
-
-    fn visit<A, G>(
-        self,
-        prepared: eredu_architectures::partitioned_execution::PreparedRoutedPartitionedArchitecture<
-            MlxNeuralBackend,
-            A,
-            G,
-            <A as eredu_runtime::PartitionedLayeredArchitecture<
-                MlxNeuralBackend,
-                MlxHybridState,
-            >>::Boundary,
-            eredu_nn::GroupedRelu2Spec,
-        >,
-        extension: <A as eredu_architectures::prediction_extension::MaterializedPredictionTarget<
-            MlxNeuralBackend,
-        >>::Extension<MlxEmbeddedPredictionMaterializer>,
-        store: Arc<dyn CheckpointSource>,
-    ) -> Result<Self::Output, Self::Error>
-    where
-        A: eredu_architectures::partitioned_execution::TextPartitionArchitecture<
-                MlxNeuralBackend,
-                MlxHybridState,
-            > + ReplicatedTextArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error>
-            + eredu_runtime::ParallelRoutedLayeredArchitecture<MlxNeuralBackend, MlxHybridState>
-            + eredu_architectures::prediction_extension::MaterializedPredictionTarget<
-                MlxNeuralBackend,
-            > + 'static,
-        A::StaticModules: Clone,
-        G: 'static,
-    {
-        bind_partitioned_relu2_resident(
-            prepared,
-            store,
-            self.distributed,
-            self.additional_claimed_sources,
-            self.stream,
-            self.weights_stream,
-            PredictionReplicatedFinalizer {
-                prediction: SelectedPrediction {
-                    extension,
-                    selected: self.selected,
-                },
-                capability: self.capability,
-            },
-        )
-    }
-}
-
-impl
     eredu_architectures::partitioned_execution::RoutedPartitionedProductionVisitor<
         MlxNeuralBackend,
         MlxHybridState,
@@ -287,56 +229,11 @@ impl
         A::StaticModules: Clone,
         G: 'static,
     {
-        bind_partitioned_routed_resident(
+        bind_partitioned_routed(
             prepared,
             store,
             self.distributed,
             self.additional_claimed_sources,
-            self.stream,
-            self.weights_stream,
-            OrdinaryReplicatedFinalizer,
-        )
-    }
-}
-impl
-    eredu_architectures::partitioned_execution::RoutedPartitionedProductionVisitor<
-        MlxNeuralBackend,
-        MlxHybridState,
-        eredu_nn::GroupedRelu2Spec,
-    > for PartitionedRoutedDecoderBindingVisitor<'_>
-{
-    type Output = Box<dyn ErasedReplicatedTextExecutable>;
-    type Error = Error;
-
-    fn visit<A, G>(
-        self,
-        prepared: eredu_architectures::partitioned_execution::PreparedRoutedPartitionedArchitecture<
-            MlxNeuralBackend,
-            A,
-            G,
-            <A as eredu_runtime::PartitionedLayeredArchitecture<
-                MlxNeuralBackend,
-                MlxHybridState,
-            >>::Boundary,
-            eredu_nn::GroupedRelu2Spec,
-        >,
-        store: Arc<dyn CheckpointSource>,
-    ) -> Result<Self::Output, Self::Error>
-    where
-        A: eredu_architectures::partitioned_execution::TextPartitionArchitecture<
-                MlxNeuralBackend,
-                MlxHybridState,
-            > + ReplicatedTextArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error>
-            + eredu_runtime::ParallelRoutedLayeredArchitecture<MlxNeuralBackend, MlxHybridState>
-            + 'static,
-        A::StaticModules: Clone,
-        G: 'static,
-    {
-        bind_partitioned_relu2_resident(
-            prepared,
-            store,
-            self.distributed,
-            std::collections::BTreeSet::new(),
             self.stream,
             self.weights_stream,
             OrdinaryReplicatedFinalizer,

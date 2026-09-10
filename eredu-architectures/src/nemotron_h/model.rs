@@ -409,6 +409,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
     fn static_spec(args: &ModelArgs) -> StaticModuleSpec {
         let embedding_name = "model.embeddings.weight";
         StaticModuleSpec {
+            normalization_groups: None,
             embedding_weight: embedding_name.into(),
             normalization_weight: "model.norm_f.weight".into(),
             head_weight: "lm_head.weight".into(),

@@ -142,12 +142,13 @@ impl ModelArgs {
     }
 
     /// Returns the canonical routed observation point for one decoder layer.
-    pub fn routed_observation_point(
+    pub fn routed_observation_points(
         &self,
         unit_path: &str,
         _layer: usize,
-    ) -> eredu_runtime::RoutedObservationPoint {
-        eredu_runtime::RoutedObservationPoint::new(
+    ) -> eredu_runtime::RoutedObservationPoints {
+        eredu_runtime::RoutedObservationPoints::new(
+            eredu_runtime::RoutedBankId::new(0),
             format!("{unit_path}.mlp"),
             self.num_local_experts,
         )
@@ -189,12 +190,12 @@ impl Config for ModelArgs {
         &self.parameter_root
     }
 
-    fn routed_observation_point(
+    fn routed_observation_points(
         &self,
         unit_path: &str,
         layer: usize,
-    ) -> Option<eredu_runtime::RoutedObservationPoint> {
-        Some(ModelArgs::routed_observation_point(self, unit_path, layer))
+    ) -> Option<eredu_runtime::RoutedObservationPoints> {
+        Some(ModelArgs::routed_observation_points(self, unit_path, layer))
     }
 
     fn validate_config(&self) -> Result<(), eredu_nn::Error> {
@@ -263,6 +264,7 @@ impl Config for ModelArgs {
 
     fn rotary_spec(&self, dimensions: i32) -> RotarySpec {
         RotarySpec {
+            arithmetic: eredu_nn::RotaryArithmetic::Native,
             dimensions,
             base: self.rope_theta,
             traditional: false,
@@ -1251,9 +1253,21 @@ mod tests {
             prompt_cache_architecture_fingerprint(&hf),
             prompt_cache_architecture_fingerprint(&gguf)
         );
-        let point = hf.routed_observation_point("model.layers.3", 3);
-        assert_eq!(point.path(), "model.layers.3.mlp");
-        assert_eq!(point.expert_count(), 32);
+        let point = hf.routed_observation_points("model.layers.3", 3);
+        assert_eq!(
+            point
+                .bank(eredu_runtime::RoutedBankId::new(0))
+                .unwrap()
+                .path(),
+            "model.layers.3.mlp"
+        );
+        assert_eq!(
+            point
+                .bank(eredu_runtime::RoutedBankId::new(0))
+                .unwrap()
+                .expert_count(),
+            32
+        );
     }
 
     #[test]

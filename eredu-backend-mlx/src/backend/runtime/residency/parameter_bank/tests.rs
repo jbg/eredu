@@ -49,7 +49,7 @@ fn fixture() -> (tempfile::TempDir, Arc<SafetensorsWeightStore>) {
 fn entries() -> Vec<ParameterBankEntry> {
     (0..3)
         .map(|entry| {
-            let identity = ParameterBankKey::new(2, entry);
+            let identity = ParameterBankKey::new(0, 2, entry);
             let bindings = [
                 WeightBinding::new("weight", format!("entry.{entry}"), TensorSelection::Full, 8)
                     .unwrap(),
@@ -60,6 +60,100 @@ fn entries() -> Vec<ParameterBankEntry> {
             ParameterBankEntry::new(identity, unit, 16).unwrap()
         })
         .collect()
+}
+
+#[test]
+fn independent_bank_scopes_share_one_budget_and_reacquire_exact_companions() {
+    let (_dir, store) = fixture();
+    let execution = stream();
+    let entries = (0..2)
+        .flat_map(|bank| {
+            entries().into_iter().map(move |entry| {
+                let key =
+                    ParameterBankKey::new(bank, entry.identity.unit(), entry.identity.member());
+                ParameterBankEntry::new(
+                    key,
+                    OffloadUnit::new(key.unit_id(), entry.unit.bindings().to_vec()).unwrap(),
+                    entry.bytes,
+                )
+                .unwrap()
+            })
+        })
+        .collect::<Vec<_>>();
+    let pool = SharedAddressableParameterBank::new(
+        AddressableParameterBank::new(
+            store,
+            entries,
+            ParameterBankOptions::new(OffloadConfig::new(Some(16), Some(32), 1).unwrap(), 16, 16)
+                .unwrap(),
+            stream(),
+            execution.clone(),
+        )
+        .unwrap(),
+    );
+    let mut scopes = [pool.scoped(0).unwrap(), pool.scoped(1).unwrap()];
+    for (bank, member) in [(0, 0), (1, 2), (0, 0), (1, 1)] {
+        let key = ParameterBankKey::new(bank, 2, member);
+        assert_eq!(scopes[1 - bank].member_bytes(key), None);
+        let entries = [(key, 1)];
+        let request = ParameterBankAcquisition::new(&entries, ParameterBankAccess::Incremental);
+        let acquired = scopes[bank].acquire(request, &execution).unwrap();
+        if bank == 0 && member == 0 {
+            assert!(scopes[1].acquire(request, &execution).is_err());
+            let competing = [(ParameterBankKey::new(1, 2, 2), 1)];
+            let request =
+                ParameterBankAcquisition::new(&competing, ParameterBankAccess::Incremental);
+            assert!(
+                scopes[1].acquire(request, &execution).is_err(),
+                "live leases must prevent cross-bank overcommit"
+            );
+        }
+        let weights = acquired
+            .compact_binding("weight", &execution)
+            .unwrap()
+            .into_evaluated()
+            .unwrap();
+        let scales = acquired
+            .compact_binding("scale", &execution)
+            .unwrap()
+            .into_evaluated()
+            .unwrap();
+        assert_eq!(
+            weights.as_slice::<i32>(),
+            &[(member * 2 + 1) as i32, (member * 2 + 2) as i32]
+        );
+        assert_eq!(weights.as_slice::<i32>(), scales.as_slice::<i32>());
+        scopes[bank]
+            .complete(
+                acquired,
+                &MlxTensor::from_array(weights.into_array().unwrap()),
+                &execution,
+            )
+            .unwrap();
+    }
+    let report = ParameterBanksResidencyReport::new(
+        scopes
+            .iter()
+            .enumerate()
+            .map(|(bank, scope)| {
+                (
+                    eredu_runtime::RoutedBankId::new(bank as u32),
+                    scope.report().unwrap(),
+                )
+            })
+            .collect(),
+    );
+    assert_eq!(report.owned_entries(), 6);
+    assert_eq!(report.owned_bytes(), 96);
+    assert_eq!(report.peak_device_resident_bytes(), 16);
+    assert!(report.peak_host_resident_bytes() <= 32);
+    assert_eq!(report.device_resident_entries(), 1);
+    assert_eq!(report.incremental().device().misses(), 4);
+    assert_eq!(report.incremental().device().evictions(), 3);
+    for bank in report.banks().values() {
+        assert_eq!(bank.owned_entries(), 3);
+        assert_eq!(bank.incremental().distinct_entries(), 2);
+    }
 }
 
 #[test]
@@ -76,7 +170,7 @@ fn bank_preflight_rejects_every_entry_before_payload_reads_or_transforms() {
     )
     .unwrap();
     let store = SafetensorsWeightStore::open(dir.path()).unwrap();
-    let key = ParameterBankKey::new(0, 0);
+    let key = ParameterBankKey::new(0, 0, 0);
     let unit = OffloadUnit::new(
         key.unit_id(),
         [WeightBinding::new("weight", "unsupported", TensorSelection::Full, 2).unwrap()],
@@ -103,7 +197,7 @@ fn selected_entry_byte_corruption_fails_before_checkpoint_work() {
             identity,
             eredu_runtime::AddressableBankMemberPlacement::new(
                 eredu_runtime::ExecutionGroupId::new("decoder").unwrap(),
-                identity.namespace,
+                identity.unit(),
                 "decoder.unit",
                 eredu_runtime::AddressableBankDistribution::Replicated,
             )
@@ -156,7 +250,7 @@ fn residency_report_retains_exact_selected_entry_placement() {
     let identity = entry.identity;
     let placement = eredu_runtime::AddressableBankMemberPlacement::new(
         eredu_runtime::ExecutionGroupId::new("decoder").unwrap(),
-        identity.namespace,
+        identity.unit(),
         "decoder.unit",
         eredu_runtime::AddressableBankDistribution::Replicated,
     )
@@ -211,14 +305,14 @@ fn mixed_selected_transforms_remain_explicit_in_telemetry() {
         WeightQuantization::Affine(eredu_checkpoint::AffineQuantization::new(64, 4).unwrap());
     let transformations = BTreeMap::from([
         (
-            (ParameterBankKey::new(0, 0), "weight".into()),
+            (ParameterBankKey::new(0, 0, 0), "weight".into()),
             SelectedBindingTransform {
                 quantization: affine,
                 companion_dtype: eredu_checkpoint::recipe::RecipeDtype::F16,
             },
         ),
         (
-            (ParameterBankKey::new(0, 1), "weight".into()),
+            (ParameterBankKey::new(0, 0, 1), "weight".into()),
             SelectedBindingTransform {
                 quantization: WeightQuantization::MxFp4,
                 companion_dtype: eredu_checkpoint::recipe::RecipeDtype::F16,
@@ -299,7 +393,7 @@ fn quantized_cache_materializes_only_rank_local_entry_and_tp_recipes() {
         Arc::new(SafetensorsWeightStore::open(dir.path()).unwrap());
     let entries = (0..2)
         .map(|entry| {
-            let identity = ParameterBankKey::new(3, entry);
+            let identity = ParameterBankKey::new(0, 3, entry);
             let bindings = ["gate", "down"].map(|projection| {
                 let owned = DerivedWeightRecipe::source(
                     format!("entries.{projection}"),
@@ -423,7 +517,7 @@ fn entry_quantization_uses_only_declared_roles_and_companion_names() {
     .unwrap();
     let store: Arc<dyn CheckpointSource> =
         Arc::new(SafetensorsWeightStore::open(dir.path()).unwrap());
-    let identity = ParameterBankKey::new(0, 0);
+    let identity = ParameterBankKey::new(0, 0, 0);
     let quantized = WeightBinding::from_recipe(
         "legitimate.bias_scale_blocks",
         DerivedWeightRecipe::source("legitimate.bias_scale_blocks", TensorSelection::Full),
@@ -480,14 +574,17 @@ fn coalesces_selections_in_global_order_and_separates_pass_counters() {
         .unwrap();
     assert_eq!(
         first.identities(),
-        &[ParameterBankKey::new(2, 0), ParameterBankKey::new(2, 2)]
+        &[
+            ParameterBankKey::new(0, 2, 0),
+            ParameterBankKey::new(0, 2, 2)
+        ]
     );
     assert_eq!(first.demand(), &[2, 2]);
     drop(first);
 
     let host = cache
         .manager
-        .acquire(&ParameterBankKey::new(2, 0).unit_id(), MemoryTier::Host)
+        .acquire(&ParameterBankKey::new(0, 2, 0).unit_id(), MemoryTier::Host)
         .unwrap();
     assert!(matches!(
         host.host_value("weight").unwrap().storage_kind().unwrap(),
@@ -640,7 +737,10 @@ fn indexed_movement_validates_before_loading_and_bank_coalesces_demand() {
         .unwrap();
     assert_eq!(
         acquired.identities(),
-        &[ParameterBankKey::new(2, 0), ParameterBankKey::new(2, 2)]
+        &[
+            ParameterBankKey::new(0, 2, 0),
+            ParameterBankKey::new(0, 2, 2)
+        ]
     );
     assert_eq!(acquired.demand(), &[2, 2]);
     drop(acquired);
@@ -738,8 +838,8 @@ fn lfu_uses_duplicate_selection_demand_and_deterministic_recency_ties() {
     assert_eq!(
         resident,
         vec![
-            ParameterBankKey::new(2, 0).unit_id().as_str(),
-            ParameterBankKey::new(2, 2).unit_id().as_str()
+            ParameterBankKey::new(0, 2, 0).unit_id().as_str(),
+            ParameterBankKey::new(0, 2, 2).unit_id().as_str()
         ]
     );
     assert_eq!(report.incremental.device.evictions, 1);

@@ -182,18 +182,14 @@ impl
             prepared,
             mechanisms,
             self.stream,
-            |prepared, options| {
-                let bank = selected_addressable_bank(
-                    prepared.addressable_members(),
-                    store,
+            |banks, options| {
+                super::routed::selected_addressable_banks(
+                    banks,
+                    Arc::clone(&store),
                     options,
                     self.weights_stream,
                     self.stream,
-                )?;
-                Ok((
-                    bank,
-                    crate::backend::runtime::residency::parameter_bank::MlxIndexedMovement,
-                ))
+                )
             },
             (
                 self.stream,
@@ -259,18 +255,14 @@ impl CompositeTextArchitectureVisitor<MlxNeuralBackend, MlxHybridState>
             prepared,
             mechanisms,
             self.stream,
-            |prepared, options| {
-                let bank = selected_addressable_bank(
-                    prepared.addressable_members(),
-                    store,
+            |banks, options| {
+                super::routed::selected_addressable_banks(
+                    banks,
+                    Arc::clone(&store),
                     options,
                     self.weights_stream,
                     self.stream,
-                )?;
-                Ok((
-                    bank,
-                    crate::backend::runtime::residency::parameter_bank::MlxIndexedMovement,
-                ))
+                )
             },
             (self.stream, OrdinaryReplicatedFinalizer),
             finish_routed_composite_session,

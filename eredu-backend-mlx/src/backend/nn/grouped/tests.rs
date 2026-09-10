@@ -328,3 +328,87 @@ fn mlx_tensor_parallel_down_bias_is_route_weighted_exactly_once() {
         + bias.clone().item::<f32>(stream);
     assert!((reduced - expected).abs() < 1e-5);
 }
+
+#[test]
+#[ignore = "explicit native BF16 routing arithmetic conformance"]
+fn routing_stages_keep_input_projection_fp32_scores_and_input_coefficients() {
+    use eredu_nn::{RoutingArithmetic, RoutingPrecision};
+    let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+    let stream = execution.stream();
+    let config = TopKGroupSelectorConfig::new(
+        2,
+        2,
+        2,
+        TopKGroupScoring::Sigmoid,
+        true,
+        0.0,
+        1.0,
+        1,
+        1,
+        false,
+        false,
+        None,
+        false,
+        false,
+    )
+    .unwrap()
+    .with_arithmetic(RoutingArithmetic {
+        projection: RoutingPrecision::Input,
+        scores: RoutingPrecision::Float32,
+        coefficients: RoutingPrecision::Input,
+    });
+    let mut selector = TopKGroupSelector::new_with_quantization(config, None, stream).unwrap();
+    selector.weight = PhysicalParam::new(
+        Array::from_slice(&[1.0f32, 0.00390625, -1.0, 0.0078125], &[2, 2])
+            .as_dtype(Dtype::Bfloat16, stream)
+            .unwrap(),
+    );
+    let input = Array::from_slice(&[1.0f32, 1.0], &[1, 2])
+        .as_dtype(Dtype::Bfloat16, stream)
+        .unwrap();
+    let ids = Array::from_slice(&[0i32, 1], &[1, 2]);
+    let selected = selector.select_indices(&input, &ids, stream).unwrap();
+    assert_eq!(selected.scores.dtype(), Dtype::Float32);
+    assert_eq!(selected.weights.dtype(), Dtype::Bfloat16);
+    let scores = selected
+        .scores
+        .evaluated()
+        .unwrap()
+        .as_slice::<f32>()
+        .to_vec();
+    let expected = [
+        1.0 / (1.0 + (-1.0f32).exp()),
+        1.0 / (1.0 + 0.9921875f32.exp()),
+    ];
+    for (&a, &e) in scores.iter().zip(&expected) {
+        assert!((a - e).abs() < 1e-6, "{a} != {e}");
+    }
+    let weights = selected
+        .weights
+        .as_dtype(Dtype::Float32, stream)
+        .unwrap()
+        .evaluated()
+        .unwrap()
+        .as_slice::<f32>()
+        .to_vec();
+    let sum = expected.iter().sum::<f32>();
+    for (&a, &score) in weights.iter().zip(&expected) {
+        let bits = (score / sum).to_bits();
+        let expected = f32::from_bits((bits + 0x7fff + ((bits >> 16) & 1)) & 0xffff0000);
+        assert_eq!(a, expected);
+    }
+    let control = eredu_nn::routing_intervention::GroupSelectionControl {
+        expected: selector.selection_spec().unwrap(),
+        learned_coefficient_scale: false,
+        first_row: 0,
+        end_row: 1,
+        row_stride: 1,
+        action: eredu_nn::routing_intervention::GroupSelectionAction::Force(vec![0, 1]),
+        capture_original: true,
+    };
+    let (original, effective) = selector
+        .select_intervened(&input, &control, stream)
+        .unwrap();
+    assert_eq!(original.unwrap().weights.dtype(), Dtype::Bfloat16);
+    assert_eq!(effective.weights.dtype(), Dtype::Bfloat16);
+}

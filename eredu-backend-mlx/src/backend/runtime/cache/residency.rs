@@ -76,6 +76,20 @@ pub enum CacheBlockArrays {
 }
 
 impl CacheBlockArrays {
+    fn isolated_snapshot(&self, stream: &Stream) -> Result<Self, safemlx::error::Exception> {
+        let copy = |array: &Array| array.contiguous(false, stream)?.deep_clone();
+        Ok(match self {
+            Self::KeyValue { keys, values } => Self::KeyValue {
+                keys: copy(keys)?,
+                values: copy(values)?,
+            },
+            Self::CompressedLatentRotary { latent, rotary_key } => Self::CompressedLatentRotary {
+                latent: copy(latent)?,
+                rotary_key: copy(rotary_key)?,
+            },
+        })
+    }
+
     /// Returns the portable representation encoded by these arrays.
     pub fn representation(&self) -> CacheRepresentation {
         match self {

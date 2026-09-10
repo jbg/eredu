@@ -209,6 +209,8 @@ pub enum ModelKind {
     GptOss,
     /// Thinking Machines Lab Inkling multimodal architecture.
     Inkling,
+    /// IFM K2 Horizon dense, MoE, and routed-value architectures.
+    K2Horizon,
     /// Moonshot Kimi Linear architecture.
     KimiLinear,
     /// Llama-compatible dense decoders, including Mistral.
@@ -260,12 +262,13 @@ impl<'de> Deserialize<'de> for ModelKind {
 
 impl ModelKind {
     /// Every architecture family implemented by this crate.
-    pub const ALL: [Self; 19] = [
+    pub const ALL: [Self; 20] = [
         Self::DeepSeekV3,
         Self::DeepSeekV4,
         Self::Gemma4,
         Self::GptOss,
         Self::Inkling,
+        Self::K2Horizon,
         Self::KimiLinear,
         Self::Llama,
         Self::Gemma2,
@@ -290,6 +293,7 @@ impl ModelKind {
             Self::Gemma4 => "gemma4",
             Self::GptOss => "gpt_oss",
             Self::Inkling => "inkling",
+            Self::K2Horizon => "k2_horizon",
             Self::KimiLinear => "kimi_linear",
             Self::Llama => "llama",
             Self::Gemma2 => "gemma2",
@@ -338,6 +342,7 @@ impl ModelKind {
             "gemma4" | "gemma4_text" | "gemma4_unified" | "gemma4_unified_text" => Ok(Self::Gemma4),
             "gpt_oss" => Ok(Self::GptOss),
             "inkling_mm_model" => Ok(Self::Inkling),
+            "k2_horizon" => Ok(Self::K2Horizon),
             "kimi_linear" => Ok(Self::KimiLinear),
             "llama" | "mistral" => Ok(Self::Llama),
             "nanbeige" => Ok(Self::Nanbeige),
@@ -361,6 +366,8 @@ impl ModelKind {
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GgufArchitecture {
+    /// `k2-horizon`.
+    K2Horizon,
     /// `kimi-linear`.
     KimiLinear,
     /// `deepseek2`.
@@ -413,6 +420,7 @@ impl GgufArchitecture {
     /// Resolves `general.architecture` through the architecture registry.
     pub fn resolve(name: &str) -> Result<Self, ArtifactError> {
         match name {
+            "k2-horizon" => Ok(Self::K2Horizon),
             "kimi-linear" => Ok(Self::KimiLinear),
             "deepseek2" => Ok(Self::DeepSeek2),
             "deepseek4" => Ok(Self::DeepSeek4),
@@ -443,6 +451,7 @@ impl GgufArchitecture {
     /// General model family implemented by this GGUF architecture.
     pub const fn model_kind(self) -> ModelKind {
         match self {
+            Self::K2Horizon => ModelKind::K2Horizon,
             Self::KimiLinear => ModelKind::KimiLinear,
             Self::DeepSeek2 => ModelKind::DeepSeekV3,
             Self::DeepSeek4 => ModelKind::DeepSeekV4,
@@ -467,6 +476,7 @@ impl GgufArchitecture {
     /// Exact metadata spelling.
     pub const fn metadata_name(self) -> &'static str {
         match self {
+            Self::K2Horizon => "k2-horizon",
             Self::KimiLinear => "kimi-linear",
             Self::DeepSeek2 => "deepseek2",
             Self::DeepSeek4 => "deepseek4",
@@ -642,6 +652,8 @@ pub enum SafetensorsModelConfig {
     GptOss(crate::gpt_oss::ModelArgs),
     /// Inkling family geometry.
     Inkling(crate::inkling::ModelArgs),
+    /// K2 Horizon dense, MoE, and routed-value geometry.
+    K2Horizon(crate::k2_horizon::ModelArgs),
     /// Kimi Linear family geometry.
     KimiLinear(crate::kimi_linear::ModelArgs),
     /// Llama-compatible family geometry.
@@ -689,6 +701,8 @@ pub enum GgufModelConfig {
     GptOss(crate::gpt_oss::ModelArgs),
     /// Inkling family geometry.
     Inkling(crate::inkling::ModelArgs),
+    /// K2 Horizon dense, MoE, and routed-value geometry.
+    K2Horizon(crate::k2_horizon::ModelArgs),
     /// Kimi Linear family geometry.
     KimiLinear(crate::kimi_linear::ModelArgs),
     /// LFM2 family geometry.
@@ -711,13 +725,14 @@ pub enum GgufModelConfig {
 
 impl SafetensorsModelConfig {
     /// Whether this exact normalized configuration constructs grouped routed experts.
-    pub const fn uses_grouped_routed_experts(&self) -> bool {
+    pub fn uses_grouped_routed_experts(&self) -> bool {
         match self {
             Self::DeepSeekV3(args) => args.n_routed_experts > 0,
             Self::DeepSeekV4(args) => args.n_routed_experts > 0,
             Self::Gemma4(args) => matches!(args.text.num_experts, Some(count) if count > 0),
             Self::GptOss(args) => args.num_local_experts > 0,
             Self::Inkling(args) => args.text_config.n_routed_experts > 0,
+            Self::K2Horizon(args) => args.is_moe(),
             Self::KimiLinear(args) => args.num_experts > 0,
             Self::Gemma2(_) | Self::Llama(_) | Self::Nanbeige(_) | Self::Moshi(_) => false,
             Self::MuseGlimmer(args) => args.num_experts > 0,
@@ -732,13 +747,14 @@ impl SafetensorsModelConfig {
 
 impl GgufModelConfig {
     /// Whether this exact normalized configuration constructs grouped routed experts.
-    pub const fn uses_grouped_routed_experts(&self) -> bool {
+    pub fn uses_grouped_routed_experts(&self) -> bool {
         match self {
             Self::DeepSeekV3(args) => args.n_routed_experts > 0,
             Self::DeepSeekV4(args) => args.n_routed_experts > 0,
             Self::Gemma4(args) => matches!(args.text.num_experts, Some(count) if count > 0),
             Self::GptOss(args) => args.num_local_experts > 0,
             Self::Inkling(args) => args.text_config.n_routed_experts > 0,
+            Self::K2Horizon(args) => args.is_moe(),
             Self::KimiLinear(args) => args.num_experts > 0,
             Self::Lfm2(args) => args.num_experts > 0,
             Self::Gemma2(_) | Self::Llama(_) | Self::Nanbeige(_) => false,
@@ -1328,6 +1344,9 @@ fn resolve_safetensors_architecture(
         ModelKind::Moshi => crate::moshi::MoshiConfig::from_config_value(Some(json))
             .map(SafetensorsModelConfig::Moshi)
             .map_err(|error| invalid_configuration(kind, error)),
+        ModelKind::K2Horizon => crate::k2_horizon::model_args_from_config_value(json)
+            .map(SafetensorsModelConfig::K2Horizon)
+            .map_err(|error| invalid_configuration(kind, error)),
         ModelKind::Qwen2 | ModelKind::Qwen3 => crate::qwen::model_args_from_config_value(json)
             .map(SafetensorsModelConfig::Qwen)
             .map_err(|error| invalid_configuration(kind, error)),
@@ -1370,6 +1389,8 @@ fn resolve_safetensors_architecture(
         SafetensorsModelConfig::NemotronH(args) => crate::nemotron_h::safetensors_plan(args)
             .map_err(|error| invalid_configuration(kind, error))?,
         SafetensorsModelConfig::Moshi(args) => crate::moshi::safetensors_plan(args)
+            .map_err(|error| invalid_configuration(kind, error))?,
+        SafetensorsModelConfig::K2Horizon(args) => crate::k2_horizon::safetensors_plan(args)
             .map_err(|error| invalid_configuration(kind, error))?,
         SafetensorsModelConfig::Qwen(args) => crate::qwen::safetensors_plan(args)
             .map_err(|error| invalid_configuration(kind, error))?,

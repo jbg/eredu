@@ -43,6 +43,37 @@ fn fixture() -> (tempfile::TempDir, Arc<SafetensorsWeightStore>) {
     (dir, store)
 }
 
+#[test]
+fn cold_workspace_counts_native_copies_without_reading_payloads() {
+    let (_directory, store) = fixture();
+    let direct = DerivedWeightRecipe::source("left", TensorSelection::Full);
+    let converted = DerivedWeightRecipe::Cast {
+        input: Box::new(direct.clone()),
+        dtype: RecipeDtype::F32,
+    };
+    let selected = DerivedWeightRecipe::Select {
+        input: Box::new(converted.clone()),
+        selection: TensorSelection::Indices {
+            axis: 0,
+            indices: vec![1],
+        },
+    };
+    #[cfg(not(feature = "cuda"))]
+    assert_eq!(
+        native_recipe_workspace(&direct, store.as_ref()).unwrap(),
+        16
+    );
+    assert_eq!(
+        native_recipe_workspace(&converted, store.as_ref()).unwrap(),
+        64
+    );
+    assert_eq!(
+        native_recipe_workspace(&selected, store.as_ref()).unwrap(),
+        72
+    );
+    assert_eq!(store.source_diagnostics().unwrap().physical_reads, 0);
+}
+
 #[cfg(not(feature = "cuda"))]
 #[test]
 fn direct_expert_join_owns_final_bytes_without_retaining_source_leases() {

@@ -29,6 +29,7 @@ pub mod discovery;
 pub use configuration::{GgufArchitecture, ModelKind};
 /// Architecture-owned external assistant inspection and preparation.
 pub mod external_assistant;
+pub mod external_draft;
 pub use external_assistant::{
     prepare_execution_plan_assistant, prepare_external_assistant,
     CompatibleExternalAssistantPreparation, ExternalAssistantArchitecture,
@@ -40,6 +41,10 @@ pub use external_assistant::{
     MaterializedExternalAssistantExecution, MaterializedExternalAssistantVisitor,
     PreparedCompatibleExternalAssistant, PreparedExternalAssistantExecution,
     PreparedExternalAssistantSource, SelectedExternalAssistantPreparation,
+};
+pub use external_draft::{
+    prepare_execution_plan_draft, prepare_external_draft, ExternalDraftPreparation,
+    PreparedExternalDraft,
 };
 /// Backend-neutral schedules and recipes for independent expert residency.
 pub mod expert_residency;
@@ -105,16 +110,17 @@ pub use expert_residency::{
     ExpertRoutePackingPlan, PartitionExpertRouteExchange, RoutedMechanismExecutionError,
 };
 pub use routed_text::{
-    routed_text_requirements, select_routed_text_realization, visit_gated_routed_text_architecture,
+    routed_text_requirements, select_routed_text_realization,
     visit_pooling_routed_text_architecture, visit_relu2_routed_text_architecture,
-    EmptyPartitionRoutedExpertProvider, GatedProductOperation, GatedRoutedTextArchitectureVisitor,
-    PlannedAddressableGatedProduct, PlannedAddressableRelu2, PlannedResidentGatedProduct,
-    PlannedResidentRelu2, PreparedRelu2RoutedTextArchitecture, PreparedRoutedTextArchitecture,
-    Relu2Operation, Relu2RoutedTextArchitectureVisitor, RoutedGroupedOperation,
-    RoutedGroupedOperationValidation, RoutedGroupedPlan, RoutedTextDispatchError,
+    visit_routed_text_architecture, EmptyPartitionRoutedExpertProvider, GatedProductOperation,
+    LinearOperation, PlannedAddressableGatedProduct, PlannedAddressableLinear,
+    PlannedAddressableRelu2, PlannedResidentGatedProduct, PlannedResidentRelu2,
+    PreparedRoutedTextArchitecture, Relu2Operation, Relu2RoutedTextArchitectureVisitor,
+    RoutedBankRequirements, RoutedGroupedOperation, RoutedGroupedOperationValidation,
+    RoutedGroupedPlan, RoutedTextArchitectureVisitor, RoutedTextDispatchError,
     RoutedTextExecutionError, RoutedTextPreparationError, RoutedTextRequirements,
     RoutedTextRequirementsError, RoutedTextSelectionError, RoutedTextSelectionRequest,
-    SelectedRoutedTextRealization,
+    SelectedRoutedBank, SelectedRoutedTextRealization,
 };
 
 /// Shared decoder mechanics used by backend-neutral text architectures.
@@ -145,6 +151,8 @@ pub mod nanbeige;
 /// Moshi-family realtime temporal/depth architecture policy.
 pub mod moshi;
 
+/// K2 Horizon dense, MoE and mixture-of-value-attention architecture policy.
+pub mod k2_horizon;
 /// Kimi Linear hybrid KDA/MLA decoder family.
 pub mod kimi_linear;
 /// LFM2 and LFM2-MoE hybrid decoder architecture.

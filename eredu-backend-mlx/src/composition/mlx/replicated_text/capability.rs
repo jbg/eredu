@@ -5,7 +5,8 @@ use eredu_runtime::{
     StateLifecycleCapabilities, StateStorageDtype,
 };
 
-pub(crate) const GROUPED_OPERATION_CAPABILITIES: [GroupedOperationRequirement; 4] = [
+pub(crate) const GROUPED_OPERATION_CAPABILITIES: [GroupedOperationRequirement; 5] = [
+    GroupedOperationRequirement::Linear,
     GroupedOperationRequirement::GatedProduct,
     GroupedOperationRequirement::GatedProductTensorParallelPartial,
     GroupedOperationRequirement::Relu2,

@@ -429,6 +429,7 @@ fn affine_expansion(
     ))
 }
 
+#[derive(Clone)]
 pub(super) struct BoundedBinding {
     checkpoint: SharedCheckpointSource,
     units: Vec<Vec<ReplicatedTextMaterializationTask>>,
@@ -446,6 +447,18 @@ impl Drop for PayloadLease {
 }
 
 impl BoundedBinding {
+    pub(super) fn restrict_units(&mut self, ordinals: &[usize]) -> Result<(), Error> {
+        self.units = ordinals
+            .iter()
+            .map(|ordinal| {
+                self.units.get(*ordinal).cloned().ok_or_else(|| {
+                    Error::backend("bounded partition ordinal is outside selected tasks")
+                })
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(())
+    }
+
     pub(super) fn prepare<A>(
         architecture: &mut A,
         layout: &eredu_runtime::ExecutionUnitLayout,
@@ -538,4 +551,50 @@ impl BoundedBinding {
             live: std::rc::Rc::clone(&self.live),
         })
     }
+}
+
+// Apply the same neutral member placement contract used by native binding.
+pub(super) fn addressable_values(
+    member: &eredu_runtime::AddressableBankMember,
+    checkpoint: &dyn CheckpointSource,
+    context: &NumericContext,
+) -> Result<(BTreeMap<String, NumericTensor>, u64), Error> {
+    let bindings = member
+        .parameters()
+        .iter()
+        .map(|parameter| {
+            eredu_runtime::WeightBinding::from_recipe(
+                parameter.binding_name(),
+                parameter.recipe().clone(),
+                parameter.source_bytes(),
+            )
+            .and_then(|binding| binding.with_logical_target(parameter.task().name()))
+            .map_err(Error::backend)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let bindings = eredu_runtime::place_addressable_member_bindings(
+        bindings,
+        checkpoint,
+        context
+            .local_layout
+            .as_ref()
+            .ok_or_else(|| Error::backend("addressable partition has no local layout"))?,
+    )
+    .map_err(Error::backend)?;
+    let mut values = BTreeMap::new();
+    let mut bytes = 0;
+    for (parameter, binding) in member.parameters().iter().zip(bindings) {
+        if parameter.task().executable() != eredu_checkpoint::LinearFormat::Dense {
+            return Err(Error::backend(
+                "scalar member payload requires a dense executable",
+            ));
+        }
+        let recipe = binding.source_recipe();
+        let metadata = recipe.infer(checkpoint).map_err(Error::backend)?;
+        bytes += eredu_runtime::selected_addressable_parameter_bytes(parameter.task(), &metadata)
+            .map_err(Error::backend)?;
+        let value = recipe_value(&recipe, checkpoint, context)?;
+        values.insert(parameter.binding_name().to_owned(), value);
+    }
+    Ok((values, bytes))
 }

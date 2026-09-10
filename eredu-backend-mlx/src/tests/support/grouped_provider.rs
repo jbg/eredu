@@ -109,7 +109,7 @@ where
         let demands = movement.index_demands(&indexed, global_span, stream)?;
         let backend_demands = demands
             .iter()
-            .map(|(member, count)| (ParameterBankKey::new(namespace, *member), *count))
+            .map(|(member, count)| (ParameterBankKey::new(0, namespace, *member), *count))
             .collect::<Vec<_>>();
         let acquired = cache.acquire_entry_demand(&backend_demands, pass, stream)?;
         let mapping = demands

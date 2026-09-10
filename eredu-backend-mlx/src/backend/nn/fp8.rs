@@ -191,6 +191,29 @@ fn quantize_activations(
     stream: &Stream,
 ) -> Result<QuantizedActivations, Exception> {
     let scale_cols = ceil_div(in_dim, SCALE_BLOCK);
+    if is_cpu_stream(stream)? {
+        let input = input
+            .as_dtype(Dtype::Float32, stream)?
+            .reshape(&[rows, in_dim], stream)?;
+        let mut values = Vec::with_capacity(scale_cols as usize);
+        let mut scales = Vec::with_capacity(scale_cols as usize);
+        for start in (0..in_dim).step_by(SCALE_BLOCK as usize) {
+            let block =
+                input.try_index_device((.., start..(start + SCALE_BLOCK).min(in_dim)), stream)?;
+            let scale = safemlx::ops::maximum(
+                block.abs(stream)?.max_axis(-1, true, stream)?,
+                Array::from_f32(1.0e-4),
+                stream,
+            )?
+            .divide(Array::from_f32(448.0), stream)?;
+            values.push(block.divide(&scale, stream)?.to_fp8(stream)?);
+            scales.push(scale);
+        }
+        return Ok(QuantizedActivations {
+            values: concatenate_axis(&values, 1, stream)?,
+            scales: concatenate_axis(&scales, 1, stream)?,
+        });
+    }
     let config = CustomKernelConfig::new()
         .with_template_arg_int("IN_DIM", in_dim)
         .with_template_arg_int("SCALE_COLS", scale_cols)
@@ -231,6 +254,21 @@ fn quantize_activations(
     let scales = outputs.pop().expect("activation scale output");
     let values = outputs.pop().expect("quantized activation output");
     Ok(QuantizedActivations { values, scales })
+}
+
+fn activation_reference(
+    input: &Array,
+    rows: i32,
+    in_dim: i32,
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    let quantized = quantize_activations(input, rows, in_dim, stream)?;
+    let scales = Array::repeat_axis::<f32>(quantized.scales, SCALE_BLOCK, 1, stream)?;
+    quantized
+        .values
+        .from_fp8(Dtype::Float32, stream)?
+        .multiply(scales.try_index_device((.., ..in_dim), stream)?, stream)?
+        .reshape(input.shape(), stream)
 }
 
 #[cfg(not(feature = "cuda"))]
@@ -355,7 +393,8 @@ pub fn linear(
     let rows = (input.size() as i32) / in_dim;
     if is_cpu_stream(stream)? {
         let weight = dequantize(weight, &scale, stream)?;
-        let output = matmul(input, &weight.transpose(stream)?, stream)?;
+        let input = activation_reference(input, rows, in_dim, stream)?;
+        let output = matmul(&input, &weight.transpose(stream)?, stream)?;
         return restore_activation_dtype(output, output_dtype, stream);
     }
     let input = input.reshape(&[rows, in_dim], stream)?;
@@ -657,8 +696,9 @@ pub fn grouped_linear(
     let scale_cols = scale.dim(2);
     if is_cpu_stream(stream)? {
         let weight = dequantize_grouped(weight, &scale, stream)?;
+        let input = activation_reference(input, routes, in_dim, stream)?;
         let output = grouped_matmul(
-            input,
+            &input,
             &weight.swap_axes(-1, -2, stream)?,
             group_ids,
             true,

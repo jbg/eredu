@@ -1,0 +1,27 @@
+diff --git a/mlx/backend/cpu/sort.cpp b/mlx/backend/cpu/sort.cpp
+--- a/mlx/backend/cpu/sort.cpp
++++ b/mlx/backend/cpu/sort.cpp
+@@ -298,7 +298,7 @@
+     StridedIterator md(idx_ptr, out_stride, kth);
+     StridedIterator ed(idx_ptr, out_stride, axis_size);
+ 
+-    std::nth_element(st, md, ed, [data_ptr, in_stride](IdxT a, IdxT b) {
++    auto less = [data_ptr, in_stride](IdxT a, IdxT b) {
+       auto v1 = data_ptr[a * in_stride];
+       auto v2 = data_ptr[b * in_stride];
+ 
+@@ -310,8 +310,12 @@
+           return true;
+       }
+ 
+-      return v1 < v2 || (v1 == v2 && a < b);
+-    });
++      return v1 < v2;
++    };
++    // Equal keys remain equal during selection. Adding the original index as a
++    // secondary key changes which values cross the requested partition boundary.
++    std::nth_element(st, md, ed, less);
++    std::sort(st, md, less);
+   }
+ }
+ 

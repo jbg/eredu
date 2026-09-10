@@ -685,7 +685,7 @@ where
     where
         F: eredu_core::ExecutionPlanBackendFactory<
             Backend = B,
-            DrafterPreparation = eredu_architectures::ExternalAssistantPreparation,
+            DrafterPreparation = eredu_architectures::ExternalDraftPreparation,
         >,
     {
         Self::load_execution_plan_with_text_options(
@@ -709,7 +709,7 @@ where
     where
         F: eredu_core::ExecutionPlanBackendFactory<
             Backend = B,
-            DrafterPreparation = eredu_architectures::ExternalAssistantPreparation,
+            DrafterPreparation = eredu_architectures::ExternalDraftPreparation,
         >,
     {
         let artifact = artifact.as_ref();
@@ -736,7 +736,7 @@ where
     where
         F: eredu_core::ExecutionPlanBackendFactory<
             Backend = B,
-            DrafterPreparation = eredu_architectures::ExternalAssistantPreparation,
+            DrafterPreparation = eredu_architectures::ExternalDraftPreparation,
         >,
     {
         Self::load_inspected_execution_plan_with_text_options(
@@ -759,7 +759,7 @@ where
     where
         F: eredu_core::ExecutionPlanBackendFactory<
             Backend = B,
-            DrafterPreparation = eredu_architectures::ExternalAssistantPreparation,
+            DrafterPreparation = eredu_architectures::ExternalDraftPreparation,
         >,
     {
         let (tokenizer, config) = loaded_text_artifact(&inspection, text_options)
@@ -770,7 +770,7 @@ where
             eredu_text::tokenizer::vocabulary_fingerprint(&tokenizer);
         let external_artifact = match plan.drafting() {
             DraftingPlan::External { model, .. } => {
-                let preparation = eredu_architectures::prepare_external_assistant(model)
+                let preparation = eredu_architectures::prepare_external_draft(model)
                     .map_err(LoadedModelLoadError::Artifact)?;
                 let draft_tokenizer = super::tokenizer::load_tokenizer_for_kind(
                     preparation.tokenizer_model_kind(),
@@ -827,7 +827,7 @@ where
     where
         F: eredu_core::ExecutionPlanBackendFactory<
                 Backend = B,
-                DrafterPreparation = eredu_architectures::ExternalAssistantPreparation,
+                DrafterPreparation = eredu_architectures::ExternalDraftPreparation,
             > + eredu_core::AutomaticPlanningBackend<
                 Inspection = eredu_core::ArtifactInspection<
                     eredu_architectures::processor_plan::ArtifactArchitecturePlan,
@@ -856,7 +856,7 @@ where
     where
         F: eredu_core::ExecutionPlanBackendFactory<
                 Backend = B,
-                DrafterPreparation = eredu_architectures::ExternalAssistantPreparation,
+                DrafterPreparation = eredu_architectures::ExternalDraftPreparation,
             > + eredu_core::AutomaticPlanningBackend<
                 Inspection = eredu_core::ArtifactInspection<
                     eredu_architectures::processor_plan::ArtifactArchitecturePlan,

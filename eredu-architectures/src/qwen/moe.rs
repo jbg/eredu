@@ -14,8 +14,8 @@ use eredu_runtime::{
 
 use crate::{
     decoder::{
-        FeedForwardOperator, Mlp, TensorParallelFeedForwardOperator,
-        TensorParallelRoutedFeedForwardOperator,
+        DecoderProjectionOperator, Mlp, TensorParallelProjectionOperator,
+        TensorParallelRoutedProjectionOperator,
     },
     linear_format::standard_expert_projection,
 };
@@ -322,7 +322,7 @@ mod tests {
     }
 }
 
-impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> FeedForwardOperator<B>
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> DecoderProjectionOperator<B>
     for RoutedGatedProduct<B>
 {
     fn forward_feed_forward(
@@ -336,6 +336,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> FeedForwardOp
             &mut provider,
             &mut self.experts,
             RoutedExpertRequest {
+                bank: eredu_runtime::RoutedBankId::new(0),
                 layer: self.layer,
                 input,
                 routes: &routes,
@@ -347,7 +348,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> FeedForwardOp
 }
 
 impl<B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
-    TensorParallelFeedForwardOperator<B> for RoutedGatedProduct<B>
+    TensorParallelProjectionOperator<B> for RoutedGatedProduct<B>
 {
     fn forward_feed_forward_parallel(
         &mut self,
@@ -361,6 +362,7 @@ impl<B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeur
             &mut provider,
             &mut self.experts,
             RoutedExpertRequest {
+                bank: eredu_runtime::RoutedBankId::new(0),
                 layer: self.layer,
                 input,
                 routes: &routes,
@@ -432,11 +434,13 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> FeedForward<B
                     input,
                     context,
                     provider,
+                    eredu_runtime::RoutedBankId::new(0),
                 )?;
                 provider
                     .forward_grouped(
                         &mut moe.experts,
                         RoutedExpertRequest {
+                            bank: eredu_runtime::RoutedBankId::new(0),
                             layer,
                             input,
                             routes: &routes,
@@ -472,6 +476,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> FeedForward<B
                     .forward_grouped_tensor_parallel(
                         &mut moe.experts,
                         RoutedExpertRequest {
+                            bank: eredu_runtime::RoutedBankId::new(0),
                             layer,
                             input,
                             routes: &routes,
@@ -487,7 +492,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> FeedForward<B
     }
 }
 
-impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> FeedForwardOperator<B>
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> DecoderProjectionOperator<B>
     for FeedForward<B>
 {
     fn forward_feed_forward(
@@ -503,7 +508,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> FeedForwardOp
 }
 
 impl<B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
-    TensorParallelFeedForwardOperator<B> for FeedForward<B>
+    TensorParallelProjectionOperator<B> for FeedForward<B>
 {
     fn forward_feed_forward_parallel(
         &mut self,
@@ -519,7 +524,7 @@ impl<B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeur
 }
 
 impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
-    crate::decoder::RoutedFeedForwardOperator<B> for FeedForward<B>
+    crate::decoder::RoutedProjectionOperator<B> for FeedForward<B>
 {
     fn forward_with_provider<P>(
         &mut self,
@@ -538,7 +543,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
 }
 
 impl<B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
-    TensorParallelRoutedFeedForwardOperator<B> for FeedForward<B>
+    TensorParallelRoutedProjectionOperator<B> for FeedForward<B>
 {
     fn forward_parallel_with_provider<P>(
         &mut self,

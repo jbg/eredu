@@ -142,7 +142,8 @@ fn pipeline_ring_worker() {
             });
         let routed_neutral = (matches!(
             family,
-            FixtureFamily::Qwen3Moe
+            FixtureFamily::K2Mova
+                | FixtureFamily::Qwen3Moe
                 | FixtureFamily::Qwen3MoeGguf
                 | FixtureFamily::GptOss
                 | FixtureFamily::GptOssGguf
@@ -193,7 +194,20 @@ fn pipeline_ring_worker() {
             crate::tests::support::path_instrumentation::reset();
         }
         let backend = crate::native::distributed_backend(&stream, &stream, &native_group);
-        let selected_paged = PagedCacheOptions::new(1, 32768, 32768, 1)
+        // Keep a small device tier while reserving finite host capacity for the
+        // independently writable branches exercised by the K2 control matrix.
+        let host_cache_bytes = if matches!(family, FixtureFamily::K2Dense | FixtureFamily::K2Mova) {
+            1 << 20
+        } else {
+            32768
+        };
+        let device_cache_bytes = if matches!(family, FixtureFamily::K2Dense | FixtureFamily::K2Mova)
+        {
+            131072
+        } else {
+            32768
+        };
+        let selected_paged = PagedCacheOptions::new(1, device_cache_bytes, host_cache_bytes, 1)
             .unwrap()
             .with_full_attention(true);
         let dense_stream = std::env::var_os(DENSE_STREAM).is_some();
@@ -224,7 +238,26 @@ fn pipeline_ring_worker() {
             } else {
                 OrdinaryWeightResidency::FullyResident
             };
-            let bank = if std::env::var_os(EXPERT_CACHE_EVICTION).is_some() {
+            let bank = if family == FixtureFamily::K2Mova {
+                let budget = if checkpoint.is_file() {
+                    16384
+                } else if serde_json::from_slice::<serde_json::Value>(
+                    &std::fs::read(checkpoint.join("config.json")).unwrap(),
+                )
+                .unwrap()["quantization_config"]
+                    .is_object()
+                {
+                    393312
+                } else {
+                    1152
+                };
+                ParameterBankLoadOptions::new(
+                    OffloadConfig::new(Some(budget), Some(1 << 20), 1).unwrap(),
+                    budget,
+                    budget,
+                )
+                .unwrap()
+            } else if std::env::var_os(EXPERT_CACHE_EVICTION).is_some() {
                 ParameterBankLoadOptions::new(
                     OffloadConfig::new(Some(12_288), Some(0), 1).unwrap(),
                     u64::MAX,
@@ -531,6 +564,29 @@ fn pipeline_ring_worker() {
         )
         .unwrap();
         assert_eq!(state.assumptions.requested_positions, 4);
+        if matches!(family, FixtureFamily::K2Dense | FixtureFamily::K2Mova) {
+            let (kv_heads, head_dim) = if checkpoint.is_dir() {
+                let config: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(checkpoint.join("config.json")).unwrap())
+                        .unwrap();
+                (
+                    config["num_key_value_heads"].as_u64().unwrap(),
+                    config["head_dim"].as_u64().unwrap(),
+                )
+            } else {
+                (2, 8)
+            };
+            let expected = local_layer_range.len() as u64 * 2 * kv_heads
+                / tensor_parallel_size as u64
+                * head_dim
+                * u64::from(state.assumptions.floating_state_dtype_bytes.get());
+            assert_eq!(
+                state.bytes_per_position_per_batch, expected,
+                "rank-local keys and already-mixed values"
+            );
+            assert_eq!(state.fixed_state_bytes, 0);
+        }
+
         assert!(matches!(
             eredu_core::apply_admission_policy(
                 &capabilities,
@@ -548,7 +604,39 @@ fn pipeline_ring_worker() {
             .unwrap(),
             eredu_core::AdmissionResult::Admitted(_)
         ));
-        <MlxBackend<'_> as eredu_core::ModelCapabilityBackend>::static_memory(&runtime).unwrap();
+        let static_memory =
+            <MlxBackend<'_> as eredu_core::ModelCapabilityBackend>::static_memory(&runtime)
+                .unwrap();
+        if matches!(family, FixtureFamily::K2Dense | FixtureFamily::K2Mova) {
+            let ordinary = runtime.session().residency_report().unwrap().unwrap();
+            let planned = ordinary.offload().planned_bytes();
+            let banks = runtime.session().parameter_bank_report().unwrap();
+            let bank_bytes = banks.as_ref().map_or(0, |banks| banks.owned_bytes());
+            let ordinary_bytes = [
+                eredu_core::residency::MemoryTier::Device,
+                eredu_core::residency::MemoryTier::Host,
+                eredu_core::residency::MemoryTier::Disk,
+            ]
+            .into_iter()
+            .map(|tier| planned.get(tier))
+            .sum::<u64>();
+            let eredu_core::Observed::Available { value, .. } =
+                static_memory.logical_parameter_bytes
+            else {
+                panic!("missing complete rank-local parameter report")
+            };
+            assert_eq!(value, ordinary_bytes + bank_bytes);
+            let eredu_core::Observed::Available { value, .. } =
+                static_memory.planned_disk_backed_bytes
+            else {
+                panic!("missing disk report")
+            };
+            assert_eq!(
+                value,
+                planned.get(eredu_core::residency::MemoryTier::Disk) + bank_bytes
+            );
+        }
+
         if std::env::var_os(PREPARED_SPECULATIVE_CAPABILITY).is_some() {
             return;
         }
@@ -1126,6 +1214,7 @@ fn pipeline_ring_worker() {
             }
             if routed_neutral && expert_parallel_size > 1 {
                 let exchanges_per_layer = match family {
+                    FixtureFamily::K2Mova => 16,
                     FixtureFamily::Qwen3Moe
                     | FixtureFamily::Qwen3MoeGguf
                     | FixtureFamily::DeepSeek
@@ -1184,6 +1273,22 @@ fn pipeline_ring_worker() {
         if std::env::var_os(EXPERT_CACHE).is_some() {
             let report = session.parameter_bank_report().unwrap();
             let expected_owned = match family {
+                FixtureFamily::K2Mova => {
+                    family.expert_layer_count(local_layer_range.clone())
+                        * [3, 5]
+                            .into_iter()
+                            .map(|count| {
+                                eredu_core::balanced_contiguous_range(
+                                    count,
+                                    expert_parallel_size,
+                                    topology.expert_parallel_rank(),
+                                    false,
+                                )
+                                .unwrap()
+                                .len()
+                            })
+                            .sum::<usize>()
+                }
                 FixtureFamily::Qwen3Moe | FixtureFamily::Qwen3MoeGguf => {
                     local_layer_range.len() * 4 / expert_parallel_size
                 }
@@ -1214,6 +1319,52 @@ fn pipeline_ring_worker() {
                 return;
             }
             let report = report.expect("owned independent expert bank must expose live telemetry");
+            if family == FixtureFamily::K2Mova {
+                assert_eq!(report.banks().len(), 2);
+                if checkpoint.is_dir() {
+                    let config: serde_json::Value = serde_json::from_slice(
+                        &std::fs::read(checkpoint.join("config.json")).unwrap(),
+                    )
+                    .unwrap();
+                    let fp8 = config["quantization_config"].is_object();
+                    let budget = if fp8 { 393312 } else { 1152 };
+                    assert!(report.peak_device_resident_bytes() <= budget);
+                    let local_experts = |count| {
+                        eredu_core::balanced_contiguous_range(
+                            count,
+                            expert_parallel_size,
+                            topology.expert_parallel_rank(),
+                            false,
+                        )
+                        .unwrap()
+                        .len()
+                    };
+                    let routed_layers = family.expert_layer_count(local_layer_range.clone());
+                    let hidden = config["hidden_size"].as_u64().unwrap() as usize;
+                    let value_rows = config["num_key_value_heads"].as_u64().unwrap() as usize
+                        * config["head_dim"].as_u64().unwrap() as usize
+                        / tensor_parallel_size;
+                    let intermediate = config["moe_intermediate_size"].as_u64().unwrap() as usize
+                        / tensor_parallel_size;
+                    let matrix_bytes = |rows: usize, columns: usize| {
+                        if fp8 {
+                            rows * columns + rows.div_ceil(128) * columns.div_ceil(128) * 4
+                        } else {
+                            rows * columns * 4
+                        }
+                    };
+                    let value_bytes = local_experts(3) * matrix_bytes(value_rows, hidden);
+                    let feed_forward_bytes = local_experts(5)
+                        * (2 * matrix_bytes(intermediate, hidden)
+                            + matrix_bytes(hidden, intermediate));
+                    assert_eq!(
+                        report.owned_bytes(),
+                        (routed_layers * (value_bytes + feed_forward_bytes)) as u64
+                    );
+                } else {
+                    assert!(report.peak_device_resident_bytes() <= 16384);
+                }
+            }
             assert!(report.owned_entries() > 0);
             assert!(report.owned_bytes() > 0);
             let requests =
@@ -1269,5 +1420,74 @@ fn pipeline_ring_worker() {
                 "cache-control retry was not rejected by the causal fence: {retry}"
             );
         }
+        if matches!(family, FixtureFamily::K2Dense | FixtureFamily::K2Mova) {
+            verify_distributed_control_branches(&mut runtime, owns_public_output);
+        }
     }
+}
+
+/// Every rank advances the same serial branch schedule through the public neutral
+/// state contract. Copies share weights, while mutable KV storage is independent.
+fn verify_distributed_control_branches(
+    runtime: &mut ModelRuntime<MlxBackend<'_>>,
+    owns_public_output: bool,
+) {
+    use eredu_core::execution_control::{ControlSupport, NativeTextStateBackend};
+    assert_eq!(
+        MlxBackend::native_text_state_support(runtime),
+        ControlSupport::Supported
+    );
+    let estimate = MlxBackend::estimate_native_text_state(runtime, None)
+        .unwrap()
+        .unwrap();
+    assert!(estimate.copy_bytes > 0 && estimate.retained_bytes > 0);
+    let saved = MlxBackend::capture_native_text_state(runtime).unwrap();
+    let mut first = MlxBackend::copy_native_text_state(runtime, &saved).unwrap();
+    let mut second = MlxBackend::copy_native_text_state(runtime, &saved).unwrap();
+    assert!(
+        MlxBackend::estimate_native_text_growth(runtime, &saved, 4)
+            .unwrap()
+            .unwrap()
+            > 0
+    );
+    let advance = |runtime: &mut ModelRuntime<MlxBackend<'_>>, tokens: &[u32]| {
+        tokens
+            .iter()
+            .map(|&token| {
+                let (backend, session) = runtime.parts_mut();
+                let output = session
+                    .decode(backend, Array::from_slice(&[token], &[1, 1]))
+                    .unwrap()
+                    .wait()
+                    .unwrap();
+                assert_eq!(output.logits().is_some(), owns_public_output);
+                output.logits().map(|logits| {
+                    logits
+                        .as_array()
+                        .evaluated()
+                        .unwrap()
+                        .as_slice::<f32>()
+                        .to_vec()
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    let baseline = advance(runtime, &[1, 2, 3, 4]);
+    MlxBackend::exchange_native_text_state(runtime, &mut first).unwrap();
+    drop(first);
+    assert_eq!(advance(runtime, &[1, 2]), baseline[..2]);
+    let mid = MlxBackend::capture_native_text_state(runtime).unwrap();
+    let mut resumed = MlxBackend::copy_native_text_state(runtime, &mid).unwrap();
+    drop(mid);
+    let _ = advance(runtime, &[5]);
+    MlxBackend::exchange_native_text_state(runtime, &mut second).unwrap();
+    drop(second);
+    assert_eq!(advance(runtime, &[1, 2, 3, 4]), baseline);
+    MlxBackend::exchange_native_text_state(runtime, &mut resumed).unwrap();
+    drop(resumed);
+    assert_eq!(advance(runtime, &[3, 4]), baseline[2..]);
+    // Reusing an immutable snapshot after all descendants advanced remains exact.
+    let mut restored = MlxBackend::copy_native_text_state(runtime, &saved).unwrap();
+    MlxBackend::exchange_native_text_state(runtime, &mut restored).unwrap();
+    assert_eq!(advance(runtime, &[1, 2, 3, 4]), baseline);
 }

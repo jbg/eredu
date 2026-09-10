@@ -471,7 +471,7 @@ pub fn expert_residency_catalog<C: RecipeCatalog + ?Sized>(
                 .collect::<Result<Vec<_>, String>>()?;
             units.push(
                 crate::ExpertResidencyUnit::new(
-                    eredu_runtime::ParameterBankKey::new(layer, expert),
+                    eredu_runtime::ParameterBankKey::new(0, layer, expert),
                     owner_group.clone(),
                     layer,
                     &unit_path,
@@ -922,7 +922,10 @@ mod tests {
         let residency = expert_residency_catalog(&catalog, &args()).unwrap();
         assert_eq!(residency.units().len(), 2);
         let first = &residency.units()[0];
-        assert_eq!(first.identity(), eredu_runtime::ParameterBankKey::new(0, 0));
+        assert_eq!(
+            first.identity(),
+            eredu_runtime::ParameterBankKey::new(0, 0, 0)
+        );
         assert_eq!(first.owner_group().as_str(), "text_decoder");
         assert_eq!(first.owner_unit(), 0);
         assert_eq!(first.unit_path(), "model.layers.0");
@@ -950,7 +953,7 @@ mod tests {
             .all(|parameter| parameter.role() == &crate::ExpertParameterRole::Preserved));
         assert_eq!(
             residency.units()[1].identity(),
-            eredu_runtime::ParameterBankKey::new(0, 1)
+            eredu_runtime::ParameterBankKey::new(0, 0, 1)
         );
 
         let local = rank_local_expert_recipes(&catalog, &args(), 0, &[1]).unwrap();

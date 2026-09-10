@@ -488,7 +488,7 @@ pub fn expert_residency_catalog<C: RecipeCatalog + ?Sized>(
                 .collect::<Result<Vec<_>, _>>()?;
             units.push(
                 crate::ExpertResidencyUnit::new(
-                    eredu_runtime::ParameterBankKey::new(layer, expert),
+                    eredu_runtime::ParameterBankKey::new(0, layer, expert),
                     owner_group.clone(),
                     owner_unit,
                     &unit_path,
@@ -2095,7 +2095,7 @@ mod tests {
         let target = &catalog.units()[0];
         assert_eq!(
             target.identity(),
-            eredu_runtime::ParameterBankKey::new(0, 0)
+            eredu_runtime::ParameterBankKey::new(0, 0, 0)
         );
         assert_eq!(target.owner_group().as_str(), "target");
         assert_eq!(target.owner_unit(), 0);
@@ -2114,7 +2114,7 @@ mod tests {
         let prediction = &catalog.units()[8];
         assert_eq!(
             prediction.identity(),
-            eredu_runtime::ParameterBankKey::new(2, 0)
+            eredu_runtime::ParameterBankKey::new(0, 2, 0)
         );
         assert_eq!(prediction.owner_group().as_str(), "mtp.0");
         assert_eq!(prediction.owner_unit(), 0);

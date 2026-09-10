@@ -55,6 +55,9 @@ fn run_ring_cartesian_pipeline_mode(
         path
     } else {
         match family {
+            FixtureFamily::K2Dense | FixtureFamily::K2Mova => {
+                write_k2_fixture(checkpoint.path(), family == FixtureFamily::K2Mova)
+            }
             FixtureFamily::Qwen2 => write_qwen_fixture(checkpoint.path(), "qwen2"),
             FixtureFamily::Qwen3
                 if matches!(
@@ -188,6 +191,9 @@ fn run_ring_layerwise_host_cartesian_pipeline_mode(
         path
     } else {
         match family {
+            FixtureFamily::K2Dense | FixtureFamily::K2Mova => {
+                write_k2_fixture(checkpoint.path(), family == FixtureFamily::K2Mova)
+            }
             FixtureFamily::Qwen2 => write_qwen_fixture(checkpoint.path(), "qwen2"),
             FixtureFamily::Qwen3
                 if matches!(
@@ -338,6 +344,9 @@ fn run_ring_pipeline_mode(dense_stream: bool, family: FixtureFamily, mode: Worke
         path
     } else {
         match family {
+            FixtureFamily::K2Dense | FixtureFamily::K2Mova => {
+                write_k2_fixture(checkpoint.path(), family == FixtureFamily::K2Mova)
+            }
             FixtureFamily::Llama => write_fixture(checkpoint.path()),
             FixtureFamily::Mistral => write_mistral_fixture(checkpoint.path()),
             FixtureFamily::DeepSeek if mode == WorkerMode::OpaqueDeepSeekMtpTarget => {

@@ -41,3 +41,5 @@ serde_json.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+safemlx.workspace = true
+eredu-text.workspace = true

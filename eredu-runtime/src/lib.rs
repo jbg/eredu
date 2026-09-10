@@ -89,7 +89,9 @@ pub mod state;
 mod weight_residency;
 
 pub use automatic_support::{
-    residency_telemetry, selected_text_bounded_requirement, BoundedResidencySizingError,
+    placed_recipe_peak_bytes, placed_source_recipe, residency_telemetry,
+    selected_parameter_resources, selected_parameter_resources_for_layout,
+    selected_text_bounded_requirement, BoundedResidencySizingError, SelectedParameterResources,
 };
 pub use backend::{
     BarrierBackend, BroadcastBackend, CollectiveBackend, CommunicationBackend, EvenGatherBackend,
@@ -165,10 +167,11 @@ pub use expert::{
     AddressableBankMemberError, AddressableBankMemberPlacement, AddressableBankParameter,
     AddressableBankTask, AddressableBindingTransform, AddressableExpertRouteProvider,
     AddressableExpertRouteRequest, AddressableGatedProductBank, AddressableGroupedBank,
-    ExpertRouteCombination, ExpertRouteExchange, ExpertRouteTensorMovement, IndexedMovement,
-    ObservedExpertProvider, ObservedExpertProviderError, ParameterBankAcquisition,
-    ResidentExpertProvider, RoutedExpertProvider, RoutedExpertRequest,
-    RoutedExpertTensorParallelOutput, RoutedObservationPoint, TensorParallelRoutedExpertProvider,
+    ExpertRouteCombination, ExpertRouteExchange, ExpertRouteInvocation, ExpertRouteTensorMovement,
+    IndexedMovement, ObservedExpertProvider, ObservedExpertProviderError, ParameterBankAcquisition,
+    ResidentExpertProvider, RoutedBankId, RoutedBankProviderError, RoutedBankProviders,
+    RoutedExpertProvider, RoutedExpertRequest, RoutedExpertTensorParallelOutput,
+    RoutedObservationPoints, TensorParallelRoutedExpertProvider,
 };
 pub use expert::{select_routes_with_observer, select_routes_with_provider};
 pub use generation::{

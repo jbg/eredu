@@ -1,0 +1,6 @@
+{
+  "torch": "2.14.0",
+  "torch_git": "08187d9e0fba026dc8217405802ab5381dc88d90",
+  "sha256": "f6f952bbaa25b33e57e43cf9d37ba5c129919f8892df34573ffdd11d08e9d94e",
+  "operation": "FP32 sigmoid; selected sum normalization; scale 2.5; BF16 coefficient rounding"
+}
