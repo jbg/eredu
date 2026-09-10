@@ -107,15 +107,15 @@ impl<C: TokenFilterController> TokenChoiceController<C> {
         &self.inner
     }
     fn restrict(
-        &self,
-        filter: TokenFilter,
+        domain: TokenDomain,
+        filter: &TokenFilter,
         token: u32,
     ) -> Result<TokenFilter, TokenChoiceError<C::Error>> {
         let mut allowed = vec![
             false;
             filter
                 .allowed_mask()
-                .map_or(self.domain.cardinality(), <[bool]>::len)
+                .map_or(domain.cardinality(), <[bool]>::len)
         ];
         allowed[token as usize] = true;
         Ok(TokenFilter::allowed(allowed).expect("one canonical candidate is allowed"))
@@ -139,7 +139,19 @@ impl<C: TokenFilterController> TokenFilterController for TokenChoiceController<C
             return Ok(filter);
         };
         Self::check_filter(&filter, token)?;
-        self.restrict(filter, token)
+        Self::restrict(self.domain, &filter, token)
+    }
+    fn current_decision(&mut self) -> Result<eredu_core::TokenSamplingDecision<'_>, Self::Error> {
+        let mut decision = self
+            .inner
+            .current_decision()
+            .map_err(TokenChoiceError::Constraint)?;
+        if let Some(token) = self.pending {
+            Self::check_filter(decision.filter(), token)?;
+            let forced = Self::restrict(self.domain, decision.filter(), token)?;
+            decision.override_filter(forced);
+        }
+        Ok(decision)
     }
     fn commit_token(&mut self, token: u32) -> Result<(), Self::Error> {
         if let Some(expected) = self.pending {
@@ -195,7 +207,7 @@ impl<C: eredu_core::SpeculativeTokenFilterController> eredu_core::SpeculativeTok
         if let (Some(token), Some(position)) = (self.pending, self.pending_position) {
             if history.len() == position {
                 Self::check_filter(&filter, token)?;
-                return self.restrict(filter, token);
+                return Self::restrict(self.domain, &filter, token);
             }
             if let Some(&actual) = history.get(position) {
                 if actual != token {
@@ -207,6 +219,30 @@ impl<C: eredu_core::SpeculativeTokenFilterController> eredu_core::SpeculativeTok
             }
         }
         Ok(filter)
+    }
+    fn decision_at(
+        &self,
+        history: &[u32],
+    ) -> Result<eredu_core::TokenSamplingDecision<'_>, Self::Error> {
+        let mut decision = self
+            .inner
+            .decision_at(history)
+            .map_err(TokenChoiceError::Constraint)?;
+        if let (Some(token), Some(position)) = (self.pending, self.pending_position) {
+            if history.len() == position {
+                Self::check_filter(decision.filter(), token)?;
+                decision.override_filter(Self::restrict(self.domain, decision.filter(), token)?);
+            }
+            if let Some(&actual) = history.get(position) {
+                if actual != token {
+                    return Err(TokenChoiceError::UnexpectedCommit {
+                        expected: token,
+                        actual,
+                    });
+                }
+            }
+        }
+        Ok(decision)
     }
     fn prefix_is_complete(&self, history: &[u32]) -> Result<bool, Self::Error> {
         if let (Some(expected), Some(position)) = (self.pending, self.pending_position) {
@@ -235,6 +271,14 @@ mod tests {
             let mut allowed = vec![true; 4];
             allowed[self.0.len() % 4] = false;
             Ok(TokenFilter::allowed(allowed).unwrap())
+        }
+        fn current_decision(
+            &mut self,
+        ) -> Result<eredu_core::TokenSamplingDecision<'_>, Infallible> {
+            Ok(
+                eredu_core::TokenSamplingDecision::new(self.current_filter()?)
+                    .with_tokenizer_validity(&TokenFilter::All),
+            )
         }
         fn commit_token(&mut self, token: u32) -> Result<(), Infallible> {
             self.0.push(token);
@@ -266,6 +310,17 @@ mod tests {
         ));
         assert!(parent.pending_forced().is_none());
         parent.force_next(2).unwrap();
+        let decision = parent.current_decision().unwrap();
+        assert_eq!(
+            decision.filter().allowed_mask(),
+            Some(&[false, false, true, false][..])
+        );
+        let domain = decision.capture_domain().unwrap();
+        assert!(domain.filter.allows(1));
+        assert!(!domain.filter.allows(0));
+        assert_eq!(domain.summary(4).allowed_tokens, 3);
+        assert!(domain.summary(4).constrained);
+        drop(decision);
         assert_eq!(
             parent.current_filter().unwrap().allowed_mask(),
             Some(&[false, false, true, false][..])

@@ -102,7 +102,8 @@ pub use backend::{
     SpeculativeTokenFilterController, Submission, TextContinuationBoundary, TextContinuationError,
     TextContinuationIdentity, TextDriverIdentity, TextGeneration, TextGenerationBackend,
     TextGenerationConfig, TextGenerationContinuation, TextGenerationDriver, TextSamplingStrategy,
-    TokenFilter, TokenFilterController, TokenFilterError, TokenOutput, ValueDescriptor,
+    TokenFilter, TokenFilterController, TokenFilterError, TokenOutput, TokenSamplingDecision,
+    ValueDescriptor,
 };
 pub use capability::{
     apply_admission_policy, estimate_runtime_state, Admission, AdmissionRejection,

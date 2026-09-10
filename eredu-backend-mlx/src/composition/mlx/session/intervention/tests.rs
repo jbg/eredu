@@ -40,7 +40,10 @@ fn native_intervention_estimates_account_for_group_masks_and_host_lookup() {
 fn native_activation_primitives_pass_shared_conformance() {
     let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
     eredu_evaluation::intervention::activation_conformance(
-        &mut NativeCapture { stream: &stream },
+        &mut NativeCapture {
+            stream: &stream,
+            domain: None,
+        },
         |value| value.to_f32_vec(&stream).unwrap(),
     );
 }
@@ -57,7 +60,10 @@ fn row() -> ResolvedCaptureSlice {
 #[test]
 fn native_intervention_patch_scale_mask_and_bias_preserve_other_rows() {
     let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-    let mut native = NativeCapture { stream: &stream };
+    let mut native = NativeCapture {
+        stream: &stream,
+        domain: None,
+    };
     let input = MlxTensor::from_array(Array::from_slice(
         &[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0],
         &[2, 3],
@@ -133,7 +139,10 @@ fn native_intervention_patch_scale_mask_and_bias_preserve_other_rows() {
 #[test]
 fn native_intervention_half_payload_bits_are_exact_and_casts_are_rejected() {
     let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-    let mut native = NativeCapture { stream: &stream };
+    let mut native = NativeCapture {
+        stream: &stream,
+        domain: None,
+    };
     let slice = ResolvedCaptureSlice {
         starts: vec![0],
         ends: vec![2],

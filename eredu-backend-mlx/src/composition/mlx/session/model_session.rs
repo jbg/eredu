@@ -1482,6 +1482,21 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
         filter: &TokenFilter,
         state: &mut Self::TextGenerationState,
     ) -> Result<Submission<Self::Token, Self::TextCompletion>, Error> {
+        Self::submit_text_prefill_decision(
+            runtime,
+            prompt,
+            &eredu_core::TokenSamplingDecision::new(filter.clone()),
+            state,
+        )
+    }
+
+    fn submit_text_prefill_decision(
+        runtime: &mut ModelRuntime<Self>,
+        prompt: Self::Prompt,
+        decision: &eredu_core::TokenSamplingDecision<'_>,
+        state: &mut Self::TextGenerationState,
+    ) -> Result<Submission<Self::Token, Self::TextCompletion>, Error> {
+        let filter = decision.filter();
         let stream = runtime.backend().stream().clone();
         if let Some(capture) = &mut state.capture {
             if prompt.with_borrowed(|input| {
@@ -1515,7 +1530,7 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
             let submission = session.submit_prefill_with_observer(
                 backend,
                 prompt,
-                &mut super::bounded_capture::observer(capture, &stream),
+                &mut super::bounded_capture::observer(capture, &stream, decision.capture_domain()),
             )?;
             let submission = Submission {
                 output: MlxModelOutput::new(Some(MlxTensor::from_array(submission.output))),
@@ -1533,6 +1548,21 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
         filter: &TokenFilter,
         state: &mut Self::TextGenerationState,
     ) -> Result<Submission<Self::Token, Self::TextCompletion>, Error> {
+        Self::submit_text_decode_decision(
+            runtime,
+            token,
+            &eredu_core::TokenSamplingDecision::new(filter.clone()),
+            state,
+        )
+    }
+
+    fn submit_text_decode_decision(
+        runtime: &mut ModelRuntime<Self>,
+        token: Self::Token,
+        decision: &eredu_core::TokenSamplingDecision<'_>,
+        state: &mut Self::TextGenerationState,
+    ) -> Result<Submission<Self::Token, Self::TextCompletion>, Error> {
+        let filter = decision.filter();
         let stream = runtime.backend().stream().clone();
         if let Some(capture) = &mut state.capture {
             capture
@@ -1552,7 +1582,7 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
             let submission = session.submit_decode_with_observer(
                 backend,
                 input,
-                &mut super::bounded_capture::observer(capture, &stream),
+                &mut super::bounded_capture::observer(capture, &stream, decision.capture_domain()),
             )?;
             let submission = Submission {
                 output: MlxModelOutput::new(Some(MlxTensor::from_array(submission.output))),

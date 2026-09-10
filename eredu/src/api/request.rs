@@ -285,6 +285,10 @@ impl TokenFilterController for PreparedChatSpeculativeConstraint {
         self.controller.current_filter()
     }
 
+    fn current_decision(&mut self) -> Result<eredu_core::TokenSamplingDecision<'_>, Self::Error> {
+        self.controller.current_decision()
+    }
+
     fn commit_token(&mut self, token_id: u32) -> Result<(), Self::Error> {
         self.controller.commit_token(token_id)
     }
@@ -303,6 +307,13 @@ impl eredu_core::SpeculativeTokenFilterController for PreparedChatSpeculativeCon
 
     fn filter_at(&self, history: &[u32]) -> Result<TokenFilter, Self::Error> {
         self.controller.filter_at(history)
+    }
+
+    fn decision_at(
+        &self,
+        history: &[u32],
+    ) -> Result<eredu_core::TokenSamplingDecision<'_>, Self::Error> {
+        eredu_core::SpeculativeTokenFilterController::decision_at(&self.controller, history)
     }
 
     fn prefix_is_complete(&self, history: &[u32]) -> Result<bool, Self::Error> {

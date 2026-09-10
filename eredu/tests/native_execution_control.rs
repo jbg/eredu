@@ -634,3 +634,6 @@ fn k2_controlled_capture_restore_and_modified_branch_use_shared_drivers() {
     )
     .unwrap();
 }
+
+#[path = "native_execution_control/candidate_domain.rs"]
+mod candidate_domain;

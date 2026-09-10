@@ -270,6 +270,27 @@ pub trait SpeculativeSampler<B: SamplingBackend> {
         context: &B::Context,
     ) -> Result<B::Logits, B::Error>;
 
+    /// Captures/intervenes on raw logits with the exact pre-forcing domain, then
+    /// runs ordinary processing. Unknown policies explicitly supply no domain.
+    /// The callback must run once, before filtering, and must not retain logits.
+    fn process_logits_with_capture(
+        &mut self,
+        logits: &B::Logits,
+        temperature: f32,
+        history: &[u32],
+        context: &B::Context,
+        capture: impl FnOnce(
+            &B::Logits,
+            Option<eredu_core::capture::CaptureTokenDomain<'_>>,
+        ) -> Result<B::Logits, B::Error>,
+    ) -> Result<B::Logits, B::Error>
+    where
+        Self: Sized,
+    {
+        let effective = capture(logits, None)?;
+        self.process_logits(&effective, temperature, history, context)
+    }
+
     /// Selects from already processed logits.
     fn sample_processed(
         &self,
@@ -437,6 +458,27 @@ where
             .filter_at(history)
             .map_err(|error| B::error(error.to_string()))?;
         let masked = B::apply_token_filter(logits, &filter, context)?;
+        self.policy
+            .process_logits(&masked, temperature, history, context)
+    }
+
+    fn process_logits_with_capture(
+        &mut self,
+        logits: &B::Logits,
+        temperature: f32,
+        history: &[u32],
+        context: &B::Context,
+        capture: impl FnOnce(
+            &B::Logits,
+            Option<eredu_core::capture::CaptureTokenDomain<'_>>,
+        ) -> Result<B::Logits, B::Error>,
+    ) -> Result<B::Logits, B::Error> {
+        let decision = self
+            .controller
+            .decision_at(history)
+            .map_err(|error| B::error(error.to_string()))?;
+        let effective = capture(logits, decision.capture_domain())?;
+        let masked = B::apply_token_filter(&effective, decision.filter(), context)?;
         self.policy
             .process_logits(&masked, temperature, history, context)
     }

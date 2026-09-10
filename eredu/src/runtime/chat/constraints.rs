@@ -242,6 +242,11 @@ impl TokenFilterController for ConstraintController {
         self.restrict(filter)
     }
 
+    fn current_decision(&mut self) -> Result<eredu_core::TokenSamplingDecision<'_>, Self::Error> {
+        let filter = self.current_filter()?;
+        Ok(eredu_core::TokenSamplingDecision::new(filter).with_tokenizer_validity(&self.validity))
+    }
+
     fn commit_token(&mut self, token_id: u32) -> Result<(), Self::Error> {
         self.commit(token_id)
     }
@@ -288,6 +293,16 @@ impl eredu_runtime::execution_control::SnapshotTokenController for ConstraintCon
 impl SpeculativeTokenFilterController for ConstraintController {
     fn filter_at(&self, history: &[u32]) -> Result<TokenFilter, Self::Error> {
         ConstraintController::filter_at(self, history)
+    }
+
+    fn decision_at(
+        &self,
+        history: &[u32],
+    ) -> Result<eredu_core::TokenSamplingDecision<'_>, Self::Error> {
+        Ok(
+            eredu_core::TokenSamplingDecision::new(self.filter_at(history)?)
+                .with_tokenizer_validity(&self.validity),
+        )
     }
 
     fn prefix_is_complete(&self, history: &[u32]) -> Result<bool, Self::Error> {

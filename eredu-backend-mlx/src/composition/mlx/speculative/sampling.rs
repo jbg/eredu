@@ -241,26 +241,40 @@ where
             SamplingPlacement::Draft => eredu_core::speculative::SpeculativeCaptureRole::Draft,
             _ => return Err(Exception::custom("unsupported speculative sampling role")),
         };
-        let effective = if let Some(capture) = &self.capture {
-            capture.borrow_mut().observe(
-                logits,
-                history.len() as u64,
-                placement,
-                self.interventions
-                    .iter()
-                    .find(|p| p.role == role)
-                    .map(|p| &p.plan),
-                sampling_stream(placement, context)?,
-            )?
-        } else {
-            None
-        };
+        let stream = sampling_stream(placement, context)?;
+        let logits = MlxTensor::from_array(logits.clone());
+        if let Some(capture) = &self.capture {
+            return SpeculativeSampler::<MlxSamplingBackend>::process_logits_with_capture(
+                &mut self.inner,
+                &logits,
+                temperature,
+                history,
+                stream,
+                |logits, domain| {
+                    let effective = capture.borrow_mut().observe(
+                        logits.as_array(),
+                        history.len() as u64,
+                        placement,
+                        self.interventions
+                            .iter()
+                            .find(|p| p.role == role)
+                            .map(|p| &p.plan),
+                        stream,
+                        domain,
+                    )?;
+                    Ok(effective
+                        .map(MlxTensor::from_array)
+                        .unwrap_or_else(|| logits.clone()))
+                },
+            )
+            .map(MlxTensor::into_array);
+        }
         SpeculativeSampler::<MlxSamplingBackend>::process_logits(
             &mut self.inner,
-            &MlxTensor::from_array(effective.unwrap_or_else(|| logits.clone())),
+            &logits,
             temperature,
             history,
-            sampling_stream(placement, context)?,
+            stream,
         )
         .map(MlxTensor::into_array)
     }
@@ -446,6 +460,7 @@ impl LogitCapture {
         placement: SamplingPlacement,
         intervention: Option<&eredu_core::intervention::AdmittedInterventionPlan>,
         stream: &Stream,
+        domain: Option<eredu_core::capture::CaptureTokenDomain<'_>>,
     ) -> Result<Option<Array>, Exception> {
         use eredu_core::{
             capture::CapturePhase,
@@ -482,7 +497,7 @@ impl LogitCapture {
         let values = logits.reshape(&[1, 1, -1], stream)?;
         let tensor = MlxTensor::from_array(values);
         let mut backend =
-            crate::composition::mlx::session::bounded_capture::NativeCapture { stream };
+            crate::composition::mlx::session::bounded_capture::NativeCapture { stream, domain };
         self.session
             .observe(
                 &mut backend,

@@ -38,12 +38,14 @@ pub(crate) fn capabilities() -> CaptureCapabilities {
             "Transforms execute synchronously; no native views or lazy capture graphs are queued".into(),
             "Statistics use F32 inputs and native chunk reductions with F64 aggregation; raw integer IDs remain exact".into(),
             "Candidate scores are finite raw logits for the last row, before token filtering and sampler processing".into(),
+            "Candidate domain membership reuses the exact tokenizer/constraint filter before forcing; unavailable provenance is explicit as domain: None".into(),
         ],
     }
 }
 
 pub(in crate::composition::mlx) struct NativeCapture<'a> {
     pub(in crate::composition::mlx) stream: &'a Stream,
+    pub(in crate::composition::mlx) domain: Option<CaptureTokenDomain<'a>>,
 }
 
 /// Includes a conservative logical allowance for source/contiguous backing, all
@@ -75,8 +77,8 @@ pub(super) fn estimate_shape(
                 ));
             }
             (
-                add(16, mul(*count, 16)?)?,
-                add(256, mul(*count, 64)?)?,
+                add(80, mul(*count, 20)?)?,
+                add(384, mul(*count, 80)?)?,
                 *count,
             )
         }
@@ -200,12 +202,14 @@ impl CaptureBackend for NativeCapture<'_> {
                     .map(|(id, score)| CaptureCandidate {
                         token_id: *id,
                         score: *score,
+                        allowed: self.domain.is_none_or(|domain| domain.filter.allows(*id)),
                     })
                     .collect();
                 Ok(CapturePayload::Candidates(CaptureCandidates {
                     stage: CandidateScoreStage::RawLogitsBeforeSampling,
                     source: CandidateLogitsSource::Original,
                     candidates,
+                    domain: self.domain.map(|domain| domain.summary(vocabulary as u32)),
                 }))
             }
             CaptureTransform::Preview { max_elements } => {
@@ -345,10 +349,11 @@ fn histogram(flat: &Array, edges: &[f32], stream: &Stream) -> Result<CaptureHist
 pub(super) fn observer<'a>(
     capture: &'a mut eredu_runtime::capture::CaptureSession,
     stream: &'a Stream,
+    domain: Option<CaptureTokenDomain<'a>>,
 ) -> impl RuntimeActivationObserver<MlxTensor, Exception> + 'a {
     eredu_runtime::intervention::CaptureObserver::new(
         capture,
-        NativeCapture { stream },
+        NativeCapture { stream, domain },
         |error: eredu_runtime::capture::CaptureExecutionError<Exception>| {
             Exception::custom(error.to_string())
         },

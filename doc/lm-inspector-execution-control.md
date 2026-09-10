@@ -65,6 +65,23 @@ validity still excludes holes and padded logits positions before sampling and
 forced-token admission; grammar constraints in semantic mode further restrict
 that same domain.
 
+For `TopCandidates` bars, inspect `CaptureCandidates.domain` before interpreting
+each candidate's `allowed` flag. With a known domain, render `allowed: false` as
+present-but-forbidden: keep its raw score visible and indicate that the token was
+never sampleable under that decision's tokenizer/semantic constraints. The flag
+is **not a probability adjustment**; raw logits (or a UI softmax of them) are not
+the sampler's final probabilities. Both `Original` and `Effective` sources use
+the domain before any forced choice. Forcing one token therefore does not mark
+every other candidate forbidden.
+
+The summary supplies the allowed count and actual logits vocabulary width;
+`constrained` distinguishes semantic restrictions from tokenizer validity alone.
+Missing/`None` domain means unknown, including old records and custom samplers
+without exact domain provenance. Their default `allowed: true` must not be shown
+as confirmed permission. MLX one-row speculative capture provides the same
+metadata at each target/draft history; draft membership is separate from target
+acceptance.
+
 Text admission rejects every nonempty tool declaration list, including with
 `ToolChoice::None`, and rejects `ToolChoice::Required` even with no declarations.
 Use a request with no tools and `Auto` or `None`; text mode provides no tool

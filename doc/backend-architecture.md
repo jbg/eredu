@@ -123,6 +123,16 @@ the backend. Physical allocator/private-workspace bounds remain explicitly
 unsupported; logical capture storage is not a bound on total inference memory.
 See [bounded capture](bounded-capture.md) for the accounting and delivery contract.
 
+`TokenSamplingDecision` carries the exact sampling filter plus optional borrowed
+tokenizer provenance across the neutral controller/backend boundary. Facade
+constraint owners supply the intersection once; runtime forced-choice wrappers
+retain its pre-override domain while narrowing only the sampling filter. MLX
+candidate transforms consume that borrowed domain for Original and Effective
+records. The speculative runtime exposes the same decision to the raw-logit
+capture callback before applying its filter, so neither native path reconstructs
+grammar policy or queries a second mask. Unknown provenance stays explicit in
+the optional host summary; filters are not retained in capture or snapshot state.
+
 `eredu-core::intervention` owns the versioned host-only operation schema, exact
 activation payload validation, routing request validation, session/source-bound
 immutable admission, and attributed outcomes. An intervention declaration is

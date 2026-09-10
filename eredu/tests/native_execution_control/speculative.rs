@@ -4,6 +4,8 @@ use eredu_core::{DraftPlacementPlan, DraftingPlan};
 fn artifacts() -> (Fixture, Fixture) {
     let target = fixture(false);
     let draft = fixture(false);
+    super::candidate_domain::install_vocabulary(&target.0);
+    super::candidate_domain::install_vocabulary(&draft.0);
     let text = serde_json::json!({"model_type":"gemma4_text", "hidden_size":32,
         "num_hidden_layers":2, "intermediate_size":64, "num_attention_heads":4,
         "num_key_value_heads":2, "head_dim":8, "rms_norm_eps":0.00001,
@@ -205,7 +207,7 @@ fn speculative_control_artifacts(
             path: eredu_core::MODEL_LOGITS_OBSERVATION_PATH.into(),
             schedule: Default::default(),
             slices: vec![],
-            transform: CaptureTransform::TopCandidates { count: 4 },
+            transform: CaptureTransform::TopCandidates { count: 64 },
         }],
         limits: CaptureLimits {
             per_step: usage,
@@ -390,6 +392,21 @@ fn speculative_control_artifacts(
         }
     }
     assert!(output.timing().time_to_first_token().is_some());
+    for capture in &captures {
+        for record in &capture.capture.records {
+            let Some(CapturePayload::Candidates(candidates)) = &record.payload else {
+                panic!()
+            };
+            let domain = candidates
+                .domain
+                .expect("speculative sampling exposes the exact domain");
+            assert_eq!(domain.vocabulary, 64);
+            assert!(domain.allowed_tokens > 1, "capture precedes forced choices");
+            if !compare {
+                super::candidate_domain::assert_domain(candidates);
+            }
+        }
+    }
     assert_eq!(replays[0], replays[1]);
     assert_eq!(replays[0], replays[2]);
     if replays[0].is_empty() {

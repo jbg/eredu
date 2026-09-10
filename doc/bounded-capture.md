@@ -96,6 +96,40 @@ MLX ranks natively and transfers only the requested IDs/scores. Candidate captur
 requires finite logits and positive count no larger than the vocabulary; it
 consumes no RNG draws. Processed-score and normalized-probability summaries are
 not currently provided.
+
+Each candidate also carries `allowed`, its membership in the **effective token
+domain at that decision, before any forced-token override**. This is the exact
+intersection of tokenizer validity and the active grammar/semantic constraint,
+including forbidden-tool suppression. It does not incorporate penalties,
+temperature, top-k/p, Mirostat, or logit interventions into membership. Scores and
+ranking remain raw: a forbidden token can still be the highest-scoring candidate.
+`Original` and `Effective` scores refer to opposite sides of the logits
+intervention hook; both use the same decision domain.
+
+`domain: Some(CandidateDomain)` reports `allowed_tokens`, `vocabulary` (the actual
+logits width, including tokenizer holes and padding), and `constrained`.
+`constrained` is true only when a semantic restriction excludes at least one
+otherwise tokenizer-valid ID within that output width. Tokenizer filtering alone
+and a forced choice do not set it. Membership is not a probability adjustment,
+nor a promise that subsequent sampler processing will select that token.
+
+MLX ordinary and controlled text capture borrow the sampler's exact decision
+filters. One-row `prepare_speculative_capture` also carries this domain for both
+target and draft predictions, using their respective histories before forcing;
+draft membership does not imply target acceptance. No extra grammar query, RNG
+draw, or vocabulary-sized host transfer is needed. Only the requested candidate
+IDs/scores, one boolean per candidate, and a small summary are exported; their
+storage and encoding are included in capture reservations.
+
+When a controller/sampler cannot expose an exact pre-override domain and its
+tokenizer baseline, `domain` is `None` and unknown membership is `allowed: true`.
+This includes legacy/custom owners using the default observation contract and
+owners unable to provide an exact enumerable domain. Treat that combination as
+**unknown**, never as proof of permission. Older JSON records deserialize with
+these same defaults; the additive fields retain `CAPTURE_SCHEMA_VERSION = 1`.
+Render known disallowed candidates as present-but-forbidden: their raw scores
+remain visible, but the constraint domain never permitted sampling them.
+
 Slices use exact catalog axis names and positive strides with half-open ranges.
 The `Slice` transform requires at least one explicit slice; unsliced full capture
 requires `FullTensor`. All modes remain budgeted.
@@ -122,7 +156,7 @@ Prediction `n > 0` comes from decode input `[prompt_len+n-1, prompt_len+n)`.
 Each capture retains its catalog node/path and intervention position. Block and
 logit captures precede intervention at that exact point; read-only routing
 captures occur after dispatch. Current observed text records are committed and
-owned by rank zero; partitioned, speculative and media capture require further
+owned by rank zero; partitioned and media capture require further
 support and are rejected by admission or the available text-only entry point.
 
 ## Delivery and lifecycle

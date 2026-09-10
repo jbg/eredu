@@ -810,7 +810,29 @@ fn tokenizer_validity_intersects_grammar_for_sampling_forcing_and_speculation() 
         valid
     );
     let mut speculative = ConstrainedSampler::new(DefaultSampler, controller.clone());
-    let processed = process_logits(&mut speculative, &logits, &[]);
+    let processed = SpeculativeSampler::<TestSamplingBackend>::process_logits_with_capture(
+        &mut speculative,
+        &logits,
+        0.0,
+        &[],
+        &(),
+        |raw, domain| {
+            let domain = domain.expect("active grammar has exact domain provenance");
+            assert_eq!(
+                domain.summary(270),
+                eredu_core::capture::CandidateDomain {
+                    allowed_tokens: 1,
+                    vocabulary: 270,
+                    constrained: true,
+                }
+            );
+            assert!(domain.filter.allows(valid));
+            assert!(!domain.filter.allows(forbidden));
+            assert!(!domain.filter.allows(hole));
+            Ok(raw.clone())
+        },
+    )
+    .unwrap();
     assert_eq!(sample_processed(&speculative, &processed), valid);
     assert!(SpeculativeSampler::<TestSamplingBackend>::process_logits(
         &mut speculative,
@@ -942,4 +964,52 @@ fn speculative_forcing_uses_the_shared_grammar_and_only_restricts_its_absolute_p
         SpeculativeSampler::<TestSamplingBackend>::control_pending_forced(&optimistic).is_some()
     );
     assert!(SpeculativeSampler::<TestSamplingBackend>::control_clear_forced(&mut optimistic));
+}
+
+#[test]
+fn speculative_capture_reuses_domain_before_forcing_and_preserves_processing() {
+    let validity = std::sync::Arc::new(TokenFilter::allowed(vec![true, false, true]).unwrap());
+    let controller = ConstraintController::text(validity);
+    let mut sampler = ConstrainedSampler::new(DefaultSampler, controller);
+    SpeculativeSampler::<TestSamplingBackend>::control_force_next(
+        &mut sampler,
+        0,
+        TokenDomain::new(3),
+        0,
+    )
+    .unwrap();
+    let logits = vec![1.0, 500.0, 2.0, 1000.0];
+    let expected = process_logits(&mut sampler.clone(), &logits, &[]);
+    let mut calls = 0;
+    let actual = SpeculativeSampler::<TestSamplingBackend>::process_logits_with_capture(
+        &mut sampler,
+        &logits,
+        0.0,
+        &[],
+        &(),
+        |raw, domain| {
+            calls += 1;
+            assert_eq!(raw, &logits);
+            let domain = domain.expect("facade controller supplies exact provenance");
+            assert_eq!(
+                domain.summary(4),
+                eredu_core::capture::CandidateDomain {
+                    allowed_tokens: 2,
+                    vocabulary: 4,
+                    constrained: false,
+                }
+            );
+            assert!(
+                domain.filter.allows(2),
+                "forcing must not change capture membership"
+            );
+            assert!(!domain.filter.allows(1));
+            assert!(!domain.filter.allows(3));
+            Ok(raw.clone())
+        },
+    )
+    .unwrap();
+    assert_eq!(calls, 1);
+    assert_eq!(actual, expected);
+    assert_eq!(sample_processed(&sampler, &actual), 0);
 }

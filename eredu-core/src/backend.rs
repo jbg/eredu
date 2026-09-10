@@ -1499,6 +1499,55 @@ pub enum TokenFilterError {
     },
 }
 
+/// One exact sampling filter with optional pre-override observation provenance.
+/// Existing controllers can return an unknown domain without inferring whether
+/// their exclusions came from tokenizer validity, semantics or forcing.
+#[derive(Debug)]
+pub struct TokenSamplingDecision<'a> {
+    filter: TokenFilter,
+    pre_override_filter: Option<TokenFilter>,
+    tokenizer_validity: Option<&'a TokenFilter>,
+}
+
+impl<'a> TokenSamplingDecision<'a> {
+    /// Creates a decision with unknown observation provenance.
+    pub fn new(filter: TokenFilter) -> Self {
+        Self {
+            filter,
+            pre_override_filter: None,
+            tokenizer_validity: None,
+        }
+    }
+
+    /// Declares the tokenizer baseline for this exact pre-override filter.
+    pub fn with_tokenizer_validity(mut self, validity: &'a TokenFilter) -> Self {
+        self.tokenizer_validity = Some(validity);
+        self
+    }
+
+    /// The final filter to apply to native sampling.
+    pub fn filter(&self) -> &TokenFilter {
+        &self.filter
+    }
+
+    /// Applies an already validated forced choice while retaining the original
+    /// domain for observation. This moves filters rather than copying masks.
+    pub fn override_filter(&mut self, filter: TokenFilter) {
+        let original = std::mem::replace(&mut self.filter, filter);
+        if self.pre_override_filter.is_none() {
+            self.pre_override_filter = Some(original);
+        }
+    }
+
+    /// Exact pre-override domain, or explicitly unknown.
+    pub fn capture_domain(&self) -> Option<crate::capture::CaptureTokenDomain<'_>> {
+        Some(crate::capture::CaptureTokenDomain {
+            filter: self.pre_override_filter.as_ref().unwrap_or(&self.filter),
+            tokenizer_validity: self.tokenizer_validity?,
+        })
+    }
+}
+
 /// Backend-independent logical controller for constrained token selection.
 pub trait TokenFilterController {
     /// Constraint or grammar error.
@@ -1506,6 +1555,13 @@ pub trait TokenFilterController {
 
     /// Returns the filter for the current durable logical prefix.
     fn current_filter(&mut self) -> Result<TokenFilter, Self::Error>;
+
+    /// Returns the sampling filter and, when available, its exact observation
+    /// domain. Implementations must reuse the same filter query and preserve the
+    /// domain before forcing. The default explicitly leaves capture unknown.
+    fn current_decision(&mut self) -> Result<TokenSamplingDecision<'_>, Self::Error> {
+        self.current_filter().map(TokenSamplingDecision::new)
+    }
 
     /// Commits one backend-selected canonical vocabulary id.
     fn commit_token(&mut self, token_id: u32) -> Result<(), Self::Error>;
@@ -1531,6 +1587,11 @@ pub trait SpeculativeTokenFilterController: TokenFilterController + Clone {
     /// more speculative tokens. Implementations must reject histories that do
     /// not begin with the durable prefix.
     fn filter_at(&self, history: &[u32]) -> Result<TokenFilter, Self::Error>;
+
+    /// Speculative counterpart of [`TokenFilterController::current_decision`].
+    fn decision_at(&self, history: &[u32]) -> Result<TokenSamplingDecision<'_>, Self::Error> {
+        self.filter_at(history).map(TokenSamplingDecision::new)
+    }
 
     /// Returns whether `history` completes the constraint without committing it.
     fn prefix_is_complete(&self, history: &[u32]) -> Result<bool, Self::Error>;
@@ -1724,6 +1785,27 @@ pub trait TextGenerationBackend: BackendProvider {
         filter: &TokenFilter,
         state: &mut Self::TextGenerationState,
     ) -> Result<Submission<Self::Token, Self::TextCompletion>, Self::Error>;
+
+    /// Prefill with optional exact capture provenance. Backends without domain
+    /// observation retain their existing submission behavior.
+    fn submit_text_prefill_decision(
+        runtime: &mut ModelRuntime<Self>,
+        prompt: Self::Prompt,
+        decision: &TokenSamplingDecision<'_>,
+        state: &mut Self::TextGenerationState,
+    ) -> Result<Submission<Self::Token, Self::TextCompletion>, Self::Error> {
+        Self::submit_text_prefill(runtime, prompt, decision.filter(), state)
+    }
+
+    /// Decode with the same pre-override domain contract as prefill.
+    fn submit_text_decode_decision(
+        runtime: &mut ModelRuntime<Self>,
+        token: Self::Token,
+        decision: &TokenSamplingDecision<'_>,
+        state: &mut Self::TextGenerationState,
+    ) -> Result<Submission<Self::Token, Self::TextCompletion>, Self::Error> {
+        Self::submit_text_decode(runtime, token, decision.filter(), state)
+    }
 }
 
 /// Failure from backend preprocessing or backend-requested text encoding.
@@ -2051,18 +2133,19 @@ where
                 return Some(Err(ControlledTextGenerationError::Backend(error)));
             }
         }
-        let filter = match self.controller.current_filter() {
-            Ok(filter) => filter,
+        let decision = match self.controller.current_decision() {
+            Ok(decision) => decision,
             Err(error) => return Some(Err(ControlledTextGenerationError::Controller(error))),
         };
         let submission = match step {
             PendingTextInput::Prefill(prompt) => {
-                B::submit_text_prefill(runtime, prompt, &filter, &mut self.backend_state)
+                B::submit_text_prefill_decision(runtime, prompt, &decision, &mut self.backend_state)
             }
             PendingTextInput::Decode(token) => {
-                B::submit_text_decode(runtime, token, &filter, &mut self.backend_state)
+                B::submit_text_decode_decision(runtime, token, &decision, &mut self.backend_state)
             }
         };
+        drop(decision);
         let submission = match submission {
             Ok(submission) => submission,
             Err(error) => return Some(Err(ControlledTextGenerationError::Backend(error))),

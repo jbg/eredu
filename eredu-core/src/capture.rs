@@ -8,6 +8,8 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+#[cfg(test)]
+mod candidate_tests;
 mod tensor_wire;
 
 use crate::{
@@ -754,6 +756,56 @@ pub struct CaptureCandidate {
     pub token_id: u32,
     /// F32 score at the declared processing stage.
     pub score: f32,
+    /// Membership in the effective tokenizer/constraint domain before a forced
+    /// choice. When domain information is unavailable, this defaults to true;
+    /// consult [`CaptureCandidates::domain`] before treating it as known.
+    #[serde(default = "candidate_allowed_default")]
+    pub allowed: bool,
+}
+
+fn candidate_allowed_default() -> bool {
+    true
+}
+
+/// Exact sampling-domain summary for the captured logits row, before forcing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CandidateDomain {
+    /// Number of model output IDs allowed by tokenizer validity and constraints.
+    pub allowed_tokens: u64,
+    /// Actual model output width, including any tokenizer holes or padding.
+    pub vocabulary: u64,
+    /// A semantic constraint excludes at least one otherwise tokenizer-valid ID
+    /// in this output vocabulary. Sampler truncation and forcing are excluded.
+    pub constrained: bool,
+}
+
+/// Borrowed exact filters for observation at one sampling decision.
+/// No grammar queries, native values or forced-token overrides are retained.
+#[derive(Debug, Clone, Copy)]
+pub struct CaptureTokenDomain<'a> {
+    /// The exact intersection used for sampling before any forced-token override.
+    pub filter: &'a crate::TokenFilter,
+    /// The tokenizer-valid domain before semantic restrictions.
+    pub tokenizer_validity: &'a crate::TokenFilter,
+}
+
+impl CaptureTokenDomain<'_> {
+    /// Summarizes only IDs in the actual model output, matching filter padding
+    /// and truncation semantics without constructing another vocabulary mask.
+    pub fn summary(&self, vocabulary: u32) -> CandidateDomain {
+        let mut allowed_tokens = 0;
+        let mut constrained = false;
+        for token in 0..vocabulary {
+            let allowed = self.filter.allows(token);
+            allowed_tokens += u64::from(allowed);
+            constrained |= !allowed && self.tokenizer_validity.allows(token);
+        }
+        CandidateDomain {
+            allowed_tokens,
+            vocabulary: u64::from(vocabulary),
+            constrained,
+        }
+    }
 }
 
 /// Bounded highest-score candidates for the last row of the current model logits.
@@ -766,6 +818,11 @@ pub struct CaptureCandidates {
     pub source: CandidateLogitsSource,
     /// Descending scores; equal-score ordering follows the native sorter.
     pub candidates: Vec<CaptureCandidate>,
+    /// Exact domain information, or unknown for older records/controllers that
+    /// cannot expose the pre-override domain. Unknown candidates use `allowed:
+    /// true`; that fallback is not evidence of permission or a probability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<CandidateDomain>,
 }
 
 /// Independently enforced accounting dimensions.
