@@ -102,10 +102,22 @@ pub(super) fn estimate_shape(
             )
         }
     };
+    // Candidate capture touches only the last logits row: its temporaries
+    // (dtype copy, finite mask, argsort indices) are all row-sized, and the
+    // source backing is an inference allocation that exists regardless of
+    // capture. Charging the whole source would veto prefill candidate capture
+    // — where the source is [batch, prompt, vocabulary] — for any real prompt.
+    let (retained_source, retained_selected) = match &selection.transform {
+        CaptureTransform::TopCandidates { .. } => {
+            let vocabulary = source.last().copied().unwrap_or(0);
+            (vocabulary, vocabulary)
+        }
+        _ => (source_elements, selected),
+    };
     Ok(CaptureUsage {
         captures: 1,
         retained_bytes: add(
-            add(mul(source_elements, 8)?, mul(selected, 16)?)?,
+            add(mul(retained_source, 8)?, mul(retained_selected, 16)?)?,
             add(4096, mul(temporary_elements, 128)?)?,
         )?,
         host_bytes,

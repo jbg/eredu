@@ -192,6 +192,21 @@ fn bounded_native_estimate_scales_host_transfer_with_preview_or_reduction() {
 }
 
 #[test]
+fn bounded_native_candidate_estimate_charges_the_row_not_the_prefill_source() {
+    let vocabulary = 262_144;
+    let request = selection(CaptureTransform::TopCandidates { count: 16 });
+    let decode = estimate_shape(&[1, 1, vocabulary], &request, &whole(&[1, 1, vocabulary])).unwrap();
+    let prefill = estimate_shape(
+        &[1, 4096, vocabulary],
+        &request,
+        &whole(&[1, 4096, vocabulary]),
+    )
+    .unwrap();
+    assert_eq!(prefill.retained_bytes, decode.retained_bytes);
+    assert!(prefill.retained_bytes < 8 * 1024 * 1024);
+}
+
+#[test]
 fn bounded_native_candidates_use_last_prediction_raw_scores() {
     let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
     let tensor = MlxTensor::from_array(Array::from_slice(
