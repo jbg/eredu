@@ -67,3 +67,8 @@ cmake = "0.1"
 tempfile = "3"
 half = "2"
 sha2 = "0.11"
+
+# Checkpoint identity reads can hash many GiB even during development. Keep the
+# SHA-2 compression kernels optimized while Eredu itself remains debuggable.
+[profile.dev.package.sha2]
+opt-level = 3

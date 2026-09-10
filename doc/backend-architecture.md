@@ -728,6 +728,20 @@ and trace-only requests do not resolve it. Backend adapters retain these neutral
 declarations and never reconstruct source membership or fingerprint files.
 Tensor loading reads selected ranges in execution order, so it is independent of
 the optional whole-file hashing pass, which also covers headers and unused bytes.
+
+The workspace optimizes the `sha2` dependency in development builds. Its
+compression kernels otherwise spend substantial time in unoptimized code even
+when CPU hash instructions are available. Eredu code retains ordinary debug
+settings; the SHA-256 identity format, full-content reads and change detection
+are unchanged. Downstream workspaces control their own Cargo profiles and can
+apply the same `[profile.dev.package.sha2] opt-level = 3` override.
+`cargo run -p eredu-core --example artifact_fingerprint -- FILE [ITERATIONS]`
+measures fresh deferred resolutions and memoized lookups. With a warm filesystem
+cache on the M3 Ultra, a 2,156,600,968-byte checkpoint took a median 8.71 seconds
+with unoptimized SHA-2 and 1.03 seconds with this override (three runs each).
+Release took 0.92 seconds and `sha256sum` took 1.01 seconds on the same file.
+The artifact identity was identical in every run.
+
 Each uncached SafeTensors range is read once into an owned buffer, with file
 identity and change metadata checked before and after the read. The shard cache
 weakly shares full-tensor buffers between live leases; it does not retain payload
