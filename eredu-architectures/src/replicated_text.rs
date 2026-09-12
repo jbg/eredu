@@ -476,7 +476,9 @@ impl<B: NeuralBackend> FixedReplicatedFamily<B> for QwenHybridReplicated {
             hidden_size: config.hidden_size,
             normalization_epsilon: config.rms_norm_eps,
             normalization_offset: 1.0,
-            embedding_quantization: config.quantization,
+            embedding_quantization: config
+                .linear_format("model.embed_tokens.weight")
+                .weight_quantization(),
             head_format: config.linear_format("lm_head.weight"),
             tied_head: config.tie_word_embeddings,
         }
@@ -1216,7 +1218,12 @@ pub(crate) fn selected_linear_formats(
     let linear_weights = requirements
         .parameters()
         .iter()
-        .filter(|parameter| matches!(parameter.role(), ReplicatedTextParameterRole::LinearWeight))
+        .filter(|parameter| {
+            matches!(
+                parameter.role(),
+                ReplicatedTextParameterRole::LinearWeight | ReplicatedTextParameterRole::Embedding
+            )
+        })
         .map(ReplicatedTextParameterRequirement::name)
         .collect::<BTreeSet<_>>();
     selected
@@ -1233,7 +1240,12 @@ fn requirement_linear_formats(
     requirements
         .parameters()
         .iter()
-        .filter(|parameter| matches!(parameter.role(), ReplicatedTextParameterRole::LinearWeight))
+        .filter(|parameter| {
+            matches!(
+                parameter.role(),
+                ReplicatedTextParameterRole::LinearWeight | ReplicatedTextParameterRole::Embedding
+            )
+        })
         .map(|parameter| (parameter.name().to_owned(), parameter.native_executable()))
         .collect()
 }

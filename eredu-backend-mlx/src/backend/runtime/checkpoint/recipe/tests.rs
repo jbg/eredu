@@ -6,6 +6,68 @@ use safetensors::tensor::{serialize_to_file, Dtype as SafeDtype, TensorView};
 use super::*;
 use eredu_checkpoint::store::SafetensorsWeightStore;
 
+#[test]
+fn subtract_one_preserves_inferred_dtype_and_residency_bytes() {
+    let directory = tempfile::tempdir().unwrap();
+    let values = [0.5_f32, 1.0, 2.0, 4.0];
+    let bf16 = values
+        .iter()
+        .flat_map(|&x| half::bf16::from_f32(x).to_le_bytes())
+        .collect::<Vec<_>>();
+    let f16 = values
+        .iter()
+        .flat_map(|&x| half::f16::from_f32(x).to_le_bytes())
+        .collect::<Vec<_>>();
+    let f32 = values
+        .iter()
+        .flat_map(|x| x.to_le_bytes())
+        .collect::<Vec<_>>();
+    serialize_to_file(
+        [
+            (
+                "bf16",
+                TensorView::new(SafeDtype::BF16, vec![4], &bf16).unwrap(),
+            ),
+            (
+                "f16",
+                TensorView::new(SafeDtype::F16, vec![4], &f16).unwrap(),
+            ),
+            (
+                "f32",
+                TensorView::new(SafeDtype::F32, vec![4], &f32).unwrap(),
+            ),
+        ],
+        None,
+        &directory.path().join("model.safetensors"),
+    )
+    .unwrap();
+    let store = SafetensorsWeightStore::open(directory.path()).unwrap();
+    let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+    for (name, dtype, bytes) in [
+        ("bf16", Dtype::Bfloat16, 8),
+        ("f16", Dtype::Float16, 8),
+        ("f32", Dtype::Float32, 16),
+    ] {
+        let recipe = DerivedWeightRecipe::SubtractOne {
+            input: Box::new(DerivedWeightRecipe::source(name, TensorSelection::Full)),
+        };
+        let inferred = recipe.infer(&store).unwrap();
+        let output = recipe.materialize(&store, &stream).unwrap();
+        assert_eq!(output.dtype(), dtype);
+        assert_eq!(inferred.dtype, recipe_dtype_from_mlx(output.dtype()));
+        assert_eq!(output.nbytes(), bytes);
+        assert_eq!(
+            output
+                .as_dtype(Dtype::Float32, &stream)
+                .unwrap()
+                .evaluated()
+                .unwrap()
+                .as_slice::<f32>(),
+            &[-0.5, 0.0, 1.0, 3.0]
+        );
+    }
+}
+
 fn fixture() -> (tempfile::TempDir, Arc<SafetensorsWeightStore>) {
     let dir = tempfile::tempdir().unwrap();
     let left = [1i32, 2, 3, 4]

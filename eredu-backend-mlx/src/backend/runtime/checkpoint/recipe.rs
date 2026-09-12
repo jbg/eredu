@@ -704,7 +704,8 @@ impl MlxWeightRecipeExt for DerivedWeightRecipe {
             Self::SubtractOne { input } => {
                 let array =
                     input.materialize_inner(store, stream, sources, borrow_sources, context)?;
-                Ok(array.subtract(Array::from_f32(1.0), stream)?)
+                let one = Array::from_f32(1.0).as_dtype(array.dtype(), stream)?;
+                Ok(array.subtract(one, stream)?)
             }
         }
     }

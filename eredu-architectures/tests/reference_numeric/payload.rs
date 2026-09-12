@@ -102,7 +102,7 @@ fn select(value: NumericTensor, selection: &TensorSelection) -> Result<NumericTe
     }
 }
 
-fn recipe_value(
+pub(super) fn recipe_value(
     recipe: &DerivedWeightRecipe,
     checkpoint: &dyn CheckpointSource,
     context: &NumericContext,

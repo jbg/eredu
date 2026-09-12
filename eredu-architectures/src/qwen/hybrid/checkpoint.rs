@@ -114,7 +114,9 @@ pub fn conditional_projector_gguf_plan(
 pub fn static_recipes(
     store: &dyn CheckpointSource,
 ) -> Result<BTreeMap<String, DerivedWeightRecipe>, String> {
-    let mut recipes = BTreeMap::new();
+    let mut recipes = super::safetensors::recipes(store, |name| {
+        !name.starts_with("model.layers.") && !name.starts_with("model.visual.blocks.")
+    })?;
     let patch0 = "model.visual.patch_embed.proj.weight.0";
     let patch1 = "model.visual.patch_embed.proj.weight.1";
     if store.source_metadata(patch0).is_ok() && store.source_metadata(patch1).is_ok() {
@@ -156,7 +158,8 @@ pub fn unit_recipes(
 ) -> Result<BTreeMap<String, DerivedWeightRecipe>, String> {
     let target_layers = usize::try_from(config.num_hidden_layers)
         .map_err(|_| "invalid Qwen hybrid layer count".to_string())?;
-    let mut recipes = BTreeMap::new();
+    let prefix = format!("model.layers.{flat}.");
+    let mut recipes = super::safetensors::recipes(store, |name| name.starts_with(&prefix))?;
     if flat < target_layers
         && config.variant == HybridVariant::Qwen3Next
         && matches!(
@@ -219,7 +222,8 @@ pub fn conditional_unit_recipes(
         .ok_or_else(|| "conditional Qwen recipe selection requires vision config".to_string())?
         .layer_count();
     if ordinal < vision_layers {
-        return Ok(BTreeMap::new());
+        let prefix = format!("model.visual.blocks.{ordinal}.");
+        return super::safetensors::recipes(store, |name| name.starts_with(&prefix));
     }
     let decoder_ordinal = ordinal - vision_layers;
     let decoder_units = usize::try_from(config.text.num_hidden_layers)

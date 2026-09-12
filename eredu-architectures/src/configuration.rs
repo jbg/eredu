@@ -962,7 +962,15 @@ impl SafetensorsArchitecturePlan {
             SafetensorsModelConfig::DeepSeekV4(args) => crate::deepseek::v4_safetensors_plan(args),
             SafetensorsModelConfig::Inkling(args) => crate::inkling::safetensors_plan(args),
             SafetensorsModelConfig::QwenHybrid(args) => {
-                crate::qwen::hybrid::composite_safetensors_plan(args)
+                let mut checkpoint = self.checkpoint.clone();
+                checkpoint
+                    .common_tensors
+                    .retain(|tensor| !tensor.key.starts_with("mtp."));
+                checkpoint
+                    .layout_groups
+                    .retain(|group| !group.id.starts_with("mtp."));
+                debug_assert_eq!(args.text.mtp_num_hidden_layers, 0);
+                Ok(checkpoint)
             }
             SafetensorsModelConfig::NemotronH(args) => crate::nemotron_h::safetensors_plan(args),
             _ => unreachable!("prediction projection admits only typed extension families"),
@@ -1004,6 +1012,13 @@ impl SafetensorsArchitecturePlan {
 
     pub(crate) fn admit_catalog(&mut self, tensors: &TensorCatalog) -> Result<(), ArtifactError> {
         let catalog = PortableSafetensorsCatalog(tensors);
+        if let SafetensorsModelConfig::QwenHybrid(config) = &self.model {
+            let (config, checkpoint) =
+                crate::qwen::hybrid::safetensors_catalog_plan(config, &catalog)
+                    .map_err(ArtifactError::InvalidArchitecturePlan)?;
+            self.model = SafetensorsModelConfig::QwenHybrid(config);
+            self.checkpoint = checkpoint;
+        }
         self.checkpoint_resolution = Some(
             resolve_safetensors_plan(&catalog, &self.checkpoint)
                 .map_err(invalid_checkpoint_validation)?,

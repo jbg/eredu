@@ -1213,6 +1213,23 @@ typed state. Artifact enrichment carries that state forward while adding any
 processor sidecars or GGUF companions; it does not reconstruct it from the
 portable configuration. Core routes the protocol and resolves companion paths;
 it neither recognizes family strings nor exposes an exhaustive family type.
+
+Qwen hybrid SafeTensors catalog admission distinguishes the official namespace
+from MLX-VLM's `language_model.model.*` and `vision_tower.*` layout. The
+architecture owns exact aliases, convolution axis conversions, and the inverse
+of MLX-VLM's normalization-weight offset. These are ordinary bounded parameter
+recipes consumed by all execution mechanisms. Canonical parameter geometry
+remains independent of the selected physical axis order. Converted artifacts
+with no MTP tensors normalize their retained prediction depth to zero before
+capability reporting and execution selection; partial drafts still fail strict
+validation. Official SafeTensors retain their declared-MTP requirements, and
+GGUF retains its separate canonical conversion recipes. Qwen embedding
+construction consumes the selected per-parameter format, including quantization
+companions, rather than relying on a checkpoint-wide quantization default.
+The CLI chooses embedded drafting from the admitted architecture's prediction
+extension and reuses that inspection for loading; it does not infer family
+capabilities from raw JSON configuration fields.
+
 SafeTensors assistant admission requires explicit, agreeing outer and nested
 model identities; architecture normalization occurs only after both identities
 have been validated and cannot supply or disregard identity evidence.

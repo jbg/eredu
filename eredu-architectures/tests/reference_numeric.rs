@@ -120,6 +120,8 @@ mod payload;
 mod prepared_adapter;
 #[path = "reference_numeric/profile_conformance.rs"]
 mod profile_conformance;
+#[path = "reference_numeric/qwen_mlx.rs"]
+mod qwen_mlx;
 #[cfg(test)]
 #[path = "reference_numeric/shadow.rs"]
 mod shadow;
@@ -20820,7 +20822,11 @@ impl<'a>
         record_reference_family(prepared.effective_model_type());
         record_reference_stage("typed_architecture");
         let mechanisms = if self.context.bind_checkpoint_values {
-            NumericReplicatedMechanisms::with_bound_checkpoint(checkpoint)
+            if prepared.selected().residency().is_fully_resident() {
+                NumericReplicatedMechanisms::with_bound_checkpoint(checkpoint)
+            } else {
+                NumericReplicatedMechanisms::with_bounded_checkpoint(checkpoint)
+            }
         } else {
             NumericReplicatedMechanisms::with_checkpoint(checkpoint)
         };

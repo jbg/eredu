@@ -1319,30 +1319,6 @@ fn base_automatic_candidates(
     [resident, layerwise, disk]
 }
 
-fn embedded_mtp_count(value: &serde_json::Value) -> Option<u64> {
-    match value {
-        serde_json::Value::Object(object) => {
-            for key in ["mtp_num_hidden_layers", "num_nextn_predict_layers"] {
-                if let Some(count) = object.get(key).and_then(serde_json::Value::as_u64) {
-                    return Some(count);
-                }
-            }
-            object.values().find_map(embedded_mtp_count)
-        }
-        serde_json::Value::Array(values) => values.iter().find_map(embedded_mtp_count),
-        _ => None,
-    }
-}
-
-fn model_advertises_embedded_mtp(model_path: &Path) -> bool {
-    model_path.is_dir()
-        && fs::read(model_path.join("config.json"))
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-            .and_then(|config| embedded_mtp_count(&config))
-            .is_some_and(|layers| layers > 0)
-}
-
 fn with_expert_cache(mut plan: ExecutionPlan) -> ExecutionPlan {
     let split = |bytes: u64, percent: u64| bytes.saturating_mul(percent) / 100;
     let (residency, device_budget, host_budget) = match plan.residency().clone() {
@@ -2192,9 +2168,23 @@ fn main() -> Result<()> {
     }
     let prompt = read_prompt(args.prompt.as_deref())?;
 
-    let configured_embedded_mtp = draft_model_path.is_none()
+    let configured_embedded_mtp = if automatic_report.is_none()
+        && draft_model_path.is_none()
         && args.speculative_draft_tokens > 0
-        && model_advertises_embedded_mtp(&model_path);
+    {
+        let inspection = match retained_automatic_inspection.take() {
+            Some(inspection) => inspection,
+            None => eredu_architectures::configuration::inspect_artifact(&model_path)?,
+        };
+        let available = inspection
+            .architecture_plan()
+            .prediction_target_projection()?
+            .is_some();
+        retained_automatic_inspection = Some(inspection);
+        available
+    } else {
+        false
+    };
     let execution_plan = match automatic_report.as_ref() {
         Some(report) => report.plan.clone(),
         None => cli_execution_plan(&args, draft_model_path.as_deref(), configured_embedded_mtp)?,
@@ -3496,18 +3486,17 @@ mod tests {
     use super::{
         apply_automatic_plan, artifact_file_stamps, base_automatic_candidates,
         cached_automatic_report, choose_automatic_residency, cli_execution_plan, device_plan,
-        discover_local_hardware, embedded_mtp_count, format_bytes, median,
-        model_advertises_embedded_mtp, read_automatic_feedback, requested_load_quantization,
-        select_cached_gguf_from_revisions, select_cached_gguf_pair_from_revisions,
-        select_cached_gguf_path, select_revision, select_unique_cached_gguf,
-        should_report_stop_reason, split_hf_model_spec, stop_reason, use_semantic_generation,
-        validate_args, validate_artifact_pair, write_auto_plan_cache, write_semantic_event,
-        write_timing_report, AutoMode, AutoPlanCacheKey, AutomaticCliOverrides, CachedGgufRole,
-        Cli, CliDevice, CliToolChoice, DraftingPlan, ExecutionPlan, ExecutionPlanReport,
-        ModelResourceProfile, NativeToolSupport, Observed, PlanExplanation, QuantizationRequest,
-        ReasoningOutput, ReasoningStream, ResidencyPlan, ResolvedModel, SemanticEvent,
-        SemanticSupport, SpeculativeDraftDevice, SpeculativeSchedulerOptions, StopReason,
-        WeightTransformationPlan,
+        discover_local_hardware, format_bytes, median, read_automatic_feedback,
+        requested_load_quantization, select_cached_gguf_from_revisions,
+        select_cached_gguf_pair_from_revisions, select_cached_gguf_path, select_revision,
+        select_unique_cached_gguf, should_report_stop_reason, split_hf_model_spec, stop_reason,
+        use_semantic_generation, validate_args, validate_artifact_pair, write_auto_plan_cache,
+        write_semantic_event, write_timing_report, AutoMode, AutoPlanCacheKey,
+        AutomaticCliOverrides, CachedGgufRole, Cli, CliDevice, CliToolChoice, DraftingPlan,
+        ExecutionPlan, ExecutionPlanReport, ModelResourceProfile, NativeToolSupport, Observed,
+        PlanExplanation, QuantizationRequest, ReasoningOutput, ReasoningStream, ResidencyPlan,
+        ResolvedModel, SemanticEvent, SemanticSupport, SpeculativeDraftDevice,
+        SpeculativeSchedulerOptions, StopReason, WeightTransformationPlan,
     };
 
     fn scanned_revision() -> CachedRevision {
@@ -3627,6 +3616,7 @@ mod tests {
             largest_execution_group_bytes: Observed::unavailable("fixture"),
             largest_adjacent_execution_groups_bytes: Observed::unavailable("fixture"),
             expert_parameter_bytes: Observed::unavailable("fixture"),
+            selected_rank: Observed::unavailable("fixture"),
         };
         let report = ExecutionPlanReport {
             schema_version: eredu_core::AUTOMATIC_SCHEMA_VERSION,
@@ -3941,29 +3931,6 @@ mod tests {
         apply_automatic_plan(&mut args, &plan).unwrap();
         assert_eq!(args.quantize, Some(4));
         assert_eq!(args.quantization_mode, super::LoadQuantizationMode::Mxfp4);
-    }
-
-    #[test]
-    fn embedded_mtp_detection_accepts_root_and_nested_config_keys() {
-        assert_eq!(
-            embedded_mtp_count(&serde_json::json!({"mtp_num_hidden_layers": 2})),
-            Some(2)
-        );
-        assert_eq!(
-            embedded_mtp_count(&serde_json::json!({
-                "mtp_config": {"num_nextn_predict_layers": 3}
-            })),
-            Some(3)
-        );
-        assert_eq!(embedded_mtp_count(&serde_json::json!({})), None);
-
-        let directory = tempfile::tempdir().unwrap();
-        std::fs::write(
-            directory.path().join("config.json"),
-            br#"{"mtp_num_hidden_layers":2}"#,
-        )
-        .unwrap();
-        assert!(model_advertises_embedded_mtp(directory.path()));
     }
 
     fn cached_file(file_path: &str, blob_path: &str) -> CachedFile {

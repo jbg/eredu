@@ -8,6 +8,9 @@ mod linear_attention;
 mod model;
 mod mtp;
 mod parallel;
+mod safetensors;
+
+pub(crate) use safetensors::catalog_plan as safetensors_catalog_plan;
 
 /// Checkpoint spellings shared by tensor admission and FP8 exclusion policy.
 fn text_checkpoint_aliases(name: &str) -> Vec<String> {

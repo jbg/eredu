@@ -127,6 +127,12 @@ full/sliding schedules. The schedule must match the decoder depth. Transformers 
 `rope_parameters` is normalized alongside legacy `rope_theta` and `rope_scaling`;
 conflicting declarations and unsupported rotary policies are rejected.
 
+Qwen3.5 also admits converted MLX-VLM checkpoints with
+`language_model.model.*` and `vision_tower.*` tensors, including the released
+`mlx-community/Qwen3.5-0.8B-8bit` artifact. Official SafeTensors and GGUF retain
+their format-specific handling. See [MLX checkpoint validation](qwen35-mlx-validation.md)
+for conversion semantics, pinned reference results and remaining validation gaps.
+
 ## Checkpoint formats
 
 ### SafeTensors directories
